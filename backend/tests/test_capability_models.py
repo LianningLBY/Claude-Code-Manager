@@ -207,6 +207,9 @@ async def test_invocation_exact_turn_evidence_round_trip(db_session):
     invocation = _invocation(task.id, "exact-turn-evidence")
     invocation.request_task_turn_generation = 2**40 + 9
     invocation.request_output_log_id = 314
+    invocation.request_reason = "Need a plan before changing the schema"
+    invocation.request_protocol_version = 1
+    invocation.request_output_hash = "3" * 64
     invocation.request_native_turn_id = "native_turn_314"
     db_session.add(invocation)
     await db_session.commit()
@@ -214,6 +217,9 @@ async def test_invocation_exact_turn_evidence_round_trip(db_session):
 
     assert invocation.request_task_turn_generation == 2**40 + 9
     assert invocation.request_output_log_id == 314
+    assert invocation.request_reason == "Need a plan before changing the schema"
+    assert invocation.request_protocol_version == 1
+    assert invocation.request_output_hash == "3" * 64
     assert invocation.request_native_turn_id == "native_turn_314"
 
 
@@ -243,11 +249,73 @@ async def test_agent_invocation_exact_turn_shape_is_accepted(db_session):
     invocation.request_task_turn_generation = 1
     invocation.request_source_log_id = 41
     invocation.request_output_log_id = 42
+    invocation.request_reason = "Review the completed turn"
+    invocation.request_protocol_version = 1
+    invocation.request_output_hash = "4" * 64
     db_session.add(invocation)
 
     await db_session.commit()
     await db_session.refresh(invocation)
     assert invocation.id is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("purpose", "required_gate"),
+        ("resume_policy", "attach_only"),
+        ("requested_by_user_id", 7),
+        ("request_task_retry_count", None),
+        ("request_task_turn_generation", None),
+        ("request_source_log_id", None),
+        ("request_output_log_id", None),
+        ("request_reason", None),
+        ("request_protocol_version", None),
+        ("request_protocol_version", 0),
+        ("request_output_hash", None),
+    ],
+)
+async def test_agent_invocation_rejects_incomplete_or_forged_identity(
+    db_session,
+    field,
+    invalid_value,
+):
+    task = Task(title=f"invalid agent audit {field}")
+    db_session.add(task)
+    await db_session.flush()
+    invocation = _invocation(task.id, f"invalid-agent-audit-{field}")
+    invocation.source = "agent_request"
+    invocation.resume_policy = "resume_task"
+    invocation.request_task_retry_count = 0
+    invocation.request_task_turn_generation = 1
+    invocation.request_source_log_id = 41
+    invocation.request_output_log_id = 42
+    invocation.request_reason = "Need an exact audit trail"
+    invocation.request_protocol_version = 1
+    invocation.request_output_hash = "5" * 64
+    setattr(invocation, field, invalid_value)
+    db_session.add(invocation)
+
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_output_log_can_authorize_only_one_invocation_per_task(db_session):
+    task = Task(title="one action per terminal output")
+    db_session.add(task)
+    await db_session.flush()
+    first = _invocation(task.id, "terminal-output-one", status="failed")
+    first.active_task_id = None
+    first.request_output_log_id = 91
+    second = _invocation(task.id, "terminal-output-two", status="failed")
+    second.active_task_id = None
+    second.request_output_log_id = 91
+    db_session.add_all([first, second])
+
+    with pytest.raises(IntegrityError):
+        await db_session.commit()
 
 
 @pytest.mark.asyncio

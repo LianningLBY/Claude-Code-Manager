@@ -18,12 +18,16 @@ from backend.models.pr_monitor import (
     PRReviewerRun,
 )
 from backend.models.task import Task
+from backend.models.worker import Worker
 from backend.services.pr_monitor_loop import (
     attach_review_to_run,
     reconcile_terminal_review_runs,
     record_blocking_evidence,
     record_gate_pass,
     record_review_error,
+)
+from backend.tests.worker_termination_helpers import (
+    persist_active_manager_receipt,
 )
 
 
@@ -716,6 +720,109 @@ async def test_local_repair_wake_has_durable_acceptance_and_awaits_new_push(
     assert dispatcher.enqueue_message.await_count == 2
     recovered_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert recovered_run.repair_attempts == attempts_before_recovery
+
+
+@pytest.mark.asyncio
+async def test_repair_terminal_yields_to_manager_termination_receipt(
+    db_session,
+    db_factory,
+):
+    from backend.services.pr_monitor_loop import finish_repair_wake
+
+    worker = Worker(
+        name="repair receipt worker",
+        status="ready",
+        private_ip="10.0.0.91",
+        auth_token="receipt-token",
+    )
+    repo = MonitoredRepo(
+        repo_full_name="owner/receipt-repair",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        auto_repair=True,
+    )
+    db_session.add_all([worker, repo])
+    await db_session.flush()
+    started_at = datetime.utcnow() - timedelta(minutes=2)
+    accepted_completed_at = started_at + timedelta(seconds=10)
+    task = Task(
+        title="receipt-owned repair terminal",
+        description="repair",
+        status="completed",
+        worker_id=worker.id,
+        session_id="repair-receipt-session",
+        started_at=started_at,
+        completed_at=accepted_completed_at + timedelta(seconds=20),
+    )
+    db_session.add(task)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=92,
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="receipt repair",
+        pr_author="alice",
+        pr_url="https://github.com/owner/receipt-repair/pull/92",
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=92,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        current_review_id=review.id,
+        developer_task_id=task.id,
+        status="repairing",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    wake = PRRepairWake(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        developer_task_id=task.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        reason_kind="review_blocked",
+        evidence_hash="e" * 64,
+        evidence={"receipt": True},
+        status="accepted",
+        delivery_token="d" * 48,
+        accepted_worker_id=worker.id,
+        accepted_task_retry_count=task.retry_count,
+        accepted_session_id=task.session_id,
+        accepted_task_started_at=task.started_at,
+        accepted_task_completed_at=accepted_completed_at,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+    task_id = task.id
+    wake_id = wake.id
+    run_id = run.id
+
+    await persist_active_manager_receipt(db_factory, task_id)
+    await finish_repair_wake(
+        db_session,
+        wake_id=wake_id,
+        delivery_token="d" * 48,
+        task_id=task_id,
+    )
+
+    current_wake = await db_session.get(
+        PRRepairWake,
+        wake_id,
+        populate_existing=True,
+    )
+    current_run = await db_session.get(
+        PRMonitorRun,
+        run_id,
+        populate_existing=True,
+    )
+    assert current_wake.status == "accepted"
+    assert current_run.status == "repairing"
+    assert current_run.repair_attempts == 0
 
 
 @pytest.mark.asyncio

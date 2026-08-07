@@ -23,6 +23,9 @@ from backend.services.task_queue import (
     task_is_pr_review_superseded,
     task_retry_not_superseded_predicate,
 )
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2641,8 +2644,36 @@ async def check_and_update_review(
     terminal_task_retry_count: int | None = None,
     background_handoff_pending: Callable[[], bool] | None = None,
     db_factory=None,
+    operation_lock_held: bool = False,
 ):
     """Verify one exact Task result and reconcile its durable publication."""
+
+    if not operation_lock_held:
+        lock_task_id = (
+            terminal_task_id
+            if type(terminal_task_id) is int
+            else await db.scalar(
+                select(PRReview.task_id).where(PRReview.id == pr_review_id)
+            )
+        )
+        if type(lock_task_id) is int:
+            # Publishing status blocks new public termination admission. Keep
+            # the process-wide Task lock through every GitHub mutation as the
+            # companion fence for internal recovery/destroy receipt creators.
+            await db.rollback()
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            async with get_task_operation_lock(lock_task_id):
+                return await check_and_update_review(
+                    db,
+                    pr_review_id,
+                    repo_full_name,
+                    terminal_task_id=terminal_task_id,
+                    terminal_task_retry_count=terminal_task_retry_count,
+                    background_handoff_pending=background_handoff_pending,
+                    db_factory=db_factory,
+                    operation_lock_held=True,
+                )
 
     lock = pr_review_action_lock(pr_review_id)
     async with lock:
@@ -2689,7 +2720,7 @@ async def _locked_task_generation_exists(
     ):
         return False
     result = await db.execute(
-        select(Task.id)
+        update(Task)
         .where(
             Task.id == task_id,
             Task.status == "completed",
@@ -2697,10 +2728,12 @@ async def _locked_task_generation_exists(
             Task.started_at == started_at,
             Task.pty_background_generation.is_(None),
             task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
         )
-        .with_for_update()
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
     )
-    return result.scalar_one_or_none() == task_id
+    return result.rowcount == 1
 
 
 async def _commit_exact_review_update(
@@ -3792,6 +3825,7 @@ async def recover_incomplete_pr_reviews(
                 else Task.completed_at == task.completed_at
             ),
             Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
         ]
         task_guard = await db.execute(
             update(Task)
@@ -3923,6 +3957,7 @@ async def recover_incomplete_pr_reviews(
                         else None
                     ),
                     db_factory=db_factory,
+                    operation_lock_held=(original_status == "reviewing"),
                 )
                 refreshed = await db.get(
                     PRReview,

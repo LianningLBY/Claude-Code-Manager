@@ -24,8 +24,12 @@ from backend.database import Base
 from backend.models.task import Task
 from backend.models.monitor_session import MonitorSession, MonitorCheck
 from backend.services.dispatcher import (
+    AuxiliaryLaunchSupersededError,
     GlobalDispatcher,
     _MonitorTurnHandle,
+)
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
 )
 
 
@@ -57,6 +61,15 @@ def dispatcher(db_factory, mock_broadcaster):
     d._sub_agent_codex_homes = {}
     d._sub_agent_codex_threads = {}
     d.codex_pool = None
+    # This fixture deliberately bypasses GlobalDispatcher.__init__. Keep the
+    # queue-admission members used by Monitor callback fencing in sync with the
+    # production constructor.
+    d._dispatch_claim_lock = asyncio.Lock()
+    d._shutting_down = False
+    d._maintenance_shutdown_committed = False
+    d._cancel_durable_queue_tasks = set()
+    d._queue_admission_epoch = "monitor-test"
+    d._task_queue_generations = {}
 
     @asynccontextmanager
     async def runtime_admission(
@@ -508,6 +521,49 @@ async def test_codex_sub_agent_final_gate_rejects_stopped_generation(
 
 
 @pytest.mark.asyncio
+async def test_codex_sub_agent_final_gate_yields_to_active_receipt(dispatcher):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=75,
+    )
+    await persist_active_worker_receipt(dispatcher.db_factory, 7)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+
+    with pytest.raises(
+        AuxiliaryLaunchSupersededError,
+        match="active Worker termination receipt",
+    ):
+        await dispatcher._launch_codex_sub_agent(
+            prompt="must yield",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=75,
+            task_id=7,
+            task_metadata={},
+            mcp_specs=(),
+            expected_task_routing=(
+                "codex",
+                "gpt-5.6-sol",
+                "default",
+            ),
+        )
+
+    registry.start_turn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_codex_sub_agent_commit_failure_aborts_exact_started_turn(
     dispatcher,
     monkeypatch,
@@ -873,6 +929,71 @@ async def test_launch_monitor_agent_keeps_larger_env_timeout(
 
     assert captured["env"]["BASH_MAX_TIMEOUT_MS"] == "99999000"
     dispatcher._monitor_log_fhs[990002].close()
+
+
+@pytest.mark.asyncio
+async def test_claude_monitor_launch_yields_without_rewriting_receipt_generation(
+    dispatcher,
+    db_factory,
+):
+    task_id, session_id = await _seed_task_and_monitor(db_factory)
+    snapshot = await dispatcher._claim_due_monitor_turn(session_id)
+    assert snapshot is not None
+    generation = int(snapshot["generation"])
+    await persist_active_worker_receipt(db_factory, task_id)
+    dispatcher._launch_monitor_agent = AsyncMock()
+
+    await dispatcher._execute_scheduled_monitor_turn(session_id, snapshot)
+
+    dispatcher._launch_monitor_agent.assert_not_awaited()
+    async with db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        assert session is not None
+        assert session.status == "running"
+        assert session.active_turn_generation == generation
+        assert session.consecutive_failures == 0
+
+
+@pytest.mark.asyncio
+async def test_claude_sub_agent_launch_yields_without_failure_publication(
+    dispatcher,
+    db_factory,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="receipt-owned Claude child",
+            description="d",
+            status="completed",
+            provider="claude",
+            target_repo="/tmp",
+        )
+        db.add(task)
+        await db.flush()
+        session = MonitorSession(
+            task_id=task.id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="child",
+            status="running",
+            provider="claude",
+        )
+        db.add(session)
+        await db.commit()
+        task_id = task.id
+        session_id = session.id
+
+    await persist_active_worker_receipt(db_factory, task_id)
+    dispatcher._launch_sub_agent = AsyncMock()
+
+    await dispatcher._sub_agent_session_lifecycle(session_id)
+
+    dispatcher._launch_sub_agent.assert_not_awaited()
+    async with db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        assert session is not None
+        assert session.status == "running"
+        assert session.completed_at is None
+    dispatcher.broadcaster.broadcast.assert_not_awaited()
 
 
 # === start_monitor_session ===
@@ -1477,8 +1598,10 @@ async def test_lifecycle_cancelled(dispatcher, db_factory, mock_broadcaster):
     task_id, ms_id = await _seed_task_and_monitor(db_factory)
 
     proc = _fake_proc(returncode=None)
+    wait_started = asyncio.Event()
 
     async def hang():
+        wait_started.set()
         await asyncio.sleep(9999)
 
     proc.wait = AsyncMock(side_effect=hang)
@@ -1509,7 +1632,7 @@ async def test_lifecycle_cancelled(dispatcher, db_factory, mock_broadcaster):
         patch("backend.services.dispatcher.os.killpg", side_effect=kill_group),
     ):
         lifecycle_task = asyncio.create_task(dispatcher._monitor_session_lifecycle(ms_id))
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(wait_started.wait(), timeout=1)
         lifecycle_task.cancel()
         try:
             await lifecycle_task
@@ -2694,6 +2817,39 @@ async def test_codex_monitor_revalidates_preselected_account_after_home_fence(
     assert dispatcher._monitor_turn_handles == {}
 
 
+@pytest.mark.asyncio
+async def test_codex_monitor_final_gate_yields_to_active_receipt(
+    dispatcher,
+    db_factory,
+):
+    task_id, session_id = await _seed_codex_monitor(db_factory)
+    snapshot = await dispatcher._claim_due_monitor_turn(session_id)
+    assert snapshot is not None
+    generation = int(snapshot["generation"])
+    await persist_active_worker_receipt(db_factory, task_id)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock()
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def home_guard(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = home_guard
+
+    await dispatcher._execute_scheduled_monitor_turn(session_id, snapshot)
+
+    registry.start_turn.assert_not_awaited()
+    async with db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+        assert session is not None
+        assert session.status == "running"
+        assert session.active_turn_generation == generation
+        assert session.consecutive_failures == 0
+
+
 # === API callbacks: MonitorCheck records + broadcasts ===
 # In the new design the sub-agent reports via MCP tools that hit these endpoints,
 # so the per-check persistence/broadcast coverage moved here.
@@ -2719,6 +2875,7 @@ def _mock_main_dispatcher():
     d.broadcaster = MagicMock()
     d.broadcaster.broadcast = AsyncMock()
     d.enqueue_message = AsyncMock()
+    d.snapshot_queue_admission = AsyncMock(return_value=object())
     d.stop_monitor_session_process = AsyncMock()
     d._monitor_processes = {}
     return d

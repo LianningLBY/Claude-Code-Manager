@@ -10,7 +10,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from alembic import command
 from alembic.config import Config
@@ -26,7 +27,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects import mysql, postgresql, sqlite
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.schema import CreateTable
 
 # All ORM models must be imported so Base.metadata is complete.
@@ -44,6 +45,7 @@ import backend.models.plan  # noqa: F401
 import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
+import backend.models.worker_task_termination  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -58,7 +60,8 @@ CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
 AUTO_CAPABILITY_TURN_REVISION = "c3a7e9f1b2d4"
-CURRENT_HEAD_REVISION = AUTO_CAPABILITY_TURN_REVISION
+TERMINAL_ARBITRATION_REVISION = "4b8d2f6a1c90"
+CURRENT_HEAD_REVISION = TERMINAL_ARBITRATION_REVISION
 PUBLISHED_PLAN_CLEANUP_SHA256 = (
     "dd8cce93f05599ebc580cb95cad5d7d8875f03415775312718d3e42ef4369d16"
 )
@@ -103,6 +106,81 @@ def _run_alembic(cfg: Config, func, *args):
     async_url = db_url.replace("sqlite:///", "sqlite+aiosqlite:///")
     with patch("backend.config.settings.database_url", async_url):
         func(cfg, *args)
+
+
+def _load_terminal_arbitration_migration(module_suffix: str = "test"):
+    migration_path = (
+        PROJECT_ROOT
+        / "alembic"
+        / "versions"
+        / "4b8d2f6a1c90_add_terminal_arbitration_identity.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"terminal_arbitration_migration_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _mysql_terminal_state(
+    *,
+    canonical: str | None,
+    shadow: str | None = None,
+    gate: bool = False,
+    columns: set[str] | None = None,
+    unique: bool = False,
+) -> dict[str, object]:
+    return {
+        "columns": set(columns or ()),
+        "column_shapes": {
+            "request_reason": True,
+            "request_protocol_version": True,
+            "request_output_hash": True,
+        },
+        "unique": unique,
+        "unique_present": unique,
+        "canonical": canonical,
+        "canonical_present": canonical is not None,
+        "canonical_enforced": canonical is not None,
+        "shadow": shadow,
+        "shadow_present": shadow is not None,
+        "shadow_enforced": shadow is not None,
+        "gate": gate,
+        "gate_present": gate,
+        "gate_enforced": gate,
+    }
+
+
+def _mysql_auxiliary_state(
+    *,
+    task_source: bool = True,
+    log_columns: bool = True,
+    task_gate: bool = False,
+    log_gate: bool = False,
+) -> dict[str, object]:
+    return {
+        "task_source_present": task_source,
+        "task_source_shape": True,
+        "task_gate": task_gate,
+        "task_gate_present": task_gate,
+        "task_gate_enforced": task_gate,
+        "turn_scope_present": log_columns,
+        "turn_scope_shape": True,
+        "actual_transport_present": log_columns,
+        "actual_transport_shape": True,
+        "scope_check": log_columns,
+        "scope_check_present": log_columns,
+        "scope_check_enforced": log_columns,
+        "transport_check": log_columns,
+        "transport_check_present": log_columns,
+        "transport_check_enforced": log_columns,
+        "log_gate": log_gate,
+        "log_gate_present": log_gate,
+        "log_gate_enforced": log_gate,
+    }
 
 
 def _get_table_columns(engine, table_name: str) -> dict[str, str]:
@@ -268,6 +346,8 @@ class TestLegacyMigration:
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
         assert "task_retry_count" in log_cols
+        assert "turn_scope" in log_cols
+        assert "actual_transport" in log_cols
         assert "task_turn_generation" in log_cols
         assert "native_turn_id" in log_cols
 
@@ -1058,6 +1138,1679 @@ class TestAutoCapabilityTurnMigration:
         engine.dispose()
 
 
+class TestTerminalArbitrationMigration:
+    def test_worker_termination_table_partial_index_replay(self, tmp_path):
+        db_path = str(tmp_path / "termination-receipt-index-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+        module = _load_terminal_arbitration_migration(
+            "termination_receipt_index_replay"
+        )
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as connection:
+            context = MigrationContext.configure(connection=connection)
+            with patch.object(module, "op", Operations(context)):
+                module._create_worker_task_termination_table()
+            connection.execute(
+                text("DROP INDEX ix_worker_task_term_due")
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        indexes = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspect(engine).get_indexes(
+                "worker_task_termination_receipts"
+            )
+        }
+        assert indexes == module._WORKER_TASK_TERMINATION_INDEXES
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == TERMINAL_ARBITRATION_REVISION
+        engine.dispose()
+
+    def test_worker_termination_table_malformed_replay_fails_before_ddl(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "termination-receipt-malformed-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as connection:
+            connection.execute(text(
+                "CREATE TABLE worker_task_termination_receipts ("
+                "operation_id VARCHAR(32) PRIMARY KEY)"
+            ))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="partial or foreign column set"):
+            _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" not in _get_table_columns(engine, "tasks")
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == AUTO_CAPABILITY_TURN_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize("malformation", ("named_unique", "foreign_unique"))
+    def test_worker_termination_table_unique_index_replay_fails_closed(
+        self,
+        tmp_path,
+        malformation,
+    ):
+        db_path = str(tmp_path / f"termination-receipt-{malformation}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+        module = _load_terminal_arbitration_migration(
+            f"termination_receipt_{malformation}"
+        )
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as connection:
+            context = MigrationContext.configure(connection=connection)
+            with patch.object(module, "op", Operations(context)):
+                module._create_worker_task_termination_table()
+            if malformation == "named_unique":
+                connection.execute(text(
+                    "DROP INDEX ix_worker_task_term_due"
+                ))
+                connection.execute(text(
+                    "CREATE UNIQUE INDEX ix_worker_task_term_due ON "
+                    "worker_task_termination_receipts"
+                    "(side, status, next_reconcile_at)"
+                ))
+            else:
+                connection.execute(text(
+                    "CREATE UNIQUE INDEX uq_worker_task_term_foreign ON "
+                    "worker_task_termination_receipts(task_id, status)"
+                ))
+        engine.dispose()
+
+        expected = (
+            "index ix_worker_task_term_due is malformed"
+            if malformation == "named_unique"
+            else "foreign UNIQUE index"
+        )
+        with pytest.raises(RuntimeError, match=expected):
+            _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" not in _get_table_columns(engine, "tasks")
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == AUTO_CAPABILITY_TURN_REVISION
+        engine.dispose()
+
+    def test_downgrade_refuses_worker_termination_receipt_history(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "termination-receipt-downgrade-fence.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as connection:
+            connection.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('termination downgrade fence', 'd', 'pending', 0, "
+                "'main', 'pending', 0, 2, 'auto', "
+                "'2026-08-06 00:00:00')"
+            ))
+            task_id = connection.execute(text(
+                "SELECT id FROM tasks "
+                "WHERE title = 'termination downgrade fence'"
+            )).scalar_one()
+            connection.execute(
+                text(
+                    "INSERT INTO worker_task_termination_receipts "
+                    "(operation_id, task_id, active_task_id, side, worker_id, "
+                    "operation, status, source_task_status, "
+                    "source_task_retry_count, source_task_turn_generation, "
+                    "request_payload, request_digest, created_at, updated_at) "
+                    "VALUES (:operation_id, :task_id, :task_id, 'manager', 4, "
+                    "'cancel', 'pending_remote', 'pending', 0, 0, '{}', "
+                    ":digest, '2026-08-06 00:00:01', "
+                    "'2026-08-06 00:00:01')"
+                ),
+                {
+                    "operation_id": "f" * 32,
+                    "task_id": task_id,
+                    "digest": "f" * 64,
+                },
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="receipt history"):
+            _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_task_termination_receipts" in _get_all_tables(engine)
+        with engine.begin() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == TERMINAL_ARBITRATION_REVISION
+            connection.execute(
+                text("DELETE FROM worker_task_termination_receipts")
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_task_termination_receipts" not in _get_all_tables(engine)
+        engine.dispose()
+
+    def test_upgrade_downgrade_preserves_rows_constraints_and_task_ids(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "terminal-arbitration.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+
+        digest = "d" * 64
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('terminal arbitration', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', "
+                "'2026-08-06 01:00:00')"
+            ))
+            task_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'terminal arbitration'"
+            )).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO log_entries "
+                    "(task_id, task_retry_count, task_turn_generation, "
+                    "event_type, role, content, is_error, timestamp) VALUES "
+                    "(:task_id, 0, 7, 'user_message', 'user', 'source', 0, "
+                    "'2026-08-06 01:00:01'), "
+                    "(:task_id, 0, 7, 'result', 'assistant', 'output', 0, "
+                    "'2026-08-06 01:00:02')"
+                ),
+                {"task_id": task_id},
+            )
+            log_ids = conn.execute(text(
+                "SELECT id FROM log_entries WHERE task_id = :task_id "
+                "ORDER BY id"
+            ), {"task_id": task_id}).scalars().all()
+            source_log_id, output_log_id = log_ids
+            conn.execute(
+                text(
+                    "INSERT INTO capability_invocations "
+                    "(task_id, capability_key, source, purpose, status, "
+                    "state_version, idempotency_key, input_payload, input_hash, "
+                    "subject_kind, subject_ref, subject_hash, executor_kind, "
+                    "executor_config, executor_config_hash, policy_snapshot, "
+                    "policy_hash, resume_policy, max_attempts, active_task_id, "
+                    "request_task_retry_count, request_task_turn_generation, "
+                    "request_source_log_id, request_output_log_id, created_at, "
+                    "updated_at) VALUES "
+                    "(:task_id, 'plan', 'human_request', 'advisory', 'failed', "
+                    "1, 'terminal-arbitration-existing', '{}', :digest, "
+                    "'task_generation', '{}', :digest, 'plan_agent', '{}', "
+                    ":digest, '{}', :digest, 'attach_only', 1, NULL, 0, 7, "
+                    ":source_log_id, :output_log_id, "
+                    "'2026-08-06 01:00:03', '2026-08-06 01:00:03')"
+                ),
+                {
+                    "task_id": task_id,
+                    "digest": digest,
+                    "source_log_id": source_log_id,
+                    "output_log_id": output_log_id,
+                },
+            )
+            invocation_id = conn.execute(text(
+                "SELECT id FROM capability_invocations WHERE "
+                "idempotency_key = 'terminal-arbitration-existing'"
+            )).scalar_one()
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(id, title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES (180, 'terminal deleted high-water', 'd', 'completed', "
+                "0, 'main', 'pending', 0, 2, 'auto', "
+                "'2026-08-06 01:00:04')"
+            ))
+            conn.execute(text("DELETE FROM tasks WHERE id = 180"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        task_columns = {
+            item["name"]: item for item in inspector.get_columns("tasks")
+        }
+        log_columns = {
+            item["name"]: item for item in inspector.get_columns("log_entries")
+        }
+        invocation_columns = {
+            item["name"]: item
+            for item in inspector.get_columns("capability_invocations")
+        }
+        assert task_columns["turn_source_log_id"]["nullable"] is True
+        assert log_columns["turn_scope"]["nullable"] is True
+        assert log_columns["turn_scope"]["type"].length == 16
+        assert log_columns["actual_transport"]["nullable"] is True
+        assert log_columns["actual_transport"]["type"].length == 24
+        for column_name in (
+            "request_reason",
+            "request_protocol_version",
+            "request_output_hash",
+        ):
+            assert invocation_columns[column_name]["nullable"] is True
+        assert invocation_columns["request_output_hash"]["type"].length == 64
+
+        log_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints("log_entries")
+        }
+        assert "ck_log_entries_turn_scope" in log_checks
+        assert "AUTONOMOUS" in log_checks["ck_log_entries_turn_scope"].upper()
+        assert "ck_log_entries_actual_transport" in log_checks
+        actual_transport_check = log_checks[
+            "ck_log_entries_actual_transport"
+        ].upper()
+        assert "TURN_SCOPE IS NOT NULL" in actual_transport_check
+        assert "TURN_SCOPE = 'SOURCE'" in actual_transport_check
+        assert "CODEX_APP_SERVER" in actual_transport_check
+        invocation_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints(
+                "capability_invocations"
+            )
+        }
+        identity_check = invocation_checks[
+            "ck_cap_inv_agent_request_identity"
+        ].upper()
+        assert "REQUEST_REASON IS NOT NULL" in identity_check
+        assert "REQUEST_PROTOCOL_VERSION >= 1" in identity_check
+        assert "REQUEST_OUTPUT_HASH IS NOT NULL" in identity_check
+        invocation_uniques = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_unique_constraints(
+                "capability_invocations"
+            )
+        }
+        assert invocation_uniques["uq_cap_inv_task_output_log"] == (
+            "task_id",
+            "request_output_log_id",
+        )
+        assert "worker_task_termination_receipts" in inspector.get_table_names()
+        termination_columns = {
+            item["name"]: item
+            for item in inspector.get_columns(
+                "worker_task_termination_receipts"
+            )
+        }
+        assert termination_columns["operation_id"]["type"].length == 32
+        assert termination_columns["source_task_incarnation_id"][
+            "nullable"
+        ] is True
+        assert termination_columns["source_task_turn_generation"][
+            "nullable"
+        ] is False
+        assert termination_columns["reconcile_count"]["nullable"] is False
+        assert termination_columns["ack_intent_at"]["nullable"] is True
+        termination_checks = {
+            item["name"]
+            for item in inspector.get_check_constraints(
+                "worker_task_termination_receipts"
+            )
+        }
+        assert termination_checks == set(
+            _load_terminal_arbitration_migration(
+                "roundtrip_checks"
+            )._WORKER_TASK_TERMINATION_CHECKS
+        )
+        termination_indexes = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_indexes(
+                "worker_task_termination_receipts"
+            )
+        }
+        assert termination_indexes == {
+            "ix_worker_task_term_task_created": ("task_id", "created_at"),
+            "ix_worker_task_term_due": (
+                "side",
+                "status",
+                "next_reconcile_at",
+            ),
+            "ix_worker_task_term_worker_status": ("worker_id", "status"),
+        }
+
+        with engine.begin() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT turn_source_log_id FROM tasks WHERE id = :task_id"
+                ),
+                {"task_id": task_id},
+            ).scalar_one() is None
+            assert conn.execute(
+                text(
+                    "SELECT turn_scope, actual_transport FROM log_entries "
+                    "WHERE task_id = :task_id "
+                    "ORDER BY id"
+                ),
+                {"task_id": task_id},
+            ).all() == [(None, None), (None, None)]
+            assert conn.execute(
+                text(
+                    "SELECT request_reason, request_protocol_version, "
+                    "request_output_hash FROM capability_invocations "
+                    "WHERE id = :invocation_id"
+                ),
+                {"invocation_id": invocation_id},
+            ).one() == (None, None, None)
+            task_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tasks'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in task_ddl.upper()
+            conn.execute(
+                text(
+                    "UPDATE tasks SET turn_source_log_id = :source_log_id "
+                    "WHERE id = :task_id"
+                ),
+                {"source_log_id": source_log_id, "task_id": task_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE log_entries SET turn_scope = CASE id "
+                    "WHEN :source_log_id THEN 'source' ELSE 'foreground' END, "
+                    "actual_transport = CASE id WHEN :source_log_id "
+                    "THEN 'codex_exec' ELSE NULL END "
+                    "WHERE task_id = :task_id"
+                ),
+                {
+                    "source_log_id": source_log_id,
+                    "task_id": task_id,
+                },
+            )
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('terminal post-upgrade', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', "
+                "'2026-08-06 01:00:05')"
+            ))
+            post_upgrade_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'terminal post-upgrade'"
+            )).scalar_one()
+            assert post_upgrade_id > 180
+            conn.execute(
+                text("DELETE FROM tasks WHERE id = :task_id"),
+                {"task_id": post_upgrade_id},
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE log_entries SET turn_scope = 'background' "
+                        "WHERE id = :output_log_id"
+                    ),
+                    {"output_log_id": output_log_id},
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE log_entries SET turn_scope = NULL, "
+                        "actual_transport = 'codex_exec' "
+                        "WHERE id = :output_log_id"
+                    ),
+                    {"output_log_id": output_log_id},
+                )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE log_entries SET actual_transport = 'claude_exec' "
+                        "WHERE id = :output_log_id"
+                    ),
+                    {"output_log_id": output_log_id},
+                )
+
+        agent_identity_update = (
+            "UPDATE capability_invocations SET source = 'agent_request', "
+            "resume_policy = 'resume_task', request_reason = :reason, "
+            "request_protocol_version = :protocol_version, "
+            "request_output_hash = :output_hash WHERE id = :invocation_id"
+        )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(agent_identity_update),
+                    {
+                        "reason": None,
+                        "protocol_version": None,
+                        "output_hash": None,
+                        "invocation_id": invocation_id,
+                    },
+                )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(agent_identity_update),
+                    {
+                        "reason": "Need terminal Plan",
+                        "protocol_version": 0,
+                        "output_hash": digest,
+                        "invocation_id": invocation_id,
+                    },
+                )
+        with engine.begin() as conn:
+            conn.execute(
+                text(agent_identity_update),
+                {
+                    "reason": "Need terminal Plan",
+                    "protocol_version": 1,
+                    "output_hash": digest,
+                    "invocation_id": invocation_id,
+                },
+            )
+
+        duplicate_insert = text(
+            "INSERT INTO capability_invocations "
+            "(task_id, capability_key, source, purpose, status, state_version, "
+            "idempotency_key, input_payload, input_hash, subject_kind, "
+            "subject_ref, subject_hash, executor_kind, executor_config, "
+            "executor_config_hash, policy_snapshot, policy_hash, resume_policy, "
+            "max_attempts, active_task_id, request_output_log_id, created_at, "
+            "updated_at) VALUES (:task_id, 'code_review', 'human_request', "
+            "'advisory', 'failed', 1, :idempotency_key, '{}', :digest, "
+            "'task_generation', '{}', :digest, 'code_review', '{}', :digest, "
+            "'{}', :digest, 'attach_only', 1, NULL, :output_log_id, "
+            "'2026-08-06 01:00:06', '2026-08-06 01:00:06')"
+        )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    duplicate_insert,
+                    {
+                        "task_id": task_id,
+                        "idempotency_key": "terminal-output-duplicate",
+                        "digest": digest,
+                        "output_log_id": output_log_id,
+                    },
+                )
+        # The downgrade deliberately refuses to discard protocol audit fields
+        # from a real Agent request.  Return this round-trip fixture to the
+        # human-request shape; a dedicated guard test below covers refusal.
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE capability_invocations SET "
+                    "source = 'human_request', resume_policy = 'attach_only' "
+                    "WHERE id = :invocation_id"
+                ),
+                {"invocation_id": invocation_id},
+            )
+            # A downgrade must never erase terminal-arbitration provenance.
+            # This fixture already exercised the fields above; clear them
+            # explicitly so the schema round-trip itself remains admissible.
+            conn.execute(
+                text(
+                    "UPDATE tasks SET turn_source_log_id = NULL "
+                    "WHERE id = :task_id"
+                ),
+                {"task_id": task_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE log_entries SET turn_scope = NULL, "
+                    "actual_transport = NULL WHERE task_id = :task_id"
+                ),
+                {"task_id": task_id},
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" not in _get_table_columns(engine, "tasks")
+        assert "turn_scope" not in _get_table_columns(engine, "log_entries")
+        assert "actual_transport" not in _get_table_columns(engine, "log_entries")
+        assert (
+            "worker_task_termination_receipts"
+            not in _get_all_tables(engine)
+        )
+        downgraded_invocation_columns = _get_table_columns(
+            engine,
+            "capability_invocations",
+        )
+        assert "request_reason" not in downgraded_invocation_columns
+        assert "request_protocol_version" not in downgraded_invocation_columns
+        assert "request_output_hash" not in downgraded_invocation_columns
+        downgraded_uniques = {
+            item["name"]
+            for item in inspect(engine).get_unique_constraints(
+                "capability_invocations"
+            )
+        }
+        assert "uq_cap_inv_task_output_log" not in downgraded_uniques
+        downgraded_checks = {
+            item["name"]: item["sqltext"].upper()
+            for item in inspect(engine).get_check_constraints(
+                "capability_invocations"
+            )
+        }
+        downgraded_identity = downgraded_checks[
+            "ck_cap_inv_agent_request_identity"
+        ]
+        assert "REQUEST_OUTPUT_LOG_ID IS NOT NULL" in downgraded_identity
+        assert "REQUEST_REASON" not in downgraded_identity
+        assert "REQUEST_PROTOCOL_VERSION" not in downgraded_identity
+        assert "REQUEST_OUTPUT_HASH" not in downgraded_identity
+        with engine.begin() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT source FROM capability_invocations "
+                    "WHERE id = :invocation_id"
+                ),
+                {"invocation_id": invocation_id},
+            ).scalar_one() == "human_request"
+            task_ddl = conn.execute(text(
+                "SELECT sql FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'tasks'"
+            )).scalar_one()
+            assert "AUTOINCREMENT" in task_ddl.upper()
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('terminal post-downgrade', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', "
+                "'2026-08-06 01:00:07')"
+            ))
+            post_downgrade_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'terminal post-downgrade'"
+            )).scalar_one()
+            assert post_downgrade_id > post_upgrade_id
+            conn.execute(
+                duplicate_insert,
+                {
+                    "task_id": task_id,
+                    "idempotency_key": "terminal-output-duplicate",
+                    "digest": digest,
+                    "output_log_id": output_log_id,
+                },
+            )
+            # The old identity CHECK still accepts its complete legacy shape.
+            conn.execute(
+                text(
+                    "UPDATE capability_invocations SET "
+                    "source = 'agent_request', resume_policy = 'resume_task' "
+                    "WHERE id = :invocation_id"
+                ),
+                {"invocation_id": invocation_id},
+            )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "UPDATE capability_invocations "
+                        "SET request_output_log_id = NULL "
+                        "WHERE id = :invocation_id"
+                    ),
+                    {"invocation_id": invocation_id},
+                )
+        with engine.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM capability_invocations WHERE "
+                "idempotency_key = 'terminal-output-duplicate'"
+            ))
+            conn.execute(
+                text(
+                    "UPDATE capability_invocations SET "
+                    "source = 'human_request', resume_policy = 'attach_only' "
+                    "WHERE id = :invocation_id"
+                ),
+                {"invocation_id": invocation_id},
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" in _get_table_columns(engine, "tasks")
+        assert "turn_scope" in _get_table_columns(engine, "log_entries")
+        assert "request_output_hash" in _get_table_columns(
+            engine,
+            "capability_invocations",
+        )
+        assert "worker_task_termination_receipts" in _get_all_tables(engine)
+        engine.dispose()
+
+    def test_preflight_refuses_unsafe_data_before_schema_changes(self, tmp_path):
+        db_path = str(tmp_path / "terminal-arbitration-preflight.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+
+        digest = "e" * 64
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES ('terminal preflight', 'd', 'completed', 0, "
+                "'main', 'pending', 0, 2, 'auto', "
+                "'2026-08-06 02:00:00')"
+            ))
+            task_id = conn.execute(text(
+                "SELECT id FROM tasks WHERE title = 'terminal preflight'"
+            )).scalar_one()
+            conn.execute(
+                text(
+                    "INSERT INTO log_entries "
+                    "(task_id, task_retry_count, task_turn_generation, "
+                    "event_type, role, content, is_error, timestamp) VALUES "
+                    "(:task_id, 0, 1, 'user_message', 'user', 'source', 0, "
+                    "'2026-08-06 02:00:01'), "
+                    "(:task_id, 0, 1, 'result', 'assistant', 'output', 0, "
+                    "'2026-08-06 02:00:02')"
+                ),
+                {"task_id": task_id},
+            )
+            source_log_id, output_log_id = conn.execute(
+                text(
+                    "SELECT id FROM log_entries WHERE task_id = :task_id "
+                    "ORDER BY id"
+                ),
+                {"task_id": task_id},
+            ).scalars().all()
+            invocation_insert = text(
+                "INSERT INTO capability_invocations "
+                "(task_id, capability_key, source, purpose, status, "
+                "state_version, idempotency_key, input_payload, input_hash, "
+                "subject_kind, subject_ref, subject_hash, executor_kind, "
+                "executor_config, executor_config_hash, policy_snapshot, "
+                "policy_hash, resume_policy, max_attempts, active_task_id, "
+                "request_task_retry_count, request_task_turn_generation, "
+                "request_source_log_id, request_output_log_id, created_at, "
+                "updated_at) VALUES "
+                "(:task_id, 'plan', :source, 'advisory', 'failed', 1, "
+                ":idempotency_key, '{}', :digest, 'task_generation', '{}', "
+                ":digest, 'plan_agent', '{}', :digest, '{}', :digest, "
+                ":resume_policy, 1, NULL, 0, 1, :source_log_id, "
+                ":output_log_id, '2026-08-06 02:00:03', "
+                "'2026-08-06 02:00:03')"
+            )
+            conn.execute(
+                invocation_insert,
+                {
+                    "task_id": task_id,
+                    "source": "agent_request",
+                    "idempotency_key": "terminal-preflight-agent",
+                    "digest": digest,
+                    "resume_policy": "resume_task",
+                    "source_log_id": source_log_id,
+                    "output_log_id": output_log_id,
+                },
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="zero legacy agent_request"):
+            _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" not in _get_table_columns(engine, "tasks")
+        assert "turn_scope" not in _get_table_columns(engine, "log_entries")
+        with engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == AUTO_CAPABILITY_TURN_REVISION
+            conn.execute(text(
+                "UPDATE capability_invocations SET source = 'human_request', "
+                "resume_policy = 'attach_only' WHERE "
+                "idempotency_key = 'terminal-preflight-agent'"
+            ))
+            conn.execute(
+                invocation_insert,
+                {
+                    "task_id": task_id,
+                    "source": "human_request",
+                    "idempotency_key": "terminal-preflight-duplicate",
+                    "digest": digest,
+                    "resume_policy": "attach_only",
+                    "source_log_id": source_log_id,
+                    "output_log_id": output_log_id,
+                },
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="duplicate task/output-log"):
+            _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" not in _get_table_columns(engine, "tasks")
+        with engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == AUTO_CAPABILITY_TURN_REVISION
+            conn.execute(text(
+                "DELETE FROM capability_invocations WHERE "
+                "idempotency_key = 'terminal-preflight-duplicate'"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TERMINAL_ARBITRATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE capability_invocations SET source = 'agent_request', "
+                    "resume_policy = 'resume_task', request_reason = :reason, "
+                    "request_protocol_version = 1, request_output_hash = :digest "
+                    "WHERE idempotency_key = 'terminal-preflight-agent'"
+                ),
+                {"reason": "Need a durable Plan", "digest": digest},
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="audit history would be destroyed"):
+            _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" in _get_table_columns(engine, "tasks")
+        assert "turn_scope" in _get_table_columns(engine, "log_entries")
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == TERMINAL_ARBITRATION_REVISION
+        engine.dispose()
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "UPDATE capability_invocations SET source = 'human_request', "
+                "resume_policy = 'attach_only' WHERE "
+                "idempotency_key = 'terminal-preflight-agent'"
+            ))
+            conn.execute(
+                text(
+                    "UPDATE tasks SET turn_source_log_id = :source_log_id "
+                    "WHERE id = :task_id"
+                ),
+                {"source_log_id": source_log_id, "task_id": task_id},
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="Task turn provenance"):
+            _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == TERMINAL_ARBITRATION_REVISION
+            conn.execute(
+                text(
+                    "UPDATE tasks SET turn_source_log_id = NULL "
+                    "WHERE id = :task_id"
+                ),
+                {"task_id": task_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE log_entries SET turn_scope = 'foreground' "
+                    "WHERE id = :output_log_id"
+                ),
+                {"output_log_id": output_log_id},
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="LogEntry turn provenance"):
+            _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE log_entries SET turn_scope = NULL "
+                    "WHERE id = :output_log_id"
+                ),
+                {"output_log_id": output_log_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE log_entries SET turn_scope = 'source', "
+                    "actual_transport = 'codex_exec' "
+                    "WHERE id = :source_log_id"
+                ),
+                {"source_log_id": source_log_id},
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="LogEntry turn provenance"):
+            _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == TERMINAL_ARBITRATION_REVISION
+            conn.execute(
+                text(
+                    "UPDATE log_entries SET turn_scope = NULL, "
+                    "actual_transport = NULL WHERE id = :source_log_id"
+                ),
+                {"source_log_id": source_log_id},
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, AUTO_CAPABILITY_TURN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "turn_source_log_id" not in _get_table_columns(engine, "tasks")
+        assert "turn_scope" not in _get_table_columns(engine, "log_entries")
+        engine.dispose()
+
+    def test_sqlite_preflight_fence_blocks_a_second_writer(self, tmp_path):
+        db_path = str(tmp_path / "terminal-preflight-fence.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, AUTO_CAPABILITY_TURN_REVISION)
+        module = _load_terminal_arbitration_migration("sqlite_fence")
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": 0},
+        )
+        first = engine.connect()
+        transaction = first.begin()
+        context = MigrationContext.configure(connection=first)
+        try:
+            with patch.object(module, "op", Operations(context)):
+                module._acquire_preflight_fence(
+                    expected_revision=AUTO_CAPABILITY_TURN_REVISION,
+                )
+                module._assert_upgrade_preconditions()
+                with engine.connect() as second:
+                    second.exec_driver_sql("PRAGMA busy_timeout = 0")
+                    with pytest.raises(OperationalError, match="locked"):
+                        second.execute(
+                            text(
+                                "UPDATE alembic_version "
+                                "SET version_num = version_num"
+                            )
+                        )
+        finally:
+            transaction.rollback()
+            first.close()
+
+        # Prove the second statement was blocked by the held writer transaction,
+        # not because the statement or database was otherwise invalid.
+        with engine.begin() as connection:
+            updated = connection.execute(
+                text("UPDATE alembic_version SET version_num = version_num")
+            )
+            assert updated.rowcount == 1
+        engine.dispose()
+
+    def test_mysql_reflected_identity_checks_require_exact_boolean_shape(self):
+        module = _load_terminal_arbitration_migration("mysql_check_shape")
+        old = (
+            "((`source` <> _utf8mb4'agent_request') or "
+            "((`purpose` = _utf8mb4'advisory') and "
+            "(`resume_policy` = _utf8mb4'resume_task') and "
+            "(`requested_by_user_id` is null) and "
+            "(`request_task_retry_count` is not null) and "
+            "(`request_task_turn_generation` is not null) and "
+            "(`request_source_log_id` is not null) and "
+            "(`request_output_log_id` is not null)))"
+        )
+        new = old[:-2] + (
+            " and (`request_reason` is not null)"
+            " and (`request_protocol_version` is not null)"
+            " and (`request_protocol_version` >= 1)"
+            " and (`request_output_hash` is not null)))"
+        )
+        gate = "(`source` <> _latin1'agent_request')"
+
+        assert module._identity_check_kind(old) == "old"
+        assert module._identity_check_kind(new) == "new"
+        assert module._is_mysql_downgrade_gate(gate)
+        assert module._identity_check_kind(new.replace(">= 1", ">= 0")) is None
+        assert module._identity_check_kind(f"({new}) or (1 = 1)") is None
+        regrouped = new.replace(
+            ") or ((`purpose`",
+            ") or (`purpose`",
+        ).replace("is not null)))", "is not null)) and (1 = 1)")
+        assert module._identity_check_kind(regrouped) is None
+
+    @pytest.mark.parametrize("failure_call", (0, 1, 2))
+    def test_mysql_upgrade_phase_failure_keeps_a_guard_and_replays(
+        self,
+        failure_call,
+    ):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_upgrade_failure_{failure_call}"
+        )
+        model = {
+            "canonical": "old",
+            "shadow": None,
+            "gate": False,
+            "columns": set(),
+            "unique": False,
+        }
+        control = {"failure": failure_call, "calls": 0}
+
+        def state():
+            return _mysql_terminal_state(**model)
+
+        def alter(table, actions):
+            assert table == "capability_invocations"
+            if not actions:
+                return
+            call = control["calls"]
+            control["calls"] += 1
+            if control["failure"] == call:
+                raise RuntimeError("injected atomic ALTER failure")
+            joined = " ".join(actions)
+            if "ADD COLUMN request_reason" in joined:
+                model["columns"] = set(module._MYSQL_NEW_COLUMNS)
+                model["unique"] = True
+                model["shadow"] = "new"
+            if any(
+                action.startswith(
+                    "ADD CONSTRAINT ck_cap_inv_agent_request_identity "
+                )
+                for action in actions
+            ):
+                model["canonical"] = "new"
+            if any(
+                action == (
+                    "DROP CHECK "
+                    f"{module._MYSQL_SHADOW_IDENTITY_CHECK}"
+                )
+                for action in actions
+            ):
+                model["shadow"] = None
+
+        with (
+            patch.object(module, "_mysql_capability_state", side_effect=state),
+            patch.object(module, "_mysql_alter", side_effect=alter),
+        ):
+            with pytest.raises(RuntimeError, match="injected atomic ALTER"):
+                module._mysql_upgrade_capability_online()
+            assert model["canonical"] in {"old", "new"} or model["shadow"] == "new"
+
+            control.update(failure=None, calls=0)
+            module._mysql_upgrade_capability_online()
+
+        assert model == {
+            "canonical": "new",
+            "shadow": None,
+            "gate": False,
+            "columns": set(module._MYSQL_NEW_COLUMNS),
+            "unique": True,
+        }
+
+    @pytest.mark.parametrize("failure_call", (0, 1, 2))
+    def test_mysql_downgrade_phase_failure_keeps_a_guard_and_replays(
+        self,
+        failure_call,
+    ):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_downgrade_failure_{failure_call}"
+        )
+        model = {
+            "canonical": "new",
+            "shadow": None,
+            "gate": False,
+            "columns": set(module._MYSQL_NEW_COLUMNS),
+            "unique": True,
+        }
+        control = {"failure": failure_call, "calls": 0}
+
+        def state():
+            return _mysql_terminal_state(**model)
+
+        def alter(table, actions):
+            assert table == "capability_invocations"
+            if not actions:
+                return
+            call = control["calls"]
+            control["calls"] += 1
+            if control["failure"] == call:
+                raise RuntimeError("injected atomic ALTER failure")
+            joined = " ".join(actions)
+            if "ADD CONSTRAINT ck_cap_inv_no_agent_request_downgrade" in joined:
+                model["gate"] = True
+            if any(
+                action.startswith(
+                    "ADD CONSTRAINT ck_cap_inv_agent_request_identity "
+                )
+                for action in actions
+            ):
+                model["canonical"] = "old"
+            if "DROP COLUMN request_reason" in joined:
+                model["columns"] = set()
+                model["unique"] = False
+            if "DROP CHECK ck_cap_inv_no_agent_request_downgrade" in joined:
+                model["gate"] = False
+
+        with (
+            patch.object(module, "_mysql_capability_state", side_effect=state),
+            patch.object(
+                module,
+                "_mysql_auxiliary_state",
+                return_value=_mysql_auxiliary_state(
+                    task_source=False,
+                    log_columns=False,
+                ),
+            ),
+            patch.object(module, "_mysql_alter", side_effect=alter),
+        ):
+            with pytest.raises(RuntimeError, match="injected atomic ALTER"):
+                module._mysql_downgrade_capability_online()
+            assert model["canonical"] in {"old", "new"} or model["gate"]
+
+            control.update(failure=None, calls=0)
+            module._mysql_downgrade_capability_online()
+            module._mysql_finish_downgrade_online()
+
+        assert model == {
+            "canonical": "old",
+            "shadow": None,
+            "gate": False,
+            "columns": set(),
+            "unique": False,
+        }
+
+    @pytest.mark.parametrize("failure_call", (0, 1, 2, 3))
+    def test_mysql_auxiliary_gate_failure_is_atomic_and_replayable(
+        self,
+        failure_call,
+    ):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_auxiliary_failure_{failure_call}"
+        )
+        model = {
+            "task_source": True,
+            "log_columns": True,
+            "task_gate": False,
+            "log_gate": False,
+        }
+        control = {"failure": failure_call, "calls": 0}
+
+        def state():
+            return _mysql_auxiliary_state(**model)
+
+        def alter(table, actions):
+            if not actions:
+                return
+            call = control["calls"]
+            control["calls"] += 1
+            if control["failure"] == call:
+                raise RuntimeError("injected atomic auxiliary ALTER failure")
+            joined = " ".join(actions)
+            if (
+                table == "tasks"
+                and f"ADD CONSTRAINT {module._MYSQL_TASK_DOWNGRADE_GATE}"
+                in joined
+            ):
+                model["task_gate"] = True
+            if (
+                table == "log_entries"
+                and f"ADD CONSTRAINT {module._MYSQL_LOG_DOWNGRADE_GATE}"
+                in joined
+            ):
+                model["log_gate"] = True
+            if table == "log_entries" and "DROP COLUMN actual_transport" in joined:
+                assert model["log_gate"] is True
+                model["log_columns"] = False
+                model["log_gate"] = False
+            if table == "tasks" and "DROP COLUMN turn_source_log_id" in joined:
+                assert model["task_gate"] is True
+                model["task_source"] = False
+                model["task_gate"] = False
+
+        def run_downgrade():
+            module._mysql_install_auxiliary_downgrade_gates_online()
+            module._mysql_downgrade_auxiliary_online()
+
+        with (
+            patch.object(module, "_mysql_auxiliary_state", side_effect=state),
+            patch.object(module, "_mysql_alter", side_effect=alter),
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="injected atomic auxiliary ALTER failure",
+            ):
+                run_downgrade()
+
+            # Every successful destructive phase retained the other table's
+            # durable gate. Reset only the injected failure and replay from the
+            # exact reflected state.
+            control.update(failure=None, calls=0)
+            run_downgrade()
+
+        assert model == {
+            "task_source": False,
+            "log_columns": False,
+            "task_gate": False,
+            "log_gate": False,
+        }
+
+    def test_mysql_worker_termination_gate_fences_drop_and_replays(self):
+        module = _load_terminal_arbitration_migration(
+            "mysql_worker_termination_gate"
+        )
+        model = {"present": True, "gate": False}
+        control = {"fail": True}
+
+        def state(*, allow_downgrade_gate=False):
+            assert allow_downgrade_gate
+            return {
+                "present": model["present"],
+                "missing_indexes": set(),
+                "downgrade_gate": model["gate"],
+                "downgrade_gate_enforced": model["gate"],
+            }
+
+        def alter(table, actions):
+            assert table == "worker_task_termination_receipts"
+            assert "operation_id IS NULL" in " ".join(actions)
+            if control["fail"]:
+                raise RuntimeError("injected termination gate failure")
+            model["gate"] = True
+
+        def drop_table(table):
+            assert table == "worker_task_termination_receipts"
+            assert model["gate"] is True
+            model["present"] = False
+
+        fake_op = SimpleNamespace(drop_table=drop_table)
+        with (
+            patch.object(
+                module,
+                "_worker_task_termination_state",
+                side_effect=state,
+            ),
+            patch.object(module, "_mysql_alter", side_effect=alter),
+            patch.object(module, "op", fake_op),
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="injected termination gate failure",
+            ):
+                module._mysql_install_worker_task_termination_downgrade_gate()
+            assert model == {"present": True, "gate": False}
+
+            control["fail"] = False
+            module._mysql_install_worker_task_termination_downgrade_gate()
+            module._mysql_drop_worker_task_termination_table()
+
+        assert model == {"present": False, "gate": True}
+
+    def test_mysql_worker_termination_drop_refuses_without_fence(self):
+        module = _load_terminal_arbitration_migration(
+            "mysql_worker_termination_unfenced_drop"
+        )
+        state = {
+            "present": True,
+            "missing_indexes": set(),
+            "downgrade_gate": False,
+            "downgrade_gate_enforced": False,
+        }
+        with (
+            patch.object(
+                module,
+                "_worker_task_termination_state",
+                return_value=state,
+            ),
+            patch.object(module, "op") as fake_op,
+            pytest.raises(RuntimeError, match="without its durable writer fence"),
+        ):
+            module._mysql_drop_worker_task_termination_table()
+        fake_op.drop_table.assert_not_called()
+
+    def test_mysql_worker_termination_missing_index_suffix_replays(self):
+        module = _load_terminal_arbitration_migration(
+            "mysql_worker_termination_index_replay"
+        )
+        due = "ix_worker_task_term_due"
+        states = [
+            {
+                "present": True,
+                "missing_indexes": {due},
+                "downgrade_gate": False,
+                "downgrade_gate_enforced": False,
+            },
+            {
+                "present": True,
+                "missing_indexes": set(),
+                "downgrade_gate": False,
+                "downgrade_gate_enforced": False,
+            },
+        ]
+        with (
+            patch.object(
+                module,
+                "_worker_task_termination_state",
+                side_effect=states,
+            ),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "op") as fake_op,
+        ):
+            module._ensure_worker_task_termination_table()
+        fake_op.create_index.assert_called_once_with(
+            due,
+            "worker_task_termination_receipts",
+            ["side", "status", "next_reconcile_at"],
+            unique=False,
+        )
+
+    @pytest.mark.parametrize(
+        ("reflected", "dialect_name", "expected"),
+        (
+            (mysql.TINYINT(display_width=1), "mysql", True),
+            (mysql.BOOLEAN(), "mysql", True),
+            (mysql.TINYINT(display_width=2), "mysql", False),
+            (mysql.TINYINT(display_width=None), "mysql", False),
+            (mysql.TINYINT(display_width=1, unsigned=True), "mysql", False),
+            (mysql.TINYINT(display_width=1, zerofill=True), "mysql", False),
+            (mysql.TINYINT(display_width=1), "sqlite", False),
+        ),
+    )
+    def test_mysql_worker_termination_boolean_reflection_is_exact(
+        self,
+        reflected,
+        dialect_name,
+        expected,
+    ):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_worker_termination_boolean_{dialect_name}_{expected}"
+        )
+        assert module._worker_task_termination_type_matches(
+            reflected,
+            module.sa.Boolean,
+            None,
+            dialect_name=dialect_name,
+        ) is expected
+
+    def test_mysql_worker_termination_legal_check_reflection_is_accepted(self):
+        module = _load_terminal_arbitration_migration(
+            "mysql_worker_termination_legal_check_reflection"
+        )
+        actual = dict(module._WORKER_TASK_TERMINATION_CHECKS)
+        actual["ck_worker_task_term_operation_id"] = (
+            "((LENGTH(`operation_id`) = 32))"
+        )
+        actual["ck_worker_task_term_side"] = (
+            "(`side` IN (_utf8mb4'manager', _utf8mb4'worker'))"
+        )
+
+        module._assert_worker_task_termination_check_semantics(
+            actual,
+            module._WORKER_TASK_TERMINATION_CHECKS,
+        )
+
+    def test_mysql_worker_termination_weakened_check_replay_fails_closed(self):
+        module = _load_terminal_arbitration_migration(
+            "mysql_worker_termination_weakened_check"
+        )
+        actual = dict(module._WORKER_TASK_TERMINATION_CHECKS)
+        actual["ck_worker_task_term_active_slot"] = "TRUE"
+
+        with pytest.raises(
+            RuntimeError,
+            match="ck_worker_task_term_active_slot is malformed",
+        ):
+            module._assert_worker_task_termination_check_semantics(
+                actual,
+                module._WORKER_TASK_TERMINATION_CHECKS,
+            )
+
+    def test_postgresql_worker_termination_legal_check_reflection_is_accepted(
+        self,
+    ):
+        module = _load_terminal_arbitration_migration(
+            "postgresql_worker_termination_legal_check_reflection"
+        )
+        canonical = {
+            name: f"CHECK ({expression})"
+            for name, expression in module._WORKER_TASK_TERMINATION_CHECKS.items()
+        }
+        actual = dict(canonical)
+        actual["ck_worker_task_term_operation_id"] = (
+            "CHECK (((LENGTH(operation_id) = 32)))"
+        )
+
+        module._assert_worker_task_termination_check_semantics(
+            actual,
+            canonical,
+        )
+
+    def test_postgresql_worker_termination_weakened_check_replay_fails_closed(
+        self,
+    ):
+        module = _load_terminal_arbitration_migration(
+            "postgresql_worker_termination_weakened_check"
+        )
+        canonical = {
+            name: f"CHECK ({expression})"
+            for name, expression in module._WORKER_TASK_TERMINATION_CHECKS.items()
+        }
+        actual = dict(canonical)
+        actual["ck_worker_task_term_active_slot"] = "CHECK (TRUE)"
+
+        with pytest.raises(
+            RuntimeError,
+            match="ck_worker_task_term_active_slot is malformed",
+        ):
+            module._assert_worker_task_termination_check_semantics(
+                actual,
+                canonical,
+            )
+
+    def test_mysql_capability_gate_is_not_released_before_auxiliary_settles(self):
+        module = _load_terminal_arbitration_migration("mysql_gate_release_order")
+        capability = _mysql_terminal_state(
+            canonical="old",
+            gate=True,
+        )
+        auxiliary = _mysql_auxiliary_state(
+            task_gate=True,
+            log_gate=True,
+        )
+        with (
+            patch.object(
+                module,
+                "_mysql_capability_state",
+                return_value=capability,
+            ),
+            patch.object(
+                module,
+                "_mysql_auxiliary_state",
+                return_value=auxiliary,
+            ),
+            patch.object(module, "_mysql_alter") as alter,
+        ):
+            with pytest.raises(
+                RuntimeError,
+                match="before auxiliary downgrade settles",
+            ):
+                module._mysql_finish_downgrade_online()
+            alter.assert_not_called()
+
+    @pytest.mark.parametrize("gate", ("task", "log"))
+    def test_mysql_auxiliary_gate_reflection_requires_enforcement(self, gate):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_auxiliary_gate_enforcement_{gate}"
+        )
+        state = _mysql_auxiliary_state(
+            task_gate=gate == "task",
+            log_gate=gate == "log",
+        )
+        state[f"{gate}_gate_enforced"] = False
+        with pytest.raises(RuntimeError, match="gate.*not enforced"):
+            module._assert_mysql_auxiliary_state(state)
+
+    def test_mysql_completed_before_stamp_skips_destructive_preflight(self):
+        module = _load_terminal_arbitration_migration("mysql_stamp_replay")
+        upgraded = _mysql_terminal_state(
+            canonical="new",
+            columns=set(module._MYSQL_NEW_COLUMNS),
+            unique=True,
+        )
+        downgraded = _mysql_terminal_state(canonical="old")
+
+        assert module._mysql_has_v2_identity_guard(upgraded)
+        assert module._mysql_has_v2_audit_schema(upgraded)
+        assert not module._mysql_has_v2_identity_guard(downgraded)
+        assert not module._mysql_has_v2_audit_schema(downgraded)
+
+        bind = MagicMock()
+        duplicate_result = MagicMock()
+        duplicate_result.first.return_value = None
+        bind.execute.return_value = duplicate_result
+        fake_op = SimpleNamespace(
+            get_context=lambda: SimpleNamespace(as_sql=False),
+            get_bind=lambda: bind,
+        )
+        with patch.object(module, "op", fake_op):
+            module._assert_upgrade_preconditions(require_zero_agent=False)
+            assert bind.execute.call_count == 1
+            assert "GROUP BY" in str(bind.execute.call_args.args[0])
+            bind.reset_mock()
+            module._assert_downgrade_preconditions(
+                require_zero_agent=False,
+                require_zero_task_source=False,
+                require_zero_log_provenance=False,
+                require_zero_worker_terminations=False,
+            )
+            bind.execute.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("version", "is_mariadb", "engines", "error"),
+        [
+            ((8, 0, 15), False, (), "8.0.16"),
+            ((8, 0, 36), True, (), "MariaDB"),
+            (
+                (8, 0, 36),
+                False,
+                (
+                    ("capability_invocations", "InnoDB"),
+                    ("log_entries", "InnoDB"),
+                ),
+                "InnoDB tables",
+            ),
+            (
+                (8, 0, 36),
+                False,
+                (
+                    ("capability_invocations", "InnoDB"),
+                    ("log_entries", "MyISAM"),
+                    ("tasks", "InnoDB"),
+                ),
+                "InnoDB tables",
+            ),
+        ],
+    )
+    def test_mysql_runtime_requirements_fail_closed(
+        self,
+        version,
+        is_mariadb,
+        engines,
+        error,
+    ):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_requirement_{error}"
+        )
+        bind = MagicMock()
+        bind.dialect = SimpleNamespace(
+            name="mysql",
+            is_mariadb=is_mariadb,
+            server_version_info=version,
+        )
+        bind.execute.return_value = engines
+        fake_op = SimpleNamespace(
+            get_context=lambda: SimpleNamespace(as_sql=False),
+            get_bind=lambda: bind,
+        )
+        with patch.object(module, "op", fake_op):
+            with pytest.raises(RuntimeError, match=error):
+                module._require_supported_mysql()
+
+    def test_mysql_runtime_requirements_accept_supported_innodb(self):
+        module = _load_terminal_arbitration_migration("mysql_requirement_ok")
+        bind = MagicMock()
+        bind.dialect = SimpleNamespace(
+            name="mysql",
+            is_mariadb=False,
+            server_version_info=(8, 4, 0),
+        )
+        bind.execute.return_value = (
+            ("capability_invocations", "InnoDB"),
+            ("log_entries", "InnoDB"),
+            ("tasks", "InnoDB"),
+        )
+        fake_op = SimpleNamespace(
+            get_context=lambda: SimpleNamespace(as_sql=False),
+            get_bind=lambda: bind,
+        )
+        with patch.object(module, "op", fake_op):
+            module._require_supported_mysql()
+
+    def test_mysql_guard_reflection_requires_enforcement_and_exact_shapes(self):
+        module = _load_terminal_arbitration_migration("mysql_guard_validation")
+        state = _mysql_terminal_state(canonical="new")
+        state["canonical_enforced"] = False
+        with pytest.raises(RuntimeError, match="no enforceable"):
+            module._assert_mysql_guarded(state)
+
+        state = _mysql_terminal_state(canonical="old", shadow="new")
+        state["canonical_enforced"] = False
+        with pytest.raises(RuntimeError, match="canonical.*not enforced"):
+            module._assert_mysql_guarded(state)
+
+        state = _mysql_terminal_state(canonical="old", shadow="new")
+        state["shadow_enforced"] = False
+        with pytest.raises(RuntimeError, match="not enforced"):
+            module._assert_mysql_guarded(state)
+
+        state = _mysql_terminal_state(canonical="old", unique=True)
+        state["unique"] = False
+        with pytest.raises(RuntimeError, match="unique constraint is malformed"):
+            module._assert_mysql_guarded(state)
+
+        state = _mysql_terminal_state(canonical="old")
+        state["column_shapes"]["request_output_hash"] = False
+        with pytest.raises(RuntimeError, match="column shape is malformed"):
+            module._assert_mysql_guarded(state)
+
+    @pytest.mark.parametrize(
+        ("transport_sql", "enforced", "should_pass"),
+        [
+            (
+                "actual_transport IS NULL OR (turn_scope IS NOT NULL AND "
+                "turn_scope = 'source' AND "
+                "actual_transport IN ('claude_pty', 'claude_exec', "
+                "'codex_app_server', 'codex_exec'))",
+                {
+                    "ck_log_entries_turn_scope",
+                    "ck_log_entries_actual_transport",
+                },
+                True,
+            ),
+            (
+                "actual_transport IS NULL OR actual_transport IN "
+                "('claude_pty', 'claude_exec', 'codex_app_server', "
+                "'codex_exec')",
+                {
+                    "ck_log_entries_turn_scope",
+                    "ck_log_entries_actual_transport",
+                },
+                False,
+            ),
+            (
+                # This weaker expression admits a valid transport with NULL
+                # scope because a SQL CHECK treats UNKNOWN as satisfied.
+                "actual_transport IS NULL OR (turn_scope = 'source' AND "
+                "actual_transport IN ('claude_pty', 'claude_exec', "
+                "'codex_app_server', 'codex_exec'))",
+                {
+                    "ck_log_entries_turn_scope",
+                    "ck_log_entries_actual_transport",
+                },
+                False,
+            ),
+            (
+                "actual_transport IS NULL OR (turn_scope IS NOT NULL AND "
+                "turn_scope = 'source' AND "
+                "actual_transport IN ('claude_pty', 'claude_exec', "
+                "'codex_app_server', 'codex_exec'))",
+                {"ck_log_entries_turn_scope"},
+                False,
+            ),
+        ],
+    )
+    def test_mysql_actual_transport_reflection_requires_source_scope_and_enforcement(
+        self,
+        transport_sql,
+        enforced,
+        should_pass,
+    ):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_actual_transport_{should_pass}_{len(enforced)}"
+        )
+        inspector = MagicMock()
+
+        def columns(table):
+            if table == "tasks":
+                return [
+                    {
+                        "name": "turn_source_log_id",
+                        "type": mysql.INTEGER(),
+                        "nullable": True,
+                    }
+                ]
+            assert table == "log_entries"
+            return [
+                {
+                    "name": "turn_scope",
+                    "type": mysql.VARCHAR(length=16),
+                    "nullable": True,
+                },
+                {
+                    "name": "actual_transport",
+                    "type": mysql.VARCHAR(length=24),
+                    "nullable": True,
+                },
+            ]
+
+        inspector.get_columns.side_effect = columns
+        inspector.get_check_constraints.return_value = [
+            {
+                "name": "ck_log_entries_turn_scope",
+                "sqltext": module._TURN_SCOPE_CHECK,
+            },
+            {
+                "name": "ck_log_entries_actual_transport",
+                "sqltext": transport_sql,
+            },
+        ]
+        fake_op = SimpleNamespace(get_bind=MagicMock())
+        with (
+            patch.object(module, "op", fake_op),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(
+                module,
+                "_mysql_enforced_checks",
+                return_value=enforced,
+            ),
+            patch.object(module, "_mysql_alter") as alter,
+        ):
+            if should_pass:
+                module._mysql_upgrade_auxiliary_online()
+                alter.assert_called_once_with("log_entries", [])
+            else:
+                with pytest.raises(
+                    RuntimeError,
+                    match="actual-transport CHECK.*malformed or not enforced",
+                ):
+                    module._mysql_upgrade_auxiliary_online()
+
+
 class TestCodeReviewMigration:
     def test_refuses_review_history_or_reviewer_task_downgrade(self, tmp_path):
         db_path = str(tmp_path / "code-review-downgrade-guard.db")
@@ -1117,7 +2870,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -1216,6 +2969,9 @@ class TestFreshMigration:
             "idempotency_key",
             "request_task_turn_generation",
             "request_output_log_id",
+            "request_reason",
+            "request_protocol_version",
+            "request_output_hash",
             "request_native_turn_id",
             "result_hash",
         }.issubset(capability_invocation_columns)
@@ -1989,6 +3745,145 @@ class TestSchemaConsistency:
                 ddl = str(CreateTable(table).compile(dialect=dialect))
                 assert "active_slot" in ddl
                 assert "UNIQUE" in ddl
+                if table_name == "capability_invocations":
+                    assert "uq_cap_inv_task_output_log" in ddl
+                    assert "request_protocol_version >= 1" in ddl
+
+    def test_terminal_turn_constraints_compile_on_all_dialects(self):
+        table = Base.metadata.tables["log_entries"]
+        for dialect in (
+            sqlite.dialect(),
+            postgresql.dialect(),
+            mysql.dialect(),
+        ):
+            ddl = str(CreateTable(table).compile(dialect=dialect))
+            assert "ck_log_entries_turn_scope" in ddl
+            assert "'foreground'" in ddl
+            assert "ck_log_entries_actual_transport" in ddl
+            assert "actual_transport IS NULL" in ddl
+            assert "turn_scope IS NOT NULL" in ddl
+            assert "turn_scope = 'source'" in ddl
+            assert "'codex_app_server'" in ddl
+
+    def test_worker_termination_constraints_compile_on_all_dialects(self):
+        table = Base.metadata.tables["worker_task_termination_receipts"]
+        for dialect in (
+            sqlite.dialect(),
+            postgresql.dialect(),
+            mysql.dialect(),
+        ):
+            ddl = str(CreateTable(table).compile(dialect=dialect))
+            assert "ck_worker_task_term_active_slot" in ddl
+            assert "ck_worker_task_term_source_status" in ddl
+            assert "ck_worker_task_term_handoff_shape" in ddl
+            assert (
+                "source_worker_turn_handoff_acknowledged IN (TRUE, FALSE)"
+                in ddl
+            )
+            assert "ck_worker_task_term_counters" in ddl
+            assert "ck_worker_task_term_execution_owner" in ddl
+            assert "execution_token" in ddl
+            assert "state_version" in ddl
+            assert "next_reconcile_at IS NOT NULL" in ddl
+            assert "ck_worker_task_term_ack_intent" in ddl
+            assert "ack_intent_at" in ddl
+            assert "reconcile_count >= 0" in ddl
+            assert (
+                "'accepted', 'executing', 'succeeded', 'rejected', 'conflict'"
+                in ddl
+            )
+            assert "uq_worker_task_term_active_task" in ddl
+            assert "FOREIGN KEY(task_id) REFERENCES tasks" in ddl
+
+        mysql_ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+        assert "ENGINE=InnoDB" in mysql_ddl
+
+    def test_worker_termination_migration_constraints_match_orm(self, tmp_path):
+        db_path = str(tmp_path / "worker-termination-schema.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        table_name = "worker_task_termination_receipts"
+        table = Base.metadata.tables[table_name]
+
+        expected_indexes = {
+            (index.name, tuple(column.name for column in index.columns))
+            for index in table.indexes
+        }
+        actual_indexes = {
+            (index["name"], tuple(index["column_names"]))
+            for index in inspector.get_indexes(table_name)
+        }
+        assert actual_indexes == expected_indexes
+
+        expected_uniques = {
+            (
+                constraint.name,
+                tuple(column.name for column in constraint.columns),
+            )
+            for constraint in table.constraints
+            if isinstance(constraint, UniqueConstraint)
+        }
+        actual_uniques = {
+            (constraint["name"], tuple(constraint["column_names"]))
+            for constraint in inspector.get_unique_constraints(table_name)
+        }
+        assert actual_uniques == expected_uniques
+
+        expected_checks = {
+            constraint.name
+            for constraint in table.constraints
+            if isinstance(constraint, CheckConstraint)
+        }
+        actual_checks = {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints(table_name)
+        }
+        assert actual_checks == expected_checks
+        module = _load_terminal_arbitration_migration(
+            "worker_termination_orm_expression_match"
+        )
+        orm_check_sql = {
+            constraint.name: constraint.sqltext
+            for constraint in table.constraints
+            if isinstance(constraint, CheckConstraint)
+        }
+        assert set(orm_check_sql) == set(
+            module._WORKER_TASK_TERMINATION_CHECKS
+        )
+        for name, expected_sql in (
+            module._WORKER_TASK_TERMINATION_CHECKS.items()
+        ):
+            assert module._boolean_check_shape(
+                orm_check_sql[name]
+            ) == module._boolean_check_shape(expected_sql)
+
+        expected_foreign_keys = {
+            (
+                tuple(
+                    element.parent.name for element in constraint.elements
+                ),
+                constraint.elements[0].column.table.name,
+                tuple(
+                    element.column.name for element in constraint.elements
+                ),
+                constraint.ondelete,
+            )
+            for constraint in table.constraints
+            if isinstance(constraint, ForeignKeyConstraint)
+        }
+        actual_foreign_keys = {
+            (
+                tuple(constraint["constrained_columns"]),
+                constraint["referred_table"],
+                tuple(constraint["referred_columns"]),
+                (constraint.get("options") or {}).get("ondelete"),
+            )
+            for constraint in inspector.get_foreign_keys(table_name)
+        }
+        assert actual_foreign_keys == expected_foreign_keys
+        engine.dispose()
 
     def test_code_review_integrity_constraints_compile_on_all_dialects(self):
         for table_name in ("code_review_runs", "code_review_results"):
@@ -2050,6 +3945,97 @@ class TestSchemaConsistency:
         assert "drop column native_turn_id" in downgrade_ddl
         assert "drop column request_output_log_id" in downgrade_ddl
         assert "drop column request_native_turn_id" in downgrade_ddl
+
+    def test_terminal_arbitration_postgresql_migration_compiles_offline(self):
+        module = _load_terminal_arbitration_migration("postgresql")
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        upgrade_output = io.StringIO()
+        upgrade_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": upgrade_output},
+        )
+        with patch.object(module, "op", Operations(upgrade_context)):
+            module.upgrade()
+        upgrade_ddl = upgrade_output.getvalue().lower()
+        assert "turn_source_log_id" in upgrade_ddl
+        assert "turn_scope" in upgrade_ddl
+        assert "ck_log_entries_turn_scope" in upgrade_ddl
+        assert "actual_transport" in upgrade_ddl
+        assert "ck_log_entries_actual_transport" in upgrade_ddl
+        assert "turn_scope is not null" in upgrade_ddl
+        assert "turn_scope = 'source'" in upgrade_ddl
+        assert "request_reason" in upgrade_ddl
+        assert "request_protocol_version" in upgrade_ddl
+        assert "request_output_hash" in upgrade_ddl
+        assert "uq_cap_inv_task_output_log" in upgrade_ddl
+        assert "request_protocol_version >= 1" in upgrade_ddl
+        assert "create table worker_task_termination_receipts" in upgrade_ddl
+        assert "ck_worker_task_term_active_slot" in upgrade_ddl
+        assert "ck_worker_task_term_ack_intent" in upgrade_ddl
+        assert "ack_intent_at" in upgrade_ddl
+        upgrade_lock_sql = (
+            "lock table tasks, log_entries, capability_invocations "
+            "in access exclusive mode"
+        )
+        assert upgrade_ddl.index(upgrade_lock_sql) < upgrade_ddl.index(
+            "alter table"
+        )
+
+        downgrade_output = io.StringIO()
+        downgrade_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": downgrade_output},
+        )
+        with patch.object(module, "op", Operations(downgrade_context)):
+            module.downgrade()
+        downgrade_ddl = downgrade_output.getvalue().lower()
+        assert "drop column turn_source_log_id" in downgrade_ddl
+        assert "drop column turn_scope" in downgrade_ddl
+        assert "drop column actual_transport" in downgrade_ddl
+        assert "drop column request_reason" in downgrade_ddl
+        assert "drop column request_protocol_version" in downgrade_ddl
+        assert "drop column request_output_hash" in downgrade_ddl
+        assert "drop constraint uq_cap_inv_task_output_log" in downgrade_ddl
+        assert "drop table worker_task_termination_receipts" in downgrade_ddl
+        guard_index = downgrade_ddl.index("do $ccm_terminal_arbitration$")
+        downgrade_lock_sql = (
+            "lock table tasks, log_entries, capability_invocations, "
+            "worker_task_termination_receipts in access exclusive mode"
+        )
+        assert downgrade_ddl.index(downgrade_lock_sql) < guard_index
+        assert guard_index < downgrade_ddl.index("alter table")
+        assert "where source = 'agent_request'" in downgrade_ddl
+        assert "where turn_source_log_id is not null" in downgrade_ddl
+        assert (
+            "where turn_scope is not null or actual_transport is not null"
+            in downgrade_ddl
+        )
+        assert "select 1 from worker_task_termination_receipts" in downgrade_ddl
+        assert downgrade_ddl.count("raise exception") == 4
+
+    @pytest.mark.parametrize("direction", ("upgrade", "downgrade"))
+    def test_terminal_arbitration_mysql_offline_is_refused(self, direction):
+        module = _load_terminal_arbitration_migration(
+            f"mysql_offline_{direction}"
+        )
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(context)),
+            pytest.raises(RuntimeError, match="refuses MySQL offline SQL"),
+        ):
+            getattr(module, direction)()
+        assert output.getvalue() == ""
 
     @pytest.mark.parametrize("dialect_name", ("postgresql", "mysql"))
     def test_delivery_migration_compiles_offline(self, dialect_name):
@@ -2349,6 +4335,10 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(TERMINAL_ARBITRATION_REVISION).down_revision
+            == AUTO_CAPABILITY_TURN_REVISION
+        )
         assert (
             script.get_revision(AUTO_CAPABILITY_TURN_REVISION).down_revision
             == DELIVERY_LOOP_REVISION

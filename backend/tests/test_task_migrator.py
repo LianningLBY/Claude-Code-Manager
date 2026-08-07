@@ -20,7 +20,15 @@ from backend.services.task_migrator import (
     migration_task_generation,
 )
 from backend.services.pr_review_runtime import PRE_PR_CODE_REVIEW_TAG
-from backend.services.worker_proxy import WorkerProxy, get_task_operation_lock
+from backend.services.worker_proxy import (
+    WorkerProxy,
+    capture_worker_destroy_lifecycle_claim,
+    get_task_operation_lock,
+)
+from backend.services.worker_relay import (
+    LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY,
+    WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY,
+)
 
 
 class FakeRelay:
@@ -165,6 +173,50 @@ async def test_auto_capability_policy_rejects_migration_before_side_effects(
     migrator._ensure_worker_task.assert_not_awaited()
     assert relay.subscribed == []
     assert relay.unsubscribed == []
+
+
+@pytest.mark.parametrize("source_is_worker", [False, True])
+async def test_plan_task_rejects_migration_before_side_effects(
+    db_factory,
+    session_factory,
+    source_is_worker,
+):
+    source = (
+        await _mk_worker(session_factory, name="source", private_ip="10.0.0.8")
+        if source_is_worker
+        else None
+    )
+    target = await _mk_worker(
+        session_factory,
+        name="target",
+        private_ip="10.0.0.9",
+    )
+    task = await _mk_task(
+        session_factory,
+        mode="plan",
+        plan_approved=True,
+        plan_content="# Legacy approved Plan",
+        worker_id=source.id if source is not None else None,
+    )
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="Plan Tasks cannot be migrated"):
+        await migrator.migrate(task.id, target.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.worker_id == (source.id if source is not None else None)
+        assert current.status == "completed"
 
 
 @pytest.mark.parametrize(
@@ -556,6 +608,152 @@ async def test_migrate_rejects_in_progress(db_factory, session_factory):
         await m.migrate(t.id, w.id)
 
 
+async def test_migrate_rejects_local_merging_before_side_effects(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="merging")
+    migrator = _migrator(db_factory)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="merging"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id is None
+    assert current.status == "merging"
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", "executing", "merging", "migrating"])
+async def test_migrate_rejects_non_inert_worker_source_before_side_effects(
+    db_factory,
+    session_factory,
+    status,
+):
+    source = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status=status,
+    )
+    migrator = _migrator(db_factory)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="inert"):
+        await migrator.migrate(task.id, None)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == source.id
+    assert current.status == status
+
+
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY,
+        LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY,
+    ],
+)
+async def test_migrate_rejects_worker_execution_quarantine_before_side_effects(
+    db_factory,
+    session_factory,
+    marker_key,
+):
+    source = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status="completed",
+        metadata_={marker_key: {"malformed": "still fail closed"}},
+    )
+    migrator = _migrator(db_factory)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="quarantined"):
+        await migrator.migrate(task.id, None)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == source.id
+    assert current.status == "completed"
+
+
+async def test_migration_rechecks_worker_quarantine_after_claim(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    """A marker written during Worker validation blocks every copy/import."""
+
+    source = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status="completed",
+        metadata_={"manager": "owned"},
+    )
+    migrator = _migrator(db_factory)
+    real_get_worker = migrator._get_worker
+
+    async def quarantine_while_validating(worker_id):
+        worker = await real_get_worker(worker_id)
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(
+                    metadata_={
+                        "manager": "owned",
+                        WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY: {
+                            "operation": "stop-session",
+                        },
+                    }
+                )
+            )
+            await db.commit()
+        return worker
+
+    monkeypatch.setattr(
+        migrator,
+        "_get_worker",
+        quarantine_while_validating,
+    )
+
+    with pytest.raises(MigrationError, match="became quarantined"):
+        await migrator.migrate(task.id, None)
+
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == source.id
+    assert current.status == "completed"
+    assert WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in current.metadata_
+
+
 async def test_migration_claim_cas_preserves_concurrent_dispatcher_claim(
     db_factory, session_factory, monkeypatch,
 ):
@@ -713,6 +911,51 @@ async def test_migrate_rejects_unready_target(db_factory, session_factory):
     m = _migrator(db_factory)
     with pytest.raises(MigrationError, match="不可用"):
         await m.migrate(t.id, w.id)
+
+
+async def test_migration_finish_rejects_target_destroying_after_remote_create(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    """Destroy and the final pointer cut arbitrate on the target Worker row."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="completed")
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    proxy = AsyncMock()
+    proxy.ensure_worker_project.return_value = 9
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    async def destroy_after_remote_task_created(*_args, **_kwargs):
+        async with session_factory() as db:
+            claimed = await db.execute(
+                update(Worker)
+                .where(
+                    Worker.id == worker.id,
+                    Worker.status == "ready",
+                )
+                .values(status="destroying")
+            )
+            assert claimed.rowcount == 1
+            await db.commit()
+
+    migrator._ensure_worker_task = AsyncMock(
+        side_effect=destroy_after_remote_task_created
+    )
+
+    with pytest.raises(MigrationError, match="不再 ready"):
+        await migrator.migrate(task.id, worker.id)
+
+    async with session_factory() as db:
+        current_task = await db.get(Task, task.id)
+        current_worker = await db.get(Worker, worker.id)
+    assert current_task.status == "completed"
+    assert current_task.worker_id is None
+    assert current_worker.status == "destroying"
+    assert (worker.id, task.id) in relay.subscribed
+    assert (worker.id, task.id) in relay.unsubscribed
 
 
 async def test_migrate_rejects_unready_source(db_factory, session_factory):
@@ -1341,7 +1584,7 @@ async def test_put_without_worker_id_unchanged(client, session_factory, monkeypa
 
 async def test_destroy_migrates_tasks_back(db_factory, session_factory, monkeypatch):
     from backend.api.workers import _migrate_back_then_destroy
-    w = await _mk_worker(session_factory)
+    w = await _mk_worker(session_factory, status="destroying")
     t1 = await _mk_task(session_factory, worker_id=w.id)
     t2 = await _mk_task(session_factory, worker_id=w.id)
 
@@ -1360,7 +1603,13 @@ async def test_destroy_migrates_tasks_back(db_factory, session_factory, monkeypa
     monkeypatch.setattr(main_module, "task_migrator", migrator)
     monkeypatch.setattr(main_module, "worker_relay", relay)
 
-    await _migrate_back_then_destroy(prov, w.id, db_factory=db_factory)
+    destroy_claim = capture_worker_destroy_lifecycle_claim(w)
+    await _migrate_back_then_destroy(
+        prov,
+        w.id,
+        destroy_claim,
+        db_factory=db_factory,
+    )
 
     async with session_factory() as db:
         a = await db.get(Task, t1.id)

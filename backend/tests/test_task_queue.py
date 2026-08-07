@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, text
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.sql.dml import Update
@@ -25,6 +25,7 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.team_share import TeamTaskShare
+from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services.delivery_service import DeliveryCreateSpec, create_delivery_run
 from backend.services.task_sharing import lock_task_share_authority
 from backend.services.task_queue import (
@@ -129,6 +130,82 @@ async def test_create_task(queue):
 
 
 @pytest.mark.asyncio
+async def test_update_task_honors_already_held_operation_lock(queue):
+    """Worker edit helpers can call the CAS without re-entering their lock."""
+
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    task = await queue.create(title="locked edit", description="d")
+    async with get_task_operation_lock(task.id):
+        updated = await asyncio.wait_for(
+            queue.update_task(
+                task.id,
+                operation_lock_held=True,
+                title="serialized edit",
+            ),
+            timeout=1,
+        )
+
+    assert updated is not None
+    assert updated.title == "serialized edit"
+
+
+@pytest.mark.asyncio
+async def test_update_task_loses_cleanly_to_concurrent_wal_receipt(tmp_path):
+    """An authorization snapshot cannot produce BUSY_SNAPSHOT on edit."""
+
+    from backend.services.worker_task_termination import (
+        WorkerTaskTerminationConflict,
+    )
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'task-update-receipt.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            task = Task(title="old title", description="d", status="completed")
+            setup.add(task)
+            await setup.commit()
+            task_id = task.id
+
+        async with sessions() as editor:
+            # Simulate the API authorization read which precedes TaskQueue's
+            # mutation boundary, then admit a receipt on another connection.
+            observed = await editor.get(Task, task_id)
+            assert observed is not None
+            assert editor.in_transaction()
+            await persist_active_worker_receipt(sessions, task_id)
+
+            with pytest.raises(
+                WorkerTaskTerminationConflict,
+                match="termination receipt",
+            ):
+                await TaskQueue(editor).update_task(
+                    task_id,
+                    title="must not overwrite receipt-owned Task",
+                )
+
+        async with sessions() as verify:
+            current = await verify.get(Task, task_id)
+            assert current is not None
+            assert current.title == "old title"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_dequeue_priority_order(queue):
     """P0 should be dequeued before P1 (lower number = higher priority)."""
     await queue.create(title="Low priority", description="d", target_repo="/tmp", priority=10)
@@ -151,6 +228,36 @@ async def test_dequeue_priority_order(queue):
     assert third is not None
     assert third.title == "Low priority"
     assert third.priority == 10
+
+
+@pytest.mark.asyncio
+async def test_dequeue_clears_previous_turn_source_in_generation_claim(queue):
+    task = await queue.create(
+        title="Fresh generation",
+        description="d",
+        target_repo="/tmp",
+    )
+    previous_source = LogEntry(
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+        turn_scope="source",
+        event_type="turn_source",
+        role="system",
+        content=None,
+        is_error=False,
+    )
+    queue.db.add(previous_source)
+    await queue.db.flush()
+    task.turn_source_log_id = previous_source.id
+    await queue.db.commit()
+
+    claimed = await queue.dequeue()
+
+    assert claimed is not None
+    assert claimed.id == task.id
+    assert claimed.turn_generation == 1
+    assert claimed.turn_source_log_id is None
 
 
 @pytest.mark.asyncio
@@ -388,6 +495,47 @@ async def test_retry_increments_count(queue):
     assert retried.status == "pending"
     assert retried.retry_count == 1
     assert retried.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_retry_atomically_clears_post_boundary_turn_source(queue):
+    """A new retry must never expose the previous attempt's source proof."""
+
+    task = await queue.create(title="boundary retry", description="d")
+    claimed = await queue.dequeue(instance_id=17)
+    assert claimed is not None
+    source = LogEntry(
+        task_id=claimed.id,
+        task_retry_count=claimed.retry_count,
+        task_turn_generation=claimed.turn_generation,
+        turn_scope="source",
+        event_type="user_message",
+        role="user",
+        content="run once",
+        is_error=False,
+        actual_transport="claude_exec",
+    )
+    queue.db.add(source)
+    await queue.db.flush()
+    claimed.turn_source_log_id = source.id
+    claimed.status = "failed"
+    claimed.error_message = "provider outcome settled as failed"
+    await queue.db.commit()
+    old_retry_count = claimed.retry_count
+    old_turn_generation = claimed.turn_generation
+    task_id = claimed.id
+    source_id = source.id
+
+    retried = await queue.retry(task_id)
+
+    assert retried is not None
+    assert retried.status == "pending"
+    assert retried.retry_count == old_retry_count + 1
+    assert retried.turn_generation == old_turn_generation
+    assert retried.turn_source_log_id is None
+    old_source = await queue.db.get(LogEntry, source_id)
+    assert old_source is not None
+    assert old_source.actual_transport == "claude_exec"
 
 
 @pytest.mark.asyncio
@@ -1047,6 +1195,45 @@ async def test_delete_task_explicitly_removes_terminal_capability_history(queue)
     assert await queue.db.get(Task, task_id) is None
     assert await queue.db.get(CapabilityInvocation, invocation_id) is None
     assert await queue.db.get(CapabilityExecution, execution_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_explicitly_removes_inactive_termination_receipt(queue):
+    assert await queue.db.scalar(text("PRAGMA foreign_keys")) == 0
+    task = await queue.create(title="terminal receipt history", description="d")
+    task.status = "completed"
+    settled_at = datetime.utcnow()
+    receipt = WorkerTaskTerminationReceipt(
+        operation_id="e" * 32,
+        task_id=task.id,
+        active_task_id=None,
+        side="worker",
+        worker_id=None,
+        operation="cancel",
+        status="acknowledged",
+        state_version=3,
+        source_task_status="completed",
+        source_task_retry_count=task.retry_count,
+        source_task_turn_generation=task.turn_generation,
+        request_payload={"operation": "cancel"},
+        request_digest="a" * 64,
+        result_payload={"ok": True},
+        result_digest="b" * 64,
+        accepted_at=settled_at,
+        completed_at=settled_at,
+        acknowledged_at=settled_at,
+    )
+    queue.db.add(receipt)
+    await queue.db.commit()
+    task_id = task.id
+    operation_id = receipt.operation_id
+
+    assert await queue.delete(task_id) is True
+    queue.db.expire_all()
+    assert await queue.db.get(Task, task_id) is None
+    assert (
+        await queue.db.get(WorkerTaskTerminationReceipt, operation_id) is None
+    )
 
 
 async def _completed_code_review_graph(

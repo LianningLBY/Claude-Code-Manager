@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
 from datetime import datetime
 import hashlib
@@ -43,14 +44,29 @@ from backend.services.pr_review_runtime import (
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import (
     acknowledge_worker_turn_handoff,
+    has_worker_execution_quarantine,
     reserve_worker_turn_handoff,
     worker_task_generation,
     worker_task_generation_predicates,
+)
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
 )
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/tasks", tags=["chat"])
+
+
+@asynccontextmanager
+async def _task_operation_locks(task_ids: list[int]):
+    """Hold a deterministic set of Task operation locks without inversion."""
+
+    async with AsyncExitStack() as stack:
+        for task_id in sorted(set(task_ids)):
+            await stack.enter_async_context(get_task_operation_lock(task_id))
+        yield
 
 
 def _plan_delivery_digest(payload: dict) -> str:
@@ -650,12 +666,23 @@ async def send_chat_message(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
+    if await active_worker_task_termination_receipt(db, task_id):
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
     from backend.api.tasks import (
         _require_expected_task_routing,
         _require_not_delivery_owned_task,
     )
 
     _require_not_delivery_owned_task(task, action="sent direct chat messages")
+    if task.mode == "plan":
+        raise HTTPException(
+            409,
+            "Plan Tasks do not accept direct chat messages; revise the Plan "
+            "or create an execution Task instead",
+        )
 
     _require_expected_task_routing(
         task,
@@ -697,21 +724,56 @@ async def send_chat_message(
     approved_plans: list[Task] = []
     approved_versions = []
 
+    # A terminal operation keeps the Task operation lock while it waits for
+    # the exact launch barrier.  Plan admission must observe the queue
+    # cancellation lease before waiting for that lock; otherwise the terminal
+    # caller can wait for a launch barrier which the blocked chat caller is
+    # expected to reject and release.  This is only an early deadlock breaker.
+    # The lock-local receipt check and final Task UPDATE below remain the
+    # authoritative cross-process admission fences.
+    if body.plan_task_ids or body.plan_version_ids:
+        from backend.main import dispatcher
+        from backend.services.dispatcher import TaskStartPausedError
+
+        try:
+            await dispatcher.snapshot_plan_queue_admission(task_id)
+        except (TaskStartPausedError, RuntimeError) as exc:
+            await db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Task queue is stopping; the Plan Version was not applied"
+                ),
+            ) from exc
+
     # Worker-local stage/ack/reconcile and direct chat admission share this
     # process-wide lock.  A stage that wins first returns 409 here; a stage
     # that wins after this check is still caught by the queued turn's final DB
     # launch barrier.
     await db.rollback()
-    async with get_task_operation_lock(task_id):
+    async with _task_operation_locks(
+        [task_id, *(body.plan_task_ids or [])]
+    ):
         db.expire_all()
         task = await db.get(Task, task_id)
         if task is None:
             raise HTTPException(404, "Task not found")
         await require_task_access(request, task, db)
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         if task.worker_id is not None or task.shared_from_id is not None:
             raise HTTPException(
                 409,
                 "Task routing changed while chat admission was in progress",
+            )
+        if task.mode == "plan":
+            raise HTTPException(
+                409,
+                "Plan Tasks do not accept direct chat messages; revise the "
+                "Plan or create an execution Task instead",
             )
         from backend.api.tasks import (
             _require_expected_task_routing,
@@ -941,6 +1003,15 @@ async def send_chat_message(
                         body.confirmed_stale_plan_task_ids
                     ),
                 )
+                for plan in approved_plans:
+                    if await active_worker_task_termination_receipt(
+                        db, plan.id
+                    ):
+                        raise HTTPException(
+                            409,
+                            f"Plan Task #{plan.id} has an active Worker "
+                            "termination receipt",
+                        )
         except ValueError as exc:
             staleness = getattr(exc, "staleness", None)
             if staleness is not None:
@@ -1062,6 +1133,24 @@ async def send_chat_message(
         raw_json=json.dumps(log_metadata) if log_metadata else None,
         is_error=False,
     )
+    # This no-op write is the final cross-process admission barrier.  Manager
+    # and Worker termination receipt staging both lock the same Task row before
+    # publishing ``active_task_id``.  Whichever transaction wins is therefore
+    # observed here; a receipt can never be crossed by a newly durable message.
+    message_gate = await db.execute(
+        sa_update(Task)
+        .where(
+            Task.id == task_id,
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+    )
+    if message_gate.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
     db.add(user_log)
     await db.flush()
     # Persist an epoch timestamp in the durable outbox. Unlike a monotonic
@@ -1158,19 +1247,19 @@ async def send_chat_message(
         db.add(application_receipt)
         await db.flush()
     if approved_plans:
-        from sqlalchemy import update as sa_update
-
         applied_at = datetime.utcnow()
         for plan in approved_plans:
+            plan_id = plan.id
             applied = await db.execute(
                 sa_update(Task)
                 .where(
-                    Task.id == plan.id,
+                    Task.id == plan_id,
                     Task.mode == "plan",
                     Task.plan_target_task_id == task_id,
                     Task.plan_approved.is_(True),
                     Task.status == "completed",
                     Task.plan_applied_at.is_(None),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(
                     plan_applied_at=applied_at,
@@ -1182,7 +1271,7 @@ async def send_chat_message(
                 await db.rollback()
                 raise HTTPException(
                     409,
-                    f"Plan Task #{plan.id} was applied concurrently",
+                    f"Plan Task #{plan_id} was applied concurrently",
                 )
     elif approved_versions:
         from backend.models.plan import PlanApplication
@@ -1278,13 +1367,17 @@ async def send_chat_message(
                 # admission failures are therefore known pre-delivery and
                 # must restore their one-shot application markers exactly as
                 # before the first-class Version path was introduced.
-                async with get_task_operation_lock(task_id):
-                    for plan in approved_plans:
-                        await db.execute(
+                approved_plan_ids = [plan.id for plan in approved_plans]
+                async with _task_operation_locks(
+                    [task_id, *approved_plan_ids]
+                ):
+                    for plan_id in approved_plan_ids:
+                        restored = await db.execute(
                             sa_update(Task)
                             .where(
-                                Task.id == plan.id,
+                                Task.id == plan_id,
                                 Task.plan_applied_log_id == user_log.id,
+                                no_active_worker_task_termination_predicate(),
                             )
                             .values(
                                 plan_applied_at=None,
@@ -1292,6 +1385,13 @@ async def send_chat_message(
                                 plan_applied_log_id=None,
                             )
                         )
+                        if restored.rowcount != 1:
+                            await db.rollback()
+                            raise HTTPException(
+                                409,
+                                f"Plan Task #{plan_id} could not be restored "
+                                "because its termination state changed",
+                            ) from exc
                     log_metadata.pop("applied_plans", None)
                     user_log.raw_json = json.dumps(log_metadata)
                     await db.commit()
@@ -1537,6 +1637,12 @@ async def fork_codex_task(
     from backend.api.tasks import _require_not_delivery_owned_task
 
     _require_not_delivery_owned_task(source, action="forked")
+    if source.mode == "plan" or source.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            "Plan Tasks and migrated Plan carriers cannot fork into ordinary "
+            "Tasks; use the canonical Plan execution flow",
+        )
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if source.shared_from_id is not None:
@@ -1933,7 +2039,9 @@ async def _send_worker_chat(
     # TaskMigrator holds the same lock for its complete copy/rebind workflow.
     task_id = task.id
     await db.rollback()
-    async with get_task_operation_lock(task_id):
+    async with _task_operation_locks(
+        [task_id, *(body.plan_task_ids or [])]
+    ):
         db.expire_all()
         current = await db.get(Task, task_id)
         observed = (
@@ -1945,6 +2053,24 @@ async def _send_worker_chat(
             raise HTTPException(
                 409,
                 "Task moved away from its Worker before chat could be sent",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        for plan_id in body.plan_task_ids or []:
+            if await active_worker_task_termination_receipt(db, plan_id):
+                raise HTTPException(
+                    409,
+                    f"Plan Task #{plan_id} has an active Worker termination "
+                    "receipt",
+                )
+        if has_worker_execution_quarantine(current.metadata_):
+            raise HTTPException(
+                409,
+                "Task Worker execution is quarantined pending explicit "
+                "authoritative reconciliation",
             )
         if observed.worker_turn_handoff_id is not None:
             raise HTTPException(
@@ -2262,7 +2388,10 @@ async def _send_worker_chat(
         # then publish the complete durable outbox atomically.
         guarded = await db.execute(
             sa_update(Task)
-            .where(*worker_task_generation_predicates(observed))
+            .where(
+                *worker_task_generation_predicates(observed),
+                no_active_worker_task_termination_predicate(),
+            )
             .values(status=observed.status)
         )
         if guarded.rowcount != 1:
@@ -2546,13 +2675,29 @@ async def _send_worker_chat(
             if isinstance(result, dict)
             else None
         )
-        if isinstance(applied_plan_ids, list):
-            applied_at = datetime.utcnow()
+        requested_plan_ids = list(body.plan_task_ids or [])
+        if applied_plan_ids is None:
             normalized_applied_ids: list[int] = []
-            for plan_id in applied_plan_ids:
-                if isinstance(plan_id, bool) or not isinstance(plan_id, int):
-                    continue
-                normalized_applied_ids.append(plan_id)
+        elif isinstance(applied_plan_ids, list) and all(
+            not isinstance(plan_id, bool) and isinstance(plan_id, int)
+            for plan_id in applied_plan_ids
+        ):
+            normalized_applied_ids = applied_plan_ids
+        else:
+            await db.rollback()
+            raise HTTPException(
+                502,
+                "Worker returned an invalid legacy Plan application identity",
+            )
+        if normalized_applied_ids != requested_plan_ids:
+            await db.rollback()
+            raise HTTPException(
+                502,
+                "Worker did not confirm the exact selected legacy Plan Tasks",
+            )
+        if normalized_applied_ids:
+            applied_at = datetime.utcnow()
+            for plan_id in normalized_applied_ids:
                 local_applied = await db.execute(
                     sa_update(Task)
                     .where(
@@ -2561,6 +2706,7 @@ async def _send_worker_chat(
                         Task.plan_target_task_id == current.id,
                         Task.plan_approved.is_(True),
                         Task.plan_applied_at.is_(None),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(
                         plan_applied_at=applied_at,
@@ -2571,28 +2717,29 @@ async def _send_worker_chat(
                     )
                 )
                 if local_applied.rowcount != 1:
-                    logger.warning(
-                        "Worker applied Plan Task %s but Manager mirror could "
-                        "not claim its local application row",
-                        plan_id,
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        f"Worker applied Plan Task #{plan_id}, but its Manager "
+                        "termination state changed before the mirror commit",
                     )
-            if normalized_applied_ids:
-                from backend.services.plan_tasks import applied_plan_snapshots
 
-                rows = await db.execute(
-                    select(Task).where(Task.id.in_(normalized_applied_ids))
-                )
-                plans_by_id = {plan.id: plan for plan in rows.scalars().all()}
-                snapshot_plans = [
-                    plans_by_id[plan_id]
-                    for plan_id in normalized_applied_ids
-                    if plan_id in plans_by_id
-                ]
-                manager_metadata = _raw_log_metadata(manager_user_log)
-                manager_metadata["applied_plans"] = applied_plan_snapshots(
-                    snapshot_plans
-                )
-                manager_user_log.raw_json = json.dumps(manager_metadata)
+            from backend.services.plan_tasks import applied_plan_snapshots
+
+            rows = await db.execute(
+                select(Task).where(Task.id.in_(normalized_applied_ids))
+            )
+            plans_by_id = {plan.id: plan for plan in rows.scalars().all()}
+            snapshot_plans = [
+                plans_by_id[plan_id]
+                for plan_id in normalized_applied_ids
+                if plan_id in plans_by_id
+            ]
+            manager_metadata = _raw_log_metadata(manager_user_log)
+            manager_metadata["applied_plans"] = applied_plan_snapshots(
+                snapshot_plans
+            )
+            manager_user_log.raw_json = json.dumps(manager_metadata)
         applied_remote_version_ids = (
             result.get("applied_plan_version_ids")
             if isinstance(result, dict)
@@ -2752,6 +2899,8 @@ async def get_chat_history(
         LogEntry.is_error, LogEntry.loop_iteration, LogEntry.timestamp,
         LogEntry.raw_json, LogEntry.task_retry_count,
         LogEntry.task_turn_generation, LogEntry.native_turn_id,
+        LogEntry.turn_scope,
+        LogEntry.actual_transport,
     ]
     conditions = [
         LogEntry.task_id == task_id,
@@ -2941,6 +3090,8 @@ async def get_chat_history(
             "task_retry_count": row.task_retry_count,
             "task_turn_generation": row.task_turn_generation,
             "native_turn_id": row.native_turn_id,
+            "turn_scope": row.turn_scope,
+            "actual_transport": row.actual_transport,
             "timestamp": (row.timestamp.isoformat() + "Z") if row.timestamp else None,
             "image_urls": image_urls or None,
             "attachments": attachments,
@@ -3108,6 +3259,9 @@ async def _store_injected_message(
     entry = LogEntry(
         instance_id=instance_id,
         task_id=task.id,
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+        turn_scope="foreground",
         event_type="user_message",
         role="user",
         content=display_content,
@@ -3176,6 +3330,11 @@ async def inject_message(
         if task is None:
             raise HTTPException(404, "Task not found")
         await require_task_access(request, task, db)
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         from backend.api.tasks import _require_not_delivery_owned_task
 
         _require_not_delivery_owned_task(
@@ -3219,6 +3378,40 @@ async def inject_message(
             raise HTTPException(400, "Task has no session yet")
 
         uploads = _validated_inject_attachments(body)
+
+        # Hold the Task write lock through the transport steer and injected
+        # LogEntry commit.  A concurrent termination admission either wins
+        # before this exact SQL gate (and injection is refused) or waits until
+        # the already-admitted injection is durably recorded.
+        injection_gate = await db.execute(
+            sa_update(Task)
+            .where(
+                Task.id == task_id,
+                Task.status == task.status,
+                Task.retry_count == task.retry_count,
+                Task.turn_generation == task.turn_generation,
+                (
+                    Task.instance_id.is_(None)
+                    if task.instance_id is None
+                    else Task.instance_id == task.instance_id
+                ),
+                (
+                    Task.session_id.is_(None)
+                    if task.session_id is None
+                    else Task.session_id == task.session_id
+                ),
+                Task.worker_id.is_(None),
+                Task.shared_from_id.is_(None),
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(status=Task.status)
+        )
+        if injection_gate.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
 
         from backend.main import instance_manager, broadcaster
 

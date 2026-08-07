@@ -153,6 +153,9 @@ class CapabilityInvocationResource(BaseModel):
     request_task_turn_generation: int | None
     request_source_log_id: int | None
     request_output_log_id: int | None
+    request_reason: str | None
+    request_protocol_version: int | None
+    request_output_hash: str | None
     request_native_turn_id: str | None
     result_kind: str | None
     result_id: int | None

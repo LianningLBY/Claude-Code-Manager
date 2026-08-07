@@ -135,10 +135,14 @@ async def test_startup_cleanup_reconciles_owner_only_idle_and_error_rows(
             assert instance.status == "error"
             assert instance.pid is None
             assert instance.current_task_id is None
-            assert task.status == "pending"
+            # A generation-zero active row predates exact source/transport
+            # evidence. Replaying it from Task.description could duplicate
+            # provider side effects, so startup now fails it closed.
+            assert task.status == "failed"
+            assert "provider-boundary proof" in task.error_message
             assert task.instance_id is None
             assert task.started_at is None
-            assert task.completed_at is None
+            assert task.completed_at is not None
 
 
 @pytest.mark.asyncio

@@ -12,7 +12,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from backend.services.instance_manager import (
@@ -46,12 +47,15 @@ from backend.services.mcp_config import (
     render_codex_exec_config_args,
 )
 from backend.config import Settings, settings
+from backend.database import Base
 from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.models.worktree import Worktree
+from backend.services import worker_task_termination as termination
 from backend.services.delivery_service import value_hash
 
 
@@ -1547,6 +1551,1305 @@ def _make_mock_process(pid=12345, returncode=0):
     proc.kill = MagicMock()
 
     return proc
+
+
+async def _make_actual_transport_scope(db_factory, *, provider: str):
+    """Create the normal pre-spawn Task owner and its exact bound source."""
+
+    async with db_factory() as db:
+        instance = Instance(name=f"actual-transport-{provider}", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title=f"actual transport {provider}",
+            status="executing",
+            provider=provider,
+            instance_id=instance.id,
+            retry_count=2,
+            turn_generation=7,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            # Dispatcher may record a planned/generic route here. It must not
+            # be interpreted as the actual transport selected at runtime.
+            raw_json=json.dumps(
+                {"original_source_log_id": None, "transport": provider}
+            ),
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        return instance.id, task.id, source.id
+
+
+async def _bind_preflight_chat_source(
+    db,
+    task,
+    *,
+    instance_id: int | None = None,
+):
+    """Bind one canonical exact source before any provider effect."""
+
+    await db.flush()
+    source = LogEntry(
+        instance_id=instance_id,
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+        turn_scope="source",
+        event_type="user_message",
+        role="user",
+        content="safe preflight retry",
+        is_error=False,
+        actual_transport=None,
+    )
+    db.add(source)
+    await db.flush()
+    task.turn_source_log_id = source.id
+    return source.id
+
+
+async def _make_minted_sequential_turn_token(db_factory):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        source.actual_transport = "codex_exec"
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    predecessor = _make_mock_process(pid=61_309, returncode=0)
+    token = await manager.mint_sequential_turn_continuation(
+        instance_id=instance_id,
+        task_id=task_id,
+        task_turn_generation=7,
+        source_log_id=source_id,
+        previous_process=predecessor,
+    )
+    return manager, instance_id, task_id, source_id, token
+
+
+def _gate_first_two_db_sessions(db_factory):
+    """Pause two mint proofs after their pre-DB predecessor checks.
+
+    The fixed implementation serializes on the instance lifecycle lock, so
+    only the first session reaches this gate.  The second gate is reached only
+    by an implementation that lets two callers inspect the same unspent
+    predecessor concurrently.
+    """
+
+    entered = [asyncio.Event(), asyncio.Event()]
+    release = [asyncio.Event(), asyncio.Event()]
+    call_count = 0
+
+    def gated_factory():
+        nonlocal call_count
+        index = call_count
+        call_count += 1
+        inner = db_factory()
+
+        class _GatedSessionContext:
+            async def __aenter__(self):
+                if index < len(entered):
+                    entered[index].set()
+                    await release[index].wait()
+                return await inner.__aenter__()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return await inner.__aexit__(exc_type, exc, traceback)
+
+        return _GatedSessionContext()
+
+    return gated_factory, entered, release
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "route", "app_server_enabled", "pty_enabled"),
+    [
+        ("claude", "claude_exec", False, False),
+        ("claude", "claude_pty", False, True),
+        ("codex", "codex_app_server", True, False),
+        ("codex", "codex_exec", False, False),
+    ],
+)
+async def test_launch_persists_final_actual_transport_before_provider_boundary(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+    route,
+    app_server_enabled,
+    pty_enabled,
+):
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        app_server_enabled,
+    )
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider=provider,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    provider_effects = []
+    process = _make_mock_process(pid=61_000 + source_id)
+
+    async def direct_spawn(*_args, **_kwargs):
+        provider_effects.append("direct_spawn")
+        return process
+
+    async def app_server_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        provider_effects.append("app_server_turn_start")
+        return process.pid
+
+    async def pty_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        provider_effects.append("pty_send_prompt")
+        return process.pid
+
+    manager._spawn_managed_direct_process = AsyncMock(side_effect=direct_spawn)
+    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+    manager._launch_codex_app_server = AsyncMock(side_effect=app_server_launch)
+    manager._launch_pty = AsyncMock(side_effect=pty_launch)
+    if pty_enabled:
+        manager._pty_enabled = True
+        manager._pty_backend = MagicMock()
+
+    assert await manager.launch(
+        instance_id=instance_id,
+        prompt="perform exact turn",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider=provider,
+        config_dir=(str(tmp_path / "codex-home") if provider == "codex" else None),
+        source_log_id=source_id,
+    ) == process.pid
+
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport == route
+        assert json.loads(source.raw_json)["transport"] == provider
+    assert len(provider_effects) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_safe_pre_turn_fallback_records_only_exec_transport(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    process = _make_mock_process(pid=61_100)
+    manager._launch_codex_app_server = AsyncMock(
+        side_effect=RuntimeError("protocol unavailable before turn/start")
+    )
+    manager._spawn_managed_direct_process = AsyncMock(return_value=process)
+    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+
+    assert await manager.launch(
+        instance_id=instance_id,
+        prompt="safe fallback",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=str(tmp_path / "codex-home"),
+        source_log_id=source_id,
+    ) == process.pid
+
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport == "codex_exec"
+    manager._spawn_managed_direct_process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_after_transport_commit_never_crosses_provider_boundary(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    callback_entered = asyncio.Event()
+    callback_release = asyncio.Event()
+
+    async def on_launch_admitted():
+        # The route commit is the first half of the shared launch boundary and
+        # must be visible before a Worker receipt (or any other owner callback)
+        # is allowed to advance.
+        async with db_factory() as db:
+            source = await db.get(LogEntry, source_id)
+            assert source.actual_transport == "codex_exec"
+        callback_entered.set()
+        await callback_release.wait()
+
+    manager._spawn_managed_direct_process = AsyncMock(
+        return_value=_make_mock_process(pid=61_150)
+    )
+    launching = asyncio.create_task(
+        manager.launch(
+            instance_id=instance_id,
+            prompt="cancel at durable boundary",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+            on_launch_admitted=on_launch_admitted,
+        )
+    )
+    await callback_entered.wait()
+    launching.cancel()
+    await asyncio.sleep(0)
+    assert not launching.done()
+    manager._spawn_managed_direct_process.assert_not_awaited()
+
+    callback_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await launching
+
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    assert instance_id not in manager._launch_reservations
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport == "codex_exec"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_cancel_commit_wins_before_transport_writer_fence(
+    monkeypatch,
+    tmp_path,
+):
+    """SQLite must not rely on its ignored SELECT .. FOR UPDATE clause."""
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'transport-cancel-race.db'}",
+        connect_args={"timeout": 2},
+    )
+    factory = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        instance_id, task_id, source_id = await _make_actual_transport_scope(
+            factory,
+            provider="codex",
+        )
+        manager = InstanceManager(factory, MagicMock(broadcast=AsyncMock()))
+        manager._spawn_managed_direct_process = AsyncMock(
+            return_value=_make_mock_process(pid=61_175)
+        )
+
+        # Keep the terminal Task write uncommitted while launch reads its old
+        # snapshot.  The admission writer fence must wait, then re-evaluate the
+        # exact status after this transaction commits.
+        async with factory() as cancellation_db:
+            cancelled = await cancellation_db.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == "executing")
+                .values(status="cancelled")
+            )
+            assert cancelled.rowcount == 1
+            launching = asyncio.create_task(
+                manager.launch(
+                    instance_id=instance_id,
+                    prompt="cancel wins before admission",
+                    task_id=task_id,
+                    task_turn_generation=7,
+                    cwd=str(tmp_path),
+                    provider="codex",
+                    config_dir=str(tmp_path / "codex-home"),
+                    source_log_id=source_id,
+                )
+            )
+            await asyncio.sleep(0.05)
+            assert not launching.done()
+            await cancellation_db.commit()
+
+        with pytest.raises(LaunchSupersededError, match="exact launch generation"):
+            await launching
+        manager._spawn_managed_direct_process.assert_not_awaited()
+        async with factory() as db:
+            source = await db.get(LogEntry, source_id)
+            assert source.actual_transport is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pass_bound_alias_id", (False, True))
+async def test_actual_transport_accepts_only_a_valid_bound_source_alias(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    pass_bound_alias_id,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        original = LogEntry(
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="resume exact turn",
+            is_error=False,
+        )
+        db.add(original)
+        await db.flush()
+        source = await db.get(LogEntry, source_id)
+        source.raw_json = json.dumps(
+            {"original_source_log_id": original.id, "transport": "codex"}
+        )
+        await db.commit()
+        original_id = original.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    process = _make_mock_process(pid=61_180)
+    manager._spawn_managed_direct_process = AsyncMock(return_value=process)
+    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+    assert await manager.launch(
+        instance_id=instance_id,
+        prompt="valid source alias",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=str(tmp_path / "codex-home"),
+        source_log_id=(source_id if pass_bound_alias_id else original_id),
+    ) == process.pid
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport == "codex_exec"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "alias_corruption",
+    ("missing", "foreign_task", "non_user"),
+)
+async def test_actual_transport_rejects_corrupt_positive_alias_when_caller_uses_alias_id(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    alias_corruption,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        if alias_corruption == "missing":
+            original_id = source_id + 1_000_000
+        else:
+            original_task_id = task_id
+            event_type = "result" if alias_corruption == "non_user" else "user_message"
+            role = "assistant" if alias_corruption == "non_user" else "user"
+            if alias_corruption == "foreign_task":
+                foreign_task = Task(title="foreign alias provenance")
+                db.add(foreign_task)
+                await db.flush()
+                original_task_id = foreign_task.id
+            original = LogEntry(
+                task_id=original_task_id,
+                event_type=event_type,
+                role=role,
+                is_error=False,
+            )
+            db.add(original)
+            await db.flush()
+            original_id = original.id
+        source.raw_json = json.dumps(
+            {"original_source_log_id": original_id, "transport": "codex"}
+        )
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._spawn_managed_direct_process = AsyncMock(
+        return_value=_make_mock_process(pid=61_190)
+    )
+    with pytest.raises(LaunchSupersededError, match="source"):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="corrupt bound alias",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+        )
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "stale_retry",
+        "stale_generation",
+        "wrong_launch_source",
+        "foreign_task_pointer",
+        "malformed_source_shape",
+        "malformed_alias_original",
+        "malformed_bound_alias",
+    ),
+)
+async def test_actual_transport_rejects_stale_source_before_process_start(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    corruption,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    launch_source_id = source_id
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        if corruption == "stale_retry":
+            source.task_retry_count = 1
+        elif corruption == "stale_generation":
+            source.task_turn_generation = 6
+        elif corruption == "wrong_launch_source":
+            other = LogEntry(
+                task_id=task_id,
+                task_retry_count=2,
+                task_turn_generation=7,
+                turn_scope="source",
+                event_type="user_message",
+            )
+            db.add(other)
+            await db.flush()
+            launch_source_id = other.id
+        elif corruption == "foreign_task_pointer":
+            other_task = Task(
+                title="foreign source owner",
+                status="pending",
+                retry_count=2,
+                turn_generation=7,
+            )
+            db.add(other_task)
+            await db.flush()
+            foreign_source = LogEntry(
+                task_id=other_task.id,
+                task_retry_count=2,
+                task_turn_generation=7,
+                turn_scope="source",
+                event_type="turn_source",
+            )
+            db.add(foreign_source)
+            await db.flush()
+            task = await db.get(Task, task_id)
+            task.turn_source_log_id = foreign_source.id
+        elif corruption == "malformed_source_shape":
+            source.event_type = "result"
+            source.role = "assistant"
+        elif corruption == "malformed_bound_alias":
+            source.raw_json = json.dumps(
+                {"original_source_log_id": False, "transport": "codex"}
+            )
+        else:
+            malformed_original = LogEntry(
+                task_id=task_id,
+                event_type="result",
+                role="assistant",
+                is_error=False,
+            )
+            db.add(malformed_original)
+            await db.flush()
+            source.raw_json = json.dumps(
+                {
+                    "original_source_log_id": malformed_original.id,
+                    "transport": "codex",
+                }
+            )
+            launch_source_id = malformed_original.id
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._spawn_managed_direct_process = AsyncMock(
+        return_value=_make_mock_process(pid=61_200)
+    )
+    with pytest.raises(LaunchSupersededError, match="source"):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must not start",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=launch_source_id,
+        )
+
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport is None
+
+
+@pytest.mark.asyncio
+async def test_actual_transport_rejects_explicit_peer_instance_owner(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        instance = await db.get(Instance, instance_id)
+        instance.current_task_id = task_id + 10_000
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._spawn_managed_direct_process = AsyncMock(
+        return_value=_make_mock_process(pid=61_250)
+    )
+    with pytest.raises(LaunchSupersededError, match="owned by another"):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must not steal peer owner",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+        )
+
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport is None
+
+
+@pytest.mark.asyncio
+async def test_actual_transport_rejects_source_bound_to_another_instance(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        instance = await db.get(Instance, instance_id)
+        instance.current_task_id = task_id
+        source = await db.get(LogEntry, source_id)
+        source.instance_id = instance_id + 10_000
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._spawn_managed_direct_process = AsyncMock(
+        return_value=_make_mock_process(pid=61_251)
+    )
+    with pytest.raises(LaunchSupersededError, match="source"):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must not borrow another instance source",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+        )
+
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport is None
+
+
+@pytest.mark.asyncio
+async def test_actual_transport_blocks_fresh_launch_even_on_the_same_route(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    codex_home = str(tmp_path / "codex-home")
+
+    async def make_exec_manager(pid):
+        monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+        manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+        process = _make_mock_process(pid=pid)
+        manager._spawn_managed_direct_process = AsyncMock(return_value=process)
+        manager._persist_and_track_launch = AsyncMock(return_value=pid)
+        return manager
+
+    manager = await make_exec_manager(61_300)
+    assert await manager.launch(
+        instance_id=instance_id,
+        prompt="first admitted turn",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=codex_home,
+        source_log_id=source_id,
+    ) == 61_300
+
+    # Durable admission cannot distinguish a lost DB acknowledgement from a
+    # provider turn that already performed tools.  A fresh Manager must never
+    # turn the same-route value into permission to spawn again.
+    repeated = await make_exec_manager(61_301)
+    with pytest.raises(LaunchSupersededError, match="provider boundary"):
+        await repeated.launch(
+            instance_id=instance_id,
+            prompt="must not replay admitted turn",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=codex_home,
+            source_log_id=source_id,
+        )
+    repeated._spawn_managed_direct_process.assert_not_awaited()
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    provider_started = False
+
+    async def app_server_launch(**kwargs):
+        nonlocal provider_started
+        await kwargs["on_launch_admitted"]()
+        provider_started = True
+        return 61_302
+
+    manager._launch_codex_app_server = AsyncMock(side_effect=app_server_launch)
+    with pytest.raises(LaunchSupersededError, match="provider boundary"):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must not rewrite route",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=codex_home,
+            source_log_id=source_id,
+        )
+    assert provider_started is False
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport == "codex_exec"
+
+
+@pytest.mark.asyncio
+async def test_actual_transport_callback_is_idempotent_only_inside_one_launch(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    async def app_server_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        await kwargs["on_launch_admitted"]()
+        return 61_303
+
+    manager._launch_codex_app_server = AsyncMock(side_effect=app_server_launch)
+    assert await manager.launch(
+        instance_id=instance_id,
+        prompt="one launch closure",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=str(tmp_path / "codex-home"),
+        source_log_id=source_id,
+    ) == 61_303
+    manager._launch_codex_app_server.assert_awaited_once()
+
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        assert source.actual_transport == "codex_app_server"
+
+
+@pytest.mark.asyncio
+async def test_successful_mode_predecessor_mints_one_real_sequential_launch(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    first = _make_mock_process(pid=61_310, returncode=0)
+    second = _make_mock_process(pid=61_311, returncode=0)
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=[first, second]
+    )
+    manager._persist_and_track_launch = AsyncMock(
+        side_effect=[first.pid, second.pid]
+    )
+    launch_kwargs = {
+        "instance_id": instance_id,
+        "task_id": task_id,
+        "task_turn_generation": 7,
+        "cwd": str(tmp_path),
+        "provider": "codex",
+        "config_dir": str(tmp_path / "codex-home"),
+        "source_log_id": source_id,
+    }
+
+    assert await manager.launch(prompt="mode turn one", **launch_kwargs) == first.pid
+    token = await manager.mint_sequential_turn_continuation(
+        instance_id=instance_id,
+        task_id=task_id,
+        task_turn_generation=7,
+        source_log_id=source_id,
+        previous_process=first,
+    )
+    assert await manager.launch(
+        prompt="mode turn two",
+        sequential_turn_token=token,
+        **launch_kwargs,
+    ) == second.pid
+    assert manager._spawn_managed_direct_process.await_count == 2
+
+    with pytest.raises(LaunchSupersededError, match="provider boundary"):
+        await manager.launch(
+            prompt="must not reuse sequential authority",
+            sequential_turn_token=token,
+            **launch_kwargs,
+        )
+    assert manager._spawn_managed_direct_process.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sequential_turn_mints_publish_one_authority(
+    db_factory,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        source.actual_transport = "codex_exec"
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    predecessor = _make_mock_process(pid=61_319, returncode=0)
+    gated_factory, entered, release = _gate_first_two_db_sessions(db_factory)
+    manager.db_factory = gated_factory
+    mint_kwargs = {
+        "instance_id": instance_id,
+        "task_id": task_id,
+        "task_turn_generation": 7,
+        "source_log_id": source_id,
+        "previous_process": predecessor,
+    }
+
+    first = asyncio.create_task(
+        manager.mint_sequential_turn_continuation(**mint_kwargs)
+    )
+    await asyncio.wait_for(entered[0].wait(), timeout=1)
+    second = asyncio.create_task(
+        manager.mint_sequential_turn_continuation(**mint_kwargs)
+    )
+    # On the vulnerable implementation the second caller passes the same
+    # predecessor check and reaches its DB proof.  On the fixed path it waits
+    # outside the lifecycle lock until the first caller publishes its marker.
+    try:
+        await asyncio.wait_for(entered[1].wait(), timeout=0.1)
+    except asyncio.TimeoutError:
+        pass
+    release[0].set()
+    release[1].set()
+
+    results = await asyncio.gather(first, second, return_exceptions=True)
+    tokens = [
+        result
+        for result in results
+        if not isinstance(result, BaseException)
+    ]
+    errors = [result for result in results if isinstance(result, BaseException)]
+    assert len(tokens) == 1
+    assert len(errors) == 1
+    assert isinstance(errors[0], LaunchSupersededError)
+    assert "already minted" in str(errors[0])
+    assert list(manager._sequential_turn_continuations) == tokens
+    assert getattr(predecessor, "_ccm_sequential_continuation_minted") is True
+
+
+@pytest.mark.asyncio
+async def test_stale_sequential_turn_mint_cannot_launch_after_token_consumed(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        source.actual_transport = "codex_exec"
+        await db.commit()
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    predecessor = _make_mock_process(pid=61_320, returncode=0)
+    successor = _make_mock_process(pid=61_321, returncode=0)
+    forbidden = _make_mock_process(pid=61_322, returncode=0)
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=[successor, forbidden]
+    )
+    manager._persist_and_track_launch = AsyncMock(
+        side_effect=[successor.pid, forbidden.pid]
+    )
+    gated_factory, entered, release = _gate_first_two_db_sessions(db_factory)
+    manager.db_factory = gated_factory
+    mint_kwargs = {
+        "instance_id": instance_id,
+        "task_id": task_id,
+        "task_turn_generation": 7,
+        "source_log_id": source_id,
+        "previous_process": predecessor,
+    }
+
+    first = asyncio.create_task(
+        manager.mint_sequential_turn_continuation(**mint_kwargs)
+    )
+    await asyncio.wait_for(entered[0].wait(), timeout=1)
+    stale = asyncio.create_task(
+        manager.mint_sequential_turn_continuation(**mint_kwargs)
+    )
+    try:
+        await asyncio.wait_for(entered[1].wait(), timeout=0.1)
+    except asyncio.TimeoutError:
+        pass
+
+    release[0].set()
+    first_token = await first
+    # Future launch DB work must no longer use the deliberately stalled test
+    # factory.  A vulnerable second mint retains the already-created inner
+    # context and remains paused until ``release[1]`` below.
+    manager.db_factory = db_factory
+    launch_kwargs = {
+        "instance_id": instance_id,
+        "task_id": task_id,
+        "task_turn_generation": 7,
+        "cwd": str(tmp_path),
+        "provider": "codex",
+        "config_dir": str(tmp_path / "codex-home"),
+        "source_log_id": source_id,
+    }
+    assert await manager.launch(
+        prompt="consume the sole continuation",
+        sequential_turn_token=first_token,
+        **launch_kwargs,
+    ) == successor.pid
+
+    release[1].set()
+    stale_result = (await asyncio.gather(stale, return_exceptions=True))[0]
+    stale_token = (
+        object()
+        if isinstance(stale_result, BaseException)
+        else stale_result
+    )
+    with pytest.raises(LaunchSupersededError, match="provider boundary"):
+        await manager.launch(
+            prompt="stale concurrent authority must not launch",
+            sequential_turn_token=stale_token,
+            **launch_kwargs,
+        )
+
+    assert isinstance(stale_result, LaunchSupersededError)
+    assert "already minted" in str(stale_result)
+    assert manager._spawn_managed_direct_process.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_three_pty_mode_turns_remint_after_each_distinct_proxy(
+    db_factory,
+    tmp_path,
+):
+    from claude_pty.adapters.ccm import _PTYProcessProxy
+
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="claude",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+
+    # A hot PTY session can expose a fresh per-turn proxy while retaining the
+    # same native session and operating-system PID.  Sequential authority must
+    # follow the completed proxy object, not reject the next successful turn
+    # merely because the underlying session/PID is unchanged.
+    shared_session = object()
+    proxies = [_PTYProcessProxy() for _ in range(3)]
+    for proxy in proxies:
+        proxy.pid = 61_314
+        proxy.session = shared_session
+
+    launched = []
+
+    async def pty_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        proxy = proxies[len(launched)]
+        manager.processes[kwargs["instance_id"]] = proxy
+        proxy.complete(0)
+        launched.append(proxy)
+        return proxy.pid
+
+    manager._launch_pty = AsyncMock(side_effect=pty_launch)
+    launch_kwargs = {
+        "instance_id": instance_id,
+        "task_id": task_id,
+        "task_turn_generation": 7,
+        "cwd": str(tmp_path),
+        "provider": "claude",
+        "source_log_id": source_id,
+    }
+
+    assert await manager.launch(prompt="mode turn one", **launch_kwargs) == 61_314
+    first_token = await manager.mint_sequential_turn_continuation(
+        instance_id=instance_id,
+        task_id=task_id,
+        task_turn_generation=7,
+        source_log_id=source_id,
+        previous_process=proxies[0],
+    )
+    assert await manager.launch(
+        prompt="mode turn two",
+        sequential_turn_token=first_token,
+        **launch_kwargs,
+    ) == 61_314
+
+    second_token = await manager.mint_sequential_turn_continuation(
+        instance_id=instance_id,
+        task_id=task_id,
+        task_turn_generation=7,
+        source_log_id=source_id,
+        previous_process=proxies[1],
+    )
+    assert second_token is not first_token
+    assert await manager.launch(
+        prompt="mode turn three",
+        sequential_turn_token=second_token,
+        **launch_kwargs,
+    ) == 61_314
+
+    assert launched == proxies
+    assert manager._launch_pty.await_count == 3
+    assert first_token not in manager._sequential_turn_continuations
+    assert second_token not in manager._sequential_turn_continuations
+    assert getattr(proxies[0], "_ccm_sequential_continuation_minted") is True
+    assert getattr(proxies[1], "_ccm_sequential_continuation_minted") is True
+    assert not hasattr(proxies[2], "_ccm_sequential_continuation_minted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("rejection", ["active_replacement", "stopping"])
+async def test_public_launch_rejection_revokes_sequential_authority(
+    db_factory,
+    tmp_path,
+    rejection,
+):
+    (
+        manager,
+        instance_id,
+        task_id,
+        source_id,
+        token,
+    ) = await _make_minted_sequential_turn_token(db_factory)
+    if rejection == "active_replacement":
+        manager.processes[instance_id] = _make_mock_process(
+            pid=61_317,
+            returncode=None,
+        )
+        expected_error = InstanceAlreadyRunningError
+    else:
+        # Set the already-published stop intent directly so this regression
+        # exercises launch's own outer revocation boundary rather than the
+        # proactive cleanup performed by _begin_stopping().
+        manager._stopping[instance_id] = 1
+        expected_error = InstanceAlreadyRunningError
+
+    with pytest.raises(expected_error):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must not retain authority after rejection",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+            sequential_turn_token=token,
+        )
+
+    assert token not in manager._sequential_turn_continuations
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_lock_wait_cancellation_revokes_sequential_authority(
+    db_factory,
+    tmp_path,
+):
+    (
+        manager,
+        instance_id,
+        task_id,
+        source_id,
+        token,
+    ) = await _make_minted_sequential_turn_token(db_factory)
+    lifecycle_lock = manager._instance_lifecycle_lock(instance_id)
+    await lifecycle_lock.acquire()
+    launch_task = asyncio.create_task(
+        manager.launch(
+            instance_id=instance_id,
+            prompt="cancel while waiting for the lifecycle lock",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+            sequential_turn_token=token,
+        )
+    )
+    try:
+        await asyncio.sleep(0)
+        assert not launch_task.done()
+        launch_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await launch_task
+    finally:
+        lifecycle_lock.release()
+
+    assert token not in manager._sequential_turn_continuations
+
+
+@pytest.mark.asyncio
+async def test_public_launch_success_revokes_unconsumed_sequential_authority(
+    db_factory,
+):
+    (
+        manager,
+        instance_id,
+        _task_id,
+        _source_id,
+        token,
+    ) = await _make_minted_sequential_turn_token(db_factory)
+    manager._launch_impl = AsyncMock(return_value=61_318)
+
+    assert await manager.launch(
+        instance_id=instance_id,
+        prompt="legacy launch without a durable task source",
+        task_id=None,
+        sequential_turn_token=token,
+    ) == 61_318
+
+    assert token not in manager._sequential_turn_continuations
+
+
+@pytest.mark.asyncio
+async def test_failed_mode_predecessor_cannot_mint_sequential_authority(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    failed = _make_mock_process(pid=61_312, returncode=1)
+    manager._spawn_managed_direct_process = AsyncMock(return_value=failed)
+    manager._persist_and_track_launch = AsyncMock(return_value=failed.pid)
+    await manager.launch(
+        instance_id=instance_id,
+        prompt="failed mode turn",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=str(tmp_path / "codex-home"),
+        source_log_id=source_id,
+    )
+
+    with pytest.raises(LaunchSupersededError, match="successful predecessor"):
+        await manager.mint_sequential_turn_continuation(
+            instance_id=instance_id,
+            task_id=task_id,
+            task_turn_generation=7,
+            source_log_id=source_id,
+            previous_process=failed,
+        )
+
+
+@pytest.mark.asyncio
+async def test_preboundary_launch_error_revokes_mode_continuation_token(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    first = _make_mock_process(pid=61_315, returncode=0)
+    forbidden = _make_mock_process(pid=61_316, returncode=0)
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=[first, forbidden]
+    )
+    manager._persist_and_track_launch = AsyncMock(return_value=first.pid)
+    base_kwargs = {
+        "instance_id": instance_id,
+        "task_id": task_id,
+        "task_turn_generation": 7,
+        "cwd": str(tmp_path),
+        "provider": "codex",
+        "config_dir": str(tmp_path / "codex-home"),
+    }
+    await manager.launch(
+        prompt="successful predecessor",
+        source_log_id=source_id,
+        **base_kwargs,
+    )
+    token = await manager.mint_sequential_turn_continuation(
+        instance_id=instance_id,
+        task_id=task_id,
+        task_turn_generation=7,
+        source_log_id=source_id,
+        previous_process=first,
+    )
+
+    with pytest.raises(LaunchSupersededError, match="omitted its exact source"):
+        await manager.launch(
+            prompt="invalid preboundary attempt",
+            source_log_id=None,
+            sequential_turn_token=token,
+            **base_kwargs,
+        )
+    with pytest.raises(LaunchSupersededError, match="provider boundary"):
+        await manager.launch(
+            prompt="stale token must not authorize a later step",
+            source_log_id=source_id,
+            sequential_turn_token=token,
+            **base_kwargs,
+        )
+    assert manager._spawn_managed_direct_process.await_count == 1
+    assert token not in manager._sequential_turn_continuations
+
+
+@pytest.mark.asyncio
+async def test_admitted_chat_transient_retry_never_spawns_a_second_provider_turn(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    import backend.services.claude_pool as claude_pool_module
+
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="codex",
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.session_id = "thread-admitted-transient"
+        task.last_cwd = str(tmp_path)
+        await db.commit()
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    monkeypatch.setattr(
+        claude_pool_module,
+        "transient_retry_delay",
+        lambda *_args: 0,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    failed = _make_mock_process(pid=61_320, returncode=1)
+    forbidden_replay = _make_mock_process(pid=61_321, returncode=0)
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=[failed, forbidden_replay]
+    )
+    manager._persist_and_track_launch = AsyncMock(return_value=failed.pid)
+    manager.get_recent_log_contents = AsyncMock(return_value=[])
+
+    await manager.launch(
+        instance_id=instance_id,
+        prompt="perform one side effect",
+        task_id=task_id,
+        task_turn_generation=7,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=str(tmp_path / "codex-home"),
+        source_log_id=source_id,
+        chat_initiated=True,
+    )
+    launched = await manager._try_chat_transient_retry(
+        instance_id,
+        task_id,
+        1,
+        "request timed out",
+    )
+
+    assert launched is False
+    assert manager._spawn_managed_direct_process.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -3903,23 +5206,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     assert im._launch_params[inst.id]["queue_timestamp"] == 12.5
     assert im._launch_params[inst.id]["codex_service_tier"] == "priority"
     await asyncio.sleep(0.1)
-    im.task_message_enqueuer.assert_awaited_once()
-    assert (
-        im.task_message_enqueuer.await_args.kwargs["source_log_id"]
-        == 4321
-    )
-    assert (
-        im.task_message_enqueuer.await_args.kwargs["current_message"]
-        == "raw work"
-    )
-    assert (
-        im.task_message_enqueuer.await_args.kwargs["model_override"]
-        == "gpt-5.5"
-    )
-    assert (
-        im.task_message_enqueuer.await_args.kwargs["queue_timestamp"]
-        == 12.5
-    )
+    im.task_message_enqueuer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -4230,6 +5517,7 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
             last_cwd="/tmp",
         )
         db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
         await db.commit()
         await db.refresh(task)
 
@@ -4248,6 +5536,8 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
         "git_env": {},
         "effort_level": "high",
         "enabled_skills": {"monitor": True},
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(return_value=999)
@@ -4287,6 +5577,7 @@ async def test_codex_chat_pool_rotation_replays_fresh_prompt_without_session(
             last_cwd="/tmp",
         )
         db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
         await db.commit()
         await db.refresh(task)
 
@@ -4305,6 +5596,8 @@ async def test_codex_chat_pool_rotation_replays_fresh_prompt_without_session(
         "model": "gpt-5.5",
         "git_env": {},
         "effort_level": "high",
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(return_value=999)
@@ -4345,10 +5638,13 @@ async def test_claude_chat_pool_rotation_migration_failure_requeues_without_swit
             last_cwd="/tmp",
         )
         db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
         await db.commit()
         await db.refresh(task)
 
     dispatcher = MagicMock(pool=pool, codex_pool=None)
+    retry_fence = object()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=retry_fence)
     dispatcher.enqueue_message = AsyncMock()
     broadcaster = MagicMock(broadcast=AsyncMock())
     im = InstanceManager(db_factory, broadcaster)
@@ -4357,6 +5653,8 @@ async def test_claude_chat_pool_rotation_migration_failure_requeues_without_swit
         "provider": "claude",
         "prompt": "preserve this exact Claude message",
         "model": "claude-opus-4-8",
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(return_value=999)
@@ -4387,6 +5685,8 @@ async def test_claude_chat_pool_rotation_migration_failure_requeues_without_swit
         source="routing_retry",
         command_skills=None,
         model_override="claude-opus-4-8",
+        source_log_id=source_id,
+        queue_admission_fence=retry_fence,
     )
     assert pool.status()["last_selected"] == "claude-a"
 
@@ -5273,11 +6573,18 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         db.add_all([task, inst])
         await db.flush()
         inst.current_task_id = task.id
+        source_id = await _bind_preflight_chat_source(
+            db,
+            task,
+            instance_id=inst.id,
+        )
         await db.commit()
         await db.refresh(task)
         await db.refresh(inst)
 
     dispatcher = MagicMock()
+    retry_fence = object()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=retry_fence)
     dispatcher._check_rate_limit_and_rotate = AsyncMock(side_effect=
         CodexAccountRoutingError(
             "rollout migration is temporarily unavailable", retry_after=5,
@@ -5293,6 +6600,8 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         "prompt": "preserve this exact user prompt",
         "model": "gpt-5.5",
         "queue_timestamp": 42.5,
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
 
@@ -5313,6 +6622,8 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         command_skills=None,
         model_override="gpt-5.5",
         queue_timestamp=42.5,
+        source_log_id=source_id,
+        queue_admission_fence=retry_fence,
     )
     async with db_factory() as db:
         refreshed_task = await db.get(Task, task.id)
@@ -5337,10 +6648,13 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
             last_cwd="/tmp",
         )
         db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
         await db.commit()
         await db.refresh(task)
 
     dispatcher = MagicMock()
+    retry_fence = object()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=retry_fence)
     dispatcher.enqueue_message = AsyncMock()
     broadcaster = MagicMock(broadcast=AsyncMock())
     im = InstanceManager(db_factory, broadcaster)
@@ -5350,6 +6664,8 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         "prompt": "preserve transient prompt",
         "model": "gpt-5.5",
         "enabled_skills": {"sub-agent": True},
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(
@@ -5377,6 +6693,8 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         source="routing_retry",
         command_skills={"sub-agent": True},
         model_override="gpt-5.5",
+        source_log_id=source_id,
+        queue_admission_fence=retry_fence,
     )
 
 
@@ -5402,6 +6720,7 @@ async def test_apex_409_capacity_terminal_failure_retries_same_account(
             last_cwd="/tmp/apex-work",
         )
         db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
         await db.commit()
         await db.refresh(task)
 
@@ -5412,6 +6731,8 @@ async def test_apex_409_capacity_terminal_failure_retries_same_account(
         "provider": "codex",
         "prompt": "continue after gateway capacity recovers",
         "model": "gpt-5.6-sol",
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     store = MagicMock()
     store.account_for_codex_home.return_value = types.SimpleNamespace(
@@ -5462,10 +6783,13 @@ async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
             last_cwd="/tmp",
         )
         db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
         await db.commit()
         await db.refresh(task)
 
     dispatcher = MagicMock()
+    retry_fence = object()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=retry_fence)
     dispatcher._check_rate_limit_and_rotate = AsyncMock(return_value={
         "config_dir": "/tmp/codex-b",
         "session_id": task.session_id,
@@ -5477,6 +6801,8 @@ async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
         "provider": "codex",
         "prompt": "preserve rotation prompt",
         "model": "gpt-5.5",
+        "task_turn_generation": task.turn_generation,
+        "source_log_id": source_id,
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(
@@ -5496,6 +6822,8 @@ async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
         source="routing_retry",
         command_skills=None,
         model_override="gpt-5.5",
+        source_log_id=source_id,
+        queue_admission_fence=retry_fence,
     )
 
 
@@ -6475,6 +7803,491 @@ async def test_instance_stop_releases_active_claim_back_to_pending(db_factory):
             "background_active": False,
         },
     )
+
+
+@pytest.mark.asyncio
+async def test_instance_stop_default_yields_before_signal_to_active_receipt(
+    db_factory,
+):
+    """Ralph/Dispatcher/shutdown-style stops leave receipt ownership intact."""
+
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 15, 0, 1)
+    pid = 75_001
+    async with db_factory() as db:
+        instance = Instance(
+            name="ordinary-stop-receipt-gate",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="active receipt owns ordinary stop",
+            status="executing",
+            retry_count=2,
+            turn_generation=5,
+            instance_id=instance.id,
+            started_at=started_at,
+            error_message="receipt-owned evidence",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    await persist_active_worker_receipt(db_factory, task_id)
+    process = MagicMock(pid=pid, returncode=None)
+    process.send_signal = MagicMock()
+    process.wait = AsyncMock(return_value=130)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+
+    assert (
+        await manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_task_turn_generation=5,
+            expected_pid=pid,
+            expected_started_at=started_at,
+            task_status="failed",
+            task_error_message="ordinary shutdown must yield",
+        )
+        is False
+    )
+
+    process.send_signal.assert_not_called()
+    process.wait.assert_not_awaited()
+    assert manager.processes[instance_id] is process
+    broadcaster.broadcast.assert_not_awaited()
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == "executing"
+    assert current_task.instance_id == instance_id
+    assert current_task.started_at == started_at
+    assert current_task.completed_at is None
+    assert current_task.error_message == "receipt-owned evidence"
+    assert current_instance.status == "running"
+    assert current_instance.pid == pid
+    assert current_instance.current_task_id == task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt_case",
+    ("wrong-active-id", "disappeared-id", "manager-side-id"),
+)
+async def test_instance_stop_receipt_bypass_requires_exact_active_worker_side(
+    db_factory,
+    receipt_case,
+):
+    """An absent, mistyped, or Manager-side id is never a stop authority."""
+
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 15, 0, 2)
+    pid = 75_002
+    async with db_factory() as db:
+        instance = Instance(
+            name=f"invalid-receipt-stop-{receipt_case}",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title=f"invalid receipt authority {receipt_case}",
+            status="executing",
+            retry_count=3,
+            turn_generation=6,
+            instance_id=instance.id,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    receipt = await persist_active_worker_receipt(
+        db_factory, task_id, executing=True
+    )
+    operation_id = receipt.operation_id
+    async with db_factory() as db:
+        if receipt_case == "wrong-active-id":
+            operation_id = "f" * 32
+        elif receipt_case == "disappeared-id":
+            persisted = await db.get(
+                WorkerTaskTerminationReceipt,
+                receipt.operation_id,
+            )
+            assert persisted is not None
+            await db.delete(persisted)
+            await db.commit()
+        else:
+            changed = await db.execute(
+                update(WorkerTaskTerminationReceipt)
+                .where(
+                    WorkerTaskTerminationReceipt.operation_id
+                    == receipt.operation_id
+                )
+                .values(
+                    side="manager",
+                    worker_id=41,
+                    status="pending_remote",
+                    accepted_at=None,
+                    execution_token=None,
+                )
+            )
+            assert changed.rowcount == 1
+            await db.commit()
+
+    process = MagicMock(pid=pid, returncode=None)
+    process.send_signal = MagicMock()
+    process.wait = AsyncMock(return_value=130)
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[instance_id] = process
+
+    assert (
+        await manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_task_turn_generation=6,
+            expected_pid=pid,
+            expected_started_at=started_at,
+            task_status="cancelled",
+            yield_to_worker_task_termination=False,
+            worker_termination_operation_id=operation_id,
+            worker_termination_operation="stop_session",
+            worker_termination_execution_token=receipt.execution_token,
+            worker_termination_state_version=receipt.state_version,
+        )
+        is False
+    )
+    process.send_signal.assert_not_called()
+    process.wait.assert_not_awaited()
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == "executing"
+    assert current_task.instance_id == instance_id
+    assert current_task.completed_at is None
+    assert current_instance.status == "running"
+    assert current_instance.pid == pid
+    assert current_instance.current_task_id == task_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "terminal_status"),
+    (
+        pytest.param("supersede", "completed", id="supersede-completed"),
+        pytest.param("cancel", "cancelled", id="cancel-cancelled"),
+    ),
+)
+async def test_instance_stop_exact_receipt_terminalizes_live_merging_owner(
+    db_factory,
+    operation,
+    terminal_status,
+):
+    """PR merging is an active live-owner status for exact termination."""
+
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 15, 0, 4)
+    pid = 75_004
+    async with db_factory() as db:
+        instance = Instance(
+            name=f"merging-{operation}-receipt-owner",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title=f"merging {operation} receipt",
+            status="merging",
+            retry_count=5,
+            turn_generation=8,
+            instance_id=instance.id,
+            started_at=started_at,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    receipt = await persist_active_worker_receipt(
+        db_factory,
+        task_id,
+        operation=operation,
+        executing=True,
+    )
+    process = MagicMock(pid=pid, returncode=None)
+    process.send_signal = MagicMock()
+
+    async def wait_for_exit():
+        process.returncode = 130
+        return process.returncode
+
+    process.wait = AsyncMock(side_effect=wait_for_exit)
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[instance_id] = process
+
+    assert await manager.stop(
+        instance_id,
+        expected_task_id=task_id,
+        expected_pid=pid,
+        expected_started_at=started_at,
+        task_status=terminal_status,
+        allow_delivery_effect_stop=True,
+        yield_to_worker_task_termination=False,
+        worker_termination_operation_id=receipt.operation_id,
+        worker_termination_operation=operation,
+        worker_termination_execution_token=receipt.execution_token,
+        worker_termination_state_version=receipt.state_version,
+    )
+    process.send_signal.assert_called_once_with(signal.SIGINT)
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == terminal_status
+    assert current_task.instance_id == instance_id
+    assert current_task.completed_at is not None
+    assert current_instance.status == "idle"
+    assert current_instance.pid is None
+    assert current_instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pid_is_gone", "expected_stopped"),
+    (
+        pytest.param(True, True, id="dead-pid-recovers"),
+        pytest.param(False, False, id="live-or-unknown-fails-closed"),
+    ),
+)
+async def test_instance_stop_exact_receipt_recovers_same_owner_after_restart(
+    db_factory,
+    pid_is_gone,
+    expected_stopped,
+):
+    """Only OS-proved dead same-owner evidence is adoptable after restart."""
+
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 15, 0, 5)
+    pid = 75_005
+    async with db_factory() as db:
+        instance = Instance(
+            name="restart-receipt-owner",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="restart exact receipt recovery",
+            status="executing",
+            retry_count=6,
+            turn_generation=9,
+            instance_id=instance.id,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    receipt = await persist_active_worker_receipt(
+        db_factory,
+        task_id,
+        operation="stop_session",
+        executing=True,
+    )
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    with patch.object(
+        manager,
+        "_pid_is_definitely_gone",
+        return_value=pid_is_gone,
+    ):
+        stopped = await manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_task_turn_generation=9,
+            expected_pid=pid,
+            expected_started_at=started_at,
+            task_status="completed",
+            yield_to_worker_task_termination=False,
+            worker_termination_operation_id=receipt.operation_id,
+            worker_termination_operation="stop_session",
+            worker_termination_execution_token=receipt.execution_token,
+            worker_termination_state_version=receipt.state_version,
+        )
+
+    assert stopped is expected_stopped
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    if expected_stopped:
+        assert current_task.status == "completed"
+        assert current_task.completed_at is not None
+        assert current_instance.status == "idle"
+        assert current_instance.pid is None
+        assert current_instance.current_task_id is None
+    else:
+        assert current_task.status == "executing"
+        assert current_task.completed_at is None
+        assert current_instance.status == "running"
+        assert current_instance.pid == pid
+        assert current_instance.current_task_id == task_id
+
+
+@pytest.mark.asyncio
+async def test_instance_stop_late_receipt_wins_db_then_exact_receipt_recovers(
+    db_factory,
+):
+    """A post-signal receipt remains the sole writer and can settle the reap."""
+
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 15, 0, 3)
+    pid = 75_003
+    async with db_factory() as db:
+        instance = Instance(
+            name="late-receipt-stop-race",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="receipt admitted after physical stop",
+            status="executing",
+            retry_count=4,
+            turn_generation=7,
+            instance_id=instance.id,
+            started_at=started_at,
+            error_message="preserve until exact receipt settles",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    process = MagicMock(pid=pid, returncode=None)
+    process.send_signal = MagicMock()
+    process.wait = AsyncMock(return_value=130)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+    receipt_box = {}
+
+    async def admit_receipt_after_signal(_instance_id, exact_process, sig):
+        assert _instance_id == instance_id
+        assert exact_process is process
+        assert sig == signal.SIGINT
+        process.send_signal(sig)
+        receipt_box["receipt"] = await persist_active_worker_receipt(
+            db_factory,
+            task_id,
+            executing=True,
+        )
+        process.returncode = 130
+
+    manager._signal_managed_process_tree = AsyncMock(
+        side_effect=admit_receipt_after_signal
+    )
+
+    # The ordinary stop did reap the physical generation, but the receipt was
+    # durable before its terminal CAS. It must therefore leave both durable
+    # owner rows and every publication untouched for the receipt executor.
+    assert (
+        await manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_pid=pid,
+            expected_started_at=started_at,
+            task_status="failed",
+            task_error_message="stale ordinary stop",
+        )
+        is False
+    )
+    manager._signal_managed_process_tree.assert_awaited_once()
+    process.send_signal.assert_called_once_with(signal.SIGINT)
+    broadcaster.broadcast.assert_not_awaited()
+    assert manager.processes[instance_id] is process
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == "executing"
+    assert current_task.instance_id == instance_id
+    assert current_task.completed_at is None
+    assert current_task.error_message == "preserve until exact receipt settles"
+    assert current_instance.status == "running"
+    assert current_instance.pid == pid
+    assert current_instance.current_task_id == task_id
+
+    # The same exact receipt can adopt the already-reaped tracked generation.
+    # Its positive SQL proof remains required in the final CAS/publication.
+    receipt = receipt_box["receipt"]
+    assert await manager.stop(
+        instance_id,
+        expected_task_id=task_id,
+        expected_task_turn_generation=7,
+        expected_pid=pid,
+        expected_started_at=started_at,
+        task_status="cancelled",
+        yield_to_worker_task_termination=False,
+        worker_termination_operation_id=receipt.operation_id,
+        worker_termination_operation="stop_session",
+        worker_termination_execution_token=receipt.execution_token,
+        worker_termination_state_version=receipt.state_version,
+    )
+    manager._signal_managed_process_tree.assert_awaited_once()
+    assert instance_id not in manager.processes
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == "cancelled"
+    assert current_task.instance_id == instance_id
+    assert current_task.completed_at is not None
+    assert current_task.error_message is None
+    assert current_instance.status == "idle"
+    assert current_instance.pid is None
+    assert current_instance.current_task_id is None
 
 
 @pytest.mark.asyncio
@@ -8275,6 +10088,362 @@ async def test_consume_output_chat_initiated_restores_task_status(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_native_exit_resume_carries_precommit_queue_fence(db_factory):
+    from backend.models.sub_agent import SubAgentSession
+
+    async with db_factory() as db:
+        inst = Instance(name="native-exit-fence")
+        task = Task(
+            title="native exit fence",
+            description="d",
+            status="executing",
+            provider="claude",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        native = SubAgentSession(
+            task_id=task.id,
+            source="native",
+            agent_type="native-monitor",
+            description="background monitor",
+            status="running",
+        )
+        db.add(native)
+        await db.commit()
+        instance_id = inst.id
+        task_id = task.id
+        native_id = native.id
+
+    process = _make_mock_process(returncode=0)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    dispatcher = MagicMock()
+    fence = object()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=fence)
+    dispatcher.enqueue_message = AsyncMock(return_value=True)
+
+    with patch("backend.main.dispatcher", dispatcher):
+        await manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        )
+
+    dispatcher.snapshot_queue_admission.assert_awaited_once_with(task_id)
+    dispatcher.enqueue_message.assert_awaited_once()
+    assert (
+        dispatcher.enqueue_message.await_args.kwargs["queue_admission_fence"]
+        is fence
+    )
+    assert (
+        dispatcher.enqueue_message.await_args.kwargs["source"]
+        == "monitor:native-exit-resume"
+    )
+    async with db_factory() as db:
+        native = await db.get(SubAgentSession, native_id)
+    assert native.status == "completed"
+    assert native.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_admitted_exact_source_empty_reply_is_never_reenqueued(
+    db_factory,
+):
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider="claude",
+    )
+    async with db_factory() as db:
+        source = await db.get(LogEntry, source_id)
+        source.actual_transport = "claude_exec"
+        await db.commit()
+
+    process = _make_mock_process(pid=61_340, returncode=0)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    manager.task_message_enqueuer = AsyncMock()
+    params = {
+        "prompt": "perform one side effect",
+        "current_message": "perform one side effect",
+        "provider": "claude",
+        "task_turn_generation": 7,
+        "source_log_id": source_id,
+    }
+    manager._launch_params[instance_id] = params
+    dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
+
+    with patch("backend.main.dispatcher", dispatcher):
+        await manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        )
+
+    manager.task_message_enqueuer.assert_not_awaited()
+    assert "_retried" not in params
+
+
+@pytest.mark.asyncio
+async def test_source_less_empty_reply_is_never_reenqueued(db_factory):
+    async with db_factory() as db:
+        instance = Instance(name="source-less-empty-reply")
+        task = Task(
+            title="source-less empty reply",
+            status="executing",
+            provider="claude",
+        )
+        db.add_all([instance, task])
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+        turn_generation = task.turn_generation
+
+    process = _make_mock_process(pid=61_341, returncode=0)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    manager.task_message_enqueuer = AsyncMock()
+    params = {
+        "prompt": "legacy prompt without durable source",
+        "provider": "claude",
+        "task_turn_generation": turn_generation,
+    }
+    manager._launch_params[instance_id] = params
+    dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
+
+    with patch("backend.main.dispatcher", dispatcher):
+        await manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        )
+
+    manager.task_message_enqueuer.assert_not_awaited()
+    assert "_retried" not in params
+
+
+@pytest.mark.asyncio
+async def test_chat_requeue_allows_exact_preflight_source(db_factory):
+    async with db_factory() as db:
+        task = Task(
+            title="safe preflight chat retry",
+            status="executing",
+            provider="codex",
+        )
+        db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
+        await db.commit()
+        task_id = task.id
+        turn_generation = task.turn_generation
+
+    dispatcher = MagicMock()
+    retry_fence = object()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=retry_fence)
+    dispatcher.enqueue_message = AsyncMock()
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    params = {
+        "prompt": "retry only before provider effect",
+        "provider": "codex",
+        "task_turn_generation": turn_generation,
+        "source_log_id": source_id,
+    }
+
+    with patch("backend.main.dispatcher", dispatcher):
+        requeued = await manager._requeue_chat_prompt(
+            task_id,
+            params,
+            RuntimeError("preflight route unavailable"),
+            phase="preflight",
+            provider="Codex",
+        )
+
+    assert requeued is True
+    dispatcher.enqueue_message.assert_awaited_once_with(
+        task_id=task_id,
+        prompt="retry only before provider effect",
+        priority=0,
+        source="routing_retry",
+        command_skills=None,
+        model_override=None,
+        source_log_id=source_id,
+        queue_admission_fence=retry_fence,
+    )
+
+
+@pytest.mark.asyncio
+async def test_chat_requeue_fence_rejects_cancel_after_exact_guard(db_factory):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    async with db_factory() as db:
+        task = Task(
+            title="cancel races automatic chat retry",
+            status="executing",
+            provider="codex",
+        )
+        db.add(task)
+        source_id = await _bind_preflight_chat_source(db, task)
+        await db.commit()
+        task_id = task.id
+        turn_generation = task.turn_generation
+
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    dispatcher = GlobalDispatcher(db_factory, manager, broadcaster)
+    dispatcher._ensure_queue_worker = MagicMock()
+    actual_enqueue = dispatcher.enqueue_message
+    enqueue_entered = asyncio.Event()
+    release_enqueue = asyncio.Event()
+
+    async def enqueue_after_cancel(**kwargs):
+        enqueue_entered.set()
+        await release_enqueue.wait()
+        return await actual_enqueue(**kwargs)
+
+    dispatcher.enqueue_message = enqueue_after_cancel
+    params = {
+        "prompt": "must lose to cancellation",
+        "provider": "codex",
+        "task_turn_generation": turn_generation,
+        "source_log_id": source_id,
+    }
+
+    with patch("backend.main.dispatcher", dispatcher):
+        requeue_task = asyncio.create_task(
+            manager._requeue_chat_prompt(
+                task_id,
+                params,
+                RuntimeError("preflight route unavailable"),
+                phase="preflight",
+                provider="Codex",
+            )
+        )
+        await enqueue_entered.wait()
+        async with db_factory() as db:
+            cancelled = await db.execute(
+                update(Task)
+                .where(Task.id == task_id, Task.status == "executing")
+                .values(status="cancelled")
+            )
+            assert cancelled.rowcount == 1
+            await db.commit()
+        await dispatcher.abort_task_queue(task_id)
+        release_enqueue.set()
+        assert await requeue_task is False
+
+    queue = dispatcher._task_queues.get(task_id)
+    assert queue is None or queue.empty()
+    assert task_id not in dispatcher._pending_task_starts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "bind_source", "actual_transport"),
+    [
+        ("cancelled", False, None),
+        ("cancelled", True, None),
+        ("executing", True, "codex_exec"),
+    ],
+)
+async def test_chat_requeue_fails_closed_without_live_preflight_evidence(
+    db_factory,
+    status,
+    bind_source,
+    actual_transport,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="unsafe automatic chat retry",
+            status=status,
+            provider="codex",
+        )
+        db.add(task)
+        source_id = None
+        if bind_source:
+            source_id = await _bind_preflight_chat_source(db, task)
+            if actual_transport is not None:
+                source = await db.get(LogEntry, source_id)
+                source.actual_transport = actual_transport
+        await db.commit()
+        task_id = task.id
+        turn_generation = task.turn_generation
+
+    params = {
+        "prompt": "must not revive or replay",
+        "provider": "codex",
+        "task_turn_generation": turn_generation,
+    }
+    if source_id is not None:
+        params["source_log_id"] = source_id
+    dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
+    dispatcher.enqueue_message = AsyncMock()
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with patch("backend.main.dispatcher", dispatcher):
+        requeued = await manager._requeue_chat_prompt(
+            task_id,
+            params,
+            RuntimeError("late routing callback"),
+            phase="routing",
+            provider="Codex",
+        )
+
+    assert requeued is False
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed_scope", [None, "foreground"])
+async def test_chat_relaunch_blocks_user_source_without_source_scope(
+    db_factory,
+    malformed_scope,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="malformed chat source scope",
+            status="executing",
+            retry_count=2,
+            turn_generation=7,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope=malformed_scope,
+            event_type="user_message",
+            role="user",
+            content="must not replay",
+            is_error=False,
+            actual_transport=None,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+        source_id = source.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    assert await manager._chat_automatic_relaunch_is_blocked(
+        task_id,
+        {
+            "task_turn_generation": 7,
+            "source_log_id": source_id,
+        },
+    ) is True
+
+
+@pytest.mark.asyncio
 async def test_consume_output_dispatcher_does_not_restore_task_status(db_factory):
     """When chat_initiated=False (dispatcher), consumer does NOT mark task completed."""
     async with db_factory() as db:
@@ -8400,6 +10569,18 @@ async def test_consume_output_chat_initiated_error_marks_failed(
     assert [notice.content for notice in notices] == [
         f"{expected_label} 进程在返回回复前异常退出（exit code 1）。"
     ]
+    notice = notices[0]
+    assert notice.turn_scope == "foreground"
+    assert notice.role == "system"
+    assert notice.task_retry_count == 0
+    assert notice.task_turn_generation == 0
+    assert json.loads(notice.raw_json) == {
+        "type": "ccm.turn.failed",
+        "version": 1,
+        "provider": provider,
+        "reason": "process_exit_before_response",
+        "exit_code": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -8717,6 +10898,270 @@ async def test_consume_output_chat_initiated_interrupt_marks_completed(db_factor
     assert task.status == "completed"
 
 
+@pytest.mark.asyncio
+async def test_chat_terminal_consumer_yields_to_preexisting_worker_receipt(
+    db_factory,
+):
+    """A durable receipt owns Task/Instance settlement and old publication."""
+
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 12, 0, 1)
+    pid = 74_301
+    async with db_factory() as db:
+        instance = Instance(
+            name="chat-terminal-preexisting-receipt",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="receipt owns natural chat terminal",
+            status="executing",
+            retry_count=2,
+            turn_generation=5,
+            instance_id=instance.id,
+            started_at=started_at,
+            error_message="receipt-owned evidence",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    await persist_active_worker_receipt(db_factory, task_id)
+
+    process = _make_mock_process(pid=pid, returncode=0)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+    consumer = asyncio.create_task(
+        manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+        )
+    )
+    manager._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        chat_initiated=True,
+        task_id=task_id,
+        task_retry_count=2,
+        task_turn_generation=5,
+        instance_started_at=started_at,
+    )
+
+    await asyncio.wait_for(consumer, timeout=1.0)
+
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == "executing"
+    assert current_task.retry_count == 2
+    assert current_task.turn_generation == 5
+    assert current_task.instance_id == instance_id
+    assert current_task.started_at == started_at
+    assert current_task.completed_at is None
+    assert current_task.error_message == "receipt-owned evidence"
+    assert current_instance.status == "running"
+    assert current_instance.pid == pid
+    assert current_instance.current_task_id == task_id
+    broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_terminal_publication_yields_to_postcommit_worker_receipt(
+    db_factory,
+):
+    """A receipt accepted after terminal CAS suppresses the old WS events."""
+
+    from backend.services import worker_task_termination as termination
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 12, 0, 3)
+    pid = 74_303
+    async with db_factory() as db:
+        instance = Instance(
+            name="chat-terminal-postcommit-receipt",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="receipt wins after natural terminal commit",
+            status="executing",
+            retry_count=4,
+            turn_generation=7,
+            instance_id=instance.id,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    factory_entries = 0
+
+    @asynccontextmanager
+    async def receipt_before_publication_factory():
+        nonlocal factory_entries
+        factory_entries += 1
+        if factory_entries == 2:
+            # The first consumer transaction committed Task completed and
+            # released the reverse Instance owner. A terminal receipt can still
+            # be accepted before the old generation publishes its status/exit.
+            await persist_active_worker_receipt(db_factory, task_id)
+        async with db_factory() as db:
+            yield db
+
+    process = _make_mock_process(pid=pid, returncode=0)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(receipt_before_publication_factory, broadcaster)
+    manager.processes[instance_id] = process
+    consumer = asyncio.create_task(
+        manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+        )
+    )
+    manager._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        chat_initiated=True,
+        task_id=task_id,
+        task_retry_count=4,
+        task_turn_generation=7,
+        instance_started_at=started_at,
+    )
+
+    await asyncio.wait_for(consumer, timeout=1.0)
+
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+        receipt = await termination.active_worker_task_termination_receipt(
+            db,
+            task_id,
+        )
+    assert factory_entries >= 2
+    assert receipt is not None
+    assert current_task.status == "completed"
+    assert current_task.retry_count == 4
+    assert current_task.turn_generation == 7
+    assert current_task.instance_id == instance_id
+    assert current_task.completed_at is not None
+    assert current_instance.status == "idle"
+    assert current_instance.pid is None
+    assert current_instance.current_task_id is None
+    broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_chat_terminal_consumer_does_not_deadlock_when_receipt_wins_lock(
+    db_factory,
+):
+    """Receipt admission after consumer precheck must still own settlement."""
+
+    from backend.services.worker_proxy import get_task_operation_lock
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    started_at = datetime(2026, 8, 7, 12, 0, 2)
+    pid = 74_302
+    async with db_factory() as db:
+        instance = Instance(
+            name="chat-terminal-receipt-lock-race",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="receipt wins terminal operation lock",
+            status="executing",
+            retry_count=3,
+            turn_generation=6,
+            instance_id=instance.id,
+            started_at=started_at,
+            error_message="preserve receipt race evidence",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    process = _make_mock_process(pid=pid, returncode=0)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+    operation_lock = get_task_operation_lock(task_id)
+    await operation_lock.acquire()
+    try:
+        consumer = asyncio.create_task(
+            manager._consume_output(
+                instance_id,
+                task_id,
+                process,
+                chat_initiated=True,
+            )
+        )
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            task_id=task_id,
+            task_retry_count=3,
+            task_turn_generation=6,
+            instance_started_at=started_at,
+        )
+        await asyncio.sleep(0.01)
+        assert not consumer.done()
+
+        # The receipt executor owns this lock while calling stop(), which may
+        # await the consumer. Keep the lock held until the consumer exits to
+        # prove the cooperative receipt read breaks that wait cycle.
+        await persist_active_worker_receipt(db_factory, task_id)
+        await asyncio.wait_for(asyncio.shield(consumer), timeout=1.0)
+    finally:
+        if operation_lock.locked():
+            operation_lock.release()
+
+    async with db_factory() as db:
+        current_task = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+    assert current_task.status == "executing"
+    assert current_task.retry_count == 3
+    assert current_task.turn_generation == 6
+    assert current_task.instance_id == instance_id
+    assert current_task.started_at == started_at
+    assert current_task.completed_at is None
+    assert current_task.error_message == "preserve receipt race evidence"
+    assert current_instance.status == "running"
+    assert current_instance.pid == pid
+    assert current_instance.current_task_id == task_id
+    broadcaster.broadcast.assert_not_awaited()
+
+
 def test_internal_codex_abort_is_not_a_successful_chat_terminal():
     """Admission/transport cleanup must not masquerade as user Interrupt."""
 
@@ -8764,6 +11209,196 @@ async def _run_crashed_chat_consumer(
         await consumer
     # Let the identity-safe done callback finish its map cleanup.
     await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize(
+    "chat_initiated",
+    (True, False),
+    ids=("chat-terminal-writer", "dispatcher-writer-fence"),
+)
+@pytest.mark.asyncio
+async def test_consumer_recovery_yields_when_worker_receipt_wins_before_task_cas(
+    db_factory,
+    chat_initiated,
+):
+    """An accepted Worker termination receipt owns every later recovery write."""
+
+    started_at = datetime(2026, 8, 7, 11, 0, int(chat_initiated))
+    pid = 74_200 + int(chat_initiated)
+    async with db_factory() as db:
+        instance = Instance(
+            name=f"consumer-receipt-race-{chat_initiated}",
+            status="running",
+            pid=pid,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="termination receipt owns consumer recovery",
+            status="executing",
+            retry_count=2,
+            turn_generation=4,
+            instance_id=instance.id,
+            started_at=started_at,
+            error_message="receipt-owned task evidence",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            actual_transport="claude_exec",
+            event_type="user_message",
+            role="user",
+            content="receipt-owned source evidence",
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id, source_id = instance.id, task.id, source.id
+
+    from sqlalchemy.sql.dml import Update
+
+    receipt_staged = False
+    update_tables: list[str] = []
+
+    @asynccontextmanager
+    async def receipt_before_task_cas_factory():
+        async with db_factory() as db:
+            class SessionProxy:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                async def execute(self, statement, *args, **kwargs):
+                    nonlocal receipt_staged
+                    if isinstance(statement, Update):
+                        update_tables.append(statement.table.name)
+                    if (
+                        isinstance(statement, Update)
+                        and statement.table.name == "tasks"
+                        and not receipt_staged
+                    ):
+                        operation_id = (
+                            "1" * 32 if chat_initiated else "2" * 32
+                        )
+                        payload = {
+                            "version": 2,
+                            "operation_id": operation_id,
+                            "task_id": task_id,
+                            "operation": "cancel",
+                            "manager_worker_id": 41,
+                            "expected_remote": {
+                                "status": "executing",
+                                "retry_count": 2,
+                                "turn_generation": 4,
+                            },
+                            "manager_handoff": None,
+                        }
+                        async with db_factory() as receipt_db:
+                            receipt = await termination.stage_worker_receipt(
+                                receipt_db,
+                                task_id=task_id,
+                                operation_id=operation_id,
+                                operation="cancel",
+                                request_payload=payload,
+                                request_digest=(
+                                    termination.canonical_json_digest(payload)
+                                ),
+                            )
+                        assert receipt.status == "accepted"
+                        receipt_staged = True
+                    return await db.execute(statement, *args, **kwargs)
+
+            yield SessionProxy()
+
+    process = _make_mock_process(pid=pid, returncode=1)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(receipt_before_task_cas_factory, broadcaster)
+    manager._consume_output_impl = AsyncMock(
+        side_effect=RuntimeError("receipt race bookkeeping")
+    )
+    manager.processes[instance_id] = process
+    consumer = asyncio.create_task(
+        manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=chat_initiated,
+        )
+    )
+    manager._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        chat_initiated=chat_initiated,
+        task_id=task_id,
+        task_retry_count=2,
+        task_turn_generation=4,
+        instance_started_at=started_at,
+    )
+
+    with pytest.raises(
+        ConsumerRecoveryUnsettledError,
+        match="active Worker termination receipt",
+    ):
+        await consumer
+    await asyncio.sleep(0)
+
+    assert receipt_staged is True
+    assert update_tables == ["tasks"]
+    recovery_key = (instance_id, process)
+    assert recovery_key in manager._consumer_recovery_pending
+    assert recovery_key in manager._consumer_errors
+    assert manager.processes[instance_id] is process
+    assert manager._tasks[instance_id] is consumer
+    assert manager._consumer_records[instance_id].process is process
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.get(LogEntry, source_id)
+        instance = await db.get(Instance, instance_id)
+        receipt = await termination.active_worker_task_termination_receipt(
+            db,
+            task_id,
+        )
+        failure_markers = list(
+            (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task_id,
+                        LogEntry.event_type == "system_event",
+                        LogEntry.is_error.is_(True),
+                    )
+                )
+            ).scalars()
+        )
+
+    assert task.status == "executing"
+    assert task.retry_count == 2
+    assert task.turn_generation == 4
+    assert task.instance_id == instance_id
+    assert task.started_at == started_at
+    assert task.completed_at is None
+    assert task.error_message == "receipt-owned task evidence"
+    assert task.turn_source_log_id == source_id
+    assert source.content == "receipt-owned source evidence"
+    assert source.actual_transport == "claude_exec"
+    assert source.is_error is False
+    assert failure_markers == []
+    assert instance.status == "running"
+    assert instance.pid == pid
+    assert instance.current_task_id == task_id
+    assert instance.started_at == started_at
+    assert receipt is not None
+    assert receipt.status == "accepted"
+    broadcaster.broadcast.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -8848,11 +11483,27 @@ async def test_consumer_exception_recovery_completes_and_publishes_failed(
             title="consumer recovery completed at",
             status="executing",
             retry_count=0,
+            turn_generation=0,
             instance_id=instance.id,
             started_at=started_at,
         )
         db.add(task)
         await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=0,
+            turn_scope="source",
+            actual_transport="claude_exec",
+            event_type="user_message",
+            role="user",
+            content="recover this exact turn",
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
         instance.current_task_id = task.id
         await db.commit()
         instance_id, task_id = instance.id, task.id
@@ -8870,6 +11521,15 @@ async def test_consumer_exception_recovery_completes_and_publishes_failed(
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
+        markers = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalars().all()
     assert task.status == "failed"
     assert task.completed_at is not None
     assert task.error_message == (
@@ -8878,6 +11538,19 @@ async def test_consumer_exception_recovery_completes_and_publishes_failed(
     assert instance.status == "error"
     assert instance.pid is None
     assert instance.current_task_id is None
+    assert len(markers) == 1
+    marker = markers[0]
+    assert marker.turn_scope == "foreground"
+    assert marker.role == "system"
+    assert marker.task_retry_count == 0
+    assert marker.task_turn_generation == 0
+    assert json.loads(marker.raw_json) == {
+        "type": "ccm.turn.failed",
+        "version": 1,
+        "provider": "claude",
+        "reason": "output_consumer_failure",
+        "exit_code": 1,
+    }
     broadcaster.broadcast.assert_awaited_once_with(
         "tasks",
         {
@@ -9348,10 +12021,20 @@ async def test_consumer_exception_recovery_without_task_releases_instance(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "canonical_source",
+    (True, False),
+    ids=("canonical-source", "malformed-source"),
+)
 async def test_non_chat_consumer_recovery_leaves_task_for_dispatcher(
     db_factory,
+    canonical_source,
 ):
-    """Non-chat recovery releases Instance but does not decide Task status."""
+    """Non-chat recovery releases Instance but does not decide Task status.
+
+    The dispatcher remains the terminal-status owner, while the consumer still
+    publishes exact failed-output evidence for arbitration.
+    """
 
     started_at = datetime(2026, 7, 23, 15, 7, 0)
     async with db_factory() as db:
@@ -9367,17 +12050,51 @@ async def test_non_chat_consumer_recovery_leaves_task_for_dispatcher(
             title="consumer recovery non-chat",
             status="executing",
             retry_count=0,
+            turn_generation=0,
             instance_id=instance.id,
         )
         db.add(task)
         await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=0,
+            turn_scope="source",
+            actual_transport="claude_exec",
+            event_type=("user_message" if canonical_source else "result"),
+            role=("user" if canonical_source else "assistant"),
+            content="dispatcher-owned turn",
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
         instance.current_task_id = task.id
         await db.commit()
         instance_id, task_id = instance.id, task.id
 
     process = _make_mock_process(pid=74_108, returncode=1)
+    from sqlalchemy.sql.dml import Update
+
+    update_tables: list[str] = []
+
+    @asynccontextmanager
+    async def recording_factory():
+        async with db_factory() as db:
+            class SessionProxy:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                async def execute(self, statement, *args, **kwargs):
+                    if isinstance(statement, Update):
+                        update_tables.append(statement.table.name)
+                    return await db.execute(statement, *args, **kwargs)
+
+            yield SessionProxy()
+
     manager = InstanceManager(
-        db_factory,
+        recording_factory,
         MagicMock(broadcast=AsyncMock()),
     )
     manager._consume_output_impl = AsyncMock(
@@ -9409,7 +12126,18 @@ async def test_non_chat_consumer_recovery_leaves_task_for_dispatcher(
     async with db_factory() as db:
         task = await db.get(Task, task_id)
         instance = await db.get(Instance, instance_id)
+        failure_markers = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                    LogEntry.is_error.is_(True),
+                )
+            )
+        ).scalars().all()
     assert task.status == "executing"
+    assert task.completed_at is None
+    assert task.error_message is None
     assert instance.status == "error"
     assert instance.pid is None
     assert instance.current_task_id is None
@@ -9417,6 +12145,23 @@ async def test_non_chat_consumer_recovery_leaves_task_for_dispatcher(
     assert not manager._consumer_recovery_pending
     assert instance_id not in manager.processes
     assert instance_id not in manager._tasks
+    assert update_tables == ["tasks", "instances"]
+    if not canonical_source:
+        assert failure_markers == []
+        return
+    assert len(failure_markers) == 1
+    marker = failure_markers[0]
+    assert marker.turn_scope == "foreground"
+    assert marker.role == "system"
+    assert marker.task_retry_count == 0
+    assert marker.task_turn_generation == 0
+    assert json.loads(marker.raw_json) == {
+        "type": "ccm.turn.failed",
+        "version": 1,
+        "provider": "claude",
+        "reason": "output_consumer_failure",
+        "exit_code": 1,
+    }
 
 
 @pytest.mark.asyncio
@@ -9644,7 +12389,7 @@ async def test_direct_chat_consumer_suppresses_events_after_retry_claim(
 async def test_prompt_too_long_compaction_rejects_changed_task_generation(
     db_factory,
 ):
-    """A stale consumer must not clear a newer session or enqueue its retry."""
+    """A stale structured preflight must not clear or retry a newer generation."""
 
     started_at = datetime(2026, 7, 23, 8, 9, 10)
     async with db_factory() as db:
@@ -9658,19 +12403,48 @@ async def test_prompt_too_long_compaction_rejects_changed_task_generation(
         await db.flush()
         task = Task(
             title="stale compaction",
+            provider="codex",
             status="executing",
             retry_count=0,
+            turn_generation=4,
             instance_id=instance.id,
             session_id="old-session",
         )
         db.add(task)
         await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps(
+                {"original_source_log_id": None, "transport": "codex"}
+            ),
+            is_error=False,
+            actual_transport="codex_app_server",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
         instance.current_task_id = task.id
         await db.commit()
-        instance_id, task_id = instance.id, task.id
+        instance_id, task_id, source_id = instance.id, task.id, source.id
 
     process = _make_mock_process(pid=73_103, returncode=1)
-    output = iter((b"prompt-too-long\n", b""))
+    output = iter((
+        json.dumps({
+            "type": "turn.failed",
+            "error": {
+                "message": "The request could not be completed.",
+                "codexErrorInfo": "contextWindowExceeded",
+            },
+        }).encode() + b"\n",
+        b"",
+    ))
 
     async def readline():
         return next(output)
@@ -9679,16 +12453,13 @@ async def test_prompt_too_long_compaction_rejects_changed_task_generation(
     broadcaster = MagicMock(broadcast=AsyncMock())
     manager = InstanceManager(db_factory, broadcaster)
     manager.processes[instance_id] = process
-    manager.parser.parse_line = MagicMock(
-        return_value=[
-            {
-                "event_type": "message",
-                "role": "assistant",
-                "content": "Prompt is too long",
-                "is_error": False,
-            }
-        ]
-    )
+    manager._launch_params[instance_id] = {
+        "prompt": "continue the task",
+        "current_message": "continue the task",
+        "provider": "codex",
+        "task_turn_generation": 4,
+        "source_log_id": source_id,
+    }
 
     dispatcher = MagicMock()
     dispatcher.enqueue_message = AsyncMock()
@@ -9711,6 +12482,7 @@ async def test_prompt_too_long_compaction_rejects_changed_task_generation(
                 task_id,
                 process,
                 chat_initiated=True,
+                provider="codex",
             )
         )
         manager._track_output_consumer(
@@ -9718,9 +12490,10 @@ async def test_prompt_too_long_compaction_rejects_changed_task_generation(
             process,
             consumer,
             chat_initiated=True,
+            provider="codex",
             task_id=task_id,
             task_retry_count=0,
-            task_turn_generation=0,
+            task_turn_generation=4,
             instance_started_at=started_at,
         )
         await consumer
@@ -9894,7 +12667,7 @@ async def test_launch_chat_initiated_stores_enable_workflows_in_params(db_factor
     assert inst_id in im._launch_params
     assert im._launch_params[inst_id]["enable_workflows"] is True
     await asyncio.sleep(0.1)
-    im.task_message_enqueuer.assert_awaited_once()
+    im.task_message_enqueuer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -9928,7 +12701,7 @@ async def test_launch_chat_initiated_stores_enable_workflows_false_in_params(db_
 
     assert im._launch_params[inst_id]["enable_workflows"] is False
     await asyncio.sleep(0.1)
-    im.task_message_enqueuer.assert_awaited_once()
+    im.task_message_enqueuer.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -9961,7 +12734,14 @@ class _FakeDB:
 
     async def execute(self, stmt):
         self.executed.append(stmt)
-        return MagicMock(rowcount=1)
+        result = MagicMock(rowcount=1)
+        result.first.return_value = (0, 0)
+        owner = MagicMock()
+        owner.turn_source_log_id = None
+        owner.current_task_id = None
+        owner.current_plan_run_id = None
+        result.scalar_one_or_none.return_value = owner
+        return result
 
     async def commit(self):
         pass
@@ -11553,7 +14333,7 @@ async def test_process_event_codex_exec_uses_rollout_last_usage(
 
 @pytest.mark.asyncio
 async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
-    """A structured app-server failure must continue via a compacted session."""
+    """An exact structured preflight failure continues via compaction."""
 
     started_at = datetime(2026, 7, 24, 9, 10, 11)
     async with db_factory() as db:
@@ -11570,14 +14350,33 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
             provider="codex",
             status="executing",
             retry_count=0,
+            turn_generation=4,
             instance_id=instance.id,
             session_id="codex-thread-1",
         )
         db.add(task)
         await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps(
+                {"original_source_log_id": None, "transport": "codex"}
+            ),
+            is_error=False,
+            actual_transport="codex_app_server",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
         instance.current_task_id = task.id
         await db.commit()
-        instance_id, task_id = instance.id, task.id
+        instance_id, task_id, source_id = instance.id, task.id, source.id
 
     process = _make_mock_process(pid=73_104, returncode=1)
     output = iter((
@@ -11602,7 +14401,8 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
         "prompt": "[already wrapped history]\ncontinue the task",
         "current_message": "continue the task",
         "provider": "codex",
-        "source_log_id": 321,
+        "task_turn_generation": 4,
+        "source_log_id": source_id,
         "enabled_skills": {"sub-agent": True},
         "model": "gpt-5.6-terra",
     }
@@ -11629,7 +14429,7 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
             provider="codex",
             task_id=task_id,
             task_retry_count=0,
-            task_turn_generation=0,
+            task_turn_generation=4,
             instance_started_at=started_at,
         )
         await consumer
@@ -11639,7 +14439,7 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
         dispatcher._compact_session.await_args.kwargs[
             "exclude_log_entry_id"
         ]
-        == 321
+        == source_id
     )
     assert (
         dispatcher._compact_session.await_args.kwargs[
@@ -11650,13 +14450,285 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
     dispatcher.enqueue_message.assert_awaited_once()
     retry = dispatcher.enqueue_message.await_args.kwargs
     assert retry["source"] == "compact_retry"
-    assert retry["source_log_id"] == 321
+    assert retry["source_log_id"] == source_id
     assert retry["current_message"] == "continue the task"
     assert retry["command_skills"] == {"sub-agent": True}
     assert retry["model_override"] == "gpt-5.6-terra"
     assert "durable summary" in retry["prompt"]
     assert "continue the task" in retry["prompt"]
     assert "already wrapped history" not in retry["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_codex_context_compaction_cas_loses_to_concurrent_task_retry(db_factory):
+    """TaskQueue.retry during summary must suppress the stale compact retry."""
+
+    started_at = datetime(2026, 8, 6, 9, 10, 11)
+    async with db_factory() as db:
+        instance = Instance(
+            name="codex-context-cancel-race",
+            status="running",
+            pid=73_105,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="codex context cancel race",
+            provider="codex",
+            status="executing",
+            retry_count=0,
+            turn_generation=4,
+            instance_id=instance.id,
+            session_id="codex-thread-cancel-race",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps(
+                {"original_source_log_id": None, "transport": "codex"}
+            ),
+            is_error=False,
+            actual_transport="codex_app_server",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id, source_id = instance.id, task.id, source.id
+
+    process = _make_mock_process(pid=73_105, returncode=1)
+    output = iter((
+        json.dumps({
+            "type": "turn.failed",
+            "error": {
+                "message": "The request could not be completed.",
+                "codexErrorInfo": "contextWindowExceeded",
+            },
+        }).encode() + b"\n",
+        b"",
+    ))
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "[already wrapped history]\ncontinue the task",
+        "current_message": "continue the task",
+        "provider": "codex",
+        "task_turn_generation": 4,
+        "source_log_id": source_id,
+    }
+
+    async def retry_while_summarizing(*_args, **_kwargs):
+        from backend.services.task_queue import TaskQueue, task_generation_fence
+
+        async with db_factory() as race_db:
+            current = await race_db.get(Task, task_id)
+            assert current is not None
+            retried = await TaskQueue(race_db).retry(
+                task_id,
+                expected_statuses=("executing",),
+                instance_id=instance_id,
+                generation_fence=task_generation_fence(current),
+            )
+            assert retried is not None
+        return "durable summary"
+
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(
+        side_effect=retry_while_summarizing
+    )
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(
+            manager._consume_output(
+                instance_id,
+                task_id,
+                process,
+                chat_initiated=True,
+                provider="codex",
+            )
+        )
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="codex",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=4,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_awaited_once()
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "pending"
+        assert current.retry_count == 1
+        assert current.session_id == "codex-thread-cancel-race"
+        assert current.turn_generation == 4
+        assert current.turn_source_log_id is None
+
+
+@pytest.mark.asyncio
+async def test_codex_context_proof_loses_to_cancel_before_summary(db_factory):
+    """A Task cancelled after proof must not even collect or enqueue a retry."""
+
+    started_at = datetime(2026, 8, 6, 10, 11, 12)
+    async with db_factory() as db:
+        instance = Instance(
+            name="codex-context-proof-cancel",
+            status="running",
+            pid=73_106,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="codex context proof cancel",
+            provider="codex",
+            status="executing",
+            retry_count=0,
+            turn_generation=5,
+            instance_id=instance.id,
+            session_id="codex-thread-proof-cancel",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps(
+                {"original_source_log_id": None, "transport": "codex"}
+            ),
+            is_error=False,
+            actual_transport="codex_app_server",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id, source_id = instance.id, task.id, source.id
+
+    process = _make_mock_process(pid=73_106, returncode=1)
+    output = iter((
+        json.dumps({
+            "type": "turn.failed",
+            "error": {
+                "message": "The request could not be completed.",
+                "codexErrorInfo": "contextWindowExceeded",
+            },
+        }).encode() + b"\n",
+        b"",
+    ))
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "continue the task",
+        "current_message": "continue the task",
+        "provider": "codex",
+        "task_turn_generation": 5,
+        "source_log_id": source_id,
+    }
+    prove = manager._chat_structured_context_preflight_rejection
+
+    async def prove_then_cancel(*args, **kwargs):
+        permit = await prove(*args, **kwargs)
+        assert permit is not None
+        async with db_factory() as race_db:
+            cancelled = await race_db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.status == "executing",
+                    Task.retry_count == 0,
+                    Task.turn_generation == 5,
+                )
+                .values(
+                    status="cancelled",
+                    completed_at=datetime(2026, 8, 6, 10, 12, 13),
+                )
+            )
+            assert cancelled.rowcount == 1
+            await race_db.commit()
+        return permit
+
+    manager._chat_structured_context_preflight_rejection = AsyncMock(
+        side_effect=prove_then_cancel
+    )
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="stale summary")
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(
+            manager._consume_output(
+                instance_id,
+                task_id,
+                process,
+                chat_initiated=True,
+                provider="codex",
+            )
+        )
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="codex",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=5,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_not_awaited()
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        current_instance = await db.get(Instance, instance_id)
+        assert current.status == "cancelled"
+        assert current.session_id == "codex-thread-proof-cancel"
+        assert current.turn_source_log_id == source_id
+        assert current.retry_count == 0
+        assert current.turn_generation == 5
+        assert current_instance.current_task_id is None
 
 
 @pytest.mark.asyncio

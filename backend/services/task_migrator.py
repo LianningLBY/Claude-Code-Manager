@@ -41,6 +41,12 @@ from backend.services.task_queue import (
     task_retry_not_superseded_predicate,
 )
 from backend.services.worker_proxy import get_task_operation_lock
+from backend.services.worker_relay import has_worker_execution_quarantine
+from backend.services.worker_routing_config import WORKER_ROUTING_SAFE_STATUSES
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 logger = logging.getLogger(__name__)
 _CODEX_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -278,12 +284,37 @@ class TaskMigrator:
             task = await db.get(Task, task_id)
             if not task:
                 raise MigrationError("task 不存在")
+            if await active_worker_task_termination_receipt(db, task_id):
+                raise MigrationError(
+                    "Worker task termination is still active; reconcile the "
+                    "durable receipt before migrating"
+                )
+            if task.plan_target_task_id is not None:
+                raise MigrationError(
+                    "关联 Plan 不能脱离目标 Task 单独迁移"
+                )
+            if task.mode == "plan":
+                raise MigrationError(
+                    "Plan Tasks cannot be migrated through the generic Task "
+                    "protocol; keep the legacy carrier on its original node"
+                )
             if task.worker_id == target:
                 if coordinated_updates:
                     raise MigrationError(
                         "Coordinated updates require a Worker location change"
                     )
                 return  # 已在目标位置
+            if task.worker_id is not None:
+                if task.status not in WORKER_ROUTING_SAFE_STATUSES:
+                    raise MigrationError(
+                        f"Worker source task 状态 {task.status} 不是可迁移的 "
+                        "inert 状态；必须先在原 Worker 上精确终止或完成"
+                    )
+                if has_worker_execution_quarantine(task.metadata_):
+                    raise MigrationError(
+                        "Worker task execution is quarantined; reconcile the "
+                        "exact remote generation before migrating"
+                    )
             if task.mode == "delivery_loop" or task.delivery_run_id is not None:
                 raise MigrationError(
                     "Delivery Loop V1 is local-only; pause and finish the Run "
@@ -314,15 +345,16 @@ class TaskMigrator:
                 is True
             ):
                 raise MigrationError("已被新 push 取代的 PR review task 不可迁移")
-            if task.status in ("in_progress", "executing", "migrating"):
+            if task.status in (
+                "in_progress",
+                "executing",
+                "merging",
+                "migrating",
+            ):
                 raise MigrationError(f"task 状态 {task.status}，先停止再切换")
             if task.pty_background_generation is not None:
                 raise MigrationError(
                     "Claude PTY 后台活动仍在输出，结束后再迁移"
-                )
-            if task.plan_target_task_id is not None:
-                raise MigrationError(
-                    "关联 Plan 不能脱离目标 Task 单独迁移"
                 )
             from backend.services.plan_tasks import ACTIVE_PLAN_STATUSES
 
@@ -433,6 +465,24 @@ class TaskMigrator:
         try:
             if claim_cancellation is not None:
                 raise claim_cancellation
+            if src_worker_id is not None:
+                # The status/retry/turn CAS above owns the source generation,
+                # but the uncertainty marker is Manager-local JSON and is not
+                # part of that portable SQL tuple.  Re-read it after the claim
+                # and before any workspace/session copy so a marker persisted
+                # during destination validation cannot be carried away or
+                # silently discarded by migration.
+                claimed_task = await self._read_claimed_task(
+                    claimed,
+                    expected_values=observed_update_values,
+                )
+                if has_worker_execution_quarantine(
+                    claimed_task.metadata_
+                ):
+                    raise MigrationError(
+                        "Worker task execution became quarantined before "
+                        "migration; reconcile the exact remote generation"
+                    )
             # The Plan admission path fences on this exact Task row before it
             # commits an active Run. Recheck after our claim so either commit
             # ordering is safe: migration-first rejects the Run; Run-first
@@ -603,6 +653,7 @@ class TaskMigrator:
                     select(Task).where(
                         *migration_generation_predicates(claimed),
                         *_task_value_predicates(expected_values or {}),
+                        no_active_worker_task_termination_predicate(),
                     )
                 )
             ).scalar_one_or_none()
@@ -627,6 +678,7 @@ class TaskMigrator:
                     Task.pty_background_generation.is_(None),
                     Task.worker_turn_handoff_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(status="migrating")
             )
@@ -651,7 +703,10 @@ class TaskMigrator:
         async with self.db_factory() as db:
             result = await db.execute(
                 update(Task)
-                .where(*migration_generation_predicates(claimed))
+                .where(
+                    *migration_generation_predicates(claimed),
+                    no_active_worker_task_termination_predicate(),
+                )
                 .values(status=restored_status)
             )
             await db.commit()
@@ -730,6 +785,7 @@ class TaskMigrator:
                     .where(
                         *migration_generation_predicates(claimed),
                         *_task_value_predicates(expected_values or {}),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .with_for_update()
                 )
@@ -738,6 +794,34 @@ class TaskMigrator:
                 raise MigrationError(
                     "task 迁移状态或 generation 已被并发修改，拒绝覆盖"
                 )
+
+            if target_worker_id is not None:
+                # Global lifecycle lock order is Task -> Worker.  Destination
+                # validation above precedes workspace/session copy and is only
+                # advisory; a concurrent destroy may claim the Worker while
+                # this Task still points at its source and is therefore absent
+                # from destroy's Task snapshot.  Take a portable no-op write
+                # barrier here so either this final pointer cut wins while the
+                # Worker is still ready, or destroy wins and migration restores
+                # its exact source claim.  Retaining ``updated_at`` suppresses
+                # its Python onupdate hook and keeps opaque lifecycle claims
+                # stable for a genuinely unchanged ready Worker.
+                target_ready = await db.execute(
+                    update(Worker)
+                    .where(
+                        Worker.id == target_worker_id,
+                        Worker.status == "ready",
+                    )
+                    .values(
+                        status=Worker.status,
+                        updated_at=Worker.updated_at,
+                    )
+                )
+                if target_ready.rowcount != 1:
+                    await db.rollback()
+                    raise MigrationError(
+                        f"目标 Worker {target_worker_id} 在迁移完成前不再 ready"
+                    )
 
             values: dict = copy.deepcopy(task_updates or {})
             values.update({
@@ -770,6 +854,7 @@ class TaskMigrator:
                 .where(
                     *migration_generation_predicates(claimed),
                     *_task_value_predicates(expected_values or {}),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(**values)
             )
@@ -843,6 +928,7 @@ class TaskMigrator:
                     .where(
                         *migration_generation_predicates(claimed),
                         *_task_value_predicates(expected_values or {}),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .with_for_update()
                 )
@@ -872,6 +958,7 @@ class TaskMigrator:
                     .where(
                         *migration_generation_predicates(claimed),
                         *_task_value_predicates(expected_values or {}),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(metadata_=metadata)
                 )
@@ -903,6 +990,7 @@ class TaskMigrator:
                 .where(
                     *migration_generation_predicates(claimed),
                     *_task_value_predicates(expected_values or {}),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(**values)
             )

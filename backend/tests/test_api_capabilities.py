@@ -236,6 +236,9 @@ async def test_public_create_freezes_server_owned_contract(
         ("policy_snapshot", {"bypass": True}),
         ("subject_ref", {"task_id": 999}),
         ("result_hash", "0" * 64),
+        ("request_reason", "forged terminal reason"),
+        ("request_protocol_version", 1),
+        ("request_output_hash", "0" * 64),
     ],
 )
 async def test_public_create_rejects_server_owned_fields(

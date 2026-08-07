@@ -10,6 +10,9 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
+)
 
 def _make_mock_instance_manager(is_running_val=False, launch_pid=12345, stop_val=True):
     mock = MagicMock()
@@ -624,7 +627,143 @@ async def test_stop_instance_success(client, session_factory):
         expected_started_at=None,
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_yields_to_active_worker_termination_receipt(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/instances",
+        json={"name": "receipt-owned-stop"},
+    )
+    instance_id = created.json()["id"]
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=5,
+    )
+    await persist_active_worker_receipt(session_factory, task_id)
+
+    mock_im = _make_mock_instance_manager(stop_val=True)
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+    ):
+        response = await client.post(
+            f"/api/instances/{instance_id}/stop",
+            json={
+                "expected_task_id": task_id,
+                "expected_task_turn_generation": 5,
+                "expected_pid": 12345,
+                "expected_started_at": None,
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.json()["detail"]
+    mock_rl.stop.assert_not_awaited()
+    mock_im.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_rechecks_receipt_after_operation_lock_wait(
+    client,
+    session_factory,
+):
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    created = await client.post(
+        "/api/instances",
+        json={"name": "receipt-wins-stop-race"},
+    )
+    instance_id = created.json()["id"]
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=6,
+    )
+    operation_lock = get_task_operation_lock(task_id)
+    await operation_lock.acquire()
+    mock_im = _make_mock_instance_manager(stop_val=True)
+    mock_rl = _make_mock_ralph_loop()
+    try:
+        with (
+            patch("backend.main.instance_manager", mock_im),
+            patch("backend.main.ralph_loop", mock_rl),
+        ):
+            request = asyncio.create_task(
+                client.post(
+                    f"/api/instances/{instance_id}/stop",
+                    json={
+                        "expected_task_id": task_id,
+                        "expected_task_turn_generation": 6,
+                        "expected_pid": 12345,
+                        "expected_started_at": None,
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+            assert not request.done()
+            await persist_active_worker_receipt(session_factory, task_id)
+            operation_lock.release()
+            response = await request
+    finally:
+        if operation_lock.locked():
+            operation_lock.release()
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.json()["detail"]
+    mock_rl.stop.assert_not_awaited()
+    mock_im.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_surfaces_receipt_that_wins_lifecycle_sql_gate(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/instances",
+        json={"name": "late-receipt-stop"},
+    )
+    instance_id = created.json()["id"]
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=7,
+    )
+
+    async def receipt_wins_final_gate(*_args, **kwargs):
+        assert kwargs["yield_to_worker_task_termination"] is True
+        await persist_active_worker_receipt(session_factory, task_id)
+        return False
+
+    mock_im = _make_mock_instance_manager(stop_val=False)
+    mock_im.stop.side_effect = receipt_wins_final_gate
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+    ):
+        response = await client.post(
+            f"/api/instances/{instance_id}/stop",
+            json={
+                "expected_task_id": task_id,
+                "expected_task_turn_generation": 7,
+                "expected_pid": 12345,
+                "expected_started_at": None,
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.json()["detail"]
+    mock_rl.stop.assert_awaited_once_with(instance_id)
+    mock_im.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -793,6 +932,7 @@ async def test_stop_instance_fails_closed_when_legacy_ralph_owner_remains(
         expected_started_at=None,
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
 
 

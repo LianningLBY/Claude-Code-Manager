@@ -19,13 +19,14 @@ import asyncio
 import hashlib
 import json
 import logging
+import uuid
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import httpx
 import websockets
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 
 from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
@@ -33,6 +34,11 @@ from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.legacy_plan_execution import (
+    LegacyPlanExecutionCarrierProof,
+    legacy_approved_execution_carrier_proof,
+    legacy_plan_execution_snapshot_matches_proof,
+)
 from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER,
     PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
@@ -59,11 +65,24 @@ _TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "conflict"}
 )
 _WORKER_BACKGROUND_MIRROR_SENTINEL = "worker-relay:background-active:v1"
-_FP_PREFIX = 1000  # chars; compare only a prefix so the chat/history endpoint's
-                   # 20k truncation of tool_input/tool_output can't cause a false
-                   # "missing" (which would re-insert an already-present entry).
+_FP_PREFIX = 20_000  # Match the history endpoint's exact observable prefix.
 WORKER_HANDOFF_RECOVERY_BASE_DELAY = 1.0
 WORKER_HANDOFF_RECOVERY_MAX_DELAY = 60.0
+LEGACY_CARRIER_RECOVERY_BASE_DELAY = 1.0
+LEGACY_CARRIER_RECOVERY_MAX_DELAY = 60.0
+
+_LEGACY_CARRIER_EXECUTION_STATUSES = frozenset(
+    {
+        "pending",
+        "in_progress",
+        "executing",
+        "merging",
+        "completed",
+        "failed",
+        "cancelled",
+        "conflict",
+    }
+)
 
 # Worker receipt states are deliberately split by replay safety, not merely by
 # whether G+1 has been assigned.  ``claimed`` still precedes every provider
@@ -75,6 +94,17 @@ _WORKER_HANDOFF_POST_BOUNDARY_STATUSES = frozenset({"launching", "launched"})
 _WORKER_HANDOFF_BOUND_GENERATION_STATUSES = frozenset(
     {"claimed", "launching", "launched"}
 )
+_TURN_SCOPES = frozenset({"source", "foreground", "autonomous", "orphan"})
+_ACTUAL_TRANSPORTS = frozenset(
+    {"claude_pty", "claude_exec", "codex_app_server", "codex_exec"}
+)
+WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY = (
+    "worker_termination_uncertainty_v1"
+)
+LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY = (
+    "legacy_plan_carrier_conflict_v1"
+)
+_WORKER_TERMINATION_OPERATIONS = frozenset({"cancel", "stop-session"})
 
 
 def _handoff_payload_digest(payload: dict) -> str:
@@ -113,6 +143,103 @@ class WorkerTaskGeneration:
     worker_turn_handoff_from_generation: int | None
     worker_turn_handoff_source_log_id: int | None
     worker_turn_handoff_acknowledged: bool | None
+    termination_uncertainty_present: bool = False
+    termination_uncertainty: object | None = None
+    legacy_carrier_conflict_present: bool = False
+    legacy_carrier_conflict: object | None = None
+
+
+def has_worker_termination_uncertainty(metadata: object) -> bool:
+    """Return whether a durable remote-termination quarantine is present.
+
+    Presence, not validity, is the safety boundary.  A malformed marker must
+    fail closed until an operator repairs it; treating malformed JSON as
+    absent would re-enable retry/migration of a possibly terminated Worker
+    generation.
+    """
+
+    return (
+        isinstance(metadata, dict)
+        and WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in metadata
+    )
+
+
+def has_worker_execution_quarantine(metadata: object) -> bool:
+    """Return whether automatic Worker execution/migration must stay closed."""
+
+    return bool(
+        has_worker_termination_uncertainty(metadata)
+        or (
+            isinstance(metadata, dict)
+            and LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY in metadata
+        )
+    )
+
+
+def _generation_marker_payload(generation: WorkerTaskGeneration) -> dict:
+    def dt(value: datetime | None) -> str | None:
+        return value.isoformat(timespec="microseconds") if value else None
+
+    return {
+        "task_id": generation.task_id,
+        "worker_id": generation.worker_id,
+        "status": generation.status,
+        "retry_count": generation.retry_count,
+        "turn_generation": generation.turn_generation,
+        "instance_id": generation.instance_id,
+        "started_at": dt(generation.started_at),
+        "completed_at": dt(generation.completed_at),
+        "pty_background_generation": generation.pty_background_generation,
+        "worker_turn_handoff_id": generation.worker_turn_handoff_id,
+        "worker_turn_handoff_worker_id": (
+            generation.worker_turn_handoff_worker_id
+        ),
+        "worker_turn_handoff_retry_count": (
+            generation.worker_turn_handoff_retry_count
+        ),
+        "worker_turn_handoff_from_generation": (
+            generation.worker_turn_handoff_from_generation
+        ),
+        "worker_turn_handoff_source_log_id": (
+            generation.worker_turn_handoff_source_log_id
+        ),
+        "worker_turn_handoff_acknowledged": (
+            generation.worker_turn_handoff_acknowledged
+        ),
+    }
+
+
+def _valid_termination_uncertainty(
+    generation: WorkerTaskGeneration,
+) -> bool:
+    """Validate that a quarantine marker names this exact pre-conflict row."""
+
+    if (
+        generation.status != "conflict"
+        or not generation.termination_uncertainty_present
+        or not isinstance(generation.termination_uncertainty, dict)
+    ):
+        return False
+    marker = generation.termination_uncertainty
+    source = marker.get("source_generation")
+    if (
+        marker.get("version") != 1
+        or marker.get("operation") not in _WORKER_TERMINATION_OPERATIONS
+        or not isinstance(marker.get("operation_id"), str)
+        or len(marker["operation_id"]) != 32
+        or not isinstance(marker.get("created_at"), str)
+        or not isinstance(source, dict)
+        or source.get("status") not in _TASK_STATUSES
+        or (
+            source.get("completed_at") is not None
+            and _remote_datetime(source.get("completed_at")) is None
+        )
+    ):
+        return False
+    current_as_source = _generation_marker_payload(generation)
+    current_as_source["status"] = source["status"]
+    current_as_source["completed_at"] = source.get("completed_at")
+    return current_as_source == source
 
 
 def worker_task_generation(
@@ -130,6 +257,7 @@ def worker_task_generation(
         )
     ):
         return None
+    metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
     return WorkerTaskGeneration(
         task_id=task.id,
         worker_id=worker_id,
@@ -151,6 +279,18 @@ def worker_task_generation(
         ),
         worker_turn_handoff_acknowledged=(
             task.worker_turn_handoff_acknowledged
+        ),
+        termination_uncertainty_present=(
+            WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in metadata
+        ),
+        termination_uncertainty=metadata.get(
+            WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY
+        ),
+        legacy_carrier_conflict_present=(
+            LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY in metadata
+        ),
+        legacy_carrier_conflict=metadata.get(
+            LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY
         ),
     )
 
@@ -203,6 +343,130 @@ def worker_task_generation_predicates(
     )
 
 
+def _worker_task_termination_apply_predicate(
+    operation_id: str | None = None,
+):
+    """Return the final SQL ordering gate for a Manager Task write.
+
+    Ordinary relay writers require the active termination slot to be empty.
+    The exact termination reconciler instead names the one Manager receipt
+    whose Task snapshot it is allowed to apply.  Keeping this as part of the
+    final Task UPDATE closes the cross-process gap after an earlier receipt
+    lookup (``SELECT FOR UPDATE`` is a no-op on SQLite).
+    """
+
+    if operation_id is None:
+        from backend.services.worker_task_termination import (
+            no_active_worker_task_termination_predicate,
+        )
+
+        return no_active_worker_task_termination_predicate()
+
+    from backend.models.worker_task_termination import (
+        WorkerTaskTerminationReceipt,
+    )
+
+    return exists(
+        select(WorkerTaskTerminationReceipt.operation_id).where(
+            WorkerTaskTerminationReceipt.operation_id == operation_id,
+            WorkerTaskTerminationReceipt.task_id == Task.id,
+            WorkerTaskTerminationReceipt.active_task_id == Task.id,
+            WorkerTaskTerminationReceipt.side == "manager",
+        )
+    )
+
+
+def _worker_task_generation_write_predicates(
+    generation: WorkerTaskGeneration,
+    *,
+    worker_termination_operation_id: str | None = None,
+) -> tuple:
+    """Bind a Task mutation to both generation and termination ownership."""
+
+    return (
+        *worker_task_generation_predicates(generation),
+        _worker_task_termination_apply_predicate(
+            worker_termination_operation_id
+        ),
+    )
+
+
+async def _active_worker_task_termination_exists(db, task_id: int) -> bool:
+    from backend.services.worker_task_termination import (
+        active_worker_task_termination_receipt,
+    )
+
+    return bool(await active_worker_task_termination_receipt(db, task_id))
+
+
+def _same_worker_turn_handoff_generation(
+    current: WorkerTaskGeneration,
+    observed: WorkerTaskGeneration,
+) -> bool:
+    """Match one reservation while allowing only its durable ACK bit to move."""
+
+    return bool(
+        _valid_worker_turn_handoff(current)
+        and _has_worker_turn_handoff(current)
+        and _valid_worker_turn_handoff(observed)
+        and _has_worker_turn_handoff(observed)
+        and current.task_id == observed.task_id
+        and current.worker_id == observed.worker_id
+        and current.status == observed.status
+        and current.retry_count == observed.retry_count
+        and current.turn_generation == observed.turn_generation
+        and current.instance_id == observed.instance_id
+        and current.started_at == observed.started_at
+        and current.completed_at == observed.completed_at
+        and current.pty_background_generation
+        == observed.pty_background_generation
+        and current.worker_turn_handoff_id
+        == observed.worker_turn_handoff_id
+        and current.worker_turn_handoff_worker_id
+        == observed.worker_turn_handoff_worker_id
+        and current.worker_turn_handoff_retry_count
+        == observed.worker_turn_handoff_retry_count
+        and current.worker_turn_handoff_from_generation
+        == observed.worker_turn_handoff_from_generation
+        and current.worker_turn_handoff_source_log_id
+        == observed.worker_turn_handoff_source_log_id
+        and not current.termination_uncertainty_present
+        and not current.legacy_carrier_conflict_present
+    )
+
+
+async def _acquire_worker_turn_handoff_effect_fence(
+    db,
+    observed: WorkerTaskGeneration,
+) -> WorkerTaskGeneration | None:
+    """Order one remote handoff effect before/after termination admission.
+
+    The no-op UPDATE holds the Task write lock across the caller's HTTP effect.
+    If termination admission committed first, the correlated receipt predicate
+    makes the UPDATE miss and no POST is attempted.
+    """
+
+    current = await read_worker_task_generation(
+        db,
+        observed.task_id,
+        observed.worker_id,
+    )
+    if current is None or not _same_worker_turn_handoff_generation(
+        current,
+        observed,
+    ):
+        return None
+    fenced = await db.execute(
+        update(Task)
+        .where(*_worker_task_generation_write_predicates(current))
+        .values(status=Task.status)
+    )
+    if fenced.rowcount != 1:
+        await db.rollback()
+        return None
+    return current
+
+
 async def read_worker_task_generation(
     db,
     task_id: int,
@@ -228,6 +492,7 @@ async def read_worker_task_generation(
                 Task.worker_turn_handoff_from_generation,
                 Task.worker_turn_handoff_source_log_id,
                 Task.worker_turn_handoff_acknowledged,
+                Task.metadata_,
             ).where(
                 Task.id == task_id,
                 Task.worker_id == worker_id,
@@ -259,7 +524,91 @@ async def read_worker_task_generation(
         worker_turn_handoff_acknowledged=(
             row.worker_turn_handoff_acknowledged
         ),
+        termination_uncertainty_present=(
+            isinstance(row.metadata_, dict)
+            and WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in row.metadata_
+        ),
+        termination_uncertainty=(
+            row.metadata_.get(WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY)
+            if isinstance(row.metadata_, dict)
+            else None
+        ),
+        legacy_carrier_conflict_present=(
+            isinstance(row.metadata_, dict)
+            and LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY in row.metadata_
+        ),
+        legacy_carrier_conflict=(
+            row.metadata_.get(LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY)
+            if isinstance(row.metadata_, dict)
+            else None
+        ),
     )
+
+
+async def quarantine_uncertain_worker_termination(
+    db,
+    observed: WorkerTaskGeneration,
+    *,
+    operation: str,
+    error: str,
+) -> WorkerTaskGeneration | None:
+    """Quarantine an exact Worker generation after an unproved mutation.
+
+    The marker retains the complete pre-conflict generation.  A later relay
+    readback may clear it only through ``apply_authoritative_worker_task`` and
+    only when the same Worker retry/turn is authoritatively terminal.
+    """
+
+    if operation not in _WORKER_TERMINATION_OPERATIONS:
+        raise ValueError(f"Unsupported Worker termination operation: {operation}")
+    fenced = await db.execute(
+        update(Task)
+        .where(*_worker_task_generation_write_predicates(observed))
+        .values(status=Task.status)
+    )
+    if fenced.rowcount != 1:
+        await db.rollback()
+        return None
+    locked = (
+        await db.execute(
+            select(Task)
+            .where(*_worker_task_generation_write_predicates(observed))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if locked is None:
+        await db.rollback()
+        return None
+    metadata = dict(locked.metadata_ or {})
+    if WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in metadata:
+        await db.rollback()
+        return None
+    metadata[WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY] = {
+        "version": 1,
+        "operation": operation,
+        "operation_id": uuid.uuid4().hex,
+        "created_at": datetime.utcnow().isoformat(timespec="microseconds"),
+        "source_generation": _generation_marker_payload(observed),
+    }
+    locked.metadata_ = metadata
+    locked.status = "conflict"
+    locked.completed_at = datetime.utcnow()
+    locked.error_message = error
+    await db.flush()
+    resulting = await read_worker_task_generation(
+        db,
+        observed.task_id,
+        observed.worker_id,
+    )
+    if (
+        resulting is None
+        or not _valid_termination_uncertainty(resulting)
+    ):
+        await db.rollback()
+        return None
+    await db.commit()
+    return resulting
 
 
 _WORKER_TURN_HANDOFF_CLEAR_VALUES = {
@@ -379,9 +728,14 @@ async def reserve_worker_turn_handoff(
 ) -> WorkerTaskGeneration | None:
     """Reserve exactly one Worker G -> G+1 follow-up before network I/O."""
 
+    if await _active_worker_task_termination_exists(db, observed.task_id):
+        return None
+
     if (
         not _valid_worker_turn_handoff(observed)
         or _has_worker_turn_handoff(observed)
+        or observed.termination_uncertainty_present
+        or observed.legacy_carrier_conflict_present
         or not handoff_id
         or len(handoff_id) > 32
         or type(source_log_id) is not int
@@ -399,7 +753,7 @@ async def reserve_worker_turn_handoff(
         return None
     changed = await db.execute(
         update(Task)
-        .where(*worker_task_generation_predicates(observed))
+        .where(*_worker_task_generation_write_predicates(observed))
         .values(
             worker_turn_handoff_id=handoff_id,
             worker_turn_handoff_worker_id=observed.worker_id,
@@ -459,6 +813,31 @@ async def acknowledge_worker_turn_handoff(
         reserved
     ):
         return None
+    from_generation = reserved.worker_turn_handoff_from_generation
+    admission = await db.execute(
+        update(Task)
+        .where(
+            Task.id == reserved.task_id,
+            Task.worker_id == reserved.worker_id,
+            Task.shared_from_id.is_(None),
+            Task.retry_count == reserved.retry_count,
+            Task.turn_generation.in_((from_generation, from_generation + 1)),
+            Task.worker_turn_handoff_id == reserved.worker_turn_handoff_id,
+            Task.worker_turn_handoff_worker_id
+            == reserved.worker_turn_handoff_worker_id,
+            Task.worker_turn_handoff_retry_count
+            == reserved.worker_turn_handoff_retry_count,
+            Task.worker_turn_handoff_from_generation
+            == reserved.worker_turn_handoff_from_generation,
+            Task.worker_turn_handoff_source_log_id
+            == reserved.worker_turn_handoff_source_log_id,
+            _worker_task_termination_apply_predicate(),
+        )
+        .values(status=Task.status)
+    )
+    if admission.rowcount != 1:
+        await db.rollback()
+        return None
     task = (
         await db.execute(
             select(Task)
@@ -477,6 +856,10 @@ async def acknowledge_worker_turn_handoff(
                 == reserved.worker_turn_handoff_from_generation,
                 Task.worker_turn_handoff_source_log_id
                 == reserved.worker_turn_handoff_source_log_id,
+                Task.turn_generation.in_(
+                    (from_generation, from_generation + 1)
+                ),
+                _worker_task_termination_apply_predicate(),
             )
             .with_for_update()
             .execution_options(populate_existing=True)
@@ -485,9 +868,13 @@ async def acknowledge_worker_turn_handoff(
     if task is None:
         return None
     current = worker_task_generation(task, expected_worker_id=reserved.worker_id)
-    if current is None or not _valid_worker_turn_handoff(current):
+    if (
+        current is None
+        or not _valid_worker_turn_handoff(current)
+        or current.termination_uncertainty_present
+        or current.legacy_carrier_conflict_present
+    ):
         return None
-    from_generation = reserved.worker_turn_handoff_from_generation
     if task.turn_generation not in {from_generation, from_generation + 1}:
         return None
     receipt = (
@@ -648,9 +1035,29 @@ async def apply_authoritative_worker_task(
     *,
     metadata_updates: dict | None = None,
     worker_turn_handoff_id: str | None = None,
+    worker_termination_operation_id: str | None = None,
+    commit: bool = True,
 ) -> WorkerTaskGeneration | None:
     """CAS an authoritative Worker snapshot onto its exact observed mirror."""
 
+    # A semantic legacy-carrier split is permanent quarantine evidence.  A
+    # later generic Worker operation may re-subscribe the task, but ordinary
+    # snapshots must never turn that Manager conflict back into remote state.
+    if observed.legacy_carrier_conflict_present:
+        return None
+    from backend.services.worker_task_termination import (
+        manager_receipt_allows_authoritative_apply,
+    )
+
+    if not await manager_receipt_allows_authoritative_apply(
+        db,
+        observed.task_id,
+        worker_termination_operation_id,
+    ):
+        # Relay/status GETs are read-only while an exact termination receipt
+        # owns the Manager mirror.  Only that operation may apply its terminal
+        # Worker result and settle any linked G->G+1 handoff atomically.
+        return None
     values = authoritative_worker_task_values(
         remote_task,
         task_id=observed.task_id,
@@ -659,30 +1066,61 @@ async def apply_authoritative_worker_task(
         return None
     remote_retry_count = values["retry_count"]
     remote_turn_generation = values["turn_generation"]
-    adopting_handoff = _handoff_authorizes_next_turn(
-        observed,
-        retry_count=remote_retry_count,
-        turn_generation=remote_turn_generation,
+    clearing_termination_uncertainty = (
+        observed.termination_uncertainty_present
     )
-    same_turn = remote_turn_generation == observed.turn_generation
-    if adopting_handoff:
-        if worker_turn_handoff_id != observed.worker_turn_handoff_id:
-            return None
-    elif not same_turn or remote_retry_count < observed.retry_count:
+    if clearing_termination_uncertainty:
+        # Version-1 metadata quarantine predates durable remote receipts.  It
+        # has no request digest or remote operation id, so even an apparently
+        # terminal snapshot cannot prove which mutation produced it.  Keep it
+        # fail-closed for explicit operator reconciliation; never auto-clear it
+        # through the v2 receipt path.
         return None
-    elif _has_worker_turn_handoff(observed):
-        # A reservation may only carry its exact retry into G+1.  Do not let a
-        # concurrent/replayed Worker retry borrow the reservation.  Likewise,
-        # once terminal G reserved a follow-up, a fresh snapshot of G is old
-        # lifecycle evidence rather than authority for the next request.
-        if remote_retry_count != observed.retry_count:
-            return None
-        if (
-            observed.turn_generation
+    else:
+        adopting_handoff = _handoff_authorizes_next_turn(
+            observed,
+            retry_count=remote_retry_count,
+            turn_generation=remote_turn_generation,
+        )
+        same_turn = remote_turn_generation == observed.turn_generation
+        termination_settles_same_turn_handoff = bool(
+            worker_termination_operation_id is not None
+            and commit is False
+            and _has_worker_turn_handoff(observed)
+            and worker_turn_handoff_id == observed.worker_turn_handoff_id
+            and remote_retry_count == observed.retry_count
+            and same_turn
+            and observed.turn_generation
             == observed.worker_turn_handoff_from_generation
-            and observed.status in _TERMINAL_TASK_STATUSES
-        ):
+            and values["status"] in _TERMINAL_TASK_STATUSES
+        )
+        if adopting_handoff:
+            if worker_turn_handoff_id != observed.worker_turn_handoff_id:
+                return None
+        elif not same_turn or remote_retry_count < observed.retry_count:
             return None
+        elif _has_worker_turn_handoff(observed):
+            # A reservation may only carry its exact retry into G+1.  Do not
+            # let a concurrent/replayed Worker retry borrow the reservation.
+            if remote_retry_count != observed.retry_count:
+                return None
+            if (
+                observed.turn_generation
+                == observed.worker_turn_handoff_from_generation
+                and observed.status in _TERMINAL_TASK_STATUSES
+                and not termination_settles_same_turn_handoff
+            ):
+                return None
+    if (
+        remote_retry_count != observed.retry_count
+        or remote_turn_generation != observed.turn_generation
+    ):
+        # A logical-turn source is exact-generation-local. Mirror adoption has
+        # the same ownership semantics as a local TaskQueue claim: the old
+        # retry/turn's source must not remain addressable after the Worker
+        # proves a replacement. A later source binding must independently
+        # validate a durable row for the newly accepted generation.
+        values["turn_source_log_id"] = None
     merged_metadata_updates = dict(metadata_updates or {})
     remote_metadata = remote_task.get("metadata_") or {}
     if (
@@ -704,7 +1142,7 @@ async def apply_authoritative_worker_task(
         ):
             if key in remote_metadata:
                 merged_metadata_updates[key] = remote_metadata[key]
-    if merged_metadata_updates:
+    if merged_metadata_updates or clearing_termination_uncertainty:
         # Lock the exact mirror before merging JSON in Python. PostgreSQL JSON
         # has no equality operator, so comparing the whole document in the CAS
         # is not portable; the row lock protects unrelated Manager metadata
@@ -712,7 +1150,14 @@ async def apply_authoritative_worker_task(
         locked = (
             await db.execute(
                 select(Task)
-                .where(*worker_task_generation_predicates(observed))
+                .where(
+                    *_worker_task_generation_write_predicates(
+                        observed,
+                        worker_termination_operation_id=(
+                            worker_termination_operation_id
+                        ),
+                    )
+                )
                 .with_for_update()
             )
         ).scalar_one_or_none()
@@ -720,11 +1165,25 @@ async def apply_authoritative_worker_task(
             await db.rollback()
             return None
         metadata = dict(locked.metadata_ or {})
+        if clearing_termination_uncertainty:
+            if (
+                WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY not in metadata
+                or metadata[WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY]
+                != observed.termination_uncertainty
+            ):
+                await db.rollback()
+                return None
+            metadata.pop(WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY)
         metadata.update(merged_metadata_updates)
         values["metadata_"] = metadata
     changed = await db.execute(
         update(Task)
-        .where(*worker_task_generation_predicates(observed))
+        .where(
+            *_worker_task_generation_write_predicates(
+                observed,
+                worker_termination_operation_id=worker_termination_operation_id,
+            )
+        )
         .values(**values)
     )
     if changed.rowcount != 1:
@@ -738,24 +1197,250 @@ async def apply_authoritative_worker_task(
     if resulting is None:
         await db.rollback()
         return None
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
+    return resulting
+
+
+def _validated_generation_history(
+    remote: object,
+    *,
+    retry_count: int,
+    turn_generation: int,
+) -> list[dict] | None:
+    """Validate one complete Worker history response and select one turn.
+
+    Old rows written before exact-turn identity may coexist in a migrated
+    database.  They are ignored, never imported, while every newer row must
+    carry a valid scope/transport shape.  Returning ``None`` means the caller
+    cannot prove that the requested generation's history is complete.
+    """
+
+    if isinstance(remote, dict):
+        remote = remote.get("messages")
+    if not isinstance(remote, list) or not all(
+        isinstance(message, dict) for message in remote
+    ):
+        return None
+    non_user_messages = [
+        message
+        for message in remote
+        if message.get("event_type") != "user_message"
+    ]
+    scoped_messages = [
+        message
+        for message in non_user_messages
+        if type(message.get("task_retry_count")) is int
+        and type(message.get("task_turn_generation")) is int
+        and _validated_native_turn_id(message) is not _INVALID_NATIVE_TURN_ID
+        and _validated_turn_scope(message) is not _INVALID_TURN_SCOPE
+        and _valid_relay_log_metadata(message)
+    ]
+    legacy_unscoped_messages = [
+        message
+        for message in non_user_messages
+        if message.get("task_turn_generation") is None
+        and (
+            message.get("task_retry_count") is None
+            or type(message.get("task_retry_count")) is int
+        )
+        and _validated_native_turn_id(message) is not _INVALID_NATIVE_TURN_ID
+        and _validated_turn_scope(message) is not _INVALID_TURN_SCOPE
+        and _valid_relay_log_metadata(message)
+    ]
+    if (
+        len(scoped_messages) + len(legacy_unscoped_messages)
+        != len(non_user_messages)
+    ):
+        return None
+    return [
+        message
+        for message in scoped_messages
+        if message["task_retry_count"] == retry_count
+        and message["task_turn_generation"] == turn_generation
+    ]
+
+
+async def apply_authoritative_legacy_plan_execution_carrier(
+    db,
+    observed: WorkerTaskGeneration,
+    remote_task: dict,
+    remote_history: object,
+    *,
+    expected_proof_digest: str,
+    remote_proof: LegacyPlanExecutionCarrierProof,
+) -> WorkerTaskGeneration | None:
+    """Adopt one already-existing legacy carrier after two-sided proof.
+
+    This is intentionally narrower than ordinary Worker reconciliation.  It
+    can only advance a still-pending Manager mirror, never creates/reposts a
+    Task, and commits the exact remote history together with the lifecycle
+    adoption.  That single transaction removes the crash window where a
+    terminal mirror could otherwise lose the only recovery subscription before
+    its output tail was durable on the Manager.
+    """
+
+    if await _active_worker_task_termination_exists(db, observed.task_id):
+        return None
+    if (
+        observed.legacy_carrier_conflict_present
+        or observed.termination_uncertainty_present
+        or observed.status not in _LEGACY_CARRIER_EXECUTION_STATUSES
+        or _has_worker_turn_handoff(observed)
+        or not isinstance(expected_proof_digest, str)
+        or len(expected_proof_digest) != 64
+        or not isinstance(remote_proof, LegacyPlanExecutionCarrierProof)
+        or remote_proof.task_id != observed.task_id
+        or remote_proof.proof_digest != expected_proof_digest
+        or remote_proof.task_status not in _LEGACY_CARRIER_EXECUTION_STATUSES
+        or not legacy_plan_execution_snapshot_matches_proof(
+            remote_task,
+            remote_proof,
+        )
+    ):
+        return None
+    values = authoritative_worker_task_values(
+        remote_task,
+        task_id=observed.task_id,
+    )
+    if (
+        values is None
+        or values["status"] != remote_proof.task_status
+        or values["retry_count"] != remote_proof.retry_count
+        or values["turn_generation"] != remote_proof.turn_generation
+        or remote_proof.retry_count < observed.retry_count
+        or remote_proof.turn_generation < observed.turn_generation
+    ):
+        return None
+    remote_entries = _validated_generation_history(
+        remote_history,
+        retry_count=remote_proof.retry_count,
+        turn_generation=remote_proof.turn_generation,
+    )
+    if remote_entries is None:
+        return None
+
+    local_proof = await legacy_approved_execution_carrier_proof(
+        db,
+        observed.task_id,
+        for_update=True,
+    )
+    if (
+        local_proof is None
+        or local_proof.proof_digest != expected_proof_digest
+        or local_proof.task_status != observed.status
+        or local_proof.retry_count != observed.retry_count
+        or local_proof.turn_generation != observed.turn_generation
+    ):
+        return None
+
+    if (
+        remote_proof.retry_count != observed.retry_count
+        or remote_proof.turn_generation != observed.turn_generation
+    ):
+        values["turn_source_log_id"] = None
+    changed = await db.execute(
+        update(Task)
+        .where(
+            *_worker_task_generation_write_predicates(observed),
+            Task.mode == "plan",
+            Task.plan_approved.is_(True),
+        )
+        .values(**values)
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        return None
+
+    local_rows = (
+        await db.execute(
+            select(
+                LogEntry.event_type,
+                LogEntry.role,
+                LogEntry.content,
+                LogEntry.tool_name,
+                LogEntry.tool_input,
+                LogEntry.tool_output,
+                LogEntry.loop_iteration,
+                LogEntry.native_turn_id,
+                LogEntry.turn_scope,
+                LogEntry.actual_transport,
+            ).where(
+                LogEntry.task_id == observed.task_id,
+                LogEntry.task_retry_count == remote_proof.retry_count,
+                LogEntry.task_turn_generation == remote_proof.turn_generation,
+                LogEntry.event_type != "user_message",
+            )
+        )
+    ).all()
+    missing = _missing_by_fingerprint(
+        [dict(row._mapping) for row in local_rows],
+        remote_entries,
+    )
+    for message in missing:
+        turn_scope = _validated_turn_scope(message)
+        db.add(
+            LogEntry(
+                instance_id=None,
+                task_id=observed.task_id,
+                task_retry_count=remote_proof.retry_count,
+                task_turn_generation=remote_proof.turn_generation,
+                native_turn_id=_validated_native_turn_id(message),
+                turn_scope=turn_scope,
+                actual_transport=_validated_actual_transport(
+                    message,
+                    turn_scope,
+                ),
+                event_type=message.get("event_type") or "message",
+                role=message.get("role"),
+                content=message.get("content"),
+                tool_name=message.get("tool_name"),
+                tool_input=message.get("tool_input"),
+                tool_output=message.get("tool_output"),
+                raw_json=message.get("raw_json"),
+                is_error=message.get("is_error", False),
+                loop_iteration=message.get("loop_iteration"),
+            )
+        )
+    resulting = await read_worker_task_generation(
+        db,
+        observed.task_id,
+        observed.worker_id,
+    )
+    if (
+        resulting is None
+        or resulting.status != remote_proof.task_status
+        or resulting.retry_count != remote_proof.retry_count
+        or resulting.turn_generation != remote_proof.turn_generation
+    ):
+        await db.rollback()
+        return None
     await db.commit()
     return resulting
 
 
 def _entry_fingerprint(e: dict) -> tuple:
     """Stable identity for a relayed log entry, comparable between the local DB
-    copy and the remote chat/history payload. Uses only fields that survive the
-    history serialization unchanged, prefix-capped to dodge truncation."""
+    copy and the remote chat/history payload.  Only tool payloads are capped,
+    exactly at the history endpoint's observable truncation boundary; message
+    content is returned in full and must never be collapsed by a shorter
+    convenience prefix."""
     def p(s):
         return (s or "")[:_FP_PREFIX]
     return (
         e.get("event_type") or "",
         e.get("role") or "",
-        p(e.get("content")),
+        e.get("content") or "",
         e.get("tool_name") or "",
         p(e.get("tool_input")),
         p(e.get("tool_output")),
         e.get("loop_iteration"),
+        # Scope is durable terminal-arbitration evidence.  A legacy NULL row
+        # must not suppress a later exact copy carrying an authoritative scope.
+        e.get("turn_scope"),
+        e.get("actual_transport"),
         # Native turns can retry/rebind within one logical task generation.
         # Identical text from two such turns is two pieces of evidence, not a
         # reconnect duplicate.
@@ -807,6 +1492,8 @@ EXACT_GENERATION_RELAY_EVENT_TYPES = frozenset({
 })
 
 _INVALID_NATIVE_TURN_ID = object()
+_INVALID_TURN_SCOPE = object()
+_INVALID_ACTUAL_TRANSPORT = object()
 
 
 def _validated_native_turn_id(payload: dict):
@@ -818,6 +1505,55 @@ def _validated_native_turn_id(payload: dict):
     if isinstance(value, str) and len(value) <= 200:
         return value
     return _INVALID_NATIVE_TURN_ID
+
+
+def _validated_turn_scope(payload: dict):
+    """Return an exact scope, legacy ``None``, or an invalid sentinel.
+
+    Rolling-upgrade Workers legitimately omit this newly introduced field.
+    Such events remain visible but cannot become terminal evidence.  Explicit
+    unknown values are protocol violations and must fail closed instead of
+    being guessed as foreground output.
+    """
+
+    value = payload.get("turn_scope")
+    if value is None:
+        return None
+    return (
+        value
+        if type(value) is str and value in _TURN_SCOPES
+        else _INVALID_TURN_SCOPE
+    )
+
+
+def _validated_actual_transport(payload: dict, turn_scope):
+    """Validate immutable source transport without inferring a route.
+
+    The current relay intentionally does not map a Worker's source row onto a
+    distinct Manager source row. Consequently output events with a missing
+    route stay NULL and Worker Auto Capability must remain gated off; neither
+    provider nor model metadata may fill that proof gap.
+    """
+
+    value = payload.get("actual_transport")
+    if value is None:
+        return None
+    if (
+        turn_scope != "source"
+        or type(value) is not str
+        or value not in _ACTUAL_TRANSPORTS
+    ):
+        return _INVALID_ACTUAL_TRANSPORT
+    return value
+
+
+def _valid_relay_log_metadata(payload: dict) -> bool:
+    scope = _validated_turn_scope(payload)
+    return bool(
+        scope is not _INVALID_TURN_SCOPE
+        and _validated_actual_transport(payload, scope)
+        is not _INVALID_ACTUAL_TRANSPORT
+    )
 
 
 class WorkerRelay:
@@ -833,6 +1569,15 @@ class WorkerRelay:
         self._handoff_recovery_tasks: dict[
             tuple[int, int, str], asyncio.Task
         ] = {}
+        self._legacy_carrier_recovery_tasks: dict[
+            tuple[int, int, str], asyncio.Task
+        ] = {}
+        # A recovery stays strongly owned through its final readback, but live
+        # events must queue behind the operation lock instead of being dropped
+        # once the initial semantic adoption has committed.
+        self._legacy_carrier_recovery_released: set[
+            tuple[int, int, str]
+        ] = set()
         self._shutting_down = False
         self._shutdown_task: asyncio.Task | None = None
 
@@ -875,6 +1620,8 @@ class WorkerRelay:
             self._loops,
             self._reconnect_tasks,
             self._handoff_recovery_tasks,
+            self._legacy_carrier_recovery_tasks,
+            self._legacy_carrier_recovery_released,
         )
         if any(owned_registries):
             raise RuntimeError(
@@ -977,6 +1724,451 @@ class WorkerRelay:
         """迁移后停止中继该 task（_handle 按 self._tasks 过滤，移除即生效）。"""
         self._tasks.get(worker_id, set()).discard(task_id)
 
+    def _legacy_carrier_recovery_active(
+        self,
+        worker_id: int,
+        task_id: int,
+    ) -> bool:
+        """Return whether live relay must defer to semantic carrier readback."""
+
+        return any(
+            key[0] == worker_id
+            and key[1] == task_id
+            and key not in self._legacy_carrier_recovery_released
+            and not recovery.done()
+            for key, recovery in self._legacy_carrier_recovery_tasks.items()
+        )
+
+    def ensure_legacy_plan_execution_carrier_recovery(
+        self,
+        worker: Worker,
+        task_id: int,
+        expected_proof_digest: str,
+        proxy,
+    ) -> None:
+        """Own read-only recovery of one pre-Plan-v2 Worker carrier.
+
+        Registration happens synchronously before the first network await so
+        the relay can subscribe without letting an unproved live Worker event
+        mutate the pending Manager mirror.  Full history/snapshot readback then
+        commits with the exact local generation before normal relay resumes.
+        """
+
+        if (
+            self._shutting_down
+            or worker.id in self._closing
+            or type(task_id) is not int
+            or task_id <= 0
+            or not isinstance(expected_proof_digest, str)
+            or len(expected_proof_digest) != 64
+            or any(
+                char not in "0123456789abcdef"
+                for char in expected_proof_digest
+            )
+        ):
+            return
+        for key, existing in self._legacy_carrier_recovery_tasks.items():
+            if (
+                key[0] == worker.id
+                and key[1] == task_id
+                and not existing.done()
+            ):
+                return
+        key = (worker.id, task_id, expected_proof_digest)
+        recovery = asyncio.create_task(
+            self._legacy_plan_execution_carrier_recovery_loop(
+                worker.id,
+                task_id,
+                expected_proof_digest,
+                proxy,
+            )
+        )
+        self._legacy_carrier_recovery_tasks[key] = recovery
+
+        def cleanup(done: asyncio.Task) -> None:
+            if self._legacy_carrier_recovery_tasks.get(key) is done:
+                self._legacy_carrier_recovery_tasks.pop(key, None)
+            self._legacy_carrier_recovery_released.discard(key)
+            if done.cancelled():
+                return
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                return
+            if error is not None:
+                logger.error(
+                    "Legacy Plan carrier recovery failed for task %s",
+                    task_id,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        recovery.add_done_callback(cleanup)
+
+    async def _conflict_legacy_plan_execution_carrier(
+        self,
+        observed: WorkerTaskGeneration,
+        *,
+        expected_proof_digest: str,
+        error: str,
+    ) -> WorkerTaskGeneration | None:
+        """Durably expose a proven semantic split without replaying either side."""
+
+        async with self.db_factory() as db:
+            if await _active_worker_task_termination_exists(
+                db,
+                observed.task_id,
+            ):
+                return None
+            local_proof = await legacy_approved_execution_carrier_proof(
+                db,
+                observed.task_id,
+                for_update=True,
+            )
+            if (
+                local_proof is None
+                or local_proof.proof_digest != expected_proof_digest
+                or local_proof.task_status != observed.status
+                or local_proof.retry_count != observed.retry_count
+                or local_proof.turn_generation != observed.turn_generation
+            ):
+                return None
+            locked = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        *_worker_task_generation_write_predicates(observed),
+                        Task.mode == "plan",
+                        Task.plan_approved.is_(True),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if locked is None:
+                await db.rollback()
+                return None
+            metadata = dict(locked.metadata_ or {})
+            if LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY in metadata:
+                await db.rollback()
+                return None
+            metadata[LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY] = {
+                "version": 1,
+                "operation_id": uuid.uuid4().hex,
+                "created_at": datetime.utcnow().isoformat(
+                    timespec="microseconds"
+                ),
+                "expected_proof_digest": expected_proof_digest,
+                "source_generation": _generation_marker_payload(observed),
+            }
+            changed = await db.execute(
+                update(Task)
+                .where(
+                    *_worker_task_generation_write_predicates(observed),
+                    Task.mode == "plan",
+                    Task.plan_approved.is_(True),
+                )
+                .values(
+                    metadata_=metadata,
+                    status="conflict",
+                    completed_at=datetime.utcnow(),
+                    error_message=error,
+                )
+            )
+            if changed.rowcount != 1:
+                await db.rollback()
+                return None
+            resulting = await read_worker_task_generation(
+                db,
+                observed.task_id,
+                observed.worker_id,
+            )
+            if (
+                resulting is None
+                or resulting.status != "conflict"
+                or not resulting.legacy_carrier_conflict_present
+            ):
+                await db.rollback()
+                return None
+            await db.commit()
+            return resulting
+
+    async def _quarantine_legacy_plan_execution_carrier(
+        self,
+        observed: WorkerTaskGeneration,
+        *,
+        expected_proof_digest: str,
+        remote_proof: LegacyPlanExecutionCarrierProof,
+    ) -> WorkerTaskGeneration | None:
+        if (
+            remote_proof.task_id != observed.task_id
+            or remote_proof.proof_digest == expected_proof_digest
+        ):
+            return None
+        return await self._conflict_legacy_plan_execution_carrier(
+            observed,
+            expected_proof_digest=expected_proof_digest,
+            error=(
+                "Legacy Plan execution carrier differs between Manager and "
+                "Worker; remote execution was quarantined without replay"
+            ),
+        )
+
+    async def _legacy_plan_execution_carrier_recovery_loop(
+        self,
+        worker_id: int,
+        task_id: int,
+        expected_proof_digest: str,
+        proxy,
+    ) -> None:
+        """Retry semantic readback until the remote carrier leaves pending."""
+
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        key = (worker_id, task_id, expected_proof_digest)
+        delay = LEGACY_CARRIER_RECOVERY_BASE_DELAY
+        adopted = False
+        while not self._shutting_down and worker_id not in self._closing:
+            resulting: WorkerTaskGeneration | None = None
+            try:
+                async with get_task_operation_lock(task_id):
+                    if self._shutting_down or worker_id in self._closing:
+                        return
+                    observed = await self._observe_task_generation(
+                        worker_id,
+                        task_id,
+                    )
+                    if (
+                        observed is None
+                        or (
+                            observed.status != "pending"
+                            and not adopted
+                        )
+                    ):
+                        return
+                    previous_status = observed.status
+                    async with self.db_factory() as db:
+                        if await _active_worker_task_termination_exists(
+                            db,
+                            task_id,
+                        ):
+                            return
+                        local_proof = (
+                            await legacy_approved_execution_carrier_proof(
+                                db,
+                                task_id,
+                            )
+                        )
+                        worker = await db.get(Worker, worker_id)
+                    if (
+                        local_proof is None
+                        or local_proof.proof_digest
+                        != expected_proof_digest
+                        or local_proof.task_status != observed.status
+                        or local_proof.retry_count != observed.retry_count
+                        or local_proof.turn_generation
+                        != observed.turn_generation
+                    ):
+                        return
+                    if worker is None or worker.status != "ready":
+                        raise RuntimeError(
+                            "legacy Plan carrier Worker is not ready"
+                        )
+
+                    # Subscribe only after the in-memory quarantine above is
+                    # registered, and before any proof/snapshot readback.
+                    await self.subscribe_task(worker, task_id)
+                    remote_proof = (
+                        await proxy.get_legacy_plan_execution_carrier_proof(
+                            worker,
+                            task_id,
+                        )
+                    )
+                    if remote_proof is None:
+                        resulting = await (
+                            self._conflict_legacy_plan_execution_carrier(
+                                observed,
+                                expected_proof_digest=expected_proof_digest,
+                                error=(
+                                    "Legacy Plan execution carrier is absent "
+                                    "on its assigned Worker; automatic replay "
+                                    "was quarantined"
+                                ),
+                            )
+                        )
+                    elif remote_proof.proof_digest != expected_proof_digest:
+                        resulting = (
+                            await self._quarantine_legacy_plan_execution_carrier(
+                                observed,
+                                expected_proof_digest=expected_proof_digest,
+                                remote_proof=remote_proof,
+                            )
+                        )
+                    elif resulting is None:
+                        async with httpx.AsyncClient(timeout=30) as client:
+                            remote_task = await self._fetch_task_snapshot(
+                                worker,
+                                task_id,
+                                client=client,
+                            )
+                            history_response = await client.get(
+                                self._api(
+                                    worker,
+                                    f"/api/tasks/{task_id}/chat/history?compact=false",
+                                ),
+                                headers=self._headers(worker),
+                            )
+                            remote_history = (
+                                history_response.json()
+                                if history_response.status_code == 200
+                                else None
+                            )
+                        proof_after = (
+                            await proxy.get_legacy_plan_execution_carrier_proof(
+                                worker,
+                                task_id,
+                            )
+                        )
+                        if proof_after != remote_proof:
+                            raise RuntimeError(
+                                "legacy Plan carrier changed during readback"
+                            )
+                        if (
+                            remote_task is not None
+                            and remote_history is not None
+                            and not legacy_plan_execution_snapshot_matches_proof(
+                                remote_task,
+                                remote_proof,
+                            )
+                        ):
+                            resulting = await (
+                                self._conflict_legacy_plan_execution_carrier(
+                                    observed,
+                                    expected_proof_digest=expected_proof_digest,
+                                    error=(
+                                        "Legacy Plan execution carrier Task "
+                                        "snapshot differs from its semantic "
+                                        "proof; remote execution was quarantined"
+                                    ),
+                                )
+                            )
+                        elif remote_task is not None and remote_history is not None:
+                            async with self.db_factory() as db:
+                                resulting = await (
+                                    apply_authoritative_legacy_plan_execution_carrier(
+                                        db,
+                                        observed,
+                                        remote_task,
+                                        remote_history,
+                                        expected_proof_digest=(
+                                            expected_proof_digest
+                                        ),
+                                        remote_proof=remote_proof,
+                                    )
+                                )
+                    if resulting is not None and resulting.status == "conflict":
+                        # Conflict is a permanent quarantine.  Keeping the
+                        # socket's routing hint would let a fresh remote
+                        # snapshot overwrite it after this recovery exits.
+                        self.unsubscribe_task(worker_id, task_id)
+                    elif resulting is not None and resulting.status != "pending":
+                        adopted = True
+                        # Stop dropping live events before the closing readback,
+                        # while the operation lock still makes them wait.  A
+                        # second stable proof/snapshot/history pass catches every
+                        # event dropped during the initial quarantine.
+                        self._legacy_carrier_recovery_released.add(key)
+                        try:
+                            closing_proof = (
+                                await proxy.get_legacy_plan_execution_carrier_proof(
+                                    worker,
+                                    task_id,
+                                )
+                            )
+                            if closing_proof is None:
+                                raise RuntimeError(
+                                    "legacy Plan carrier disappeared during "
+                                    "closing readback"
+                                )
+                            async with httpx.AsyncClient(timeout=30) as client:
+                                closing_task = await self._fetch_task_snapshot(
+                                    worker,
+                                    task_id,
+                                    client=client,
+                                )
+                                closing_history_response = await client.get(
+                                    self._api(
+                                        worker,
+                                        f"/api/tasks/{task_id}/chat/history?compact=false",
+                                    ),
+                                    headers=self._headers(worker),
+                                )
+                                closing_history = (
+                                    closing_history_response.json()
+                                    if closing_history_response.status_code == 200
+                                    else None
+                                )
+                            closing_proof_after = (
+                                await proxy.get_legacy_plan_execution_carrier_proof(
+                                    worker,
+                                    task_id,
+                                )
+                            )
+                            if (
+                                closing_proof_after != closing_proof
+                                or closing_proof.proof_digest
+                                != expected_proof_digest
+                                or closing_task is None
+                                or closing_history is None
+                                or not legacy_plan_execution_snapshot_matches_proof(
+                                    closing_task,
+                                    closing_proof,
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "legacy Plan carrier closing readback was "
+                                    "not stable"
+                                )
+                            async with self.db_factory() as db:
+                                closing_result = await (
+                                    apply_authoritative_legacy_plan_execution_carrier(
+                                        db,
+                                        resulting,
+                                        closing_task,
+                                        closing_history,
+                                        expected_proof_digest=expected_proof_digest,
+                                        remote_proof=closing_proof,
+                                    )
+                                )
+                            if closing_result is None:
+                                raise RuntimeError(
+                                    "legacy Plan carrier closing generation "
+                                    "could not be committed"
+                                )
+                            resulting = closing_result
+                        except BaseException:
+                            self._legacy_carrier_recovery_released.discard(key)
+                            raise
+                    if resulting is not None and resulting.status != previous_status:
+                        await self._publish_status_generation(
+                            resulting,
+                            notify_completion=False,
+                        )
+                    if resulting is not None and resulting.status != "pending":
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.info(
+                    "Legacy Plan carrier recovery deferred for task %s",
+                    task_id,
+                    exc_info=True,
+                )
+            await asyncio.sleep(delay)
+            delay = min(
+                max(delay * 2, LEGACY_CARRIER_RECOVERY_BASE_DELAY),
+                LEGACY_CARRIER_RECOVERY_MAX_DELAY,
+            )
+
     async def _stop_worker_impl(self, worker_id: int) -> None:
         """Close one Worker's socket and await every owned background task."""
 
@@ -992,10 +2184,20 @@ class WorkerRelay:
                 for key, task in list(self._handoff_recovery_tasks.items())
                 if key[0] == worker_id
             ]
+            legacy_recovery_items = [
+                (key, task)
+                for key, task in list(
+                    self._legacy_carrier_recovery_tasks.items()
+                )
+                if key[0] == worker_id
+            ]
             if loop_task is not None:
                 owned_tasks.add(loop_task)
             owned_tasks.update(reconnect_tasks)
             owned_tasks.update(task for _key, task in recovery_items)
+            owned_tasks.update(
+                task for _key, task in legacy_recovery_items
+            )
             current = asyncio.current_task()
             for task in owned_tasks:
                 if task is not current and not task.done():
@@ -1018,6 +2220,10 @@ class WorkerRelay:
         for key, task in recovery_items:
             if self._handoff_recovery_tasks.get(key) is task:
                 self._handoff_recovery_tasks.pop(key, None)
+        for key, task in legacy_recovery_items:
+            if self._legacy_carrier_recovery_tasks.get(key) is task:
+                self._legacy_carrier_recovery_tasks.pop(key, None)
+            self._legacy_carrier_recovery_released.discard(key)
 
     async def stop_worker(self, worker_id: int):
         """断开并停止重连（worker 关机/销毁前必须调，否则重连风暴）。"""
@@ -1044,6 +2250,7 @@ class WorkerRelay:
             | set(self._loops)
             | set(self._reconnect_tasks)
             | {key[0] for key in self._handoff_recovery_tasks}
+            | {key[0] for key in self._legacy_carrier_recovery_tasks}
         )
         results = await asyncio.gather(
             *(self._stop_worker_impl(worker_id) for worker_id in worker_ids),
@@ -1061,6 +2268,7 @@ class WorkerRelay:
                 for task in tasks
             ),
             *self._handoff_recovery_tasks.values(),
+            *self._legacy_carrier_recovery_tasks.values(),
         }
         current = asyncio.current_task()
         for task in leftovers:
@@ -1085,6 +2293,8 @@ class WorkerRelay:
         self._loops.clear()
         self._reconnect_tasks.clear()
         self._handoff_recovery_tasks.clear()
+        self._legacy_carrier_recovery_tasks.clear()
+        self._legacy_carrier_recovery_released.clear()
         self._tasks.clear()
 
         failures = [result for result in results if isinstance(result, BaseException)]
@@ -1121,6 +2331,7 @@ class WorkerRelay:
             result = await db.execute(
                 select(Task).where(
                     Task.worker_id == worker.id,
+                    _worker_task_termination_apply_predicate(),
                     or_(
                         Task.status.in_(
                             ["executing", "in_progress", "plan_review"]
@@ -1129,6 +2340,11 @@ class WorkerRelay:
                             (Task.status == "completed")
                             & Task.pty_background_generation.isnot(None)
                         ),
+                        # A lost stop/cancel response is deliberately stored
+                        # as conflict. Re-subscribe it after restart so one
+                        # exact terminal GET can converge the durable marker;
+                        # ordinary/legacy conflicts are filtered below.
+                        Task.status == "conflict",
                         # A completed Manager mirror may already have ACKed a
                         # follow-up while the Worker has not emitted the first
                         # exact G+1 event yet.  The durable reservation is an
@@ -1141,7 +2357,12 @@ class WorkerRelay:
                     ),
                 )
             )
-            active = result.scalars().all()
+            active = [
+                task
+                for task in result.scalars().all()
+                if task.status != "conflict"
+                or has_worker_termination_uncertainty(task.metadata_)
+            ]
         for t in active:
             if self._shutting_down:
                 return
@@ -1191,6 +2412,7 @@ class WorkerRelay:
                         Task.id == task_id,
                         Task.worker_id == worker_id,
                         Task.shared_from_id.is_(None),
+                        _worker_task_termination_apply_predicate(),
                     )
                     .with_for_update()
                 )
@@ -1232,6 +2454,12 @@ class WorkerRelay:
                     return None
                 await db.rollback()
                 return observed
+            if (
+                observed.termination_uncertainty_present
+                or observed.legacy_carrier_conflict_present
+            ):
+                await db.rollback()
+                return None
             if not _handoff_authorizes_next_turn(
                 observed,
                 retry_count=retry_count,
@@ -1240,21 +2468,40 @@ class WorkerRelay:
                 await db.rollback()
                 return None
 
-            task.turn_generation = turn_generation
             # Do not clear the marker here.  This transaction only adopts the
             # generation fence.  A live chat event clears it in the same
             # transaction that persists the Manager LogEntry; status recovery
             # keeps it until exact history is backfilled.  Marking the task
             # active guarantees restart recovery remains subscribed between
             # those two commits.
-            task.status = "executing"
-            task.completed_at = None
-            await db.flush()
-            resulting = worker_task_generation(
-                task,
-                expected_worker_id=worker_id,
+            # SELECT .. FOR UPDATE is ignored by SQLite.  Adopt through a
+            # complete conditional write so a concurrent cancel/retry/migrate
+            # that changes any observed ownership field wins instead of being
+            # overwritten by this session's stale ORM snapshot.
+            adopted = await db.execute(
+                update(Task)
+                .where(*_worker_task_generation_write_predicates(observed))
+                .values(
+                    turn_generation=turn_generation,
+                    turn_source_log_id=None,
+                    status="executing",
+                    completed_at=None,
+                )
             )
-            if resulting is None:
+            if adopted.rowcount != 1:
+                await db.rollback()
+                return None
+            resulting = await read_worker_task_generation(
+                db,
+                task_id,
+                worker_id,
+            )
+            if (
+                resulting is None
+                or resulting.retry_count != retry_count
+                or resulting.turn_generation != turn_generation
+                or resulting.status != "executing"
+            ):
                 await db.rollback()
                 return None
             await db.commit()
@@ -1392,25 +2639,41 @@ class WorkerRelay:
         *,
         client=None,
     ) -> bool:
-        headers = self._headers(worker)
-        if replay["terminal_pr_review_chat"]:
-            headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
-                PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
-            )
-
-        async def send(http_client):
-            response = await http_client.post(
-                self._api(worker, f"/api/tasks/{observed.task_id}/chat"),
-                headers=headers,
-                json=replay["payload"],
-            )
-            return 200 <= response.status_code < 300
-
         try:
-            if client is not None:
-                return await send(client)
-            async with httpx.AsyncClient(timeout=60) as http_client:
-                return await send(http_client)
+            async with self.db_factory() as db:
+                fenced = await _acquire_worker_turn_handoff_effect_fence(
+                    db,
+                    observed,
+                )
+                if fenced is None:
+                    return False
+                headers = self._headers(worker)
+                if replay["terminal_pr_review_chat"]:
+                    headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
+                        PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
+                    )
+
+                async def send(http_client):
+                    response = await http_client.post(
+                        self._api(
+                            worker,
+                            f"/api/tasks/{observed.task_id}/chat",
+                        ),
+                        headers=headers,
+                        json=replay["payload"],
+                    )
+                    return 200 <= response.status_code < 300
+
+                if client is not None:
+                    accepted = await send(client)
+                else:
+                    async with httpx.AsyncClient(timeout=60) as http_client:
+                        accepted = await send(http_client)
+                if accepted:
+                    await db.commit()
+                else:
+                    await db.rollback()
+                return accepted
         except Exception:
             logger.warning(
                 "replay Worker turn handoff %s for task %s on worker %s failed",
@@ -1479,10 +2742,18 @@ class WorkerRelay:
         """Consume exact remote cancellation and clear the Manager marker."""
 
         async with self.db_factory() as db:
+            fenced = await db.execute(
+                update(Task)
+                .where(*_worker_task_generation_write_predicates(observed))
+                .values(status=Task.status)
+            )
+            if fenced.rowcount != 1:
+                await db.rollback()
+                return False
             task = (
                 await db.execute(
                     select(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .with_for_update()
                 )
             ).scalar_one_or_none()
@@ -1516,31 +2787,46 @@ class WorkerRelay:
         worker: Worker,
         observed: WorkerTaskGeneration,
     ) -> bool:
+        if (
+            observed.termination_uncertainty_present
+            or observed.legacy_carrier_conflict_present
+        ):
+            return False
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
-                response = await client.post(
-                    self._api(
-                        worker,
-                        f"/api/tasks/{observed.task_id}/worker-turn-handoffs/"
-                        f"{observed.worker_turn_handoff_id}/resume",
-                    ),
-                    headers=self._headers(worker),
+            async with self.db_factory() as db:
+                fenced = await _acquire_worker_turn_handoff_effect_fence(
+                    db,
+                    observed,
                 )
-            if response.status_code != 200:
-                return False
-            payload = response.json()
-            return bool(
-                isinstance(payload, dict)
-                and self._remote_handoff_matches(observed, payload)
-                # Only accepted/claimed callers invoke this endpoint.  The
-                # response may already be post-boundary because the queue can
-                # advance while the resume request is in flight.
-                and payload.get("status")
-                in (
-                    _WORKER_HANDOFF_REPLAYABLE_STATUSES
-                    | _WORKER_HANDOFF_POST_BOUNDARY_STATUSES
+                if fenced is None:
+                    return False
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(
+                        self._api(
+                            worker,
+                            f"/api/tasks/{observed.task_id}/worker-turn-handoffs/"
+                            f"{observed.worker_turn_handoff_id}/resume",
+                        ),
+                        headers=self._headers(worker),
+                    )
+                payload = response.json() if response.status_code == 200 else None
+                resumed = bool(
+                    isinstance(payload, dict)
+                    and self._remote_handoff_matches(observed, payload)
+                    # Only accepted/claimed callers invoke this endpoint.  The
+                    # response may already be post-boundary because the queue
+                    # can advance while the resume request is in flight.
+                    and payload.get("status")
+                    in (
+                        _WORKER_HANDOFF_REPLAYABLE_STATUSES
+                        | _WORKER_HANDOFF_POST_BOUNDARY_STATUSES
+                    )
                 )
-            )
+                if resumed:
+                    await db.commit()
+                else:
+                    await db.rollback()
+                return resumed
         except Exception:
             logger.warning(
                 "resume Worker turn handoff %s for task %s on worker %s failed",
@@ -1561,7 +2847,11 @@ class WorkerRelay:
     ) -> bool:
         """Recover a missing/accepted receipt using the exact durable POST."""
 
-        if not _has_worker_turn_handoff(observed):
+        if (
+            not _has_worker_turn_handoff(observed)
+            or observed.termination_uncertainty_present
+            or observed.legacy_carrier_conflict_present
+        ):
             return False
         if not operation_lock_held:
             from backend.services.worker_proxy import get_task_operation_lock
@@ -1575,6 +2865,8 @@ class WorkerRelay:
                     current is None
                     or current.worker_turn_handoff_id
                     != observed.worker_turn_handoff_id
+                    or current.termination_uncertainty_present
+                    or current.legacy_carrier_conflict_present
                 ):
                     return False
                 return await self._resume_accepted_worker_turn_handoff(
@@ -1585,6 +2877,12 @@ class WorkerRelay:
                     operation_lock_held=True,
                 )
 
+        async with self.db_factory() as db:
+            if await _active_worker_task_termination_exists(
+                db,
+                observed.task_id,
+            ):
+                return False
         replay = await self._manager_worker_turn_handoff_request(observed)
         if replay is None:
             return False
@@ -1668,6 +2966,8 @@ class WorkerRelay:
             self._shutting_down
             or worker.id in self._closing
             or not _has_worker_turn_handoff(observed)
+            or observed.termination_uncertainty_present
+            or observed.legacy_carrier_conflict_present
         ):
             return
         key = (
@@ -1735,6 +3035,12 @@ class WorkerRelay:
                             or observed.worker_turn_handoff_id != handoff_id
                         ):
                             return
+                        async with self.db_factory() as db:
+                            if await _active_worker_task_termination_exists(
+                                db,
+                                task_id,
+                            ):
+                                return
                         async with self.db_factory() as db:
                             worker = await db.get(Worker, worker_id)
                         if worker is not None and worker.status == "ready":
@@ -1898,7 +3204,7 @@ class WorkerRelay:
         async with self.db_factory() as db:
             guarded = await db.execute(
                 update(Task)
-                .where(*worker_task_generation_predicates(generation))
+                .where(*_worker_task_generation_write_predicates(generation))
                 .values(status=generation.status)
             )
             if guarded.rowcount != 1:
@@ -2081,7 +3387,7 @@ class WorkerRelay:
         async with self.db_factory() as db:
             guarded = await db.execute(
                 update(Task)
-                .where(*worker_task_generation_predicates(generation))
+                .where(*_worker_task_generation_write_predicates(generation))
                 .values(
                     pty_background_generation=(
                         generation.pty_background_generation
@@ -2217,26 +3523,28 @@ class WorkerRelay:
                 if self._shutting_down or worker_id in self._closing:
                     return
                 continue
-        # 重连失败 → 活跃 task 标 failed（worker 状态交给健康检查处理）
+        # Reconnect exhaustion cannot prove the Worker stopped.  Preserve the
+        # exact active/background generation so retry and migration remain
+        # blocked, while recording a durable quarantine reason for later
+        # Worker readback/reconciliation.
         if self._shutting_down or worker_id in self._closing:
             return
         logger.error("worker %s relay reconnect exhausted", worker.id)
-        failed_generations: list[WorkerTaskGeneration] = []
+        quarantined_generations: list[WorkerTaskGeneration] = []
         for tid, observed in disconnected_generations.items():
             async with self.db_factory() as db:
-                failed = await db.execute(
+                quarantined = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(
-                        status="failed",
-                        completed_at=datetime.utcnow(),
                         error_message=(
-                            f"Worker {worker.name} 断连且无法重连"
+                            f"Worker {worker.name} relay reconnect exhausted; "
+                            "remote execution outcome is uncertain and automatic "
+                            "retry/migration remains blocked pending reconciliation"
                         ),
-                        pty_background_generation=None,
                     )
                 )
-                if failed.rowcount != 1:
+                if quarantined.rowcount != 1:
                     await db.rollback()
                     continue
                 resulting = await read_worker_task_generation(
@@ -2248,9 +3556,19 @@ class WorkerRelay:
                     await db.rollback()
                     continue
                 await db.commit()
-                failed_generations.append(resulting)
-        for generation in failed_generations:
-            await self._publish_status_generation(generation)
+                quarantined_generations.append(resulting)
+        for generation in quarantined_generations:
+            await self._publish_status_generation(
+                generation,
+                payload={
+                    "relay_state": "uncertain",
+                    "error_message": (
+                        f"Worker {worker.name} relay reconnect exhausted; "
+                        "remote execution outcome is uncertain"
+                    ),
+                },
+                notify_completion=False,
+            )
 
     async def _handle(self, msg: dict, worker: Worker):
         """Handle one relay event under the shared Task operation fence.
@@ -2309,6 +3627,11 @@ class WorkerRelay:
                 return
         if not task_id or task_id not in self._tasks.get(worker.id, set()):
             return
+        # Check quarantine only under the per-Task operation lock.  Events that
+        # arrive during proof/readback must wait for the recovery handshake;
+        # dropping them before lock acquisition would lose a terminal edge.
+        if self._legacy_carrier_recovery_active(worker.id, task_id):
+            return
 
         # 1) user_message 跳过：chat 代理已在转发前存 Manager DB 并广播，防双写
         if event_type == "user_message":
@@ -2317,6 +3640,8 @@ class WorkerRelay:
         event_retry_count: int | None = None
         event_turn_generation: int | None = None
         native_turn_id = None
+        turn_scope = None
+        actual_transport = None
         worker_turn_handoff_id: str | None = None
         generation_scoped_event = (
             event_type in EXACT_GENERATION_RELAY_EVENT_TYPES
@@ -2325,6 +3650,12 @@ class WorkerRelay:
         if event_type in CHAT_EVENT_TYPES:
             native_turn_id = _validated_native_turn_id(data)
             if native_turn_id is _INVALID_NATIVE_TURN_ID:
+                return
+            turn_scope = _validated_turn_scope(data)
+            if turn_scope is _INVALID_TURN_SCOPE:
+                return
+            actual_transport = _validated_actual_transport(data, turn_scope)
+            if actual_transport is _INVALID_ACTUAL_TRANSPORT:
                 return
         if generation_scoped_event:
             event_retry_count = data.get("task_retry_count")
@@ -2550,7 +3881,7 @@ class WorkerRelay:
                     guard_values["has_unread"] = True
                 guarded = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(**guard_values)
                 )
                 if guarded.rowcount != 1:
@@ -2571,6 +3902,8 @@ class WorkerRelay:
                     task_retry_count=event_retry_count,
                     task_turn_generation=event_turn_generation,
                     native_turn_id=native_turn_id,
+                    turn_scope=turn_scope,
+                    actual_transport=actual_transport,
                     event_type=event_type,
                     role=data.get("role"),
                     content=data.get("content"),
@@ -2601,6 +3934,8 @@ class WorkerRelay:
                 persisted_forward["task_turn_generation"] = event_turn_generation
                 if native_turn_id is not None:
                     persisted_forward["native_turn_id"] = native_turn_id
+                persisted_forward["turn_scope"] = turn_scope
+                persisted_forward["actual_transport"] = actual_transport
             # session_id 同步：worker 广播前 pop 了 session_id，首条事件到达时从 Worker 拉取
             if event_type == "system_init":
                 session_observed = await self._observe_task_generation(
@@ -2629,7 +3964,7 @@ class WorkerRelay:
                             session_synced = await db.execute(
                                 update(Task)
                                 .where(
-                                    *worker_task_generation_predicates(
+                                    *_worker_task_generation_write_predicates(
                                         session_observed
                                     ),
                                     Task.session_id.is_(None),
@@ -2747,7 +4082,7 @@ class WorkerRelay:
             async with self.db_factory() as db:
                 changed = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(
                         context_window_usage={
                         k: v for k, v in data.items()
@@ -2799,7 +4134,7 @@ class WorkerRelay:
                     values["loop_progress"] = data["progress"]
                 changed = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(**values)
                 )
                 if changed.rowcount == 1:
@@ -2817,7 +4152,7 @@ class WorkerRelay:
                     values["goal_last_reason"] = data["reason"]
                 changed = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(**values)
                 )
                 if changed.rowcount == 1:
@@ -2830,7 +4165,7 @@ class WorkerRelay:
             async with self.db_factory() as db:
                 guarded = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(status=observed.status)
                 )
                 if guarded.rowcount != 1:
@@ -2856,7 +4191,7 @@ class WorkerRelay:
             async with self.db_factory() as db:
                 guarded = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(status=observed.status)
                 )
                 if guarded.rowcount != 1:
@@ -2879,7 +4214,7 @@ class WorkerRelay:
             async with self.db_factory() as db:
                 guarded = await db.execute(
                     update(Task)
-                    .where(*worker_task_generation_predicates(observed))
+                    .where(*_worker_task_generation_write_predicates(observed))
                     .values(status=observed.status)
                 )
                 if guarded.rowcount != 1:
@@ -3041,6 +4376,9 @@ class WorkerRelay:
                                 ) is int
                                 and _validated_native_turn_id(message)
                                 is not _INVALID_NATIVE_TURN_ID
+                                and _validated_turn_scope(message)
+                                is not _INVALID_TURN_SCOPE
+                                and _valid_relay_log_metadata(message)
                             ]
                             # Rows persisted by a pre-turn-generation Worker
                             # legitimately serialize ``turn_generation=NULL``.
@@ -3057,6 +4395,9 @@ class WorkerRelay:
                                 )
                                 and _validated_native_turn_id(message)
                                 is not _INVALID_NATIVE_TURN_ID
+                                and _validated_turn_scope(message)
+                                is not _INVALID_TURN_SCOPE
+                                and _valid_relay_log_metadata(message)
                             ]
                             history_protocol_valid = (
                                 all(isinstance(message, dict) for message in remote)
@@ -3129,7 +4470,7 @@ class WorkerRelay:
                                     guarded = await db.execute(
                                         update(Task)
                                         .where(
-                                            *worker_task_generation_predicates(
+                                            *_worker_task_generation_write_predicates(
                                                 history_observed
                                             )
                                         )
@@ -3162,6 +4503,8 @@ class WorkerRelay:
                                                     LogEntry.tool_output,
                                                     LogEntry.loop_iteration,
                                                     LogEntry.native_turn_id,
+                                                    LogEntry.turn_scope,
+                                                    LogEntry.actual_transport,
                                                 ).where(
                                                     LogEntry.task_id == tid,
                                                     LogEntry.task_retry_count
@@ -3195,6 +4538,19 @@ class WorkerRelay:
                                                     native_turn_id=(
                                                         _validated_native_turn_id(
                                                             message
+                                                        )
+                                                    ),
+                                                    turn_scope=(
+                                                        _validated_turn_scope(
+                                                            message
+                                                        )
+                                                    ),
+                                                    actual_transport=(
+                                                        _validated_actual_transport(
+                                                            message,
+                                                            _validated_turn_scope(
+                                                                message
+                                                            ),
                                                         )
                                                     ),
                                                     event_type=(

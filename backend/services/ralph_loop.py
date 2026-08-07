@@ -6,6 +6,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.instance import Instance
+from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.config import settings
 from backend.services.instance_manager import InstanceManager
@@ -15,6 +16,9 @@ from backend.services.task_queue import (
     TaskQueue,
     append_task_generation_predicates,
     task_generation_fence,
+)
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
 )
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
@@ -172,6 +176,8 @@ class RalphLoop:
         task: Task,
         prompt: str,
         cwd: str,
+        *,
+        source_log_id: int,
     ) -> int:
         """Launch through the same provider-account resolver as Dispatcher.
 
@@ -207,7 +213,173 @@ class RalphLoop:
             thinking_budget=task.thinking_budget,
             provider=task.provider,
             config_dir=config_dir,
+            source_log_id=source_log_id,
         )
+
+    async def _bind_claimed_turn_source(
+        self,
+        instance_id: int,
+        task: Task,
+    ) -> int:
+        """Bind Ralph's exact dequeue generation before provider admission."""
+
+        from backend.services.dispatcher import _turn_transport_name
+        from backend.services.terminal_arbitration import bind_turn_source
+
+        predicates = [
+            Task.id == task.id,
+            Task.status.in_(("in_progress", "executing")),
+            Task.instance_id == instance_id,
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        ]
+        append_task_generation_predicates(
+            predicates,
+            task_generation_fence(task),
+        )
+        async with self.db_factory() as db:
+            # Share the same portable Task writer fence as provider admission.
+            # Either this source binding commits first, or cancellation/retry
+            # changes the exact generation and makes the bind fail closed.
+            guarded = await db.execute(
+                update(Task)
+                .where(*predicates)
+                .values(turn_source_log_id=Task.turn_source_log_id)
+            )
+            if guarded.rowcount != 1:
+                await db.rollback()
+                raise RuntimeError(
+                    "Ralph Task generation changed before source binding"
+                )
+            current = (
+                await db.execute(
+                    select(Task).where(*predicates).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                await db.rollback()
+                raise RuntimeError(
+                    "Ralph Task generation disappeared before source binding"
+                )
+            source = await bind_turn_source(
+                db,
+                task=current,
+                source_log_id=None,
+                instance_id=instance_id,
+                transport=_turn_transport_name(current),
+            )
+            await db.commit()
+
+        task.turn_source_log_id = source.id
+        return source.id
+
+    async def _settle_automatic_failure(
+        self,
+        instance_id: int,
+        task: Task,
+        reason: str,
+        *,
+        defer_if_preflight: bool,
+        generation: TaskGenerationFence | None = None,
+    ) -> tuple[str, TaskGenerationFence] | None:
+        """Defer only a proven pre-provider rejection; otherwise fail closed."""
+
+        from backend.services.terminal_arbitration import (
+            source_alias_original_log_id,
+            source_shape_is_canonical,
+        )
+
+        generation = generation or task_generation_fence(task)
+        predicates = [
+            Task.id == task.id,
+            Task.status.in_(("in_progress", "executing")),
+            Task.instance_id == instance_id,
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        ]
+        append_task_generation_predicates(predicates, generation)
+        async with self.db_factory() as db:
+            # This no-op write and InstanceManager's actual-transport write use
+            # the same Task-first order.  A routing failure cannot observe
+            # NULL, race provider admission, and then return admitted work to
+            # pending after the provider-boundary transaction commits.
+            guarded = await db.execute(
+                update(Task)
+                .where(*predicates)
+                .values(turn_source_log_id=Task.turn_source_log_id)
+            )
+            if guarded.rowcount != 1:
+                await db.rollback()
+                return None
+            current = (
+                await db.execute(
+                    select(Task).where(*predicates).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                await db.rollback()
+                return None
+
+            source = None
+            original_source = None
+            source_id = current.turn_source_log_id
+            if type(source_id) is int and source_id > 0:
+                source = (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(LogEntry.id == source_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                original_id = source_alias_original_log_id(source)
+                if original_id is not None:
+                    original_source = (
+                        await db.execute(
+                            select(LogEntry)
+                            .where(LogEntry.id == original_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+            source_is_exact = bool(
+                source is not None
+                and source.task_id == current.id
+                and source.task_retry_count == current.retry_count
+                and source.task_turn_generation == current.turn_generation
+                and source.turn_scope == "source"
+                and source_shape_is_canonical(source, original_source)
+            )
+            preflight_rejection = bool(
+                defer_if_preflight
+                and source_is_exact
+                and source.actual_transport is None
+            )
+            if preflight_rejection:
+                current.status = "pending"
+                current.instance_id = None
+                current.started_at = None
+                current.completed_at = None
+                current.error_message = reason[:500]
+                status = "pending"
+            else:
+                transport = (
+                    source.actual_transport
+                    if source_is_exact and source.actual_transport is not None
+                    else "unknown"
+                )
+                current.status = "failed"
+                current.completed_at = datetime.utcnow()
+                current.error_message = (
+                    f"{reason}; Ralph automatic replay was blocked because "
+                    f"the exact provider outcome is uncertain "
+                    f"(transport={transport})"
+                )[:2000]
+                status = "failed"
+            await db.flush()
+            resulting_generation = task_generation_fence(current)
+            await db.commit()
+        return status, resulting_generation
 
     async def _wait_for_turn(
         self,
@@ -408,6 +580,9 @@ class RalphLoop:
                 predicates,
                 resulting_generation,
             )
+            predicates.append(
+                no_active_worker_task_termination_predicate()
+            )
             locked = await db.execute(
                 update(Task)
                 .where(*predicates)
@@ -448,38 +623,24 @@ class RalphLoop:
         """Release a Ralph-owned task when account routing cannot launch it."""
 
         task_id = task.id
-        generation = task_generation_fence(task)
-        if retry_after is None:
-            async with self.db_factory() as db:
-                queue = TaskQueue(db)
-                failed = await queue.mark_failed(
-                    task_id,
-                    reason[:500],
-                    expected_statuses=("in_progress", "executing"),
-                    instance_id=instance_id,
-                    generation_fence=generation,
-                )
-            if not failed:
-                return 0.0
-            status = "failed"
-            delay = 0.0
-        else:
-            async with self.db_factory() as db:
-                queue = TaskQueue(db)
-                deferred = await queue.defer(
-                    task_id,
-                    reason[:500],
-                    instance_id=instance_id,
-                    generation_fence=generation,
-                )
-            if not deferred:
-                return 0.0
-            status = "pending"
-            delay = max(1.0, min(float(retry_after), 300.0))
+        settled = await self._settle_automatic_failure(
+            instance_id,
+            task,
+            reason,
+            defer_if_preflight=retry_after is not None,
+        )
+        if settled is None:
+            return 0.0
+        status, resulting_generation = settled
+        delay = (
+            max(1.0, min(float(retry_after), 300.0))
+            if status == "pending" and retry_after is not None
+            else 0.0
+        )
 
         await self._broadcast_generation_event(
             task_id,
-            generation,
+            resulting_generation,
             status,
             {
             "event": "status_change",
@@ -488,7 +649,7 @@ class RalphLoop:
             "instance_id": instance_id,
             "reason": "codex_account_wait" if status == "pending" else "codex_account_routing",
             },
-            released=status == "pending",
+            released=False,
             terminal=status == "failed",
         )
         return delay
@@ -507,12 +668,21 @@ class RalphLoop:
             Task.id == task.id,
             Task.status.in_(("in_progress", "executing")),
             Task.instance_id == instance_id,
+            no_active_worker_task_termination_predicate(),
         ]
         append_task_generation_predicates(
             predicates,
             task_generation_fence(task),
         )
         async with self.db_factory() as db:
+            guarded = await db.execute(
+                update(Task)
+                .where(*predicates)
+                .values(status=Task.status)
+            )
+            if guarded.rowcount != 1:
+                await db.rollback()
+                return False
             current = (
                 await db.execute(
                     select(Task)
@@ -569,6 +739,7 @@ class RalphLoop:
                 Task.id == task_id,
                 Task.status.in_(task_statuses),
                 Task.instance_id == instance_id,
+                no_active_worker_task_termination_predicate(),
             ]
             append_task_generation_predicates(
                 task_predicates,
@@ -647,7 +818,10 @@ class RalphLoop:
             task = (
                 await db.execute(
                     select(Task)
-                    .where(Task.id == task_id)
+                    .where(
+                        Task.id == task_id,
+                        no_active_worker_task_termination_predicate(),
+                    )
                     .with_for_update()
                 )
             ).scalar_one_or_none()
@@ -734,6 +908,7 @@ class RalphLoop:
                 # the marker currently protected by the Task row lock for all
                 # subsequent exact stop/defer/failure operations.
                 current_generation = task_generation_fence(current)
+                task.turn_source_log_id = current.turn_source_log_id
                 if instance is not None:
                     instance_snapshot = (
                         instance.status,
@@ -752,12 +927,18 @@ class RalphLoop:
                         "Ralph could not prove that the persisted process "
                         "generation was reaped"
                     )
+                stop_reason = (
+                    "Ralph loop stopped after provider admission; the exact "
+                    "turn outcome is uncertain"
+                )
                 stopped = await self.instance_manager.stop(
                     instance_id,
                     expected_task_id=task_id,
                     expected_task_turn_generation=current_generation[-1],
                     expected_pid=instance_snapshot[1],
                     expected_started_at=instance_snapshot[3],
+                    task_status="failed",
+                    task_error_message=stop_reason,
                     terminal_consumer_timeout=30.0,
                     consumer_cancel_timeout=10.0,
                 )
@@ -801,14 +982,17 @@ class RalphLoop:
             return
 
         try:
-            async with self.db_factory() as db:
-                queue = TaskQueue(db)
-                released = await queue.defer(
-                    task_id,
-                    "Ralph loop stopped; task returned to the queue",
-                    instance_id=instance_id,
-                    generation_fence=current_generation,
-                )
+            # Re-read the exact source under the same Task writer fence used by
+            # provider admission.  A cancellation may return the claim to the
+            # queue only while the source still proves no provider transport
+            # was selected.
+            settled = await self._settle_automatic_failure(
+                instance_id,
+                task,
+                "Ralph loop stopped; task returned to the queue",
+                defer_if_preflight=True,
+                generation=current_generation,
+            )
         except Exception:
             logger.exception(
                 "Failed to release cancelled Ralph claim for task %s",
@@ -816,20 +1000,26 @@ class RalphLoop:
             )
             return
 
-        if released:
+        if settled is not None:
+            status, resulting_generation = settled
             await self._broadcast_generation_event(
                 task_id,
-                current_generation,
-                "pending",
+                resulting_generation,
+                status,
                 {
                     "event": "status_change",
                     "task_id": task_id,
                     "old_status": "in_progress",
-                    "new_status": "pending",
+                    "new_status": status,
                     "instance_id": instance_id,
-                    "reason": "ralph_stopped",
+                    "reason": (
+                        "ralph_stopped"
+                        if status == "pending"
+                        else "ralph_stop_outcome_uncertain"
+                    ),
                 },
-                released=True,
+                released=False,
+                terminal=status == "failed",
             )
 
     async def _fail_unexpected_claim(
@@ -924,6 +1114,7 @@ class RalphLoop:
                     else Task.pty_background_generation
                     == expected_background_generation
                 ),
+                no_active_worker_task_termination_predicate(),
             ]
             result = await db.execute(
                 update(Task)
@@ -1083,65 +1274,97 @@ class RalphLoop:
                 cwd = task.target_repo or "."
 
                 # Plan mode handling
-                if task.mode == "plan" and not task.plan_approved:
-                    logger.info(
-                        "Task %s is in Plan mode, running read-only pipeline",
-                        task.id,
-                    )
-                    from backend.services.plan_agent_runner import (
-                        PlanAgentRunner,
-                    )
-                    runner = PlanAgentRunner(
-                        db_factory=self.db_factory,
-                        instance_manager=self.instance_manager,
-                        claude_pool=dispatcher.pool,
-                        codex_pool=dispatcher.codex_pool,
-                        cloudrouter_store=dispatcher.cloudrouter_store,
-                        broadcaster=self.broadcaster,
-                    )
-                    plan_lifecycle = asyncio.create_task(
-                        runner.run(task, cwd=cwd)
-                    )
-                    registered_plan = (instance_id, plan_lifecycle)
-                    self._plan_lifecycles[task.id] = registered_plan
-                    try:
-                        plan_result = await plan_lifecycle
-                    finally:
-                        if self._plan_lifecycles.get(task.id) == registered_plan:
-                            self._plan_lifecycles.pop(task.id, None)
+                if task.mode == "plan":
+                    if task.plan_approved is True:
+                        from backend.services.legacy_plan_execution import (
+                            is_legacy_approved_execution_carrier,
+                        )
 
-                    stored = await self._store_plan_if_owned(
-                        instance_id,
-                        task,
-                        plan_result.plan_content,
-                        metadata_updates={
-                            "plan_agent_run_id": plan_result.run_id,
-                            "plan_review_verdict": plan_result.verdict,
-                            "plan_review_feedback": plan_result.feedback,
-                            "plan_review_exhausted": (
-                                plan_result.review_exhausted
-                            ),
-                        },
-                    )
-                    if stored:
-                        await self._broadcast_generation_event(
+                        async with self.db_factory() as db:
+                            legacy_execution = (
+                                await is_legacy_approved_execution_carrier(
+                                    db,
+                                    task.id,
+                                )
+                            )
+                        if not legacy_execution:
+                            # Route this through the exact-generation failure
+                            # cleanup below without admitting a provider.
+                            raise RuntimeError(
+                                "Approved Plan Tasks cannot launch ordinary "
+                                "coding turns without an exact migrated "
+                                "execution carrier"
+                            )
+                    elif task.plan_approved is None:
+                        logger.info(
+                            "Task %s is in Plan mode, running read-only pipeline",
                             task.id,
-                            task_generation_fence(task),
-                            "plan_review",
-                            {
-                                "event": "plan_ready",
-                                "task_id": task.id,
-                                "instance_id": instance_id,
+                        )
+                        from backend.services.plan_agent_runner import (
+                            PlanAgentRunner,
+                        )
+                        runner = PlanAgentRunner(
+                            db_factory=self.db_factory,
+                            instance_manager=self.instance_manager,
+                            claude_pool=dispatcher.pool,
+                            codex_pool=dispatcher.codex_pool,
+                            cloudrouter_store=dispatcher.cloudrouter_store,
+                            broadcaster=self.broadcaster,
+                        )
+                        plan_lifecycle = asyncio.create_task(
+                            runner.run(task, cwd=cwd)
+                        )
+                        registered_plan = (instance_id, plan_lifecycle)
+                        self._plan_lifecycles[task.id] = registered_plan
+                        try:
+                            plan_result = await plan_lifecycle
+                        finally:
+                            if self._plan_lifecycles.get(task.id) == registered_plan:
+                                self._plan_lifecycles.pop(task.id, None)
+
+                        stored = await self._store_plan_if_owned(
+                            instance_id,
+                            task,
+                            plan_result.plan_content,
+                            metadata_updates={
+                                "plan_agent_run_id": plan_result.run_id,
+                                "plan_review_verdict": plan_result.verdict,
+                                "plan_review_feedback": plan_result.feedback,
+                                "plan_review_exhausted": (
+                                    plan_result.review_exhausted
+                                ),
                             },
                         )
-                    continue  # Move to next task; this one waits for approval
+                        if stored:
+                            await self._broadcast_generation_event(
+                                task.id,
+                                task_generation_fence(task),
+                                "plan_review",
+                                {
+                                    "event": "plan_ready",
+                                    "task_id": task.id,
+                                    "instance_id": instance_id,
+                                },
+                            )
+                        continue  # Move to next task; this one waits for approval
+                    else:
+                        raise RuntimeError(
+                            "Rejected Plan Tasks cannot re-enter planning or "
+                            "launch ordinary coding turns"
+                        )
 
-                # Normal execution — Claude Code is fully autonomous
+                # Normal execution — bind the exact dequeue generation before
+                # account resolution or any provider transport can be admitted.
+                source_log_id = await self._bind_claimed_turn_source(
+                    instance_id,
+                    task,
+                )
                 await self._launch_task_on_bound_account(
                     instance_id,
                     task,
                     task.description,
                     cwd,
+                    source_log_id=source_log_id,
                 )
 
                 # Wait for process to finish (with timeout)
@@ -1172,42 +1395,31 @@ class RalphLoop:
                         publication_generation = resulting_generation
                         status = "completed"
                 else:
-                    async with self.db_factory() as db:
-                        queue = TaskQueue(db)
-                        if (
-                            task.retry_count < task.max_retries
-                        ):
-                            retried = await queue.retry(
-                                task.id,
-                                expected_statuses=("in_progress", "executing"),
-                                instance_id=instance_id,
-                                generation_fence=task_generation_fence(task),
-                            )
-                            if retried:
-                                status = "retrying"
-                        else:
-                            failed = await queue.mark_failed(
-                                task.id,
-                                f"Exit code: {exit_code}",
-                                instance_id=instance_id,
-                                generation_fence=task_generation_fence(task),
-                            )
-                            if failed:
-                                status = "failed"
+                    # A returned provider process necessarily passed
+                    # InstanceManager's actual-transport boundary.  Exit text,
+                    # including rate-limit/transient wording, cannot prove that
+                    # tools or other external effects did not run.
+                    settled = await self._settle_automatic_failure(
+                        instance_id,
+                        task,
+                        f"Exit code: {exit_code}",
+                        defer_if_preflight=False,
+                    )
+                    if settled is not None:
+                        status, publication_generation = settled
 
                 if status is not None:
                     await self._broadcast_generation_event(
                         task.id,
                         publication_generation,
-                        "pending" if status == "retrying" else status,
+                        status,
                         {
                             "event": "status_change",
                             "task_id": task.id,
                             "new_status": status,
                             "instance_id": instance_id,
                         },
-                        retry_count_delta=1 if status == "retrying" else 0,
-                        released=status == "retrying",
+                        released=False,
                         terminal=status in ("completed", "failed"),
                     )
 

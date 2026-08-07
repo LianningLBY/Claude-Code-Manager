@@ -47,6 +47,9 @@ from backend.services.pr_review_service import (
     _validated_pr_snapshot,
     verify_pr_review_snapshot_current,
 )
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1998,23 +2001,99 @@ async def _commit_task_transition(
     *,
     action: PRFindingAction,
     finding: PRFinding,
+    task: Task,
     action_values: dict,
     finding_status: str,
 ) -> bool:
     """Commit a model-Task terminal state only while no push owner exists."""
 
+    task_identity = {
+        "id": task.id,
+        "incarnation_id": task.incarnation_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "turn_source_log_id": task.turn_source_log_id,
+        "worker_id": task.worker_id,
+        "instance_id": task.instance_id,
+        "session_id": task.session_id,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+    }
+    action_identity = {
+        "id": action.id,
+        "task_id": action.task_id,
+    }
     values = dict(action_values)
     values["updated_at"] = datetime.utcnow()
     if values.get("status") not in {
         "pending", "running", "awaiting_confirmation", "cancelling",
     }:
         values["active_fix_finding_id"] = None
+    # Patch parsing and GitHub validation may span a SQLite WAL read snapshot.
+    # Make the Task proof the first statement of a fresh writer transaction so
+    # a concurrently committed receipt becomes a clean CAS miss, never a
+    # SQLITE_BUSY_SNAPSHOT upgrade failure.
+    await db.rollback()
+    task_guard = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task_identity["id"],
+            (
+                Task.incarnation_id.is_(None)
+                if task_identity["incarnation_id"] is None
+                else Task.incarnation_id == task_identity["incarnation_id"]
+            ),
+            Task.status == task_identity["status"],
+            Task.retry_count == task_identity["retry_count"],
+            Task.turn_generation == task_identity["turn_generation"],
+            (
+                Task.turn_source_log_id.is_(None)
+                if task_identity["turn_source_log_id"] is None
+                else Task.turn_source_log_id
+                == task_identity["turn_source_log_id"]
+            ),
+            (
+                Task.worker_id.is_(None)
+                if task_identity["worker_id"] is None
+                else Task.worker_id == task_identity["worker_id"]
+            ),
+            (
+                Task.instance_id.is_(None)
+                if task_identity["instance_id"] is None
+                else Task.instance_id == task_identity["instance_id"]
+            ),
+            (
+                Task.session_id.is_(None)
+                if task_identity["session_id"] is None
+                else Task.session_id == task_identity["session_id"]
+            ),
+            (
+                Task.started_at.is_(None)
+                if task_identity["started_at"] is None
+                else Task.started_at == task_identity["started_at"]
+            ),
+            (
+                Task.completed_at.is_(None)
+                if task_identity["completed_at"] is None
+                else Task.completed_at == task_identity["completed_at"]
+            ),
+            Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_guard.rowcount != 1:
+        await db.rollback()
+        return False
+
     changed = await db.execute(
         update(PRFindingAction)
         .where(
-            PRFindingAction.id == action.id,
+            PRFindingAction.id == action_identity["id"],
             PRFindingAction.status == "running",
-            PRFindingAction.task_id == action.task_id,
+            PRFindingAction.task_id == action_identity["task_id"],
             PRFindingAction.operation_token.is_(None),
             PRFindingAction.confirmed_at.is_(None),
         )
@@ -2081,6 +2160,7 @@ async def handle_fix_task_completion(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "failed",
                 "error_message": "PR fix action state is invalid",
@@ -2104,30 +2184,27 @@ async def handle_fix_task_completion(
             allowed_files=set(allowed),
         )
     except (GitInfrastructureError, GhError) as exc:
-        now = await _database_now(db)
-        await db.execute(
-            update(PRFindingAction)
-            .where(
-                PRFindingAction.id == action.id,
-                PRFindingAction.status == "running",
-                PRFindingAction.confirmed_at.is_(None),
-                PRFindingAction.operation_token.is_(None),
-            )
-            .values(
-                error_message=(
+        await _commit_task_transition(
+            db,
+            action=action,
+            finding=finding,
+            task=task,
+            action_values={
+                "status": "running",
+                "error_message": (
                     "PR fix validation infrastructure is unavailable; "
                     "recovery will retry: " + str(exc)
                 )[:2000],
-                updated_at=now,
-            )
+            },
+            finding_status="open",
         )
-        await db.commit()
         return
     except PRHeadDriftError as exc:
         await _commit_task_transition(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "stale",
                 "error_message": str(exc)[:2000],
@@ -2141,6 +2218,7 @@ async def handle_fix_task_completion(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "failed",
                 "error_message": str(exc)[:2000],
@@ -2167,6 +2245,7 @@ async def handle_fix_task_completion(
         db,
         action=action,
         finding=finding,
+        task=task,
         action_values={
             "result": result_data,
             "patch_sha256": patch_sha256,
@@ -2213,6 +2292,7 @@ async def handle_fix_task_failure(
         db,
         action=action,
         finding=finding,
+        task=task,
         action_values={
             "status": "failed",
             "error_message": (
@@ -2891,8 +2971,36 @@ async def reconcile_finding_action(
     action_id: int,
     *,
     worker_relay=None,
+    operation_lock_held: bool = False,
 ) -> bool:
     """Converge one incomplete model, cancellation, or push generation."""
+
+    if not operation_lock_held:
+        async with db_factory() as discovery_db:
+            discovery = await discovery_db.get(
+                PRFindingAction,
+                action_id,
+                populate_existing=True,
+            )
+            lock_task_id = (
+                discovery.task_id
+                if discovery is not None
+                and discovery.action_type == "ai_fix"
+                and discovery.status == "running"
+                and discovery.confirmed_at is None
+                and type(discovery.task_id) is int
+                else None
+            )
+        if lock_task_id is not None:
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            async with get_task_operation_lock(lock_task_id):
+                return await reconcile_finding_action(
+                    db_factory,
+                    action_id,
+                    worker_relay=worker_relay,
+                    operation_lock_held=True,
+                )
 
     async with db_factory() as db:
         action = await db.get(PRFindingAction, action_id, populate_existing=True)

@@ -13,11 +13,13 @@ import hashlib
 import logging
 import os
 import stat
+from dataclasses import dataclass, field
+from datetime import datetime
 from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -27,6 +29,11 @@ from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.legacy_plan_execution import (
+    LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION,
+    LegacyPlanExecutionCarrierProof,
+    parse_legacy_plan_execution_carrier_proof,
+)
 from backend.services.pr_review_runtime import (
     PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
     PR_REVIEW_TERMINAL_CHAT_HEADER,
@@ -40,8 +47,91 @@ from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_SCOPE_VERSION,
 )
 from backend.services.worker_relay import worker_task_generation
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_WORKER_DESTROY_CLAIM_SEAL = object()
+
+
+@dataclass(frozen=True)
+class WorkerDestroyLifecycleClaim:
+    """Opaque authority for one already-claimed Worker destroy lifecycle.
+
+    The public Worker proxy remains ready-only.  This token is created only
+    from the row returned by the ``ready|stopped|error -> destroying`` CAS and
+    lets the destroy coordinator perform the narrow stop/readback handshake
+    while that exact Worker endpoint still owns the Task.
+    """
+
+    _seal: object = field(repr=False, compare=False)
+    worker_id: int
+    created_at: datetime | None
+    updated_at: datetime | None
+    cloud_instance_id: str | None
+    private_ip: str | None
+    ccm_port: int
+    auth_token: str | None = field(repr=False)
+
+
+def capture_worker_destroy_lifecycle_claim(
+    worker: Worker,
+) -> WorkerDestroyLifecycleClaim:
+    """Freeze the stable identity behind one successful destroy CAS."""
+
+    if worker.status != "destroying":
+        raise ValueError("Worker destroy claim requires destroying status")
+    return WorkerDestroyLifecycleClaim(
+        _seal=_WORKER_DESTROY_CLAIM_SEAL,
+        worker_id=worker.id,
+        created_at=worker.created_at,
+        updated_at=worker.updated_at,
+        cloud_instance_id=worker.cloud_instance_id,
+        private_ip=worker.private_ip,
+        ccm_port=worker.ccm_port,
+        auth_token=worker.auth_token,
+    )
+
+
+def _worker_destroy_lifecycle_predicates(
+    claim: WorkerDestroyLifecycleClaim,
+) -> tuple:
+    """Return the durable CAS fence for one opaque in-process destroy claim."""
+
+    if (
+        not isinstance(claim, WorkerDestroyLifecycleClaim)
+        or claim._seal is not _WORKER_DESTROY_CLAIM_SEAL
+    ):
+        raise ValueError("invalid Worker destroy lifecycle claim")
+    return (
+        Worker.id == claim.worker_id,
+        Worker.status == "destroying",
+        (
+            Worker.created_at.is_(None)
+            if claim.created_at is None
+            else Worker.created_at == claim.created_at
+        ),
+        (
+            Worker.updated_at.is_(None)
+            if claim.updated_at is None
+            else Worker.updated_at == claim.updated_at
+        ),
+        (
+            Worker.cloud_instance_id.is_(None)
+            if claim.cloud_instance_id is None
+            else Worker.cloud_instance_id == claim.cloud_instance_id
+        ),
+        (
+            Worker.private_ip.is_(None)
+            if claim.private_ip is None
+            else Worker.private_ip == claim.private_ip
+        ),
+        Worker.ccm_port == claim.ccm_port,
+    )
 
 # (worker_id, manager_project_id) -> Lock，防并发 task 重复建项目
 _project_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -53,6 +143,50 @@ _task_operation_locks: WeakKeyDictionary[
 
 class WorkerEndpointNotFoundError(Exception):
     """A caller-requested signal that the Worker returned an exact HTTP 404."""
+
+
+class WorkerTaskForwardOutcomeUncertainError(RuntimeError):
+    """The initial create request may already have committed on the Worker.
+
+    Retrying that POST without an idempotent remote receipt can create a
+    second execution or make the Manager declare failure while the Worker is
+    still running.  ``cancellation`` preserves an outer shutdown request after
+    the Manager has durably quarantined the ambiguous claim.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cancellation = cancellation
+
+
+class WorkerTaskForwardAdmissionBlockedError(RuntimeError):
+    """A durable termination receipt won before initial Worker creation."""
+
+
+class WorkerTaskMutationOutcomeUncertainError(RuntimeError):
+    """A Worker mutation may have committed without a readable response.
+
+    Callers which opt into this contract must durably quarantine the exact
+    Manager-side generation before releasing the per-Task operation lock.  In
+    particular, blindly replaying a cancel/stop POST is unsafe: the first
+    request may already have terminated the only remote execution.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.cancellation = cancellation
 
 
 def get_task_operation_lock(task_id: int) -> asyncio.Lock:
@@ -116,6 +250,32 @@ class WorkerProxy:
             )
         return worker
 
+    async def _require_destroy_lifecycle_claim(
+        self,
+        claim: WorkerDestroyLifecycleClaim,
+    ) -> Worker:
+        """Resolve one opaque destroy claim without widening ready admission."""
+
+        async with self.db_factory() as db:
+            worker = (
+                await db.execute(
+                    select(Worker).where(
+                        *_worker_destroy_lifecycle_predicates(claim)
+                    )
+                )
+            ).scalar_one_or_none()
+        # Keep the internal credential out of SQL parameters: driver errors are
+        # routinely logged and may render bound values. ``updated_at`` already
+        # fences every supported credential mutation; compare the token again
+        # in memory before it can authorize a request.
+        if worker is None or worker.auth_token != claim.auth_token:
+            raise HTTPException(
+                409,
+                "Worker destroy lifecycle or endpoint identity changed; "
+                "remote Task mutation was refused",
+            )
+        return worker
+
     async def _require_versioned_plan_protocol(self, worker: Worker) -> None:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
@@ -131,6 +291,68 @@ class WorkerProxy:
             raise RuntimeError(
                 f"Worker {worker.name} does not support versioned Plan protocol 3"
             )
+
+    async def _require_legacy_plan_execution_carrier_protocol(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Require exact readback before trusting an existing Plan carrier."""
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("legacy_plan_execution_carrier_protocol")
+            != LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} does not support legacy Plan execution "
+                f"carrier protocol "
+                f"{LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION}"
+            )
+
+    async def get_legacy_plan_execution_carrier_proof(
+        self,
+        worker: Worker,
+        task_id: int,
+    ) -> LegacyPlanExecutionCarrierProof | None:
+        """Read one existing Worker's semantic carrier proof, never create it."""
+
+        if type(task_id) is not int or task_id <= 0:
+            raise ValueError("legacy Plan carrier task_id must be positive")
+        await self._require_legacy_plan_execution_carrier_protocol(worker)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/legacy-plan-execution-carrier-proof",
+                ),
+                headers=self._headers(worker),
+            )
+        if response.status_code in {404, 409}:
+            # Both outcomes prove that the assigned Worker cannot supply the
+            # exact migrated carrier.  Recovery must durably quarantine the
+            # Manager mirror instead of retrying a permanent 409 forever.
+            return None
+        response.raise_for_status()
+        try:
+            proof = parse_legacy_plan_execution_carrier_proof(response.json())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} returned an invalid legacy Plan "
+                "execution carrier proof"
+            ) from exc
+        if proof.task_id != task_id:
+            raise RuntimeError(
+                f"Worker {worker.name} returned a legacy Plan carrier proof "
+                "for another Task"
+            )
+        return proof
 
     async def get_plan_repo_revision(
         self,
@@ -789,7 +1011,7 @@ class WorkerProxy:
             return await self._forward_task_to_worker_locked(current)
 
     async def _authoritative_forward_task(self, task: Task) -> Task:
-        """Reload one claimed generation before serializing Worker create."""
+        """Fence one claimed generation immediately before Worker effects."""
 
         if self.db_factory is None:
             return task
@@ -799,12 +1021,52 @@ class WorkerProxy:
                 "Task is no longer assigned to a Worker before forwarding"
             )
         async with self.db_factory() as db:
-            current = await db.get(Task, task.id)
-        if current is None or worker_task_generation(current) != expected:
-            raise RuntimeError(
-                "Task Worker generation changed before initial forwarding"
+            # This is the portable Task-side writer fence shared with
+            # termination admission. ``forward_task_to_worker`` holds the
+            # per-Task operation lock across this check and every following
+            # Worker effect, so a receipt either wins first and blocks the
+            # POST, or waits until this exact forwarding attempt settles.
+            admitted = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task.id,
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(status=Task.status)
             )
-        return current
+            if admitted.rowcount != 1:
+                current = await db.get(Task, task.id, populate_existing=True)
+                current_generation = (
+                    worker_task_generation(current)
+                    if current is not None
+                    else None
+                )
+                await db.rollback()
+                if current_generation == expected:
+                    raise WorkerTaskForwardAdmissionBlockedError(
+                        "Task termination owns the claimed Worker generation"
+                    )
+                raise RuntimeError(
+                    "Task Worker generation changed before initial forwarding"
+                )
+            current = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == task.id,
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if current is None or worker_task_generation(current) != expected:
+                await db.rollback()
+                raise RuntimeError(
+                    "Task Worker generation changed before initial forwarding"
+                )
+            await db.commit()
+            return current
 
     async def _forward_task_to_worker_locked(self, task: Task):
         worker = await self.get_worker(task.worker_id)
@@ -898,28 +1160,48 @@ class WorkerProxy:
             "attachments": attachment_records or None,
             "attention_tag": task.attention_tag,
         }
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                self._api(worker, "/api/tasks"),
-                headers=self._headers(worker),
-                json=payload,
-            )
-            # 不检查会卡死在 in_progress：422 字段校验失败 / 500 都要立刻暴露
-            r.raise_for_status()
-            if (task.codex_service_tier or "default") == "priority":
-                try:
-                    created = r.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
-                    ) from exc
-                if (
-                    not isinstance(created, dict)
-                    or created.get("codex_service_tier") != "priority"
-                ):
-                    raise RuntimeError(
-                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
-                    )
+        post_started = False
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                post_started = True
+                r = await c.post(
+                    self._api(worker, "/api/tasks"),
+                    headers=self._headers(worker),
+                    json=payload,
+                )
+                # Once POST has started, even an HTTP error or malformed ACK
+                # cannot prove that the Worker did not commit and wake its
+                # dispatcher.  Surface a distinct uncertainty contract so the
+                # Manager never blindly resends the create request.
+                r.raise_for_status()
+                if (task.codex_service_tier or "default") == "priority":
+                    try:
+                        created = r.json()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                        ) from exc
+                    if (
+                        not isinstance(created, dict)
+                        or created.get("codex_service_tier") != "priority"
+                    ):
+                        raise RuntimeError(
+                            f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                        )
+        except asyncio.CancelledError as exc:
+            if not post_started:
+                raise
+            raise WorkerTaskForwardOutcomeUncertainError(
+                f"Worker {worker.name} initial Task POST was cancelled after "
+                "its outcome became uncertain",
+                cancellation=exc,
+            ) from exc
+        except Exception as exc:
+            if not post_started:
+                raise
+            raise WorkerTaskForwardOutcomeUncertainError(
+                f"Worker {worker.name} initial Task POST outcome is uncertain: {exc}"
+            ) from exc
         logger.info("task %s forwarded to worker %s", task.id, worker.id)
 
     async def _user_skill_snapshots(self, task: Task) -> list[dict]:
@@ -1143,6 +1425,7 @@ class WorkerProxy:
         surface_endpoint_not_found: bool = False,
         operation_lock_held: bool = False,
         pr_review_terminal_chat: bool = False,
+        quarantine_on_transport_uncertainty: bool = False,
     ):
         if pr_review_terminal_chat and not is_pr_review_task(task):
             raise ValueError(
@@ -1158,6 +1441,9 @@ class WorkerProxy:
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
                 pr_review_terminal_chat=pr_review_terminal_chat,
+                quarantine_on_transport_uncertainty=(
+                    quarantine_on_transport_uncertainty
+                ),
             )
         async with self.task_operation_lock(task.id):
             return await self._proxy_to_worker_locked(
@@ -1169,6 +1455,9 @@ class WorkerProxy:
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
                 pr_review_terminal_chat=pr_review_terminal_chat,
+                quarantine_on_transport_uncertainty=(
+                    quarantine_on_transport_uncertainty
+                ),
             )
 
     async def _proxy_to_worker_locked(
@@ -1182,30 +1471,192 @@ class WorkerProxy:
         allow_task_absent: bool,
         surface_endpoint_not_found: bool,
         pr_review_terminal_chat: bool,
+        quarantine_on_transport_uncertainty: bool,
     ):
+        # A durable Manager receipt owns every remote mutation until its exact
+        # result is ACKed. The reconciliation loop itself traverses this common
+        # proxy, so admit only that receipt's identity-bound GET/PUT/ACK paths;
+        # all ordinary Plan/Monitor/Sub-Agent/config requests must wait.
+        if self.db_factory is not None:
+            async with self.db_factory() as db:
+                active_receipt = await active_worker_task_termination_receipt(
+                    db,
+                    task.id,
+                )
+            if active_receipt is not None:
+                receipt_path = (
+                    f"/api/tasks/{task.id}/termination-receipts/"
+                    f"{active_receipt.operation_id}"
+                )
+                exact_receipt_request = bool(
+                    active_receipt.side == "manager"
+                    and active_receipt.worker_id == task.worker_id
+                    and (
+                        (
+                            method == "GET"
+                            and path == receipt_path
+                            and body is None
+                        )
+                        or (
+                            method == "PUT"
+                            and path == receipt_path
+                            and isinstance(body, dict)
+                        )
+                        or (
+                            method == "POST"
+                            and path == f"{receipt_path}/ack"
+                            and isinstance(body, dict)
+                        )
+                    )
+                )
+                if not exact_receipt_request:
+                    raise HTTPException(
+                        409,
+                        "Task has an active Worker termination receipt",
+                    )
         worker = await self.require_ready_worker(task.worker_id)
+        return await self._proxy_to_authorized_worker_locked(
+            worker,
+            task,
+            method,
+            path,
+            body,
+            require_json=require_json,
+            allow_task_absent=allow_task_absent,
+            surface_endpoint_not_found=surface_endpoint_not_found,
+            pr_review_terminal_chat=pr_review_terminal_chat,
+            quarantine_on_transport_uncertainty=(
+                quarantine_on_transport_uncertainty
+            ),
+        )
+
+    async def _proxy_to_claimed_destroying_worker(
+        self,
+        task: Task,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        destroy_claim: WorkerDestroyLifecycleClaim,
+        require_json: bool = False,
+        allow_task_absent: bool = False,
+        surface_endpoint_not_found: bool = False,
+        operation_lock_held: bool = False,
+        quarantine_on_transport_uncertainty: bool = False,
+    ):
+        """Proxy only for exact terminal reconciliation during Worker destroy."""
+
+        if not operation_lock_held:
+            raise ValueError(
+                "claimed Worker destroy proxy requires the Task operation lock"
+            )
+        receipt_prefix = f"/api/tasks/{task.id}/termination-receipts/"
+        receipt_suffix = path[len(receipt_prefix):] if path.startswith(receipt_prefix) else ""
+        receipt_operation_id = (
+            receipt_suffix[:-4] if receipt_suffix.endswith("/ack") else receipt_suffix
+        )
+        valid_receipt_id = bool(
+            len(receipt_operation_id) == 32
+            and all(char in "0123456789abcdef" for char in receipt_operation_id)
+        )
+        receipt_get = method == "GET" and valid_receipt_id and not receipt_suffix.endswith("/ack")
+        receipt_put = method == "PUT" and valid_receipt_id and not receipt_suffix.endswith("/ack")
+        receipt_ack = method == "POST" and valid_receipt_id and receipt_suffix.endswith("/ack")
+        allowed_request = bool(
+            (receipt_get and body is None)
+            or ((receipt_put or receipt_ack) and isinstance(body, dict))
+        )
+        if (
+            not allowed_request
+            or require_json is not True
+            or allow_task_absent
+            or surface_endpoint_not_found
+            or quarantine_on_transport_uncertainty
+        ):
+            raise ValueError(
+                "Worker destroy claim authorizes only exact termination receipt "
+                "GET/PUT/ACK requests"
+            )
+        if task.worker_id != destroy_claim.worker_id:
+            raise HTTPException(
+                409,
+                "Task moved away from the claimed destroying Worker",
+            )
+        worker = await self._require_destroy_lifecycle_claim(destroy_claim)
+        return await self._proxy_to_authorized_worker_locked(
+            worker,
+            task,
+            method,
+            path,
+            body,
+            require_json=require_json,
+            allow_task_absent=allow_task_absent,
+            surface_endpoint_not_found=surface_endpoint_not_found,
+            pr_review_terminal_chat=False,
+            quarantine_on_transport_uncertainty=(
+                quarantine_on_transport_uncertainty
+            ),
+        )
+
+    async def _proxy_to_authorized_worker_locked(
+        self,
+        worker: Worker,
+        task: Task,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        require_json: bool,
+        allow_task_absent: bool,
+        surface_endpoint_not_found: bool,
+        pr_review_terminal_chat: bool,
+        quarantine_on_transport_uncertainty: bool,
+    ):
         await self.relay.subscribe_task(worker, task.id)
         headers = self._headers(worker)
         if pr_review_terminal_chat:
             headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
                 PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
             )
-        async with httpx.AsyncClient(timeout=60) as c:
-            try:
+        request_started = False
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                request_started = True
                 r = await c.request(
                     method, self._api(worker, path),
                     headers=headers, json=body,
                 )
-            except (httpx.TimeoutException, TimeoutError) as exc:
-                raise HTTPException(
-                    503,
-                    f"Worker {worker.name} 请求超时，请稍后重试",
+        except asyncio.CancelledError as exc:
+            if quarantine_on_transport_uncertainty and request_started:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} request was cancelled after "
+                    "the mutation boundary",
+                    status_code=503,
+                    cancellation=exc,
                 ) from exc
-            except (httpx.RequestError, OSError) as exc:
-                raise HTTPException(
-                    502,
-                    f"Worker 网关连接失败，无法连接到 Worker {worker.name}",
+            raise
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            if quarantine_on_transport_uncertainty and request_started:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} request timed out after the "
+                    "mutation boundary",
+                    status_code=503,
                 ) from exc
+            raise HTTPException(
+                503,
+                f"Worker {worker.name} 请求超时，请稍后重试",
+            ) from exc
+        except (httpx.RequestError, OSError) as exc:
+            if quarantine_on_transport_uncertainty and request_started:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} connection was lost after the "
+                    "mutation boundary",
+                    status_code=502,
+                ) from exc
+            raise HTTPException(
+                502,
+                f"Worker 网关连接失败，无法连接到 Worker {worker.name}",
+            ) from exc
 
         # Worker token is an internal Manager→Worker credential.  Never
         # propagate a remote 401/403: doing so makes the frontend treat the
@@ -1230,6 +1681,12 @@ class WorkerProxy:
             ):
                 return {"ok": True, "already_deleted": True}
         if not 200 <= r.status_code < 300:
+            if quarantine_on_transport_uncertainty:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} returned HTTP {r.status_code} "
+                    "after the mutation boundary",
+                    status_code=502,
+                )
             raise HTTPException(
                 502,
                 f"Worker 上游请求失败（远端 HTTP {r.status_code}）",
@@ -1238,6 +1695,12 @@ class WorkerProxy:
             return r.json()
         except Exception as exc:
             if require_json:
+                if quarantine_on_transport_uncertainty:
+                    raise WorkerTaskMutationOutcomeUncertainError(
+                        f"Worker {worker.name} returned an unreadable "
+                        "confirmation after the mutation boundary",
+                        status_code=502,
+                    ) from exc
                 raise HTTPException(
                     502,
                     f"Worker {worker.name} returned an invalid confirmation",

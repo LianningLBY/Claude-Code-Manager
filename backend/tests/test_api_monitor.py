@@ -887,6 +887,7 @@ async def test_monitor_complete_loses_cas_to_concurrent_cancel(
     callback_ready = asyncio.Event()
     release_callback = asyncio.Event()
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
 
@@ -979,6 +980,7 @@ async def test_sub_agent_result_loses_cas_to_concurrent_stop(
     callback_ready = asyncio.Event()
     release_callback = asyncio.Event()
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_sub_agent_session_process = AsyncMock()
@@ -1075,6 +1077,7 @@ async def test_late_progress_callbacks_do_not_write_after_terminal_state(
         sub_agent_id = sub_agent.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
@@ -1204,6 +1207,7 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_monitor_session_process = AsyncMock()
@@ -1274,6 +1278,7 @@ async def test_monitor_callback_requires_exact_active_turn_generation(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
@@ -1372,6 +1377,7 @@ async def test_sub_agent_progress_then_result_uses_unique_report_numbers(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_sub_agent_session_process = AsyncMock()

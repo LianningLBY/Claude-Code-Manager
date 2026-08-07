@@ -459,6 +459,8 @@ async def _transition_worker_status(
     *,
     allowed_statuses: tuple[str, ...] | frozenset[str],
     target_status: str,
+    block_active_task_terminations: bool = False,
+    destroy_recovery: bool = False,
 ) -> Worker:
     """Atomically claim a Worker lifecycle transition.
 
@@ -468,12 +470,57 @@ async def _transition_worker_status(
     lifecycle work.
     """
     await db.rollback()
+    task_ids: list[int] = []
+    if block_active_task_terminations:
+        from backend.models.task import Task
+        from backend.services.worker_task_termination import (
+            active_worker_task_termination_receipt,
+        )
+
+        # Receipt admission and this destroy claim share the Task write lock.
+        # SELECT FOR UPDATE covers PostgreSQL/MySQL; the exact no-op UPDATE is
+        # the corresponding SQLite/MySQL CAS barrier.  Check only after those
+        # locks so a concurrently committed receipt cannot be crossed by the
+        # Worker lifecycle transition.
+        task_ids = list(
+            (
+                await db.execute(
+                    select(Task.id)
+                    .where(Task.worker_id == worker_id)
+                    .order_by(Task.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        await db.execute(
+            update(Task)
+            .where(Task.worker_id == worker_id)
+            .values(status=Task.status)
+        )
+    worker_predicates = [
+        Worker.id == worker_id,
+        Worker.status.in_(tuple(allowed_statuses)),
+    ]
+    if block_active_task_terminations:
+        # A restart recovery is a narrower lifecycle than an ordinary destroy:
+        # it may resume the exact Manager stop receipt admitted by the previous
+        # claim, but only while the durable restart marker still identifies an
+        # interrupted destroy.  Conversely, an ordinary destroy must not race
+        # across a row which became a recovery lifecycle after its initial read.
+        if destroy_recovery:
+            worker_predicates.extend(
+                (Worker.status == "error", Worker.bootstrap_step == "destroy")
+            )
+        else:
+            worker_predicates.append(
+                or_(
+                    Worker.bootstrap_step.is_(None),
+                    Worker.bootstrap_step != "destroy",
+                )
+            )
     result = await db.execute(
         update(Worker)
-        .where(
-            Worker.id == worker_id,
-            Worker.status.in_(tuple(allowed_statuses)),
-        )
+        .where(*worker_predicates)
         .values(status=target_status)
     )
     if result.rowcount != 1:
@@ -487,6 +534,35 @@ async def _transition_worker_status(
             409,
             f"Worker 当前状态 {current_status}，不允许该操作",
         )
+    if block_active_task_terminations:
+        # Global cross-process order is Task -> Worker -> receipt.  The Worker
+        # status change remains uncommitted until every receipt has been
+        # checked; a blocker rolls the lifecycle claim back atomically.
+        blocked_task_id = None
+        for task_id in task_ids:
+            receipt = await active_worker_task_termination_receipt(
+                db,
+                task_id,
+                for_update=True,
+            )
+            if receipt is None:
+                continue
+            if destroy_recovery and (
+                receipt.side == "manager"
+                and receipt.worker_id == worker_id
+                and receipt.operation == "stop_session"
+                and receipt.status in {"pending_remote", "awaiting_ack"}
+            ):
+                continue
+            blocked_task_id = task_id
+            break
+        if blocked_task_id is not None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Worker destroy is blocked by active Task termination "
+                f"receipt on Task {blocked_task_id}",
+            )
     await db.commit()
     worker = await db.get(Worker, worker_id)
     if worker is None:  # Defensive: the row cannot normally disappear here.
@@ -538,63 +614,111 @@ async def start_worker(worker_id: int, request: Request, db: AsyncSession = Depe
 @router.post("/{worker_id}/destroy", response_model=WorkerResponse)
 async def destroy_worker(worker_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     from backend.api.deps import require_admin
+    from backend.services.worker_proxy import (
+        capture_worker_destroy_lifecycle_claim,
+    )
+
     require_admin(request)
     prov = _provisioner()
     worker = await db.get(Worker, worker_id)
     if not worker:
         raise HTTPException(404, "Worker not found")
+    destroy_recovery = (
+        worker.status == "error" and worker.bootstrap_step == "destroy"
+    )
     worker = await _transition_worker_status(
         db,
         worker_id,
         allowed_statuses=_WORKER_DESTROYABLE_STATUSES,
         target_status="destroying",
+        block_active_task_terminations=True,
+        destroy_recovery=destroy_recovery,
     )
+    destroy_claim = capture_worker_destroy_lifecycle_claim(worker)
     # 先把该 worker 的 task 全部迁回本机（执行态无损），再销毁实例
-    _spawn(_migrate_back_then_destroy(prov, worker.id))
+    _spawn(_migrate_back_then_destroy(prov, worker.id, destroy_claim))
     return worker
 
 
-async def _migrate_back_then_destroy(prov, worker_id: int, db_factory=None):
+async def _migrate_back_then_destroy(
+    prov,
+    worker_id: int,
+    destroy_claim,
+    db_factory=None,
+):
     """销毁 = 批量 migrate(task, 本机) + terminate（设计 §10.3）。
 
-    单个 task 迁移失败不阻塞销毁（日志/状态在 Manager 本就完整，丢的只是
-    session 续聊能力），但要记到 task.error_message 让用户知情。
-    例外是已持久化的 Worker turn handoff：在 exact remote outcome 尚未
-    reconcile 前既不能丢掉 Worker 路由，也不能销毁唯一可证明该 turn
-    的 Worker。这种情况将整次销毁置为可重试的 fail-closed 错误。"""
+    单个 inert task 迁移失败时仍保留旧的可损脱钩降级（并写入
+    task.error_message）。任何非 inert 状态、未收敛的 Worker turn
+    handoff 或 durable execution quarantine 都必须保留 Worker 路由；该
+    Worker 恢复 ready 以继续对账，云实例不得销毁。"""
     from backend.main import task_migrator, worker_relay
+    from backend.api.tasks import _stop_worker_task_for_destroy
     from backend.models.task import Task
+    from backend.services.worker_proxy import WorkerProxy
     from sqlalchemy import select
 
     if db_factory is None:
         from backend.database import async_session as db_factory
 
+    if destroy_claim.worker_id != worker_id:
+        raise ValueError("Worker destroy claim does not match its coordinator")
+    destroy_proxy = WorkerProxy(db_factory, worker_relay)
+    try:
+        await destroy_proxy._require_destroy_lifecycle_claim(destroy_claim)
+    except Exception as e:
+        detail = f"Worker 销毁已拒绝：destroy lifecycle claim 已失效（{e}）"
+        logger.error("destroy: worker %s blocked: %s", worker_id, detail)
+        await _mark_worker_destroy_blocked(
+            db_factory,
+            destroy_claim=destroy_claim,
+            detail=detail,
+        )
+        return
+
     # TaskMigrator 已接受 destroying 状态作为迁移源，无需临时改 ready
     async with db_factory() as db:
         result = await db.execute(select(Task).where(Task.worker_id == worker_id))
         tasks = result.scalars().all()
-    # Stop executing tasks before migrating — running sessions can't be migrated
+    # Resume the exact stop receipt for every Task before migration.  The helper
+    # is a no-op for an inert Task without a receipt, while terminal Tasks with
+    # an awaiting ACK still need this call to finish durable reconciliation.
     for task in tasks:
-        if task.status in ("executing", "in_progress"):
-            try:
-                from backend.services.worker_proxy import WorkerProxy
-                proxy = WorkerProxy(db_factory, worker_relay)
-                await proxy.proxy_to_worker(task, "POST", f"/api/tasks/{task.id}/stop-session")
-                logger.info("destroy: stopped executing task %s before migration", task.id)
-                await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning("destroy: failed to stop task %s: %s", task.id, e)
+        try:
+            async with db_factory() as db:
+                await _stop_worker_task_for_destroy(
+                    task.id,
+                    destroy_claim,
+                    destroy_proxy,
+                    db,
+                )
+            logger.info("destroy: settled task %s before migration", task.id)
+        except Exception as e:
+            logger.warning("destroy: failed to settle task %s: %s", task.id, e)
     # Refresh task statuses after stopping
     async with db_factory() as db:
         result = await db.execute(select(Task).where(Task.worker_id == worker_id))
         tasks = result.scalars().all()
     for task in tasks:
         try:
-            if task_migrator is not None:
-                await task_migrator.migrate(task.id, None)
+            if task_migrator is None:
+                raise RuntimeError("Task migrator is unavailable")
+            await task_migrator.migrate(task.id, None)
+
+            # A successful return must have cut the source pointer.  Never let
+            # a buggy/mixed-version migrator response become permission to
+            # terminate the only Worker still named by the durable Task row.
+            async with db_factory() as db:
+                remaining_worker_id = await db.scalar(
+                    select(Task.worker_id).where(Task.id == task.id)
+                )
+            if remaining_worker_id == worker_id:
+                raise RuntimeError(
+                    "Task migration returned without changing Worker ownership"
+                )
         except Exception as e:
             logger.warning("destroy: migrate task %s back failed: %s", task.id, e)
-            detached, pending_handoff_id = (
+            detached, block_reason = (
                 await _fallback_detach_after_destroy_migration_failure(
                     db_factory,
                     task_id=task.id,
@@ -603,18 +727,57 @@ async def _migrate_back_then_destroy(prov, worker_id: int, db_factory=None):
                 )
             )
             if not detached:
-                detail = (
-                    f"Worker 销毁已拒绝：Task {task.id} 仍有未收敛的 "
-                    f"turn handoff {pending_handoff_id}；请等待 exact remote "
-                    "outcome 同步后重试"
+                reason = block_reason or (
+                    f"Task {task.id} 仍保留远程执行证据"
                 )
+                detail = f"Worker 销毁已拒绝：{reason}"
                 logger.error("destroy: worker %s blocked: %s", worker_id, detail)
                 await _mark_worker_destroy_blocked(
                     db_factory,
-                    worker_id=worker_id,
+                    destroy_claim=destroy_claim,
                     detail=detail,
                 )
                 return
+
+    # Final durable gate: normal assignment rejects a ``destroying`` target,
+    # but an older process or a failed fallback must still not strand a Task on
+    # an instance we are about to terminate.
+    async with db_factory() as db:
+        remaining = list(
+            (
+                await db.execute(
+                    select(Task.id, Task.status).where(
+                        Task.worker_id == worker_id
+                    )
+                )
+            ).all()
+        )
+    if remaining:
+        detail = (
+            "Worker 销毁已拒绝：仍有 Task 指向该 Worker（"
+            + ", ".join(
+                f"{task_id}:{status}" for task_id, status in remaining[:20]
+            )
+            + "）"
+        )
+        logger.error("destroy: worker %s blocked: %s", worker_id, detail)
+        await _mark_worker_destroy_blocked(
+            db_factory,
+            destroy_claim=destroy_claim,
+            detail=detail,
+        )
+        return
+    try:
+        await destroy_proxy._require_destroy_lifecycle_claim(destroy_claim)
+    except Exception as e:
+        detail = f"Worker 销毁已拒绝：destroy lifecycle claim 已失效（{e}）"
+        logger.error("destroy: worker %s blocked: %s", worker_id, detail)
+        await _mark_worker_destroy_blocked(
+            db_factory,
+            destroy_claim=destroy_claim,
+            detail=detail,
+        )
+        return
     if worker_relay is not None:
         try:
             await worker_relay.stop_worker(worker_id)
@@ -632,15 +795,27 @@ async def _fallback_detach_after_destroy_migration_failure(
     worker_id: int,
     error: Exception,
 ) -> tuple[bool, str | None]:
-    """Apply the legacy lossy fallback only when no handoff remains.
+    """Apply the legacy lossy fallback only to a proven inert mirror.
 
     ``TaskMigrator`` and Manager→Worker mutations share this operation lock.
     Re-reading the row under that lock lets an exact relay reconciliation which
     already cleared the marker win, while preventing a new handoff from being
-    installed between this decision and the detach write.
+    installed between this decision and the detach write.  Active/queued
+    generations and uncertain remote termination outcomes retain ``worker_id``
+    so cloud destruction remains fail-closed.
     """
     from backend.models.task import Task
     from backend.services.worker_proxy import get_task_operation_lock
+    from backend.services.worker_relay import (
+        has_worker_execution_quarantine,
+    )
+    from backend.services.worker_task_termination import (
+        active_worker_task_termination_receipt,
+        no_active_worker_task_termination_predicate,
+    )
+    from backend.services.worker_routing_config import (
+        WORKER_ROUTING_SAFE_STATUSES,
+    )
 
     async with get_task_operation_lock(task_id):
         async with db_factory() as db:
@@ -654,16 +829,59 @@ async def _fallback_detach_after_destroy_migration_failure(
             if current is None or current.worker_id != worker_id:
                 await db.rollback()
                 return True, None
+            if current.status not in WORKER_ROUTING_SAFE_STATUSES:
+                status = current.status
+                await db.rollback()
+                return False, (
+                    f"Task {task_id} 仍处于非 inert 状态 {status}；"
+                    "远程执行结果尚未可证明"
+                )
             if current.worker_turn_handoff_id is not None:
                 handoff_id = current.worker_turn_handoff_id
                 await db.rollback()
-                return False, handoff_id
+                return False, (
+                    f"Task {task_id} 仍有未收敛的 turn handoff "
+                    f"{handoff_id}；请等待 exact remote outcome 同步后重试"
+                )
+            if has_worker_execution_quarantine(current.metadata_):
+                await db.rollback()
+                return False, (
+                    f"Task {task_id} 的 Worker execution 仍处于 quarantine；"
+                    "必须先对账 exact remote generation"
+                )
 
-            current.worker_id = None
-            current.error_message = (
-                (current.error_message or "")
-                + f"\n[销毁迁移失败: {error}]"
+            if await active_worker_task_termination_receipt(db, task_id):
+                await db.rollback()
+                return False, (
+                    f"Task {task_id} 仍有 active Worker termination receipt；"
+                    "必须先完成 durable termination reconciliation"
+                )
+
+            detached = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.worker_id == worker_id,
+                    Task.status == current.status,
+                    Task.retry_count == current.retry_count,
+                    Task.turn_generation == current.turn_generation,
+                    Task.worker_turn_handoff_id.is_(None),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(
+                    worker_id=None,
+                    error_message=(
+                        (current.error_message or "")
+                        + f"\n[销毁迁移失败: {error}]"
+                    ),
+                )
             )
+            if detached.rowcount != 1:
+                await db.rollback()
+                return False, (
+                    f"Task {task_id} 在销毁 fallback gate 期间取得新的 "
+                    "termination/turn generation；保留远程 Worker 路由"
+                )
             await db.commit()
             return True, None
 
@@ -671,7 +889,7 @@ async def _fallback_detach_after_destroy_migration_failure(
 async def _mark_worker_destroy_blocked(
     db_factory,
     *,
-    worker_id: int,
+    destroy_claim,
     detail: str,
 ) -> None:
     """Restore relay eligibility without overwriting a newer lifecycle state.
@@ -682,13 +900,14 @@ async def _mark_worker_destroy_blocked(
     fail on the same marker.  Keep the visible error text, but return the live
     Worker to the normal recovery state so a later destroy can succeed.
     """
+    from backend.services.worker_proxy import (
+        _worker_destroy_lifecycle_predicates,
+    )
+
     async with db_factory() as db:
         result = await db.execute(
             update(Worker)
-            .where(
-                Worker.id == worker_id,
-                Worker.status == "destroying",
-            )
+            .where(*_worker_destroy_lifecycle_predicates(destroy_claim))
             .values(
                 status="ready",
                 bootstrap_step=None,

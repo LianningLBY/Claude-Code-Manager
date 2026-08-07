@@ -29,6 +29,10 @@ from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.services.task_creation import stage_task_record
 from backend.services.plan_tasks import MAX_ACTIVE_PLANS_PER_TASK
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 from backend.schemas.plan_resource import (
     PlanApplicationAttemptResource,
     PlanApplicationResource,
@@ -468,6 +472,26 @@ def _serialize_related_plan_creation(function):
     return wrapped
 
 
+async def _end_plan_routing_read(db: AsyncSession) -> None:
+    """Start the Task admission fence from a fresh writer transaction.
+
+    Plan APIs perform authorization and context reads before entering this
+    service.  Upgrading that SQLite WAL snapshot after another connection
+    admits a termination receipt raises ``BUSY_SNAPSHOT`` instead of letting
+    the Task predicate choose a winner.  A clean commit preserves the loaded
+    ORM inputs (sessions use ``expire_on_commit=False``) while ending the old
+    read snapshot.  Staged caller mutations are rejected rather than being
+    published early by this routing boundary.
+    """
+
+    if db.new or db.dirty or db.deleted:
+        raise HTTPException(
+            409,
+            "Plan admission requires a clean database transaction",
+        )
+    await db.commit()
+
+
 async def _fence_target_task(
     db: AsyncSession,
     *,
@@ -489,13 +513,23 @@ async def _fence_target_task(
             Task.id == target_task_id,
             Task.status != "migrating",
             worker_predicate,
+            no_active_worker_task_termination_predicate(),
         )
         # A matched-row UPDATE takes the same database write lock used by the
         # migration claim without changing user-visible Task state.
         .values(status=Task.status)
     )
     if fenced.rowcount != 1:
+        receipt = await active_worker_task_termination_receipt(
+            db,
+            target_task_id,
+        )
         await db.rollback()
+        if receipt is not None:
+            raise HTTPException(
+                409,
+                "Plan target has an active Worker termination receipt",
+            )
         raise HTTPException(409, "Plan target is changing execution location")
 
 
@@ -649,6 +683,7 @@ async def create_plan_with_run(
 ) -> tuple[Plan, PlanAgentRun]:
     """Create and commit a Plan/Run pair for existing API callers."""
 
+    await _end_plan_routing_read(db)
     plan, run = await stage_plan_with_run(
         db,
         title=title,
@@ -690,6 +725,7 @@ async def create_plan_run(
     context_log_id: int | None,
     context_snapshot: str | None,
     repo_revision: dict | None,
+    worker_id: int | None,
     source_run_id: int | None = None,
 ) -> PlanAgentRun:
     """Create one Run under the Plan's durable active-run fence."""
@@ -705,10 +741,11 @@ async def create_plan_run(
         if base is None or base.plan_id != plan.id:
             raise HTTPException(400, "Base Version does not belong to this Plan")
 
+    await _end_plan_routing_read(db)
     await _fence_target_task(
         db,
         target_task_id=plan.target_task_id,
-        expected_worker_id=plan.worker_id,
+        expected_worker_id=worker_id,
     )
 
     now = datetime.utcnow()
@@ -726,7 +763,7 @@ async def create_plan_run(
         context_log_id=context_log_id,
         context_snapshot=context_snapshot,
         repo_revision=repo_revision,
-        worker_id=plan.worker_id,
+        worker_id=worker_id,
         pipeline_config=plan.pipeline_config,
         round=1,
         generation=0,
@@ -740,6 +777,7 @@ async def create_plan_run(
         .where(
             Plan.id == plan.id,
             Plan.active_run_id.is_(None),
+            Plan.archived_at.is_(None),
             (
                 Plan.current_version_id.is_(None)
                 if expected_current_version_id is None
@@ -749,6 +787,7 @@ async def create_plan_run(
         )
         .values(
             active_run_id=run.id,
+            worker_id=worker_id,
             lock_version=Plan.lock_version + 1,
             updated_at=now,
         )

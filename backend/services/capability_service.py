@@ -35,6 +35,9 @@ from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.services.capability_events import broadcast_capability_event
 from backend.services.capability_registry import CAPABILITY_KEY_RE, resolve_capability
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 
 class CapabilityError(RuntimeError):
@@ -273,13 +276,27 @@ async def _find_idempotent(
     ).scalar_one_or_none()
 
 
-async def _lock_task(db: AsyncSession, task_id: int) -> Task:
+async def _lock_task(
+    db: AsyncSession,
+    task_id: int,
+    *,
+    require_termination_clear: bool = False,
+) -> Task:
     """Acquire the first lock in Task -> Invocation -> Execution order."""
 
+    predicates = [Task.id == task_id]
+    if require_termination_clear:
+        predicates.append(no_active_worker_task_termination_predicate())
     guarded = await db.execute(
-        update(Task).where(Task.id == task_id).values(status=Task.status)
+        update(Task).where(*predicates).values(status=Task.status)
     )
     if not guarded.rowcount:
+        if require_termination_clear and await db.scalar(
+            select(Task.id).where(Task.id == task_id)
+        ) is not None:
+            raise CapabilityConflictError(
+                "Task has an active Worker termination receipt"
+            )
         raise CapabilityNotFoundError("Task not found")
     task = (
         await db.execute(
@@ -345,9 +362,17 @@ async def _create_invocation(
             f"Capability {capability_key!r} is not registered"
         )
 
+    # The idempotency probe above opened a read transaction.  End it before
+    # the Task write fence so a receipt committed by another SQLite WAL
+    # connection wins cleanly instead of producing BUSY_SNAPSHOT.
+    await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            task = await _lock_task(db, task_id)
+            task = await _lock_task(
+                db,
+                task_id,
+                require_termination_clear=True,
+            )
             _ensure_local_task(task)
 
             existing = await _find_idempotent(
@@ -589,9 +614,15 @@ async def _invocation_task_id(
 async def _lock_aggregate(
     db: AsyncSession,
     invocation_id: int,
+    *,
+    require_termination_clear: bool = False,
 ) -> tuple[Task, CapabilityInvocation, list[CapabilityExecution]]:
     task_id = await _invocation_task_id(db, invocation_id)
-    task = await _lock_task(db, task_id)
+    task = await _lock_task(
+        db,
+        task_id,
+        require_termination_clear=require_termination_clear,
+    )
     invocation = (
         await db.execute(
             select(CapabilityInvocation)
@@ -803,7 +834,11 @@ async def stage_and_claim_execution(
     invocation: CapabilityInvocation | None = None
     async with capability_task_lock(task_id):
         try:
-            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            task, invocation, executions = await _lock_aggregate(
+                db,
+                invocation_id,
+                require_termination_clear=True,
+            )
             execution = _active_execution(invocation, executions)
             _expect_version(
                 invocation.state_version,
@@ -949,9 +984,14 @@ async def claim_execution(
     if not handle_kind.strip() or not handle_id.strip():
         raise CapabilityValidationError("Executor handle kind and id are required")
     task_id = await _invocation_task_id(db, invocation_id)
+    await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            _, invocation, executions = await _lock_aggregate(
+                db,
+                invocation_id,
+                require_termination_clear=True,
+            )
             execution = _active_execution(invocation, executions)
             _expect_version(
                 invocation.state_version,
@@ -1030,9 +1070,14 @@ async def resume_waiting_execution(
     """CAS a user-answered execution back to running."""
 
     task_id = await _invocation_task_id(db, invocation_id)
+    await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            _, invocation, executions = await _lock_aggregate(
+                db,
+                invocation_id,
+                require_termination_clear=True,
+            )
             execution = _active_execution(invocation, executions)
             _expect_version(
                 invocation.state_version,

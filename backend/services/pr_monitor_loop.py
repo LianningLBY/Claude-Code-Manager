@@ -26,6 +26,9 @@ from backend.services.delivery_pr_policy import (
     frozen_delivery_pr_policy,
     legacy_pr_effect_is_forbidden,
 )
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 
 def _hash_evidence(value: dict) -> str:
@@ -866,7 +869,10 @@ async def _cas_repair_terminal(
     # whose SELECT FOR UPDATE support is weaker.
     task_guard = await db.execute(
         update(Task)
-        .where(*_repair_task_cas_predicates(wake, task)[:8])
+        .where(
+            *_repair_task_cas_predicates(wake, task)[:8],
+            no_active_worker_task_termination_predicate(),
+        )
         .values(status=Task.status)
         .execution_options(synchronize_session=False)
     )

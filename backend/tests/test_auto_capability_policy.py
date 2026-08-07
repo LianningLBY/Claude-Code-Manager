@@ -257,7 +257,7 @@ async def test_task_put_cannot_move_frozen_policy_outside_auto_scope(
     })
 
     assert response.status_code == 422, response.text
-    assert "mode=auto" in response.text
+    assert "mode is immutable" in response.text
     async with session_factory() as db:
         task = await db.get(Task, task_id)
         assert task.mode == "auto"

@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from copy import deepcopy
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -28,6 +29,7 @@ from backend.models.pr_monitor import (
 )
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.schemas.pr_monitor import MonitoredRepoResponse, MonitoredRepoUpdate
 from backend.services import pr_review_service
 
@@ -39,6 +41,105 @@ BASE_SHA_2 = "2" * 40
 HEAD_SHA_1 = "a" * 40
 HEAD_SHA_2 = "b" * 40
 HEAD_SHA_3 = "c" * 40
+_WORKER_TERMINATION_TIME = "2026-08-07T01:02:03.000000"
+
+
+def _worker_termination_success_receipt(
+    put_body: dict,
+    *,
+    source_status: str,
+    source_background_generation: str | None = None,
+) -> dict:
+    """Build the strict Worker receipt returned by PUT/readback."""
+
+    from backend.services.worker_task_termination import canonical_json_digest
+
+    request_payload = put_body["request_payload"]
+    request_digest = put_body["request_digest"]
+    expected = request_payload["expected_remote"]
+    result = {
+        "version": 2,
+        "operation_id": request_payload["operation_id"],
+        "task_id": request_payload["task_id"],
+        "operation": request_payload["operation"],
+        "request_digest": request_digest,
+        "task": {
+            "id": request_payload["task_id"],
+            "status": "completed",
+            "retry_count": expected["retry_count"],
+            "turn_generation": expected["turn_generation"],
+            "instance_id": None,
+            "started_at": None,
+            "completed_at": _WORKER_TERMINATION_TIME,
+            "session_id": None,
+            "error_message": "Superseded by new PR push",
+            "background_active": False,
+        },
+        "response": {"ok": True},
+    }
+    return {
+        "version": 2,
+        "operation_id": request_payload["operation_id"],
+        "task_id": request_payload["task_id"],
+        "side": "worker",
+        "worker_id": None,
+        "operation": request_payload["operation"],
+        "status": "succeeded",
+        "state_version": 3,
+        "source": {
+            "incarnation_id": "d" * 32,
+            "status": source_status,
+            "retry_count": expected["retry_count"],
+            "turn_generation": expected["turn_generation"],
+            "source_log_id": None,
+            "instance_id": None,
+            "started_at": None,
+            "completed_at": (
+                _WORKER_TERMINATION_TIME
+                if source_status in {"completed", "failed", "cancelled", "conflict"}
+                else None
+            ),
+            "session_id": None,
+            "pty_background_generation": source_background_generation,
+        },
+        "request_payload": deepcopy(request_payload),
+        "request_digest": request_digest,
+        "result_payload": result,
+        "result_digest": canonical_json_digest(result),
+        "attempt_count": 1,
+        "reconcile_count": 0,
+        "last_error": None,
+        "accepted_at": _WORKER_TERMINATION_TIME,
+        "completed_at": _WORKER_TERMINATION_TIME,
+        "ack_intent_at": None,
+        "acknowledged_at": None,
+        "created_at": _WORKER_TERMINATION_TIME,
+        "updated_at": _WORKER_TERMINATION_TIME,
+    }
+
+
+def _acknowledged_worker_termination_receipt(receipt: dict) -> dict:
+    acknowledged = deepcopy(receipt)
+    acknowledged["status"] = "acknowledged"
+    acknowledged["state_version"] += 1
+    acknowledged["acknowledged_at"] = _WORKER_TERMINATION_TIME
+    return acknowledged
+
+
+async def _manager_termination_receipt(session_factory, task_id: int):
+    async with session_factory() as db:
+        receipts = list(
+            (
+                await db.execute(
+                    select(WorkerTaskTerminationReceipt).where(
+                        WorkerTaskTerminationReceipt.task_id == task_id,
+                        WorkerTaskTerminationReceipt.side == "manager",
+                    )
+                )
+            ).scalars()
+        )
+    assert len(receipts) == 1
+    return receipts[0]
 
 
 @pytest.fixture(autouse=True)
@@ -2724,6 +2825,7 @@ async def test_webhook_synchronize_stops_exact_running_review_generation(
             "terminal_consumer_timeout": 30.0,
             "consumer_cancel_timeout": 10.0,
             "allow_delivery_effect_stop": True,
+            "yield_to_worker_task_termination": True,
         }
         async with session_factory() as db:
             stopped_task = await db.get(Task, old_task_id)
@@ -3193,7 +3295,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     session_factory,
     remote_initial_status,
 ):
-    """Worker reviews use the locked internal full-lifecycle endpoint."""
+    """Worker reviews use one locked durable GET/PUT/ACK operation."""
 
     import backend.main
     from backend.services.worker_proxy import get_task_operation_lock
@@ -3213,7 +3315,9 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     async with session_factory() as db:
         old_review = await db.get(PRReview, old_review_id)
         old_task = await db.get(Task, old_review.task_id)
-        old_task.status = "executing"
+        old_task.status = remote_initial_status
+        if remote_initial_status == "completed":
+            old_task.completed_at = datetime.utcnow()
         await db.commit()
         old_task_id = old_task.id
 
@@ -3221,6 +3325,8 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
     migration_lock = asyncio.Lock()
     calls: list[tuple[str, str]] = []
     remote_background_generation = "worker-opaque-tail-1"
+    operation_id: str | None = None
+    worker_receipt: dict | None = None
 
     async def authoritative_worker_call(
         routing_task,
@@ -3229,6 +3335,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
         body=None,
         **kwargs,
     ):
+        nonlocal operation_id, worker_receipt
         assert routing_task.id == old_task_id
         assert routing_task.worker_id == 77
         assert operation_lock.locked()
@@ -3236,33 +3343,66 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
         assert kwargs["operation_lock_held"] is True
         assert kwargs["require_json"] is True
         calls.append((method, path))
+
+        receipt_path = path.removesuffix("/ack")
+        expected_prefix = (
+            f"/api/tasks/{old_task_id}/termination-receipts/"
+        )
+        assert receipt_path.startswith(expected_prefix)
+        request_operation_id = receipt_path.removeprefix(expected_prefix)
+        assert len(request_operation_id) == 32
+        assert all(char in "0123456789abcdef" for char in request_operation_id)
+        if operation_id is None:
+            operation_id = request_operation_id
+        assert request_operation_id == operation_id
+
         if method == "GET":
+            assert path == receipt_path
+            assert body is None
             return {
-                "id": old_task_id,
-                "status": remote_initial_status,
-                "retry_count": 0,
-                "turn_generation": 0,
-                "pty_background_generation": remote_background_generation,
+                "version": 2,
+                "task_id": old_task_id,
+                "operation_id": operation_id,
+                "status": "receipt_not_found",
             }
+        if method == "PUT":
+            assert path == receipt_path
+            assert body["operation"] == "supersede"
+            assert body["request_payload"] == {
+                "version": 2,
+                "operation_id": operation_id,
+                "task_id": old_task_id,
+                "operation": "supersede",
+                "manager_worker_id": 77,
+                "expected_remote": {
+                    "status": remote_initial_status,
+                    "retry_count": 0,
+                    "turn_generation": 0,
+                },
+                "manager_handoff": None,
+            }
+            from backend.services.worker_task_termination import (
+                canonical_json_digest,
+            )
+
+            assert body["request_digest"] == canonical_json_digest(
+                body["request_payload"]
+            )
+            worker_receipt = _worker_termination_success_receipt(
+                body,
+                source_status=remote_initial_status,
+                source_background_generation=remote_background_generation,
+            )
+            return deepcopy(worker_receipt)
+
         assert method == "POST"
-        assert path == f"/api/tasks/{old_task_id}/terminate-generation"
+        assert path == receipt_path + "/ack"
+        assert worker_receipt is not None
         assert body == {
-            "expected_status": remote_initial_status,
-            "expected_retry_count": 0,
-            "expected_turn_generation": 0,
-            "expected_instance_id": None,
-            "expected_started_at": None,
-            "expected_completed_at": None,
-            "expected_pty_background_generation": remote_background_generation,
+            "request_digest": worker_receipt["request_digest"],
+            "result_digest": worker_receipt["result_digest"],
         }
-        return {
-            "id": old_task_id,
-            "status": "completed",
-            "retry_count": 0,
-            "turn_generation": 0,
-            "error_message": "Superseded by new PR push",
-            "metadata_": {"pr_review_superseded": True},
-        }
+        return _acknowledged_worker_termination_receipt(worker_receipt)
 
     proxy = SimpleNamespace(
         proxy_to_worker=AsyncMock(
@@ -3293,12 +3433,27 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
 
     assert synchronized.status_code == 200, synchronized.text
     assert synchronized.json()["status"] == "accepted"
+    assert operation_id is not None
+    receipt_path = (
+        f"/api/tasks/{old_task_id}/termination-receipts/{operation_id}"
+    )
     assert calls == [
-        ("GET", f"/api/tasks/{old_task_id}/terminate-generation"),
-        ("POST", f"/api/tasks/{old_task_id}/terminate-generation"),
+        ("GET", receipt_path),
+        ("PUT", receipt_path),
+        ("POST", receipt_path + "/ack"),
     ]
     assert not operation_lock.locked()
     assert not migration_lock.locked()
+    manager_receipt = await _manager_termination_receipt(
+        session_factory,
+        old_task_id,
+    )
+    assert manager_receipt.operation_id == operation_id
+    assert manager_receipt.operation == "supersede"
+    assert manager_receipt.status == "settled"
+    assert manager_receipt.active_task_id is None
+    assert manager_receipt.source_task_retry_count == 0
+    assert manager_receipt.source_task_turn_generation == 0
     async with session_factory() as db:
         old_review = await db.get(PRReview, old_review_id)
         old_task = await db.get(Task, old_task_id)
@@ -3325,7 +3480,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
     client,
     session_factory,
 ):
-    """A lost response is fail-closed, then a terminal retry converges."""
+    """A lost PUT response is recovered by GET of the same durable receipt."""
 
     import backend.main
     from backend.services.worker_proxy import get_task_operation_lock
@@ -3351,55 +3506,97 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
 
     operation_lock = get_task_operation_lock(old_task_id)
     migration_lock = asyncio.Lock()
-    post_attempts = 0
+    operation_id: str | None = None
+    worker_receipt: dict | None = None
+    calls: list[tuple[str, str]] = []
+    get_attempts = 0
+    put_attempts = 0
+    ack_attempts = 0
 
     async def lost_worker_response(
-        _routing_task,
+        routing_task,
         method,
-        _path,
+        path,
         body=None,
-        **_kwargs,
+        **kwargs,
     ):
-        nonlocal post_attempts
+        nonlocal operation_id
+        nonlocal worker_receipt
+        nonlocal get_attempts, put_attempts, ack_attempts
+
+        assert routing_task.id == old_task_id
+        assert routing_task.worker_id == 78
+        assert operation_lock.locked()
+        assert migration_lock.locked()
+        assert kwargs["operation_lock_held"] is True
+        assert kwargs["require_json"] is True
+        calls.append((method, path))
+
+        receipt_path = path.removesuffix("/ack")
+        expected_prefix = (
+            f"/api/tasks/{old_task_id}/termination-receipts/"
+        )
+        assert receipt_path.startswith(expected_prefix)
+        request_operation_id = receipt_path.removeprefix(expected_prefix)
+        assert len(request_operation_id) == 32
+        assert all(char in "0123456789abcdef" for char in request_operation_id)
+        if operation_id is None:
+            operation_id = request_operation_id
+        assert request_operation_id == operation_id
+
         if method == "GET":
+            assert path == receipt_path
+            assert body is None
+            get_attempts += 1
+            if worker_receipt is not None:
+                return deepcopy(worker_receipt)
             return {
-                "id": old_task_id,
-                "status": (
-                    "executing"
-                    if post_attempts == 0
-                    else "completed"
-                ),
-                "retry_count": 0,
-                "turn_generation": 0,
-                "pty_background_generation": None,
-                "metadata_": (
-                    {"pr_review_superseded": True}
-                    if post_attempts
-                    else None
-                ),
+                "version": 2,
+                "task_id": old_task_id,
+                "operation_id": operation_id,
+                "status": "receipt_not_found",
             }
-        assert body == {
-            "expected_status": (
-                "executing" if post_attempts == 0 else "completed"
-            ),
-            "expected_retry_count": 0,
-            "expected_turn_generation": 0,
-            "expected_instance_id": None,
-            "expected_started_at": None,
-            "expected_completed_at": None,
-            "expected_pty_background_generation": None,
-        }
-        post_attempts += 1
-        if post_attempts == 1:
+
+        if method == "PUT":
+            assert path == receipt_path
+            assert worker_receipt is None
+            assert body["operation"] == "supersede"
+            assert body["request_payload"] == {
+                "version": 2,
+                "operation_id": operation_id,
+                "task_id": old_task_id,
+                "operation": "supersede",
+                "manager_worker_id": 78,
+                "expected_remote": {
+                    "status": "executing",
+                    "retry_count": 0,
+                    "turn_generation": 0,
+                },
+                "manager_handoff": None,
+            }
+            from backend.services.worker_task_termination import (
+                canonical_json_digest,
+            )
+
+            assert body["request_digest"] == canonical_json_digest(
+                body["request_payload"]
+            )
+            worker_receipt = _worker_termination_success_receipt(
+                body,
+                source_status="executing",
+            )
+            put_attempts += 1
             raise TimeoutError("response lost after remote commit")
-        return {
-            "id": old_task_id,
-            "status": "completed",
-            "retry_count": 0,
-            "turn_generation": 0,
-            "error_message": "Superseded by new PR push",
-            "metadata_": {"pr_review_superseded": True},
+
+        assert method == "POST"
+        assert path == receipt_path + "/ack"
+        assert worker_receipt is not None
+        assert body == {
+            "request_digest": worker_receipt["request_digest"],
+            "result_digest": worker_receipt["result_digest"],
         }
+        ack_attempts += 1
+        return _acknowledged_worker_termination_receipt(worker_receipt)
 
     proxy = SimpleNamespace(
         proxy_to_worker=AsyncMock(side_effect=lost_worker_response)
@@ -3448,6 +3645,17 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
             # The Manager cannot assume the timed-out remote mutation landed.
             assert old_task.status == "executing"
             assert old_task.worker_id == 78
+        pending_receipt = await _manager_termination_receipt(
+            session_factory,
+            old_task_id,
+        )
+        assert operation_id is not None
+        assert pending_receipt.operation_id == operation_id
+        assert pending_receipt.operation == "supersede"
+        assert pending_receipt.status == "pending_remote"
+        assert pending_receipt.active_task_id == old_task_id
+        assert pending_receipt.source_task_retry_count == 0
+        assert pending_receipt.source_task_turn_generation == 0
 
         second_attempt = await _post_webhook(
             client,
@@ -3461,9 +3669,28 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
 
     assert second_attempt.status_code == 200, second_attempt.text
     assert second_attempt.json()["status"] == "accepted"
-    assert post_attempts == 2
+    assert operation_id is not None
+    receipt_path = (
+        f"/api/tasks/{old_task_id}/termination-receipts/{operation_id}"
+    )
+    assert calls == [
+        ("GET", receipt_path),
+        ("PUT", receipt_path),
+        ("GET", receipt_path),
+        ("POST", receipt_path + "/ack"),
+    ]
+    assert get_attempts == 2
+    assert put_attempts == 1
+    assert ack_attempts == 1
     assert not operation_lock.locked()
     assert not migration_lock.locked()
+    settled_receipt = await _manager_termination_receipt(
+        session_factory,
+        old_task_id,
+    )
+    assert settled_receipt.operation_id == operation_id
+    assert settled_receipt.status == "settled"
+    assert settled_receipt.active_task_id is None
     async with session_factory() as db:
         old_review = await db.get(PRReview, old_review_id)
         old_task = await db.get(Task, old_task_id)

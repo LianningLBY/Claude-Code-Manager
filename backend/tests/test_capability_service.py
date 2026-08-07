@@ -1,6 +1,7 @@
 """Transactional state-machine tests for Capability Core."""
 
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 import pytest
@@ -14,6 +15,9 @@ from backend.services.capability_registry import (
     CapabilityDefinition,
     register_capability,
     unregister_capability,
+)
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
 )
 
 
@@ -169,7 +173,212 @@ async def test_remote_shared_and_migrating_tasks_fail_closed(
 
 
 @pytest.mark.asyncio
-async def test_unregistered_and_agent_requests_are_explicitly_rejected(db_session):
+async def test_active_termination_receipt_blocks_capability_creation(
+    db_session,
+    db_factory,
+):
+    task = await _task(db_session)
+    await persist_active_worker_receipt(db_factory, task.id)
+
+    with pytest.raises(
+        service.CapabilityConflictError,
+        match="termination receipt",
+    ):
+        await _create(db_session, task.id)
+
+    assert await db_session.scalar(
+        select(func.count(CapabilityInvocation.id))
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("create", "claim"))
+async def test_capability_admission_loses_cleanly_to_concurrent_wal_receipt(
+    tmp_path,
+    monkeypatch,
+    transition,
+):
+    """The Task gate starts from a fresh writer transaction on SQLite WAL."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / f'capability-{transition}.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as creator:
+            task = await _task(creator)
+            task_id = task.id
+            invocation_id = None
+            invocation_version = None
+            execution_version = None
+            if transition == "claim":
+                invocation, _ = await _create(creator, task_id)
+                execution = await service.active_execution_for(
+                    creator,
+                    invocation.id,
+                )
+                assert execution is not None
+                invocation_id = invocation.id
+                invocation_version = invocation.state_version
+                execution_version = execution.state_version
+                await creator.rollback()
+
+            @asynccontextmanager
+            async def receipt_wins_after_routing_read(locked_task_id):
+                assert locked_task_id == task_id
+                await persist_active_worker_receipt(sessions, task_id)
+                yield
+
+            monkeypatch.setattr(
+                service,
+                "capability_task_lock",
+                receipt_wins_after_routing_read,
+            )
+
+            with pytest.raises(
+                service.CapabilityConflictError,
+                match="termination receipt",
+            ):
+                if transition == "create":
+                    await _create(creator, task_id, key="wal-race")
+                else:
+                    await service.claim_execution(
+                        creator,
+                        invocation_id=invocation_id,
+                        expected_invocation_version=invocation_version,
+                        expected_execution_version=execution_version,
+                        handle_kind="fake_run",
+                        handle_id="must-not-claim",
+                    )
+
+            if transition == "create":
+                assert await creator.scalar(
+                    select(func.count(CapabilityInvocation.id))
+                ) == 0
+            else:
+                current = await creator.get(
+                    CapabilityInvocation,
+                    invocation_id,
+                    populate_existing=True,
+                )
+                assert current is not None
+                assert current.status == "queued"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_active_termination_receipt_blocks_capability_stage_and_claim(
+    db_session,
+    db_factory,
+):
+    task = await _task(db_session)
+    invocation, _ = await _create(db_session, task.id)
+    execution = await service.active_execution_for(db_session, invocation.id)
+    assert execution is not None
+    task_id = task.id
+    invocation_id = invocation.id
+    invocation_version = invocation.state_version
+    execution_version = execution.state_version
+    await db_session.rollback()
+    await persist_active_worker_receipt(db_factory, task_id)
+    stage = AsyncMock()
+
+    with pytest.raises(
+        service.CapabilityConflictError,
+        match="termination receipt",
+    ):
+        await service.stage_and_claim_execution(
+            db_session,
+            invocation_id=invocation_id,
+            expected_invocation_version=invocation_version,
+            expected_execution_version=execution_version,
+            stage=stage,
+        )
+
+    stage.assert_not_awaited()
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    stored_execution = await service.active_execution_for(
+        db_session,
+        invocation_id,
+    )
+    assert stored_invocation.status == "queued"
+    assert stored_execution is not None
+    assert stored_execution.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_active_termination_receipt_blocks_capability_resume(
+    db_session,
+    db_factory,
+):
+    task = await _task(db_session)
+    invocation, _ = await _create(db_session, task.id)
+    execution = await service.active_execution_for(db_session, invocation.id)
+    assert execution is not None
+    invocation, execution = await service.claim_execution(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=invocation.state_version,
+        expected_execution_version=execution.state_version,
+        handle_kind="fake_run",
+        handle_id="receipt-fenced-run",
+    )
+    invocation, execution = await service.mark_execution_waiting(
+        db_session,
+        invocation_id=invocation.id,
+        expected_invocation_version=invocation.state_version,
+        expected_execution_version=execution.state_version,
+    )
+    invocation_id = invocation.id
+    invocation_version = invocation.state_version
+    execution_version = execution.state_version
+    await persist_active_worker_receipt(db_factory, task.id)
+
+    with pytest.raises(
+        service.CapabilityConflictError,
+        match="termination receipt",
+    ):
+        await service.resume_waiting_execution(
+            db_session,
+            invocation_id=invocation_id,
+            expected_invocation_version=invocation_version,
+            expected_execution_version=execution_version,
+        )
+
+    current = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    assert current.status == "waiting_user"
+
+
+@pytest.mark.asyncio
+async def test_unregistered_and_agent_requests_are_explicitly_rejected(
+    db_session,
+    monkeypatch,
+):
     task = await _task(db_session)
     unregister_capability("plan")
     with pytest.raises(service.CapabilityUnavailableError, match="not registered"):
@@ -179,6 +388,9 @@ async def test_unregistered_and_agent_requests_are_explicitly_rejected(db_sessio
         service.CapabilityUnsupportedScopeError,
         match="exact task-turn generation",
     ):
+        # The dark-rollout switch must not enable this stub before exact
+        # terminal arbitration and durable resume admission are connected.
+        monkeypatch.setattr(settings, "auto_capability_enabled", True)
         await service.create_agent_invocation(
             db_session,
             task_id=task.id,

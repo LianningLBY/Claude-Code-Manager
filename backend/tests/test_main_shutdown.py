@@ -20,6 +20,13 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     async def start_worker_relay() -> None:
         await record("worker_relay")
 
+    async def recover_worker_terminations(*, include_manager: bool) -> None:
+        assert include_manager is False
+        await record("worker_termination_recover")
+
+    async def start_worker_terminations() -> None:
+        await record("worker_termination")
+
     async def start_capability() -> None:
         await record("capability")
 
@@ -37,6 +44,16 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     )
     monkeypatch.setattr(main, "worker_relay", worker_relay)
     monkeypatch.setattr(
+        main.worker_task_termination_coordinator,
+        "recover_once",
+        AsyncMock(side_effect=recover_worker_terminations),
+    )
+    monkeypatch.setattr(
+        main.worker_task_termination_coordinator,
+        "start",
+        AsyncMock(side_effect=start_worker_terminations),
+    )
+    monkeypatch.setattr(
         main.capability_coordinator,
         "start",
         AsyncMock(side_effect=start_capability),
@@ -50,8 +67,10 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     await main._start_execution_runtimes()
 
     assert calls == [
+        "worker_termination_recover",
         "dispatcher",
         "worker_relay",
+        "worker_termination",
         "capability",
         "delivery",
     ]
@@ -78,6 +97,9 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
     async def stop_worker_relay() -> None:
         await record("worker_relay")
 
+    async def stop_worker_terminations() -> None:
+        await record("worker_termination")
+
     async def stop_dispatcher() -> None:
         await record("dispatcher")
 
@@ -96,6 +118,11 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
         shutdown=AsyncMock(side_effect=stop_worker_relay)
     )
     monkeypatch.setattr(main, "worker_relay", worker_relay)
+    monkeypatch.setattr(
+        main.worker_task_termination_coordinator,
+        "shutdown",
+        AsyncMock(side_effect=stop_worker_terminations),
+    )
     monkeypatch.setattr(
         main.dispatcher,
         "shutdown",
@@ -121,6 +148,7 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
     assert calls == [
         "delivery",
         "capability",
+        "worker_termination",
         "worker_relay",
         "dispatcher",
     ]

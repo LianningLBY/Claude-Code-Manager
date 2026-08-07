@@ -305,13 +305,13 @@ class TaskUpdate(BaseModel):
 
     @field_validator("mode", mode="before")
     @classmethod
-    def reject_explicit_null_mode(cls, value: object) -> object:
-        # ``None`` is only the model default used to mean "not supplied".
-        # An explicit JSON null must not clear the non-null database field or
-        # let the dispatcher fall through to its ordinary Auto path.
-        if value is None:
-            raise ValueError("mode must be auto, plan, loop, or goal")
-        return value
+    def reject_mode_mutation(cls, value: object) -> object:
+        # Mode selects a lifecycle state machine and is therefore part of the
+        # Task's creation identity.  Changing it after dequeue can race a
+        # detached dispatcher snapshot and turn a Plan into an ordinary coding
+        # launch (or vice versa).  Keep the field on the wire so old clients
+        # receive an explicit validation error instead of a misleading 200.
+        raise ValueError("mode is immutable after Task creation")
 
     @field_validator("attention_tag", mode="before")
     @classmethod

@@ -4737,6 +4737,9 @@ async def test_notifications_stream_delta_and_finish_process():
     assert lines[2] == {
         "type": "turn.completed",
         "turn_id": "turn-1",
+        "status": "completed",
+        "success": True,
+        "error": None,
         "usage": {
             "input_tokens": 100,
             "cached_input_tokens": 80,
@@ -5926,6 +5929,589 @@ async def test_context_window_error_keeps_structured_codex_error_info():
 
 
 @pytest.mark.asyncio
+async def test_interrupted_terminal_has_explicit_failure_semantics():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="stop",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=298,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-1",
+        "turn": {
+            "id": "turn-1",
+            "status": "interrupted",
+            "error": None,
+        },
+    })
+
+    terminal = json.loads((await process.stdout.readline()).decode())
+    assert terminal == {
+        "type": "turn.completed",
+        "usage": {},
+        "turn_id": "turn-1",
+        "status": "interrupted",
+        "success": False,
+        "error": {"message": "Codex turn was interrupted"},
+    }
+    assert await process.wait() == 130
+    assert process.termination_kind == "user_interrupt"
+
+
+async def _start_terminal_validation_turn():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-terminal-validation",
+                "status": {"type": "idle"},
+            }
+        },
+        {"turn": {"id": "turn-terminal-validation"}},
+    ])
+    process, thread_id = await server.start_turn(
+        prompt="validate the native terminal",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+    assert json.loads((await process.stdout.readline()).decode()) == {
+        "type": "thread.started",
+        "thread_id": thread_id,
+    }
+    return server, process, thread_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        pytest.param(
+            {"turnId": "turn-terminal-validation"},
+            id="missing-turn",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": "not-an-object",
+            },
+            id="non-object-turn",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"status": "completed"},
+            },
+            id="missing-turn-id",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"id": 301, "status": "completed"},
+            },
+            id="non-string-turn-id",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"id": "   ", "status": "completed"},
+            },
+            id="empty-turn-id",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"id": " padded-id ", "status": "completed"},
+            },
+            id="whitespace-corrupt-turn-id",
+        ),
+        pytest.param(
+            {"turn": {"id": "turn-terminal-validation"}},
+            id="missing-status",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": {"message": "native error"},
+                }
+            },
+            id="completed-with-error",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": None,
+                },
+                "error": {"message": "root-level native error"},
+            },
+            id="completed-with-root-error",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "success": False,
+                }
+            },
+            id="completed-with-false-success",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "failed",
+                    "success": True,
+                }
+            },
+            id="failed-with-true-success",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "success": True,
+                },
+                "success": False,
+            },
+            id="conflicting-root-and-turn-success",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {
+                    "id": "turn-conflicting",
+                    "status": "completed",
+                }
+            },
+            id="conflicting-turn-id",
+        ),
+        pytest.param(
+            {
+                "status": "failed",
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": None,
+                },
+            },
+            id="conflicting-root-status",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-other",
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": None,
+                },
+            },
+            id="conflicting-root-turn-id",
+        ),
+        pytest.param(
+            {
+                "error": {"message": "different"},
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "failed",
+                    "error": {"message": "failed"},
+                },
+            },
+            id="conflicting-root-error",
+        ),
+    ],
+)
+async def test_malformed_turn_terminal_fails_exact_adapter_without_deferral(
+    terminal,
+):
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    context.following_native_goal = True
+    context.descendant_thread_ids.add("thread-terminal-child")
+    context.active_descendant_thread_ids.add("thread-terminal-child")
+    server._contexts_by_descendant["thread-terminal-child"] = context
+
+    server._handle_notification(
+        "turn/completed",
+        {"threadId": thread_id, **terminal},
+    )
+
+    failure = json.loads((await process.stdout.readline()).decode())
+    assert failure["type"] == "turn.failed"
+    assert failure["status"] == "failed"
+    assert failure["success"] is False
+    assert failure["terminal"] is True
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    raw_turn = terminal.get("turn")
+    raw_turn_id = raw_turn.get("id") if isinstance(raw_turn, dict) else None
+    if (
+        not isinstance(raw_turn_id, str)
+        or not raw_turn_id.strip()
+        or raw_turn_id != raw_turn_id.strip()
+    ):
+        assert "turn_id" not in failure
+    assert await process.wait() == 1
+    assert context.pending_goal_terminal_notification is None
+    assert context.deferred_terminal_notification is None
+    assert context.descendant_guard_task is None
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert server._contexts_by_descendant == {}
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_terminal_retains_owner_until_exact_interrupt_finishes():
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    runtime = server._runtime_state_for(thread_id)
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-terminal-validation")
+    release_interrupt = asyncio.Event()
+
+    async def interrupt_exact(candidate):
+        assert candidate is context
+        assert server._contexts_by_thread[thread_id] is context
+        assert runtime.status_type == "active"
+        assert runtime.active_turn_ids == {"turn-terminal-validation"}
+        await release_interrupt.wait()
+
+    server._interrupt_turn_context = AsyncMock(side_effect=interrupt_exact)
+    server.shutdown = AsyncMock()
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-delayed-unrelated",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    assert server._contexts_by_thread[thread_id] is context
+    assert runtime.status_type == "active"
+    assert runtime.active_turn_ids == {"turn-terminal-validation"}
+
+    release_interrupt.set()
+    await guard
+    failure = json.loads((await process.stdout.readline()).decode())
+    assert failure["type"] == "turn.failed"
+    assert failure["turn_id"] == "turn-terminal-validation"
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    assert await process.wait() == 1
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert runtime.status_type == "idle"
+    assert runtime.active_turn_ids == set()
+    server.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_terminal_shutdowns_transport_before_detaching_owner():
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    runtime = server._runtime_state_for(thread_id)
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-terminal-validation")
+    server._interrupt_turn_context = AsyncMock(
+        side_effect=CodexAppServerError("interrupt outcome unknown")
+    )
+
+    async def shutdown_transport(**kwargs):
+        assert "uncorrelated terminal" in kwargs["reason"]
+        assert process.returncode is None
+        assert server._contexts_by_thread[thread_id] is context
+        assert runtime.status_type == "active"
+
+    server.shutdown = AsyncMock(side_effect=shutdown_transport)
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-delayed-unrelated",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    await guard
+    server.shutdown.assert_awaited_once()
+    assert await process.wait() == 1
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert runtime.status_type == "idle"
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_terminal_keeps_owner_when_transport_shutdown_is_unknown():
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    runtime = server._runtime_state_for(thread_id)
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-terminal-validation")
+    server._interrupt_turn_context = AsyncMock(
+        side_effect=CodexAppServerError("interrupt outcome unknown")
+    )
+    server.shutdown = AsyncMock(
+        side_effect=CodexAppServerError("transport survived shutdown")
+    )
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-delayed-unrelated",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    await guard
+
+    assert process.returncode is None
+    assert server._contexts_by_thread[thread_id] is context
+    assert server._contexts_by_turn["turn-terminal-validation"] is context
+    assert runtime.status_type == "active"
+    assert runtime.active_turn_ids == {"turn-terminal-validation"}
+
+    # Test cleanup only; production deliberately retains this fail-closed
+    # owner until a later transport reconciliation proves termination.
+    process.finish(1, "test cleanup")
+    server._detach_turn_context(context)
+
+
+@pytest.mark.asyncio
+async def test_peer_turn_identity_never_falls_back_to_another_active_thread():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-a", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-a"}},
+        {"thread": {"id": "thread-b", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-b"}},
+    ])
+    process_a, _ = await server.start_turn(
+        prompt="a",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+    await process_a.stdout.readline()
+    process_b, _ = await server.start_turn(
+        prompt="b",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=302,
+    )
+    await process_b.stdout.readline()
+    context_a = server._contexts_by_thread["thread-a"]
+    context_b = server._contexts_by_thread["thread-b"]
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-a",
+        "turn": {"id": "turn-b", "status": "completed", "error": None},
+    })
+
+    assert process_a.returncode is None
+    assert process_b.returncode is None
+    assert context_a.malformed_terminal_guard_task is None
+    assert context_b.malformed_terminal_guard_task is None
+    assert server._contexts_by_thread == {
+        "thread-a": context_a,
+        "thread-b": context_b,
+    }
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-a",
+        "turn": {"id": "turn-a", "status": "completed", "error": None},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-b",
+        "turn": {"id": "turn-b", "status": "completed", "error": None},
+    })
+    assert await process_a.wait() == 0
+    assert await process_b.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_valid_explicit_completed_terminal_still_succeeds():
+    server, process, thread_id = await _start_terminal_validation_turn()
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-terminal-validation",
+            "status": "completed",
+            "success": True,
+            "error": None,
+        },
+    })
+
+    terminal = json.loads((await process.stdout.readline()).decode())
+    assert terminal == {
+        "type": "turn.completed",
+        "usage": {},
+        "turn_id": "turn-terminal-validation",
+        "status": "completed",
+        "success": True,
+        "error": None,
+    }
+    assert await process.wait() == 0
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_response_first_malformed_terminal_cannot_resurrect_context():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-response-first-malformed",
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "turn/start":
+            server._handle_notification("turn/completed", {
+                "threadId": "thread-response-first-malformed",
+                "turn": {
+                    "id": "turn-native-malformed",
+                    "status": "completed",
+                    "error": {"message": "must not be successful"},
+                    "items": [{
+                        "id": "input-response-first-malformed",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    }],
+                },
+            })
+            return {"turn": {"id": "turn-submission-malformed"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="fail closed before admission returns",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    failure = next(row for row in rows if row["type"] == "turn.failed")
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    assert failure["turn_id"] == "turn-native-malformed"
+    assert await process.wait() == 1
+    assert thread_id == "thread-response-first-malformed"
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_response_first_uncorrelated_terminal_interrupts_admitted_identity():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    release_interrupt = asyncio.Event()
+
+    async def interrupt_after_admission(context):
+        await release_interrupt.wait()
+        assert context.turn_id == "turn-submission-after-unknown"
+
+    server._interrupt_turn_context = AsyncMock(side_effect=interrupt_after_admission)
+    server.shutdown = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-response-first-unknown",
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "turn/start":
+            server._handle_notification("turn/completed", {
+                "threadId": "thread-response-first-unknown",
+                "turn": {
+                    "id": "turn-unrelated-before-response",
+                    "status": "completed",
+                    "error": None,
+                },
+            })
+            return {"turn": {"id": "turn-submission-after-unknown"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="retain admission while terminal identity is unknown",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+    context = server._contexts_by_thread[thread_id]
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    assert context.turn_id == "turn-submission-after-unknown"
+    assert process.returncode is None
+
+    release_interrupt.set()
+    await guard
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    failure = next(row for row in rows if row["type"] == "turn.failed")
+    assert failure["turn_id"] == "turn-submission-after-unknown"
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    assert await process.wait() == 1
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    server.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
         "will_retry",
@@ -6015,6 +6601,14 @@ async def test_error_notification_respects_will_retry(
     completed = json.loads((await process.stdout.readline()).decode())
     assert completed["type"] == "turn.completed"
     assert completed["turn_id"] == "turn-1"
+    if will_retry:
+        assert completed["status"] == "completed"
+        assert completed["success"] is True
+        assert completed["error"] is None
+    else:
+        assert completed["status"] == "failed"
+        assert completed["success"] is False
+        assert completed["error"] == error
     assert await process.wait() == expected_exit_code
     assert process.termination_kind == expected_termination_kind
 

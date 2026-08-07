@@ -767,6 +767,134 @@ async def test_related_plan_capacity_is_atomic_for_concurrent_creates(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("create", "run"))
+async def test_plan_admission_loses_cleanly_to_concurrent_wal_receipt(
+    tmp_path,
+    transition,
+):
+    """First-class Plan writers end API reads before the Task receipt CAS."""
+
+    from fastapi import HTTPException
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.services.plan_service import (
+        create_plan_run,
+        create_plan_with_run,
+    )
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / f'plan-{transition}.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            target = Task(
+                title="WAL receipt target",
+                description="d",
+                status="completed",
+                session_id="wal-plan-session",
+                target_repo="/tmp",
+            )
+            setup.add(target)
+            await setup.flush()
+            target_id = target.id
+            plan_id = None
+            if transition == "run":
+                plan = Plan(
+                    title="Inactive WAL Plan",
+                    initial_request="revise safely",
+                    target_task_id=target_id,
+                    target_repo="/tmp",
+                    target_branch="main",
+                    worker_id=None,
+                    pipeline_config=pipeline,
+                    active_run_id=None,
+                )
+                setup.add(plan)
+                await setup.flush()
+                plan_id = plan.id
+            await setup.commit()
+
+        async with sessions() as creator:
+            # Freeze an old WAL read snapshot, then let a different connection
+            # durably admit the receipt before the Plan's first Task write.
+            observed_target = await creator.get(Task, target_id)
+            assert observed_target is not None
+            observed_plan = (
+                await creator.get(Plan, plan_id)
+                if plan_id is not None
+                else None
+            )
+            assert creator.in_transaction()
+            await persist_active_worker_receipt(sessions, target_id)
+
+            with pytest.raises(HTTPException) as rejected:
+                if transition == "create":
+                    await create_plan_with_run(
+                        creator,
+                        title="Must not be created",
+                        initial_request="receipt owns admission",
+                        attachments=None,
+                        target_task_id=target_id,
+                        project_id=None,
+                        target_repo="/tmp",
+                        target_branch="main",
+                        worker_id=None,
+                        priority=0,
+                        timeout_hours=None,
+                        created_by=None,
+                        pipeline_config=pipeline,
+                        context_session_id=observed_target.session_id,
+                        context_log_id=None,
+                        context_snapshot=None,
+                        repo_revision=None,
+                    )
+                else:
+                    assert observed_plan is not None
+                    await create_plan_run(
+                        creator,
+                        plan=observed_plan,
+                        run_type="user_revision",
+                        request_text="receipt owns admission",
+                        attachments=None,
+                        base_version_id=None,
+                        expected_current_version_id=None,
+                        context_session_id=observed_target.session_id,
+                        context_log_id=None,
+                        context_snapshot=None,
+                        repo_revision=None,
+                        worker_id=None,
+                    )
+
+            assert rejected.value.status_code == 409
+            assert "termination receipt" in rejected.value.detail
+
+        async with sessions() as verify:
+            assert await verify.scalar(select(func.count(PlanAgentRun.id))) == 0
+            expected_plans = 0 if transition == "create" else 1
+            assert await verify.scalar(select(func.count(Plan.id))) == expected_plans
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_related_plan_capacity_applies_to_forks(client, session_factory):
     target = await _target(client, session_factory)
     source = await client.post(

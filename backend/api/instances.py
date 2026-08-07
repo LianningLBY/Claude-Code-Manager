@@ -378,61 +378,83 @@ async def stop_instance(
     db: AsyncSession = Depends(get_db),
 ):
     from backend.main import instance_manager, ralph_loop
-    instance = await db.get(Instance, instance_id)
-    if instance is None:
-        raise HTTPException(404, "Instance not found")
-    exact_owner = (
-        await db.execute(
-            select(Instance, Task)
-            .join(Task, Task.id == Instance.current_task_id)
-            .where(
-                Instance.id == instance_id,
-                Instance.current_plan_run_id.is_(None),
-                Instance.current_task_id == body.expected_task_id,
-                (
-                    Instance.pid.is_(None)
-                    if body.expected_pid is None
-                    else Instance.pid == body.expected_pid
-                ),
-                (
-                    Instance.started_at.is_(None)
-                    if body.expected_started_at is None
-                    else Instance.started_at == body.expected_started_at
-                ),
-                Task.id == body.expected_task_id,
-                Task.instance_id == instance_id,
-                Task.turn_generation
-                == body.expected_task_turn_generation,
-            )
-        )
-    ).one_or_none()
-    if exact_owner is None:
-        raise HTTPException(
-            409,
-            "Instance Task or process generation changed; refresh before stopping",
-        )
-    instance, task = exact_owner
-    if task.mode == "delivery_loop" or task.delivery_run_id is not None:
-        raise HTTPException(
-            409,
-            "Delivery Developer instances are controlled by DeliveryRun; "
-            "the process was not stopped",
-        )
-    if is_pr_sandbox_task(task):
-        raise HTTPException(
-            409,
-            "Automated PR and Delivery Capability reviewer instances are "
-            "workflow-controlled; the process was not stopped",
-        )
+    from backend.services.worker_proxy import get_task_operation_lock
+    from backend.services.worker_task_termination import (
+        active_worker_task_termination_receipt,
+    )
 
-    # Do not retain the admission snapshot while Ralph/InstanceManager acquire
-    # their own lifecycle locks and may commit a newer Task turn. The stop call
-    # independently revalidates this exact generation under that lock, and a
-    # failed stop below must start a fresh read on MySQL REPEATABLE READ.
+    # The Task operation lock is shared by receipt admission, migration, chat,
+    # and every Manager->Worker mutation.  Re-read the complete owner only
+    # after entering it: an administrator may have clicked Stop before a
+    # durable termination request committed, then waited behind that request.
     await db.rollback()
+    async with get_task_operation_lock(body.expected_task_id):
+        instance = await db.get(Instance, instance_id)
+        if instance is None:
+            raise HTTPException(404, "Instance not found")
+        exact_owner = (
+            await db.execute(
+                select(Instance, Task)
+                .join(Task, Task.id == Instance.current_task_id)
+                .where(
+                    Instance.id == instance_id,
+                    Instance.current_plan_run_id.is_(None),
+                    Instance.current_task_id == body.expected_task_id,
+                    (
+                        Instance.pid.is_(None)
+                        if body.expected_pid is None
+                        else Instance.pid == body.expected_pid
+                    ),
+                    (
+                        Instance.started_at.is_(None)
+                        if body.expected_started_at is None
+                        else Instance.started_at == body.expected_started_at
+                    ),
+                    Task.id == body.expected_task_id,
+                    Task.instance_id == instance_id,
+                    Task.turn_generation
+                    == body.expected_task_turn_generation,
+                )
+            )
+        ).one_or_none()
+        if exact_owner is None:
+            raise HTTPException(
+                409,
+                "Instance Task or process generation changed; refresh before stopping",
+            )
+        instance, task = exact_owner
+        if await active_worker_task_termination_receipt(
+            db,
+            body.expected_task_id,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+            raise HTTPException(
+                409,
+                "Delivery Developer instances are controlled by DeliveryRun; "
+                "the process was not stopped",
+            )
+        if is_pr_sandbox_task(task):
+            raise HTTPException(
+                409,
+                "Automated PR and Delivery Capability reviewer instances are "
+                "workflow-controlled; the process was not stopped",
+            )
 
-    # Stop the producer first so it cannot claim another task immediately after
-    # InstanceManager has reaped the current process.
+        # The operation lock is an admission preflight, not a lifecycle lease.
+        # Ralph shutdown can wait for InstanceManager/consumer cleanup, whose
+        # own terminal path may need this same Task lock. Release both the DB
+        # snapshot and process-local lock before any lifecycle wait. A receipt
+        # admitted afterwards still wins InstanceManager's final SQL gate via
+        # ``yield_to_worker_task_termination=True`` below.
+        await db.rollback()
+
+    # Stop the producer first so it cannot claim another task immediately
+    # after InstanceManager has reaped the current process.
     ralph_was_running = ralph_loop.is_running(instance_id)
     if await ralph_loop.stop(instance_id) is False:
         raise HTTPException(
@@ -449,9 +471,19 @@ async def stop_instance(
         expected_started_at=body.expected_started_at,
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
     if not ok:
         db.expire_all()
+        if await active_worker_task_termination_receipt(
+            db,
+            body.expected_task_id,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         remaining_exact_owner = await db.scalar(
             select(Instance.id)
             .join(Task, Task.id == Instance.current_task_id)

@@ -1179,7 +1179,11 @@ async def create_run(
         if target is not None:
             # Inactive Plan history is Manager-owned. A new Run follows the
             # target's current Worker and rehydrates its exact base Version.
-            plan.worker_id = target.worker_id
+            # The service persists this routing change atomically with its
+            # active-Run claim after ending the API's old read snapshot.
+            run_worker_id = target.worker_id
+        else:
+            run_worker_id = plan.worker_id
         source_run = None
         if body.run_type == "retry":
             if not is_admin(request):
@@ -1197,7 +1201,10 @@ async def create_run(
         elif body.source_run_id is not None:
             raise HTTPException(422, "source_run_id is only valid for retry")
         context = await _capture_context_for_plan(
-            db, target=target, target_repo=plan.target_repo, worker_id=plan.worker_id
+            db,
+            target=target,
+            target_repo=plan.target_repo,
+            worker_id=run_worker_id,
         )
         run = await create_plan_run(
             db,
@@ -1211,6 +1218,7 @@ async def create_run(
             context_log_id=context[1],
             context_snapshot=context[2],
             repo_revision=context[3],
+            worker_id=run_worker_id,
             source_run_id=source_run.id if source_run is not None else None,
         )
     await _wake_dispatcher()

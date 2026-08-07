@@ -10,12 +10,18 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services.task_creation import (
     purge_task_access_grants,
     stage_task_record,
 )
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
+)
+from backend.services.worker_task_termination import (
+    WorkerTaskTerminationConflict,
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
 )
 
 
@@ -430,10 +436,36 @@ class TaskQueue:
         await self.db.refresh(task)
         return task
 
-    async def update_task(self, task_id: int, **kwargs) -> Task | None:
-        task = await self.get(task_id)
-        if not task:
-            return None
+    async def update_task(
+        self,
+        task_id: int,
+        *,
+        operation_lock_held: bool = False,
+        **kwargs,
+    ) -> Task | None:
+        """Update one Task only while no durable termination owns it.
+
+        Public edits, Worker configuration saves, and read/unread toggles all
+        converge here.  A process-local operation lock closes same-process
+        admission races; the Task no-op/write CAS is still the authoritative
+        cross-process boundary.  It deliberately starts from a fresh
+        transaction so SQLite WAL cannot raise ``BUSY_SNAPSHOT`` when a
+        receipt committed after an earlier API authorization read.
+        """
+
+        if not operation_lock_held:
+            # Imported lazily because WorkerProxy itself depends on TaskQueue.
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            await self.db.rollback()
+            async with get_task_operation_lock(task_id):
+                return await self.update_task(
+                    task_id,
+                    operation_lock_held=True,
+                    **kwargs,
+                )
+
+        values = {}
         for key, value in kwargs.items():
             if value is None:
                 mapped_attr = getattr(Task, key, None)
@@ -448,10 +480,36 @@ class TaskQueue:
                 # when the mapped column permits it.
                 if not columns or not columns[0].nullable:
                     continue
-            setattr(task, key, value)
+            values[key] = value
+
+        if not values:
+            return await self.get(task_id)
+
+        # This must be the first statement in the mutation transaction.  The
+        # correlated receipt predicate and receipt admission's own Task write
+        # then have one deterministic winner on every supported database.
+        await self.db.rollback()
+        changed = await self.db.execute(
+            update(Task)
+            .where(
+                Task.id == task_id,
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if changed.rowcount != 1:
+            await self.db.rollback()
+            if await active_worker_task_termination_receipt(self.db, task_id):
+                await self.db.rollback()
+                raise WorkerTaskTerminationConflict(
+                    f"Task {task_id} has an active Worker termination receipt"
+                )
+            await self.db.rollback()
+            return None
         await self.db.commit()
-        await self.db.refresh(task)
-        return task
+        self.db.expire_all()
+        return await self.db.get(Task, task_id)
 
     async def delete(
         self,
@@ -490,6 +548,9 @@ class TaskQueue:
         # remote task/process can still exist.  The API opts in only after a
         # 2xx Worker response with an explicit deletion acknowledgement.
         if (observed_worker_id is not None) != remote_worker_deleted:
+            return False
+        if await active_worker_task_termination_receipt(self.db, task_id):
+            await self.db.rollback()
             return False
 
         # Code Review completion locks its aggregate in Developer Task ->
@@ -539,6 +600,7 @@ class TaskQueue:
                 else Task.pty_background_generation
                 == observed_background_generation
             ),
+            no_active_worker_task_termination_predicate(),
         ]
         # Establish the global lifecycle DB lock order at Task first. A no-op
         # exact UPDATE is both a generation CAS and a current-write lock on
@@ -933,6 +995,17 @@ class TaskQueue:
                 sa_delete(MonitorSession).where(MonitorSession.task_id == task_id)
             )
 
+        # SQLite deployments do not globally enable FK enforcement, while
+        # PostgreSQL/MySQL cascade this history.  Remove inactive tombstones
+        # explicitly in the same Task-generation transaction so deletion has
+        # identical semantics and downgrade is not blocked by orphan receipts.
+        await self.db.execute(
+            sa_delete(WorkerTaskTerminationReceipt).where(
+                WorkerTaskTerminationReceipt.task_id == task_id,
+                WorkerTaskTerminationReceipt.active_task_id.is_(None),
+            )
+        )
+
         # The terminal status and task-side owner observed above are the delete
         # generation fence. A concurrent retry may move this row to pending and
         # immediately launch it after our owner SELECT; an ORM ``delete(task)``
@@ -978,6 +1051,7 @@ class TaskQueue:
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                     dispatcher_scope,
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
@@ -1005,12 +1079,23 @@ class TaskQueue:
                 # them; final launch barriers independently fail closed.
                 blocked_ids.add(candidate_id)
                 continue
+            from backend.services.worker_relay import (
+                has_worker_execution_quarantine,
+            )
+
+            if has_worker_execution_quarantine(candidate.metadata_):
+                blocked_ids.add(candidate_id)
+                continue
 
             values = {
                 "status": "in_progress",
                 "started_at": datetime.utcnow(),
                 "error_message": None,
                 "turn_generation": Task.turn_generation + 1,
+                # A source pointer belongs to exactly one logical turn.  Clear
+                # the previous generation in the same CAS that creates G+1;
+                # Step 2 will bind the initial hidden source before launch.
+                "turn_source_log_id": None,
             }
             if instance_id is not None:
                 values["instance_id"] = instance_id
@@ -1023,6 +1108,7 @@ class TaskQueue:
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                     dispatcher_scope,
                 )
                 .values(**values)
@@ -1045,7 +1131,12 @@ class TaskQueue:
         if status in ("completed", "failed"):
             values.setdefault("completed_at", datetime.utcnow())
         await self.db.execute(
-            update(Task).where(Task.id == task_id).values(**values)
+            update(Task)
+            .where(
+                Task.id == task_id,
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(**values)
         )
         await self.db.commit()
 
@@ -1066,6 +1157,7 @@ class TaskQueue:
         predicates = [
             Task.id == task_id,
             Task.status.in_(expected_statuses),
+            no_active_worker_task_termination_predicate(),
         ]
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
@@ -1093,7 +1185,11 @@ class TaskQueue:
     ) -> bool:
         """Fail only the still-active task generation that produced ``error``."""
 
-        predicates = [Task.id == task_id, Task.status.in_(expected_statuses)]
+        predicates = [
+            Task.id == task_id,
+            Task.status.in_(expected_statuses),
+            no_active_worker_task_termination_predicate(),
+        ]
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicates, generation_fence)
@@ -1127,6 +1223,7 @@ class TaskQueue:
             Task.id == task_id,
             Task.status.in_(("in_progress", "executing")),
             task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
         ]
         if instance_id is not None:
             predicate.append(Task.instance_id == instance_id)
@@ -1174,6 +1271,7 @@ class TaskQueue:
             Task.status.in_(expected_statuses),
             Task.pty_background_generation.is_(None),
             task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
         ]
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
@@ -1189,6 +1287,11 @@ class TaskQueue:
                 started_at=None,
                 completed_at=None,
                 pty_background_generation=None,
+                # The source pointer is exact retry/generation provenance.
+                # Clear it in the same CAS that advances retry_count so no
+                # reader can temporarily treat the previous provider-boundary
+                # evidence as belonging to the fresh retry.
+                turn_source_log_id=None,
             )
         )
         if not result.rowcount:
@@ -1213,6 +1316,7 @@ class TaskQueue:
             .where(
                 Task.id == task_id,
                 Task.status.in_(("pending", "in_progress", "executing", "merging")),
+                no_active_worker_task_termination_predicate(),
             )
             .values(status="cancelled", completed_at=datetime.utcnow())
         )

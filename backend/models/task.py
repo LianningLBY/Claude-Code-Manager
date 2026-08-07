@@ -97,6 +97,13 @@ class Task(Base):
         default=0,
         server_default="0",
     )
+    # Internal pointer to the exact user/system source row that admitted the
+    # current logical turn.  It is deliberately not a foreign key: Worker
+    # mirrors and migration boundaries cannot assume node-local LogEntry ids.
+    turn_source_log_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
     # Manager-side durable reservation for exactly one Worker follow-up turn.
     # The remote Worker increments ``turn_generation`` only when its queued
     # message is dequeued, which can happen before the proxy HTTP response.

@@ -760,6 +760,8 @@ class _TurnContext:
     tools_disabled: bool = False
     tool_policy_violation: str | None = None
     tool_policy_abort_task: asyncio.Task | None = None
+    terminal_protocol_violation: str | None = None
+    malformed_terminal_guard_task: asyncio.Task | None = None
 
 
 @dataclass
@@ -908,6 +910,18 @@ class CodexAppServer:
             and not policy_task.done()
         ):
             policy_task.cancel()
+        malformed_task = getattr(
+            context,
+            "malformed_terminal_guard_task",
+            None,
+        )
+        context.malformed_terminal_guard_task = None
+        if (
+            malformed_task is not None
+            and malformed_task is not current_task
+            and not malformed_task.done()
+        ):
+            malformed_task.cancel()
         goal_tasks = set(getattr(context, "goal_guard_tasks", set()))
         if hasattr(context, "goal_guard_tasks"):
             context.goal_guard_tasks.clear()
@@ -1039,10 +1053,309 @@ class CodexAppServer:
 
         if method in {"turn/started", "turn/completed"}:
             turn = params.get("turn")
-            if isinstance(turn, dict) and turn.get("id"):
-                return str(turn["id"])
+            if isinstance(turn, dict):
+                turn_id = turn.get("id")
+                if (
+                    isinstance(turn_id, str)
+                    and turn_id
+                    and turn_id == turn_id.strip()
+                ):
+                    return turn_id
         turn_id = params.get("turnId")
         return str(turn_id) if turn_id else None
+
+    def _malformed_turn_terminal_reason(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+    ) -> str | None:
+        """Reject ambiguous native terminals before any deferral can retain them."""
+
+        if "turn" not in params:
+            return "turn/completed is missing its turn object"
+        turn = params.get("turn")
+        if not isinstance(turn, dict):
+            return "turn/completed turn must be an object"
+
+        turn_id = turn.get("id")
+        if (
+            not isinstance(turn_id, str)
+            or not turn_id.strip()
+            or turn_id != turn_id.strip()
+        ):
+            return (
+                "turn/completed turn.id must be a non-empty, "
+                "whitespace-normalized string"
+            )
+        if "turnId" in params:
+            root_turn_id = params["turnId"]
+            if (
+                not isinstance(root_turn_id, str)
+                or not root_turn_id
+                or root_turn_id != root_turn_id.strip()
+            ):
+                return (
+                    "turn/completed root turnId must be a non-empty, "
+                    "whitespace-normalized string when present"
+                )
+            if root_turn_id != turn_id:
+                return "turn/completed root turnId conflicts with turn.id"
+
+        status = turn.get("status")
+        if (
+            not isinstance(status, str)
+            or not status
+            or status != status.strip()
+        ):
+            return (
+                "turn/completed turn.status must be a non-empty, "
+                "whitespace-normalized string"
+            )
+        if "status" in params:
+            root_status = params["status"]
+            if (
+                not isinstance(root_status, str)
+                or not root_status
+                or root_status != root_status.strip()
+            ):
+                return (
+                    "turn/completed root status must be a non-empty, "
+                    "whitespace-normalized string when present"
+                )
+            if root_status != status:
+                return "turn/completed root status conflicts with turn.status"
+
+        success_values: list[Any] = []
+        if "success" in turn:
+            success_values.append(turn["success"])
+        # ``success`` is not part of the current native Turn schema, but
+        # reject a contradictory gateway spelling rather than silently
+        # blessing it as completed.
+        if "success" in params:
+            success_values.append(params["success"])
+        for success in success_values:
+            if type(success) is not bool:
+                return "turn/completed success must be a boolean when present"
+            if success is not (status == "completed"):
+                return (
+                    "turn/completed success conflicts with "
+                    f"turn.status {status!r}"
+                )
+        if len(success_values) > 1 and any(
+            success is not success_values[0]
+            for success in success_values[1:]
+        ):
+            return "turn/completed root success conflicts with turn.success"
+
+        if "error" in turn and "error" in params and params["error"] != turn["error"]:
+            return "turn/completed root error conflicts with turn.error"
+
+        if status == "completed":
+            error = turn.get("error")
+            if error not in (None, "", {}, []):
+                return (
+                    "turn/completed reports completed with a non-empty "
+                    "turn.error"
+                )
+            root_error = params.get("error")
+            if root_error not in (None, "", {}, []):
+                return (
+                    "turn/completed reports completed with a non-empty "
+                    "root error"
+                )
+
+        if self._turn_terminal_correlates_context(context, params):
+            return None
+        return (
+            "turn/completed turn.id is not correlated to the active "
+            f"adapter: {turn_id!r}"
+        )
+
+    def _turn_terminal_correlates_context(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+    ) -> bool:
+        """Require native identity or client-input proof, never thread alone."""
+
+        candidate_ids: list[Any] = []
+        turn = params.get("turn")
+        if isinstance(turn, dict) and "id" in turn:
+            candidate_ids.append(turn["id"])
+        if "turnId" in params:
+            candidate_ids.append(params["turnId"])
+        for turn_id in candidate_ids:
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and turn_id == turn_id.strip()
+                and self._contexts_by_turn.get(turn_id) is context
+            ):
+                return True
+        return self._notification_matches_context_input(
+            context,
+            "turn/completed",
+            params,
+        )
+
+    def _fail_malformed_turn_terminal(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+        reason: str,
+        *,
+        use_context_identity: bool = False,
+    ) -> None:
+        """Fail closed on a corrupt native terminal without reusing an old id."""
+
+        if not self._context_is_current(context):
+            return
+        error = {
+            "message": f"Malformed Codex turn/completed notification: {reason}",
+            "code": "ccm_malformed_turn_terminal",
+        }
+        event: dict[str, Any] = {
+            "type": "turn.failed",
+            "status": "failed",
+            "success": False,
+            "terminal": True,
+            "error": error,
+        }
+        if use_context_identity:
+            if context.turn_id:
+                event["turn_id"] = context.turn_id
+        else:
+            turn = params.get("turn")
+            raw_turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if (
+                isinstance(raw_turn_id, str)
+                and raw_turn_id
+                and raw_turn_id == raw_turn_id.strip()
+            ):
+                event["turn_id"] = raw_turn_id
+        context.process.feed(event)
+
+        # A malformed completion must not survive as a retained Goal or a
+        # descendant-delayed success.  Detach also cancels any live guards.
+        context.pending_terminal_notification = None
+        context.pending_goal_terminal_notification = None
+        context.deferred_terminal_notification = None
+        context.goal_terminal_generation += 1
+
+        runtime = self._thread_runtime.get(context.thread_id)
+        if runtime is not None:
+            aliases = {
+                turn_id
+                for turn_id, candidate in self._contexts_by_turn.items()
+                if candidate is context
+            }
+            runtime.active_turn_ids.difference_update(aliases)
+            if not runtime.active_turn_ids:
+                runtime.status_type = "idle"
+
+        logger.error(
+            "Failing Codex adapter on malformed terminal thread=%s task=%s: %s",
+            context.thread_id,
+            context.task_id,
+            reason,
+        )
+        context.process.finish(1, str(error["message"]))
+        self._detach_turn_context(context)
+
+    async def _abort_uncorrelated_turn_terminal(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Stop the real current turn before failing its local adapter.
+
+        A terminal found only through ``threadId`` may belong to an older
+        native turn.  Until the exact current turn is interrupted (or the
+        whole transport is proven dead), its context and runtime identities
+        must remain live so no replacement can overlap it.
+        """
+
+        try:
+            try:
+                await self._interrupt_turn_context(context)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                logger.exception(
+                    "Could not confirm exact Codex interrupt after an "
+                    "uncorrelated terminal thread=%s task=%s; shutting down "
+                    "the transport",
+                    context.thread_id,
+                    context.task_id,
+                )
+                try:
+                    # Do not mark the target as a user interrupt.  Protocol
+                    # ambiguity is a failed turn, and every peer adapter on
+                    # this now-untrusted transport must fail as well.
+                    await self.shutdown(
+                        reason=(
+                            "Codex app-server emitted an uncorrelated terminal: "
+                            f"{reason}"
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # shutdown() publishes its one-way intent before touching
+                    # the process.  Retain the context/runtime and live adapter
+                    # when termination cannot be proven; a future start will
+                    # fail closed on that shutdown intent.
+                    logger.exception(
+                        "Could not prove Codex transport shutdown after an "
+                        "uncorrelated terminal thread=%s task=%s",
+                        context.thread_id,
+                        context.task_id,
+                    )
+                    return
+                if self._context_is_current(context):
+                    # Test doubles and a reader-cancellation race may return
+                    # from shutdown without running normal EOF finalization.
+                    self._fail_malformed_turn_terminal(
+                        context,
+                        params,
+                        reason,
+                        use_context_identity=True,
+                    )
+                return
+
+            if self._context_is_current(context):
+                self._fail_malformed_turn_terminal(
+                    context,
+                    params,
+                    reason,
+                    use_context_identity=True,
+                )
+        finally:
+            if context.malformed_terminal_guard_task is asyncio.current_task():
+                context.malformed_terminal_guard_task = None
+
+    def _schedule_uncorrelated_turn_terminal_abort(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Retain ownership while asynchronously isolating an unknown terminal."""
+
+        if not self._context_is_current(context):
+            return
+        existing = context.malformed_terminal_guard_task
+        if existing is not None and not existing.done():
+            return
+        context.terminal_protocol_violation = reason
+        context.malformed_terminal_guard_task = asyncio.create_task(
+            self._abort_uncorrelated_turn_terminal(
+                context,
+                dict(params),
+                reason,
+            )
+        )
 
     @staticmethod
     def _notification_user_message_client_ids(
@@ -2004,6 +2317,7 @@ class CodexAppServer:
             and goal_may_continue
             and context.tool_policy_violation is None
             and context.non_retry_error is None
+            and context.terminal_protocol_violation is None
             and not context.tools_disabled
         ):
             self._defer_terminal_turn_for_native_goal(context, params)
@@ -2023,7 +2337,28 @@ class CodexAppServer:
         terminal_turn_id = turn.get("id") or context.turn_id
         status = turn.get("status") or "completed"
         error = turn.get("error")
-        if context.tool_policy_violation is not None:
+        if context.terminal_protocol_violation is not None:
+            normalized_error = {
+                "message": (
+                    "Malformed Codex turn/completed notification: "
+                    f"{context.terminal_protocol_violation}"
+                ),
+                "code": "ccm_malformed_turn_terminal",
+            }
+            context.process.feed(
+                {
+                    "type": "turn.failed",
+                    "turn_id": terminal_turn_id,
+                    "status": "failed",
+                    "success": False,
+                    "terminal": True,
+                    "error": normalized_error,
+                }
+            )
+            status = "terminalProtocolViolation"
+            exit_code = 1
+            stderr = str(normalized_error["message"])
+        elif context.tool_policy_violation is not None:
             normalized_error = {
                 "message": context.tool_policy_violation,
                 "code": "ccm_tool_policy_violation",
@@ -2034,22 +2369,51 @@ class CodexAppServer:
             status = "toolPolicyViolation"
             exit_code = 1
             stderr = context.tool_policy_violation
+        elif context.non_retry_error is not None:
+            # A willRetry=false notification is authoritative even when Codex
+            # later closes the native turn as completed/interrupted.  Publish
+            # an explicit failed terminal so durable arbitration cannot infer
+            # success from the otherwise ambiguous turn.completed type.
+            normalized_error = dict(context.non_retry_error)
+            context.process.feed(
+                {
+                    "type": "turn.completed",
+                    "usage": context.usage or {},
+                    "turn_id": terminal_turn_id,
+                    "status": "failed",
+                    "success": False,
+                    "error": normalized_error,
+                }
+            )
+            status = "failed"
+            exit_code = 1
+            stderr = str(normalized_error["message"])
         elif status == "completed":
             context.process.feed(
                 {
                     "type": "turn.completed",
                     "usage": context.usage or {},
                     "turn_id": terminal_turn_id,
+                    "status": "completed",
+                    "success": True,
+                    "error": None,
                 }
             )
             exit_code = 0
             stderr = ""
         elif status == "interrupted":
+            normalized_error = self._normalize_turn_error(
+                error,
+                fallback="Codex turn was interrupted",
+            )
             context.process.feed(
                 {
                     "type": "turn.completed",
                     "usage": context.usage or {},
                     "turn_id": terminal_turn_id,
+                    "status": "interrupted",
+                    "success": False,
+                    "error": normalized_error,
                 }
             )
             exit_code = 130
@@ -2065,12 +2429,6 @@ class CodexAppServer:
             )
             exit_code = 1
             stderr = str(message)
-        if context.non_retry_error is not None and exit_code != 1:
-            # Match native `codex exec`: any ErrorNotification with
-            # willRetry=false makes the turn fail even if a later terminal
-            # notification reports completed/interrupted.
-            exit_code = 1
-            stderr = str(context.non_retry_error["message"])
         logger.info(
             "Codex latency task=%s thread=%s stage=completed elapsed_ms=%.1f status=%s",
             context.task_id,
@@ -3444,6 +3802,14 @@ class CodexAppServer:
                     + message
                 )
             raise CodexAppServerError(message)
+        if turn_process.returncode is not None:
+            # A response-first malformed terminal can close the adapter while
+            # the turn/start RPC response is still in flight. Do not resurrect
+            # that failed context by binding the later submission id.
+            self._detach_turn_context(context)
+            if turn_cancelled:
+                raise asyncio.CancelledError
+            return turn_process, str(thread_id)
         context.admitted_turn_id = str(turn_id)
         # An already-running steerable turn can emit notifications before this
         # response arrives. In that case its notification turn id is the real
@@ -4719,6 +5085,53 @@ class CodexAppServer:
                 method,
             )
             return
+        if method == "turn/completed":
+            terminal_context = context
+            if terminal_context is None and thread_id_str is not None:
+                terminal_context = self._contexts_by_thread.get(thread_id_str)
+                if (
+                    terminal_context is not None
+                    and terminal_context.client_user_message_id
+                    and notification_client_ids
+                    and terminal_context.client_user_message_id
+                    not in notification_client_ids
+                ):
+                    # Preserve the same contradictory-clientId rule used for
+                    # mapped aliases. A different input's terminal is not
+                    # evidence that this adapter failed.
+                    logger.error(
+                        "Ignoring Codex terminal with mismatched client input "
+                        "thread=%s turn=%s expected_client=%s "
+                        "actual_clients=%s",
+                        thread_id,
+                        turn_id,
+                        terminal_context.client_user_message_id,
+                        sorted(notification_client_ids),
+                    )
+                    return
+            if terminal_context is not None:
+                terminal_is_correlated = self._turn_terminal_correlates_context(
+                    terminal_context,
+                    params,
+                )
+                malformed_reason = self._malformed_turn_terminal_reason(
+                    terminal_context,
+                    params,
+                )
+                if malformed_reason is not None:
+                    if terminal_is_correlated:
+                        self._fail_malformed_turn_terminal(
+                            terminal_context,
+                            params,
+                            malformed_reason,
+                        )
+                    else:
+                        self._schedule_uncorrelated_turn_terminal_abort(
+                            terminal_context,
+                            params,
+                            malformed_reason,
+                        )
+                    return
         if (
             thread_id_str is not None
             and method in {"turn/started", "turn/completed"}

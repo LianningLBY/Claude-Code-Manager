@@ -69,6 +69,11 @@ class CapabilityInvocation(Base):
             "idempotency_key",
             name="uq_cap_inv_task_idem",
         ),
+        UniqueConstraint(
+            "task_id",
+            "request_output_log_id",
+            name="uq_cap_inv_task_output_log",
+        ),
         UniqueConstraint("active_task_id", name="uq_cap_inv_active_task"),
         CheckConstraint(
             f"status IN ({_sql_values(INVOCATION_STATUSES)})",
@@ -94,7 +99,11 @@ class CapabilityInvocation(Base):
             "AND request_task_retry_count IS NOT NULL "
             "AND request_task_turn_generation IS NOT NULL "
             "AND request_source_log_id IS NOT NULL "
-            "AND request_output_log_id IS NOT NULL)",
+            "AND request_output_log_id IS NOT NULL "
+            "AND request_reason IS NOT NULL "
+            "AND request_protocol_version IS NOT NULL "
+            "AND request_protocol_version >= 1 "
+            "AND request_output_hash IS NOT NULL)",
             name="ck_cap_inv_agent_request_identity",
         ),
         CheckConstraint("state_version >= 1", name="ck_cap_inv_state_version"),
@@ -168,6 +177,15 @@ class CapabilityInvocation(Base):
     )
     request_source_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     request_output_log_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_protocol_version: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    request_output_hash: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+    )
     request_native_turn_id: Mapped[str | None] = mapped_column(
         String(200), nullable=True
     )

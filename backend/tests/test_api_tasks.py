@@ -60,6 +60,55 @@ async def test_create_task_with_explicit_id_uses_internal_service_gate(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_mode", ["plan", "canonical_link"])
+async def test_create_task_cannot_clone_a_legacy_plan_carrier(
+    client,
+    session_factory,
+    source_mode,
+):
+    from backend.models.plan import Plan, PlanLegacyTaskLink
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        source = Task(
+            title="legacy Plan source",
+            description="approved planning history",
+            status="completed",
+            mode="plan" if source_mode == "plan" else "auto",
+            session_id="legacy-plan-session",
+            last_cwd="/repo",
+        )
+        db.add(source)
+        await db.flush()
+        if source_mode == "canonical_link":
+            plan = Plan(
+                title="Canonical Plan",
+                initial_request="plan this",
+                pipeline_config={},
+            )
+            db.add(plan)
+            await db.flush()
+            db.add(
+                PlanLegacyTaskLink(
+                    legacy_task_id=source.id,
+                    plan_id=plan.id,
+                    plan_version_id=None,
+                )
+            )
+        await db.commit()
+        source_id = source.id
+
+    response = await client.post("/api/tasks", json={
+        "title": "bypass canonical execution",
+        "description": "must not inherit the Plan session",
+        "clone_from_task_id": source_id,
+    })
+
+    assert response.status_code == 409, response.text
+    assert "Plan Tasks cannot be used as clone sources" in response.text
+
+
+@pytest.mark.asyncio
 async def test_create_task_rejects_unknown_mode_before_write(
     client,
     session_factory,
@@ -103,6 +152,34 @@ async def test_update_task_rejects_invalid_mode_without_mutation(
 
     assert response.status_code == 422
     assert response.json()["detail"][0]["loc"] == ["body", "mode"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_valid_mode_change_without_mutation(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Immutable lifecycle mode",
+        "description": "must remain Auto",
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"mode": "loop"},
+    )
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "mode"]
+    assert "immutable" in error["msg"]
     async with session_factory() as db:
         task = await db.get(Task, task_id)
         assert task.mode == "auto"
@@ -598,6 +675,74 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
 
 
 @pytest.mark.asyncio
+async def test_migration_import_cannot_repurpose_existing_task_mode(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7010,
+            title="existing Auto task",
+            description="keep its authority",
+            status="cancelled",
+            mode="auto",
+        )
+        db.add(task)
+        await db.commit()
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7010,
+        "title": "forged Goal replacement",
+        "description": "must not replace",
+        "mode": "goal",
+        "goal_condition": "done",
+        "source_status": "cancelled",
+    })
+
+    assert response.status_code == 409, response.text
+    assert "cannot change an existing Task mode" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7010)
+    assert current.mode == "auto"
+    assert current.title == "existing Auto task"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_cannot_refresh_existing_plan_carrier(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7011,
+            title="existing Plan carrier",
+            description="immutable approval history",
+            status="cancelled",
+            mode="plan",
+        )
+        db.add(task)
+        await db.commit()
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7011,
+        "title": "replace Plan carrier",
+        "description": "must not replace",
+        "mode": "plan",
+        "source_status": "cancelled",
+    })
+
+    assert response.status_code == 409, response.text
+    assert "Plan carriers are immutable" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7011)
+    assert current.title == "existing Plan carrier"
+
+
+@pytest.mark.asyncio
 async def test_migration_import_rejects_codex_monitor_worker_copy(
     client,
     session_factory,
@@ -673,19 +818,23 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
         db.add(task)
         await db.commit()
 
-    real_fence = task_api._task_generation_fence
-
-    def replace_generation_after_snapshot(task_id, observed):
-        predicates = real_fence(task_id, observed)
-        # Autoflush applies this same-status generation change immediately
-        # before the import's guarded UPDATE. The old retry_count already
-        # captured in ``predicates`` must make that UPDATE miss.
-        observed.retry_count += 1
-        return predicates
+    @asynccontextmanager
+    async def replace_generation_after_snapshot(task_id):
+        # Model a different Worker process committing after this request froze
+        # its exact scalar predicates and ended its read transaction.  The
+        # fresh-writer CAS must miss without SQLite BUSY_SNAPSHOT.
+        async with session_factory() as competing_db:
+            await competing_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(retry_count=5)
+            )
+            await competing_db.commit()
+        yield
 
     monkeypatch.setattr(
         task_api,
-        "_task_generation_fence",
+        "get_task_operation_lock",
         replace_generation_after_snapshot,
     )
 
@@ -701,7 +850,7 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
         current = await db.get(Task, 7003)
     assert current.title == "Current generation"
     assert current.status == "cancelled"
-    assert current.retry_count == 4
+    assert current.retry_count == 5
 
 
 @pytest.mark.asyncio
@@ -727,16 +876,20 @@ async def test_migration_import_rejects_turn_generation_only_aba(
         db.add(task)
         await db.commit()
 
-    real_fence = task_api._task_generation_fence
-
-    def replace_turn_after_snapshot(task_id, observed):
-        predicates = real_fence(task_id, observed)
-        observed.turn_generation += 1
-        return predicates
+    @asynccontextmanager
+    async def replace_turn_after_snapshot(task_id):
+        async with session_factory() as competing_db:
+            await competing_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(turn_generation=10)
+            )
+            await competing_db.commit()
+        yield
 
     monkeypatch.setattr(
         task_api,
-        "_task_generation_fence",
+        "get_task_operation_lock",
         replace_turn_after_snapshot,
     )
 
@@ -754,7 +907,184 @@ async def test_migration_import_rejects_turn_generation_only_aba(
     assert current.title == "Current logical turn"
     assert current.status == "cancelled"
     assert current.retry_count == 4
-    assert current.turn_generation == 9
+    assert current.turn_generation == 10
+
+
+@pytest.mark.asyncio
+async def test_migration_import_yields_to_receipt_after_snapshot(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A Worker receipt committed after validation owns the inert copy."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            id=7012,
+            title="receipt-owned Worker copy",
+            description="d",
+            status="cancelled",
+        )
+        db.add(task)
+        await db.commit()
+
+    @asynccontextmanager
+    async def receipt_wins_after_snapshot(task_id):
+        await persist_active_worker_receipt(session_factory, task_id)
+        yield
+
+    monkeypatch.setattr(
+        task_api,
+        "get_task_operation_lock",
+        receipt_wins_after_snapshot,
+    )
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7012,
+        "title": "stale Manager mirror",
+        "description": "must not overwrite the receipt generation",
+        "source_status": "completed",
+    })
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7012)
+    assert current is not None
+    assert current.title == "receipt-owned Worker copy"
+    assert current.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_commits_before_status_publication(
+    client,
+    session_factory,
+):
+    """A publication failure cannot roll back an already imported mirror."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7013,
+            title="old Worker mirror",
+            description="d",
+            status="cancelled",
+        )
+        db.add(task)
+        await db.commit()
+
+    async def fail_after_verifying_commit(task_id, status):
+        assert task_id == 7013
+        assert status == "completed"
+        async with session_factory() as verify_db:
+            committed = await verify_db.get(Task, task_id)
+            assert committed is not None
+            assert committed.title == "durable imported mirror"
+            assert committed.status == "completed"
+        raise RuntimeError("publication failed after durable import")
+
+    with (
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new=AsyncMock(side_effect=fail_after_verifying_commit),
+        ),
+        pytest.raises(RuntimeError, match="publication failed"),
+    ):
+        await client.post("/api/tasks/migration-import", json={
+            "id": 7013,
+            "title": "durable imported mirror",
+            "description": "d",
+            "source_status": "completed",
+        })
+
+    async with session_factory() as db:
+        current = await db.get(Task, 7013)
+    assert current is not None
+    assert current.title == "durable imported mirror"
+    assert current.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_publication_yields_to_post_commit_receipt(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A receipt admitted after import commit suppresses its old status event."""
+
+    from backend.models.task import Task
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            id=7014,
+            title="old Worker mirror",
+            description="d",
+            status="cancelled",
+        )
+        db.add(task)
+        await db.commit()
+
+    publication_waiting = asyncio.Event()
+    release_publication = asyncio.Event()
+    original_execute = AsyncSession.execute
+    publication_paused = False
+
+    async def pause_publication_guard(self, statement, *args, **kwargs):
+        nonlocal publication_paused
+        values = getattr(statement, "_values", None)
+        value_keys = {
+            getattr(column, "key", None)
+            for column in values or ()
+        }
+        table = getattr(statement, "table", None)
+        if (
+            not publication_paused
+            and getattr(table, "name", None) == Task.__tablename__
+            and value_keys == {"status"}
+        ):
+            publication_paused = True
+            publication_waiting.set()
+            await release_publication.wait()
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", pause_publication_guard)
+    with patch(
+        "backend.services.task_events.broadcast_status_change",
+        new_callable=AsyncMock,
+    ) as publish:
+        request_task = asyncio.create_task(
+            client.post("/api/tasks/migration-import", json={
+                "id": 7014,
+                "title": "durable imported mirror",
+                "description": "d",
+                "source_status": "completed",
+            })
+        )
+        await asyncio.wait_for(publication_waiting.wait(), timeout=2)
+        async with session_factory() as db:
+            committed = await db.get(Task, 7014)
+            assert committed is not None
+            assert committed.title == "durable imported mirror"
+            assert committed.status == "completed"
+
+        await persist_active_worker_receipt(session_factory, 7014)
+        release_publication.set()
+        response = await asyncio.wait_for(request_task, timeout=2)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["title"] == "durable imported mirror"
+    assert response.json()["status"] == "completed"
+    publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -813,6 +1143,77 @@ async def test_get_task_not_found(client):
 
 
 @pytest.mark.asyncio
+async def test_get_worker_termination_receipt_returns_exact_task_not_found(
+    client,
+):
+    operation_id = "a" * 32
+    task_id = 987654
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/termination-receipts/{operation_id}"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "version": 2,
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "status": "task_not_found",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_worker_termination_receipt_fails_closed_on_corrupt_storage(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.services.worker_task_termination import (
+        WorkerTaskTerminationReceipt,
+        canonical_json_digest,
+        stage_worker_receipt,
+    )
+
+    operation_id = "b" * 32
+    async with session_factory() as db:
+        task = Task(title="corrupt Worker receipt", status="pending")
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        payload = {
+            "version": 2,
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "operation": "cancel",
+            "manager_worker_id": 17,
+            "expected_remote": {
+                "status": "pending",
+                "retry_count": 0,
+                "turn_generation": 0,
+            },
+            "manager_handoff": None,
+        }
+        await stage_worker_receipt(
+            db,
+            task_id=task_id,
+            operation_id=operation_id,
+            operation="cancel",
+            request_payload=payload,
+            request_digest=canonical_json_digest(payload),
+        )
+        receipt = await db.get(WorkerTaskTerminationReceipt, operation_id)
+        receipt.request_payload = {**payload, "unexpected": True}
+        await db.commit()
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/termination-receipts/{operation_id}"
+    )
+
+    assert response.status_code == 409, response.text
+    assert "receipt" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
 async def test_delete_task(client):
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
@@ -844,6 +1245,45 @@ async def test_retry_task(client):
     assert cancelled.status_code == 200
     resp = await client.post(f"/api/tasks/{task_id}/retry")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "plan_approved"),
+    [("completed", True), ("cancelled", False)],
+)
+async def test_manual_retry_rejects_terminal_plan_tasks(
+    client,
+    session_factory,
+    status,
+    plan_approved,
+):
+    """Plan decisions are immutable; revision owns another planning run."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        plan = Task(
+            title="Terminal Plan",
+            description="Plan this",
+            status=status,
+            mode="plan",
+            plan_approved=plan_approved,
+            plan_content="A reviewed proposal",
+        )
+        db.add(plan)
+        await db.commit()
+        task_id = plan.id
+
+    response = await client.post(f"/api/tasks/{task_id}/retry")
+
+    assert response.status_code == 409
+    assert "Plan Tasks cannot be retried" in response.json()["detail"]
+    async with session_factory() as db:
+        plan = await db.get(Task, task_id)
+    assert plan.status == status
+    assert plan.retry_count == 0
+    assert plan.plan_approved is plan_approved
 
 
 @pytest.mark.asyncio
@@ -1179,6 +1619,55 @@ async def test_update_task(client):
     resp = await client.put(f"/api/tasks/{task_id}", json={"title": "Updated"})
     assert resp.status_code == 200
     assert resp.json()["title"] == "Updated"
+
+
+@pytest.mark.asyncio
+async def test_update_task_yields_to_receipt_after_api_precheck(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """The service-level CAS defeats receipt admission after authorization."""
+
+    import backend.services.worker_proxy as worker_proxy_module
+    from backend.models.task import Task
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="receipt-owned config",
+            description="d",
+            status="completed",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    @asynccontextmanager
+    async def receipt_wins_before_service_cas(locked_task_id):
+        assert locked_task_id == task_id
+        await persist_active_worker_receipt(session_factory, task_id)
+        yield
+
+    monkeypatch.setattr(
+        worker_proxy_module,
+        "get_task_operation_lock",
+        receipt_wins_before_service_cas,
+    )
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"title": "must not be saved"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current is not None
+    assert current.title == "receipt-owned config"
 
 
 async def _create_worker_task_for_handoff_edit_test(
@@ -2709,10 +3198,12 @@ async def test_tracked_pty_background_terminal_request_clears_marker(
         expected_generations,
         expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert stopped_task_id == task_id
         assert expected_task_turn_generation == 0
         assert task_status == terminal_status
+        assert worker_termination_operation_id is None
         assert expected_generations == [
             (instance_id, 41001, started_at)
         ]
@@ -2831,10 +3322,12 @@ async def test_owner_stop_preserves_new_background_generation(
         expected_generations,
         expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert _task_id == task_id
         assert expected_task_turn_generation == 0
         assert task_status == terminal_status
+        assert worker_termination_operation_id is None
         assert expected_generations == [
             (instance_id, 42001, started_at)
         ]
@@ -3368,10 +3861,12 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
         expected_generations,
         expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert stopped_task_id == task_id
         assert expected_task_turn_generation == 0
         assert task_status == terminal_status
+        assert worker_termination_operation_id is None
         assert [
             (owner_id, pid, owner_started_at)
             for owner_id, pid, owner_started_at in expected_generations
@@ -3760,6 +4255,9 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
         )
         db.add(inst)
         await db.commit()
+        task_id = task.id
+        task_turn_generation = task.turn_generation
+        instance_id = inst.id
 
         with patch.object(
             backend.main.instance_manager,
@@ -3768,20 +4266,21 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
             return_value=True,
         ) as stop:
             assert await _stop_task_process(
-                task.id,
+                task_id,
                 db,
-                expected_generations=[(inst.id, None, None)],
-                expected_task_turn_generation=task.turn_generation,
+                expected_generations=[(instance_id, None, None)],
+                expected_task_turn_generation=task_turn_generation,
             ) is True
             stop.assert_awaited_once_with(
-                inst.id,
-                expected_task_id=task.id,
-                expected_task_turn_generation=task.turn_generation,
+                instance_id,
+                expected_task_id=task_id,
+                expected_task_turn_generation=task_turn_generation,
                 expected_pid=None,
                 expected_started_at=None,
                 task_status="completed",
                 terminal_consumer_timeout=30.0,
                 consumer_cancel_timeout=10.0,
+                yield_to_worker_task_termination=True,
             )
 
 
@@ -3846,6 +4345,7 @@ async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
         task_status="completed",
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
     reconcile.assert_awaited_once_with(
         instance_id,
@@ -3899,6 +4399,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
         task_status,
         terminal_consumer_timeout,
         consumer_cancel_timeout,
+        yield_to_worker_task_termination,
     ):
         assert stopped_instance_id == instance_id
         assert expected_task_id == task_id
@@ -3908,6 +4409,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
         assert task_status == "completed"
         assert terminal_consumer_timeout == 30.0
         assert consumer_cancel_timeout == 10.0
+        assert yield_to_worker_task_termination is True
         async with session_factory() as db:
             instance = await db.get(Instance, instance_id)
             instance.pid = 2222
@@ -3983,10 +4485,12 @@ async def test_cancel_stops_exact_owner_before_publishing_status(
         expected_generations,
         expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert tid == task_id
         assert expected_task_turn_generation == 0
         assert task_status == "cancelled"
+        assert worker_termination_operation_id is None
         assert expected_generations == [(instance_id, 9911, None)]
         async with session_factory() as verify_db:
             task = await verify_db.get(Task, task_id)

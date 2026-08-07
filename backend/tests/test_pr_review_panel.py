@@ -22,6 +22,9 @@ from backend.models.task import Task
 from backend.services import pr_review_panel
 from backend.services import pr_review_service
 from backend.services.pr_monitor_loop import attach_review_to_run
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
+)
 
 
 BASE_SHA = "a" * 40
@@ -558,6 +561,11 @@ async def test_panel_creates_three_independent_tasks_and_gates_findings(
     assert [run.role for run in runs] == list(pr_review_panel.REVIEWER_ROLES)
     assert len({run.task_id for run in runs}) == 3
     tasks = [await db_session.get(Task, run.task_id) for run in runs]
+    review_id = review.id
+    run_task_specs = [
+        (run.id, run.role, task.id)
+        for run, task in zip(runs, tasks)
+    ]
     assert all("filesystem, shell, network, GitHub" in task.description for task in tasks)
     from backend.api.tasks import _require_pr_review_chat_allowed
     for task in tasks:
@@ -575,7 +583,8 @@ async def test_panel_creates_three_independent_tasks_and_gates_findings(
             AsyncMock(),
         ) as publish,
     ):
-        for index, (run, task) in enumerate(zip(runs, tasks)):
+        for index, (run_id, role, task_id) in enumerate(run_task_specs):
+            task = await db_session.get(Task, task_id, populate_existing=True)
             now = datetime.utcnow()
             task.status = "completed"
             task.started_at = now
@@ -585,21 +594,21 @@ async def test_panel_creates_three_independent_tasks_and_gates_findings(
                 task_retry_count=task.retry_count,
                 event_type="result",
                 role="assistant",
-                content=_output(run.role, blocker=index == 2),
+                content=_output(role, blocker=index == 2),
                 timestamp=now,
             ))
             await db_session.commit()
             await pr_review_panel.check_and_update_reviewer_run(
                 db_session,
-                reviewer_run_id=run.id,
-                task_id=task.id,
+                reviewer_run_id=run_id,
+                task_id=task_id,
                 retry_count=task.retry_count,
                 db_factory=db_factory,
             )
 
-    refreshed = await db_session.get(PRReview, review.id, populate_existing=True)
+    refreshed = await db_session.get(PRReview, review_id, populate_existing=True)
     findings = list((await db_session.execute(
-        select(PRFinding).where(PRFinding.pr_review_id == review.id)
+        select(PRFinding).where(PRFinding.pr_review_id == review_id)
     )).scalars())
     assert refreshed.status == "publishing"
     assert refreshed.pending_action == "review_comments"
@@ -860,6 +869,181 @@ async def test_reviewer_completion_revalidates_stale_second_session(
     )
     assert refreshed_review.status == "reviewing"
     assert findings == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("task_status", ["completed", "failed"])
+async def test_panel_terminal_consumers_yield_to_active_termination_receipt(
+    db_session,
+    db_factory,
+    task_status,
+):
+    review, run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=None,
+    )
+    task.status = task_status
+    if task_status == "completed":
+        db_session.add(LogEntry(
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            event_type="result",
+            role="assistant",
+            content=_output(run.role),
+            timestamp=task.started_at,
+        ))
+    await db_session.commit()
+    review_id = review.id
+    run_id = run.id
+    task_id = task.id
+    retry_count = task.retry_count
+    await persist_active_worker_receipt(db_factory, task_id)
+
+    if task_status == "completed":
+        changed = await pr_review_panel.check_and_update_reviewer_run(
+            db_session,
+            reviewer_run_id=run_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            db_factory=db_factory,
+        )
+    else:
+        changed = await pr_review_panel.fail_reviewer_run(
+            db_session,
+            reviewer_run_id=run_id,
+            task_id=task_id,
+            error="receipt owns failure arbitration",
+        )
+
+    assert not changed
+    current_review = await db_session.get(
+        PRReview,
+        review_id,
+        populate_existing=True,
+    )
+    current_run = await db_session.get(
+        PRReviewerRun,
+        run_id,
+        populate_existing=True,
+    )
+    assert current_review.status == "reviewing"
+    assert current_run.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_panel_completion_final_cas_yields_to_receipt_race(
+    tmp_path,
+):
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'panel-receipt-race.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as consumer:
+            review, run, task = await _create_recoverable_panel_run(
+                consumer,
+                worker_id=None,
+            )
+            consumer.add(LogEntry(
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                event_type="result",
+                role="assistant",
+                content=_output(run.role),
+                timestamp=task.started_at,
+            ))
+            await consumer.commit()
+            review_id = review.id
+            run_id = run.id
+            task_id = task.id
+            retry_count = task.retry_count
+            original_guard = pr_review_panel._guard_exact_terminal_task
+
+            async def receipt_wins_before_final_cas(
+                db,
+                guarded_task,
+                *,
+                statuses,
+            ):
+                assert guarded_task.id == task_id
+                await persist_active_worker_receipt(sessions, task_id)
+                return await original_guard(
+                    db,
+                    guarded_task,
+                    statuses=statuses,
+                )
+
+            with patch.object(
+                pr_review_panel,
+                "_guard_exact_terminal_task",
+                side_effect=receipt_wins_before_final_cas,
+            ):
+                assert await pr_review_panel.check_and_update_reviewer_run(
+                    consumer,
+                    reviewer_run_id=run_id,
+                    task_id=task_id,
+                    retry_count=retry_count,
+                    db_factory=sessions,
+                ) is False
+
+        async with sessions() as verifier:
+            current_review = await verifier.get(PRReview, review_id)
+            current_run = await verifier.get(PRReviewerRun, run_id)
+            assert current_review.status == "reviewing"
+            assert current_run.status == "pending"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_panel_startup_recovery_holds_shared_task_operation_lock(
+    db_session,
+    db_factory,
+):
+    _, run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=None,
+    )
+    db_session.add(LogEntry(
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        event_type="result",
+        role="assistant",
+        content=_output(run.role),
+        timestamp=task.started_at,
+    ))
+    await db_session.commit()
+    task_id = task.id
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    original_read = pr_review_panel._read_panel_terminal
+
+    async def assert_locked(*args, **kwargs):
+        assert get_task_operation_lock(task_id).locked()
+        return await original_read(*args, **kwargs)
+
+    with patch.object(
+        pr_review_panel,
+        "_read_panel_terminal",
+        side_effect=assert_locked,
+    ):
+        assert await pr_review_panel.recover_panel_reviews(db_factory) == 1
 
 
 @pytest.mark.asyncio

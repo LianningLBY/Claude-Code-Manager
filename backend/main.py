@@ -255,6 +255,18 @@ if settings.worker_enabled:
     except Exception:
         logger.exception("Worker provisioner init failed — workers disabled")
 
+# The same runtime also runs on a Worker where Manager-side Worker support may
+# be disabled.  It must still recover locally accepted/executing receipts and
+# keep their durable dequeue gate authoritative across restart.
+from backend.services.worker_task_termination import (
+    WorkerTaskTerminationCoordinator,
+)
+
+worker_task_termination_coordinator = WorkerTaskTerminationCoordinator(
+    async_session,
+    worker_proxy=worker_proxy,
+)
+
 
 async def _sync_tags():
     """Ensure all project tags have corresponding Tag records."""
@@ -589,6 +601,14 @@ async def _shutdown_runtime_services(
         failures.append(exc)
         logger.exception("Capability coordinator shutdown failed")
 
+    # Stop receipt reconciliation while both the Worker relay and Dispatcher
+    # resources it may use for exact readback/reaping are still available.
+    try:
+        await worker_task_termination_coordinator.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Worker termination coordinator shutdown failed")
+
     # Relay recovery and health producers are already quiescent above. Close
     # relay-owned sockets/tasks before Dispatcher starts dismantling the local
     # execution paths that accepted Worker handoffs depend on.
@@ -664,10 +684,18 @@ async def _shutdown_runtime_services(
 async def _start_execution_runtimes() -> None:
     """Start execution runtimes from downstream owner to controller."""
 
+    # Reconcile Worker-local accepted/executing rows synchronously while their
+    # SQL active_task_id gate still excludes every TaskQueue claim.  Only after
+    # this pass may Dispatcher expose dequeue; the periodic runner handles
+    # transient cleanup failures without releasing that gate.
+    await worker_task_termination_coordinator.recover_once(
+        include_manager=False
+    )
     if settings.auto_start_dispatcher:
         await dispatcher.start()
     if worker_relay is not None:
         await worker_relay.start()
+    await worker_task_termination_coordinator.start()
     # This remains active when capability admission is disabled: it must still
     # recover/cancel work that was already running before a feature rollback.
     await capability_coordinator.start()

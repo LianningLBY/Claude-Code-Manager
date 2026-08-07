@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, or_, select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -59,10 +60,12 @@ from backend.services.task_termination import (
 from backend.services.worker_relay import (
     WorkerTaskGeneration,
     apply_authoritative_worker_task,
+    has_worker_execution_quarantine,
     worker_task_generation,
     worker_task_generation_predicates,
 )
 from backend.services.worker_proxy import (
+    WorkerDestroyLifecycleClaim,
     WorkerEndpointNotFoundError,
     get_task_operation_lock,
 )
@@ -76,6 +79,24 @@ from backend.services.worker_routing_config import (
     task_routing_tuple,
     with_pending_worker_routing,
     without_pending_worker_routing,
+)
+from backend.services.worker_task_termination import (
+    WorkerTaskTerminationConflict as DurableWorkerTerminationConflict,
+    WorkerTaskTerminationPending,
+    active_worker_task_termination_receipt,
+    acknowledge_worker_receipt,
+    create_or_resume_manager_receipt,
+    execute_worker_receipt,
+    local_task_termination_effect_authority_matches,
+    mark_worker_receipt_conflict,
+    no_active_worker_task_termination_predicate,
+    persist_worker_preflight_rejection,
+    receipt_not_found_payload,
+    reconcile_manager_receipt,
+    serialize_receipt,
+    stage_worker_receipt,
+    task_not_found_payload,
+    worker_task_termination_authority_predicate,
 )
 from backend.services.auto_capability_policy import (
     validate_auto_capability_task_scope,
@@ -107,6 +128,25 @@ _WORKER_SKILL_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 _PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
     {"approved", "merged", "commented", "error"}
 )
+
+
+class WorkerTerminationPutRequest(BaseModel):
+    """Strict Manager->Worker durable termination request."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: Literal["cancel", "stop_session", "supersede"]
+    request_payload: dict
+    request_digest: str = Field(min_length=64, max_length=64)
+
+
+class WorkerTerminationAckRequest(BaseModel):
+    """Manager proof that the exact Worker result is durable locally."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_digest: str = Field(min_length=64, max_length=64)
+    result_digest: str = Field(min_length=64, max_length=64)
 
 
 def _require_not_delivery_owned_task(task: Task, *, action: str) -> None:
@@ -943,6 +983,12 @@ async def create_task(
             raise HTTPException(404, "Clone source task not found")
         await require_task_control(request, source, db)
         _require_not_delivery_owned_task(source, action="used as clone sources")
+        if source.mode == "plan" or source.canonical_plan_id is not None:
+            raise HTTPException(
+                409,
+                "Plan Tasks cannot be used as clone sources; materialize the "
+                "approved canonical Plan through its execution workflow",
+            )
         if "attention_tag" not in body.model_fields_set:
             data["attention_tag"] = source.attention_tag
         cloned = await _clone_session(clone_from_task_id, db)
@@ -1004,24 +1050,54 @@ async def create_task(
         metadata = dict(data.get("metadata_") or {})
         metadata["revised_from_plan_task_id"] = superseded_id
         data["metadata_"] = metadata
-        task = await stage_task_record(db, **data)
-        from backend.services.plan_tasks import mark_plan_superseded
+        from backend.services.plan_tasks import (
+            mark_plan_superseded,
+            PlanTerminalQuiescenceError,
+            run_plan_terminal_transition,
+        )
 
-        if not await mark_plan_superseded(
-            db,
-            supersedes,
-            successor_id=task.id,
-        ):
-            await db.rollback()
-            raise HTTPException(
-                409,
-                "Plan changed while its revision was being created",
-            )
-        await db.commit()
+        async with get_task_operation_lock(superseded_id):
+            async def commit_legacy_standalone_supersede() -> Task:
+                db.expire_all()
+                current_supersedes = await db.get(Task, superseded_id)
+                if (
+                    current_supersedes is None
+                    or current_supersedes.mode != "plan"
+                    or current_supersedes.plan_target_task_id is not None
+                ):
+                    raise HTTPException(
+                        400,
+                        "Standalone Plan can only supersede another "
+                        "standalone Plan",
+                    )
+                await require_task_control(request, current_supersedes, db)
+                if current_supersedes.status != "plan_review":
+                    raise HTTPException(
+                        409,
+                        "Only a Plan awaiting review can be superseded",
+                    )
+                staged = await stage_task_record(db, **data)
+                if not await mark_plan_superseded(
+                    db,
+                    current_supersedes,
+                    successor_id=staged.id,
+                ):
+                    raise HTTPException(
+                        409,
+                        "Plan changed while its revision was being created",
+                    )
+                return staged
+
+            try:
+                task = await run_plan_terminal_transition(
+                    db,
+                    superseded_id,
+                    "superseded",
+                    commit_legacy_standalone_supersede,
+                )
+            except PlanTerminalQuiescenceError as exc:
+                raise HTTPException(409, str(exc)) from exc
         await db.refresh(task)
-        from backend.services.task_events import broadcast_status_change
-
-        await broadcast_status_change(superseded_id, "superseded")
     # Eliminate the dispatcher's historical 0-2s polling delay.  Importing
     # here avoids a module cycle during application construction.
     try:
@@ -1076,6 +1152,17 @@ async def import_migrated_task(
     existing = await db.get(Task, body.id)
     if existing is not None:
         _require_not_delivery_owned_task(existing, action="migration-imported")
+        if existing.mode == "plan" or existing.canonical_plan_id is not None:
+            raise HTTPException(
+                409,
+                "Existing Plan carriers are immutable and cannot be "
+                "migration-imported",
+            )
+        if existing.mode != body.mode:
+            raise HTTPException(
+                409,
+                "Migration import cannot change an existing Task mode",
+            )
         # Migration import may refresh an inert Worker copy, but it must never
         # repurpose a same-id local Auto Task that carries immutable capability
         # authority.  The wire schema deliberately omits the policy, so merely
@@ -1146,6 +1233,7 @@ async def import_migrated_task(
         return await queue.create(**data)
 
     old_status = existing.status
+    existing_generation = _task_generation_fence(body.id, existing)
     if old_status in ("in_progress", "executing", "migrating"):
         raise HTTPException(
             409,
@@ -1153,28 +1241,107 @@ async def import_migrated_task(
         )
 
     values = {key: value for key, value in data.items() if key != "id"}
-    result = await db.execute(
-        sa_update(Task)
-        .where(
-            *_task_generation_fence(body.id, existing),
-            Task.mode != "delivery_loop",
-            Task.delivery_run_id.is_(None),
+    # End every validation read before competing with receipt admission.  The
+    # no-op/write CAS below must be the first statement of a fresh transaction
+    # so a receipt that committed through another SQLite WAL connection cannot
+    # turn this into BUSY_SNAPSHOT or be overwritten by the stale import.
+    await db.rollback()
+    async with get_task_operation_lock(body.id):
+        result = await db.execute(
+            sa_update(Task)
+            .where(
+                *existing_generation,
+                Task.mode != "delivery_loop",
+                Task.delivery_run_id.is_(None),
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
         )
-        .values(**values)
-    )
-    if result.rowcount != 1:
-        await db.rollback()
-        raise HTTPException(409, "Destination task changed during migration import")
-    await db.commit()
-    db.expire_all()
-    task = await db.get(Task, body.id)
-    if task is None:  # defensive: a concurrent delete must not look successful
-        raise HTTPException(409, "Destination task disappeared during migration import")
-    if old_status != source_status:
-        from backend.services.task_events import broadcast_status_change
+        if result.rowcount != 1:
+            await db.rollback()
+            if await active_worker_task_termination_receipt(db, body.id):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Destination task has an active Worker termination receipt",
+                )
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task changed during migration import",
+            )
+        db.expire_all()
+        task = await db.get(Task, body.id)
+        if task is None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task disappeared during migration import",
+            )
+        publication_generation = _task_generation_fence(body.id, task)
+        await db.commit()
 
-        await broadcast_status_change(task.id, source_status)
-    return task
+        if old_status != source_status:
+            # The imported state is already durable before publication.  Hold
+            # a fresh exact-result no-op write across the WebSocket await so a
+            # retry, migration, or termination receipt cannot cross this old
+            # status event.  A receipt which wins after the import commit owns
+            # subsequent publication; the import itself remains successful.
+            guarded = await db.execute(
+                sa_update(Task)
+                .where(
+                    *publication_generation,
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(status=source_status)
+                .execution_options(synchronize_session=False)
+            )
+            if guarded.rowcount == 1:
+                from backend.services.task_events import broadcast_status_change
+
+                await broadcast_status_change(task.id, source_status)
+                await db.commit()
+            else:
+                await db.rollback()
+                db.expire_all()
+                task = await db.get(Task, body.id)
+                if task is None:
+                    raise HTTPException(
+                        409,
+                        "Destination task disappeared after migration import",
+                    )
+        return task
+
+
+@router.get("/{task_id}/legacy-plan-execution-carrier-proof")
+async def get_legacy_plan_execution_carrier_proof(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return semantic proof for an existing migrated Worker carrier.
+
+    This endpoint is deliberately read-only and internal-only.  It cannot
+    create, approve, retry, or wake a Task; the Manager must subscribe before
+    readback and let the Worker's own dispatcher execute the already-present
+    carrier.
+    """
+
+    require_internal_service(request)
+    if await db.get(Task, task_id) is None:
+        raise HTTPException(404, "Task not found")
+    from backend.services.legacy_plan_execution import (
+        legacy_approved_execution_carrier_proof,
+    )
+
+    proof = await legacy_approved_execution_carrier_proof(db, task_id)
+    if proof is None:
+        raise HTTPException(
+            409,
+            "Task is not an exact migrated approved Plan execution carrier",
+        )
+    return proof.to_wire()
 
 
 @router.get("/{task_id}", response_model=TaskResponse)
@@ -1353,6 +1520,7 @@ async def _lock_worker_local_routing_task(
         Task.worker_id.is_(None),
         Task.shared_from_id.is_(None),
         Task.pty_background_generation.is_(None),
+        no_active_worker_task_termination_predicate(),
     ]
     if allowed_statuses is not None:
         predicates.append(Task.status.in_(allowed_statuses))
@@ -1369,6 +1537,12 @@ async def _lock_worker_local_routing_task(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="routing-configured")
+        if await active_worker_task_termination_receipt(db, task_id):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         if current.worker_id is not None or current.shared_from_id is not None:
             raise HTTPException(
                 409,
@@ -2266,7 +2440,14 @@ async def _update_worker_task_with_skill_configuration(
                 "execution claim became active; wait for the current Worker "
                 "turn to finish",
             )
-        updated = await queue.update_task(task_id, **updates)
+        try:
+            updated = await queue.update_task(
+                task_id,
+                operation_lock_held=True,
+                **updates,
+            )
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         if updated is None:
             raise HTTPException(404, "Task not found")
         return updated
@@ -2295,7 +2476,14 @@ async def _update_worker_task_with_handoff_fence(
                 "Task Worker assignment changed before configuration could be saved",
             )
         _require_no_pending_worker_turn_handoff(current)
-        updated = await queue.update_task(task_id, **updates)
+        try:
+            updated = await queue.update_task(
+                task_id,
+                operation_lock_held=True,
+                **updates,
+            )
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
         if updated is None:
             raise HTTPException(404, "Task not found")
         return updated
@@ -2548,7 +2736,10 @@ async def update_task(
                 expected_worker_id=task.worker_id,
             )
         )
-    task = await queue.update_task(task_id, **updates)
+    try:
+        task = await queue.update_task(task_id, **updates)
+    except DurableWorkerTerminationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
     return task
@@ -2865,6 +3056,11 @@ async def delete_task(
                     409,
                     "Task moved back to this Manager; refresh before deleting",
                 )
+            if await active_worker_task_termination_receipt(db, task_id):
+                raise HTTPException(
+                    409,
+                    "Task has an active Worker termination receipt",
+                )
             if not is_task_status_deletable(
                 mode=worker_task.mode,
                 status=worker_task.status,
@@ -2996,6 +3192,7 @@ async def _proxy(
     allow_task_absent: bool = False,
     surface_endpoint_not_found: bool = False,
     operation_lock_held: bool = False,
+    quarantine_on_transport_uncertainty: bool = False,
 ):
     from backend.main import worker_proxy
 
@@ -3006,6 +3203,7 @@ async def _proxy(
         or allow_task_absent
         or surface_endpoint_not_found
         or operation_lock_held
+        or quarantine_on_transport_uncertainty
     ):
         proxy_options = {
             "require_json": require_json,
@@ -3014,6 +3212,8 @@ async def _proxy(
         }
         if surface_endpoint_not_found:
             proxy_options["surface_endpoint_not_found"] = True
+        if quarantine_on_transport_uncertainty:
+            proxy_options["quarantine_on_transport_uncertainty"] = True
         return await worker_proxy.proxy_to_worker(
             task,
             method,
@@ -3058,28 +3258,11 @@ async def _sync_task_from_worker_response(
             "Task Worker assignment or generation changed while the request "
             "was in flight",
         )
-    status_changed = resulting.status != observed.status
-    if status_changed:
-        # relay 断连窗口内 Worker 侧广播镜像不过来，这里本地补一次。
-        # Hold an exact-result no-op UPDATE across publication so a rapid retry
-        # cannot let this old status event cross the replacement generation.
-        guarded = await db.execute(
-            sa_update(Task)
-            .where(*worker_task_generation_predicates(resulting))
-            .values(status=resulting.status)
-        )
-        if guarded.rowcount == 1:
-            from backend.services.task_events import broadcast_status_change
-
-            await broadcast_status_change(task_id, resulting.status)
-            await db.commit()
-        else:
-            await db.rollback()
-            raise HTTPException(
-                409,
-                "Task Worker assignment or generation changed before status "
-                "publication",
-            )
+    await _publish_worker_status_transition(
+        db,
+        observed_status=observed.status,
+        resulting=resulting,
+    )
 
     db.expire_all()
     current = await db.get(Task, task_id)
@@ -3089,6 +3272,181 @@ async def _sync_task_from_worker_response(
             "Task disappeared while the Worker request was in flight",
         )
     return current
+
+
+async def _publish_worker_status_transition(
+    db: AsyncSession,
+    *,
+    observed_status: str,
+    resulting: WorkerTaskGeneration,
+) -> None:
+    """Publish one exact Worker status transition behind its generation CAS."""
+
+    if resulting.status == observed_status:
+        return
+    # Relay disconnects can hide the Worker's broadcast. Hold an exact-result
+    # no-op UPDATE across publication so an old event cannot cross a retry or
+    # migration generation.
+    guarded = await db.execute(
+        sa_update(Task)
+        .where(
+            *worker_task_generation_predicates(resulting),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=resulting.status)
+    )
+    if guarded.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task Worker assignment or generation changed before status "
+            "publication",
+        )
+    from backend.services.task_events import broadcast_status_change
+
+    await broadcast_status_change(resulting.task_id, resulting.status)
+    await db.commit()
+
+
+async def _internal_worker_termination_task(
+    task_id: int,
+    request: Request,
+    db: AsyncSession,
+) -> Task:
+    """Authorize the v2 durable Manager->Worker termination protocol."""
+
+    require_internal_service(request)
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    if task.worker_id is not None or task.shared_from_id is not None:
+        raise HTTPException(409, "Termination receipt Task is not Worker-local")
+    return task
+
+
+@router.get(
+    "/{task_id}/termination-receipts/{operation_id}",
+    include_in_schema=False,
+)
+async def get_worker_termination_receipt(
+    task_id: int,
+    operation_id: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Read one Worker receipt; absence is an explicit idempotency sentinel."""
+
+    require_internal_service(request)
+    from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
+
+    receipt = await db.get(WorkerTaskTerminationReceipt, operation_id)
+    if receipt is not None:
+        if receipt.task_id != task_id or receipt.side != "worker":
+            raise HTTPException(409, "Termination receipt identity changed")
+        try:
+            return serialize_receipt(receipt)
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+    task = await db.get(Task, task_id)
+    if task is None:
+        return task_not_found_payload(task_id, operation_id)
+    await require_task_control(request, task, db)
+    if task.worker_id is not None or task.shared_from_id is not None:
+        raise HTTPException(409, "Termination receipt Task is not Worker-local")
+    return receipt_not_found_payload(task_id, operation_id)
+
+
+@router.put(
+    "/{task_id}/termination-receipts/{operation_id}",
+    include_in_schema=False,
+)
+async def put_worker_termination_receipt(
+    task_id: int,
+    operation_id: str,
+    body: WorkerTerminationPutRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept durably, then stop/cancel the exact Worker-local generation."""
+
+    require_internal_service(request)
+    from backend.services.task_termination import task_termination_operation_locks
+
+    await db.rollback()
+    async with task_termination_operation_locks((task_id,)):
+        await _internal_worker_termination_task(task_id, request, db)
+        try:
+            receipt = await stage_worker_receipt(
+                db,
+                task_id=task_id,
+                operation_id=operation_id,
+                operation=body.operation,
+                request_payload=body.request_payload,
+                request_digest=body.request_digest,
+            )
+            if receipt.status in {"accepted", "executing"}:
+                receipt = await _finish_task_operation(
+                    execute_worker_receipt(db, operation_id)
+                )
+        except DurableWorkerTerminationConflict as exc:
+            # If acceptance never committed, persist a digest-bound rejected
+            # tombstone so Manager GET can prove PUT had no side effect and
+            # release its gate.  Once accepted/executing exists, the same error
+            # is an active conflict quarantine instead.
+            rejected = await persist_worker_preflight_rejection(
+                db,
+                task_id=task_id,
+                operation_id=operation_id,
+                operation=body.operation,
+                request_payload=body.request_payload,
+                request_digest=body.request_digest,
+                error=str(exc),
+            )
+            if rejected is not None and rejected.status == "rejected":
+                try:
+                    return serialize_receipt(rejected)
+                except DurableWorkerTerminationConflict as serialization_exc:
+                    raise HTTPException(409, str(serialization_exc)) from serialization_exc
+            await mark_worker_receipt_conflict(db, operation_id, exc)
+            raise HTTPException(409, str(exc)) from exc
+        try:
+            return serialize_receipt(receipt)
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+
+@router.post(
+    "/{task_id}/termination-receipts/{operation_id}/ack",
+    include_in_schema=False,
+)
+async def ack_worker_termination_receipt(
+    task_id: int,
+    operation_id: str,
+    body: WorkerTerminationAckRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Release the Worker active gate after exact Manager result commit."""
+
+    require_internal_service(request)
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        await _internal_worker_termination_task(task_id, request, db)
+        try:
+            receipt = await acknowledge_worker_receipt(
+                db,
+                task_id=task_id,
+                operation_id=operation_id,
+                request_digest=body.request_digest,
+                result_digest=body.result_digest,
+            )
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        try:
+            return serialize_receipt(receipt)
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
 
 
 async def _internal_pr_review_termination_task(
@@ -3139,67 +3497,90 @@ async def terminate_task_generation(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Internal Manager→Worker exact-generation termination endpoint.
-
-    The complete local lifecycle is cancellation-shielded. The resulting Task
-    row remains locked through response serialization so a remote retry cannot
-    overtake the authoritative terminal snapshot returned to the Manager.
-    """
+    """Reject the pre-receipt mutation protocol without side effects."""
 
     await _internal_pr_review_termination_task(task_id, request, db)
-
-    from backend.services.task_termination import (
-        LocalTaskGeneration,
-        TaskTerminationConflict,
-        lock_task_generation,
-        terminate_local_task_generation,
+    raise HTTPException(
+        409,
+        "Legacy termination mutation is disabled; use the durable "
+        "termination receipt protocol",
     )
 
-    try:
-        terminated = await terminate_local_task_generation(
-            task_id,
-            db,
-            reason="Superseded by new PR push",
-            expected_generation=LocalTaskGeneration(
-                status=body.expected_status,
-                retry_count=body.expected_retry_count,
-                turn_generation=body.expected_turn_generation,
-                instance_id=body.expected_instance_id,
-                started_at=body.expected_started_at,
-                completed_at=body.expected_completed_at,
-                pty_background_generation=(body.expected_pty_background_generation),
-            ),
-            allow_delivery_effect_stop=True,
-        )
-    except TaskTerminationConflict as exc:
-        await db.rollback()
-        raise HTTPException(
-            409,
-            "Task generation cleanup could not be confirmed",
-        ) from exc
 
-    locked_task = await lock_task_generation(
+async def _require_local_termination_effect_authority(
+    task_id: int,
+    db: AsyncSession,
+    *,
+    worker_termination_operation_id: str | None,
+    expected_operation: str,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
+) -> None:
+    """Fence queue/process effects against the durable termination owner."""
+
+    task, receipt = await _lock_local_termination_effect_authority(
         task_id,
         db,
-        expected_status=terminated.terminal_status,
-        expected_retry_count=terminated.retry_count,
-        expected_turn_generation=terminated.turn_generation,
-        expected_instance_id=terminated.instance_id,
-        expected_started_at=terminated.started_at,
-        expected_completed_at=terminated.completed_at,
-        expected_pty_background_generation=(terminated.pty_background_generation),
     )
-    if locked_task is None:
+    lease_valid_at = datetime.utcnow()
+    authorized = local_task_termination_effect_authority_matches(
+        task,
+        receipt,
+        operation_id=worker_termination_operation_id,
+        operation=(
+            expected_operation
+            if worker_termination_operation_id is not None
+            else None
+        ),
+        execution_token=worker_termination_execution_token,
+        state_version=worker_termination_state_version,
+        lease_valid_at=lease_valid_at,
+    )
+    await db.rollback()
+    if not authorized:
         raise HTTPException(
             409,
-            "Task started a newer generation after termination",
+            "Task termination effects are owned by a different durable "
+            "Worker receipt",
         )
-    return locked_task
+
+
+async def _lock_local_termination_effect_authority(
+    task_id: int,
+    db: AsyncSession,
+):
+    """Acquire the portable Task writer barrier, then the active receipt row."""
+
+    await db.rollback()
+    task_lock = await db.execute(
+        sa_update(Task)
+        .where(Task.id == task_id)
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_lock.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(404, "Task not found")
+    task = await db.get(Task, task_id, populate_existing=True)
+    if task is None:
+        await db.rollback()
+        raise HTTPException(404, "Task not found")
+    receipt = await active_worker_task_termination_receipt(
+        db,
+        task_id,
+        for_update=True,
+    )
+    return task, receipt
 
 
 async def _stop_task_session_local_impl(
     task_id: int,
     db: AsyncSession,
+    *,
+    worker_termination_operation_id: str | None = None,
+    worker_supersede: bool = False,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
 ) -> dict:
     """Keep message admission closed until the stopped generation is final."""
 
@@ -3209,17 +3590,48 @@ async def _stop_task_session_local_impl(
         return await _stop_task_session_local_under_cancellation_lease(
             task_id,
             db,
+            worker_termination_operation_id=(
+                worker_termination_operation_id
+            ),
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+            worker_supersede=worker_supersede,
         )
 
 
 async def _stop_task_session_local_under_cancellation_lease(
     task_id: int,
     db: AsyncSession,
+    *,
+    worker_termination_operation_id: str | None = None,
+    worker_supersede: bool = False,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
 ) -> dict:
     """Cancellation-safe local core for ``POST /stop-session``."""
 
     from backend.main import dispatcher, instance_manager, ralph_loop
 
+    # Queue cancellation and auxiliary process stops are effects too.  Prove
+    # the exact durable receipt owns them before touching either subsystem;
+    # a mismatched operation id must not get as far as the later process CAS.
+    await _require_local_termination_effect_authority(
+        task_id,
+        db,
+        worker_termination_operation_id=worker_termination_operation_id,
+        expected_operation=(
+            "supersede" if worker_supersede else "stop_session"
+        ),
+        worker_termination_execution_token=(
+            worker_termination_execution_token
+        ),
+        worker_termination_state_version=worker_termination_state_version,
+    )
+    termination_operation = (
+        "supersede" if worker_supersede else "stop_session"
+    )
     await db.rollback()
     try:
         cleared = await dispatcher.abort_task_queue(
@@ -3238,6 +3650,15 @@ async def _stop_task_session_local_under_cancellation_lease(
             ) from exc
         raise
 
+    await _require_local_termination_effect_authority(
+        task_id,
+        db,
+        worker_termination_operation_id=worker_termination_operation_id,
+        expected_operation=termination_operation,
+        worker_termination_execution_token=worker_termination_execution_token,
+        worker_termination_state_version=worker_termination_state_version,
+    )
+
     # stop-session is a Task-wide execution stop, not merely a signal to the
     # current foreground process.  Monitors and CCM-owned sub-agents are
     # independent message producers; if they remain ``running`` they can post
@@ -3246,6 +3667,10 @@ async def _stop_task_session_local_under_cancellation_lease(
     # drain once more to catch a report that was already in flight.
     from backend.models.monitor_session import MonitorSession
 
+    (
+        auxiliary_task,
+        auxiliary_receipt,
+    ) = await _lock_local_termination_effect_authority(task_id, db)
     auxiliary_rows = await db.execute(
         select(
             MonitorSession.id,
@@ -3259,6 +3684,26 @@ async def _stop_task_session_local_under_cancellation_lease(
         .with_for_update()
     )
     auxiliary_sessions = list(auxiliary_rows.all())
+    auxiliary_lease_valid_at = datetime.utcnow()
+    if not local_task_termination_effect_authority_matches(
+        auxiliary_task,
+        auxiliary_receipt,
+        operation_id=worker_termination_operation_id,
+        operation=(
+            termination_operation
+            if worker_termination_operation_id is not None
+            else None
+        ),
+        execution_token=worker_termination_execution_token,
+        state_version=worker_termination_state_version,
+        lease_valid_at=auxiliary_lease_valid_at,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task termination receipt lease expired while auxiliary rows "
+            "were being locked",
+        )
     await db.execute(
         sa_update(MonitorSession)
         .where(
@@ -3278,6 +3723,16 @@ async def _stop_task_session_local_under_cancellation_lease(
     for session_id, agent_type, source in auxiliary_sessions:
         if source != "ccm":
             continue
+        await _require_local_termination_effect_authority(
+            task_id,
+            db,
+            worker_termination_operation_id=worker_termination_operation_id,
+            expected_operation=termination_operation,
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+        )
         try:
             if agent_type == "sub_agent":
                 await dispatcher.stop_sub_agent_session_process(session_id)
@@ -3296,6 +3751,16 @@ async def _stop_task_session_local_under_cancellation_lease(
             ) from exc
 
     if auxiliary_sessions:
+        await _require_local_termination_effect_authority(
+            task_id,
+            db,
+            worker_termination_operation_id=worker_termination_operation_id,
+            expected_operation=termination_operation,
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+        )
         try:
             cleared += await dispatcher.abort_task_queue(task_id)
         except Exception as exc:
@@ -3329,12 +3794,36 @@ async def _stop_task_session_local_under_cancellation_lease(
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
     if probe_is_active_plan:
+        await _require_local_termination_effect_authority(
+            task_id,
+            db,
+            worker_termination_operation_id=worker_termination_operation_id,
+            expected_operation=termination_operation,
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+        )
         try:
             stopped = await dispatcher.stop_plan_agent_lifecycle(
                 task_id,
                 probe_instance_id,
             )
             if not stopped:
+                await _require_local_termination_effect_authority(
+                    task_id,
+                    db,
+                    worker_termination_operation_id=(
+                        worker_termination_operation_id
+                    ),
+                    expected_operation=termination_operation,
+                    worker_termination_execution_token=(
+                        worker_termination_execution_token
+                    ),
+                    worker_termination_state_version=(
+                        worker_termination_state_version
+                    ),
+                )
                 stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
             if not stopped:
                 raise RuntimeError(f"No exact Plan lifecycle owns Task {task_id}")
@@ -3344,7 +3833,10 @@ async def _stop_task_session_local_under_cancellation_lease(
                 "Plan Agent process cleanup could not be confirmed",
             ) from exc
 
-    db.expire_all()
+    (
+        authority_task,
+        active_receipt,
+    ) = await _lock_local_termination_effect_authority(task_id, db)
     active_task = (
         await db.execute(
             select(Task)
@@ -3354,6 +3846,7 @@ async def _stop_task_session_local_under_cancellation_lease(
                 Task.shared_from_id.is_(None),
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if active_task is None:
@@ -3361,6 +3854,36 @@ async def _stop_task_session_local_under_cancellation_lease(
         raise HTTPException(
             409,
             "Task execution location changed while stopping its session",
+        )
+    owner_rows = await db.execute(
+        select(
+            Instance.id,
+            Instance.pid,
+            Instance.started_at,
+        )
+        .where(Instance.current_task_id == task_id)
+        .with_for_update()
+    )
+    expected_generations = list(owner_rows.all())
+    mutation_lease_valid_at = datetime.utcnow()
+    if not local_task_termination_effect_authority_matches(
+        authority_task,
+        active_receipt,
+        operation_id=worker_termination_operation_id,
+        operation=(
+            termination_operation
+            if worker_termination_operation_id is not None
+            else None
+        ),
+        execution_token=worker_termination_execution_token,
+        state_version=worker_termination_state_version,
+        lease_valid_at=mutation_lease_valid_at,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task termination receipt lease expired while owner rows were "
+            "being locked",
         )
 
     stoppable_statuses = {
@@ -3371,6 +3894,8 @@ async def _stop_task_session_local_under_cancellation_lease(
         "cancelled",
         "conflict",
     }
+    if worker_supersede:
+        stoppable_statuses.add("merging")
     if active_task.status not in stoppable_statuses:
         if active_task.status == "pending" and cleared:
             queue_only = await db.execute(
@@ -3378,6 +3903,17 @@ async def _stop_task_session_local_under_cancellation_lease(
                 .where(
                     *_task_generation_fence(task_id, active_task),
                     Task.pty_background_generation.is_(None),
+                    worker_task_termination_authority_predicate(
+                        operation_id=worker_termination_operation_id,
+                        operation=(
+                            termination_operation
+                            if worker_termination_operation_id is not None
+                            else None
+                        ),
+                        execution_token=worker_termination_execution_token,
+                        state_version=worker_termination_state_version,
+                        lease_valid_at=mutation_lease_valid_at,
+                    ),
                 )
                 .values(status=active_task.status)
             )
@@ -3404,17 +3940,9 @@ async def _stop_task_session_local_under_cancellation_lease(
     observed_session_id = active_task.session_id
     observed_completed_at = active_task.completed_at
     observed_background_generation = active_task.pty_background_generation
-    owner_rows = await db.execute(
-        select(
-            Instance.id,
-            Instance.pid,
-            Instance.started_at,
-        )
-        .where(Instance.current_task_id == task_id)
-        .with_for_update()
-    )
-    expected_generations = list(owner_rows.all())
-
+    transitioning_statuses = {"executing", "in_progress"}
+    if worker_supersede:
+        transitioning_statuses.add("merging")
     if expected_generations:
         # InstanceManager owns PTY terminal arbitration. Stop first while the
         # Task is still active; it then writes Task+Instance+marker atomically.
@@ -3427,6 +3955,27 @@ async def _stop_task_session_local_under_cancellation_lease(
             expected_generations=expected_generations,
             expected_task_turn_generation=observed_turn_generation,
             task_status="completed",
+            worker_termination_operation_id=(
+                worker_termination_operation_id
+            ),
+            **(
+                {"allow_delivery_effect_stop": True}
+                if worker_supersede
+                else {}
+            ),
+            **(
+                {
+                    "worker_termination_operation": termination_operation,
+                    "worker_termination_execution_token": (
+                        worker_termination_execution_token
+                    ),
+                    "worker_termination_state_version": (
+                        worker_termination_state_version
+                    ),
+                }
+                if worker_termination_operation_id is not None
+                else {}
+            ),
         )
         remaining_generations = await _remaining_task_process_generations(
             task_id,
@@ -3441,13 +3990,23 @@ async def _stop_task_session_local_under_cancellation_lease(
                 + ", ".join(map(str, remaining_generations)),
             )
         await db.rollback()
-        db.expire_all()
+        (
+            post_stop_authority_task,
+            post_stop_receipt,
+        ) = await _lock_local_termination_effect_authority(task_id, db)
         current = (
-            await db.execute(select(Task).where(Task.id == task_id).with_for_update())
+            await db.execute(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
         expected_status = (
             "completed"
-            if observed_status in {"executing", "in_progress"}
+            if observed_status in transitioning_statuses
             else observed_status
         )
         if (
@@ -3469,6 +4028,26 @@ async def _stop_task_session_local_under_cancellation_lease(
             .where(Instance.current_task_id == task_id)
             .with_for_update()
         )
+        post_stop_lease_valid_at = datetime.utcnow()
+        if not local_task_termination_effect_authority_matches(
+            post_stop_authority_task,
+            post_stop_receipt,
+            operation_id=worker_termination_operation_id,
+            operation=(
+                termination_operation
+                if worker_termination_operation_id is not None
+                else None
+            ),
+            execution_token=worker_termination_execution_token,
+            state_version=worker_termination_state_version,
+            lease_valid_at=post_stop_lease_valid_at,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task termination receipt lease expired while stopped owner "
+                "rows were being locked",
+            )
         if replacement_owner is not None:
             await db.rollback()
             raise HTTPException(
@@ -3495,7 +4074,33 @@ async def _stop_task_session_local_under_cancellation_lease(
                 "previous session was stopping",
             )
         if current.pty_background_generation is not None:
-            current.pty_background_generation = None
+            background_clear = await db.execute(
+                sa_update(Task)
+                .where(
+                    *_task_generation_fence(task_id, current),
+                    Task.pty_background_generation
+                    == current.pty_background_generation,
+                    worker_task_termination_authority_predicate(
+                        operation_id=worker_termination_operation_id,
+                        operation=(
+                            termination_operation
+                            if worker_termination_operation_id is not None
+                            else None
+                        ),
+                        execution_token=worker_termination_execution_token,
+                        state_version=worker_termination_state_version,
+                        lease_valid_at=post_stop_lease_valid_at,
+                    ),
+                )
+                .values(pty_background_generation=None)
+                .execution_options(synchronize_session=False)
+            )
+            if background_clear.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task termination receipt changed before background cleanup",
+                )
             background_cleared_by_api = True
         publication_retry_count = current.retry_count
         publication_turn_generation = current.turn_generation
@@ -3515,6 +4120,20 @@ async def _stop_task_session_local_under_cancellation_lease(
                 expected_started_at=publication_started_at,
                 expected_completed_at=publication_completed_at,
                 expected_pty_background_generation=None,
+                allow_worker_termination_operation_id=(
+                    worker_termination_operation_id
+                ),
+                worker_termination_operation=(
+                    termination_operation
+                    if worker_termination_operation_id is not None
+                    else None
+                ),
+                worker_termination_execution_token=(
+                    worker_termination_execution_token
+                ),
+                worker_termination_state_version=(
+                    worker_termination_state_version
+                ),
             )
             if (
                 publication_task is None
@@ -3551,7 +4170,20 @@ async def _stop_task_session_local_under_cancellation_lease(
             )
         guarded = await db.execute(
             sa_update(Task)
-            .where(*_task_generation_fence(task_id, active_task))
+            .where(
+                *_task_generation_fence(task_id, active_task),
+                worker_task_termination_authority_predicate(
+                    operation_id=worker_termination_operation_id,
+                    operation=(
+                        termination_operation
+                        if worker_termination_operation_id is not None
+                        else None
+                    ),
+                    execution_token=worker_termination_execution_token,
+                    state_version=worker_termination_state_version,
+                    lease_valid_at=mutation_lease_valid_at,
+                ),
+            )
             .values(status=active_task.status)
         )
         if not guarded.rowcount:
@@ -3572,6 +4204,23 @@ async def _stop_task_session_local_under_cancellation_lease(
                 expected_instance_id=observed_instance_id,
                 expected_started_at=observed_started_at,
                 expected_completed_at=observed_completed_at,
+                yield_to_worker_task_termination=(
+                    worker_termination_operation_id is None
+                ),
+                worker_termination_operation_id=(
+                    worker_termination_operation_id
+                ),
+                worker_termination_operation=(
+                    termination_operation
+                    if worker_termination_operation_id is not None
+                    else None
+                ),
+                worker_termination_execution_token=(
+                    worker_termination_execution_token
+                ),
+                worker_termination_state_version=(
+                    worker_termination_state_version
+                ),
             )
         )
         if not detached_stopped:
@@ -3589,6 +4238,18 @@ async def _stop_task_session_local_under_cancellation_lease(
             expected_started_at=observed_started_at,
             expected_completed_at=observed_completed_at,
             expected_pty_background_generation=None,
+            allow_worker_termination_operation_id=(
+                worker_termination_operation_id
+            ),
+            worker_termination_operation=(
+                termination_operation
+                if worker_termination_operation_id is not None
+                else None
+            ),
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
         )
         if (
             publication_task is None
@@ -3614,7 +4275,7 @@ async def _stop_task_session_local_under_cancellation_lease(
             "cleared_messages": cleared,
         }
 
-    transitioned = observed_status in {"executing", "in_progress"}
+    transitioned = observed_status in transitioning_statuses
     if transitioned:
         completed_at = datetime.utcnow()
         completed = await db.execute(
@@ -3622,6 +4283,17 @@ async def _stop_task_session_local_under_cancellation_lease(
             .where(
                 *_task_generation_fence(task_id, active_task),
                 Task.pty_background_generation.is_(None),
+                worker_task_termination_authority_predicate(
+                    operation_id=worker_termination_operation_id,
+                    operation=(
+                        termination_operation
+                        if worker_termination_operation_id is not None
+                        else None
+                    ),
+                    execution_token=worker_termination_execution_token,
+                    state_version=worker_termination_state_version,
+                    lease_valid_at=mutation_lease_valid_at,
+                ),
             )
             .values(status="completed", completed_at=completed_at)
         )
@@ -3643,6 +4315,18 @@ async def _stop_task_session_local_under_cancellation_lease(
             expected_started_at=observed_started_at,
             expected_completed_at=publication_completed_at,
             expected_pty_background_generation=None,
+            allow_worker_termination_operation_id=(
+                worker_termination_operation_id
+            ),
+            worker_termination_operation=(
+                termination_operation
+                if worker_termination_operation_id is not None
+                else None
+            ),
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
         )
         if (
             publication_task is None
@@ -3671,7 +4355,20 @@ async def _stop_task_session_local_under_cancellation_lease(
 
     guarded = await db.execute(
         sa_update(Task)
-        .where(*_task_generation_fence(task_id, active_task))
+        .where(
+            *_task_generation_fence(task_id, active_task),
+            worker_task_termination_authority_predicate(
+                operation_id=worker_termination_operation_id,
+                operation=(
+                    termination_operation
+                    if worker_termination_operation_id is not None
+                    else None
+                ),
+                execution_token=worker_termination_execution_token,
+                state_version=worker_termination_state_version,
+                lease_valid_at=mutation_lease_valid_at,
+            ),
+        )
         .values(status=active_task.status)
     )
     if not guarded.rowcount:
@@ -3688,6 +4385,286 @@ async def _stop_task_session_local_under_cancellation_lease(
             "cleared_messages": cleared,
         }
     raise HTTPException(400, "No running session found for this task")
+
+
+async def _fresh_worker_terminal_task(
+    task_id: int,
+    request: Request,
+    db: AsyncSession,
+    *,
+    action: str,
+) -> tuple[Task, WorkerTaskGeneration]:
+    """Re-authorize and observe one Worker Task inside its operation fence."""
+
+    db.expire_all()
+    current = await db.get(Task, task_id)
+    if current is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, current, db)
+    _require_not_delivery_owned_task(current, action=action)
+    await _require_no_pr_review_publication(db, task_id)
+    await _require_not_pr_review_task_mutation(db, task_id, action=action)
+    if current.worker_id is None or current.shared_from_id is not None:
+        raise HTTPException(
+            409,
+            "Task execution location changed before Worker termination",
+        )
+    if has_worker_execution_quarantine(current.metadata_):
+        raise HTTPException(
+            409,
+            "Task Worker execution is quarantined pending explicit "
+            "authoritative reconciliation",
+        )
+    observed = worker_task_generation(current)
+    if observed is None:
+        raise HTTPException(409, "Task Worker assignment changed")
+    return current, observed
+
+
+async def _worker_terminal_request_impl(
+    task_id: int,
+    request: Request,
+    db: AsyncSession,
+    *,
+    operation: str,
+    force_readback: bool,
+) -> tuple[object, Task]:
+    """Run the durable query-before-write protocol under one operation lock."""
+
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        current, observed = await _fresh_worker_terminal_task(
+            task_id,
+            request,
+            db,
+            action="cancelled" if operation == "cancel" else "stopped",
+        )
+        # ``operation_id`` and the immutable request digest are committed here,
+        # before even the first remote GET.  A repeated public request resumes
+        # this active receipt instead of allocating a new mutation identity.
+        try:
+            receipt = await create_or_resume_manager_receipt(
+                db,
+                current,
+                operation=(
+                    "stop_session" if operation == "stop-session" else operation
+                ),
+            )
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        receipt_operation_id = receipt.operation_id
+
+        try:
+            outcome = await reconcile_manager_receipt(
+                db,
+                receipt_operation_id,
+                proxy_request=_proxy,
+            )
+        except WorkerTaskTerminationPending as exc:
+            # Once the terminal Worker result is committed on the Manager the
+            # public operation succeeded even if the final ACK response was
+            # lost.  Keep the active receipt for background ACK recovery while
+            # returning the authoritative result to the caller.
+            await db.rollback()
+            db.expire_all()
+            from backend.models.worker_task_termination import (
+                WorkerTaskTerminationReceipt,
+            )
+
+            durable = await db.get(
+                WorkerTaskTerminationReceipt, receipt_operation_id
+            )
+            if (
+                durable is None
+                or durable.status != "awaiting_ack"
+                or not isinstance(durable.result_payload, dict)
+            ):
+                raise HTTPException(
+                    503,
+                    "Worker termination is durably pending reconciliation "
+                    f"({receipt_operation_id})",
+                ) from exc
+            outcome_payload = durable.result_payload
+            if outcome_payload.get("rejected") is True:
+                raise HTTPException(
+                    409,
+                    str(
+                        outcome_payload.get("error")
+                        or "Worker rejected termination before side effects"
+                    ),
+                ) from exc
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        else:
+            if not isinstance(outcome.result_payload, dict):
+                raise HTTPException(
+                    503,
+                    "Worker termination result is not yet available "
+                    f"({receipt_operation_id})",
+                )
+            outcome_payload = outcome.result_payload
+
+        db.expire_all()
+        mirrored = await db.get(Task, task_id)
+        if mirrored is None or mirrored.worker_id != observed.worker_id:
+            raise HTTPException(
+                409,
+                "Task Worker assignment changed after termination",
+            )
+        response = outcome_payload.get("response")
+        if not isinstance(response, dict):
+            response = {"ok": True, "operation_id": receipt_operation_id}
+        return response, mirrored
+
+
+async def _stop_worker_task_for_destroy_impl(
+    task_id: int,
+    destroy_claim: WorkerDestroyLifecycleClaim,
+    worker_proxy,
+    db: AsyncSession,
+) -> tuple[object, Task]:
+    """Stop one active Task under an opaque exact Worker destroy claim."""
+
+    if worker_proxy is None:
+        raise HTTPException(503, "Worker 功能未启用")
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        # Validate the claim before reading Task authority, then again inside
+        # every network request.  No public proxy path accepts ``destroying``.
+        await worker_proxy._require_destroy_lifecycle_claim(destroy_claim)
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        if (
+            current.worker_id != destroy_claim.worker_id
+            or current.shared_from_id is not None
+        ):
+            raise HTTPException(
+                409,
+                "Task moved away from the claimed destroying Worker",
+            )
+        if has_worker_execution_quarantine(current.metadata_):
+            raise HTTPException(
+                409,
+                "Task Worker execution is quarantined pending explicit "
+                "authoritative reconciliation",
+            )
+        active_termination = await active_worker_task_termination_receipt(
+            db, task_id
+        )
+        if active_termination is not None and (
+            active_termination.side != "manager"
+            or active_termination.worker_id != destroy_claim.worker_id
+            or active_termination.operation != "stop_session"
+        ):
+            raise HTTPException(
+                409,
+                "Task has a different active Worker termination receipt",
+            )
+        if (
+            current.status not in {"executing", "in_progress"}
+            and active_termination is None
+        ):
+            return {"ok": True, "stopped": False}, current
+        observed = worker_task_generation(
+            current,
+            expected_worker_id=destroy_claim.worker_id,
+        )
+        if observed is None:
+            raise HTTPException(409, "Task Worker assignment changed")
+
+        async def claimed_proxy(task, method, path, body=None, **options):
+            return await worker_proxy._proxy_to_claimed_destroying_worker(
+                task,
+                method,
+                path,
+                body,
+                destroy_claim=destroy_claim,
+                **options,
+            )
+        try:
+            receipt = await create_or_resume_manager_receipt(
+                db,
+                current,
+                operation="stop_session",
+                destroy_claim=destroy_claim,
+            )
+            receipt_operation_id = receipt.operation_id
+            outcome = await reconcile_manager_receipt(
+                db,
+                receipt_operation_id,
+                proxy_request=claimed_proxy,
+            )
+        except WorkerTaskTerminationPending as exc:
+            await db.rollback()
+            from backend.models.worker_task_termination import (
+                WorkerTaskTerminationReceipt,
+            )
+
+            durable = await db.get(
+                WorkerTaskTerminationReceipt, receipt_operation_id
+            )
+            if (
+                durable is None
+                or durable.status != "awaiting_ack"
+                or not isinstance(durable.result_payload, dict)
+            ):
+                # The destroy lifecycle remains fail-closed.  A restart cannot
+                # recreate its opaque destroying claim, but the active receipt
+                # prevents lossy detach/migration and an operator retry resumes
+                # the same operation id after the Worker is made reachable.
+                raise HTTPException(
+                    503,
+                    "Destroy stop is durably pending termination receipt "
+                    f"{receipt_operation_id}",
+                ) from exc
+            result_payload = durable.result_payload
+            if result_payload.get("rejected") is True:
+                raise HTTPException(
+                    409,
+                    str(
+                        result_payload.get("error")
+                        or "Destroy stop was rejected before side effects"
+                    ),
+                ) from exc
+        except DurableWorkerTerminationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        else:
+            if not isinstance(outcome.result_payload, dict):
+                raise HTTPException(503, "Destroy termination result is pending")
+            result_payload = outcome.result_payload
+
+        db.expire_all()
+        mirrored = await db.get(Task, task_id)
+        if mirrored is None or mirrored.worker_id != destroy_claim.worker_id:
+            raise HTTPException(
+                409,
+                "Task moved away from the claimed destroying Worker",
+            )
+        response = result_payload.get("response")
+        return (
+            response if isinstance(response, dict) else {"ok": True},
+            mirrored,
+        )
+
+
+async def _stop_worker_task_for_destroy(
+    task_id: int,
+    destroy_claim: WorkerDestroyLifecycleClaim,
+    worker_proxy,
+    db: AsyncSession,
+) -> tuple[object, Task]:
+    """Cancellation-safe internal entrypoint for Worker destroy coordination."""
+
+    return await _finish_task_operation(
+        _stop_worker_task_for_destroy_impl(
+            task_id,
+            destroy_claim,
+            worker_proxy,
+            db,
+        )
+    )
 
 
 @router.post("/{task_id}/stop-session")
@@ -3716,31 +4693,98 @@ async def stop_task_session(
         )
     wt = await _worker_task_or_none(db, task_id)
     if wt is not None:
-        return await _proxy(wt, "POST", f"/api/tasks/{task_id}/stop-session")
+        result, _mirrored = await _finish_task_operation(
+            _worker_terminal_request_impl(
+                task_id,
+                request,
+                db,
+                operation="stop-session",
+                force_readback=True,
+            )
+        )
+        return result
 
-    return await _finish_task_operation(_stop_task_session_local_impl(task_id, db))
+    # The public local path, unlike the receipt executor, must acquire the
+    # shared mutation lock and re-read authority immediately before entering
+    # its long queue/process cleanup. A Worker receipt that wins this lock is
+    # then the only caller allowed to invoke the local core directly.
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, db)
+        _require_not_delivery_owned_task(current, action="stopped")
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_not_pr_review_task_mutation(
+            db,
+            task_id,
+            action="stopped",
+        )
+        if current.worker_id is not None or current.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Task execution location changed while stopping its session",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        return await _finish_task_operation(
+            _stop_task_session_local_impl(task_id, db)
+        )
 
 
 async def _cancel_local_task_impl(
     task_id: int,
     db: AsyncSession,
+    *,
+    worker_termination_operation_id: str | None = None,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
 ) -> Task:
     """Keep message admission closed until cancellation is authoritative."""
 
     from backend.main import dispatcher
 
     async with dispatcher.task_queue_cancellation_lease(task_id):
-        return await _cancel_local_task_under_cancellation_lease(task_id, db)
+        return await _cancel_local_task_under_cancellation_lease(
+            task_id,
+            db,
+            worker_termination_operation_id=(
+                worker_termination_operation_id
+            ),
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+        )
 
 
 async def _cancel_local_task_under_cancellation_lease(
     task_id: int,
     db: AsyncSession,
+    *,
+    worker_termination_operation_id: str | None = None,
+    worker_termination_execution_token: str | None = None,
+    worker_termination_state_version: int | None = None,
 ) -> Task:
     """Cancellation-safe local core for ``POST /cancel``."""
 
     from backend.main import dispatcher, ralph_loop
 
+    await _require_local_termination_effect_authority(
+        task_id,
+        db,
+        worker_termination_operation_id=worker_termination_operation_id,
+        expected_operation="cancel",
+        worker_termination_execution_token=(
+            worker_termination_execution_token
+        ),
+        worker_termination_state_version=worker_termination_state_version,
+    )
     await db.rollback()
     try:
         await dispatcher.abort_task_queue(
@@ -3758,6 +4802,15 @@ async def _cancel_local_task_under_cancellation_lease(
                 "was not published",
             ) from exc
         raise
+
+    await _require_local_termination_effect_authority(
+        task_id,
+        db,
+        worker_termination_operation_id=worker_termination_operation_id,
+        expected_operation="cancel",
+        worker_termination_execution_token=worker_termination_execution_token,
+        worker_termination_state_version=worker_termination_state_version,
+    )
 
     # Close the spawn-without-owner window before choosing the running-owner
     # path or the ownerless terminal CAS path.
@@ -3778,11 +4831,35 @@ async def _cancel_local_task_under_cancellation_lease(
     await db.rollback()
     await _settle_task_launch_barrier(task_id, probe_instance_id)
     if probe_is_active_plan:
+        await _require_local_termination_effect_authority(
+            task_id,
+            db,
+            worker_termination_operation_id=worker_termination_operation_id,
+            expected_operation="cancel",
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+        )
         stopped = await dispatcher.stop_plan_agent_lifecycle(
             task_id,
             probe_instance_id,
         )
         if not stopped:
+            await _require_local_termination_effect_authority(
+                task_id,
+                db,
+                worker_termination_operation_id=(
+                    worker_termination_operation_id
+                ),
+                expected_operation="cancel",
+                worker_termination_execution_token=(
+                    worker_termination_execution_token
+                ),
+                worker_termination_state_version=(
+                    worker_termination_state_version
+                ),
+            )
             stopped = await ralph_loop.stop_plan_agent_lifecycle(task_id)
         if not stopped:
             raise HTTPException(
@@ -3790,7 +4867,10 @@ async def _cancel_local_task_under_cancellation_lease(
                 "Plan Agent process cleanup could not be confirmed",
             )
 
-    db.expire_all()
+    (
+        authority_task,
+        active_receipt,
+    ) = await _lock_local_termination_effect_authority(task_id, db)
     active_task = (
         await db.execute(
             select(Task)
@@ -3800,6 +4880,7 @@ async def _cancel_local_task_under_cancellation_lease(
                 Task.shared_from_id.is_(None),
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     active_statuses = (
@@ -3830,6 +4911,24 @@ async def _cancel_local_task_under_cancellation_lease(
         .with_for_update()
     )
     expected_generations = list(owner_rows.all())
+    mutation_lease_valid_at = datetime.utcnow()
+    if not local_task_termination_effect_authority_matches(
+        authority_task,
+        active_receipt,
+        operation_id=worker_termination_operation_id,
+        operation=(
+            "cancel" if worker_termination_operation_id is not None else None
+        ),
+        execution_token=worker_termination_execution_token,
+        state_version=worker_termination_state_version,
+        lease_valid_at=mutation_lease_valid_at,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task cancellation receipt lease expired while owner rows were "
+            "being locked",
+        )
 
     transitioned_by_api = False
     background_cleared_by_api = False
@@ -3843,6 +4942,22 @@ async def _cancel_local_task_under_cancellation_lease(
             expected_generations=expected_generations,
             expected_task_turn_generation=observed_turn_generation,
             task_status="cancelled",
+            worker_termination_operation_id=(
+                worker_termination_operation_id
+            ),
+            **(
+                {
+                    "worker_termination_operation": "cancel",
+                    "worker_termination_execution_token": (
+                        worker_termination_execution_token
+                    ),
+                    "worker_termination_state_version": (
+                        worker_termination_state_version
+                    ),
+                }
+                if worker_termination_operation_id is not None
+                else {}
+            ),
         )
         remaining_generations = await _remaining_task_process_generations(
             task_id,
@@ -3857,9 +4972,19 @@ async def _cancel_local_task_under_cancellation_lease(
                 + ", ".join(map(str, remaining_generations)),
             )
         await db.rollback()
-        db.expire_all()
+        (
+            authority_task,
+            active_receipt,
+        ) = await _lock_local_termination_effect_authority(task_id, db)
         active_task = (
-            await db.execute(select(Task).where(Task.id == task_id).with_for_update())
+            await db.execute(
+                select(Task)
+                .where(
+                    Task.id == task_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
         ).scalar_one_or_none()
         if (
             active_task is None
@@ -3880,6 +5005,26 @@ async def _cancel_local_task_under_cancellation_lease(
             .where(Instance.current_task_id == task_id)
             .with_for_update()
         )
+        mutation_lease_valid_at = datetime.utcnow()
+        if not local_task_termination_effect_authority_matches(
+            authority_task,
+            active_receipt,
+            operation_id=worker_termination_operation_id,
+            operation=(
+                "cancel"
+                if worker_termination_operation_id is not None
+                else None
+            ),
+            execution_token=worker_termination_execution_token,
+            state_version=worker_termination_state_version,
+            lease_valid_at=mutation_lease_valid_at,
+        ):
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Task cancellation receipt lease expired while stopped owner "
+                "rows were being locked",
+            )
         if replacement_owner is not None:
             await db.rollback()
             raise HTTPException(
@@ -3904,7 +5049,33 @@ async def _cancel_local_task_under_cancellation_lease(
                 "cancellation was stopping its previous generation",
             )
         if active_task.pty_background_generation is not None:
-            active_task.pty_background_generation = None
+            background_clear = await db.execute(
+                sa_update(Task)
+                .where(
+                    *_task_generation_fence(task_id, active_task),
+                    Task.pty_background_generation
+                    == active_task.pty_background_generation,
+                    worker_task_termination_authority_predicate(
+                        operation_id=worker_termination_operation_id,
+                        operation=(
+                            "cancel"
+                            if worker_termination_operation_id is not None
+                            else None
+                        ),
+                        execution_token=worker_termination_execution_token,
+                        state_version=worker_termination_state_version,
+                        lease_valid_at=mutation_lease_valid_at,
+                    ),
+                )
+                .values(pty_background_generation=None)
+                .execution_options(synchronize_session=False)
+            )
+            if background_clear.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task cancellation receipt changed before background cleanup",
+                )
             background_cleared_by_api = True
     else:
         if active_task.pty_background_generation is not None:
@@ -3927,6 +5098,17 @@ async def _cancel_local_task_under_cancellation_lease(
             .where(
                 *_task_generation_fence(task_id, active_task),
                 Task.pty_background_generation.is_(None),
+                worker_task_termination_authority_predicate(
+                    operation_id=worker_termination_operation_id,
+                    operation=(
+                        "cancel"
+                        if worker_termination_operation_id is not None
+                        else None
+                    ),
+                    execution_token=worker_termination_execution_token,
+                    state_version=worker_termination_state_version,
+                    lease_valid_at=mutation_lease_valid_at,
+                ),
             )
             .values(**cancelled_values)
         )
@@ -3940,6 +5122,11 @@ async def _cancel_local_task_under_cancellation_lease(
 
     from backend.models.monitor_session import MonitorSession
 
+    committed_retry_count = active_task.retry_count
+    committed_turn_generation = active_task.turn_generation
+    committed_instance_id = active_task.instance_id
+    committed_started_at = active_task.started_at
+    committed_completed_at = await _read_persisted_task_completed_at(task_id, db)
     monitor_rows = await db.execute(
         select(
             MonitorSession.id,
@@ -3953,6 +5140,24 @@ async def _cancel_local_task_under_cancellation_lease(
         .with_for_update()
     )
     auxiliary_sessions = list(monitor_rows.all())
+    auxiliary_lease_valid_at = datetime.utcnow()
+    if not local_task_termination_effect_authority_matches(
+        active_task,
+        active_receipt,
+        operation_id=worker_termination_operation_id,
+        operation=(
+            "cancel" if worker_termination_operation_id is not None else None
+        ),
+        execution_token=worker_termination_execution_token,
+        state_version=worker_termination_state_version,
+        lease_valid_at=auxiliary_lease_valid_at,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task cancellation receipt lease expired while auxiliary rows "
+            "were being locked",
+        )
     await db.execute(
         sa_update(MonitorSession)
         .where(
@@ -3967,11 +5172,6 @@ async def _cancel_local_task_under_cancellation_lease(
             turn_started_at=None,
         )
     )
-    committed_retry_count = active_task.retry_count
-    committed_turn_generation = active_task.turn_generation
-    committed_instance_id = active_task.instance_id
-    committed_started_at = active_task.started_at
-    committed_completed_at = await _read_persisted_task_completed_at(task_id, db)
     await db.commit()
 
     for session_id, agent_type, source in auxiliary_sessions:
@@ -3979,6 +5179,16 @@ async def _cancel_local_task_under_cancellation_lease(
         # processes use their own exact registries and must be reaped explicitly.
         if source != "ccm":
             continue
+        await _require_local_termination_effect_authority(
+            task_id,
+            db,
+            worker_termination_operation_id=worker_termination_operation_id,
+            expected_operation="cancel",
+            worker_termination_execution_token=(
+                worker_termination_execution_token
+            ),
+            worker_termination_state_version=worker_termination_state_version,
+        )
         try:
             if agent_type == "sub_agent":
                 await dispatcher.stop_sub_agent_session_process(session_id)
@@ -4006,6 +5216,18 @@ async def _cancel_local_task_under_cancellation_lease(
         expected_started_at=committed_started_at,
         expected_completed_at=committed_completed_at,
         expected_pty_background_generation=None,
+        allow_worker_termination_operation_id=(
+            worker_termination_operation_id
+        ),
+        worker_termination_operation=(
+            "cancel"
+            if worker_termination_operation_id is not None
+            else None
+        ),
+        worker_termination_execution_token=(
+            worker_termination_execution_token
+        ),
+        worker_termination_state_version=worker_termination_state_version,
     )
     if current_task is None:
         raise HTTPException(
@@ -4043,18 +5265,42 @@ async def cancel_task(
         )
     wt = await _worker_task_or_none(db, task_id)
     if wt is not None:
-        observed = worker_task_generation(wt)
-        if observed is None:
-            raise HTTPException(409, "Task Worker assignment changed")
-        result = await _proxy(wt, "POST", f"/api/tasks/{task_id}/cancel")
-        return await _sync_task_from_worker_response(
-            db,
-            wt,
-            result,
-            observed=observed,
+        _result, mirrored = await _finish_task_operation(
+            _worker_terminal_request_impl(
+                task_id,
+                request,
+                db,
+                operation="cancel",
+                force_readback=False,
+            )
         )
+        return mirrored
 
-    return await _finish_task_operation(_cancel_local_task_impl(task_id, db))
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, db)
+        _require_not_delivery_owned_task(current, action="cancelled")
+        await _require_no_pr_review_publication(db, task_id)
+        await _require_not_pr_review_task_mutation(
+            db,
+            task_id,
+            action="cancelled",
+        )
+        if current.worker_id is not None or current.shared_from_id is not None:
+            raise HTTPException(
+                409,
+                "Task execution location changed while cancellation was starting",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        return await _finish_task_operation(_cancel_local_task_impl(task_id, db))
 
 
 @router.post("/{task_id}/retry", response_model=TaskResponse)
@@ -4079,6 +5325,23 @@ async def retry_task(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="retried")
+        if has_worker_execution_quarantine(current.metadata_):
+            raise HTTPException(
+                409,
+                "Task Worker execution is quarantined pending explicit "
+                "authoritative reconciliation",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
+        if current.mode == "plan":
+            raise HTTPException(
+                409,
+                "Plan Tasks cannot be retried; revise the Plan or create an "
+                "execution Task instead",
+            )
         _require_expected_task_routing(
             current,
             body.expected_routing if body is not None else None,
@@ -4194,7 +5457,10 @@ async def mark_task_read(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
-    task = await queue.update_task(task_id, has_unread=False)
+    try:
+        task = await queue.update_task(task_id, has_unread=False)
+    except DurableWorkerTerminationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
     return task
@@ -4210,7 +5476,10 @@ async def mark_task_unread(
     task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
-    task = await queue.update_task(task_id, has_unread=True)
+    try:
+        task = await queue.update_task(task_id, has_unread=True)
+    except DurableWorkerTerminationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
     return task
@@ -4337,32 +5606,76 @@ async def approve_plan(
                     "staleness": stale,
                 },
             )
-        approved_at = datetime.utcnow()
-        changed = await db.execute(
-            sa_update(Task)
-            .where(*_task_generation_fence(task_id, current))
-            .values(
-                plan_approved=True,
-                plan_approved_at=approved_at,
-                plan_approved_by=get_current_user_id(request),
-                status="completed",
-                completed_at=approved_at,
-            )
+        from backend.services.plan_tasks import (
+            PlanTerminalQuiescenceError,
+            run_plan_terminal_transition,
         )
-        if changed.rowcount != 1:
-            await db.rollback()
-            raise HTTPException(
-                409,
-                "Task generation changed while approving the plan",
+
+        async def commit_approval() -> None:
+            db.expire_all()
+            exact = await db.get(Task, task_id)
+            if exact is None:
+                raise HTTPException(404, "Task not found")
+            await require_task_control(request, exact, db)
+            _require_expected_task_routing(
+                exact,
+                body.expected_routing if body is not None else None,
+                effective_model=exact.model,
             )
-        await db.commit()
+            _require_plan_review_operation(exact)
+            if exact.worker_id is not None:
+                raise HTTPException(409, "Task Worker assignment changed")
+            _require_no_pending_worker_routing(exact)
+            exact_target = None
+            if exact.plan_target_task_id is not None:
+                exact_target = await db.get(Task, exact.plan_target_task_id)
+                if exact_target is None:
+                    raise HTTPException(409, "Plan target no longer exists")
+                await require_task_control(request, exact_target, db)
+            exact_stale = await plan_staleness(
+                db,
+                exact,
+                current_target=exact_target,
+            )
+            if exact_stale["stale"] and not (body and body.confirm_stale):
+                raise HTTPException(
+                    409,
+                    detail={
+                        "message": "Plan context changed; confirm stale approval",
+                        "staleness": exact_stale,
+                    },
+                )
+            approved_at = datetime.utcnow()
+            changed = await db.execute(
+                sa_update(Task)
+                .where(*_task_generation_fence(task_id, exact))
+                .values(
+                    plan_approved=True,
+                    plan_approved_at=approved_at,
+                    plan_approved_by=get_current_user_id(request),
+                    status="completed",
+                    completed_at=approved_at,
+                )
+            )
+            if changed.rowcount != 1:
+                raise HTTPException(
+                    409,
+                    "Task generation changed while approving the plan",
+                )
+
+        try:
+            await run_plan_terminal_transition(
+                db,
+                task_id,
+                "completed",
+                commit_approval,
+            )
+        except PlanTerminalQuiescenceError as exc:
+            raise HTTPException(409, str(exc)) from exc
         db.expire_all()
         approved = await db.get(Task, task_id)
         if approved is None:
             raise HTTPException(409, "Task disappeared while approving the plan")
-        from backend.services.task_events import broadcast_status_change
-
-        await broadcast_status_change(task_id, "completed")
         return approved
 
 
@@ -4404,27 +5717,46 @@ async def reject_plan(
                 observed=observed,
             )
 
-        changed = await db.execute(
-            sa_update(Task)
-            .where(*_task_generation_fence(task_id, current))
-            .values(
-                plan_approved=False,
-                status="cancelled",
-                completed_at=datetime.utcnow(),
-            )
+        from backend.services.plan_tasks import (
+            PlanTerminalQuiescenceError,
+            run_plan_terminal_transition,
         )
-        if changed.rowcount != 1:
-            await db.rollback()
-            raise HTTPException(
-                409,
-                "Task generation changed while rejecting the plan",
+
+        async def commit_rejection() -> None:
+            db.expire_all()
+            exact = await db.get(Task, task_id)
+            if exact is None:
+                raise HTTPException(404, "Task not found")
+            await require_task_control(request, exact, db)
+            _require_plan_review_operation(exact)
+            if exact.worker_id is not None:
+                raise HTTPException(409, "Task Worker assignment changed")
+            changed = await db.execute(
+                sa_update(Task)
+                .where(*_task_generation_fence(task_id, exact))
+                .values(
+                    plan_approved=False,
+                    status="cancelled",
+                    completed_at=datetime.utcnow(),
+                )
             )
-        await db.commit()
+            if changed.rowcount != 1:
+                raise HTTPException(
+                    409,
+                    "Task generation changed while rejecting the plan",
+                )
+
+        try:
+            await run_plan_terminal_transition(
+                db,
+                task_id,
+                "cancelled",
+                commit_rejection,
+            )
+        except PlanTerminalQuiescenceError as exc:
+            raise HTTPException(409, str(exc)) from exc
         db.expire_all()
         rejected = await db.get(Task, task_id)
         if rejected is None:
             raise HTTPException(409, "Task disappeared while rejecting the plan")
-        from backend.services.task_events import broadcast_status_change
-
-        await broadcast_status_change(task_id, "cancelled")
         return rejected

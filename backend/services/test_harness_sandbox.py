@@ -582,11 +582,14 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 "--stop-timeout",
                 "5",
                 "--tmpfs",
-                f"/workspace:rw,nosuid,nodev,mode=1777,size={self.workspace_bytes}",
+                (
+                    "/workspace:rw,nosuid,nodev,exec,mode=1777,"
+                    f"size={self.workspace_bytes}"
+                ),
                 "--tmpfs",
                 f"/tmp:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
                 "--tmpfs",
-                f"/home/sandbox:rw,nosuid,nodev,size={self.tmp_bytes}",
+                f"/home/sandbox:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
                 "--tmpfs",
                 "/run:rw,noexec,nosuid,nodev,mode=1777,size=67108864",
                 "--workdir",
@@ -898,15 +901,17 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         command.extend([resource_id, *argv])
         code, output = await self._runner(command, timeout)
         if code != 0:
-            diagnostic = ""
-            if argv[0] == "/usr/bin/git":
-                safe_tail = re.sub(
-                    r"[^\x20-\x7e\n\r\t]",
-                    "?",
-                    output[-2000:],
-                ).strip()
-                if safe_tail:
-                    diagnostic = f": {safe_tail}"
+            # Commands execute untrusted repository content without host
+            # credentials.  Preserve a small, printable-only output tail so an
+            # administrator can distinguish dependency, proxy, disk and build
+            # failures without allowing terminal control sequences or unbounded
+            # attacker-controlled logs into Harness events.
+            safe_tail = re.sub(
+                r"[^\x20-\x7e\n\r\t]",
+                "?",
+                output[-2000:],
+            ).strip()
+            diagnostic = f": {safe_tail}" if safe_tail else ""
             raise TestHarnessSandboxError(
                 f"sandbox source command failed: {argv[0]}{diagnostic}"
             )

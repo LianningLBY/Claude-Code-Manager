@@ -106,6 +106,33 @@ async def test_sandbox_probe_rejects_unverifiable_image_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_sandbox_command_failure_preserves_only_bounded_printable_tail():
+    async def runner(_argv: list[str], _timeout: float) -> tuple[int, str]:
+        return 1, "discard-me" * 300 + "\x1b[31mnpm dependency failed\x00"
+
+    runtime = DockerTestHarnessSandboxRuntime(
+        enabled=True,
+        runner=runner,
+    )
+
+    with pytest.raises(SandboxError) as exc_info:
+        await runtime._exec_source(
+            binary="/usr/bin/docker",
+            resource_id="d" * 64,
+            env={},
+            argv=["npm", "ci"],
+            timeout=30,
+        )
+
+    message = str(exc_info.value)
+    assert message.startswith("sandbox source command failed: npm: ")
+    assert "npm dependency failed" in message
+    assert "\x1b" not in message
+    assert "\x00" not in message
+    assert len(message) < 2100
+
+
+@pytest.mark.asyncio
 async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch):
     run_id = "a" * 32
     lease_id = "b" * 32
@@ -187,6 +214,17 @@ async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch
     assert "--publish" not in create
     assert "/var/run/docker.sock" not in " ".join(create)
     assert all(".claude" not in value and ".codex" not in value for value in create)
+    tmpfs_specs = [
+        create[index + 1]
+        for index, value in enumerate(create[:-1])
+        if value == "--tmpfs"
+    ]
+    assert (
+        "/workspace:rw,nosuid,nodev,exec,mode=1777,size=536870912"
+        in tmpfs_specs
+    )
+    assert "/tmp:rw,noexec,nosuid,nodev,size=134217728" in tmpfs_specs
+    assert "/home/sandbox:rw,noexec,nosuid,nodev,size=134217728" in tmpfs_specs
     network_create = next(call for call in calls if call[1:3] == ["network", "create"])
     assert "--internal" in network_create
     assert resource.metadata["network_mode"] == "internal-only"
@@ -394,13 +432,24 @@ async def test_real_pr99_source_preview_and_identity_cleanup(db_factory):
     try:
         lease = await manager.provision(run.id)
         assert lease.runtime_metadata["host_mounts"] == 0
-        source = await manager.acquire_source(run.id, resolved)
+        source = await manager.acquire_source(
+            run.id,
+            resolved,
+            additional_allowed_hosts=("registry.npmjs.org",),
+        )
         assert source.head_sha == resolved.head_sha
         preview = await manager.prepare_preview(
             run.id,
             source,
             preview_config={
-                "setup": [],
+                "setup": [
+                    {
+                        "command": ["npm", "ci", "--no-audit", "--no-fund"],
+                        "cwd": "frontend",
+                        "env": {},
+                        "timeout_seconds": 900,
+                    }
+                ],
                 "processes": [
                     {
                         "name": "web",

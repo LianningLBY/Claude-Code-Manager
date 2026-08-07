@@ -448,7 +448,13 @@ async def test_real_pr99_source_preview_and_identity_cleanup(db_factory):
                         "cwd": "frontend",
                         "env": {},
                         "timeout_seconds": 900,
-                    }
+                    },
+                    {
+                        "command": ["npm", "run", "build"],
+                        "cwd": "frontend",
+                        "env": {},
+                        "timeout_seconds": 600,
+                    },
                 ],
                 "processes": [
                     {

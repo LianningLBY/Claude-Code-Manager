@@ -958,6 +958,13 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **PR #77 第六轮评审修复（commit 60c096a）**：`send_chat_message` 原先在解析和校验开头 `$command` 前就分流 Worker/Shared chat，Codex `$monitor` 会先在 Manager 写日志并广播，再由远端拒绝并留下幽灵消息。现统一命令解析/能力校验：Worker 在 task operation lock 内按刷新后的 Manager provider、Shared 按刷新后的 shadow provider，在任何日志、广播、附件/Skill 同步和远端请求前 fail closed；远端仍接收原始消息做二次校验。新增 Worker `$monitor`/未知命令负向、合法 `$sub-agent` 正向和 Shared 无副作用回归，相关定向矩阵 `10 passed`；本地合成 Shared Codex Task 手测返回预期 400，数据库匹配用户日志为 0；未运行全量测试。
 - **PR #77 第七轮评审修复（本提交）**：Dispatcher 原先在 task operation lock 外把 pending Worker Task claim 为 `in_progress`，随后把 claim 前已加载的 Task 对象交给 WorkerProxy；Skill 保存与首次转发的两个锁顺序都可能让 Manager 与远端创建 payload 使用不同配置。现 pending Skill 保存与首次 claim 共用 operation lock，claim 胜出后活跃 generation 的 Skill 编辑返回 409；WorkerProxy 在远端创建前于同一锁内重新加载 Manager 权威行并校验完整 Worker generation，陈旧转发 fail closed。新增两个锁顺序、权威 Skill 重载、generation 变化拒绝及 pending/终态可编辑回归；新增核心用例 `6 passed`，相邻 Worker/Skill/dispatch 矩阵 `18 passed, 107 deselected`，`git diff --check` 通过；未运行全量测试。
 
+### 2026-07-29 — 独立 Plan Task 与显式应用协议（commit 76e2dc3）
+
+- **决策**：Plan 永远是独立 Task。关联 Plan 只用 `plan_target_task_id` 指向目标 Task；approve/reject 不再启动 turn 或改变目标 session。已批准方案只有随下一条真实用户消息显式携带时才进入模型上下文，standalone Plan 则显式创建新的执行 Task。
+- **实现**：新增有界对话快照、HEAD/dirty 指纹、审批/应用审计和 Planner/Reviewer run/step 表；`PlanAgentRunner` 对 Claude 强制 Read/Grep/Glob 且禁 Bash/MCP/子 agent，对 Codex 强制 ephemeral/read-only sandbox/空 MCP/禁 multi-agent，统一账号池、CloudRouter admission、transient retry 与 exact process-group cleanup。ChatView 提供多 Plan 历史、审批、revision、stale 确认和持久 composer attachments。
+- **Worker/并发边界**：Manager-local 的 user/log/execution Task id 不接受 Worker mirror 覆盖；active、待审批、approved-but-unapplied Plan 阻止目标迁移，关联 Plan 不可单独迁移。Git 指纹禁 optional locks/fsmonitor，Task 列表不返回 60K transcript 快照。
+- **验证**：Plan/Dispatcher/Ralph/Worker/迁移/Alembic 相关后端 `523 passed`；前端 Plan/Chat `77 passed`，TypeScript + Vite production build 通过。后端全量仅余 13 个失败，并已在未包含本改动的 `origin/main@4249605` 独立 worktree 上逐项复现同样的 13 个失败，确认不是 Plan 回归；全仓 ESLint 仍有 59 个既有 error（本次变更文件未新增 error）。生产手工验收尚未执行。
+
 ### 2026-07-29 — PR7B2：本地 Codex Monitor capability 与 UI 收尾（本提交）
 
 - **问题**：PR7B1 已完成 Codex Monitor 的持久 thread、generation fence、read-only profile、停止和恢复语义，但公开 API/MCP/UI 仍沿用 blanket Codex 拒绝。若直接移除这一层，Worker/Shared 或迁移副本可能拿到只适用于本机的 Monitor runtime；前端 Runtime Settings 瞬时失败还可能在切换无关 Skill 时删除未知的持久选择。
@@ -965,6 +972,20 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **预防**：部署级 capability 只回答“服务是否具备能力”，不能代替 Task scope；所有产生持久化、远端代理或进程副作用的入口必须在副作用前校验，并在可能改变路由的写屏障后复核。跨 Worker snapshot 的“存在”本身就是远端管理证据，不能因 `worker_id` 暂时为空而猜成本地任务。
 - **验证**：Linux 容器聚焦后端共 `118 passed`，覆盖 Task/Chat/Monitor API、Runtime Settings、Skill context、MCP server/spec、Instance launch 及 PR7B1 的多轮/恢复/关机/停止/清理不变量；前端五个聚焦文件 `127 passed`，production build 通过。真实本地 Codex 手测验证 5 轮普通/重要报告后自动完成，以及活动 Monitor Stop 后清空调度、删除精确 thread 且不终止共享 app-server；未运行全量测试。
 
+### 2026-07-30 — 跨版本更新放行真实 systemd user-manager（commit 752890e）
+
+- **问题**：SQLite 停服独占检查本意只忽略固定的 systemd user-manager，但匹配条件要求命令行以 `systemd --user` 结尾；真实宿主 PID 1 拉起的进程是 `systemd --user --deserialize=19`，同 UID `/proc/<pid>/fd` 因内核保护不可读，导致每次迁移都误判无法证明独占并回滚。
+- **解决**：把允许项收窄为 basename 精确等于 `systemd`、首参数精确 `--user`，并且只允许无额外参数或单个数字形式 `--deserialize=N`；仍要求进程位于该 UID 的 `init.scope`，任何额外/非数字参数继续 fail closed。
+- **验证**：新增正反例分类回归并运行 `test_update_migrate_hardening.py`，`27 passed`；Shell 语法检查通过。
+
+### 2026-08-04 — Codex Plan `request_input` 结构化输出空白失控（commit：本提交）
+
+- **现象与误诊风险**：Plan 40 的 Codex Planner primary 在 30 分钟内流出 1,517,893 字符后超时；fallback 虽完成，但 10,768 字符中有 9,980 个空白，最长连续空白 9,961 个，精确位于首个问题的 `options` 数组结束与下一个 `"required"` 属性之间。Plan 34 的同类提问请求也在 1,543 秒内流出 653,706 字符后被取消。该路径没有 MCP/tool，CCM 又原样转发 app-server delta 和权威 `item/completed`，因此不是工具循环或本地字符串拼接。
+- **真实 A/B**：固定 `codex-cli 0.144.6`、`gpt-5.6-sol`、`effort=medium`、同一 prompt/cwd/只读配置及隔离临时 `CODEX_HOME`。原 wire schema 在 app-server 5 次中 4 次达到 1,024 连续空白，唯一成功样本仍出现 19 个连续格式空白；旧 `codex exec --output-schema` 对同一 schema 150 秒无终态。只把模型字段 `required` 改为 `is_required` 后，app-server 5/5 正常，连同 exec 共 6/6 正常、8.2–12.9 秒、连续空白为 0；只把 `required` 移到 `options` 前也跨两路 3/3 正常。故 transport 切换不是根因，触发点是嵌套 `options` 后紧跟 JSON Schema 关键字同名属性 `required` 的约束生成状态。
+- **根因修复**：模型-facing `_QUESTION_SCHEMA` 使用 `is_required`；`_validate_structured_v2` 在唯一解析边界严格要求布尔值、拒绝旧 `required` alias 或两者并存，再映射回领域/API 的 `PlanQuestion.required`。数据库、API、前端与历史持久数据契约不变，无需迁移。改名优于仅换序，因为 JSON Schema 的对象属性顺序不是应依赖的语义。
+- **纵深保护**：Codex 结构化 assistant JSON 在字符串外连续输出达到 `PLAN_STRUCTURED_OUTPUT_WHITESPACE_LIMIT`（默认 4,096）时，精确 interrupt 并删除 disposable thread 后才允许 route fallback；JSON 字符串内的长 Plan/问题及 reasoning 不计入。不要用总输出上限或缩短复杂 Plan 的阶段预算代替该保护，也不要回滚 `codex exec` 作为修复。
+- **长期约定**：模型 wire schema 与领域/API schema 必须允许使用不同字段名；遇到可能与 JSON Schema 关键字冲突的模型-facing 属性，应在边界显式映射并用真实 provider A/B 验证，不能只靠 mock/本地 schema validation 推断生成稳定性。真实模型回归是手工测试，不进入 CI；CI 固定 schema alias、映射、歧义输入拒绝及 runaway cleanup。
+- **验证**：先以旧实现跑出 2 个确定性红测，再完成 schema/映射/非法输入覆盖；`backend/tests/test_plan_agent_runner.py` 最终 `25 passed`。未限制合法问题数量、Plan 正文长度或 reasoning，未触碰生产服务。
 ### 2026-07-30 — Coding Agent 前沿调研 + main 测试基线清零（commit 4f72c7b / 5bfc36e）
 
 - **调研**：五路并行（Claude Code 生态 / Codex 生态 / 竞品产品 / 学术与基准 / harness 实践与同类项目）交叉整合成 `docs/coding-agent-frontier-2026H1.md`（commit 5bfc36e），全部条目附一手来源与日期，含对 CCM 分优先级（P0 验证与完成判定 / P1 官方原语迁移与 best-of-n / P2 沙箱与记忆蒸馏）的机会点分析与定位判断。

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import App from './App';
 
 vi.mock('./api/client', () => ({
@@ -11,17 +12,34 @@ vi.mock('./config/server', () => ({
   getApiBase: vi.fn(() => ''),
 }));
 vi.mock('./components/Layout/AppShell', () => ({
-  AppShell: ({ children }: { children: React.ReactNode }) => (
+  AppShell: ({ children, onNavigate }: { children: React.ReactNode; onNavigate: (page: string) => void }) => (
     <div
       data-testid="app-shell"
       data-role={JSON.parse(localStorage.getItem('cc_user') || '{}').role || ''}
     >
+      <button type="button" onClick={() => onNavigate('plans')}>Navigate to Plans</button>
+      <button type="button" onClick={() => onNavigate('settings')}>Navigate to Settings</button>
       {children}
     </div>
   ),
 }));
 vi.mock('./pages/TasksPage', () => ({
-  TasksPage: () => <div>Tasks screen</div>,
+  TasksPage: ({ chatTaskId }: { chatTaskId: number | null }) => <>
+    <div>Tasks screen</div>
+    {chatTaskId != null && <div>Task chat {chatTaskId}</div>}
+  </>,
+}));
+vi.mock('./pages/PlansPage', () => ({
+  PlansPage: ({ selectedPlanId, onNavigateTask, onNavigateSettings }: { selectedPlanId: number | null; onNavigateTask: (taskId: number) => void; onNavigateSettings: () => void }) => (
+    <div>
+      Plans screen {selectedPlanId ?? 'none'}
+      <button type="button" onClick={() => onNavigateTask(200)}>Open related Task #200</button>
+      <button type="button" onClick={onNavigateSettings}>Open Plan settings</button>
+    </div>
+  ),
+}));
+vi.mock('./pages/SettingsPage', () => ({
+  SettingsPage: () => <div>Settings screen</div>,
 }));
 vi.mock('./pages/LoginPage', () => ({
   LoginPage: () => <div>Login screen</div>,
@@ -108,5 +126,61 @@ describe('App authentication probe', () => {
         role: 'super_admin',
       });
     });
+  });
+
+  it('restores a first-class Plan deep link', async () => {
+    window.location.hash = '#/plans/14';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ok: true, role: 'super_admin' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+
+    expect(await screen.findByText('Plans screen 14')).toBeInTheDocument();
+  });
+
+  it('navigates atomically from a related Plan to its Task chat', async () => {
+    window.location.hash = '#/plans/14';
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ok: true, role: 'super_admin' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Open related Task #200' }));
+
+    expect(await screen.findByText('Task chat 200')).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe('#/tasks/chat/200'));
+  });
+
+  it('returns from Settings to the plain Plans URL instead of an older Plan deep link', async () => {
+    window.history.replaceState(null, '', '#/plans/34');
+    window.history.pushState(null, '', '#/plans');
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce({ ok: true })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: vi.fn().mockResolvedValue({ ok: true, role: 'super_admin' }),
+      });
+    vi.stubGlobal('fetch', fetchMock);
+
+    render(<App />);
+    expect(await screen.findByText('Plans screen none')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open Plan settings' }));
+    expect(await screen.findByText('Settings screen')).toBeInTheDocument();
+    expect(window.location.hash).toBe('#/settings');
+
+    window.history.back();
+
+    expect(await screen.findByText('Plans screen none')).toBeInTheDocument();
+    await waitFor(() => expect(window.location.hash).toBe('#/plans'));
   });
 });

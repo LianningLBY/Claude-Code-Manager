@@ -232,11 +232,21 @@ def authoritative_worker_task_values(
         "loop_progress",
         "session_id",
         "plan_content",
+        "plan_applied_to_session_id",
         "goal_turns_used",
         "goal_last_reason",
     ):
         if field in remote_task:
             values[field] = remote_task[field]
+
+    for field in (
+        "plan_approved_at",
+        "plan_applied_at",
+    ):
+        if field in remote_task:
+            parsed = _remote_datetime(remote_task[field])
+            if remote_task[field] is None or parsed is not None:
+                values[field] = parsed
 
     if "started_at" in remote_task:
         started_at = _remote_datetime(remote_task["started_at"])
@@ -297,6 +307,17 @@ async def apply_authoritative_worker_task(
         # Worker→Manager path, including a normal relay GET after the hidden
         # termination response was lost.
         merged_metadata_updates[PR_REVIEW_SUPERSEDED_METADATA_KEY] = True
+    if isinstance(remote_metadata, dict):
+        # Plan audit summaries are safe Worker-authoritative lifecycle data.
+        # Do not replace unrelated Manager-owned metadata wholesale.
+        for key in (
+            "plan_agent_run_id",
+            "plan_review_verdict",
+            "plan_review_feedback",
+            "plan_review_exhausted",
+        ):
+            if key in remote_metadata:
+                merged_metadata_updates[key] = remote_metadata[key]
     if merged_metadata_updates:
         # Lock the exact mirror before merging JSON in Python. PostgreSQL JSON
         # has no equality operator, so comparing the whole document in the CAS
@@ -916,6 +937,151 @@ class WorkerRelay:
         if observed is None:
             # Subscription state is only a routing hint.  The durable worker_id
             # assignment is the authority after migrations.
+            return
+
+        if event_type in {
+            "plan_application_delivery_failed",
+            "plan_application_delivery_uncertain",
+            "plan_application_delivery_resolved",
+        }:
+            receipt_key = data.get("receipt_key")
+            delivery_status = data.get("delivery_status")
+            if (
+                not isinstance(receipt_key, str)
+                or not receipt_key
+                or len(receipt_key) > 200
+            ):
+                return
+            from backend.services.plan_events import broadcast_plan_event
+            from backend.models.plan import (
+                PlanApplicationReceipt,
+            )
+            from backend.services.plan_service import (
+                preserve_uncertain_plan_application,
+                release_unstarted_plan_application,
+                resolve_uncertain_plan_application,
+            )
+
+            async with self.db_factory() as db:
+                receipt = (
+                    await db.execute(
+                        select(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key == receipt_key,
+                            PlanApplicationReceipt.worker_id == worker.id,
+                            PlanApplicationReceipt.target_task_id == task_id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if receipt is None:
+                    await db.rollback()
+                    return
+                if event_type == "plan_application_delivery_failed":
+                    if delivery_status not in {"failed", "cancelled"}:
+                        await db.rollback()
+                        return
+                    released = await release_unstarted_plan_application(
+                        db,
+                        receipt_key=receipt_key,
+                        delivery_status=delivery_status,
+                        error=str(data.get("error") or "")[:2000],
+                        expected_worker_id=worker.id,
+                    )
+                elif event_type == "plan_application_delivery_uncertain":
+                    if receipt.delivery_status not in {
+                        "pending",
+                        "queued",
+                        "launching",
+                        "uncertain",
+                    }:
+                        await db.rollback()
+                        return
+                    evidence = data.get("launch_evidence")
+                    plan_ids = await preserve_uncertain_plan_application(
+                        db,
+                        receipt=receipt,
+                        error=str(data.get("error") or "")[:2000],
+                        launch_evidence=(
+                            evidence if isinstance(evidence, dict) else None
+                        ),
+                        response=(
+                            receipt.response
+                            if isinstance(receipt.response, dict)
+                            else None
+                        ),
+                    )
+                    released = (plan_ids, receipt.target_task_id)
+                else:
+                    action = data.get("action")
+                    note = str(data.get("note") or "Worker resolution")[:2000]
+                    if action not in {"confirm_launched", "release_for_retry"}:
+                        await db.rollback()
+                        return
+                    already_resolved = bool(
+                        isinstance(receipt.delivery_resolution, dict)
+                        and receipt.delivery_resolution.get("action") == action
+                    )
+                    if not already_resolved:
+                        if receipt.delivery_status not in {
+                            "pending",
+                            "queued",
+                            "launching",
+                            "uncertain",
+                        }:
+                            await db.rollback()
+                            return
+                        await preserve_uncertain_plan_application(
+                            db,
+                            receipt=receipt,
+                            error=(
+                                str(data.get("error") or "")[:2000]
+                                or "Worker launch required manual reconciliation"
+                            ),
+                            launch_evidence=(
+                                data.get("launch_evidence")
+                                if isinstance(data.get("launch_evidence"), dict)
+                                else receipt.launch_evidence
+                            ),
+                            response=(
+                                receipt.response
+                                if isinstance(receipt.response, dict)
+                                else None
+                            ),
+                        )
+                    released = await resolve_uncertain_plan_application(
+                        db,
+                        receipt_key=receipt_key,
+                        action=action,
+                        note=note,
+                        actor_id=None,
+                    )
+                    delivery_status = (
+                        "launched"
+                        if action == "confirm_launched"
+                        else "cancelled"
+                    )
+                if released is None:
+                    await db.rollback()
+                    return
+                plan_ids, target_task_id = released
+                if target_task_id != task_id:
+                    await db.rollback()
+                    return
+                await db.commit()
+            for plan_id in plan_ids:
+                await broadcast_plan_event(
+                    event=event_type,
+                    plan_id=plan_id,
+                    target_task_id=task_id,
+                    broadcaster=self.broadcaster,
+                    receipt_key=receipt_key,
+                    delivery_status=delivery_status,
+                )
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {key: value for key, value in data.items() if key != "instance_id"},
+            )
             return
 
         event_retry_count: int | None = None

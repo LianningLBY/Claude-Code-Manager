@@ -13,7 +13,11 @@ import { api, type Task } from '../api/client';
  * Clearing or changing the query invalidates requests that already left the
  * browser, not just debounce timers that have not fired yet.
  */
-export function useTaskSearch(searchQuery: string, showArchived: boolean) {
+export function useTaskSearch(
+  searchQuery: string,
+  showArchived: boolean,
+  taskKind?: 'standalone_plan' | 'related_plan' | 'main',
+) {
   const q = searchQuery.trim();
   const [searchState, setSearchState] = useState<{
     query: string;
@@ -42,6 +46,8 @@ export function useTaskSearch(searchQuery: string, showArchived: boolean) {
           1000,
           0,
           showArchived,
+          undefined,
+          taskKind,
         );
         if (generation !== generationRef.current) return;
         let re: RegExp | null = null;
@@ -62,7 +68,7 @@ export function useTaskSearch(searchQuery: string, showArchived: boolean) {
       window.clearTimeout(handle);
       if (generationRef.current === generation) generationRef.current += 1;
     };
-  }, [q, showArchived]);
+  }, [q, showArchived, taskKind]);
 
   const visibleResults = q && searchState.query === q ? searchState.results : null;
   return [visibleResults, setSearchResults] as const;

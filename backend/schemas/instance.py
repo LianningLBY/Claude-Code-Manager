@@ -31,6 +31,7 @@ class InstanceResponse(BaseModel):
     pid: int | None
     status: str
     current_task_id: int | None
+    current_plan_run_id: int | None
     worktree_path: str | None
     worktree_branch: str | None
     provider: str

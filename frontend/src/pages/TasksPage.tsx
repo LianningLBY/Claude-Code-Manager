@@ -4,7 +4,6 @@ import type { Task, Project, TagItem } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { TaskForm } from '../components/Tasks/TaskForm';
 import { TaskList } from '../components/Tasks/TaskList';
-import { PlanPanel } from '../components/PlanReview/PlanPanel';
 import { ChatView } from '../components/Chat/ChatView';
 import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
@@ -15,6 +14,7 @@ import { TAG_COLOR_OPTIONS } from '../components/TagColors';
 import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
 import { useTaskSearch } from '../hooks/useTaskSearch';
 import { TeamShareModal } from '../components/TeamShareModal';
+import { getTaskStatusLabel } from '../components/Tasks/taskStatus';
 
 const PAGE_SIZE = 20;
 
@@ -25,7 +25,7 @@ interface TasksPageProps {
 
 export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
-  const [allTasks, setAllTasks] = useState<Task[]>([]);
+  const [, setAllTasks] = useState<Task[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -94,19 +94,66 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     // status until the chat is closed).
     const data = msg.data;
     const event = msg.channel === 'tasks' ? data?.event : undefined;
-    if (data && (event === 'status_change' || event === 'background_activity')) {
+    if (
+      data
+      && (
+        event === 'status_change'
+        || event === 'background_activity'
+        || event === 'plan_stage_change'
+        || event === 'plan_ready'
+      )
+    ) {
       const taskId = Number(data.task_id);
       if (!Number.isSafeInteger(taskId) || taskId <= 0) return;
 
-      const newStatus = (
-        event === 'status_change'
-        && typeof data.new_status === 'string'
-        && data.new_status
-      ) ? data.new_status : undefined;
+      const newStatus = event === 'plan_ready'
+        ? 'plan_review'
+        : (
+          event === 'status_change'
+          && typeof data.new_status === 'string'
+          && data.new_status
+            ? data.new_status
+            : undefined
+        );
       const backgroundActive = typeof data.background_active === 'boolean'
         ? data.background_active
         : undefined;
-      if (newStatus === undefined && backgroundActive === undefined) return;
+      const planStage = event === 'plan_stage_change'
+        && typeof data.plan_stage === 'string'
+        ? data.plan_stage
+        : undefined;
+      const planStageRound = event === 'plan_stage_change'
+        && Number.isSafeInteger(Number(data.plan_stage_round))
+        ? Number(data.plan_stage_round)
+        : undefined;
+      const planStageProvider = event === 'plan_stage_change'
+        && typeof data.plan_stage_provider === 'string'
+        ? data.plan_stage_provider
+        : undefined;
+      const planStageModel = event === 'plan_stage_change'
+        && (typeof data.plan_stage_model === 'string' || data.plan_stage_model === null)
+        ? data.plan_stage_model
+        : undefined;
+      const planStageEffort = event === 'plan_stage_change'
+        && (typeof data.plan_stage_effort === 'string' || data.plan_stage_effort === null)
+        ? data.plan_stage_effort
+        : undefined;
+      const planStageRouteSlot = event === 'plan_stage_change'
+        && (data.plan_stage_route_slot === 'primary'
+          || data.plan_stage_route_slot === 'fallback'
+          || data.plan_stage_route_slot === null)
+        ? data.plan_stage_route_slot
+        : undefined;
+      if (
+        newStatus === undefined
+        && backgroundActive === undefined
+        && planStage === undefined
+        && planStageRound === undefined
+        && planStageProvider === undefined
+        && planStageModel === undefined
+        && planStageEffort === undefined
+        && planStageRouteSlot === undefined
+      ) return;
 
       const patchTask = (task: Task): Task => {
         if (task.id !== taskId) return task;
@@ -115,11 +162,37 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           backgroundActive !== undefined
           && task.background_active !== backgroundActive
         );
-        if (!statusChanged && !backgroundChanged) return task;
+        const planStageChanged = (
+          planStage !== undefined
+          && task.plan_stage !== planStage
+        );
+        const planStageRoundChanged = (
+          planStageRound !== undefined
+          && task.plan_stage_round !== planStageRound
+        );
+        const planRouteChanged = (
+          (planStageProvider !== undefined && task.plan_stage_provider !== planStageProvider)
+          || (planStageModel !== undefined && task.plan_stage_model !== planStageModel)
+          || (planStageEffort !== undefined && task.plan_stage_effort !== planStageEffort)
+          || (planStageRouteSlot !== undefined && task.plan_stage_route_slot !== planStageRouteSlot)
+        );
+        if (
+          !statusChanged
+          && !backgroundChanged
+          && !planStageChanged
+          && !planStageRoundChanged
+          && !planRouteChanged
+        ) return task;
         return {
           ...task,
           ...(newStatus !== undefined ? { status: newStatus } : {}),
           ...(backgroundActive !== undefined ? { background_active: backgroundActive } : {}),
+          ...(planStage !== undefined ? { plan_stage: planStage } : {}),
+          ...(planStageRound !== undefined ? { plan_stage_round: planStageRound } : {}),
+          ...(planStageProvider !== undefined ? { plan_stage_provider: planStageProvider } : {}),
+          ...(planStageModel !== undefined ? { plan_stage_model: planStageModel } : {}),
+          ...(planStageEffort !== undefined ? { plan_stage_effort: planStageEffort } : {}),
+          ...(planStageRouteSlot !== undefined ? { plan_stage_route_slot: planStageRouteSlot } : {}),
         };
       };
       const patchList = (list: Task[]) => {
@@ -228,7 +301,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
 
-  const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'failed'];
+  const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'superseded', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   const filterDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -249,6 +322,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     executing: 'Executing',
     plan_review: 'Plan Review',
     completed: 'Completed',
+    superseded: 'Superseded',
     failed: 'Failed',
   };
 
@@ -258,6 +332,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     executing: 'bg-blue-400',
     plan_review: 'bg-purple-500',
     completed: 'bg-green-500',
+    superseded: 'bg-gray-500',
     failed: 'bg-red-500',
   };
 
@@ -286,9 +361,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         return proj ? tagFilters.some((tag) => proj.tags.includes(tag)) : false;
       })
     : tasks;
+  const filteredSearchResults = searchResults;
 
   // 侧边栏拖拽排序（与主列表同一套逻辑）
-  const sidebarTasks = searchResults ?? filteredTasks;
+  const sidebarTasks = filteredSearchResults ?? filteredTasks;
   const reorderRefresh = useCallback((optimistic?: Task[]) => {
     if (optimistic) {
       setTasks((current) => mergeVisibleTaskOrder(current, optimistic));
@@ -486,8 +562,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
             )}
           </div>
         )}
-        {searchResults !== null && (
-          <span className="text-xs text-gray-500 whitespace-nowrap">{searchResults.length} match{searchResults.length === 1 ? '' : 'es'}</span>
+        {filteredSearchResults !== null && (
+          <span className="text-xs text-gray-500 whitespace-nowrap">{filteredSearchResults.length} match{filteredSearchResults.length === 1 ? '' : 'es'}</span>
         )}
       </div>
   );
@@ -495,13 +571,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const taskListContent = (
     <>
       <TaskForm onCreated={refresh} />
-
-      <PlanPanel tasks={allTasks} onRefresh={refresh} />
-
       {filterControls}
 
       <TaskList
-        tasks={searchResults ?? filteredTasks}
+        tasks={filteredSearchResults ?? filteredTasks}
         projects={projects}
         onRefresh={refresh}
         onTaskUpdated={applyReturnedTaskUpdate}
@@ -523,7 +596,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           </button>
           <span className="text-xs text-gray-400">
             {page} / {totalPages}
-            <span className="ml-2 text-gray-600">({totalCount} tasks)</span>
+            <span className="ml-2 text-gray-600">
+              ({totalCount} tasks)
+            </span>
           </span>
           <button
             onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
@@ -598,6 +673,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       executing: 'bg-blue-400 animate-pulse',
       background: 'bg-teal-400 animate-pulse',
       plan_review: 'bg-purple-500',
+      superseded: 'bg-gray-500',
       completed: 'bg-green-500',
       failed: 'bg-red-500',
       cancelled: 'bg-gray-500',
@@ -641,7 +717,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     {/* 状态只靠圆点颜色表达（绿=完成 红=失败 蓝=运行 黄=等待） */}
                     <span
                       className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`}
-                      title={t.background_active ? 'background' : t.status}
+                      title={getTaskStatusLabel(t)}
                     />
                     <span className={`text-xs truncate flex-1 ${chatTask?.id === t.id ? 'text-foreground font-medium' : 'text-gray-300'}`}>
                       {t.title || t.description?.slice(0, 50) || `Task #${t.id}`}

@@ -68,7 +68,7 @@ describe('useTaskSearch', () => {
       .mockReturnValueOnce(new Promise((resolve) => { resolveSecond = resolve; }));
 
     const { result, rerender } = renderHook(
-      ({ query }) => useTaskSearch(query, false),
+      ({ query }) => useTaskSearch(query, false, 'main'),
       { initialProps: { query: 'alpha' } },
     );
     await act(async () => { await vi.advanceTimersByTimeAsync(300); });
@@ -87,5 +87,6 @@ describe('useTaskSearch', () => {
       await Promise.resolve();
     });
     expect(result.current[0]?.map((item) => item.id)).toEqual([2]);
+    expect(vi.mocked(api.listTasks).mock.calls.every((call) => call[8] === 'main')).toBe(true);
   });
 });

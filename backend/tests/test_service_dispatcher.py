@@ -9354,6 +9354,45 @@ async def test_build_task_prompt_carries_doc_sync_note(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_build_task_prompt_adds_short_math_hint_only_for_math_intent(
+    db_factory,
+):
+    """Task #114-like theory questions get LaTeX guidance; ordinary work does not."""
+    dispatcher = _make_dispatcher(db_factory)
+
+    for provider in ("claude", "codex"):
+        math_prompt = await dispatcher._build_task_prompt(
+            Task(
+                title="t",
+                description="什么是 Diagonal AdaGrad 的核心理论保证？",
+                provider=provider,
+            )
+        )
+        ordinary_prompt = await dispatcher._build_task_prompt(
+            Task(title="t", description="整理部署文档", provider=provider)
+        )
+
+        assert "数学排版提示" in math_prompt
+        assert "不要放进代码块" in math_prompt
+        assert "数学排版提示" not in ordinary_prompt
+
+        for non_math_description in (
+            "Fix the CSS linear-gradient and its color stops",
+            "Update this Excel formula and spreadsheet formatting",
+            "Debug Matrix protocol message delivery",
+            "Write a proof of concept for the deployment hook",
+        ):
+            non_math_prompt = await dispatcher._build_task_prompt(
+                Task(
+                    title="t",
+                    description=non_math_description,
+                    provider=provider,
+                )
+            )
+            assert "数学排版提示" not in non_math_prompt
+
+
+@pytest.mark.asyncio
 async def test_build_task_prompt_requires_downloadable_artifact_links(
     db_factory,
     tmp_path,
@@ -9451,6 +9490,23 @@ def test_user_prompt_cannot_suppress_followup_artifact_policy(tmp_path):
     assert ".claude-manager/artifacts/task-45" in wrapped
     assert wrapped.startswith(TASK_ARTIFACT_POLICY_TAG)
     assert wrapped.count(TASK_ARTIFACT_POLICY_TAG) == 2
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+def test_followup_math_hint_is_turn_scoped(provider, tmp_path):
+    task = Task(
+        id=47,
+        title="t",
+        provider=provider,
+        target_repo=str(tmp_path),
+    )
+
+    math_turn = _prepend_task_artifact_policy(task, "请推导这个公式的上界")
+    ordinary_turn = _prepend_task_artifact_policy(task, "继续整理 README")
+
+    assert "数学排版提示" in math_turn
+    assert math_turn.endswith("请推导这个公式的上界")
+    assert "数学排版提示" not in ordinary_turn
 
 
 @pytest.mark.parametrize("provider", ["claude", "codex"])

@@ -2848,6 +2848,18 @@ async def _send_worker_chat(
                     user_log_id=manager_user_log.id,
                 )
 
+        if approved_versions:
+            from backend.services.plan_events import broadcast_plan_event
+
+            for plan, version in approved_versions:
+                await broadcast_plan_event(
+                    event="plan_version_applied",
+                    plan_id=plan.id,
+                    target_task_id=current.id,
+                    version_id=version.id,
+                    user_log_id=manager_user_log.id,
+                )
+
         if isinstance(result, dict):
             result["instance_id"] = None  # Worker instance ids are not Manager ids.
             result["applied_plan_version_ids"] = [

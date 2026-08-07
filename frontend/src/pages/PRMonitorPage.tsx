@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
 import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, GitPullRequest, Check } from '../components/icons';
 import { FindingActions } from '../components/PRReview/FindingActions';
+import { useDialogA11y } from '../hooks/useDialogA11y';
 
 const DEFAULT_WEBHOOK_URL = `${window.location.origin}/api/github/webhook`;
 const FINDING_SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -161,6 +162,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   const [createdSecret, setCreatedSecret] = useState<string | null>(null);
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
+  const dialogRef = useDialogA11y(true, onClose);
 
   useEffect(() => {
     api.listWorkers().then(w => setWorkers(w.filter(wk => wk.status !== 'terminated'))).catch(() => {});
@@ -236,13 +238,22 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   }
 
   return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-      <div className="bg-gray-800 rounded-xl shadow-2xl w-full max-w-md">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-gray-700">
-          <h3 className="text-foreground font-semibold">Add Repository</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-200"><X size={18} /></button>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onMouseDown={(event) => event.target === event.currentTarget && onClose()}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="add-repository-title"
+        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-md flex-col overflow-hidden rounded-xl bg-gray-800 shadow-2xl"
+      >
+        <div className="flex shrink-0 items-center justify-between border-b border-gray-700 px-5 py-4">
+          <h3 id="add-repository-title" className="text-foreground font-semibold">Add Repository</h3>
+          <button type="button" aria-label="Close Add Repository" onClick={onClose} className="text-gray-400 hover:text-gray-200"><X size={18} /></button>
         </div>
-        <form onSubmit={handleSubmit} className="p-5 space-y-4">
+        <form onSubmit={handleSubmit} className="min-h-0 flex-1 space-y-4 overflow-y-auto overscroll-contain p-5">
           {error && <p className="text-red-400 text-sm">{error}</p>}
           <div>
             <label className="block text-xs text-gray-400 mb-1">Repository (owner/repo)</label>

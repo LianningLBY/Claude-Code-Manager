@@ -251,6 +251,111 @@ async def _seed_claimed_capability_resume(
     }
 
 
+def _worker_handoff_payload_digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+async def _seed_claimed_worker_handoff(
+    db_factory,
+    *,
+    handoff_id: str,
+    actual_transport: str | None,
+):
+    """Persist one exact claimed G+1 with only a forward Instance pointer."""
+
+    retry_count = 3
+    from_generation = 5
+    claimed_generation = from_generation + 1
+    message = "continue exact Worker turn"
+    request_payload = {
+        "message": message,
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": retry_count,
+        "worker_turn_handoff_from_generation": from_generation,
+    }
+    async with db_factory() as db:
+        instance = Instance(name="worker-pre-spawn", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claimed Worker turn",
+            description="old task description",
+            status="executing",
+            retry_count=retry_count,
+            turn_generation=claimed_generation,
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=retry_count,
+            task_turn_generation=claimed_generation,
+            turn_scope="source",
+            actual_transport=actual_transport,
+            event_type="user_message",
+            role="user",
+            content=message,
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        queue_payload = {
+            "prompt": message,
+            "priority": 0,
+            "source": "user",
+            "user_message_text": None,
+            "command_skills": None,
+            "model_override": None,
+            "expected_task_routing": ["claude", None, "default"],
+            "source_log_id": source.id,
+            "current_message": message,
+            "queue_timestamp": 1234.5,
+            "allow_new_session": False,
+            "delivery_key": None,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task.id,
+                source_log_id=source.id,
+                side="worker",
+                worker_id=None,
+                retry_count=retry_count,
+                from_generation=from_generation,
+                status="claimed",
+                request_payload=request_payload,
+                request_digest=_worker_handoff_payload_digest(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=_worker_handoff_payload_digest(queue_payload),
+                response={"ok": True, "queued": True},
+                claimed_turn_generation=claimed_generation,
+            )
+        )
+        await db.commit()
+        return {
+            "task_id": task.id,
+            "instance_id": instance.id,
+            "source_log_id": source.id,
+            "handoff_id": handoff_id,
+            "retry_count": retry_count,
+            "from_generation": from_generation,
+            "claimed_generation": claimed_generation,
+        }
+
+
 # === _cleanup_stale_state tests ===
 
 
@@ -1352,89 +1457,14 @@ async def test_cleanup_quarantines_worker_claim_after_transport_ack_loss(
     """A committed route outranks a stale claimed callback receipt."""
 
     d = _make_dispatcher(db_factory)
-    handoff_id = "7" * 32
-    retry_count = 3
-    from_generation = 5
-    claimed_generation = from_generation + 1
-    request_payload = {
-        "message": "continue exact Worker turn",
-        "worker_turn_handoff_id": handoff_id,
-        "worker_turn_handoff_retry_count": retry_count,
-        "worker_turn_handoff_from_generation": from_generation,
-    }
-    async with db_factory() as db:
-        instance = Instance(name="worker-pre-spawn", status="idle")
-        db.add(instance)
-        await db.flush()
-        task = Task(
-            title="claimed Worker turn",
-            description="old task description",
-            status="executing",
-            retry_count=retry_count,
-            turn_generation=claimed_generation,
-            instance_id=instance.id,
-        )
-        db.add(task)
-        await db.flush()
-        source = LogEntry(
-            task_id=task.id,
-            task_retry_count=retry_count,
-            task_turn_generation=claimed_generation,
-            turn_scope="source",
-            actual_transport="claude_exec",
-            event_type="user_message",
-            role="user",
-            content="continue exact Worker turn",
-            is_error=False,
-        )
-        db.add(source)
-        await db.flush()
-        task.turn_source_log_id = source.id
-        queue_payload = {
-            "prompt": "continue exact Worker turn",
-            "priority": 0,
-            "source": "user",
-            "user_message_text": None,
-            "command_skills": None,
-            "model_override": None,
-            "expected_task_routing": ["claude", None, "default"],
-            "source_log_id": source.id,
-            "current_message": "continue exact Worker turn",
-            "queue_timestamp": 1234.5,
-            "allow_new_session": False,
-            "delivery_key": None,
-            "worker_turn_handoff_id": handoff_id,
-            "worker_turn_handoff_retry_count": retry_count,
-            "worker_turn_handoff_from_generation": from_generation,
-        }
-
-        def digest(payload):
-            return hashlib.sha256(json.dumps(
-                payload,
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=False,
-                allow_nan=False,
-            ).encode("utf-8")).hexdigest()
-
-        db.add(WorkerTurnHandoffReceipt(
-            handoff_id=handoff_id,
-            task_id=task.id,
-            source_log_id=source.id,
-            side="worker",
-            worker_id=None,
-            retry_count=retry_count,
-            from_generation=from_generation,
-            status="claimed",
-            request_payload=request_payload,
-            request_digest=digest(request_payload),
-            queue_payload=queue_payload,
-            queue_payload_digest=digest(queue_payload),
-            response={"ok": True, "queued": True},
-            claimed_turn_generation=claimed_generation,
-        ))
-        await db.commit()
-        task_id = task.id
+    seed = await _seed_claimed_worker_handoff(
+        db_factory,
+        handoff_id="7" * 32,
+        actual_transport="claude_exec",
+    )
+    task_id = seed["task_id"]
+    handoff_id = seed["handoff_id"]
+    claimed_generation = seed["claimed_generation"]
 
     await d._cleanup_stale_state()
 
@@ -1453,6 +1483,74 @@ async def test_cleanup_quarantines_worker_claim_after_transport_ack_loss(
     d._ensure_queue_worker = MagicMock()
     await d._recover_worker_turn_handoff_outbox()
     assert d._get_task_queue(task_id).empty()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_replays_pretransport_claimed_worker_handoff_exactly(
+    db_factory,
+):
+    """An orphan forward owner does not invalidate a pre-transport G+1."""
+
+    d = _make_dispatcher(db_factory)
+    seed = await _seed_claimed_worker_handoff(
+        db_factory,
+        handoff_id="8" * 32,
+        actual_transport=None,
+    )
+    task_id = seed["task_id"]
+    claimed_generation = seed["claimed_generation"]
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, seed["instance_id"])
+        source = await db.get(LogEntry, seed["source_log_id"])
+    assert task.instance_id == instance.id
+    assert instance.status == "idle"
+    assert instance.current_task_id is None
+    assert source.actual_transport is None
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            seed["handoff_id"],
+        )
+    assert task.status == "executing"
+    assert task.instance_id is None
+    assert task.turn_generation == claimed_generation
+    assert task.completed_at is None
+    assert task.error_message is None
+    assert receipt.status == "claimed"
+    assert receipt.claimed_turn_generation == claimed_generation
+
+    d._ensure_queue_worker = MagicMock()
+    await d._recover_worker_turn_handoff_outbox()
+    # Recovery is idempotent while the exact handoff already owns the volatile
+    # queue slot; it must not enqueue a second copy or create G+2.
+    await d._recover_worker_turn_handoff_outbox()
+    queue = d._get_task_queue(task_id)
+    assert queue.qsize() == 1
+    recovered = queue.get_nowait()
+    assert recovered.source_log_id == seed["source_log_id"]
+    assert recovered.worker_turn_handoff_id == seed["handoff_id"]
+    assert recovered.claimed_retry_count == seed["retry_count"]
+    assert recovered.claimed_turn_generation == claimed_generation
+    assert (
+        recovered.worker_turn_handoff_claimed_generation
+        == claimed_generation
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            seed["handoff_id"],
+        )
+    assert task.turn_generation == claimed_generation
+    assert receipt.status == "claimed"
+    assert receipt.claimed_turn_generation == claimed_generation
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,8 @@
-"""add first-class versioned Plan v2 resources
+"""add first-class versioned Plan resources
 
-Revision ID: 3f2a9c8e7b10
-Revises: 2f6c8a1d4e90
-Create Date: 2026-08-05
+Revision ID: e7c4a21d9b30
+Revises: d2b8f6a10c43
+Create Date: 2026-08-02
 """
 
 from datetime import UTC, datetime
@@ -13,8 +13,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision: str = "3f2a9c8e7b10"
-down_revision: Union[str, None] = "2f6c8a1d4e90"
+revision: str = "e7c4a21d9b30"
+down_revision: Union[str, None] = "d2b8f6a10c43"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -122,177 +122,6 @@ def _legacy_pipeline_config(bind, value):
     }
 
 
-def _create_carrier_schema() -> None:
-    """Recreate the reverted carrier fields as the final Plan v2 schema.
-
-    ``f7a1c3d9e5b2`` is published main history and intentionally remains
-    unchanged.  This forward-only revision runs after that cleanup and owns
-    every restored field/table, so a downgrade can return exactly to the
-    published main head.
-    """
-
-    with op.batch_alter_table("tasks") as batch:
-        batch.add_column(
-            sa.Column("plan_target_task_id", sa.Integer(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_context_session_id", sa.String(200), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_context_log_id", sa.Integer(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_context_snapshot", sa.Text(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_repo_revision", sa.JSON(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("supersedes_plan_task_id", sa.Integer(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_approved_at", sa.DateTime(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_approved_by", sa.Integer(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_applied_at", sa.DateTime(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column(
-                "plan_applied_to_session_id",
-                sa.String(200),
-                nullable=True,
-            )
-        )
-        batch.add_column(
-            sa.Column("plan_applied_log_id", sa.Integer(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_execution_task_id", sa.Integer(), nullable=True)
-        )
-        batch.add_column(
-            sa.Column("plan_pipeline_config", sa.JSON(), nullable=True)
-        )
-        batch.create_index(
-            "ix_tasks_plan_target_task_id",
-            ["plan_target_task_id"],
-            unique=False,
-        )
-        batch.create_index(
-            "ix_tasks_supersedes_plan_task_id",
-            ["supersedes_plan_task_id"],
-            unique=False,
-        )
-
-    with op.batch_alter_table("global_settings") as batch:
-        batch.add_column(
-            sa.Column("plan_pipeline_config", sa.JSON(), nullable=True)
-        )
-
-    op.create_table(
-        "plan_agent_runs",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("plan_task_id", sa.Integer(), nullable=True),
-        sa.Column("plan_id", sa.Integer(), nullable=True),
-        sa.Column("run_type", sa.String(30), nullable=False),
-        sa.Column("source_run_id", sa.Integer(), nullable=True),
-        sa.Column("base_version_id", sa.Integer(), nullable=True),
-        sa.Column("result_version_id", sa.Integer(), nullable=True),
-        sa.Column("draft_content", sa.Text(), nullable=True),
-        sa.Column("draft_step_id", sa.Integer(), nullable=True),
-        sa.Column("draft_repo_revision", sa.JSON(), nullable=True),
-        sa.Column("request_text", sa.Text(), nullable=True),
-        sa.Column("attachments", sa.JSON(), nullable=True),
-        sa.Column("context_session_id", sa.String(200), nullable=True),
-        sa.Column("context_log_id", sa.Integer(), nullable=True),
-        sa.Column("context_snapshot", sa.Text(), nullable=True),
-        sa.Column("repo_revision", sa.JSON(), nullable=True),
-        sa.Column("current_stage", sa.String(30), nullable=False),
-        sa.Column("generation", sa.Integer(), nullable=False),
-        sa.Column("instance_id", sa.Integer(), nullable=True),
-        sa.Column("worker_id", sa.Integer(), nullable=True),
-        sa.Column("relay_origin", sa.String(30), nullable=True),
-        sa.Column("import_payload_digest", sa.String(64), nullable=True),
-        sa.Column("import_attachment_receipt", sa.JSON(), nullable=True),
-        sa.Column("open_input_request_id", sa.Integer(), nullable=True),
-        sa.Column("interaction_count", sa.Integer(), nullable=False),
-        sa.Column("max_interactions", sa.Integer(), nullable=False),
-        sa.Column("execution_seconds", sa.Float(), nullable=False),
-        sa.Column("last_execution_started_at", sa.DateTime(), nullable=True),
-        sa.Column("status", sa.String(30), nullable=False),
-        sa.Column("combo_used", sa.String(20), nullable=True),
-        sa.Column("planner_provider", sa.String(20), nullable=True),
-        sa.Column("planner_model", sa.String(100), nullable=True),
-        sa.Column("planner_effort", sa.String(20), nullable=True),
-        sa.Column("reviewer_provider", sa.String(20), nullable=True),
-        sa.Column("reviewer_model", sa.String(100), nullable=True),
-        sa.Column("reviewer_effort", sa.String(20), nullable=True),
-        sa.Column("pipeline_config", sa.JSON(), nullable=True),
-        sa.Column("round", sa.Integer(), nullable=False),
-        sa.Column("review_verdict", sa.String(20), nullable=True),
-        sa.Column("review_feedback", sa.Text(), nullable=True),
-        sa.Column("review_exhausted", sa.Boolean(), nullable=False),
-        sa.Column("error", sa.Text(), nullable=True),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.Column("finished_at", sa.DateTime(), nullable=True),
-        sa.PrimaryKeyConstraint("id"),
-    )
-    op.create_index(
-        "ix_plan_agent_runs_plan_task_id",
-        "plan_agent_runs",
-        ["plan_task_id"],
-    )
-    op.create_index(
-        "ix_plan_agent_runs_plan_id", "plan_agent_runs", ["plan_id"]
-    )
-    op.create_index(
-        "ix_plan_agent_runs_instance_id", "plan_agent_runs", ["instance_id"]
-    )
-    op.create_index(
-        "ix_plan_agent_runs_status", "plan_agent_runs", ["status"]
-    )
-
-    op.create_table(
-        "plan_agent_steps",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("run_id", sa.Integer(), nullable=False),
-        sa.Column("plan_id", sa.Integer(), nullable=True),
-        sa.Column("worker_id", sa.Integer(), nullable=True),
-        sa.Column("worker_step_id", sa.Integer(), nullable=True),
-        sa.Column("plan_version_id", sa.Integer(), nullable=True),
-        sa.Column("input_request_id", sa.Integer(), nullable=True),
-        sa.Column("generation", sa.Integer(), nullable=False),
-        sa.Column("step_type", sa.String(20), nullable=False),
-        sa.Column("round", sa.Integer(), nullable=False),
-        sa.Column("provider", sa.String(20), nullable=False),
-        sa.Column("model", sa.String(100), nullable=True),
-        sa.Column("effort", sa.String(20), nullable=True),
-        sa.Column("route_slot", sa.String(20), nullable=True),
-        sa.Column("account_id", sa.String(100), nullable=True),
-        sa.Column("status", sa.String(20), nullable=False),
-        sa.Column("output", sa.Text(), nullable=True),
-        sa.Column("error", sa.Text(), nullable=True),
-        sa.Column("last_delta_at", sa.DateTime(), nullable=True),
-        sa.Column("streamed_output_chars", sa.Integer(), nullable=False),
-        sa.Column("last_event_type", sa.String(100), nullable=True),
-        sa.Column("started_at", sa.DateTime(), nullable=False),
-        sa.Column("finished_at", sa.DateTime(), nullable=True),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "worker_id", "worker_step_id", name="uq_plan_steps_worker_id"
-        ),
-    )
-    op.create_index(
-        "ix_plan_agent_steps_run_id", "plan_agent_steps", ["run_id"]
-    )
-    op.create_index(
-        "ix_plan_agent_steps_plan_id", "plan_agent_steps", ["plan_id"]
-    )
-
-
 def _create_tables() -> None:
     op.create_table(
         "plans",
@@ -346,7 +175,6 @@ def _create_tables() -> None:
         sa.Column("context_log_id", sa.Integer(), nullable=True),
         sa.Column("context_snapshot", sa.Text(), nullable=True),
         sa.Column("repo_revision", sa.JSON(), nullable=True),
-        sa.Column("reviewer_repo_revision", sa.JSON(), nullable=True),
         sa.Column("review_verdict", sa.String(20), nullable=True),
         sa.Column("review_feedback", sa.Text(), nullable=True),
         sa.Column("reviewed_by_step_id", sa.Integer(), nullable=True),
@@ -421,17 +249,9 @@ def _create_tables() -> None:
         sa.Column("user_log_id", sa.Integer(), nullable=True),
         sa.Column("execution_task_id", sa.Integer(), nullable=True),
         sa.Column("applied_by", sa.Integer(), nullable=True),
-        sa.Column("application_receipt_key", sa.String(200), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("plan_version_id", name="uq_plan_application_version"),
-        sa.CheckConstraint(
-            "(application_type = 'chat_message' AND user_log_id IS NOT NULL "
-            "AND execution_task_id IS NULL) OR "
-            "(application_type = 'execution_task' "
-            "AND execution_task_id IS NOT NULL AND user_log_id IS NULL)",
-            name="ck_plan_application_target",
-        ),
     )
     op.create_index("ix_plan_applications_plan_id", "plan_applications", ["plan_id"])
     op.create_index(
@@ -439,18 +259,12 @@ def _create_tables() -> None:
         "plan_applications",
         ["plan_version_id"],
     )
-    op.create_index(
-        "ix_plan_applications_application_receipt_key",
-        "plan_applications",
-        ["application_receipt_key"],
-    )
 
     op.create_table(
         "plan_legacy_task_links",
         sa.Column("legacy_task_id", sa.Integer(), nullable=False),
         sa.Column("plan_id", sa.Integer(), nullable=False),
         sa.Column("plan_version_id", sa.Integer(), nullable=True),
-        sa.Column("plan_run_id", sa.Integer(), nullable=True),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("legacy_task_id"),
     )
@@ -458,79 +272,45 @@ def _create_tables() -> None:
         "ix_plan_legacy_task_links_plan_id", "plan_legacy_task_links", ["plan_id"]
     )
 
-    op.create_table(
-        "plan_application_receipts",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("receipt_key", sa.String(200), nullable=False),
-        sa.Column("target_task_id", sa.Integer(), nullable=False),
-        sa.Column("worker_id", sa.Integer(), nullable=True),
-        sa.Column("manager_user_log_id", sa.Integer(), nullable=True),
-        sa.Column("plan_version_ids", sa.JSON(), nullable=False),
-        sa.Column("status", sa.String(20), nullable=False),
-        sa.Column("response", sa.JSON(), nullable=True),
-        sa.Column("delivery_status", sa.String(20), nullable=False),
-        sa.Column("outbox_payload", sa.JSON(), nullable=True),
-        sa.Column("payload_digest", sa.String(64), nullable=True),
-        sa.Column("delivery_error", sa.Text(), nullable=True),
-        sa.Column("launch_evidence", sa.JSON(), nullable=True),
-        sa.Column("delivery_resolution", sa.JSON(), nullable=True),
-        sa.Column("created_at", sa.DateTime(), nullable=False),
-        sa.Column("updated_at", sa.DateTime(), nullable=False),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "receipt_key", name="uq_plan_application_receipt_key"
-        ),
-    )
-    op.create_index(
-        "ix_plan_application_receipts_target_task_id",
-        "plan_application_receipts",
-        ["target_task_id"],
-    )
-    op.create_index(
-        "ix_plan_application_receipts_delivery_status",
-        "plan_application_receipts",
-        ["delivery_status"],
-    )
-
-    op.create_table(
-        "plan_application_attempts",
-        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
-        sa.Column("plan_id", sa.Integer(), nullable=False),
-        sa.Column("plan_version_id", sa.Integer(), nullable=False),
-        sa.Column("application_receipt_key", sa.String(200), nullable=False),
-        sa.Column("application_type", sa.String(30), nullable=False),
-        sa.Column("target_task_id", sa.Integer(), nullable=True),
-        sa.Column("target_session_id", sa.String(200), nullable=True),
-        sa.Column("user_log_id", sa.Integer(), nullable=True),
-        sa.Column("execution_task_id", sa.Integer(), nullable=True),
-        sa.Column("applied_by", sa.Integer(), nullable=True),
-        sa.Column("application_created_at", sa.DateTime(), nullable=False),
-        sa.Column("released_at", sa.DateTime(), nullable=False),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "application_receipt_key",
-            "plan_version_id",
-            name="uq_plan_application_attempt_receipt_version",
-        ),
-    )
-    op.create_index(
-        "ix_plan_application_attempts_plan_id",
-        "plan_application_attempts",
-        ["plan_id"],
-    )
-    op.create_index(
-        "ix_plan_application_attempts_plan_version_id",
-        "plan_application_attempts",
-        ["plan_version_id"],
-    )
-    op.create_index(
-        "ix_plan_application_attempts_application_receipt_key",
-        "plan_application_attempts",
-        ["application_receipt_key"],
-    )
-
 
 def _expand_existing_tables() -> None:
+    with op.batch_alter_table("plan_agent_runs") as batch:
+        batch.alter_column("plan_task_id", existing_type=sa.Integer(), nullable=True)
+        batch.add_column(sa.Column("plan_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("run_type", sa.String(30), nullable=False, server_default="legacy"))
+        batch.add_column(sa.Column("base_version_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("result_version_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("request_text", sa.Text(), nullable=True))
+        batch.add_column(sa.Column("attachments", sa.JSON(), nullable=True))
+        batch.add_column(sa.Column("context_session_id", sa.String(200), nullable=True))
+        batch.add_column(sa.Column("context_log_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("context_snapshot", sa.Text(), nullable=True))
+        batch.add_column(sa.Column("repo_revision", sa.JSON(), nullable=True))
+        batch.add_column(sa.Column("current_stage", sa.String(30), nullable=False, server_default="planner"))
+        batch.add_column(sa.Column("generation", sa.Integer(), nullable=False, server_default="0"))
+        batch.add_column(sa.Column("instance_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("worker_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("relay_origin", sa.String(30), nullable=True))
+        batch.add_column(sa.Column("open_input_request_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("interaction_count", sa.Integer(), nullable=False, server_default="0"))
+        batch.add_column(sa.Column("max_interactions", sa.Integer(), nullable=False, server_default="3"))
+        batch.add_column(sa.Column("execution_seconds", sa.Float(), nullable=False, server_default="0"))
+        batch.add_column(sa.Column("last_execution_started_at", sa.DateTime(), nullable=True))
+        batch.create_index("ix_plan_agent_runs_plan_id", ["plan_id"])
+        batch.create_index("ix_plan_agent_runs_instance_id", ["instance_id"])
+
+    with op.batch_alter_table("plan_agent_steps") as batch:
+        batch.add_column(sa.Column("plan_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("worker_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("worker_step_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("plan_version_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("input_request_id", sa.Integer(), nullable=True))
+        batch.add_column(sa.Column("generation", sa.Integer(), nullable=False, server_default="0"))
+        batch.create_index("ix_plan_agent_steps_plan_id", ["plan_id"])
+        batch.create_unique_constraint(
+            "uq_plan_steps_worker_id", ["worker_id", "worker_step_id"]
+        )
+
     with op.batch_alter_table("instances") as batch:
         batch.add_column(sa.Column("current_plan_run_id", sa.Integer(), nullable=True))
         batch.create_check_constraint(
@@ -737,16 +517,13 @@ def _backfill_legacy_plans() -> None:
         bind.execute(
             sa.text(
                 """INSERT INTO plan_legacy_task_links
-                (legacy_task_id, plan_id, plan_version_id, plan_run_id,
-                 created_at)
-                VALUES (:task_id, :plan_id, :version_id, :run_id,
-                        :created_at)"""
+                (legacy_task_id, plan_id, plan_version_id, created_at)
+                VALUES (:task_id, :plan_id, :version_id, :created_at)"""
             ),
             {
                 "task_id": task_id,
                 "plan_id": plan_id,
                 "version_id": version_id,
-                "run_id": run_id,
                 "created_at": created_at,
             },
         )
@@ -780,96 +557,51 @@ def _backfill_legacy_plans() -> None:
 
 
 def upgrade() -> None:
-    _create_carrier_schema()
     _create_tables()
     _expand_existing_tables()
     _backfill_legacy_plans()
 
 
 def downgrade() -> None:
-    # Only queued legacy carriers are changed by the backfill. Restore their
-    # published-main shape before removing the canonical Plan audit tables so
-    # a downgrade/re-upgrade remains deterministic.
-    op.execute(
-        sa.text(
-            """UPDATE tasks
-            SET status='pending', completed_at=NULL, error_message=NULL
-            WHERE status='superseded'
-              AND error_message LIKE
-                  'Migrated to first-class Plan #%; the canonical Run owns execution'
-              AND id IN (
-                  SELECT l.legacy_task_id
-                  FROM plan_legacy_task_links l
-                  JOIN plan_agent_runs r ON r.id = l.plan_run_id
-                  WHERE r.run_type = 'legacy_migration'
-              )"""
-        )
-    )
-
-    op.drop_index(
-        "ix_plan_application_attempts_application_receipt_key",
-        table_name="plan_application_attempts",
-    )
-    op.drop_index(
-        "ix_plan_application_attempts_plan_version_id",
-        table_name="plan_application_attempts",
-    )
-    op.drop_index(
-        "ix_plan_application_attempts_plan_id",
-        table_name="plan_application_attempts",
-    )
-    op.drop_table("plan_application_attempts")
-
-    op.drop_index(
-        "ix_plan_application_receipts_delivery_status",
-        table_name="plan_application_receipts",
-    )
-    op.drop_index(
-        "ix_plan_application_receipts_target_task_id",
-        table_name="plan_application_receipts",
-    )
-    op.drop_table("plan_application_receipts")
-
     with op.batch_alter_table("instances") as batch:
         batch.drop_constraint(
             "ck_instances_task_xor_plan_run_owner",
             type_="check",
         )
         batch.drop_column("current_plan_run_id")
+    with op.batch_alter_table("plan_agent_steps") as batch:
+        batch.drop_constraint("uq_plan_steps_worker_id", type_="unique")
+        batch.drop_index("ix_plan_agent_steps_plan_id")
+        batch.drop_column("generation")
+        batch.drop_column("input_request_id")
+        batch.drop_column("plan_version_id")
+        batch.drop_column("plan_id")
+        batch.drop_column("worker_step_id")
+        batch.drop_column("worker_id")
+    with op.batch_alter_table("plan_agent_runs") as batch:
+        batch.drop_index("ix_plan_agent_runs_instance_id")
+        batch.drop_index("ix_plan_agent_runs_plan_id")
+        for column in (
+            "last_execution_started_at", "execution_seconds", "max_interactions", "interaction_count", "open_input_request_id",
+            "worker_id", "instance_id", "generation", "current_stage",
+            "repo_revision", "context_snapshot", "context_log_id",
+            "context_session_id", "attachments", "request_text", "relay_origin",
+            "result_version_id", "base_version_id", "run_type", "plan_id",
+        ):
+            batch.drop_column(column)
+        batch.alter_column("plan_task_id", existing_type=sa.Integer(), nullable=False)
 
-    op.drop_index(
-        "ix_plan_legacy_task_links_plan_id",
-        table_name="plan_legacy_task_links",
-    )
+    op.drop_index("ix_plan_legacy_task_links_plan_id", table_name="plan_legacy_task_links")
     op.drop_table("plan_legacy_task_links")
-    op.drop_index(
-        "ix_plan_applications_application_receipt_key",
-        table_name="plan_applications",
-    )
-    op.drop_index(
-        "ix_plan_applications_plan_version_id",
-        table_name="plan_applications",
-    )
-    op.drop_index(
-        "ix_plan_applications_plan_id", table_name="plan_applications"
-    )
+    op.drop_index("ix_plan_applications_plan_version_id", table_name="plan_applications")
+    op.drop_index("ix_plan_applications_plan_id", table_name="plan_applications")
     op.drop_table("plan_applications")
-    op.drop_index(
-        "ix_plan_inputs_run_status", table_name="plan_input_requests"
-    )
-    op.drop_index(
-        "ix_plan_inputs_plan_status", table_name="plan_input_requests"
-    )
-    op.drop_index(
-        "ix_plan_input_requests_run_id", table_name="plan_input_requests"
-    )
-    op.drop_index(
-        "ix_plan_input_requests_plan_id", table_name="plan_input_requests"
-    )
+    op.drop_index("ix_plan_inputs_run_status", table_name="plan_input_requests")
+    op.drop_index("ix_plan_inputs_plan_status", table_name="plan_input_requests")
+    op.drop_index("ix_plan_input_requests_run_id", table_name="plan_input_requests")
+    op.drop_index("ix_plan_input_requests_plan_id", table_name="plan_input_requests")
     op.drop_table("plan_input_requests")
-    op.drop_index(
-        "ix_plan_versions_plan_created", table_name="plan_versions"
-    )
+    op.drop_index("ix_plan_versions_plan_created", table_name="plan_versions")
     op.drop_index("ix_plan_versions_plan_id", table_name="plan_versions")
     op.drop_table("plan_versions")
     op.drop_index("ix_plans_created_by_archived", table_name="plans")
@@ -879,44 +611,3 @@ def downgrade() -> None:
     op.drop_index("ix_plans_worker_id", table_name="plans")
     op.drop_index("ix_plans_project_id", table_name="plans")
     op.drop_table("plans")
-
-    op.drop_index(
-        "ix_plan_agent_steps_plan_id", table_name="plan_agent_steps"
-    )
-    op.drop_index(
-        "ix_plan_agent_steps_run_id", table_name="plan_agent_steps"
-    )
-    op.drop_table("plan_agent_steps")
-    op.drop_index(
-        "ix_plan_agent_runs_status", table_name="plan_agent_runs"
-    )
-    op.drop_index(
-        "ix_plan_agent_runs_instance_id", table_name="plan_agent_runs"
-    )
-    op.drop_index(
-        "ix_plan_agent_runs_plan_id", table_name="plan_agent_runs"
-    )
-    op.drop_index(
-        "ix_plan_agent_runs_plan_task_id", table_name="plan_agent_runs"
-    )
-    op.drop_table("plan_agent_runs")
-
-    with op.batch_alter_table("global_settings") as batch:
-        batch.drop_column("plan_pipeline_config")
-
-    with op.batch_alter_table("tasks") as batch:
-        batch.drop_index("ix_tasks_supersedes_plan_task_id")
-        batch.drop_index("ix_tasks_plan_target_task_id")
-        batch.drop_column("plan_pipeline_config")
-        batch.drop_column("plan_execution_task_id")
-        batch.drop_column("plan_applied_log_id")
-        batch.drop_column("plan_applied_to_session_id")
-        batch.drop_column("plan_applied_at")
-        batch.drop_column("plan_approved_by")
-        batch.drop_column("plan_approved_at")
-        batch.drop_column("supersedes_plan_task_id")
-        batch.drop_column("plan_repo_revision")
-        batch.drop_column("plan_context_snapshot")
-        batch.drop_column("plan_context_log_id")
-        batch.drop_column("plan_context_session_id")
-        batch.drop_column("plan_target_task_id")

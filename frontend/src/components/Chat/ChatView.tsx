@@ -1402,14 +1402,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       };
       setSending(true);
       setMessages((prev) => {
-        if (isPersisted) {
-          return mergeChatHistory([entry], prev);
-        }
-
         // Reconcile the optimistic bubble with the authoritative broadcast.
         // The optimistic content can be raw text while the server content is
-        // prefixed with the sender name, so display content alone is not a
-        // stable identity. raw_content is the canonical user input.
+        // prefixed with the sender name. Worker Manager broadcasts also omit
+        // attachment and Plan snapshots from their first persisted event, so
+        // that event must participate in reconciliation before fingerprinting.
+        // raw_content is the canonical user input.
         let optimisticIndex = -1;
         for (let index = prev.length - 1; index >= 0; index -= 1) {
           const candidate = prev[index];
@@ -1431,9 +1429,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         }
         if (optimisticIndex >= 0) {
           const optimistic = prev[optimisticIndex];
-          const next = [...prev];
-          next[optimisticIndex] = {
-            ...optimistic,
+          const reconciled = {
+            ...entry,
+            // A live event without a durable LogEntry id is still the same
+            // optimistic send. Keep its local id so HTTP failure compensation
+            // can remove the bubble it originally created.
+            id: isPersisted ? entry.id : optimistic.id,
             content,
             source,
             raw_content: rawContent ?? optimistic.raw_content,
@@ -1441,9 +1442,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             image_urls: imageUrls?.length ? imageUrls : optimistic.image_urls,
             attachments: attachments?.length ? attachments : optimistic.attachments,
             applied_plans: appliedPlans?.length ? appliedPlans : optimistic.applied_plans,
-            persisted: optimistic.persisted,
+            persisted: isPersisted,
           };
+          if (isPersisted) {
+            return mergeChatHistory(
+              [reconciled],
+              prev.filter((_candidate, index) => index !== optimisticIndex),
+            );
+          }
+          const next = [...prev];
+          next[optimisticIndex] = reconciled;
           return next;
+        }
+        if (isPersisted) {
+          return mergeChatHistory([entry], prev);
         }
         return [...prev, entry];
       });

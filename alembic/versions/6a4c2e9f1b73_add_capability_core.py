@@ -1,7 +1,7 @@
 """add provider-neutral Capability Core audit tables
 
 Revision ID: 6a4c2e9f1b73
-Revises: 3f2a9c8e7b10
+Revises: e5b8d1c4a7f2
 Create Date: 2026-08-05
 """
 
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 
 revision: str = "6a4c2e9f1b73"
-down_revision: Union[str, None] = "3f2a9c8e7b10"
+down_revision: Union[str, None] = "e5b8d1c4a7f2"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

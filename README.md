@@ -1,5 +1,7 @@
 # Claude Code Manager
 
+**简体中文** | [English](README.en-US.md)
+
 Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊鸣的文章「我给 10 个 Claude Code 打工」。
 
 > **⚠️ 重要安全提示：** 本项目会以 `--dangerously-skip-permissions` 模式运行 Claude Code，这意味着 Claude Code 将拥有**不受限制的文件读写、命令执行和网络访问权限**，并且会自动执行 `git push` 等操作。**强烈建议在一台单独的、没有重要文件的电脑或虚拟机上部署**，避免对你的个人数据或工作环境造成意外影响。
@@ -269,8 +271,13 @@ cd frontend
 # 安装 Capacitor（已在 package.json 中）
 npm install
 
-# 构建 + 同步 + 打包 APK
+# 构建 Web 资源
 npm run build
+
+# 首次 clone：生成未纳入 Git 的原生 Android 工程；后续打包跳过此步
+npx cap add android
+
+# 同步 Web 资源与原生依赖，然后打包 APK
 npx cap sync android
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   android/gradlew -p android assembleDebug
@@ -309,17 +316,7 @@ uv run alembic history         # 查看历史
 
 ### 数据迁移
 
-在数据库之间迁移全部数据（注意使用同步 URL）：
-
-```bash
-# 先在目标库初始化 schema
-DATABASE_URL=postgresql+asyncpg://... uv run alembic upgrade head
-
-# 再迁移数据
-uv run python scripts/transfer_db.py \
-    "sqlite:///./claude_manager.db" \
-    "postgresql://user:pass@host:5432/claude_manager"
-```
+本仓库不提供跨 SQLite、PostgreSQL 和 MySQL 的数据搬运脚本。跨数据库迁移时，请先停止写入并完整备份，再使用源数据库和目标数据库官方提供的导出、导入或复制工具（或经过独立验证的 ETL）。迁移后应运行 Alembic、核对行数与关键关联，并在切换 `DATABASE_URL` 前完成恢复演练。
 
 ## 更新已部署的实例
 
@@ -466,12 +463,22 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | | `GET/PUT/DELETE /api/tasks/{id}` | 任务详情/更新/删除 |
 | | `POST /api/tasks/{id}/cancel` | 取消任务 |
 | | `POST /api/tasks/{id}/retry` | 重试任务 |
-| | `POST /api/tasks/{id}/plan/approve` | 批准计划 |
 | | `POST /api/tasks/{id}/chat` | 发送追问消息 |
 | | `GET /api/tasks/{id}/chat/history` | 获取对话历史 |
 | | `POST /api/tasks/{id}/permissions/{rid}` | 回复权限请求 |
 | | `POST /api/tasks/{id}/ask-user/{rid}` | 回复 ask_user 提问 |
 | | `GET /api/tasks/{id}/ask-user/pending` | 获取待回复提问 |
+| Plans | `GET/POST /api/plans` | Plan 目录/创建 |
+| | `GET/PATCH /api/plans/{id}` | 详情、重命名、归档或恢复 |
+| | `POST /api/plans/{id}/runs` | 创建 Revise/Refresh/Retry Run |
+| | `POST /api/plans/{id}/fork` | Fork 为新 Plan |
+| | `GET /api/plans/{id}/versions` | 获取不可变 Version 历史 |
+| | `GET /api/plan-versions/{id}` | 获取 exact Version |
+| | `GET /api/plan-versions/{id}/staleness` | 检查 Version 上下文是否过期 |
+| | `POST /api/plan-versions/{id}/approve` | 批准 exact Version |
+| | `POST /api/plan-versions/{id}/reject` | 拒绝 exact Version |
+| | `POST /api/plan-runs/{run_id}/input-requests/{request_id}/answer` | 回答必要输入并恢复同一 Run |
+| | `POST /api/plan-versions/{id}/create-execution-task` | 从 standalone Version 创建执行 Task |
 | Instances | `GET/POST /api/instances` | 实例列表/创建 |
 | | `DELETE /api/instances/{id}` | 删除实例 |
 | | `POST /api/instances/{id}/stop` | 停止实例 |

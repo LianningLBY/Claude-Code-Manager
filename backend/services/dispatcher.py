@@ -85,6 +85,10 @@ from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from backend.services.claude_pool import ClaudePool
+    from backend.services.codex_pool import CodexPool
+
 
 def _durable_json_digest(payload: dict) -> str:
     return hashlib.sha256(
@@ -232,6 +236,32 @@ _DOC_SYNC_NOTE = (
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
 )
 
+_MATH_FORMAT_HINT = (
+    "数学排版提示：公式请使用有效 LaTeX（行内 `\\(...\\)`，独立 "
+    "`\\[...\\]`），不要放进代码块或写成 `sum_i`、`sqrt(...)` 等 ASCII 伪公式。"
+)
+_MATH_INTENT_PATTERN = re.compile(
+    r"(?:"
+    r"数学|公式|方程|不等式|定理|证明|推导|求导|积分|极限|矩阵|"
+    r"概率|期望|方差|梯度|收敛|上界|下界|理论保证|遗憾界|"
+    r"\b(?:latex|math(?:ematics)?|equation|theorem|"
+    r"deriv(?:e|ation|ative)|integral|probabilit(?:y|ies)|expectation|"
+    r"variance|convergence|regret|adagrad|eigenvalue|eigenvector)\b|"
+    r"\bgradient\s+(?:descent|method|vector)\b|"
+    r"\bmatrix\s+(?:algebra|calculus|equation|multiplication|inverse|transpose)\b|"
+    r"\b(?:prove|proof)\s+(?:that|this|the|an?\s+(?:identity|inequality|theorem))\b|"
+    r"\\(?:frac|sum|sqrt|int|lim|prod|mathbb|mathbf|begin)\b|"
+    r"\\\(|\\\[|\$\$|[∑√≤≥∞]"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _conditional_math_format_hint(prompt: str) -> str:
+    """Return a short rendering hint only for clearly mathematical turns."""
+
+    return _MATH_FORMAT_HINT if _MATH_INTENT_PATTERN.search(prompt) else ""
+
 
 def _task_artifact_policy(task: Task) -> str:
     """Build the provider-neutral, project-scoped artifact contract."""
@@ -294,10 +324,13 @@ def _task_artifact_policy(task: Task) -> str:
 
 
 def _prepend_task_artifact_policy(task: Task, prompt: str) -> str:
-    """Attach the artifact contract to one Task turn prompt."""
+    """Attach mandatory artifacts plus any turn-specific formatting hint."""
 
-    policy = _task_artifact_policy(task)
-    return f"{policy}\n\n{prompt}" if policy else prompt
+    prefixes = [_task_artifact_policy(task)]
+    if not is_pr_sandbox_task(task):
+        prefixes.append(_conditional_math_format_hint(prompt))
+    active_prefixes = [prefix for prefix in prefixes if prefix]
+    return "\n\n".join([*active_prefixes, prompt])
 
 
 def _agent_doc_preamble(task: Task) -> str:
@@ -6260,6 +6293,10 @@ class GlobalDispatcher:
             if command_args:
                 task_description = command_args
             parts.append(command.prompt_template)
+        if not is_pr_sandbox_task(task):
+            math_hint = _conditional_math_format_hint(task_description)
+            if math_hint:
+                parts.append(math_hint)
         parts.append(f"任务:\n{task_description}")
         from backend.services.auto_capability_policy import (
             build_auto_capability_instructions,
@@ -10666,6 +10703,11 @@ class GlobalDispatcher:
                 f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
             )
 
+        math_hint = _conditional_math_format_hint(
+            f"{task.description}\n{task.goal_condition or ''}"
+        )
+        if math_hint:
+            parts.append(math_hint)
         parts.append(f"任务:\n{task.description}")
         parts.append(
             f"\n目标完成条件:\n{task.goal_condition}\n\n"

@@ -1348,7 +1348,6 @@ async def get_legacy_plan_execution_carrier_proof(
     from backend.services.legacy_plan_execution import (
         legacy_approved_execution_carrier_proof,
     )
-
     proof = await legacy_approved_execution_carrier_proof(db, task_id)
     if proof is None:
         raise HTTPException(
@@ -3541,7 +3540,6 @@ async def terminate_task_generation(
         "Legacy termination mutation is disabled; use the durable "
         "termination receipt protocol",
     )
-
 
 async def _require_local_termination_effect_authority(
     task_id: int,

@@ -189,6 +189,27 @@ describe('PRMonitorPage safety controls', () => {
     vi.clearAllMocks();
   });
 
+  it('keeps the add-repository dialog scrollable and dismissible within the viewport', async () => {
+    const user = userEvent.setup();
+    render(<PRMonitorPage />);
+    await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
+
+    const dialog = screen.getByRole('dialog', { name: 'Add Repository' });
+    const form = dialog.querySelector('form');
+    expect(dialog).toHaveClass('max-h-[calc(100dvh-2rem)]', 'overflow-hidden');
+    expect(form).toHaveClass('min-h-0', 'overflow-y-auto', 'overscroll-contain');
+    expect(document.body.style.overflow).toBe('hidden');
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Add Repository' })).not.toBeInTheDocument();
+    expect(document.body.style.overflow).toBe('');
+
+    await user.click(screen.getByRole('button', { name: 'Add Repository' }));
+    const reopenedDialog = screen.getByRole('dialog', { name: 'Add Repository' });
+    await user.click(reopenedDialog.parentElement!);
+    expect(screen.queryByRole('dialog', { name: 'Add Repository' })).not.toBeInTheDocument();
+  });
+
   it('keeps panel-only settings out of a new single-reviewer payload', async () => {
     const user = userEvent.setup();
     render(<PRMonitorPage />);

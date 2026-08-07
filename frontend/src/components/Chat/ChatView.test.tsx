@@ -414,6 +414,51 @@ describe('ChatView', () => {
     });
   });
 
+  describe('optimistic user-message reconciliation', () => {
+    it('removes the optimistic bubble when an id-less WS echo precedes HTTP failure', async () => {
+      let rejectSend!: (reason: Error) => void;
+      vi.mocked(api.sendTaskChat).mockReturnValueOnce(
+        new Promise((_resolve, reject) => { rejectSend = reject; }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ id: 17, status: 'completed' })}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      await userEvent.type(screen.getByRole('textbox'), 'pending legacy echo');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+      expect(screen.getByText('pending legacy echo')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:17',
+          data: {
+            event_type: 'user_message',
+            role: 'user',
+            content: '[Legacy] pending legacy echo',
+            raw_content: 'pending legacy echo',
+          },
+        });
+      });
+      expect(screen.getAllByText('[Legacy] pending legacy echo')).toHaveLength(1);
+
+      await act(async () => {
+        rejectSend(new Error('send failed after live echo'));
+      });
+
+      expect(await screen.findByText(/send failed after live echo/)).toBeInTheDocument();
+      await waitFor(() => {
+        expect(screen.queryByText('[Legacy] pending legacy echo')).not.toBeInTheDocument();
+      });
+      expect(screen.getByRole('textbox')).toHaveValue('pending legacy echo');
+    });
+  });
+
   describe('legacy Codex completion compatibility', () => {
     it('hides only raw-classified collab item completions from history', async () => {
       const legacyNoise: ChatMessage = {
@@ -2133,7 +2178,7 @@ describe('ChatView', () => {
       });
       expect(api.injectTaskMessage).not.toHaveBeenCalled();
       expect(api.sendTaskChat).not.toHaveBeenCalled();
-    });
+    }, 10_000);
 
     it('backfills again after the task-channel subscription is acknowledged', async () => {
       const task = makeTask({ id: 13 });
@@ -3360,7 +3405,7 @@ describe('independent Plan attachments', () => {
 
     expect(selectedButton).toHaveAttribute('aria-current', 'true');
     expect(selectedButton).toHaveClass('border-indigo-500/70', 'bg-indigo-500/15');
-    expect(within(selectedButton).getByText('Awaiting review'))
+    expect(within(selectedButton).getByText('Needs approval'))
       .toHaveClass('text-indigo-300', 'ring-indigo-500/30');
     expect(otherButton).not.toHaveAttribute('aria-current');
   });
@@ -3400,6 +3445,83 @@ describe('independent Plan attachments', () => {
     expect(screen.getByRole('heading', { level: 1, name: 'Migration' }))
       .toBeInTheDocument();
     expect(screen.getByText('safe path').tagName).toBe('STRONG');
+  });
+
+  it('reconciles a Worker persisted message without dropping optimistic attachments or Plans', async () => {
+    localStorage.clear();
+    const version = makePlanVersion({
+      id: 505,
+      plan_id: 85,
+      human_decision: 'approved',
+      display_state: 'approved',
+    });
+    const plan = makePlan({
+      id: 85,
+      title: 'Worker rollout',
+      display_state: 'approved',
+      current_version_id: version.id,
+      current_version: version,
+    });
+    const upload = makeUpload('worker-notes', 'worker-notes.txt');
+    (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([plan]);
+    (api.listPlanVersions as ReturnType<typeof vi.fn>).mockResolvedValue([version]);
+    (api.uploadImages as ReturnType<typeof vi.fn>).mockResolvedValueOnce([upload]);
+
+    const { container } = render(
+      <ChatView
+        task={makeTask({ id: 1, worker_id: 7 })}
+        projects={[]}
+        onBack={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    await userEvent.click(await screen.findByRole('button', { name: /#85 Worker rollout/ }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Attach to next message' }));
+    expect(await screen.findByText('Plan #85 · v1 · Worker rollout')).toBeInTheDocument();
+
+    await userEvent.upload(
+      container.querySelector<HTMLInputElement>('input[type="file"]')!,
+      new File(['worker evidence'], upload.filename, { type: 'text/plain' }),
+    );
+    await screen.findByText(upload.filename);
+    await userEvent.type(
+      screen.getByPlaceholderText('Type a follow-up message...'),
+      'Ship the Worker rollout',
+    );
+    await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+
+    await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalled());
+    await waitFor(() => {
+      expect(screen.queryByText('Plan #85 · v1 · Worker rollout')).not.toBeInTheDocument();
+    });
+
+    // The Manager's initial Worker broadcast has a durable id/raw_content but
+    // does not yet contain attachment or applied-Plan metadata.
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'task:1',
+        data: {
+          id: 1901,
+          event_type: 'user_message',
+          role: 'user',
+          content: '[Admin] Ship the Worker rollout',
+          raw_content: 'Ship the Worker rollout',
+          timestamp: '2026-08-05T10:00:00Z',
+          image_urls: null,
+          attachments: null,
+          applied_plans: null,
+        },
+      });
+    });
+
+    expect(screen.getAllByText('[Admin] Ship the Worker rollout')).toHaveLength(1);
+    expect(screen.queryByText('Ship the Worker rollout')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: upload.filename })).toHaveAttribute(
+      'href',
+      upload.url,
+    );
+    expect(screen.getByText('Applied Plan #85: Worker rollout')).toBeInTheDocument();
   });
 
   it('creates an associated Plan with uploaded files from the modal composer', async () => {

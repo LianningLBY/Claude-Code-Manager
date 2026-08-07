@@ -7785,12 +7785,17 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             f"/api/tasks/{task.id}/{action_path}",
         )
         assert response.status_code == 200, response.text
-        assert response.json()["status"] == "pending"
+        assert response.json()["status"] == (
+            "completed" if action_path == "plan/approve" else "pending"
+        )
 
-    assert len(skill_payloads) == 1
-    assert skill_payloads[0]["enabled_skills"] == {
-        "code-review": True,
-    }
+    if action_path == "plan/approve":
+        assert skill_payloads == []
+    else:
+        assert len(skill_payloads) == 1
+        assert skill_payloads[0]["enabled_skills"] == {
+            "code-review": True,
+        }
 
 
 @pytest.mark.parametrize("status", ["pending", "completed"])

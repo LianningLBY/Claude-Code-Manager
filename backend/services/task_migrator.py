@@ -395,6 +395,10 @@ class TaskMigrator:
                 raise MigrationError(
                     "Claude PTY 后台活动仍在输出，结束后再迁移"
                 )
+            if task.plan_target_task_id is not None:
+                raise MigrationError(
+                    "关联 Plan 不能脱离目标 Task 单独迁移"
+                )
             from backend.services.plan_tasks import ACTIVE_PLAN_STATUSES
 
             blocking_versioned_plan_id = await db.scalar(

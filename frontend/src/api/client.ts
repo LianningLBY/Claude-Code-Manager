@@ -243,6 +243,10 @@ export interface SystemConfig {
   codex_service_tier_options?: CodexServiceTier[];
   codex_model_service_tiers: Record<string, CodexServiceTier[]>;
   versioned_plan_worker_protocol?: number;
+  /** Manager/Worker capability fences; absent on older deployments. */
+  pr_review_snapshot_context_version?: number;
+  pr_review_terminal_chat_version?: number;
+  task_artifact_scope_version?: number;
   /** Absent when the UI is connected to an older Manager/Worker. */
   plan_pipeline_defaults?: PlanPipelineConfig;
   /** Side-effecting mode stays hidden unless both server feature gates are on. */

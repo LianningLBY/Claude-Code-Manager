@@ -2,6 +2,7 @@
 
 import asyncio
 from copy import deepcopy
+from contextlib import asynccontextmanager
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1879,12 +1880,45 @@ async def test_legacy_internal_termination_rejects_pr_fix_task_generations(
     snapshot = snapshot_response.json()
     assert snapshot["status"] == initial_status
 
+    lease_events: list[str] = []
+    original_lease = backend.main.dispatcher.task_queue_cancellation_lease
+
+    @asynccontextmanager
+    async def observed_lease(leased_task_id: int):
+        assert leased_task_id == task_id
+        async with original_lease(leased_task_id):
+            lease_events.append("acquired")
+            assert task_id in backend.main.dispatcher._cancel_durable_queue_tasks
+            try:
+                yield
+            finally:
+                # The outer fence must remain held until the terminal Task row
+                # is committed, not merely until queue draining completes.
+                assert task_id in backend.main.dispatcher._cancel_durable_queue_tasks
+                async with session_factory() as verify_db:
+                    terminal = await verify_db.get(Task, task_id)
+                    assert terminal is not None
+                    assert terminal.status == "completed"
+                lease_events.append("terminal_committed")
+        lease_events.append("released")
+
+    async def abort_inside_lease(aborted_task_id: int, **kwargs):
+        assert aborted_task_id == task_id
+        assert task_id in backend.main.dispatcher._cancel_durable_queue_tasks
+        assert kwargs["cancel_durable"] is False
+        assert kwargs["durable_db"] is not None
+        return 0
+
     with patch.object(
         backend.main.dispatcher,
         "abort_task_queue",
         new_callable=AsyncMock,
-        return_value=0,
-    ) as abort:
+        side_effect=abort_inside_lease,
+    ) as abort, patch.object(
+        backend.main.dispatcher,
+        "task_queue_cancellation_lease",
+        observed_lease,
+    ):
         response = await client.post(
             f"/api/tasks/{task_id}/terminate-generation",
             json={

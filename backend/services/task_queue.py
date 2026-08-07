@@ -1028,7 +1028,7 @@ class TaskQueue:
                     CapabilityInvocation.task_id == task_id
                 )
             )
-        from backend.models.plan_agent import PlanAgentStep
+        from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 
         plan_run_ids = list(
             (

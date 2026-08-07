@@ -90,6 +90,11 @@ export interface WorkspacePreviewConfig {
   url: string;
   health_url: string;
   startup_timeout_seconds: number;
+  sandbox?: {
+    setup: WorkspacePreviewCommand[];
+    processes: WorkspacePreviewCommand[];
+    allowed_hosts: string[];
+  } | null;
 }
 
 export interface WorkspaceReviewCapabilities {

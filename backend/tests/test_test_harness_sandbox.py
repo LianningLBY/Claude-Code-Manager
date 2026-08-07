@@ -11,12 +11,14 @@ from backend.models.test_harness import (
 from backend.services.test_harness_sandbox import (
     DockerTestHarnessSandboxRuntime,
     SandboxCapability,
+    SandboxPreviewSnapshot,
     SandboxResource,
     SandboxSourceSnapshot,
     TestHarnessSandboxError as SandboxError,
     TestHarnessSandboxManager as SandboxManager,
 )
 from backend.services.test_harness_git_targets import ResolvedGitTarget
+from backend.services import test_harness_sandbox as sandbox_module
 from backend.services.test_harness import TestHarnessService as HarnessService
 from backend.services.test_harness_contracts import TestHarnessSpec as HarnessSpec
 
@@ -273,6 +275,39 @@ class _ManagedRuntime:
             allowed_hosts=("github.com",),
         )
 
+    async def prepare_preview(
+        self,
+        *,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        resource_id: str,
+        source: SandboxSourceSnapshot,
+        preview_config: dict[str, object],
+        startup_timeout_seconds: float,
+        url_template: str,
+        health_url_template: str,
+    ) -> SandboxPreviewSnapshot:
+        _ = (
+            run_id,
+            lease_id,
+            lease_nonce,
+            resource_id,
+            source,
+            preview_config,
+            startup_timeout_seconds,
+            url_template,
+            health_url_template,
+        )
+        return SandboxPreviewSnapshot(
+            url="http://127.0.0.1:43123/",
+            health_url="http://127.0.0.1:43123/health",
+            host_port=43123,
+            internal_port=4173,
+            process_names=("web",),
+            setup_logs=({"index": 0, "executable": "npm"},),
+        )
+
 
 async def _fixed_url_run(db_factory):
     from backend.models.task import Task
@@ -343,6 +378,32 @@ async def test_sandbox_manager_freezes_resolved_target_before_source_ready(db_fa
     assert stored_lease is not None
     assert stored_lease.status == "source_ready"
     assert stored_lease.runtime_metadata["repository_path"] == "/workspace/repo"
+
+    preview = await manager.prepare_preview(
+        run.id,
+        snapshot,
+        preview_config={
+            "setup": [],
+            "processes": [
+                {
+                    "name": "web",
+                    "command": ["npm", "run", "dev", "--", "--port", "{preview_port}"],
+                    "cwd": ".",
+                    "env": {},
+                }
+            ],
+        },
+        startup_timeout_seconds=30,
+        url_template="http://127.0.0.1:{preview_port}/",
+        health_url_template="http://127.0.0.1:{preview_port}/health",
+    )
+
+    assert preview.host_port == 43123
+    async with db_factory() as db:
+        stored_lease = await db.get(SandboxLeaseModel, lease.id)
+    assert stored_lease is not None
+    assert stored_lease.status == "preview_ready"
+    assert stored_lease.runtime_metadata["egress_revoked"] is True
 
 
 @pytest.mark.asyncio
@@ -464,6 +525,137 @@ async def test_source_acquisition_uses_internal_network_and_exact_sha(monkeypatc
     assert "HTTPS_PROXY=http://egress-proxy:3128" in fetch
     assert "refs/pull/99/head" in fetch
     assert not any("token" in value.lower() for value in fetch)
+
+
+@pytest.mark.asyncio
+async def test_sandbox_preview_revokes_egress_before_loopback_health(monkeypatch):
+    run_id = "a" * 32
+    lease_id = "b" * 32
+    nonce = "c" * 48
+    source_id = "d" * 64
+    internal_id = "e" * 64
+    egress_id = "f" * 64
+    proxy_id = "1" * 64
+    calls: list[list[str]] = []
+
+    async def runner(argv: list[str], _timeout: float) -> tuple[int, str]:
+        calls.append(argv)
+        if argv[1] == "inspect" and any("{{json" in item for item in argv):
+            return 0, '{"internal":{"NetworkID":"' + internal_id + '"}}'
+        if argv[1] == "inspect":
+            resource_id = argv[-1]
+            role = "source" if resource_id == source_id else "egress-proxy"
+            return 0, "\t".join(
+                [
+                    resource_id,
+                    "test-harness",
+                    run_id,
+                    lease_id,
+                    nonce,
+                    role,
+                    "true",
+                    "true",
+                    "none" if role == "source" else internal_id,
+                ]
+            )
+        if argv[1:3] == ["network", "inspect"]:
+            return 0, "\t".join(
+                [
+                    egress_id,
+                    "test-harness",
+                    run_id,
+                    lease_id,
+                    nonce,
+                    "egress-network",
+                    "false",
+                ]
+            )
+        if argv[1:3] == ["network", "rm"] or argv[1] == "rm":
+            return 0, ""
+        if argv[1] == "port":
+            return 0, "127.0.0.1:43123\n"
+        if argv[1] == "exec":
+            if "/usr/bin/cat" in argv:
+                return 1, ""
+            return 0, "setup complete"
+        raise AssertionError(argv)
+
+    class _Response:
+        status_code = 200
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, url):
+            assert url == "http://127.0.0.1:43123/health"
+            assert any(call[1:3] == ["network", "rm"] for call in calls)
+            return _Response()
+
+    monkeypatch.setattr("shutil.which", lambda _value: "/usr/bin/docker")
+    monkeypatch.setattr(sandbox_module.httpx, "AsyncClient", _Client)
+    runtime = DockerTestHarnessSandboxRuntime(
+        enabled=True,
+        runner=runner,
+        probe_ttl_seconds=0,
+    )
+    source = SandboxSourceSnapshot(
+        repository_path="/workspace/repo",
+        head_sha="2" * 40,
+        internal_network_id=internal_id,
+        egress_network_id=egress_id,
+        proxy_container_id=proxy_id,
+        allowed_hosts=("github.com", "registry.npmjs.org"),
+    )
+
+    preview = await runtime.prepare_preview(
+        run_id=run_id,
+        lease_id=lease_id,
+        lease_nonce=nonce,
+        resource_id=source_id,
+        source=source,
+        preview_config={
+            "setup": [
+                {
+                    "command": ["npm", "ci"],
+                    "cwd": ".",
+                    "env": {},
+                    "timeout_seconds": 30,
+                }
+            ],
+            "processes": [
+                {
+                    "name": "web",
+                    "command": ["npm", "run", "dev", "--", "--port", "{preview_port}"],
+                    "cwd": ".",
+                    "env": {"AUTH_TOKEN": ""},
+                }
+            ],
+        },
+        startup_timeout_seconds=30,
+        url_template="http://127.0.0.1:{preview_port}/",
+        health_url_template="http://127.0.0.1:{preview_port}/health",
+    )
+
+    assert preview.url == "http://127.0.0.1:43123/"
+    setup_call = next(
+        call for call in calls if call[1] == "exec" and "npm" in call and "ci" in call
+    )
+    process_call = next(
+        call for call in calls if call[1:3] == ["exec", "-d"]
+    )
+    assert "HTTPS_PROXY=http://egress-proxy:3128" in setup_call
+    assert not any(
+        value.startswith(("HTTPS_PROXY=", "HTTP_PROXY=", "ALL_PROXY="))
+        for value in process_call
+    )
+    assert "/opt/ccm/process_wrapper.py" in process_call
 
 
 @pytest.mark.asyncio

@@ -10,6 +10,7 @@ untrusted target can be admitted.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import secrets
@@ -18,8 +19,11 @@ import signal
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import PurePosixPath
 from typing import Awaitable, Callable
+from urllib.parse import urlsplit
 
+import httpx
 from sqlalchemy import select
 
 from backend.database import async_session
@@ -51,6 +55,23 @@ _DEFAULT_GIT_EGRESS_HOSTS = frozenset(
     }
 )
 _MAX_RUNTIME_OUTPUT_BYTES = 8 * 1024 * 1024
+_SANDBOX_PLACEHOLDERS = frozenset(
+    {"workspace", "preview_port", "temp_dir", "temp_db", "python"}
+)
+_SANDBOX_ENV_KEY_RE = re.compile(r"[A-Z_][A-Z0-9_]{0,79}\Z")
+_SANDBOX_SENSITIVE_ENV = frozenset(
+    {
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CODEX_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+    }
+)
 SandboxCommandRunner = Callable[[list[str], float], Awaitable[tuple[int, str]]]
 
 
@@ -111,6 +132,21 @@ class TestHarnessSandboxRuntime:
     ) -> "SandboxSourceSnapshot":
         raise NotImplementedError
 
+    async def prepare_preview(
+        self,
+        *,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        resource_id: str,
+        source: "SandboxSourceSnapshot",
+        preview_config: dict[str, object],
+        startup_timeout_seconds: float,
+        url_template: str,
+        health_url_template: str,
+    ) -> "SandboxPreviewSnapshot":
+        raise NotImplementedError
+
 
 @dataclass(frozen=True, slots=True)
 class SandboxResource:
@@ -130,6 +166,16 @@ class SandboxSourceSnapshot:
     egress_network_id: str
     proxy_container_id: str
     allowed_hosts: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class SandboxPreviewSnapshot:
+    url: str
+    health_url: str
+    host_port: int
+    internal_port: int
+    process_names: tuple[str, ...]
+    setup_logs: tuple[dict[str, object], ...]
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -198,6 +244,75 @@ async def _run_command(argv: list[str], timeout: float) -> tuple[int, str]:
     return process.returncode or 0, (stdout or b"").decode(
         "utf-8", errors="replace"
     )
+
+
+def _format_sandbox_preview_value(
+    value: object,
+    variables: dict[str, str],
+) -> str:
+    if not isinstance(value, str) or len(value) > 4000 or "\x00" in value:
+        raise TestHarnessSandboxError("sandbox preview value is invalid")
+    result = value
+    for key, replacement in variables.items():
+        result = result.replace("{" + key + "}", replacement)
+    unknown = re.findall(r"\{([a-zA-Z0-9_]+)\}", result)
+    if unknown:
+        if unknown[0] not in _SANDBOX_PLACEHOLDERS:
+            raise TestHarnessSandboxError(
+                f"sandbox preview placeholder is invalid: {unknown[0]}"
+            )
+        raise TestHarnessSandboxError(
+            f"sandbox preview placeholder was not resolved: {unknown[0]}"
+        )
+    return result
+
+
+def _sandbox_repo_workdir(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise TestHarnessSandboxError("sandbox preview cwd is invalid")
+    relative = PurePosixPath(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise TestHarnessSandboxError("sandbox preview cwd escapes the repository")
+    return str(PurePosixPath("/workspace/repo") / relative)
+
+
+def _sandbox_preview_env(
+    value: object,
+    variables: dict[str, str],
+    *,
+    with_proxy: bool,
+) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > 64:
+        raise TestHarnessSandboxError("sandbox preview env is invalid")
+    env = {
+        "HOME": "/home/sandbox",
+        "CCM_PREVIEW": "1",
+        "PYTHONUNBUFFERED": "1",
+        "NO_COLOR": "1",
+        "UV_CACHE_DIR": "/workspace/.cache/uv",
+        "npm_config_cache": "/workspace/.cache/npm",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/bin/false",
+    }
+    if with_proxy:
+        env.update(
+            {
+                "HTTPS_PROXY": "http://egress-proxy:3128",
+                "HTTP_PROXY": "http://egress-proxy:3128",
+                "ALL_PROXY": "http://egress-proxy:3128",
+                "NO_PROXY": "localhost,127.0.0.1",
+            }
+        )
+    for key, raw in value.items():
+        if (
+            not isinstance(key, str)
+            or _SANDBOX_ENV_KEY_RE.fullmatch(key) is None
+            or key in _SANDBOX_SENSITIVE_ENV
+        ):
+            raise TestHarnessSandboxError("sandbox preview env key is invalid")
+        env[key] = _format_sandbox_preview_value(raw, variables)
+    return env
 
 
 class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
@@ -456,13 +571,13 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             "--publish",
             f"127.0.0.1::{settings.test_harness_sandbox_preview_port}",
             "--tmpfs",
-            f"/workspace:rw,nosuid,nodev,size={self.workspace_bytes}",
+            f"/workspace:rw,nosuid,nodev,mode=1777,size={self.workspace_bytes}",
             "--tmpfs",
             f"/tmp:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
             "--tmpfs",
             f"/home/sandbox:rw,nosuid,nodev,size={self.tmp_bytes}",
             "--tmpfs",
-            "/run:rw,noexec,nosuid,nodev,size=67108864",
+            "/run:rw,noexec,nosuid,nodev,mode=1777,size=67108864",
             "--workdir",
             "/workspace",
             "--entrypoint",
@@ -659,7 +774,18 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         env: dict[str, str],
         argv: list[str],
         timeout: float,
+        workdir: str = "/workspace",
     ) -> str:
+        parsed_workdir = PurePosixPath(workdir)
+        if (
+            not parsed_workdir.is_absolute()
+            or (
+                parsed_workdir != PurePosixPath("/workspace")
+                and parsed_workdir.parts[:3] != ("/", "workspace", "repo")
+            )
+            or ".." in parsed_workdir.parts
+        ):
+            raise TestHarnessSandboxError("sandbox command workdir is invalid")
         command = [
             binary,
             "exec",
@@ -667,10 +793,14 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             "--user",
             "10001:10001",
             "--workdir",
-            "/workspace",
+            str(parsed_workdir),
         ]
         for key, value in env.items():
-            if re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", key) is None or "\x00" in value:
+            if (
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", key) is None
+                or not isinstance(value, str)
+                or "\x00" in value
+            ):
                 raise TestHarnessSandboxError("sandbox command environment is invalid")
             command.extend(["--env", f"{key}={value}"])
         command.extend([resource_id, *argv])
@@ -959,6 +1089,386 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             except BaseException as cleanup_exc:
                 raise TestHarnessSandboxError(
                     "sandbox source acquisition failed and cleanup could not be proven"
+                ) from cleanup_exc
+            raise
+
+    async def _revoke_source_egress(
+        self,
+        *,
+        binary: str,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        resource_id: str,
+        source: SandboxSourceSnapshot,
+    ) -> None:
+        """Remove the only outbound member, then prove source is internal-only."""
+
+        await self._verify_resource(
+            binary=binary,
+            resource_id=source.proxy_container_id,
+            run_id=run_id,
+            lease_id=lease_id,
+            lease_nonce=lease_nonce,
+            expected_role="egress-proxy",
+            require_running=True,
+        )
+        remove_code, _ = await self._runner(
+            [binary, "rm", "-f", source.proxy_container_id],
+            30.0,
+        )
+        if remove_code != 0:
+            raise TestHarnessSandboxError("sandbox egress proxy removal failed")
+        role = await self._verify_network(
+            binary=binary,
+            network_id=source.egress_network_id,
+            run_id=run_id,
+            lease_id=lease_id,
+            lease_nonce=lease_nonce,
+        )
+        if role != "egress-network":
+            raise TestHarnessSandboxError("sandbox egress network role mismatch")
+        network_remove_code, _ = await self._runner(
+            [binary, "network", "rm", source.egress_network_id],
+            30.0,
+        )
+        if network_remove_code != 0:
+            raise TestHarnessSandboxError("sandbox egress network removal failed")
+
+        template = "{{json .NetworkSettings.Networks}}"
+        inspect_code, inspect_output = await self._runner(
+            [binary, "inspect", "--format", template, resource_id],
+            10.0,
+        )
+        try:
+            networks = json.loads(inspect_output)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TestHarnessSandboxError(
+                "sandbox source network state is invalid"
+            ) from exc
+        if inspect_code != 0 or not isinstance(networks, dict) or not networks:
+            raise TestHarnessSandboxError(
+                "sandbox source network state could not be proven"
+            )
+        network_ids = {
+            item.get("NetworkID")
+            for item in networks.values()
+            if isinstance(item, dict)
+        }
+        if network_ids != {source.internal_network_id}:
+            raise TestHarnessSandboxError(
+                "sandbox source retained an unexpected network attachment"
+            )
+
+    async def _published_preview_port(
+        self,
+        *,
+        binary: str,
+        resource_id: str,
+    ) -> int:
+        internal_port = settings.test_harness_sandbox_preview_port
+        code, output = await self._runner(
+            [binary, "port", resource_id, f"{internal_port}/tcp"],
+            10.0,
+        )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if code != 0 or len(lines) != 1:
+            raise TestHarnessSandboxError(
+                "sandbox preview loopback port could not be resolved"
+            )
+        match = re.fullmatch(r"127\.0\.0\.1:([1-9][0-9]{0,4})", lines[0])
+        if match is None:
+            raise TestHarnessSandboxError(
+                "sandbox preview was not published to exact IPv4 loopback"
+            )
+        port = int(match.group(1))
+        if not 1024 <= port <= 65535:
+            raise TestHarnessSandboxError("sandbox preview host port is invalid")
+        return port
+
+    async def _preview_process_error(
+        self,
+        *,
+        binary: str,
+        resource_id: str,
+        process_count: int,
+    ) -> str | None:
+        for index in range(process_count):
+            status_path = f"/run/ccm-preview-{index}.status"
+            code, output = await self._runner(
+                [
+                    binary,
+                    "exec",
+                    "--user",
+                    "10001:10001",
+                    resource_id,
+                    "/usr/bin/cat",
+                    status_path,
+                ],
+                5.0,
+            )
+            if code == 0:
+                status = output.strip()
+                if re.fullmatch(r"-?[0-9]{1,10}", status) is None:
+                    status = "unknown"
+                log_code, log_output = await self._runner(
+                    [
+                        binary,
+                        "exec",
+                        "--user",
+                        "10001:10001",
+                        resource_id,
+                        "/usr/bin/tail",
+                        "-c",
+                        "8192",
+                        f"/run/ccm-preview-{index}.log",
+                    ],
+                    5.0,
+                )
+                tail = log_output.strip()[-4000:] if log_code == 0 else ""
+                return (
+                    f"sandbox preview process {index} exited with code {status}"
+                    + (f": {tail}" if tail else "")
+                )
+        return None
+
+    async def prepare_preview(
+        self,
+        *,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        resource_id: str,
+        source: SandboxSourceSnapshot,
+        preview_config: dict[str, object],
+        startup_timeout_seconds: float,
+        url_template: str,
+        health_url_template: str,
+    ) -> SandboxPreviewSnapshot:
+        """Run approved setup, revoke egress, and expose one loopback preview."""
+
+        self._validate_identity(run_id, lease_id, lease_nonce)
+        if _CONTAINER_ID_RE.fullmatch(resource_id) is None:
+            raise TestHarnessSandboxError("sandbox source container is invalid")
+        if not 3 <= startup_timeout_seconds <= 300:
+            raise TestHarnessSandboxError("sandbox preview startup timeout is invalid")
+        setup = preview_config.get("setup")
+        processes = preview_config.get("processes")
+        if (
+            not isinstance(setup, list)
+            or len(setup) > 6
+            or not isinstance(processes, list)
+            or not 1 <= len(processes) <= 4
+        ):
+            raise TestHarnessSandboxError("sandbox preview profile is invalid")
+        binary = shutil.which(self.docker_binary)
+        if binary is None:
+            raise TestHarnessSandboxError("isolated sandbox Docker client disappeared")
+        await self._verify_resource(
+            binary=binary,
+            resource_id=resource_id,
+            run_id=run_id,
+            lease_id=lease_id,
+            lease_nonce=lease_nonce,
+            expected_role="source",
+            require_running=True,
+        )
+        internal_port = settings.test_harness_sandbox_preview_port
+        variables = {
+            "workspace": "/workspace/repo",
+            "preview_port": str(internal_port),
+            "temp_dir": "/workspace/runtime",
+            "temp_db": "/workspace/runtime/preview.db",
+            "python": "/workspace/repo/.venv/bin/python",
+        }
+        setup_logs: list[dict[str, object]] = []
+        await self._exec_source(
+            binary=binary,
+            resource_id=resource_id,
+            env={},
+            argv=["/usr/bin/mkdir", "-p", "/workspace/runtime"],
+            timeout=10.0,
+            workdir="/workspace/repo",
+        )
+        try:
+            for index, raw in enumerate(setup):
+                if not isinstance(raw, dict):
+                    raise TestHarnessSandboxError(
+                        "sandbox preview setup entry is invalid"
+                    )
+                raw_argv = raw.get("command")
+                if not isinstance(raw_argv, list) or not raw_argv:
+                    raise TestHarnessSandboxError(
+                        "sandbox preview setup command is invalid"
+                    )
+                argv = [
+                    _format_sandbox_preview_value(item, variables)
+                    for item in raw_argv
+                ]
+                cwd = _sandbox_repo_workdir(raw.get("cwd", "."))
+                env = _sandbox_preview_env(
+                    raw.get("env", {}),
+                    variables,
+                    with_proxy=True,
+                )
+                timeout = float(raw.get("timeout_seconds", 300))
+                if not 1 <= timeout <= 1200:
+                    raise TestHarnessSandboxError(
+                        "sandbox preview setup timeout is invalid"
+                    )
+                output = await self._exec_source(
+                    binary=binary,
+                    resource_id=resource_id,
+                    env=env,
+                    argv=argv,
+                    timeout=timeout,
+                    workdir=cwd,
+                )
+                setup_logs.append(
+                    {
+                        "index": index,
+                        "executable": PurePosixPath(argv[0]).name,
+                        "cwd": str(raw.get("cwd", ".")),
+                        "output_tail": output[-4000:],
+                    }
+                )
+
+            process_names: list[str] = []
+            for index, raw in enumerate(processes):
+                if not isinstance(raw, dict):
+                    raise TestHarnessSandboxError(
+                        "sandbox preview process entry is invalid"
+                    )
+                name = raw.get("name")
+                raw_argv = raw.get("command")
+                if (
+                    not isinstance(name, str)
+                    or not name
+                    or name in process_names
+                    or not isinstance(raw_argv, list)
+                    or not raw_argv
+                ):
+                    raise TestHarnessSandboxError(
+                        "sandbox preview process contract is invalid"
+                    )
+                process_names.append(name)
+                argv = [
+                    _format_sandbox_preview_value(item, variables)
+                    for item in raw_argv
+                ]
+                cwd = _sandbox_repo_workdir(raw.get("cwd", "."))
+                env = _sandbox_preview_env(
+                    raw.get("env", {}),
+                    variables,
+                    with_proxy=False,
+                )
+                command = [
+                    binary,
+                    "exec",
+                    "-d",
+                    "--user",
+                    "10001:10001",
+                    "--workdir",
+                    cwd,
+                ]
+                for key, value in env.items():
+                    command.extend(["--env", f"{key}={value}"])
+                command.extend(
+                    [
+                        resource_id,
+                        "/usr/bin/python3",
+                        "/opt/ccm/process_wrapper.py",
+                        f"/run/ccm-preview-{index}.pid",
+                        f"/run/ccm-preview-{index}.status",
+                        f"/run/ccm-preview-{index}.log",
+                        "--",
+                        *argv,
+                    ]
+                )
+                code, _ = await self._runner(command, 30.0)
+                if code != 0:
+                    raise TestHarnessSandboxError(
+                        f"sandbox preview process {index} could not start"
+                    )
+
+            await self._revoke_source_egress(
+                binary=binary,
+                run_id=run_id,
+                lease_id=lease_id,
+                lease_nonce=lease_nonce,
+                resource_id=resource_id,
+                source=source,
+            )
+            host_port = await self._published_preview_port(
+                binary=binary,
+                resource_id=resource_id,
+            )
+            host_variables = {**variables, "preview_port": str(host_port)}
+            url = _format_sandbox_preview_value(url_template, host_variables)
+            health_url = _format_sandbox_preview_value(
+                health_url_template,
+                host_variables,
+            )
+            for candidate in (url, health_url):
+                parsed = urlsplit(candidate)
+                if (
+                    parsed.scheme != "http"
+                    or parsed.hostname != "127.0.0.1"
+                    or parsed.port != host_port
+                    or parsed.username is not None
+                    or parsed.password is not None
+                ):
+                    raise TestHarnessSandboxError(
+                        "sandbox preview URL is not exact loopback"
+                    )
+
+            deadline = asyncio.get_running_loop().time() + startup_timeout_seconds
+            last_error = "health check did not respond"
+            async with httpx.AsyncClient(
+                timeout=2.0,
+                follow_redirects=False,
+                trust_env=False,
+            ) as client:
+                while asyncio.get_running_loop().time() < deadline:
+                    process_error = await self._preview_process_error(
+                        binary=binary,
+                        resource_id=resource_id,
+                        process_count=len(processes),
+                    )
+                    if process_error:
+                        raise TestHarnessSandboxError(process_error)
+                    try:
+                        response = await client.get(health_url)
+                        if 200 <= response.status_code < 500:
+                            return SandboxPreviewSnapshot(
+                                url=url,
+                                health_url=health_url,
+                                host_port=host_port,
+                                internal_port=internal_port,
+                                process_names=tuple(process_names),
+                                setup_logs=tuple(setup_logs),
+                            )
+                        last_error = (
+                            f"health check returned HTTP {response.status_code}"
+                        )
+                    except httpx.HTTPError as exc:
+                        last_error = type(exc).__name__
+                    await asyncio.sleep(0.5)
+            raise TestHarnessSandboxError(
+                f"sandbox preview did not become ready: {last_error}"
+            )
+        except BaseException:
+            try:
+                await asyncio.shield(
+                    self.cleanup_identity(
+                        run_id=run_id,
+                        lease_id=lease_id,
+                        lease_nonce=lease_nonce,
+                    )
+                )
+            except BaseException as cleanup_exc:
+                raise TestHarnessSandboxError(
+                    "sandbox preview failed and cleanup could not be proven"
                 ) from cleanup_exc
             raise
 
@@ -1333,6 +1843,125 @@ class TestHarnessSandboxManager:
                 lease.phase = "source_ready"
                 await db.commit()
             return snapshot
+        except BaseException as exc:
+            cleanup_error: str | None = None
+            try:
+                await asyncio.shield(
+                    self.runtime.cleanup_identity(
+                        run_id=run_id,
+                        lease_id=lease_id,
+                        lease_nonce=lease_nonce,
+                    )
+                )
+            except BaseException as cleanup_exc:
+                cleanup_error = str(cleanup_exc)[:4000]
+            await asyncio.shield(
+                self._mark_failed(
+                    lease_id,
+                    error=(str(exc) or type(exc).__name__)[:4000],
+                    cleanup_error=cleanup_error,
+                )
+            )
+            raise
+
+    async def prepare_preview(
+        self,
+        run_id: str,
+        source: SandboxSourceSnapshot,
+        *,
+        preview_config: dict[str, object],
+        startup_timeout_seconds: float,
+        url_template: str,
+        health_url_template: str,
+    ) -> SandboxPreviewSnapshot:
+        """Persist preview ownership around one cancellation-safe runtime call."""
+
+        async with self._lock:
+            async with self.db_factory() as db:
+                lease = await db.scalar(
+                    select(TestHarnessSandboxLease).where(
+                        TestHarnessSandboxLease.run_id == run_id
+                    )
+                )
+                if lease is None:
+                    raise TestHarnessSandboxError("sandbox lease was not found")
+                if lease.status != "source_ready" or lease.cleanup_status != "pending":
+                    raise TestHarnessSandboxError(
+                        "sandbox source is not ready for preview"
+                    )
+                if not lease.resource_id:
+                    raise TestHarnessSandboxError(
+                        "sandbox lease has no source container"
+                    )
+                metadata = dict(lease.runtime_metadata or {})
+                expected = {
+                    "repository_path": source.repository_path,
+                    "head_sha": source.head_sha,
+                    "internal_network_id": source.internal_network_id,
+                    "egress_network_id": source.egress_network_id,
+                    "proxy_container_id": source.proxy_container_id,
+                }
+                if any(metadata.get(key) != value for key, value in expected.items()):
+                    raise TestHarnessSandboxError(
+                        "sandbox source identity does not match its durable lease"
+                    )
+                lease.status = "preparing"
+                lease.phase = "starting_preview"
+                await db.commit()
+                lease_id = lease.id
+                lease_nonce = lease.lease_nonce
+                resource_id = lease.resource_id
+        try:
+            preview = await self.runtime.prepare_preview(
+                run_id=run_id,
+                lease_id=lease_id,
+                lease_nonce=lease_nonce,
+                resource_id=resource_id,
+                source=source,
+                preview_config=preview_config,
+                startup_timeout_seconds=startup_timeout_seconds,
+                url_template=url_template,
+                health_url_template=health_url_template,
+            )
+        except BaseException as exc:
+            cleanup_error: str | None = None
+            try:
+                await asyncio.shield(
+                    self.runtime.cleanup_identity(
+                        run_id=run_id,
+                        lease_id=lease_id,
+                        lease_nonce=lease_nonce,
+                    )
+                )
+            except BaseException as cleanup_exc:
+                cleanup_error = str(cleanup_exc)[:4000]
+            await asyncio.shield(
+                self._mark_failed(
+                    lease_id,
+                    error=(str(exc) or type(exc).__name__)[:4000],
+                    cleanup_error=cleanup_error,
+                )
+            )
+            raise
+        try:
+            async with self.db_factory() as db:
+                lease = await db.get(TestHarnessSandboxLease, lease_id)
+                if lease is None:
+                    raise TestHarnessSandboxError("sandbox lease disappeared")
+                lease.runtime_metadata = {
+                    **dict(lease.runtime_metadata or {}),
+                    "preview_url": preview.url,
+                    "health_url": preview.health_url,
+                    "host_port": preview.host_port,
+                    "internal_port": preview.internal_port,
+                    "process_names": list(preview.process_names),
+                    "setup_logs": list(preview.setup_logs),
+                    "egress_revoked": True,
+                }
+                lease.status = "preview_ready"
+                lease.phase = "preview_ready"
+                await db.commit()
+            return preview
         except BaseException as exc:
             cleanup_error: str | None = None
             try:

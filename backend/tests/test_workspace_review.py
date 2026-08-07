@@ -146,6 +146,41 @@ def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_buil
             "timeout_seconds": 600,
         },
     ]
+    assert suggestion["sandbox"]["setup"][0]["command"] == [
+        "uv",
+        "sync",
+        "--frozen",
+        "--no-dev",
+    ]
+    assert suggestion["sandbox"]["processes"][0]["command"][-4:] == [
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "{preview_port}",
+    ]
+
+
+def test_sandbox_preview_profile_requires_explicit_port_and_public_hosts(tmp_path):
+    workspace = _make_repo(tmp_path)
+    config = _http_preview_config()
+    config["sandbox"] = {
+        "setup": [],
+        "processes": [
+            {
+                "name": "web",
+                "command": ["{python}", "-m", "http.server", "{preview_port}"],
+                "cwd": ".",
+            }
+        ],
+        "allowed_hosts": ["registry.npmjs.org"],
+    }
+
+    normalized = validate_preview_config(config, workspace)
+
+    assert normalized["sandbox"]["allowed_hosts"] == ["registry.npmjs.org"]
+    config["sandbox"]["allowed_hosts"] = ["127.0.0.1"]
+    with pytest.raises(PreviewConfigurationError, match="IP literals"):
+        validate_preview_config(config, workspace)
 
 
 @pytest.mark.asyncio

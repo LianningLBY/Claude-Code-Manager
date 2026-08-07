@@ -162,6 +162,125 @@ def _validate_env(value: object, *, label: str) -> dict[str, str]:
     return result
 
 
+def _validate_sandbox_preview_config(
+    value: object,
+    workspace: Path,
+) -> dict[str, Any] | None:
+    """Normalize an explicit admin-owned profile for untrusted Git targets."""
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PreviewConfigurationError("preview sandbox profile must be an object")
+    setup = value.get("setup", [])
+    if not isinstance(setup, list) or len(setup) > 6:
+        raise PreviewConfigurationError(
+            "preview sandbox setup must contain at most six commands"
+        )
+    normalized_setup: list[dict[str, Any]] = []
+    for index, item in enumerate(setup):
+        if not isinstance(item, dict):
+            raise PreviewConfigurationError(
+                "preview sandbox setup entries must be objects"
+            )
+        label = f"sandbox.setup[{index}]"
+        cwd = str(
+            PurePosixPath(
+                _relative_dir(workspace, item.get("cwd", "."))
+                .relative_to(workspace)
+                .as_posix()
+            )
+        )
+        normalized_setup.append(
+            {
+                "command": _validate_command(item.get("command"), label=label),
+                "cwd": cwd,
+                "env": _validate_env(item.get("env"), label=label),
+                "timeout_seconds": min(
+                    1200,
+                    max(1, int(item.get("timeout_seconds", 300))),
+                ),
+            }
+        )
+
+    processes = value.get("processes")
+    if not isinstance(processes, list) or not 1 <= len(processes) <= 4:
+        raise PreviewConfigurationError(
+            "preview sandbox profile requires one to four processes"
+        )
+    normalized_processes: list[dict[str, Any]] = []
+    names: set[str] = set()
+    exposes_preview_port = False
+    for index, item in enumerate(processes):
+        if not isinstance(item, dict):
+            raise PreviewConfigurationError(
+                "preview sandbox process entries must be objects"
+            )
+        label = f"sandbox.processes[{index}]"
+        name = item.get("name")
+        if (
+            not isinstance(name, str)
+            or not name.strip()
+            or len(name) > 60
+            or name in names
+        ):
+            raise PreviewConfigurationError(
+                "preview sandbox process names must be unique"
+            )
+        names.add(name)
+        command = _validate_command(item.get("command"), label=label)
+        exposes_preview_port = exposes_preview_port or any(
+            "{preview_port}" in argument for argument in command
+        )
+        cwd = str(
+            PurePosixPath(
+                _relative_dir(workspace, item.get("cwd", "."))
+                .relative_to(workspace)
+                .as_posix()
+            )
+        )
+        normalized_processes.append(
+            {
+                "name": name,
+                "command": command,
+                "cwd": cwd,
+                "env": _validate_env(item.get("env"), label=label),
+            }
+        )
+    if not exposes_preview_port:
+        raise PreviewConfigurationError(
+            "preview sandbox process must receive {preview_port}"
+        )
+
+    raw_hosts = value.get("allowed_hosts", [])
+    if not isinstance(raw_hosts, list) or len(raw_hosts) > 32:
+        raise PreviewConfigurationError(
+            "preview sandbox allowed_hosts must be a list of at most 32 hosts"
+        )
+    from backend.services.test_harness_egress_proxy import (
+        EgressPolicyError,
+        normalize_allowed_hosts,
+    )
+
+    if any(not isinstance(host, str) for host in raw_hosts):
+        raise PreviewConfigurationError(
+            "preview sandbox allowed_hosts contains an invalid host"
+        )
+    try:
+        allowed_hosts = (
+            sorted(normalize_allowed_hosts(",".join(raw_hosts)))
+            if raw_hosts
+            else []
+        )
+    except EgressPolicyError as exc:
+        raise PreviewConfigurationError(str(exc)) from exc
+    return {
+        "setup": normalized_setup,
+        "processes": normalized_processes,
+        "allowed_hosts": allowed_hosts,
+    }
+
+
 def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
     """Validate and normalize one manager-owned, shell-free preview profile."""
 
@@ -237,6 +356,10 @@ def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
         "startup_timeout_seconds": min(
             300, max(3, int(config.get("startup_timeout_seconds", 90)))
         ),
+        "sandbox": _validate_sandbox_preview_config(
+            config.get("sandbox"),
+            workspace,
+        ),
     }
 
 
@@ -292,6 +415,58 @@ def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
             "url": "http://127.0.0.1:{preview_port}/",
             "health_url": "http://127.0.0.1:{preview_port}/api/system/health",
             "startup_timeout_seconds": 180,
+            "sandbox": {
+                "setup": [
+                    {
+                        "command": ["uv", "sync", "--frozen", "--no-dev"],
+                        "cwd": ".",
+                        "timeout_seconds": 1200,
+                    },
+                    {
+                        "command": ["npm", "ci", "--no-audit", "--no-fund"],
+                        "cwd": "frontend",
+                        "timeout_seconds": 900,
+                    },
+                    {
+                        "command": ["npm", "run", "build"],
+                        "cwd": "frontend",
+                        "timeout_seconds": 600,
+                    },
+                ],
+                "processes": [
+                    {
+                        "name": "web",
+                        "command": [
+                            "{workspace}/.venv/bin/python",
+                            "-m",
+                            "uvicorn",
+                            "backend.main:app",
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
+                            "{preview_port}",
+                        ],
+                        "cwd": ".",
+                        "env": {
+                            "DATABASE_URL": "sqlite+aiosqlite:///{temp_db}",
+                            "AUTH_TOKEN": "",
+                            "WORKSPACE_DIR": "{temp_dir}/workspace",
+                            "AUTO_START_DISPATCHER": "false",
+                            "AUTO_PUSH_TO_ORIGIN": "false",
+                            "WORKER_ENABLED": "false",
+                            "POOL_ENABLED": "false",
+                            "CODEX_POOL_ENABLED": "false",
+                            "BACKUP_ENABLED": "false",
+                            "TMP_CLEANUP_ENABLED": "false",
+                        },
+                    }
+                ],
+                "allowed_hosts": [
+                    "pypi.org",
+                    "files.pythonhosted.org",
+                    "registry.npmjs.org",
+                ],
+            },
         }
 
     for relative in ("frontend", "."):
@@ -325,6 +500,37 @@ def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
                 "url": "http://127.0.0.1:{preview_port}/",
                 "health_url": "http://127.0.0.1:{preview_port}/",
                 "startup_timeout_seconds": 90,
+                "sandbox": {
+                    "setup": [
+                        {
+                            "command": [
+                                "npm",
+                                "ci",
+                                "--no-audit",
+                                "--no-fund",
+                            ],
+                            "cwd": relative,
+                            "timeout_seconds": 900,
+                        }
+                    ],
+                    "processes": [
+                        {
+                            "name": "frontend",
+                            "command": [
+                                "npm",
+                                "run",
+                                "dev",
+                                "--",
+                                "--host",
+                                "0.0.0.0",
+                                "--port",
+                                "{preview_port}",
+                            ],
+                            "cwd": relative,
+                        }
+                    ],
+                    "allowed_hosts": ["registry.npmjs.org"],
+                },
             }
     return None
 

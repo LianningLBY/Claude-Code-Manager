@@ -10,10 +10,12 @@ RUN apt-get update \
         python3-venv \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 sandbox \
-    && useradd --uid 10001 --gid 10001 --create-home sandbox
+    && useradd --uid 10001 --gid 10001 --create-home sandbox \
+    && python3 -m pip install --no-cache-dir --break-system-packages uv==0.11.32
 
 COPY backend/services/test_harness_egress_proxy.py /opt/ccm/egress_proxy.py
-RUN chmod 0555 /opt/ccm/egress_proxy.py
+COPY backend/services/test_harness_process_wrapper.py /opt/ccm/process_wrapper.py
+RUN chmod 0555 /opt/ccm/egress_proxy.py /opt/ccm/process_wrapper.py
 
 USER 10001:10001
 WORKDIR /workspace

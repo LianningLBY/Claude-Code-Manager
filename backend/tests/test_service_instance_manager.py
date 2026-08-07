@@ -1969,7 +1969,7 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
 
 
 @pytest.mark.asyncio
-async def test_codex_browser_review_mcp_is_required_when_main_mcp_is_disabled(
+async def test_codex_browser_review_requires_mcp_only_app_server(
     db_factory, monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
@@ -1990,30 +1990,126 @@ async def test_codex_browser_review_mcp_is_required_when_main_mcp_is_disabled(
         await db.refresh(inst)
         await db.refresh(task)
 
-    mock_proc = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     im.task_message_enqueuer = AsyncMock()
     with patch(
         "backend.services.instance_manager.asyncio.create_subprocess_exec",
         new_callable=AsyncMock,
-        return_value=mock_proc,
     ) as exec_mock:
-        await im.launch(
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="app-server read-only sandbox",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="review the browser",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                enabled_skills=task.enabled_skills,
+                config_dir=str(tmp_path / "codex-browser-review-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_browser_review_uses_proven_mcp_only_profile(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-browser-review-app-server")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="isolated browser review",
+            status="executing",
+            provider="codex",
             instance_id=inst.id,
-            prompt="review the browser",
+            enabled_skills={"browser-review": "job-bound"},
+            metadata_={"isolated_browser_agent": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch.object(
+        im,
+        "_launch_codex_app_server",
+        new_callable=AsyncMock,
+        return_value=4321,
+    ) as launch_app_server:
+        pid = await im.launch(
+            instance_id=inst.id,
+            prompt="use only the bound browser tools",
             task_id=task.id,
-            cwd="/tmp",
+            cwd=str(tmp_path),
             provider="codex",
             enabled_skills=task.enabled_skills,
-            config_dir=str(tmp_path / "codex-browser-review-home"),
+            config_dir=str(tmp_path / "codex-browser-mcp-only-home"),
         )
 
-    argv = list(exec_mock.await_args.args)
-    expected_mcp_args = render_codex_exec_config_args(
-        build_browser_review_mcp_server_specs("job-abc")
-    )
-    flag_index = argv.index("-c")
-    assert argv[flag_index : flag_index + 2] == expected_mcp_args
+    assert pid == 4321
+    kwargs = launch_app_server.await_args.kwargs
+    assert kwargs["mcp_only"] is True
+    assert kwargs["tools_disabled"] is False
+    assert kwargs["sandbox_mode"] == "read-only"
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["skill_context"] == ""
+    assert [spec.name for spec in kwargs["mcp_specs"]] == ["ccm_browser_review"]
+
+
+@pytest.mark.asyncio
+async def test_claude_browser_review_disables_builtins_but_keeps_bound_mcp(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "use_pty_mode", False)
+    async with db_factory() as db:
+        inst = Instance(name="claude-browser-review-tools")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="isolated Claude browser review",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+            enabled_skills={"browser-review": "job-claude"},
+            metadata_={"isolated_browser_agent": True},
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+
+    process = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=process,
+    ) as spawn:
+        await im.launch(
+            instance_id=inst.id,
+            prompt="use only browser evidence tools",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="claude",
+            enabled_skills=task.enabled_skills,
+        )
+
+    argv = list(spawn.await_args.args)
+    tools_index = argv.index("--tools")
+    assert argv[tools_index + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" in argv
+    assert "--setting-sources" in argv
     await asyncio.sleep(0.1)
 
 

@@ -51,12 +51,93 @@ logger = logging.getLogger(__name__)
 
 _WORKSPACE_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _BROWSER_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+_FRONTEND_PATH_SUFFIXES = {
+    ".astro",
+    ".css",
+    ".gif",
+    ".html",
+    ".ico",
+    ".jpeg",
+    ".js",
+    ".jpg",
+    ".jsx",
+    ".less",
+    ".mjs",
+    ".png",
+    ".sass",
+    ".scss",
+    ".svelte",
+    ".svg",
+    ".ts",
+    ".tsx",
+    ".ttf",
+    ".vue",
+    ".webp",
+    ".woff",
+    ".woff2",
+}
 _CONTENT_TYPES = {
     ".png": "image/png",
     ".md": "text/markdown; charset=utf-8",
     ".json": "application/json",
     ".jsonl": "application/x-ndjson",
 }
+
+
+def _looks_frontend_facing(path: str) -> bool:
+    normalized = path.lower()
+    parts = normalized.split("/")
+    if any(part in {"frontend", "client", "web", "ui", "public"} for part in parts):
+        return True
+    name = parts[-1]
+    if name in {
+        "package.json",
+        "vite.config.js",
+        "vite.config.mjs",
+        "vite.config.ts",
+    }:
+        return True
+    return Path(name).suffix in _FRONTEND_PATH_SUFFIXES
+
+
+def _git_browser_target_context(run: TestHarnessRun) -> dict[str, Any] | None:
+    resolved = run.resolved_target
+    if run.target_kind not in {"pull_request", "git_ref"} or not isinstance(
+        resolved, dict
+    ):
+        return None
+    changed_files: list[dict[str, Any]] = []
+    raw_files = resolved.get("changed_files")
+    if isinstance(raw_files, list):
+        for item in raw_files:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                continue
+            changed_files.append(
+                {
+                    key: item[key]
+                    for key in (
+                        "path",
+                        "previous_path",
+                        "status",
+                        "additions",
+                        "deletions",
+                        "changes",
+                    )
+                    if key in item
+                }
+            )
+    return {
+        "kind": run.target_kind,
+        "repository": resolved.get("repository"),
+        "pr_number": resolved.get("pr_number"),
+        "base_sha": resolved.get("base_sha"),
+        "head_sha": resolved.get("head_sha"),
+        "source_ref": resolved.get("source_ref"),
+        "changed_files": changed_files,
+        "frontend_changed_files": [
+            item for item in changed_files if _looks_frontend_facing(str(item["path"]))
+        ],
+    }
 
 
 class TestHarnessError(RuntimeError):
@@ -591,22 +672,31 @@ class TestHarnessService:
                     for key, value in run.target_spec.items()
                     if key != "kind"
                 }
-            await self._update_run(
-                run_id,
-                values={
-                    "status": "preparing_environment",
-                    "stage": "preparing_sandbox",
-                },
-                event_type="lifecycle",
-                title="正在创建隔离 Sandbox",
-                source_key="sandbox:preparing",
-            )
+
+            async def record_target_progress(
+                stage: str,
+                title: str,
+                detail: str | None,
+            ) -> None:
+                await self._update_run(
+                    run_id,
+                    values={
+                        "status": "preparing_environment",
+                        "stage": stage,
+                    },
+                    event_type="lifecycle",
+                    title=title,
+                    detail=detail,
+                    source_key=f"sandbox:{stage}",
+                )
+
             prepared = await self.target_manager.prepare(
                 run_id=run_id,
                 task=task,
                 project=project,
                 kind=kind,
                 target=target,
+                on_progress=record_target_progress,
             )
             await self._update_run(
                 run_id,
@@ -897,6 +987,7 @@ class TestHarnessService:
                             job.options,
                             profile=str(runtime.get("profile") or "standard"),
                             test_plan=run.test_plan,
+                            target_context=_git_browser_target_context(run),
                         ),
                         status="pending",
                         priority=0,

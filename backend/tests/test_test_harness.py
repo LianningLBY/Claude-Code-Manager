@@ -18,6 +18,7 @@ from backend.models.test_harness import (
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.browser_review_jobs import BrowserReviewJob
 from backend.services.test_harness import (
+    _git_browser_target_context,
     TestHarnessError as HarnessError,
     TestHarnessIdempotencyError as HarnessIdempotencyError,
     TestHarnessService as HarnessService,
@@ -49,6 +50,52 @@ async def _task(db_factory) -> int:
         db.add(task)
         await db.commit()
         return task.id
+
+
+def test_git_browser_context_exposes_metadata_not_diff_content():
+    run = SimpleNamespace(
+        target_kind="pull_request",
+        resolved_target={
+            "repository": "acme/ui",
+            "pr_number": 7,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "source_ref": "feature",
+            "clone_url": "https://github.com/acme/ui.git",
+            "changed_files": [
+                {
+                    "path": "frontend/src/App.tsx",
+                    "status": "modified",
+                    "additions": 3,
+                    "deletions": 1,
+                    "patch": "untrusted source text must not be exposed",
+                },
+                {
+                    "path": "backend/main.py",
+                    "status": "modified",
+                    "additions": 2,
+                    "deletions": 0,
+                },
+                {
+                    "path": "src/assets/logo.svg",
+                    "status": "modified",
+                    "additions": 1,
+                    "deletions": 1,
+                },
+            ],
+        },
+    )
+
+    context = _git_browser_target_context(run)
+
+    assert context is not None
+    assert context["repository"] == "acme/ui"
+    assert [item["path"] for item in context["frontend_changed_files"]] == [
+        "frontend/src/App.tsx",
+        "src/assets/logo.svg",
+    ]
+    assert "patch" not in context["changed_files"][0]
+    assert "clone_url" not in context
 
 
 def _completed_job(tmp_path, *, title: str, severity: str = "high") -> BrowserReviewJob:

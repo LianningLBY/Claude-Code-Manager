@@ -187,6 +187,10 @@ async def test_target_manager_prepares_exact_sha_with_approved_sandbox_profile()
             },
         },
     )
+    progress: list[tuple[str, str, str | None]] = []
+
+    async def _progress(stage, title, detail):
+        progress.append((stage, title, detail))
 
     prepared = await manager.prepare(
         run_id="2" * 32,
@@ -194,6 +198,7 @@ async def test_target_manager_prepares_exact_sha_with_approved_sandbox_profile()
         project=project,
         kind="pull_request",
         target={"remote": "origin", "pr_number": 7},
+        on_progress=_progress,
     )
 
     assert prepared.resolved.head_sha == "b" * 40
@@ -203,3 +208,9 @@ async def test_target_manager_prepares_exact_sha_with_approved_sandbox_profile()
     assert calls[2][3]["additional_allowed_hosts"] == (
         "registry.npmjs.org",
     )
+    assert [item[0] for item in progress] == [
+        "target_resolved",
+        "preparing_sandbox",
+        "acquiring_source",
+        "preparing_preview",
+    ]

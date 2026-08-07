@@ -167,6 +167,8 @@ async def get_test_harness_capabilities(
             "git_ref": git_targets.available,
         },
         "target_reasons": {
+            "current_workspace": workspace["reason"],
+            "fixed_url": None,
             "pull_request": git_targets.reason,
             "git_ref": git_targets.reason,
         },

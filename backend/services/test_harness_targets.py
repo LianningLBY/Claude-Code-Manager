@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from backend.models.project import Project
 from backend.models.task import Task
@@ -83,6 +83,9 @@ class PreparedGitTarget:
     preview: SandboxPreviewSnapshot
 
 
+TargetProgressCallback = Callable[[str, str, str | None], Awaitable[None]]
+
+
 class TestHarnessTargetManager:
     """Resolve, acquire and preview one exact target without host execution."""
 
@@ -109,6 +112,7 @@ class TestHarnessTargetManager:
         project: Project | None,
         kind: str,
         target: dict[str, Any],
+        on_progress: TargetProgressCallback | None = None,
     ) -> PreparedGitTarget:
         _ = task
         if kind not in {"pull_request", "git_ref"}:
@@ -150,12 +154,38 @@ class TestHarnessTargetManager:
             kind=kind,
             target=target,
         )
+        if on_progress is not None:
+            await on_progress(
+                "target_resolved",
+                "已锁定精确 Git 提交",
+                (
+                    f"HEAD {resolved.head_sha[:12]}；"
+                    f"{len(resolved.changed_files)} 个变更文件。"
+                ),
+            )
+            await on_progress(
+                "preparing_sandbox",
+                "正在创建隔离 Sandbox",
+                None,
+            )
         await self.sandbox_manager.provision(run_id)
+        if on_progress is not None:
+            await on_progress(
+                "acquiring_source",
+                "正在 Sandbox 内获取精确源码",
+                f"只接受 HEAD {resolved.head_sha[:12]}。",
+            )
         source = await self.sandbox_manager.acquire_source(
             run_id,
             resolved,
             additional_allowed_hosts=tuple(allowed_hosts),
         )
+        if on_progress is not None:
+            await on_progress(
+                "preparing_preview",
+                "正在隔离环境安装依赖并启动 Preview",
+                "依赖出口完成后会被撤销，Preview 仅映射到 Manager loopback。",
+            )
         preview = await self.sandbox_manager.prepare_preview(
             run_id,
             source,

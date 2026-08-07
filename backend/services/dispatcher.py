@@ -137,11 +137,6 @@ def _worker_handoff_message_matches_payload(
         == msg.worker_turn_handoff_from_generation
     )
 
-if TYPE_CHECKING:
-    from backend.services.claude_pool import ClaudePool
-    from backend.services.codex_pool import CodexPool
-
-
 class QueuedMessagePrelaunchError(RuntimeError):
     """A queued message launch failed before any managed turn could start."""
 

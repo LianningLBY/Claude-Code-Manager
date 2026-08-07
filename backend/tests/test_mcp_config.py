@@ -399,6 +399,7 @@ def test_task_ssh_spec_exposes_only_tools_for_granted_capabilities():
     assert spec.args[spec.args.index("-m") + 1] == (
         "backend.mcp.ccm_ssh_server"
     )
+    assert dict(spec.env) == {"PYTHONPATH": mcp_config._CCM_ROOT}
 
 
 def test_claude_task_ssh_config_is_added_without_replacing_skills_server():
@@ -412,6 +413,9 @@ def test_claude_task_ssh_config_is_added_without_replacing_skills_server():
         config = json.loads(path.read_text())
         assert set(config["mcpServers"]) == {"ccm_skills", "ccm_ssh"}
         assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
+        assert config["mcpServers"]["ccm_ssh"]["env"] == {
+            "PYTHONPATH": mcp_config._CCM_ROOT,
+        }
     finally:
         cleanup_mcp_config(42)
 

@@ -149,7 +149,7 @@ async def get_test_harness_capabilities(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider = runtime["provider"]
-    git_targets = await untrusted_git_target_capability()
+    git_targets = await untrusted_git_target_capability(project=project)
     return {
         "contract_version": 1,
         "available": workspace["available"],

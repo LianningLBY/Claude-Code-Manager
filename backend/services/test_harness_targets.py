@@ -1,10 +1,4 @@
-"""Fail-closed admission for untrusted Git Test Harness targets.
-
-PR/ref preparation used to create a detached worktree and then execute its
-Preview commands on the Manager host.  A worktree is version isolation, not an
-execution sandbox, so that implementation is intentionally absent.  A future
-sandbox runtime can replace this gate; it must never fall back to host execution.
-"""
+"""Fail-closed preparation of public GitHub PR/ref Harness targets."""
 
 from __future__ import annotations
 
@@ -16,15 +10,20 @@ from backend.models.task import Task
 from backend.services.workspace_review import WorkspaceReviewError
 from backend.services.test_harness_sandbox import (
     SandboxCapability,
+    SandboxPreviewSnapshot,
+    SandboxSourceSnapshot,
+    TestHarnessSandboxManager,
     TestHarnessSandboxRuntime,
+    test_harness_sandbox_manager,
     test_harness_sandbox_runtime,
 )
-
-
-_TARGET_PIPELINE_AVAILABLE = False
-_TARGET_PIPELINE_REASON = (
-    "PR/ref sandbox runtime is not connected to the Test Harness target pipeline"
+from backend.services.test_harness_git_targets import (
+    PublicGitTargetResolver,
+    ResolvedGitTarget,
 )
+
+
+_TARGET_PIPELINE_AVAILABLE = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,13 +43,32 @@ class UntrustedGitTargetCapability:
 async def untrusted_git_target_capability(
     runtime: TestHarnessSandboxRuntime | None = None,
     *,
+    project: Project | None = None,
     force: bool = False,
 ) -> UntrustedGitTargetCapability:
     sandbox = await (runtime or test_harness_sandbox_runtime).probe(force=force)
     if not sandbox.available:
         return UntrustedGitTargetCapability(False, sandbox.reason, sandbox)
     if not _TARGET_PIPELINE_AVAILABLE:
-        return UntrustedGitTargetCapability(False, _TARGET_PIPELINE_REASON, sandbox)
+        return UntrustedGitTargetCapability(
+            False,
+            "PR/ref sandbox target pipeline is unavailable",
+            sandbox,
+        )
+    if project is None:
+        return UntrustedGitTargetCapability(
+            False,
+            "PR/ref tests require a Task Project with a confirmed sandbox Preview profile",
+            sandbox,
+        )
+    preview = project.preview_config
+    profile = preview.get("sandbox") if isinstance(preview, dict) else None
+    if not isinstance(profile, dict):
+        return UntrustedGitTargetCapability(
+            False,
+            "Project has no confirmed sandbox Preview profile",
+            sandbox,
+        )
     return UntrustedGitTargetCapability(True, None, sandbox)
 
 
@@ -58,11 +76,30 @@ class TestHarnessTargetError(WorkspaceReviewError):
     """An untrusted Git target cannot be admitted safely."""
 
 
-class TestHarnessTargetManager:
-    """Reject untrusted Git targets until a real sandbox runtime is installed."""
+@dataclass(frozen=True, slots=True)
+class PreparedGitTarget:
+    resolved: ResolvedGitTarget
+    source: SandboxSourceSnapshot
+    preview: SandboxPreviewSnapshot
 
-    def __init__(self, runtime: TestHarnessSandboxRuntime | None = None) -> None:
+
+class TestHarnessTargetManager:
+    """Resolve, acquire and preview one exact target without host execution."""
+
+    def __init__(
+        self,
+        runtime: TestHarnessSandboxRuntime | None = None,
+        *,
+        resolver: PublicGitTargetResolver | None = None,
+        sandbox_manager: TestHarnessSandboxManager | None = None,
+    ) -> None:
         self.runtime = runtime or test_harness_sandbox_runtime
+        self.resolver = resolver or PublicGitTargetResolver()
+        self.sandbox_manager = sandbox_manager or (
+            test_harness_sandbox_manager
+            if runtime is None
+            else TestHarnessSandboxManager(runtime=self.runtime)
+        )
 
     async def prepare(
         self,
@@ -72,15 +109,67 @@ class TestHarnessTargetManager:
         project: Project | None,
         kind: str,
         target: dict[str, Any],
-    ) -> None:
-        _ = (run_id, task, project, target)
-        if kind in {"pull_request", "git_ref"}:
-            capability = await untrusted_git_target_capability(self.runtime)
+    ) -> PreparedGitTarget:
+        _ = task
+        if kind not in {"pull_request", "git_ref"}:
+            raise TestHarnessTargetError(
+                f"target kind {kind!r} does not use the untrusted Git sandbox gate"
+            )
+        capability = await untrusted_git_target_capability(
+            self.runtime,
+            project=project,
+        )
+        if not capability.available:
             raise TestHarnessTargetError(
                 capability.reason or "PR/ref sandbox target is unavailable"
             )
-        raise TestHarnessTargetError(
-            f"target kind {kind!r} does not use the untrusted Git sandbox gate"
+        if project is None:  # Kept explicit even though capability rejects it.
+            raise TestHarnessTargetError(
+                "PR/ref tests require a Task Project"
+            )
+        root_config = project.preview_config
+        if not isinstance(root_config, dict):
+            raise TestHarnessTargetError(
+                "Project has no confirmed Preview configuration"
+            )
+        sandbox_config = root_config.get("sandbox")
+        if not isinstance(sandbox_config, dict):
+            raise TestHarnessTargetError(
+                "Project has no confirmed sandbox Preview profile"
+            )
+        allowed_hosts = sandbox_config.get("allowed_hosts", [])
+        if (
+            not isinstance(allowed_hosts, list)
+            or any(not isinstance(host, str) for host in allowed_hosts)
+        ):
+            raise TestHarnessTargetError(
+                "Project sandbox Preview allowlist is invalid"
+            )
+        resolved = await self.resolver.resolve(
+            project=project,
+            kind=kind,
+            target=target,
+        )
+        await self.sandbox_manager.provision(run_id)
+        source = await self.sandbox_manager.acquire_source(
+            run_id,
+            resolved,
+            additional_allowed_hosts=tuple(allowed_hosts),
+        )
+        preview = await self.sandbox_manager.prepare_preview(
+            run_id,
+            source,
+            preview_config=sandbox_config,
+            startup_timeout_seconds=float(
+                root_config.get("startup_timeout_seconds", 90)
+            ),
+            url_template=str(root_config.get("url", "")),
+            health_url_template=str(root_config.get("health_url", "")),
+        )
+        return PreparedGitTarget(
+            resolved=resolved,
+            source=source,
+            preview=preview,
         )
 
 

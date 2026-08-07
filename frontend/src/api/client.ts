@@ -201,6 +201,7 @@ export interface TestHarnessRun {
   agent_task_id: number | null;
   target_kind: TestHarnessTargetKind;
   target: Record<string, unknown>;
+  resolved_target: Record<string, unknown> | null;
   test_plan: Record<string, unknown> & { objective?: string; profile?: string };
   runtime: Record<string, unknown>;
   request_fingerprint: string;

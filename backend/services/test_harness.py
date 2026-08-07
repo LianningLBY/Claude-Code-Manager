@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+import httpx
 from sqlalchemy import delete, select
 
 from backend.config import settings
@@ -22,6 +23,7 @@ from backend.models.test_harness import (
     TestHarnessEvidence,
     TestHarnessFinding,
     TestHarnessRun,
+    TestHarnessSandboxLease,
 )
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.test_harness_contracts import (
@@ -32,7 +34,10 @@ from backend.services.test_harness_contracts import (
     normalize_verdict,
     request_fingerprint,
 )
-from backend.services.test_harness_targets import untrusted_git_target_capability
+from backend.services.test_harness_targets import (
+    test_harness_target_manager,
+    untrusted_git_target_capability,
+)
 from backend.services.test_harness_runtime import resolve_harness_runtime
 from backend.services.test_harness_artifacts import (
     OpenedHarnessArtifact,
@@ -76,6 +81,8 @@ class TestHarnessService:
         poll_interval: float = 0.5,
         artifact_store: TestHarnessArtifactStore | None = None,
         retention_interval: float | None = None,
+        target_manager: Any | None = None,
+        sandbox_manager: Any | None = None,
     ) -> None:
         self.db_factory = db_factory
         self.poll_interval = poll_interval
@@ -85,6 +92,14 @@ class TestHarnessService:
             if retention_interval is not None
             else settings.test_harness_artifact_cleanup_interval_seconds
         )
+        self.target_manager = target_manager or test_harness_target_manager
+        if sandbox_manager is None:
+            from backend.services.test_harness_sandbox import (
+                test_harness_sandbox_manager,
+            )
+
+            sandbox_manager = test_harness_sandbox_manager
+        self.sandbox_manager = sandbox_manager
         self._pipelines: dict[str, asyncio.Task[None]] = {}
         self._retention_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -98,11 +113,6 @@ class TestHarnessService:
         owner_user_id: int | None = None,
     ) -> TestHarnessRun:
         normalized = spec.normalized()
-        if normalized.target_kind in {"pull_request", "git_ref"}:
-            capability = await untrusted_git_target_capability()
-            raise TestHarnessError(
-                capability.reason or "PR/ref sandbox target is unavailable"
-            )
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
             if task is None:
@@ -120,6 +130,14 @@ class TestHarnessService:
                 supplied=normalized.test_plan,
             )
             project_id = project.id if project is not None else None
+            if normalized.target_kind in {"pull_request", "git_ref"}:
+                capability = await untrusted_git_target_capability(
+                    project=project,
+                )
+                if not capability.available:
+                    raise TestHarnessError(
+                        capability.reason or "PR/ref sandbox target is unavailable"
+                    )
 
         run, created = await self._create_run(
             task_id=task_id,
@@ -152,6 +170,12 @@ class TestHarnessService:
                 title="等待浏览器执行器",
                 source_key="harness:waiting-for-browser",
             )
+        elif normalized.target_kind in {"pull_request", "git_ref"}:
+            pipeline = asyncio.create_task(
+                self._run_git_target_pipeline(run.id),
+                name=f"test-harness-git-{run.id}",
+            )
+            self._register_pipeline(run.id, pipeline)
         else:  # pragma: no cover - normalized() is the authority.
             raise TestHarnessContractError("unsupported target kind")
         current = await self.get_run_model(run.id)
@@ -269,7 +293,11 @@ class TestHarnessService:
             "max_steps": spec.max_steps,
             "max_actions": spec.max_actions,
             "terminal_owner": (
-                "workspace" if spec.target_kind != "fixed_url" else "browser"
+                "workspace"
+                if spec.target_kind == "current_workspace"
+                else "browser"
+                if spec.target_kind == "fixed_url"
+                else "sandbox"
             ),
             "context_policy": "isolated_black_box_v1",
         }
@@ -488,6 +516,219 @@ class TestHarnessService:
             ),
         )
 
+    async def _stop_agent_task(self, task_id: int) -> None:
+        from backend.services.internal_api_endpoint import resolve_internal_api_base
+
+        headers = (
+            {"Authorization": f"Bearer {settings.auth_token}"}
+            if settings.auth_token
+            else {}
+        )
+        async with httpx.AsyncClient(timeout=30.0, trust_env=False) as client:
+            response = await client.post(
+                f"{resolve_internal_api_base(None)}/api/tasks/{task_id}/stop-session",
+                headers=headers,
+            )
+            if response.status_code not in {200, 404, 409}:
+                raise TestHarnessError(
+                    f"Browser Agent stop returned HTTP {response.status_code}"
+                )
+
+    async def _stop_git_target_children(self, job: Any | None) -> None:
+        if job is None:
+            return
+        task_id = getattr(job, "task_id", None)
+        if isinstance(task_id, int) and task_id > 0:
+            try:
+                await self._stop_agent_task(task_id)
+            except Exception:
+                logger.exception("Could not stop sandbox Browser Agent Task %s", task_id)
+        try:
+            from backend.services.browser_review_jobs import browser_review_job_manager
+
+            await browser_review_job_manager.cancel(job.id)
+        except Exception:
+            logger.exception("Could not cancel sandbox Browser job %s", job.id)
+
+    async def _cleanup_git_target(self, run_id: str) -> str | None:
+        try:
+            await asyncio.shield(self.sandbox_manager.cleanup(run_id))
+            return None
+        except BaseException as exc:
+            return _safe_error(exc)
+
+    async def _run_git_target_pipeline(self, run_id: str) -> None:
+        """Own target preparation, black-box execution and exact cleanup."""
+
+        job: Any | None = None
+        try:
+            await self._update_run(
+                run_id,
+                values={
+                    "status": "resolving_target",
+                    "stage": "resolving_target",
+                    "started_at": datetime.utcnow(),
+                },
+                event_type="lifecycle",
+                title="正在解析精确 Git 目标",
+                source_key="sandbox:resolving-target",
+            )
+            async with self.db_factory() as db:
+                run = await db.get(TestHarnessRun, run_id)
+                if run is None or run.task_id is None:
+                    raise TestHarnessError("Harness run has no owning Task")
+                task = await db.get(Task, run.task_id)
+                project = (
+                    await db.get(Project, task.project_id)
+                    if task is not None and task.project_id
+                    else None
+                )
+                if task is None:
+                    raise TestHarnessError("Harness owner Task disappeared")
+                kind = run.target_kind
+                target = {
+                    key: value
+                    for key, value in run.target_spec.items()
+                    if key != "kind"
+                }
+            await self._update_run(
+                run_id,
+                values={
+                    "status": "preparing_environment",
+                    "stage": "preparing_sandbox",
+                },
+                event_type="lifecycle",
+                title="正在创建隔离 Sandbox",
+                source_key="sandbox:preparing",
+            )
+            prepared = await self.target_manager.prepare(
+                run_id=run_id,
+                task=task,
+                project=project,
+                kind=kind,
+                target=target,
+            )
+            await self._update_run(
+                run_id,
+                values={
+                    "status": "preview_ready",
+                    "stage": "preview_ready",
+                    "source_git_head": prepared.resolved.head_sha,
+                    "source_fingerprint": prepared.resolved.fingerprint,
+                },
+                event_type="lifecycle",
+                title="精确提交的隔离预览已就绪",
+                detail=(
+                    f"HEAD {prepared.resolved.head_sha[:12]}；"
+                    "依赖出口已撤销，页面仅映射到 Manager loopback。"
+                ),
+                source_key="sandbox:preview-ready",
+            )
+            job = await self.start_managed_preview_browser(
+                run_id=run_id,
+                url=prepared.preview.url,
+            )
+            from backend.services.browser_review_jobs import browser_review_job_manager
+
+            while True:
+                current_job = await browser_review_job_manager.get(job.id)
+                if current_job is None:
+                    raise TestHarnessError("Sandbox Browser Review job disappeared")
+                job = current_job
+                await self.sync_browser_job(job)
+                if job.status in _BROWSER_TERMINAL:
+                    break
+                await asyncio.sleep(self.poll_interval)
+
+            cleanup_error = await self._cleanup_git_target(run_id)
+            report = job._read_report()
+            if cleanup_error is not None:
+                status = "failed"
+                verdict = "error"
+                error = f"Sandbox cleanup could not be proven: {cleanup_error}"
+                cleanup_status = "failed"
+            elif job.status == "completed" and report:
+                status = "completed"
+                verdict = normalize_verdict(job.verdict, report=report)
+                error = None
+                cleanup_status = "completed"
+            elif job.status == "cancelled":
+                status = "cancelled"
+                verdict = "cancelled"
+                error = job.error
+                cleanup_status = "completed"
+            else:
+                status = "failed"
+                verdict = "error"
+                error = job.error or "Browser Agent did not return a report"
+                cleanup_status = "completed"
+            await self._update_run(
+                run_id,
+                values={
+                    "status": status,
+                    "stage": status,
+                    "verdict": verdict,
+                    "report": report,
+                    "error": error,
+                    "cleanup_status": cleanup_status,
+                    "cleanup_error": cleanup_error,
+                    "completed_at": datetime.utcnow(),
+                },
+                event_type="cleanup" if cleanup_error is None else "error",
+                title=(
+                    "Sandbox 已按精确身份清理"
+                    if cleanup_error is None
+                    else "Sandbox 清理失败"
+                ),
+                detail=cleanup_error,
+                source_key=f"sandbox:terminal:{status}:{cleanup_status}",
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(self._stop_git_target_children(job))
+            cleanup_error = await self._cleanup_git_target(run_id)
+            await asyncio.shield(
+                self._update_run(
+                    run_id,
+                    values={
+                        "status": "cancelled",
+                        "stage": "cancelled",
+                        "verdict": "cancelled",
+                        "cleanup_status": (
+                            "completed" if cleanup_error is None else "failed"
+                        ),
+                        "cleanup_error": cleanup_error,
+                        "completed_at": datetime.utcnow(),
+                    },
+                    event_type="cleanup",
+                    title="测试已取消并清理 Sandbox",
+                    detail=cleanup_error,
+                    source_key="sandbox:cancelled",
+                )
+            )
+            raise
+        except Exception as exc:
+            logger.exception("Git target Harness pipeline failed run=%s", run_id)
+            await self._stop_git_target_children(job)
+            cleanup_error = await self._cleanup_git_target(run_id)
+            await self._update_run(
+                run_id,
+                values={
+                    "status": "failed",
+                    "stage": "failed",
+                    "verdict": "error",
+                    "error": _safe_error(exc),
+                    "cleanup_status": (
+                        "completed" if cleanup_error is None else "failed"
+                    ),
+                    "cleanup_error": cleanup_error,
+                    "completed_at": datetime.utcnow(),
+                },
+                event_type="error",
+                title="PR/ref 隔离测试失败",
+                detail=_safe_error(exc),
+                source_key="sandbox:failed",
+            )
+
     async def attach_browser_job(
         self,
         *,
@@ -560,6 +801,49 @@ class TestHarnessService:
         run = await self.get_run_model(run_id)
         if run is None or run.task_id is None or run.target_kind != "fixed_url":
             raise TestHarnessError("Fixed URL harness run not found")
+        return await self._start_browser_for_url(
+            run=run,
+            url=str(run.target_spec["url"]),
+            network_policy="external_public",
+            inline=inline,
+            watch_terminal=True,
+            fail_run_on_error=True,
+        )
+
+    async def start_managed_preview_browser(
+        self,
+        *,
+        run_id: str,
+        url: str,
+    ) -> Any:
+        run = await self.get_run_model(run_id)
+        if (
+            run is None
+            or run.task_id is None
+            or run.target_kind not in {"pull_request", "git_ref"}
+        ):
+            raise TestHarnessError("Git target Harness run not found")
+        return await self._start_browser_for_url(
+            run=run,
+            url=url,
+            network_policy="managed_preview",
+            inline=False,
+            watch_terminal=False,
+            fail_run_on_error=False,
+        )
+
+    async def _start_browser_for_url(
+        self,
+        *,
+        run: TestHarnessRun,
+        url: str,
+        network_policy: str,
+        inline: bool,
+        watch_terminal: bool,
+        fail_run_on_error: bool,
+    ) -> Any:
+        run_id = run.id
+        assert run.task_id is not None
         async with self.db_factory() as db:
             task = await db.get(Task, run.task_id)
             if task is None:
@@ -570,8 +854,8 @@ class TestHarnessService:
         from backend.services.browser_review_jobs import browser_review_job_manager
 
         options = BrowserReviewOptions(
-            url=str(run.target_spec["url"]),
-            network_policy="external_public",
+            url=url,
+            network_policy=network_policy,
             goal=str(run.test_plan["objective"]),
             model=str(runtime["model"]),
             reasoning_effort=str(runtime["reasoning_effort"]),
@@ -648,13 +932,14 @@ class TestHarnessService:
             await self.attach_browser_job(
                 run_id=run_id,
                 job=job,
-                watch_terminal=True,
+                watch_terminal=watch_terminal,
             )
             return job
         except BaseException as exc:
             if job is not None:
                 await browser_review_job_manager.fail_start(job.id, exc)
-            await self._fail_start(run_id, exc)
+            if fail_run_on_error:
+                await self._fail_start(run_id, exc)
             raise
 
     async def _watch_browser_job(
@@ -1084,12 +1369,22 @@ class TestHarnessService:
             from backend.services.workspace_review import workspace_review_manager
 
             await workspace_review_manager.cancel(run.workspace_review_run_id)
-        elif run.agent_task_id is not None and stop_agent_task is not None:
-            await stop_agent_task(run.agent_task_id)
-        elif run.browser_review_job_id:
-            from backend.services.browser_review_jobs import browser_review_job_manager
+        else:
+            if run.agent_task_id is not None:
+                try:
+                    if stop_agent_task is not None:
+                        await stop_agent_task(run.agent_task_id)
+                    else:
+                        await self._stop_agent_task(run.agent_task_id)
+                except Exception:
+                    logger.exception(
+                        "Could not stop Harness Browser Agent Task %s",
+                        run.agent_task_id,
+                    )
+            if run.browser_review_job_id:
+                from backend.services.browser_review_jobs import browser_review_job_manager
 
-            await browser_review_job_manager.cancel(run.browser_review_job_id)
+                await browser_review_job_manager.cancel(run.browser_review_job_id)
         pipeline = self._pipelines.get(run_id)
         if pipeline is not None and not pipeline.done():
             pipeline.cancel()
@@ -1205,6 +1500,7 @@ class TestHarnessService:
             "agent_task_id": run.agent_task_id,
             "target_kind": run.target_kind,
             "target": run.target_spec,
+            "resolved_target": run.resolved_target,
             "test_plan": run.test_plan,
             "runtime": run.runtime_config,
             "request_fingerprint": run.request_fingerprint,
@@ -1489,6 +1785,10 @@ class TestHarnessService:
                 logger.exception("Test Harness evidence retention failed")
 
     async def recover_interrupted_runs(self) -> int:
+        try:
+            await self.sandbox_manager.recover_interrupted()
+        except Exception:
+            logger.exception("Could not fully recover interrupted Harness sandboxes")
         obsolete_storage_keys: list[str] = []
         async with self._db_lock:
             async with self.db_factory() as db:
@@ -1546,13 +1846,26 @@ class TestHarnessService:
                     ).scalars()
                 )
                 for run in runs:
+                    sandbox_lease = await db.scalar(
+                        select(TestHarnessSandboxLease).where(
+                            TestHarnessSandboxLease.run_id == run.id
+                        )
+                    )
+                    sandbox_cleaned = (
+                        sandbox_lease is not None
+                        and sandbox_lease.cleanup_status == "completed"
+                    )
                     run.status = "failed"
                     run.stage = "interrupted"
                     run.verdict = "error"
                     run.error = "Manager restarted before this test run reached a terminal state"
-                    run.cleanup_status = "unconfirmed"
+                    run.cleanup_status = (
+                        "completed" if sandbox_cleaned else "unconfirmed"
+                    )
                     run.cleanup_error = (
-                        "The previous process could not prove browser, preview, or worktree cleanup"
+                        None
+                        if sandbox_cleaned
+                        else "The previous process could not prove browser, preview, or sandbox cleanup"
                     )
                     run.completed_at = datetime.utcnow()
                     await self._append_event(

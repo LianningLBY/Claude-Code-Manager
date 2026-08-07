@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from sqlalchemy import select
 
+from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.test_harness import (
     TestHarnessAttempt as AttemptModel,
@@ -25,6 +27,13 @@ from backend.services.test_harness_contracts import (
     normalize_findings,
 )
 from backend.services.test_harness_artifacts import TestHarnessArtifactStore as ArtifactStore
+from backend.services.test_harness_git_targets import ResolvedGitTarget
+from backend.services.test_harness_sandbox import (
+    SandboxPreviewSnapshot,
+    SandboxSourceSnapshot,
+)
+from backend.services.test_harness_targets import PreparedGitTarget
+from backend.services import test_harness as harness_module
 
 
 async def _task(db_factory) -> int:
@@ -299,6 +308,150 @@ async def test_untrusted_git_run_is_rejected_before_persistence(
 
     async with db_factory() as db:
         assert await db.scalar(select(RunModel.id)) is None
+
+
+@pytest.mark.asyncio
+async def test_git_target_pipeline_runs_browser_then_proves_sandbox_cleanup(
+    monkeypatch,
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        project = Project(
+            name="git-harness-project",
+            git_url="https://github.com/acme/ui.git",
+            status="ready",
+            preview_config={
+                "sandbox": {"setup": [], "processes": [], "allowed_hosts": []}
+            },
+        )
+        db.add(project)
+        await db.flush()
+        task = Task(
+            title="Git Harness owner",
+            status="completed",
+            project_id=project.id,
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort_level="high",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    resolved = ResolvedGitTarget(
+        kind="pull_request",
+        repository="acme/ui",
+        clone_url="https://github.com/acme/ui.git",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        fetch_ref="refs/pull/7/head",
+        source_repository="fork/ui",
+        source_ref="feature",
+        pr_number=7,
+        changed_files=(),
+        fingerprint="c" * 64,
+    )
+    prepared = PreparedGitTarget(
+        resolved=resolved,
+        source=SandboxSourceSnapshot(
+            repository_path="/workspace/repo",
+            head_sha=resolved.head_sha,
+            internal_network_id="d" * 64,
+            egress_network_id="e" * 64,
+            proxy_container_id="f" * 64,
+            allowed_hosts=("github.com",),
+        ),
+        preview=SandboxPreviewSnapshot(
+            url="http://127.0.0.1:43123/",
+            health_url="http://127.0.0.1:43123/health",
+            host_port=43123,
+            internal_port=4173,
+            process_names=("web",),
+            setup_logs=(),
+        ),
+    )
+
+    class _TargetManager:
+        async def prepare(self, **_kwargs):
+            return prepared
+
+    class _SandboxManager:
+        def __init__(self):
+            self.cleaned: list[str] = []
+
+        async def cleanup(self, run_id):
+            self.cleaned.append(run_id)
+
+        async def recover_interrupted(self):
+            return 0
+
+    sandbox_manager = _SandboxManager()
+    service = HarnessService(
+        db_factory=db_factory,
+        poll_interval=0.001,
+        target_manager=_TargetManager(),
+        sandbox_manager=sandbox_manager,
+    )
+    job = _completed_job(tmp_path, title="No issue", severity="info")
+
+    async def _start_browser(*, run_id, url):
+        assert url == "http://127.0.0.1:43123/"
+        job.harness_run_id = run_id
+        return job
+
+    async def _sync(_job):
+        return None
+
+    service.start_managed_preview_browser = _start_browser
+    service.sync_browser_job = _sync
+
+    class _BrowserManager:
+        async def get(self, job_id):
+            assert job_id == job.id
+            return job
+
+        async def cancel(self, _job_id):
+            return job
+
+    from backend.services import browser_review_jobs
+
+    monkeypatch.setattr(
+        browser_review_jobs,
+        "browser_review_job_manager",
+        _BrowserManager(),
+    )
+
+    async def _available(*_args, **_kwargs):
+        return SimpleNamespace(available=True, reason=None)
+
+    monkeypatch.setattr(
+        harness_module,
+        "untrusted_git_target_capability",
+        _available,
+    )
+
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="pull_request",
+            target={"pr_number": 7, "remote": "origin"},
+            goal="Verify PR 7",
+        ),
+    )
+    for _ in range(200):
+        payload = await service.get_run(run.id)
+        if payload is not None and payload["status"] == "completed":
+            break
+        await asyncio.sleep(0.005)
+    else:
+        pytest.fail("Git target pipeline did not complete")
+
+    assert payload is not None
+    assert payload["source_git_head"] == "b" * 40
+    assert payload["verdict"] == "passed"
+    assert payload["cleanup_status"] == "completed"
+    assert sandbox_manager.cleaned == [run.id]
 
 
 @pytest.mark.asyncio

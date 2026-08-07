@@ -20,7 +20,7 @@ mcp = FastMCP(
         "Use these tools when the user asks to test the current trusted workspace, "
         "worktree, uncommitted frontend changes, or the feature just developed. "
         "CCM prepares the preview URL and assigns a separate black-box Browser Agent. "
-        "PR/ref execution is fail-closed until an untrusted-code sandbox is available."
+        "Public GitHub PR/ref targets run only in the advertised untrusted-code sandbox."
     ),
 )
 
@@ -151,33 +151,41 @@ async def test_git_target(
     reasoning_effort: str | None = None,
     codex_service_tier: str | None = None,
 ) -> str:
-    """Report that untrusted PR/ref execution needs a sandbox.
+    """Start a fresh exact-SHA black-box run for a public GitHub PR or ref.
 
     Omit the runtime fields to use the saved Browser Review configuration,
     which may intentionally differ from the parent Task.
     """
 
-    _ = (
-        goal,
-        target_kind,
-        pr_number,
-        git_ref,
-        remote,
-        fetch,
-        profile,
-        allow_actions,
-        browser_channel,
-        viewport_width,
-        viewport_height,
-        provider,
-        model,
-        reasoning_effort,
-        codex_service_tier,
+    if target_kind == "pull_request":
+        if pr_number is None or git_ref is not None:
+            raise RuntimeError("pull_request requires pr_number and no git_ref")
+        target: dict[str, Any] = {"remote": remote, "pr_number": pr_number}
+    elif target_kind == "git_ref":
+        if not git_ref or pr_number is not None:
+            raise RuntimeError("git_ref requires git_ref and no pr_number")
+        target = {"remote": remote, "ref": git_ref, "fetch": fetch}
+    else:
+        raise RuntimeError("target_kind must be pull_request or git_ref")
+    result = await _request(
+        "POST",
+        "/internal/start",
+        {
+            "target_kind": target_kind,
+            "target": target,
+            "goal": goal,
+            "profile": profile,
+            "allow_actions": allow_actions,
+            "browser_channel": browser_channel,
+            "viewport_width": viewport_width,
+            "viewport_height": viewport_height,
+            "provider": provider,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "codex_service_tier": codex_service_tier,
+        },
     )
-    from backend.services.test_harness_targets import untrusted_git_target_capability
-
-    capability = await untrusted_git_target_capability()
-    raise RuntimeError(capability.reason or "PR/ref sandbox target is unavailable")
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool(structured_output=False)

@@ -12,8 +12,9 @@ def test_routes_named_pr_frontend_acceptance_to_fresh_browser_review():
     assert prompt is not None
     assert "test_git_target" in prompt
     assert "PR #99" in prompt
-    assert "sandbox unavailable" in prompt
-    assert "不会创建 Harness run" in prompt
+    assert "target_kind=pull_request" in prompt
+    assert "check_current_changes_review" in prompt
+    assert "resolved Git SHA" in prompt
     assert "不得改测当前工作区" in prompt
     assert "不得直接复用旧结论" in prompt
 
@@ -25,7 +26,8 @@ def test_routes_github_pull_url_to_the_exact_pr_target():
 
     assert prompt is not None
     assert "PR #123" in prompt
-    assert "不得调用 `check_current_changes_review`" in prompt
+    assert "check_current_changes_review" in prompt
+    assert "不得改测当前工作区" in prompt
 
 
 def test_routes_explicit_browser_review_without_named_branch():

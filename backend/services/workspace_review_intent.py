@@ -128,24 +128,21 @@ def workspace_browser_review_routing_prompt(message: str) -> str | None:
         pr_number = int(pr_match.group("label") or pr_match.group("url"))
     if pr_number is not None:
         target_instruction = (
-            f"用户点名 PR #{pr_number}。PR/ref 的宿主机执行已安全关闭；调用 "
-            "`ccm_workspace_review.test_git_target` 获取明确的 sandbox unavailable 结果，"
-            "随后停止浏览器验收流程并如实报告阻塞；不得调用 "
-            "`check_current_changes_review`，不得改测当前工作区，也不得以代码分析冒充"
-            "该 PR 的浏览器验收。"
+            f"用户点名 PR #{pr_number}。调用 `ccm_workspace_review.test_git_target`，"
+            f"使用 target_kind=pull_request、pr_number={pr_number} 创建精确 SHA 的"
+            "隔离黑盒验收；不得改测当前工作区，也不得以代码分析冒充该 PR 的浏览器验收。"
         )
         completion_instruction = (
-            "该调用不会创建 Harness run；不要轮询或声称产生了 resolved Git SHA。"
+            "成功创建 Test Harness run 后，用 `check_current_changes_review` 轮询到终态。"
         )
         report_instruction = (
-            "报告必须明确记录 sandbox unavailable、未创建 Harness run、未解析 Git SHA，"
-            "以及本轮没有实际浏览器覆盖。\n"
+            "报告必须记录 Harness run、resolved Git SHA、覆盖范围、Sandbox cleanup 与限制。\n"
         )
     else:
         target_instruction = (
             "当前分支/未提交修改调用 `ccm_workspace_review.test_current_changes`；"
             "若用户明确点名另一个 Git ref，则调用 `ccm_workspace_review.test_git_target` "
-            "获取 sandbox unavailable 结果；不得静默测试不同目标。"
+            "创建 exact-SHA Sandbox run；不得静默测试不同目标。"
         )
         completion_instruction = (
             "成功创建当前工作区 Test Harness run 后，用 "

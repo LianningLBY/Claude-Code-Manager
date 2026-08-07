@@ -224,7 +224,11 @@ async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch
         in tmpfs_specs
     )
     assert "/tmp:rw,noexec,nosuid,nodev,size=134217728" in tmpfs_specs
-    assert "/home/sandbox:rw,noexec,nosuid,nodev,size=134217728" in tmpfs_specs
+    assert (
+        "/home/sandbox:rw,noexec,nosuid,nodev,"
+        "uid=10001,gid=10001,mode=0700,size=134217728"
+        in tmpfs_specs
+    )
     network_create = next(call for call in calls if call[1:3] == ["network", "create"])
     assert "--internal" in network_create
     assert resource.metadata["network_mode"] == "internal-only"
@@ -435,7 +439,11 @@ async def test_real_pr99_source_preview_and_identity_cleanup(db_factory):
         source = await manager.acquire_source(
             run.id,
             resolved,
-            additional_allowed_hosts=("registry.npmjs.org",),
+            additional_allowed_hosts=(
+                "files.pythonhosted.org",
+                "pypi.org",
+                "registry.npmjs.org",
+            ),
         )
         assert source.head_sha == resolved.head_sha
         preview = await manager.prepare_preview(
@@ -443,6 +451,12 @@ async def test_real_pr99_source_preview_and_identity_cleanup(db_factory):
             source,
             preview_config={
                 "setup": [
+                    {
+                        "command": ["uv", "sync", "--frozen", "--no-dev"],
+                        "cwd": ".",
+                        "env": {},
+                        "timeout_seconds": 1200,
+                    },
                     {
                         "command": ["npm", "ci", "--no-audit", "--no-fund"],
                         "cwd": "frontend",
@@ -460,27 +474,40 @@ async def test_real_pr99_source_preview_and_identity_cleanup(db_factory):
                     {
                         "name": "web",
                         "command": [
-                            "/usr/local/bin/node",
-                            "-e",
-                            (
-                                "require('http').createServer((request,response)=>"
-                                "{response.end('ccm-pr99-sandbox-ok')}).listen("
-                                "Number(process.argv[1]),'0.0.0.0')"
-                            ),
+                            "{workspace}/.venv/bin/python",
+                            "-m",
+                            "uvicorn",
+                            "backend.main:app",
+                            "--host",
+                            "0.0.0.0",
+                            "--port",
                             "{preview_port}",
                         ],
                         "cwd": ".",
-                        "env": {},
+                        "env": {
+                            "DATABASE_URL": "sqlite+aiosqlite:///{temp_db}",
+                            "AUTH_TOKEN": "",
+                            "WORKSPACE_DIR": "{temp_dir}/workspace",
+                            "AUTO_START_DISPATCHER": "false",
+                            "AUTO_PUSH_TO_ORIGIN": "false",
+                            "WORKER_ENABLED": "false",
+                            "POOL_ENABLED": "false",
+                            "CODEX_POOL_ENABLED": "false",
+                            "BACKUP_ENABLED": "false",
+                            "TMP_CLEANUP_ENABLED": "false",
+                        },
                     }
                 ],
             },
-            startup_timeout_seconds=30,
+            startup_timeout_seconds=180,
             url_template="http://127.0.0.1:{preview_port}/",
-            health_url_template="http://127.0.0.1:{preview_port}/",
+            health_url_template=(
+                "http://127.0.0.1:{preview_port}/api/system/health"
+            ),
         )
         async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
-            response = await client.get(preview.url)
-        assert response.text == "ccm-pr99-sandbox-ok"
+            response = await client.get(preview.health_url)
+        assert response.json()["status"] == "ok"
     finally:
         cleaned = await manager.cleanup(run.id)
 

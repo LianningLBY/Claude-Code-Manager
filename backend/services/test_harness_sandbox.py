@@ -589,7 +589,10 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 "--tmpfs",
                 f"/tmp:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
                 "--tmpfs",
-                f"/home/sandbox:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
+                (
+                    "/home/sandbox:rw,noexec,nosuid,nodev,"
+                    f"uid=10001,gid=10001,mode=0700,size={self.tmp_bytes}"
+                ),
                 "--tmpfs",
                 "/run:rw,noexec,nosuid,nodev,mode=1777,size=67108864",
                 "--workdir",

@@ -110,6 +110,7 @@ claude-manager/
 │       ├── test_harness_contracts.py # Target/TestPlan/Verdict/Finding 契约
 │       ├── test_harness_git_targets.py # 公共 GitHub PR/ref 元数据解析与 exact-SHA 冻结
 │       ├── test_harness_sandbox.py # PR/ref 临时 Sandbox Runtime、持久 Lease 与动态能力探测
+│       ├── test_harness_egress_proxy.py # Sandbox 内 HTTPS CONNECT 域名白名单与逐连接公网 DNS 门禁
 │       ├── test_harness_targets.py # PR/ref 隔离 sandbox 未接入前的 fail-closed 门禁
 │       ├── ws_broadcaster.py    # WebSocket channel 广播
 │       ├── whisper_client.py    # OpenAI Whisper 客户端

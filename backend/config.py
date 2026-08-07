@@ -188,6 +188,8 @@ class Settings(BaseSettings):
     test_harness_sandbox_pids_limit: int = 256
     test_harness_sandbox_workspace_bytes: int = 3 * 1024 * 1024 * 1024
     test_harness_sandbox_tmp_bytes: int = 512 * 1024 * 1024
+    test_harness_sandbox_preview_port: int = 4173
+    test_harness_sandbox_proxy_max_bytes: int = 1024 * 1024 * 1024
 
     # --- Backup service (auto-backup) ---
     backup_enabled: bool = False        # Set true to enable periodic DB backups

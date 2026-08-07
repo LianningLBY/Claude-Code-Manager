@@ -179,7 +179,7 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
 
     thread_call, turn_call = server._request.await_args_list
     thread_params = thread_call.args[1]
-    assert thread_params["sandbox"] == "workspace-write"
+    assert "sandbox" not in thread_params
     config = thread_params["config"]
     assert config["default_permissions"] == "ccm_task_ssh_isolated_v1"
     profile = config["permissions"]["ccm_task_ssh_isolated_v1"]
@@ -201,7 +201,7 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
         "SSH_AGENT_PID": "",
         "SSH_ASKPASS": "",
     }
-    assert turn_call.args[1]["sandboxPolicy"]["networkAccess"] is False
+    assert "sandboxPolicy" not in turn_call.args[1]
 
 
 @pytest.mark.asyncio

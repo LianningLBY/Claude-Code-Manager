@@ -2788,7 +2788,11 @@ class CodexAppServer:
             # layer above defines and selects the profile atomically.
             common["baseInstructions"] = ""
             common["developerInstructions"] = ""
-        else:
+        elif not task_ssh_protected_paths:
+            # Task SSH selects its request-local named permission profile in
+            # ``config.default_permissions`` below.  Sending the legacy
+            # top-level sandbox selector at the same time wins precedence and
+            # silently replaces that profile with ``:workspace``.
             common["sandbox"] = sandbox_mode
         if model and model != "default":
             common["model"] = model
@@ -3142,7 +3146,7 @@ class CodexAppServer:
                 "type": "readOnly",
                 "networkAccess": False,
             }
-        elif sandbox_mode == "workspace-write":
+        elif sandbox_mode == "workspace-write" and not task_ssh_protected_paths:
             turn_params["sandboxPolicy"] = {
                 "type": "workspaceWrite",
                 "writableRoots": [os.path.abspath(cwd)],

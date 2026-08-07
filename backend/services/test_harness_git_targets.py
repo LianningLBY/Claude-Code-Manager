@@ -171,6 +171,12 @@ def github_repository_from_project(project: Project | None) -> str:
                 "Only canonical GitHub HTTPS/SSH Project remotes are supported"
             )
         path = parsed.path.lstrip("/")
+    # Project remotes saved by the UI or copied from GitHub commonly retain the
+    # repository URL's optional trailing slash.  Normalize exactly one suffix
+    # before validating the owner/repository identity; repeated/path-internal
+    # slashes still fail the strict two-component regex below.
+    if path.endswith("/"):
+        path = path[:-1]
     if path.endswith(".git"):
         path = path[:-4]
     if not path or _REPO_RE.fullmatch(path) is None:

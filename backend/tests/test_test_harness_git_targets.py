@@ -71,6 +71,8 @@ def _file(path: str, status: str = "modified") -> dict[str, object]:
     "url",
     [
         "https://github.com/zjw49246/CC-Manager.git",
+        "https://github.com/zjw49246/CC-Manager/",
+        "https://github.com/zjw49246/CC-Manager.git/",
         "git@github.com:zjw49246/CC-Manager.git",
         "ssh://git@github.com/zjw49246/CC-Manager.git",
     ],

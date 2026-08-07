@@ -43,6 +43,7 @@ export interface BrowserReviewJob {
   status: BrowserReviewStatus;
   stage: string;
   url: string;
+  network_policy: 'external_public' | 'managed_preview';
   goal: string;
   provider: 'claude' | 'codex' | 'capture' | 'openai-responses';
   model: string;

@@ -9,7 +9,11 @@ from httpx import ASGITransport, AsyncClient
 from backend.api import test_harness as test_harness_api
 from backend.database import get_db
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessEvidence as EvidenceModel
 from backend.services.test_harness import TestHarnessService as HarnessService
+from backend.services.test_harness_artifacts import (
+    TestHarnessArtifactStore as ArtifactStore,
+)
 from backend.services.test_harness_contracts import TestHarnessSpec as HarnessSpec
 
 
@@ -73,6 +77,14 @@ async def test_task_test_run_api_persists_lists_and_cancels_fixed_url(
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as client:
+        capabilities = await client.get(
+            f"/api/tasks/{task_id}/test-runs/capabilities"
+        )
+        assert capabilities.status_code == 200
+        assert capabilities.json()["targets"]["pull_request"] is False
+        assert capabilities.json()["targets"]["git_ref"] is False
+        assert "sandbox" in capabilities.json()["target_reasons"]["pull_request"]
+
         started = await client.post(
             f"/api/tasks/{task_id}/test-runs",
             json={
@@ -183,6 +195,89 @@ async def test_public_test_run_waits_for_parent_task_terminal(db_factory):
 
     assert response.status_code == 409
     assert "Agent 可直接调用测试工具" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_evidence_download_streams_the_integrity_checked_open_file(
+    monkeypatch,
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(title="Evidence owner", status="completed")
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    store = ArtifactStore(tmp_path / "archive")
+    service = HarnessService(
+        db_factory=db_factory,
+        artifact_store=store,
+        retention_interval=0,
+    )
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Verify durable evidence download",
+        ),
+    )
+    source = tmp_path / "final.png"
+    payload = b"\x89PNG\r\n\x1a\nverified-image"
+    source.write_bytes(payload)
+    archived = store.archive(
+        source,
+        task_id=task_id,
+        run_id=run.id,
+        attempt_id="a" * 32,
+        name="final.png",
+    )
+    async with db_factory() as db:
+        db.add(
+            EvidenceModel(
+                id="e" * 32,
+                run_id=run.id,
+                attempt_id=None,
+                kind="screenshot",
+                name="final.png",
+                content_type="image/png",
+                storage_path=archived.storage_key,
+                sha256=archived.sha256,
+                byte_size=archived.byte_size,
+                metadata_={"storage_version": 1},
+            )
+        )
+        await db.commit()
+    monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _admin(request: Request, call_next):
+        request.state.user_role = "admin"
+        request.state.auth_type = "token"
+        return await call_next(request)
+
+    async def _get_db():
+        async with db_factory() as db:
+            yield db
+
+    app.include_router(test_harness_api.router)
+    app.dependency_overrides[get_db] = _get_db
+    url = f"/api/tasks/{task_id}/test-runs/{run.id}/evidence/final.png"
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(url)
+        assert response.status_code == 200
+        assert response.headers["content-length"] == str(len(payload))
+        assert response.content == payload
+
+        archived.path.write_bytes(payload + b"tampered")
+        rejected = await client.get(url)
+        assert rejected.status_code == 404
 
 
 @pytest.mark.asyncio

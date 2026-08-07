@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from contextlib import asynccontextmanager
@@ -27,6 +28,11 @@ from backend.services.browser_review import (
     normalize_key,
     run_browser_review,
     validate_target_url,
+)
+from backend.services.browser_network import (
+    BrowserNetworkPolicyError,
+    PublicEgressProxy,
+    resolve_public_endpoint,
 )
 
 
@@ -63,11 +69,9 @@ async def test_finish_review_mcp_schema_is_canonical_and_constrained():
 @pytest.mark.parametrize(
     ("url", "origin"),
     [
-        ("http://127.0.0.1:5173/tasks?x=1", "http://127.0.0.1:5173"),
         ("https://Example.COM/path", "https://example.com"),
         ("https://例子.测试/path", "https://xn--fsqu00a.xn--0zwm56d"),
         ("https://example.com:8443", "https://example.com:8443"),
-        ("http://[::1]:8000/", "http://[::1]:8000"),
     ],
 )
 def test_validate_target_url_returns_canonical_origin(url: str, origin: str):
@@ -80,6 +84,9 @@ def test_validate_target_url_returns_canonical_origin(url: str, origin: str):
         "file:///tmp/page.html",
         "https://user:secret@example.com",
         "http://0.0.0.0:8000",
+        "http://127.0.0.1:8000",
+        "http://10.0.0.2:8000",
+        "http://[::1]:8000",
         "http://169.254.169.254/latest/meta-data",
         "http://metadata.google.internal",
         "http://example.com:99999",
@@ -88,6 +95,51 @@ def test_validate_target_url_returns_canonical_origin(url: str, origin: str):
 def test_validate_target_url_rejects_unsafe_targets(url: str):
     with pytest.raises(ValueError):
         validate_target_url(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "origin"),
+    [
+        ("http://127.0.0.1:5173/tasks?x=1", "http://127.0.0.1:5173"),
+        ("http://localhost:8000/", "http://localhost:8000"),
+        ("http://[::1]:8000/", "http://[::1]:8000"),
+    ],
+)
+def test_managed_preview_policy_allows_only_explicit_loopback(url: str, origin: str):
+    assert validate_target_url(url, network_policy="managed_preview") == origin
+
+
+@pytest.mark.asyncio
+async def test_public_resolver_rejects_mixed_public_private_dns_answers(monkeypatch):
+    async def fake_getaddrinfo(*_args, **_kwargs):
+        return [
+            (2, 1, 6, "", ("93.184.216.34", 443)),
+            (2, 1, 6, "", ("10.0.0.8", 443)),
+        ]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(BrowserNetworkPolicyError, match="non-public"):
+        await resolve_public_endpoint("example.test", 443)
+
+
+@pytest.mark.asyncio
+async def test_public_proxy_blocks_loopback_connect_and_reports_reason():
+    blocked = []
+    async with PublicEgressProxy(
+        on_blocked=lambda target, reason: blocked.append((target, reason))
+    ) as proxy:
+        parsed = httpx.URL(proxy.url)
+        reader, writer = await asyncio.open_connection(parsed.host, parsed.port)
+        writer.write(
+            b"CONNECT 127.0.0.1:8000 HTTP/1.1\r\nHost: 127.0.0.1:8000\r\n\r\n"
+        )
+        await writer.drain()
+        response = await reader.read(4096)
+        writer.close()
+        await writer.wait_closed()
+    assert b"403 Forbidden" in response
+    assert blocked and "public IP" in blocked[0][1]
 
 
 def test_normalizers_follow_playwright_names():
@@ -112,6 +164,59 @@ def test_initial_payload_configures_ga_computer_tool_and_policy():
     assert payload["reasoning"] == {"effort": "medium"}
     assert "read-only" in payload["input"][0]["content"][0]["text"]
     assert "untrusted evidence" in payload["instructions"]
+
+
+def test_external_browser_launch_forces_validating_proxy_without_loopback_bypass():
+    options = BrowserReviewOptions(url="https://example.com")
+    launch = browser_review._browser_launch_options(
+        options,
+        proxy_url="http://127.0.0.1:45678",
+    )
+    assert launch["proxy"] == {
+        "server": "http://127.0.0.1:45678",
+        "bypass": "",
+    }
+    assert "--proxy-bypass-list=<-loopback>" in launch["args"]
+    assert "--disable-quic" in launch["args"]
+    assert any("disable_non_proxied_udp" in value for value in launch["args"])
+
+
+def test_managed_preview_blocks_every_cross_origin_subresource():
+    options = BrowserReviewOptions(
+        url="http://127.0.0.1:5173",
+        network_policy="managed_preview",
+    )
+    reason = browser_review._request_policy_violation(
+        options,
+        target_origin="http://127.0.0.1:5173",
+        request_url="http://127.0.0.1:8000/private-api",
+        top_level_navigation=False,
+    )
+    assert reason is not None and "outside" in reason
+
+
+def test_external_policy_allows_public_subresources_but_blocks_private_and_redirects():
+    options = BrowserReviewOptions(url="https://example.com")
+    assert browser_review._request_policy_violation(
+        options,
+        target_origin="https://example.com",
+        request_url="https://cdn.example.net/app.js",
+        top_level_navigation=False,
+    ) is None
+    private_reason = browser_review._request_policy_violation(
+        options,
+        target_origin="https://example.com",
+        request_url="http://127.0.0.1/secret",
+        top_level_navigation=False,
+    )
+    assert private_reason is not None and "public IP" in private_reason
+    redirect_reason = browser_review._request_policy_violation(
+        options,
+        target_origin="https://example.com",
+        request_url="https://other.example/redirected",
+        top_level_navigation=True,
+    )
+    assert redirect_reason is not None and "top-level origin" in redirect_reason
 
 
 def test_followup_payload_embeds_original_detail_screenshot_and_telemetry():
@@ -380,9 +485,10 @@ async def test_run_browser_review_completes_loop_and_writes_artifacts(
     monkeypatch.setattr(browser_review, "ResponsesClient", FakeResponsesClient)
 
     result = await run_browser_review(
-        BrowserReviewOptions(
-            url="http://localhost:5173",
-            output_dir=tmp_path,
+            BrowserReviewOptions(
+                url="http://localhost:5173",
+                network_policy="managed_preview",
+                output_dir=tmp_path,
             action_delay_ms=0,
         ),
         api_key="test-key",

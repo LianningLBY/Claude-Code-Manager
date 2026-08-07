@@ -57,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="capture screenshot/telemetry without calling OpenAI",
     )
+    parser.add_argument(
+        "--managed-preview",
+        action="store_true",
+        help="allow an explicitly trusted loopback Preview URL",
+    )
     return parser
 
 
@@ -74,6 +79,7 @@ async def _run(args: argparse.Namespace) -> int:
         viewport_width=args.viewport_width,
         viewport_height=args.viewport_height,
         output_dir=args.output_dir,
+        network_policy=("managed_preview" if args.managed_preview else "external_public"),
     )
     try:
         result = await run_browser_review(

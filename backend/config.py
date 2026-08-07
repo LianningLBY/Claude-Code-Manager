@@ -165,6 +165,18 @@ class Settings(BaseSettings):
     tmp_cleanup_interval_seconds: int = 3 * 3600
     tmp_cleanup_min_age_seconds: int = 6 * 3600
 
+    # --- Frontend Test Harness evidence ---
+    # Evidence is never stored in /tmp. Files are archived beneath this private
+    # Manager-owned root and referenced by relative storage keys in the DB.
+    test_harness_artifact_root: str = "~/.ccm/test-harness-artifacts"
+    test_harness_artifact_max_file_bytes: int = 20 * 1024 * 1024
+    test_harness_artifact_max_run_bytes: int = 256 * 1024 * 1024
+    test_harness_artifact_max_task_bytes: int = 2 * 1024 * 1024 * 1024
+    test_harness_artifact_max_total_bytes: int = 10 * 1024 * 1024 * 1024
+    test_harness_artifact_retention_days: int = 30
+    test_harness_artifact_cleanup_interval_seconds: int = 6 * 3600
+    browser_review_job_history_limit: int = 100
+
     # --- Backup service (auto-backup) ---
     backup_enabled: bool = False        # Set true to enable periodic DB backups
     backup_type: str = "local"          # local | s3 | oss

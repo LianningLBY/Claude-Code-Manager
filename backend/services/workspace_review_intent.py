@@ -128,27 +128,41 @@ def workspace_browser_review_routing_prompt(message: str) -> str | None:
         pr_number = int(pr_match.group("label") or pr_match.group("url"))
     if pr_number is not None:
         target_instruction = (
-            f"用户点名 PR #{pr_number}；调用 "
-            "`ccm_workspace_review.test_git_target`，传入 "
-            f"`target_kind=pull_request` 和 `pr_number={pr_number}`。CCM 会 fetch 精确 "
-            "PR head SHA 并创建 detached worktree；不得改写当前开发工作树。"
+            f"用户点名 PR #{pr_number}。PR/ref 的宿主机执行已安全关闭；调用 "
+            "`ccm_workspace_review.test_git_target` 获取明确的 sandbox unavailable 结果，"
+            "随后停止浏览器验收流程并如实报告阻塞；不得调用 "
+            "`check_current_changes_review`，不得改测当前工作区，也不得以代码分析冒充"
+            "该 PR 的浏览器验收。"
+        )
+        completion_instruction = (
+            "该调用不会创建 Harness run；不要轮询或声称产生了 resolved Git SHA。"
+        )
+        report_instruction = (
+            "报告必须明确记录 sandbox unavailable、未创建 Harness run、未解析 Git SHA，"
+            "以及本轮没有实际浏览器覆盖。\n"
         )
     else:
         target_instruction = (
             "当前分支/未提交修改调用 `ccm_workspace_review.test_current_changes`；"
             "若用户明确点名另一个 Git ref，则调用 `ccm_workspace_review.test_git_target` "
-            "并传入 `target_kind=git_ref` 和该 ref。不得静默测试不同目标。"
+            "获取 sandbox unavailable 结果；不得静默测试不同目标。"
+        )
+        completion_instruction = (
+            "成功创建当前工作区 Test Harness run 后，用 "
+            "`check_current_changes_review` 轮询到终态。"
+        )
+        report_instruction = (
+            "报告必须记录 Harness 返回的 resolved Git SHA、覆盖范围和限制。\n"
         )
     return (
         "<ccm_workspace_browser_review_request>\n"
         "本轮用户明确要求对本地 PR、分支或当前前端改动做运行验收。"
         "在给出实现/通过结论前，你必须调用 "
         "`ccm_workspace_review.workspace_review_capabilities`。"
-        f"{target_instruction} 创建一次新的 Test Harness 黑盒运行，并用 "
-        "`check_current_changes_review` 轮询到终态。\n"
+        f"{target_instruction}{completion_instruction}\n"
         "这是一次新的验收请求：之前的浏览器报告、代码阅读、构建或单元测试"
         "都不能替代本次 run。除非用户明确要求解读旧报告，否则不得直接复用旧结论。\n"
-        "必须在报告中记录 Harness 返回的 resolved Git SHA、覆盖范围和限制。\n"
+        f"{report_instruction}"
         "若 Preview 配置尚未由用户确认，明确要求用户通过一次性审查入口确认；"
         "不要退化成代码分析后声称已经完成浏览器审查。\n"
         "浏览器审查实际完成前不要声称功能已实现、已通过或已验收。\n"

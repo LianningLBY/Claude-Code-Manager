@@ -208,6 +208,7 @@ async def _ensure_browser() -> Any:
     channel = context.get("browser_channel")
     _options = BrowserReviewOptions(
         url=str(context["url"]),
+        network_policy=str(context.get("network_policy") or "external_public"),
         goal=str(context.get("goal") or "Review the frontend"),
         model=str(context.get("model") or "ccm-provider"),
         reasoning_effort=str(context.get("reasoning_effort") or "medium"),
@@ -221,7 +222,10 @@ async def _ensure_browser() -> Any:
     )
     _options.validate()
     _telemetry = BrowserTelemetry()
-    target_origin = validate_target_url(_options.url)
+    target_origin = validate_target_url(
+        _options.url,
+        network_policy=_options.network_policy,
+    )
     _browser_context = _browser_page(_options, target_origin, _telemetry)
     _page = await _browser_context.__aenter__()
     try:

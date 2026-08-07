@@ -8,7 +8,6 @@ import binascii
 import json
 import re
 import stat
-import tempfile
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -17,6 +16,7 @@ from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select
 
+from backend.config import settings
 from backend.services.browser_review import (
     BrowserReviewOptions,
     BrowserReviewResult,
@@ -25,6 +25,10 @@ from backend.services.browser_review import (
 from backend.services.test_harness_contracts import (
     normalize_findings,
     normalize_verdict,
+)
+from backend.services.test_harness_artifacts import (
+    TestHarnessArtifactStore,
+    test_harness_artifact_store,
 )
 
 
@@ -87,6 +91,7 @@ class BrowserReviewJob:
             "status": self.status,
             "stage": self.stage,
             "url": self.options.url,
+            "network_policy": self.options.network_policy,
             "goal": self.options.goal,
             "provider": self.provider,
             "model": self.options.model,
@@ -156,10 +161,21 @@ class BrowserReviewJobManager:
         *,
         task_reader: BrowserReviewTaskReader | None = None,
         poll_interval: float = 0.5,
+        artifact_store: TestHarnessArtifactStore | None = None,
+        history_limit: int | None = None,
     ) -> None:
         self._runner = runner
         self._task_reader = task_reader or _read_task_snapshot
         self._poll_interval = poll_interval
+        self._artifact_store = artifact_store or test_harness_artifact_store
+        self._history_limit = max(
+            1,
+            int(
+                settings.browser_review_job_history_limit
+                if history_limit is None
+                else history_limit
+            ),
+        )
         self._jobs: dict[str, BrowserReviewJob] = {}
         self._lock = asyncio.Lock()
 
@@ -326,6 +342,7 @@ class BrowserReviewJobManager:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._artifact_store.cleanup_job_dirs(active_job_ids=set())
 
     async def context(self, job_id: str) -> dict[str, Any] | None:
         job = await self.get(job_id)
@@ -340,6 +357,7 @@ class BrowserReviewJobManager:
             "job_id": job.id,
             "task_id": job.task_id,
             "url": job.options.url,
+            "network_policy": job.options.network_policy,
             "goal": job.options.goal,
             "provider": job.provider,
             "model": job.options.model,
@@ -371,17 +389,37 @@ class BrowserReviewJobManager:
             telemetry = event.get("telemetry")
             if isinstance(telemetry, dict):
                 job.telemetry = telemetry
+                encoded_telemetry = json.dumps(
+                    telemetry,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                self._ensure_artifact_capacity(
+                    job,
+                    "telemetry.json",
+                    len(encoded_telemetry.encode("utf-8")),
+                )
                 _write_private_text(
                     job.options.output_dir / "telemetry.json",
-                    json.dumps(telemetry, ensure_ascii=False, indent=2),
+                    encoded_telemetry,
                 )
 
             action_batch = event.get("action_batch")
             if isinstance(action_batch, list) and action_batch:
                 batch = {"step": job.steps, "actions": action_batch}
+                encoded_batch = json.dumps(batch, ensure_ascii=False) + "\n"
+                actions_path = job.options.output_dir / "actions.jsonl"
+                existing_size = actions_path.stat().st_size if actions_path.exists() else 0
+                self._ensure_artifact_capacity(
+                    job,
+                    "actions.jsonl",
+                    existing_size + len(encoded_batch.encode("utf-8")),
+                )
                 job.action_batches.append(batch)
+                if len(job.action_batches) > 250:
+                    job.action_batches = job.action_batches[-250:]
                 _append_private_jsonl(
-                    job.options.output_dir / "actions.jsonl",
+                    actions_path,
                     batch,
                 )
 
@@ -395,14 +433,21 @@ class BrowserReviewJobManager:
                     screenshot_name = "final.png"
                 else:
                     screenshot_name = f"step-{max(1, job.steps):02d}.png"
+                self._ensure_artifact_capacity(job, screenshot_name, len(screenshot))
                 _write_private_bytes(job.options.output_dir / screenshot_name, screenshot)
                 job.latest_screenshot = screenshot_name
 
             report = event.get("report")
             if isinstance(report, str) and report.strip():
+                report_value = report.strip()
+                self._ensure_artifact_capacity(
+                    job,
+                    "report.md",
+                    len(report_value.encode("utf-8")),
+                )
                 _write_private_text(
                     job.options.output_dir / "report.md",
-                    report.strip(),
+                    report_value,
                 )
             if report is not None or event.get("verdict") is not None:
                 job.verdict = normalize_verdict(event.get("verdict"), report=report)
@@ -453,16 +498,17 @@ class BrowserReviewJobManager:
     ) -> BrowserReviewJob:
         options.validate()
         async with self._lock:
+            self._prune_terminal_locked()
             if any(
                 job.status not in _TERMINAL_STATUSES for job in self._jobs.values()
             ):
                 raise BrowserReviewBusyError(
                     "A browser review is already running; wait for it or cancel it"
                 )
-            output_dir = Path(tempfile.mkdtemp(prefix="ccm-browser-review-job-"))
-            output_dir.chmod(0o700)
+            job_id = uuid.uuid4().hex
+            output_dir = self._artifact_store.create_job_dir(job_id)
             job = BrowserReviewJob(
-                id=uuid.uuid4().hex,
+                id=job_id,
                 options=replace(options, output_dir=output_dir),
                 capture_only=capture_only,
                 provider=provider,
@@ -536,9 +582,15 @@ class BrowserReviewJobManager:
                 if status in _TASK_TERMINAL_STATUSES:
                     assistant_report = snapshot.get("assistant_report")
                     if not job._read_report() and isinstance(assistant_report, str):
+                        report_value = assistant_report.strip()
+                        self._ensure_artifact_capacity(
+                            job,
+                            "report.md",
+                            len(report_value.encode("utf-8")),
+                        )
                         _write_private_text(
                             job.options.output_dir / "report.md",
-                            assistant_report.strip(),
+                            report_value,
                         )
                     if status == "completed":
                         job.status = "completed"
@@ -599,6 +651,28 @@ class BrowserReviewJobManager:
                 job.stage = "failed"
                 job.error = _safe_error(exc)
                 job.completed_at = _now()
+
+    def _ensure_artifact_capacity(
+        self,
+        job: BrowserReviewJob,
+        name: str,
+        byte_size: int,
+    ) -> None:
+        output_dir = job.options.output_dir
+        if output_dir is None:
+            raise RuntimeError("Browser Review job has no evidence directory")
+        self._artifact_store.ensure_job_capacity(output_dir, name, byte_size)
+
+    def _prune_terminal_locked(self) -> None:
+        terminal_ids = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if job.status in _TERMINAL_STATUSES
+        ]
+        excess = max(0, len(terminal_ids) - self._history_limit + 1)
+        for job_id in terminal_ids[:excess]:
+            self._jobs.pop(job_id, None)
+            self._artifact_store.remove_job_dir(job_id)
 
     @staticmethod
     def _merge_trace_events(job: BrowserReviewJob, events: Any) -> None:

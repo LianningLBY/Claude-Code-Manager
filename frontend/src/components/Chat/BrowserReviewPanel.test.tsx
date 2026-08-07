@@ -74,6 +74,7 @@ const completedJob: BrowserReviewJob = {
   status: 'completed',
   stage: 'completed',
   url: 'http://127.0.0.1:5173',
+  network_policy: 'managed_preview',
   goal: '检查 Task 页面布局和运行错误',
   provider: 'claude',
   model: 'claude-opus-4-6',

@@ -8,17 +8,20 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import ipaddress
 import json
 import os
 import tempfile
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urlsplit
-
 import httpx
+
+from backend.services.browser_network import (
+    BrowserNetworkPolicy,
+    PublicEgressProxy,
+    canonical_target_origin,
+)
 
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -50,9 +53,6 @@ INTERACTIVE_ACTIONS = frozenset(
 )
 SUPPORTED_ACTIONS = PASSIVE_ACTIONS | INTERACTIVE_ACTIONS
 MODIFIER_KEYS = frozenset({"Control", "Alt", "Shift", "Meta"})
-BLOCKED_HOSTS = frozenset({"metadata.google.internal"})
-
-
 class BrowserReviewError(RuntimeError):
     """Base error for the browser review harness."""
 
@@ -77,9 +77,10 @@ class BrowserReviewOptions:
     navigation_timeout_ms: int = 30_000
     action_delay_ms: int = 150
     output_dir: Path | None = None
+    network_policy: BrowserNetworkPolicy = "external_public"
 
     def validate(self) -> None:
-        validate_target_url(self.url)
+        validate_target_url(self.url, network_policy=self.network_policy)
         if not self.goal.strip():
             raise ValueError("review goal cannot be empty")
         if not self.model.strip():
@@ -121,43 +122,14 @@ class BrowserReviewResult:
 BrowserReviewProgressCallback = Callable[[dict[str, Any]], None]
 
 
-def validate_target_url(url: str) -> str:
-    """Validate a user-supplied browser target and return its canonical origin."""
+def validate_target_url(
+    url: str,
+    *,
+    network_policy: BrowserNetworkPolicy = "external_public",
+) -> str:
+    """Validate a browser target and return its canonical origin."""
 
-    parsed = urlsplit(url)
-    if parsed.scheme not in {"http", "https"}:
-        raise ValueError("target URL must use http or https")
-    if not parsed.hostname:
-        raise ValueError("target URL must include a hostname")
-    if parsed.username is not None or parsed.password is not None:
-        raise ValueError("target URL must not contain credentials")
-
-    hostname = parsed.hostname.rstrip(".").lower()
-    if hostname in BLOCKED_HOSTS:
-        raise ValueError("cloud metadata hosts are not allowed")
-    try:
-        address = ipaddress.ip_address(hostname)
-    except ValueError:
-        address = None
-    if address is not None and (
-        address.is_unspecified or address.is_multicast or address.is_link_local
-    ):
-        raise ValueError("unspecified, multicast, and link-local targets are not allowed")
-    if address is None:
-        try:
-            hostname = hostname.encode("idna").decode("ascii")
-        except UnicodeError as exc:
-            raise ValueError("target URL has an invalid hostname") from exc
-
-    try:
-        port = parsed.port
-    except ValueError as exc:
-        raise ValueError("target URL has an invalid port") from exc
-    default_port = 80 if parsed.scheme == "http" else 443
-    host_for_origin = f"[{hostname}]" if ":" in hostname else hostname
-    if port is None or port == default_port:
-        return f"{parsed.scheme}://{host_for_origin}"
-    return f"{parsed.scheme}://{host_for_origin}:{port}"
+    return canonical_target_origin(url, policy=network_policy)
 
 
 def normalize_key(key: Any) -> str:
@@ -596,7 +568,10 @@ async def run_browser_review(
         raise ValueError("OPENAI_API_KEY is not set")
     output_dir = _prepare_output_dir(options.output_dir)
     telemetry = BrowserTelemetry()
-    target_origin = validate_target_url(options.url)
+    target_origin = validate_target_url(
+        options.url,
+        network_policy=options.network_policy,
+    )
     steps = 0
     action_count = 0
     response_id: str | None = None
@@ -762,15 +737,17 @@ async def _browser_page(
         raise BrowserReviewError("Playwright is not installed; run `uv sync`") from exc
 
     try:
-        async with async_playwright() as playwright:
-            launch_options: dict[str, Any] = {
-                "headless": options.headless,
-                "chromium_sandbox": True,
-                "env": {},
-                "args": ["--disable-extensions", "--disable-file-system"],
-            }
-            if options.browser_channel:
-                launch_options["channel"] = options.browser_channel
+        async with AsyncExitStack() as stack:
+            proxy: PublicEgressProxy | None = None
+            if options.network_policy == "external_public":
+                proxy = await stack.enter_async_context(
+                    PublicEgressProxy(on_blocked=telemetry.add_blocked_navigation)
+                )
+            playwright = await stack.enter_async_context(async_playwright())
+            launch_options = _browser_launch_options(
+                options,
+                proxy_url=proxy.url if proxy is not None else None,
+            )
             browser = await playwright.chromium.launch(**launch_options)
             context = await browser.new_context(
                 viewport={
@@ -784,20 +761,19 @@ async def _browser_page(
             telemetry.attach(page)
 
             async def guard_navigation(route: Any, request: Any) -> None:
-                if request.is_navigation_request() and request.frame == page.main_frame:
-                    try:
-                        request_origin = validate_target_url(request.url)
-                    except ValueError as exc:
-                        telemetry.add_blocked_navigation(request.url, str(exc))
-                        await route.abort("blockedbyclient")
-                        return
-                    if request_origin != target_origin:
-                        telemetry.add_blocked_navigation(
-                            request.url,
-                            f"top-level origin {request_origin} is outside {target_origin}",
-                        )
-                        await route.abort("blockedbyclient")
-                        return
+                violation = _request_policy_violation(
+                    options,
+                    target_origin=target_origin,
+                    request_url=request.url,
+                    top_level_navigation=(
+                        request.is_navigation_request()
+                        and request.frame == page.main_frame
+                    ),
+                )
+                if violation is not None:
+                    telemetry.add_blocked_navigation(request.url, violation)
+                    await route.abort("blockedbyclient")
+                    return
                 await route.continue_()
 
             async def close_popup(popup: Any) -> None:
@@ -831,6 +807,57 @@ async def _browser_page(
         if "Executable doesn't exist" in message:
             message += " (run `uv run playwright install chromium`)"
         raise BrowserReviewError(f"Playwright browser failed: {message}") from exc
+
+
+def _browser_launch_options(
+    options: BrowserReviewOptions,
+    *,
+    proxy_url: str | None,
+) -> dict[str, Any]:
+    launch_options: dict[str, Any] = {
+        "headless": options.headless,
+        "chromium_sandbox": True,
+        "env": {},
+        "args": [
+            "--disable-extensions",
+            "--disable-file-system",
+            "--disable-quic",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+        ],
+    }
+    if proxy_url is not None:
+        launch_options["proxy"] = {"server": proxy_url, "bypass": ""}
+        # Chromium otherwise bypasses explicit proxies for loopback
+        # destinations, which would reopen localhost/intranet access.
+        launch_options["args"].append("--proxy-bypass-list=<-loopback>")
+    if options.browser_channel:
+        launch_options["channel"] = options.browser_channel
+    return launch_options
+
+
+def _request_policy_violation(
+    options: BrowserReviewOptions,
+    *,
+    target_origin: str,
+    request_url: str,
+    top_level_navigation: bool,
+) -> str | None:
+    try:
+        request_origin = validate_target_url(
+            request_url,
+            network_policy=options.network_policy,
+        )
+    except ValueError as exc:
+        return str(exc)
+    if options.network_policy == "managed_preview" and request_origin != target_origin:
+        return f"managed preview request {request_origin} is outside {target_origin}"
+    if (
+        options.network_policy == "external_public"
+        and top_level_navigation
+        and request_origin != target_origin
+    ):
+        return f"top-level origin {request_origin} is outside {target_origin}"
+    return None
 
 
 async def _with_modifiers(

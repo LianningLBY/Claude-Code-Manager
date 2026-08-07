@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
 from backend.api.deps import (
     get_current_user_id,
@@ -34,6 +36,10 @@ from backend.services.test_harness_runtime import (
     harness_runtime_config_payload,
 )
 from backend.services.workspace_review import workspace_review_capability
+from backend.services.test_harness_targets import (
+    UNTRUSTED_GIT_TARGETS_AVAILABLE,
+    UNTRUSTED_GIT_TARGETS_REASON,
+)
 
 
 router = APIRouter(prefix="/api/tasks", tags=["test-harness"])
@@ -159,8 +165,12 @@ async def get_test_harness_capabilities(
         "targets": {
             "current_workspace": workspace["available"],
             "fixed_url": True,
-            "pull_request": workspace["available"],
-            "git_ref": workspace["available"],
+            "pull_request": UNTRUSTED_GIT_TARGETS_AVAILABLE,
+            "git_ref": UNTRUSTED_GIT_TARGETS_AVAILABLE,
+        },
+        "target_reasons": {
+            "pull_request": UNTRUSTED_GIT_TARGETS_REASON,
+            "git_ref": UNTRUSTED_GIT_TARGETS_REASON,
         },
         "preview": workspace,
         "supports_repeat": True,
@@ -419,21 +429,27 @@ async def get_test_harness_evidence(
     name: str,
     request: Request,
     db: AsyncSession = Depends(get_db),
-) -> FileResponse:
+) -> StreamingResponse:
     task = await _task_or_404(task_id, db)
     await require_task_access(request, task, db)
     run = await test_harness_service.get_run(run_id)
     if run is None or run["task_id"] != task_id:
         raise HTTPException(status_code=404, detail="Test run not found")
-    path = await test_harness_service.resolve_evidence(run_id, name)
-    if path is None:
+    opened = await test_harness_service.open_evidence(run_id, name)
+    if opened is None:
         raise HTTPException(status_code=404, detail="Test evidence not found")
-    return FileResponse(
-        path,
+    suffix = Path(opened.name).suffix
+    return StreamingResponse(
+        opened.chunks(),
         media_type={
             ".png": "image/png",
             ".md": "text/markdown; charset=utf-8",
             ".json": "application/json",
             ".jsonl": "application/x-ndjson",
-        }.get(path.suffix, "application/octet-stream"),
+        }.get(suffix, "application/octet-stream"),
+        headers={
+            "Content-Length": str(opened.byte_size),
+            "Content-Disposition": f'inline; filename="{opened.name}"',
+        },
+        background=BackgroundTask(opened.close),
     )

@@ -974,6 +974,7 @@ class WorkspaceReviewManager:
             )
             options = BrowserReviewOptions(
                 url=handle.url,
+                network_policy="managed_preview",
                 goal=run.goal,
                 model=model,
                 reasoning_effort=effort,

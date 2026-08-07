@@ -44,6 +44,9 @@ os.environ.update({
     # Unit tests exercise the cleaner with isolated roots explicitly. Importing
     # backend.main must never start a watchdog against the host's real /tmp.
     "TMP_CLEANUP_ENABLED": "false",
+    "TEST_HARNESS_ARTIFACT_ROOT": str(
+        _GLOBAL_TEST_DB_DIR / "test-harness-artifacts"
+    ),
     "AUTO_START_DISPATCHER": "false",
     "AUTO_PUSH_TO_ORIGIN": "false",
     # Preserve the product default for constructor/wiring tests. Dispatcher is

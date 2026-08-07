@@ -12,27 +12,15 @@ from backend.services.browser_review_jobs import (
     BrowserReviewJobManager,
     _safe_tool_arguments,
 )
+from backend.services.test_harness_artifacts import TestHarnessArtifactStore as ArtifactStore
 
 
-def _install_temp_factory(monkeypatch, tmp_path: Path) -> None:
-    counter = 0
-
-    def make_temp_dir(*, prefix: str) -> str:
-        nonlocal counter
-        counter += 1
-        path = tmp_path / f"{prefix}{counter}"
-        path.mkdir(mode=0o700)
-        return str(path)
-
-    monkeypatch.setattr(
-        "backend.services.browser_review_jobs.tempfile.mkdtemp", make_temp_dir
-    )
+def _artifact_store(tmp_path: Path) -> ArtifactStore:
+    return ArtifactStore(tmp_path / "artifacts")
 
 
 @pytest.mark.asyncio
 async def test_job_manager_tracks_progress_and_artifacts(monkeypatch, tmp_path):
-    _install_temp_factory(monkeypatch, tmp_path)
-
     async def runner(options, *, progress_callback, **_kwargs):
         assert options.output_dir is not None
         options.output_dir.joinpath("initial.png").write_bytes(b"initial")
@@ -72,9 +60,15 @@ async def test_job_manager_tracks_progress_and_artifacts(monkeypatch, tmp_path):
             actions=1,
         )
 
-    manager = BrowserReviewJobManager(runner=runner)
+    manager = BrowserReviewJobManager(
+        runner=runner,
+        artifact_store=_artifact_store(tmp_path),
+    )
     job = await manager.start(
-        BrowserReviewOptions(url="http://localhost:5173"),
+        BrowserReviewOptions(
+            url="http://localhost:5173",
+            network_policy="managed_preview",
+        ),
         capture_only=False,
         api_key="test-key",
     )
@@ -104,7 +98,6 @@ async def test_job_manager_tracks_progress_and_artifacts(monkeypatch, tmp_path):
 
 @pytest.mark.asyncio
 async def test_job_manager_allows_only_one_job_and_can_cancel(monkeypatch, tmp_path):
-    _install_temp_factory(monkeypatch, tmp_path)
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -113,8 +106,14 @@ async def test_job_manager_allows_only_one_job_and_can_cancel(monkeypatch, tmp_p
         await release.wait()
         raise AssertionError("cancelled runner must not complete")
 
-    manager = BrowserReviewJobManager(runner=runner)
-    options = BrowserReviewOptions(url="http://localhost:5173")
+    manager = BrowserReviewJobManager(
+        runner=runner,
+        artifact_store=_artifact_store(tmp_path),
+    )
+    options = BrowserReviewOptions(
+        url="http://localhost:5173",
+        network_policy="managed_preview",
+    )
     job = await manager.start(options, capture_only=True, api_key=None)
     await asyncio.wait_for(started.wait(), timeout=1)
 
@@ -129,7 +128,6 @@ async def test_job_manager_allows_only_one_job_and_can_cancel(monkeypatch, tmp_p
 
 @pytest.mark.asyncio
 async def test_agent_job_tracks_task_and_browser_events(monkeypatch, tmp_path):
-    _install_temp_factory(monkeypatch, tmp_path)
     task_state = {
         "status": "in_progress",
         "error": None,
@@ -159,9 +157,13 @@ async def test_agent_job_tracks_task_and_browser_events(monkeypatch, tmp_path):
     manager = BrowserReviewJobManager(
         task_reader=read_task,
         poll_interval=0.01,
+        artifact_store=_artifact_store(tmp_path),
     )
     job = await manager.prepare_agent(
-        BrowserReviewOptions(url="http://localhost:5173"),
+        BrowserReviewOptions(
+            url="http://localhost:5173",
+            network_policy="managed_preview",
+        ),
         provider="codex",
         codex_service_tier="default",
     )
@@ -221,7 +223,6 @@ async def test_inline_task_tool_completes_and_allows_a_later_run(
     monkeypatch,
     tmp_path,
 ):
-    _install_temp_factory(monkeypatch, tmp_path)
 
     task_state = {"status": "in_progress"}
 
@@ -239,8 +240,14 @@ async def test_inline_task_tool_completes_and_allows_a_later_run(
             ],
         }
 
-    manager = BrowserReviewJobManager(task_reader=read_task)
-    options = BrowserReviewOptions(url="http://localhost:5173")
+    manager = BrowserReviewJobManager(
+        task_reader=read_task,
+        artifact_store=_artifact_store(tmp_path),
+    )
+    options = BrowserReviewOptions(
+        url="http://localhost:5173",
+        network_policy="managed_preview",
+    )
     first = await manager.prepare_task_tool(
         options,
         task_id=73,
@@ -276,6 +283,45 @@ async def test_inline_task_tool_completes_and_allows_a_later_run(
     await asyncio.wait_for(second.task, timeout=1)
     assert second.status == "failed"
     assert "finish_review" in (second.error or "")
+    await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_history_is_bounded_and_prunes_only_managed_staging(
+    tmp_path,
+):
+    store = _artifact_store(tmp_path)
+    manager = BrowserReviewJobManager(
+        artifact_store=store,
+        history_limit=2,
+    )
+    options = BrowserReviewOptions(url="https://example.com")
+
+    first = await manager.prepare_agent(
+        options,
+        provider="codex",
+        codex_service_tier="default",
+    )
+    first_dir = first.options.output_dir
+    assert first_dir is not None and first_dir.exists()
+    await manager.fail_start(first.id, RuntimeError("done"))
+
+    second = await manager.prepare_agent(
+        options,
+        provider="codex",
+        codex_service_tier="default",
+    )
+    await manager.fail_start(second.id, RuntimeError("done"))
+    third = await manager.prepare_agent(
+        options,
+        provider="codex",
+        codex_service_tier="default",
+    )
+
+    assert await manager.get(first.id) is None
+    assert not first_dir.exists()
+    assert [job.id for job in await manager.list()] == [third.id, second.id]
+    await manager.fail_start(third.id, RuntimeError("done"))
     await manager.shutdown()
 
 

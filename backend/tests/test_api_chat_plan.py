@@ -1329,7 +1329,9 @@ async def test_chat_frontend_pr_acceptance_injects_browser_review_protocol(
     assert prompt.startswith(message)
     assert "ccm_workspace_browser_review_request" in prompt
     assert "test_git_target" in prompt
-    assert "pr_number=99" in prompt
+    assert "PR #99" in prompt
+    assert "sandbox unavailable" in prompt
+    assert "不得改测当前工作区" in prompt
 
     history = await client.get(f"/api/tasks/{task_id}/chat/history")
     user_rows = [row for row in history.json() if row["role"] == "user"]

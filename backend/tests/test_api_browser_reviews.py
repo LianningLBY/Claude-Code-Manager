@@ -12,22 +12,13 @@ from backend.api import browser_reviews
 from backend.config import settings
 from backend.services.browser_review_jobs import BrowserReviewJobManager
 from backend.services.browser_review import BrowserReviewOptions
+from backend.services.test_harness_artifacts import TestHarnessArtifactStore as ArtifactStore
 
 
 @pytest.mark.asyncio
 async def test_browser_review_api_creates_ccm_task_and_records_evidence(
     monkeypatch, tmp_path
 ):
-    job_dir = tmp_path / "job"
-
-    def make_temp_dir(*, prefix: str) -> str:
-        assert prefix == "ccm-browser-review-job-"
-        job_dir.mkdir(mode=0o700)
-        return str(job_dir)
-
-    monkeypatch.setattr(
-        "backend.services.browser_review_jobs.tempfile.mkdtemp", make_temp_dir
-    )
     task_state = {
         "status": "in_progress",
         "error": None,
@@ -80,6 +71,7 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
     manager = BrowserReviewJobManager(
         task_reader=read_task,
         poll_interval=0.01,
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
     )
     app = FastAPI()
     app.include_router(browser_reviews.router)
@@ -100,7 +92,7 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
         created = await client.post(
             "/api/browser-reviews",
             json={
-                "url": "http://localhost:5173",
+                "url": "https://example.com",
                 "provider": "codex",
                 "model": settings.default_codex_model,
                 "reasoning_effort": "medium",
@@ -118,7 +110,8 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
             f"/api/browser-reviews/{job_id}/internal/context"
         )
         assert context.status_code == 200
-        assert context.json()["url"] == "http://localhost:5173"
+        assert context.json()["url"] == "https://example.com"
+        assert context.json()["network_policy"] == "external_public"
 
         png = b"\x89PNG\r\n\x1a\nfinal"
         evidence = await client.post(
@@ -171,7 +164,15 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
 
 
 @pytest.mark.asyncio
-async def test_browser_review_api_rejects_unsafe_url(monkeypatch):
+@pytest.mark.parametrize(
+    ("url", "message"),
+    [
+        ("file:///tmp/index.html", "http or https"),
+        ("http://127.0.0.1:8000/admin", "public IP"),
+        ("http://169.254.169.254/latest/meta-data", "public IP"),
+    ],
+)
+async def test_browser_review_api_rejects_unsafe_url(monkeypatch, url, message):
     manager = BrowserReviewJobManager()
     app = FastAPI()
     app.include_router(browser_reviews.router)
@@ -187,7 +188,7 @@ async def test_browser_review_api_rejects_unsafe_url(monkeypatch):
         response = await client.post(
             "/api/browser-reviews",
             json={
-                "url": "file:///tmp/index.html",
+                "url": url,
                 "provider": "codex",
                 "model": settings.default_codex_model,
                 "reasoning_effort": "medium",
@@ -195,7 +196,7 @@ async def test_browser_review_api_rejects_unsafe_url(monkeypatch):
         )
 
     assert response.status_code == 422
-    assert "http or https" in response.json()["detail"]
+    assert message in response.json()["detail"]
 
 
 @pytest.mark.asyncio
@@ -203,15 +204,6 @@ async def test_ordinary_task_can_start_and_list_isolated_browser_review(
     monkeypatch,
     tmp_path,
 ):
-    counter = 0
-
-    def make_temp_dir(*, prefix: str) -> str:
-        nonlocal counter
-        counter += 1
-        path = tmp_path / f"{prefix}{counter}"
-        path.mkdir(mode=0o700)
-        return str(path)
-
     task = SimpleNamespace(
         id=73,
         status="in_progress",
@@ -233,13 +225,12 @@ async def test_ordinary_task_can_start_and_list_isolated_browser_review(
     async def read_task(_task_id: int):
         return dict(task_state)
 
-    monkeypatch.setattr(
-        "backend.services.browser_review_jobs.tempfile.mkdtemp",
-        make_temp_dir,
-    )
     monkeypatch.setattr(settings, "auth_token", "")
     monkeypatch.setattr(browser_reviews, "require_task_access", allow_task_access)
-    manager = BrowserReviewJobManager(task_reader=read_task)
+    manager = BrowserReviewJobManager(
+        task_reader=read_task,
+        artifact_store=ArtifactStore(tmp_path / "artifacts"),
+    )
 
     class FakeHarnessService:
         async def start_task_run(self, *, task_id, spec, **_kwargs):
@@ -291,7 +282,7 @@ async def test_ordinary_task_can_start_and_list_isolated_browser_review(
         started = await client.post(
             "/api/tasks/73/browser-reviews/internal/start",
             json={
-                "url": "http://localhost:5173",
+                "url": "https://example.com",
                 "goal": "Check the task UI",
                 "browser_channel": "chromium",
                 "viewport_width": 390,

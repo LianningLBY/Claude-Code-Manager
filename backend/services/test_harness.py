@@ -3,17 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
-import stat
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from sqlalchemy import delete, select
 
+from backend.config import settings
 from backend.database import async_session
 from backend.models.project import Project
 from backend.models.task import Task
@@ -33,12 +32,14 @@ from backend.services.test_harness_contracts import (
     normalize_verdict,
     request_fingerprint,
 )
-from backend.services.test_harness_targets import (
-    PreparedHarnessTarget,
-    TestHarnessTargetManager,
-    test_harness_target_manager,
-)
+from backend.services.test_harness_targets import UNTRUSTED_GIT_TARGETS_REASON
 from backend.services.test_harness_runtime import resolve_harness_runtime
+from backend.services.test_harness_artifacts import (
+    OpenedHarnessArtifact,
+    TestHarnessArtifactError,
+    TestHarnessArtifactStore,
+    test_harness_artifact_store,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -66,19 +67,26 @@ class TestHarnessIdempotencyError(TestHarnessError):
 
 
 class TestHarnessService:
-    """Facade shared by Task chat, MCP, Goal, PR targets, and future loops."""
+    """Facade shared by Task chat, MCP, Goal, and future loops."""
 
     def __init__(
         self,
         *,
         db_factory=async_session,
-        target_manager: TestHarnessTargetManager | None = None,
         poll_interval: float = 0.5,
+        artifact_store: TestHarnessArtifactStore | None = None,
+        retention_interval: float | None = None,
     ) -> None:
         self.db_factory = db_factory
-        self.target_manager = target_manager or test_harness_target_manager
         self.poll_interval = poll_interval
+        self.artifact_store = artifact_store or test_harness_artifact_store
+        self.retention_interval = float(
+            retention_interval
+            if retention_interval is not None
+            else settings.test_harness_artifact_cleanup_interval_seconds
+        )
         self._pipelines: dict[str, asyncio.Task[None]] = {}
+        self._retention_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
         self._db_lock = asyncio.Lock()
 
@@ -90,6 +98,8 @@ class TestHarnessService:
         owner_user_id: int | None = None,
     ) -> TestHarnessRun:
         normalized = spec.normalized()
+        if normalized.target_kind in {"pull_request", "git_ref"}:
+            raise TestHarnessError(UNTRUSTED_GIT_TARGETS_REASON)
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
             if task is None:
@@ -129,16 +139,6 @@ class TestHarnessService:
             except BaseException as exc:
                 await self._fail_start(run.id, exc)
                 raise
-        elif normalized.target_kind in {"pull_request", "git_ref"}:
-            pipeline = asyncio.create_task(
-                self._run_git_target(
-                    run_id=run.id,
-                    spec=normalized,
-                    test_plan=plan,
-                ),
-                name=f"test-harness-target-{run.id}",
-            )
-            self._register_pipeline(run.id, pipeline)
         elif normalized.target_kind == "fixed_url":
             # A fixed URL needs the caller to reserve either an inline browser
             # tool or a separate Task, then attach that exact job below.
@@ -277,7 +277,6 @@ class TestHarnessService:
         run_id: str,
         spec: TestHarnessSpec,
         test_plan: dict[str, Any],
-        prepared: PreparedHarnessTarget | None = None,
         await_completion: bool = False,
     ) -> WorkspaceReviewRun:
         run = await self.get_run_model(run_id)
@@ -306,8 +305,6 @@ class TestHarnessService:
             max_steps=spec.max_steps,
             max_actions=spec.max_actions,
             harness_run_id=run_id,
-            workspace_override=prepared.workspace if prepared is not None else None,
-            preview_config_override=preview_config if prepared is not None else None,
             test_plan=test_plan,
             runtime_config=run.runtime_config,
         )
@@ -329,120 +326,57 @@ class TestHarnessService:
         if await_completion:
             await self._watch_workspace_run(
                 run_id=run_id,
-                workspace_run_id=workspace_run.id,
-                prepared=prepared,
+                workspace_review_run_id=workspace_run.id,
             )
         else:
             watcher = asyncio.create_task(
                 self._watch_workspace_run(
                     run_id=run_id,
-                    workspace_run_id=workspace_run.id,
-                    prepared=prepared,
+                    workspace_review_run_id=workspace_run.id,
                 ),
                 name=f"test-harness-workspace-{run_id}",
             )
             self._register_pipeline(run_id, watcher)
         return workspace_run
 
-    async def _run_git_target(
-        self,
-        *,
-        run_id: str,
-        spec: TestHarnessSpec,
-        test_plan: dict[str, Any],
-    ) -> None:
-        prepared: PreparedHarnessTarget | None = None
-        workspace_run_id: str | None = None
-        try:
-            await self._update_run(
-                run_id,
-                values={"status": "resolving_target", "stage": "resolving_git_target"},
-                event_type="lifecycle",
-                title="正在解析 Git 测试目标",
-                source_key="target:resolving",
-            )
-            async with self.db_factory() as db:
-                run = await db.get(TestHarnessRun, run_id)
-                task = await db.get(Task, run.task_id) if run and run.task_id else None
-                project = await db.get(Project, task.project_id) if task and task.project_id else None
-            if run is None or task is None:
-                raise TestHarnessError("Harness owner Task disappeared")
-            prepared = await self.target_manager.prepare(
-                run_id=run_id,
-                task=task,
-                project=project,
-                kind=spec.target_kind,
-                target=spec.target,
-            )
-            await self._update_run(
-                run_id,
-                values={
-                    "target_spec": prepared.public_spec,
-                    "source_git_head": prepared.git_head,
-                    "status": "preparing_environment",
-                    "stage": "detached_worktree_ready",
-                },
-                event_type="lifecycle",
-                title="隔离 Git worktree 已就绪",
-                detail=f"精确提交 {prepared.git_head[:12]}，未切换开发工作区。",
-                source_key="target:prepared",
-            )
-            workspace_run = await self._start_workspace_review(
-                run_id=run_id,
-                spec=spec,
-                test_plan=test_plan,
-                prepared=prepared,
-                await_completion=True,
-            )
-            workspace_run_id = workspace_run.id
-        except asyncio.CancelledError:
-            if workspace_run_id is None:
-                current = await self.get_run_model(run_id)
-                workspace_run_id = current.workspace_review_run_id if current else None
-            if workspace_run_id:
-                from backend.services.workspace_review import workspace_review_manager
-
-                await asyncio.shield(workspace_review_manager.cancel(workspace_run_id))
-            await self._mark_cancelled(run_id)
-            raise
-        except Exception as exc:
-            logger.exception("Test harness Git target pipeline failed run=%s", run_id)
-            await self._fail_start(run_id, exc)
-        finally:
-            if prepared is not None:
-                try:
-                    await asyncio.shield(self.target_manager.cleanup(prepared))
-                except Exception as exc:
-                    await self._update_run(
-                        run_id,
-                        values={
-                            "cleanup_status": "failed",
-                            "cleanup_error": _safe_error(exc),
-                        },
-                        event_type="cleanup",
-                        title="隔离 worktree 清理失败",
-                        detail=_safe_error(exc),
-                        source_key="target:cleanup-failed",
-                    )
-                else:
-                    await self._update_run(
-                        run_id,
-                        values={"cleanup_status": "completed", "cleanup_error": None},
-                        event_type="cleanup",
-                        title="隔离 worktree 已清理",
-                        source_key="target:cleanup-completed",
-                    )
-
     async def _watch_workspace_run(
         self,
         *,
         run_id: str,
-        workspace_run_id: str,
-        prepared: PreparedHarnessTarget | None,
+        workspace_review_run_id: str,
+    ) -> None:
+        try:
+            await self._watch_workspace_run_inner(
+                run_id=run_id,
+                workspace_review_run_id=workspace_review_run_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Test Harness workspace watcher failed run=%s", run_id)
+            try:
+                from backend.services.workspace_review import workspace_review_manager
+
+                await workspace_review_manager.cancel(workspace_review_run_id)
+            except Exception:
+                logger.exception(
+                    "Could not cancel workspace review after Harness watcher failure run=%s",
+                    run_id,
+                )
+            await self._fail_start(run_id, exc)
+
+    async def _watch_workspace_run_inner(
+        self,
+        *,
+        run_id: str,
+        workspace_review_run_id: str,
     ) -> None:
         while True:
             async with self.db_factory() as db:
-                workspace_run = await db.get(WorkspaceReviewRun, workspace_run_id)
+                workspace_run = await db.get(
+                    WorkspaceReviewRun,
+                    workspace_review_run_id,
+                )
             if workspace_run is None:
                 raise TestHarnessError("Workspace review record disappeared")
             await self._sync_workspace_run(run_id, workspace_run)
@@ -634,6 +568,7 @@ class TestHarnessService:
 
         options = BrowserReviewOptions(
             url=str(run.target_spec["url"]),
+            network_policy="external_public",
             goal=str(run.test_plan["objective"]),
             model=str(runtime["model"]),
             reasoning_effort=str(runtime["reasoning_effort"]),
@@ -730,24 +665,27 @@ class TestHarnessService:
 
             browser_manager = browser_review_job_manager
 
-        while True:
-            job = await browser_manager.get(job_id)
-            if job is None:
-                await self._fail_start(
-                    run_id,
-                    TestHarnessError("Browser Review job disappeared"),
-                )
-                return
-            await self.sync_browser_job(job)
-            if job.status in _BROWSER_TERMINAL:
-                return
-            await asyncio.sleep(self.poll_interval)
+        try:
+            while True:
+                job = await browser_manager.get(job_id)
+                if job is None:
+                    raise TestHarnessError("Browser Review job disappeared")
+                await self.sync_browser_job(job)
+                if job.status in _BROWSER_TERMINAL:
+                    return
+                await asyncio.sleep(self.poll_interval)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Test Harness browser watcher failed run=%s", run_id)
+            await self._fail_start(run_id, exc)
 
     async def sync_browser_job(self, job: Any) -> None:
         run_id = getattr(job, "harness_run_id", None)
         if not isinstance(run_id, str) or not run_id:
             return
         payload = job.as_dict()
+        obsolete_storage_keys: list[str] = []
         async with self._db_lock:
             async with self.db_factory() as db:
                 run = await db.get(TestHarnessRun, run_id)
@@ -853,41 +791,75 @@ class TestHarnessService:
                         },
                         source_key=f"trace:{job.id}:{source_id}",
                     )
-                await self._sync_evidence(db, run_id, attempt.id, job)
+                obsolete_storage_keys = await self._sync_evidence(
+                    db,
+                    run,
+                    attempt.id,
+                    job,
+                )
+                if job.status in _BROWSER_TERMINAL and run.task_id is not None:
+                    attempt.artifact_root = self.artifact_store.run_prefix(
+                        task_id=run.task_id,
+                        run_id=run.id,
+                        attempt_id=attempt.id,
+                    )
                 await self._sync_findings(db, run_id, job.findings)
                 await db.commit()
+        for storage_key in obsolete_storage_keys:
+            if not self.artifact_store.remove(storage_key):
+                logger.warning(
+                    "Could not remove superseded Test Harness evidence %s",
+                    storage_key,
+                )
 
     async def _sync_evidence(
         self,
         db: Any,
-        run_id: str,
+        run: TestHarnessRun,
         attempt_id: str,
         job: Any,
-    ) -> None:
+    ) -> list[str]:
         root_value = job.options.output_dir
-        if root_value is None:
-            return
+        if root_value is None or run.task_id is None:
+            return []
         try:
             root = Path(root_value).resolve(strict=True)
         except OSError:
-            return
-        for name in job.artifact_names():
+            return []
+        return await self._archive_evidence_files(
+            db,
+            run=run,
+            attempt_id=attempt_id,
+            root=root,
+            names=job.artifact_names(),
+            browser_review_job_id=job.id,
+        )
+
+    async def _archive_evidence_files(
+        self,
+        db: Any,
+        *,
+        run: TestHarnessRun,
+        attempt_id: str,
+        root: Path,
+        names: list[str],
+        browser_review_job_id: str | None,
+    ) -> list[str]:
+        if run.task_id is None:
+            return []
+        obsolete: list[str] = []
+        for name in names:
             candidate = root / name
-            try:
-                info = candidate.lstat()
-                resolved = candidate.resolve(strict=True)
-                resolved.relative_to(root)
-            except (OSError, ValueError):
-                continue
-            if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
-                continue
-            digest = hashlib.sha256()
-            with candidate.open("rb") as handle:
-                while chunk := handle.read(1024 * 1024):
-                    digest.update(chunk)
+            archived = self.artifact_store.archive(
+                candidate,
+                task_id=run.task_id,
+                run_id=run.id,
+                attempt_id=attempt_id,
+                name=name,
+            )
             evidence = await db.scalar(
                 select(TestHarnessEvidence).where(
-                    TestHarnessEvidence.run_id == run_id,
+                    TestHarnessEvidence.run_id == run.id,
                     TestHarnessEvidence.name == name,
                 )
             )
@@ -901,24 +873,36 @@ class TestHarnessService:
             if evidence is None:
                 evidence = TestHarnessEvidence(
                     id=uuid.uuid4().hex,
-                    run_id=run_id,
+                    run_id=run.id,
                     attempt_id=attempt_id,
                     kind=kind,
                     name=name,
                     content_type=_CONTENT_TYPES.get(
                         candidate.suffix, "application/octet-stream"
                     ),
-                    storage_path=str(resolved),
-                    sha256=digest.hexdigest(),
-                    byte_size=info.st_size,
-                    metadata_={"browser_review_job_id": job.id},
+                    storage_path=archived.storage_key,
+                    sha256=archived.sha256,
+                    byte_size=archived.byte_size,
+                    metadata_={
+                        "browser_review_job_id": browser_review_job_id,
+                        "storage_version": 1,
+                    },
                 )
                 db.add(evidence)
             else:
+                old_storage_key = evidence.storage_path
                 evidence.attempt_id = attempt_id
-                evidence.storage_path = str(resolved)
-                evidence.sha256 = digest.hexdigest()
-                evidence.byte_size = info.st_size
+                evidence.storage_path = archived.storage_key
+                evidence.sha256 = archived.sha256
+                evidence.byte_size = archived.byte_size
+                evidence.metadata_ = {
+                    **(evidence.metadata_ or {}),
+                    "browser_review_job_id": browser_review_job_id,
+                    "storage_version": 1,
+                }
+                if old_storage_key != archived.storage_key:
+                    obsolete.append(old_storage_key)
+        return obsolete
 
     async def _sync_findings(
         self,
@@ -1304,7 +1288,11 @@ class TestHarnessService:
             "browser_review": browser_payload,
         }
 
-    async def resolve_evidence(self, run_id: str, name: str) -> Path | None:
+    async def open_evidence(
+        self,
+        run_id: str,
+        name: str,
+    ) -> OpenedHarnessArtifact | None:
         if not name or len(name) > 255 or "/" in name or "\\" in name:
             return None
         async with self.db_factory() as db:
@@ -1316,18 +1304,35 @@ class TestHarnessService:
             )
         if evidence is None:
             return None
-        candidate = Path(evidence.storage_path)
         try:
-            info = candidate.lstat()
-            resolved = candidate.resolve(strict=True)
-        except OSError:
+            return self.artifact_store.open(
+                evidence.storage_path,
+                expected_sha256=evidence.sha256,
+                expected_size=evidence.byte_size,
+            )
+        except TestHarnessArtifactError:
             return None
-        if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
+
+    async def resolve_evidence(self, run_id: str, name: str) -> Path | None:
+        """Compatibility helper for tests; HTTP downloads use the opened FD."""
+
+        opened = await self.open_evidence(run_id, name)
+        if opened is None:
             return None
-        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-        if digest != evidence.sha256 or info.st_size != evidence.byte_size:
+        opened.close()
+        async with self.db_factory() as db:
+            evidence = await db.scalar(
+                select(TestHarnessEvidence).where(
+                    TestHarnessEvidence.run_id == run_id,
+                    TestHarnessEvidence.name == name,
+                )
+            )
+        if evidence is None:
             return None
-        return resolved
+        try:
+            return self.artifact_store.resolve_path(evidence.storage_path)
+        except TestHarnessArtifactError:
+            return None
 
     async def compare(self, base_run_id: str, candidate_run_id: str) -> dict[str, Any]:
         async with self.db_factory() as db:
@@ -1402,9 +1407,132 @@ class TestHarnessService:
             owner_user_id=owner_user_id,
         )
 
-    async def recover_interrupted_runs(self) -> int:
+    async def cleanup_evidence(self) -> int:
+        """Apply TTL and task/global quotas without touching active runs."""
+
+        cutoff = datetime.utcnow() - timedelta(days=self.artifact_store.retention_days)
+        removed_keys: list[str] = []
+        kept_global = 0
+        kept_by_task: dict[int, int] = {}
         async with self._db_lock:
             async with self.db_factory() as db:
+                rows = (
+                    await db.execute(
+                        select(
+                            TestHarnessEvidence,
+                            TestHarnessRun.task_id,
+                            TestHarnessRun.status,
+                        )
+                        .join(TestHarnessRun, TestHarnessRun.id == TestHarnessEvidence.run_id)
+                        .order_by(
+                            TestHarnessEvidence.created_at.desc(),
+                            TestHarnessEvidence.id.desc(),
+                        )
+                    )
+                ).all()
+                for evidence, task_id_value, run_status in rows:
+                    task_id = int(task_id_value or 0)
+                    task_total = kept_by_task.get(task_id, 0)
+                    active = run_status not in HARNESS_TERMINAL_STATUSES
+                    expired = evidence.created_at < cutoff
+                    exceeds_task = (
+                        task_total + evidence.byte_size
+                        > self.artifact_store.max_task_bytes
+                    )
+                    exceeds_global = (
+                        kept_global + evidence.byte_size
+                        > self.artifact_store.max_total_bytes
+                    )
+                    if not active and (expired or exceeds_task or exceeds_global):
+                        removed_keys.append(evidence.storage_path)
+                        await db.delete(evidence)
+                        continue
+                    kept_by_task[task_id] = task_total + evidence.byte_size
+                    kept_global += evidence.byte_size
+                await db.commit()
+                referenced = set(
+                    (
+                        await db.execute(select(TestHarnessEvidence.storage_path))
+                    ).scalars()
+                )
+        for storage_key in removed_keys:
+            self.artifact_store.remove(storage_key)
+        self.artifact_store.cleanup_orphan_archives(referenced)
+        clean_job_dirs = True
+        try:
+            from backend.services.browser_review_jobs import browser_review_job_manager
+
+            jobs = await browser_review_job_manager.list()
+            active_job_ids = {
+                job.id for job in jobs if job.status not in _BROWSER_TERMINAL
+            }
+        except Exception:
+            # Failure to prove which jobs are active must never turn into
+            # deleting their staging evidence under quota pressure.
+            clean_job_dirs = False
+            active_job_ids = set()
+        if clean_job_dirs:
+            self.artifact_store.cleanup_job_dirs(active_job_ids=active_job_ids)
+        return len(removed_keys)
+
+    async def _retention_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.retention_interval)
+            try:
+                await self.cleanup_evidence()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Test Harness evidence retention failed")
+
+    async def recover_interrupted_runs(self) -> int:
+        obsolete_storage_keys: list[str] = []
+        async with self._db_lock:
+            async with self.db_factory() as db:
+                attempts_to_reconcile = list(
+                    (
+                        await db.execute(
+                            select(TestHarnessAttempt).where(
+                                TestHarnessAttempt.artifact_root.is_not(None)
+                            )
+                        )
+                    ).scalars()
+                )
+                reconciled = False
+                for attempt in attempts_to_reconcile:
+                    source_root = attempt.artifact_root
+                    if not source_root or not self.artifact_store.is_managed_job_dir(
+                        source_root
+                    ):
+                        continue
+                    run_for_attempt = await db.get(TestHarnessRun, attempt.run_id)
+                    if run_for_attempt is None or run_for_attempt.task_id is None:
+                        continue
+                    try:
+                        names = self.artifact_store.list_job_artifacts(source_root)
+                        obsolete_storage_keys.extend(
+                            await self._archive_evidence_files(
+                                db,
+                                run=run_for_attempt,
+                                attempt_id=attempt.id,
+                                root=Path(source_root),
+                                names=names,
+                                browser_review_job_id=attempt.browser_review_job_id,
+                            )
+                        )
+                    except TestHarnessArtifactError:
+                        logger.exception(
+                            "Could not reconcile interrupted Harness evidence run=%s",
+                            attempt.run_id,
+                        )
+                        continue
+                    attempt.artifact_root = self.artifact_store.run_prefix(
+                        task_id=run_for_attempt.task_id,
+                        run_id=run_for_attempt.id,
+                        attempt_id=attempt.id,
+                    )
+                    reconciled = True
+
                 runs = list(
                     (
                         await db.execute(
@@ -1449,15 +1577,34 @@ class TestHarnessService:
                         attempt.stage = "interrupted"
                         attempt.error = "Manager restarted before the browser attempt ended"
                         attempt.completed_at = datetime.utcnow()
+                if runs or reconciled:
                     await db.commit()
-                return len(runs)
+                interrupted_count = len(runs)
+        for storage_key in obsolete_storage_keys:
+            self.artifact_store.remove(storage_key)
+        await self.cleanup_evidence()
+        if (
+            self.retention_interval > 0
+            and (self._retention_task is None or self._retention_task.done())
+        ):
+            self._retention_task = asyncio.create_task(
+                self._retention_loop(),
+                name="test-harness-evidence-retention",
+            )
+        return interrupted_count
 
     async def shutdown(self) -> None:
+        retention_task = self._retention_task
+        self._retention_task = None
+        if retention_task is not None and not retention_task.done():
+            retention_task.cancel()
         tasks = [task for task in self._pipelines.values() if not task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        if retention_task is not None:
+            await asyncio.gather(retention_task, return_exceptions=True)
 
     def _register_pipeline(self, run_id: str, task: asyncio.Task[None]) -> None:
         existing = self._pipelines.get(run_id)

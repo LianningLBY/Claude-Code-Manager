@@ -849,7 +849,7 @@ export function BrowserReviewPanel({
                 <div className="min-w-0 flex-1">
                   <div className="text-xs font-medium text-gray-200">Browser Agent 独立运行配置</div>
                   <div className="mt-1 text-[10px] leading-relaxed text-gray-500">
-                    这组设置只控制浏览器审查 Agent，不会修改当前 Task 的模型或推理强度。普通对话、单次审查、PR/分支审查和 Goal 复查都会使用它。
+                    这组设置只控制浏览器审查 Agent，不会修改当前 Task 的模型或推理强度。普通对话、单次审查和 Goal 复查都会使用它。
                   </div>
                 </div>
               </div>
@@ -968,9 +968,12 @@ export function BrowserReviewPanel({
                 required
                 value={configuredUrl}
                 onChange={(event) => setConfiguredUrl(event.target.value)}
-                placeholder="https://example.com 或 http://127.0.0.1:5173"
+                placeholder="https://example.com"
                 className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2.5 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
               />
+              <p className="mt-1.5 text-[10px] leading-relaxed text-gray-500">
+                固定 URL 只允许公网地址，并通过受控网络出口访问。本机 Preview 请使用输入框上方的“单次审查”。
+              </p>
             </div>
 
             <div>

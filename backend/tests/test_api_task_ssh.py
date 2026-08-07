@@ -3,7 +3,9 @@ from pathlib import Path
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from sqlalchemy import select
 
+from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.services.ssh_executor import (
     SSHCommandResult,
     derive_openssh_public_key,
@@ -77,6 +79,36 @@ async def test_task_create_atomically_snapshots_ssh_grant(client, tmp_path):
     serialized = listed.text
     assert "key_path" not in serialized
     assert "host_key_value" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_task_delete_removes_ssh_grants(
+    client,
+    session_factory,
+    tmp_path,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Temporary remote inspection",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["read"]}],
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    deleted = await client.delete(f"/api/tasks/{task_id}")
+    assert deleted.status_code == 200, deleted.text
+
+    async with session_factory() as db:
+        remaining = list((await db.execute(
+            select(TaskSSHGrant).where(TaskSSHGrant.task_id == task_id)
+        )).scalars())
+    assert remaining == []
+
+    recreated = await client.post("/api/tasks", json={
+        "description": "Another remote inspection",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["read"]}],
+    })
+    assert recreated.status_code == 201, recreated.text
 
 
 @pytest.mark.asyncio

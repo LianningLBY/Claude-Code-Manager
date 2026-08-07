@@ -1,8 +1,8 @@
-
-
 # Claude Code Manager
 
-Web-based tool for scheduling and managing multiple Claude Code instances to work in parallel. Inspired by Hu Yuanming's article "I Made 10 Claude Code Instances Work for Me".
+[简体中文](README.md) | **English**
+
+Web-based tool for scheduling and managing multiple Claude Code instances to work in parallel. Inspired by Hu Yuanming's article "I Worked for 10 Claude Code Instances".
 
 > **⚠️ Important Security Notice:** This project runs Claude Code in `--dangerously-skip-permissions` mode, which means Claude Code will have **unrestricted file read/write, command execution, and network access**, and will automatically perform operations like `git push`. **Strongly recommended to deploy on a separate machine or virtual machine without important files** to avoid unintended impact on your personal data or work environment.
 
@@ -22,7 +22,7 @@ Web-based tool for scheduling and managing multiple Claude Code instances to wor
 - **Multi-Provider (Claude / Codex)** — Task-level execution engine selection: OpenAI Codex CLI (default, `gpt-5.6-sol`) or Claude Code. Codex tasks support full lifecycle, multi-turn dialog, Goal mode evaluation, Plan approval, automatic context compression, instantaneous error backoff retry, account pool, and cross-Worker rollout migration; instruction files read `AGENTS.md` (auto-injected). PTY hot sessions, `ask_user`, and Claude native sub-agents remain Claude-exclusive (explicitly hidden/rejected under Codex, no silent degradation)
 - **Persistent PTY Session Mode** — Default mode, Claude Code runs as a persistent interactive session, multi-turn cold-start free (hot session reuse), first launch shows Cold Start indicator
 - **Goal Mode** — `mode="goal"` uses natural language completion conditions (`goal_condition`), lightweight evaluator (default Haiku) automatically checks goal achievement after each turn
-- **Plan Mode** — Sensitive tasks first generate a read-only plan, executed only after manual approval
+- **Interactive Versioned Plans** — A Plan is a first-class artifact independent of Tasks. Planner and Reviewer can pause the same Run for any number of required inputs, resume after answers, and preserve immutable Version history. Approval does not execute anything automatically: a related Version is applied only when the user explicitly attaches it to the next real message, while a standalone Version can create an execution Task on demand
 - **Effort Level** — Supports `low` / `medium` / `high` / `xhigh` / `max` five levels, priority chain: Task → Instance → Global default
 - **Model Configuration** — Supports full model IDs (including `claude-opus-5`); Opus 5 fixed to 1M context and supports `low/medium/high/xhigh/max` effort; other compatible models can enable 1M context with `[1m]` suffix
 - **Codex Fast** — Codex Tasks can choose Standard or Fast; Fast uses the same model's `priority` service tier, won't switch models or reduce effort. Currently supports GPT-5.6 Sol/Terra/Luna, GPT-5.5, GPT-5.4; if account/model cannot confirm `priority`, it explicitly fails before execution, won't silently attach Fast badge and run as Standard
@@ -53,7 +53,7 @@ Web-based tool for scheduling and managing multiple Claude Code instances to wor
 
 ### Distributed
 - **Distributed Workers** — Distributes tasks to remote EC2 instances for execution, breaking single-machine concurrency limits. Phase 1 (create/deploy/manage) + Phase 2 (task forwarding + event relay) + Phase 3 (real-time task migration) all available. See [Worker Deployment Guide](docs/worker-deployment-guide.md)
-- **Safe One-Click Update & Restart** — Scheduled background checks with popup reminders; pauses new task claims during update, refuses restart if active tasks, manual instances without tasks, or pending resume messages aren't zeroed; detects manually pulled but unlaoded code, then completes dependencies, migration, frontend build, and intelligent restart
+- **Safe One-Click Update & Restart** — Scheduled background checks with popup reminders; pauses new task claims during update, refuses restart if active tasks, manual instances without tasks, or pending resume messages aren't zeroed; detects manually pulled but unloaded code, then completes dependencies, migration, frontend build, and intelligent restart
 
 ### Projects & Collaboration
 - **Project Management** — Supports cloning existing repositories (with remote) and local git init (without remote), new projects can be created directly when creating tasks
@@ -111,6 +111,8 @@ claude-manager/
 │   ├── database.py              # SQLAlchemy async engine + session
 │   ├── api/                     # REST + WebSocket routes
 │   │   ├── tasks.py             # Task CRUD + plan approval + conflict resolution
+│   │   ├── plans.py             # Related Plan history, staleness, revisions, execution Tasks
+│   │   ├── plan_resources.py    # First-class Plan/Version/Run/Input/Application API
 │   │   ├── chat.py              # Multi-turn conversation (based on task, --resume)
 │   │   ├── instances.py         # Instance CRUD + Ralph Loop + Dispatcher endpoints
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -130,6 +132,8 @@ claude-manager/
 │   │   └── ask_user_hook.py     # AskUserQuestion PreToolUse hook script
 │   ├── models/                  # SQLAlchemy ORM models
 │   │   ├── task.py              # Task (session_id, last_cwd, project_id, enabled_skills, effort_level...)
+│   │   ├── plan_agent.py        # Planner/Reviewer Runs and step audit records
+│   │   ├── plan.py              # Plan/Version/Input/Application aggregate models
 │   │   ├── instance.py          # Claude Code instance
 │   │   ├── project.py           # Project (name, git_url, local_path)
 │   │   ├── sub_agent.py         # SubAgentSession + SubAgentReport (generic sub-agents)
@@ -146,6 +150,9 @@ claude-manager/
 │       ├── instance_manager.py  # Child process lifecycle (launch/stop/consume, MCP injection)
 │       ├── claude_pool.py       # Multi-account pool (rate limit detection/auto-switch/session migration/quota query)
 │       ├── goal_evaluator.py    # Goal condition evaluator (claude -p child process)
+│       ├── plan_agent_runner.py # Strictly read-only Planner/Reviewer pipeline
+│       ├── plan_tasks.py        # Plan context, repository fingerprints, staleness, attachment validation
+│       ├── plan_service.py      # Version state machine, inputs, approval, Worker outcome imports
 │       ├── mcp_config.py        # Dynamic MCP config generation
 │       ├── tmp_space_manager.py # /tmp capacity/inode watchdog & whitelist safety cleanup
 │       ├── cloud_provider.py    # AWS EC2 Provider (Worker instance create/start/destroy)
@@ -171,7 +178,7 @@ claude-manager/
 │       ├── api/ws.ts            # WebSocket client (exponential backoff reconnect)
 │       ├── config/server.ts     # Remote server URL config (Capacitor/Android)
 │       ├── config/theme.ts      # Theme registry (modern dark/light + Legacy group, meta theme-color sync)
-│       ├── pages/               # Dashboard, TasksPage, WorkersPage, PRMonitorPage, LoginPage...
+│       ├── pages/               # Dashboard, TasksPage, PlansPage, WorkersPage, PRMonitorPage, LoginPage...
 │       ├── components/
 │       │   ├── AskUserNotifications.tsx   # Global ask_user popup notifications
 │       │   ├── Chat/ChatView.tsx          # Multi-turn conversation UI
@@ -180,7 +187,7 @@ claude-manager/
 │       │   ├── Instances/                 # InstanceGrid, InstanceLog
 │       │   ├── Tasks/                     # TaskForm, TaskList, TaskConfigBadge
 │       │   ├── Layout/PoolDrawer.tsx      # Pool quota drawer
-│       │   ├── PlanReview/PlanPanel.tsx    # Plan approval
+│       │   ├── PlanReview/                 # First-class Plan action/history/detail/input UI
 │       │   ├── System/                    # UpdatePanel
 │       │   └── Voice/VoiceButton.tsx      # Voice input
 │       └── hooks/useWebSocket.ts
@@ -255,8 +262,13 @@ cd frontend
 # Install Capacitor (already in package.json)
 npm install
 
-# Build + sync + package APK
+# Build web assets
 npm run build
+
+# First clone only: generate the untracked native Android project; skip on later builds
+npx cap add android
+
+# Sync web assets and native dependencies, then package the APK
 npx cap sync android
 JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home" \
   android/gradlew -p android assembleDebug
@@ -293,17 +305,7 @@ uv run alembic history         # View history
 
 ### Data Migration
 
-Migrate all data between databases (note to use sync URLs):
-
-```bash
-# First initialize schema on target DB
-DATABASE_URL=postgresql+asyncpg://... uv run alembic upgrade head
-
-# Then migrate data
-uv run python scripts/transfer_db.py \
-    "sqlite:///./claude_manager.db" \
-    "postgresql://user:pass@host:5432/claude_manager"
-```
+This repository does not provide a data-transfer script for moving between SQLite, PostgreSQL, and MySQL. For a cross-database migration, stop writes and take a complete backup first, then use the source and target databases' official export, import, or replication tools (or an independently validated ETL process). After migration, run Alembic, verify row counts and critical relationships, and complete a restore drill before switching `DATABASE_URL`.
 
 ## Updating Deployed Instances
 
@@ -369,12 +371,19 @@ cd frontend && npm run build && cd ..  # 4. Rebuild frontend
 4. In tasks with Monitor enabled, Agent can autonomously create persistent monitoring sub-agents, task list shows active sub-agent count
 5. Can add focus tag via task card menu, or click task card/chat top bar tag to modify; clear and save to remove
 
-### Plan Mode
+### Interactive Plans
 
-Select Mode = `plan` when creating task:
-1. Claude Code first analyzes code in read-only mode, generates execution plan
-2. Task enters `plan_review` status, shows plan content on Tasks page
-3. Click Approve to allow, task re-queues for execution
+A Plan is a first-class, versioned artifact independent of Tasks:
+
+1. Create a standalone Plan on the dedicated **Plans** page, or create multiple independent related Plans from the **Plans** panel in an existing Chat. The **Tasks** page creates and displays only real Tasks.
+2. Planner/Reviewer routing is configured only in global Settings. Each new Plan freezes the current primary/fallback provider, model, effort, and round settings.
+3. Both Planner and Reviewer can pause the same Run for required input. There is no business limit on the number of questions in one round; the number of pauses allowed per Run is a separate global `0–5` setting.
+4. Each complete proposal is stored as an immutable Version. Revise creates a new Run and Version under the same Plan; only Fork creates a new Plan.
+5. Approve/Reject applies to the exact Version the user viewed and does not wake or change the original Task/session. A related Version is applied once only when explicitly attached to the next real message; a standalone Version can explicitly create a normal execution Task.
+
+The **Plans** page groups pending inputs, approvals, and execution actions under **Plans requiring action**. Its catalog supports standalone/related, status, Project, search, and Archived only filters. Archive is a reversible soft archive and does not delete Plan, Version, Run, or Q&A history. Plan details retain Version switching and comparison, complete Q&A/Run/route/repository audit history, and the dual state where an older Version was applied while a newer Version awaits review. If the conversation, repository, or target changes, an action requires stale confirmation or is explicitly blocked by a hard conflict.
+
+Planner and Reviewer use a strictly read-only transport. Codex steps reuse the account's persistent App Server, but use a disposable read-only thread that is deleted at terminal state. Plan creation requests, titles, Revise/Fork requests, and answers are persisted, so high-confidence credentials such as API keys, access tokens, and private keys must be stored in **Settings → Secrets**; Plan text should contain only the reference name.
 
 ### Goal Mode
 
@@ -433,12 +442,22 @@ Worker system supports distributing tasks to remote EC2 instances for execution,
 | | `GET/PUT/DELETE /api/tasks/{id}` | Task detail/update/delete |
 | | `POST /api/tasks/{id}/cancel` | Cancel task |
 | | `POST /api/tasks/{id}/retry` | Retry task |
-| | `POST /api/tasks/{id}/plan/approve` | Approve plan |
 | | `POST /api/tasks/{id}/chat` | Send follow-up message |
 | | `GET /api/tasks/{id}/chat/history` | Get chat history |
 | | `POST /api/tasks/{id}/permissions/{rid}` | Reply to permission request |
 | | `POST /api/tasks/{id}/ask-user/{rid}` | Reply to ask_user prompt |
 | | `GET /api/tasks/{id}/ask-user/pending` | Get pending prompts |
+| Plans | `GET/POST /api/plans` | Plan catalog/create |
+| | `GET/PATCH /api/plans/{id}` | Detail, rename, archive, or restore |
+| | `POST /api/plans/{id}/runs` | Create a Revise/Refresh/Retry Run |
+| | `POST /api/plans/{id}/fork` | Fork into a new Plan |
+| | `GET /api/plans/{id}/versions` | Get immutable Version history |
+| | `GET /api/plan-versions/{id}` | Get an exact Version |
+| | `GET /api/plan-versions/{id}/staleness` | Check whether Version context is stale |
+| | `POST /api/plan-versions/{id}/approve` | Approve an exact Version |
+| | `POST /api/plan-versions/{id}/reject` | Reject an exact Version |
+| | `POST /api/plan-runs/{run_id}/input-requests/{request_id}/answer` | Answer required input and resume the same Run |
+| | `POST /api/plan-versions/{id}/create-execution-task` | Create an execution Task from a standalone Version |
 | Instances | `GET/POST /api/instances` | Instance list/create |
 | | `DELETE /api/instances/{id}` | Delete instance |
 | | `POST /api/instances/{id}/stop` | Stop instance |
@@ -505,7 +524,7 @@ All APIs (except health, login, github webhook) require `Authorization: Bearer <
 | `TASK_TIMEOUT_SECONDS` | `1800` | Max execution time per task (seconds) |
 | `SERVICE_NAME` | (Auto-detect) | systemd service name, used for one-click update restart |
 
-New installs won't generate fixed password admin: first registered user completing email verification becomes `super_admin`. When `AUTH_TOKEN` configured and no active users exist, registration form must fill that Token in optional "Bootstrap Token" field to prevent public visitors from抢占 first admin. Upgrades auto-disable shared default admin written by old versions; single-token deployments can still use `AUTH_TOKEN` to enter, team deployments need `SMTP_*` configured then register real admin. Verification code service rate-limits by email and `Request.client.host`; multi-process/multi-replica deployments should also configure shared rate-limiting at reverse proxy or gateway, as app-level state isolates per-process.
+New installs won't generate a fixed-password administrator: the first registered user to complete email verification becomes `super_admin`. When `AUTH_TOKEN` is configured and no active users exist, the registration form must include that Token in the optional "Bootstrap Token" field to prevent a public visitor from seizing the first administrator account. Upgrades automatically disable the shared default administrator created by older versions; single-token deployments can still enter with `AUTH_TOKEN`, while team deployments should configure `SMTP_*` and then register a real administrator. The verification-code service rate-limits by email and `Request.client.host`; multi-process or multi-replica deployments should also configure shared rate limiting at the reverse proxy or gateway because application-level state is isolated per process.
 
 ### PTY Mode
 

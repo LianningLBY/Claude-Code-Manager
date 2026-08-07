@@ -24,8 +24,11 @@ logger = logging.getLogger(__name__)
 _CCM_ROOT = Path(__file__).resolve().parent.parent.parent
 _VENV_PYTHON = _CCM_ROOT / ".venv" / "bin" / "python3"
 _HOOK_SCRIPT = _CCM_ROOT / "backend" / "hooks" / "ask_user_hook.py"
+_SSH_GUARD_SCRIPT = _CCM_ROOT / "backend" / "hooks" / "task_ssh_guard_hook.py"
 _MATCHER = "AskUserQuestion"
 _MARKER = "ask_user_hook.py"  # 识别"我们的"hook 项
+_SSH_GUARD_MATCHER = "Bash|Read|Write|Edit|MultiEdit|Glob|Grep"
+_SSH_GUARD_MARKER = "task_ssh_guard_hook.py"
 
 
 def _hook_command() -> str:
@@ -58,8 +61,37 @@ def _is_our_pretool_entry(entry: dict) -> bool:
     return False
 
 
-def ensure_ask_user_hook(config_dir: str) -> None:
-    """幂等地把（或从）{config_dir}/settings.json 加入/移除 AskUserQuestion hook。"""
+def _is_our_ssh_guard_entry(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks") or []:
+        if isinstance(hook, dict) and _SSH_GUARD_MARKER in (
+            hook.get("command") or ""
+        ):
+            return True
+    return False
+
+
+def _ssh_guard_command(protected_paths: tuple[str, ...]) -> str:
+    python = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else "python3"
+    parts = [python, str(_SSH_GUARD_SCRIPT)]
+    for path in protected_paths:
+        parts.extend(["--protected-path", path])
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def ensure_ask_user_hook(
+    config_dir: str,
+    *,
+    ssh_guard: bool = False,
+    ssh_protected_paths: tuple[str, ...] = (),
+) -> bool:
+    """Merge CCM's Claude hooks into ``settings.json``.
+
+    ``ssh_guard`` is security-sensitive: callers must check the return value
+    and fail the Task launch when it is false.  The AskUser hook retains its
+    historical fail-open behavior at its call sites.
+    """
     from backend.config import settings
 
     enabled = bool(getattr(settings, "ask_user_enabled", True))
@@ -85,7 +117,12 @@ def ensure_ask_user_hook(config_dir: str) -> None:
             pretool = []
 
         # 去掉旧的"我们的"项
-        new_pretool = [e for e in pretool if not _is_our_pretool_entry(e)]
+        new_pretool = [
+            entry
+            for entry in pretool
+            if not _is_our_pretool_entry(entry)
+            and not (ssh_guard and _is_our_ssh_guard_entry(entry))
+        ]
         changed = len(new_pretool) != len(pretool)
 
         if enabled:
@@ -102,6 +139,17 @@ def ensure_ask_user_hook(config_dir: str) -> None:
             })
             changed = True
 
+        if ssh_guard:
+            new_pretool.append({
+                "matcher": _SSH_GUARD_MATCHER,
+                "hooks": [{
+                    "type": "command",
+                    "command": _ssh_guard_command(ssh_protected_paths),
+                    "timeout": 5,
+                }],
+            })
+            changed = True
+
         # Ensure thinking summaries are visible in stream output —
         # without this, CC returns encrypted thinking only.
         if not data.get("showThinkingSummaries"):
@@ -110,7 +158,7 @@ def ensure_ask_user_hook(config_dir: str) -> None:
 
         # 没变化（disabled 且本来就没有我们的项）→ 不写盘
         if not changed and not enabled:
-            return
+            return True
 
         if new_pretool:
             hooks["PreToolUse"] = new_pretool
@@ -122,8 +170,10 @@ def ensure_ask_user_hook(config_dir: str) -> None:
             data.pop("hooks", None)
 
         _atomic_write_json(settings_path, data)
-    except Exception:  # noqa: BLE001 — 注入失败绝不能阻断 launch
+        return True
+    except Exception:  # noqa: BLE001 — SSH caller decides whether to fail closed
         logger.exception("ensure_ask_user_hook failed for %s", config_dir)
+        return False
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:

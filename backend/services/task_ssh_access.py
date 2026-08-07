@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.models.ssh_profile import SSHProfile
 from backend.models.task import Task
 from backend.models.task_ssh_grant import TaskSSHGrant
@@ -25,6 +27,65 @@ class PreparedTaskSSHGrant:
     profile_id: int
     profile_revision: int
     capabilities: tuple[str, ...]
+
+
+def task_ssh_policy_context(capabilities: Iterable[str]) -> str:
+    """Return provider-neutral, model-visible instructions for managed SSH.
+
+    The MCP allow-list is the enforcement boundary, but models also need an
+    explicit routing rule.  Otherwise a request such as "check my SSH hosts"
+    can make the general shell inspect ``~/.ssh/known_hosts`` and confuse
+    historical host keys with the Profiles authorized for this Task.
+    """
+
+    selected = sorted(set(capabilities) & {"exec", "read", "write"})
+    if not selected:
+        return ""
+    return (
+        "## Managed Task SSH (authoritative)\n"
+        "This Task has CCM-managed SSH access with capabilities: "
+        f"{', '.join(selected)}. For every request involving SSH, a remote "
+        "server, remote commands, or remote files, call "
+        "`ccm_ssh.list_connections` first and use only the returned "
+        "`valid=true` Profile ids with the `ccm_ssh` tools. Treat that "
+        "result as the complete authorized connection list. Never inspect "
+        "or use ambient `~/.ssh`, `known_hosts`, SSH agents, private-key "
+        "paths, system `ssh`/`scp`/`sftp`, or another network client as a "
+        "substitute. If a requested connection or capability is absent, "
+        "report that it must be authorized in CCM; do not search the host "
+        "for another credential."
+    )
+
+
+def _protected_path_variants(value: str | Path) -> set[str]:
+    raw = Path(value).expanduser()
+    if not raw.is_absolute():
+        return set()
+    variants = {str(raw)}
+    try:
+        variants.add(str(raw.resolve(strict=False)))
+    except OSError:
+        pass
+    return variants
+
+
+async def task_ssh_protected_paths(db: AsyncSession) -> tuple[str, ...]:
+    """Return local credential paths that Task tools must never read.
+
+    Include every Profile key, rather than only keys granted to the current
+    Task: an ungranted key is exactly the credential an ambient shell must not
+    discover.  The parent ``~/.ssh`` and CCM-managed storage roots also cover
+    history/config files and keys that have not yet been imported as Profiles.
+    """
+
+    values: set[str] = set()
+    values.update(_protected_path_variants(Path.home() / ".ssh"))
+    values.update(_protected_path_variants(settings.ssh_key_storage_dir))
+    key_paths = (await db.execute(select(SSHProfile.key_path))).scalars()
+    for key_path in key_paths:
+        if key_path:
+            values.update(_protected_path_variants(key_path))
+    return tuple(sorted(values))
 
 
 def task_ssh_scope_invalid_reason(

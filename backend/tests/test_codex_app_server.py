@@ -138,6 +138,109 @@ async def _start_tool_free_test_turn(
     )
 
 
+@pytest.mark.asyncio
+async def test_task_ssh_profile_denies_host_keys_and_direct_network():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-task-ssh",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+            "activePermissionProfile": {
+                "id": "ccm_task_ssh_isolated_v1",
+                "extends": None,
+            },
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": False,
+            },
+        },
+        {"turn": {"id": "turn-task-ssh"}},
+    ])
+
+    await server.start_turn(
+        prompt="inspect the authorized server",
+        cwd="/workspace/project",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env={"GIT_AUTHOR_NAME": "CCM"},
+        task_id=991,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=(
+            "/Users/operator/.ssh",
+            "/private/ccm/ssh-keys/profile.pem",
+        ),
+    )
+
+    thread_call, turn_call = server._request.await_args_list
+    thread_params = thread_call.args[1]
+    assert thread_params["sandbox"] == "workspace-write"
+    config = thread_params["config"]
+    assert config["default_permissions"] == "ccm_task_ssh_isolated_v1"
+    profile = config["permissions"]["ccm_task_ssh_isolated_v1"]
+    assert profile["filesystem"]["/"] == "read"
+    assert profile["filesystem"]["/workspace/project"] == "write"
+    assert profile["filesystem"]["/Users/operator/.ssh"] == "deny"
+    assert (
+        profile["filesystem"]["/private/ccm/ssh-keys/profile.pem"]
+        == "deny"
+    )
+    assert profile["network"] == {
+        "enabled": False,
+        "allow_local_binding": False,
+    }
+    assert config["shell_environment_policy"]["set"] == {
+        "GIT_AUTHOR_NAME": "CCM",
+        "CCM_TASK_SSH_GUARD": "1",
+        "SSH_AUTH_SOCK": "",
+        "SSH_AGENT_PID": "",
+        "SSH_ASKPASS": "",
+    }
+    assert turn_call.args[1]["sandboxPolicy"]["networkAccess"] is False
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_profile_fails_before_model_input_when_not_admitted():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "thread": {
+            "id": "thread-task-ssh-unproven",
+            "status": {"type": "idle"},
+        },
+        "serviceTier": "default",
+        "activePermissionProfile": {"id": ":workspace"},
+        "sandbox": {
+            "type": "workspaceWrite",
+            "networkAccess": False,
+        },
+    })
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task SSH isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=992,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+        )
+
+    assert server._request.await_count == 1
+
+
 def _write_schema_filtering_app_server(path: Path) -> None:
     """Write a stdio peer that models Codex 0.144.6's serde boundary."""
 

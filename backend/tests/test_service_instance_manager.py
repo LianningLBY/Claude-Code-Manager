@@ -1647,6 +1647,7 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
             task_id=task_id,
             cwd=str(tmp_path),
             provider="claude",
+            config_dir=str(tmp_path / "claude-task-ssh-home"),
         )
 
     argv = list(exec_mock.await_args.args)
@@ -1657,15 +1658,129 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
         assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
     finally:
         config_path.unlink(missing_ok=True)
+    env = exec_mock.await_args.kwargs["env"]
+    assert env["CCM_TASK_SSH_GUARD"] == "1"
+    assert env["SSH_AUTH_SOCK"] == ""
+    settings_data = json.loads(
+        (tmp_path / "claude-task-ssh-home" / "settings.json").read_text()
+    )
+    assert any(
+        "task_ssh_guard_hook.py" in hook.get("command", "")
+        for entry in settings_data["hooks"]["PreToolUse"]
+        for hook in entry.get("hooks", [])
+    )
+    policy_path = Path(argv[argv.index("--append-system-prompt-file") + 1])
+    assert "ccm_ssh.list_connections" in policy_path.read_text()
+    assert "known_hosts" in policy_path.read_text()
     await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio
-async def test_codex_ssh_mcp_is_required_when_main_mcp_is_disabled(
+async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        inst = Instance(name="claude-pty-task-ssh")
+        profile = _managed_ssh_profile("claude-pty-launch-ssh")
+        db.add_all([inst, profile])
+        await db.flush()
+        task = Task(
+            title="Claude PTY SSH task",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._pty_enabled = True
+    im._pty_backend = MagicMock()
+    im._launch_pty = AsyncMock(return_value=54_321)
+
+    pid = await im.launch(
+        instance_id=inst.id,
+        prompt="inspect remote files",
+        task_id=task.id,
+        cwd=str(tmp_path),
+        provider="claude",
+        config_dir=str(tmp_path / "claude-pty-ssh-home"),
+    )
+
+    assert pid == 54_321
+    kwargs = im._launch_pty.await_args.kwargs
+    assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
+    assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert "ccm_ssh.list_connections" in kwargs["skill_context"]
+    assert "known_hosts" in kwargs["skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_claude_task_ssh_refuses_launch_when_guard_install_fails(
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        inst = Instance(name="claude-task-ssh-no-guard")
+        profile = _managed_ssh_profile("claude-task-ssh-no-guard-profile")
+        db.add_all([inst, profile])
+        await db.flush()
+        task = Task(
+            title="Claude SSH must fail closed",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["exec"],
+        ))
+        await db.commit()
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with (
+        patch(
+            "backend.services.ask_user_settings.ensure_ask_user_hook",
+            return_value=False,
+        ),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
+        with pytest.raises(
+            RuntimeError,
+            match="Task SSH guard could not be installed",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="connect",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="claude",
+                config_dir=str(tmp_path / "claude-task-ssh-no-guard-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_ssh_requires_isolated_app_server_when_main_mcp_is_disabled(
     db_factory,
     monkeypatch,
     tmp_path,
-    caplog,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
@@ -1693,38 +1808,25 @@ async def test_codex_ssh_mcp_is_required_when_main_mcp_is_disabled(
         task_id = task.id
         instance_id = inst.id
 
-    process = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    with (
-        caplog.at_level("INFO", logger="backend.services.instance_manager"),
-        patch(
-            "backend.services.instance_manager.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=process,
-        ) as exec_mock,
-    ):
-        await im.launch(
-            instance_id=instance_id,
-            prompt="run health check",
-            task_id=task_id,
-            cwd=str(tmp_path),
-            provider="codex",
-            config_dir=str(tmp_path / "codex-ssh-home"),
-        )
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="requires the app-server isolated permission profile",
+        ):
+            await im.launch(
+                instance_id=instance_id,
+                prompt="run health check",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-ssh-home"),
+            )
 
-    argv = list(exec_mock.await_args.args)
-    expected = render_codex_exec_config_args(
-        build_task_ssh_mcp_server_specs(
-            task_id,
-            capabilities=("exec",),
-        )
-    )
-    flag_index = argv.index("-c")
-    assert argv[flag_index:flag_index + 2] == expected
-    assert "ccm_ssh" in expected[1]
-    assert "ccm_skills" not in expected[1]
-    assert "required_mcp=True" in caplog.text
-    await asyncio.sleep(0.1)
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1779,6 +1881,67 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
         "list_directory",
         "read_file",
     )
+    kwargs = im._launch_codex_app_server.await_args.kwargs
+    assert kwargs["sandbox_mode"] == "workspace-write"
+    assert "/private/test/id_ed25519" in kwargs["task_ssh_protected_paths"]
+    assert any(path.endswith("/.ssh") for path in kwargs["task_ssh_protected_paths"])
+    assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
+    assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert "ccm_ssh.list_connections" in kwargs["skill_context"]
+    assert "known_hosts" in kwargs["skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_codex_task_ssh_isolation_failure_never_falls_back_to_exec(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="codex-task-ssh-isolation-failure")
+        profile = _managed_ssh_profile("codex-task-ssh-isolation-profile")
+        db.add_all([inst, profile])
+        await db.flush()
+        task = Task(
+            title="Codex SSH must fail closed",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(side_effect=(
+        CodexRequiredMcpPreTurnError("SSH profile not admitted")
+    ))
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="Task SSH isolation could not be confirmed",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="inspect remote file",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-task-ssh-failed-home"),
+            )
+
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio

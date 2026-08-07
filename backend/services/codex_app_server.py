@@ -97,6 +97,7 @@ def _format_process_exit(returncode: int | None) -> str:
 # this exact profile, rather than an inherited :read-only profile, was selected
 # before any model turn is admitted.
 _TOOL_FREE_PERMISSION_PROFILE = "ccm_pr_review_no_access_v1"
+_TASK_SSH_PERMISSION_PROFILE = "ccm_task_ssh_isolated_v1"
 _TOOL_FREE_DISABLED_FEATURES = frozenset({
     "apps",
     "artifact",
@@ -384,6 +385,51 @@ def _audit_tool_free_thread_response(response: Any) -> None:
         raise ValueError(
             "deny-all profile did not resolve to restricted sandbox"
         )
+
+
+def _task_ssh_permission_config(
+    *,
+    cwd: str,
+    protected_paths: Sequence[str],
+) -> dict[str, Any]:
+    """Build a request-local Codex profile that hides host SSH material."""
+
+    filesystem: dict[str, str] = {"/": "read"}
+    for writable in {
+        os.path.abspath(cwd),
+        os.path.abspath(os.environ.get("TMPDIR") or "/tmp"),
+        "/tmp",
+    }:
+        filesystem[writable] = "write"
+    for value in protected_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if path == "/":
+            raise ValueError("Task SSH protected path cannot be filesystem root")
+        filesystem[path] = "deny"
+    return {
+        "filesystem": filesystem,
+        "network": {
+            "enabled": False,
+            "allow_local_binding": False,
+        },
+    }
+
+
+def _audit_task_ssh_thread_response(response: Any) -> None:
+    """Prove Codex admitted CCM's exact SSH-isolation profile."""
+
+    if not isinstance(response, dict):
+        raise ValueError("thread response is not an object")
+    permission_profile = response.get("activePermissionProfile")
+    if (
+        not isinstance(permission_profile, dict)
+        or permission_profile.get("id") != _TASK_SSH_PERMISSION_PROFILE
+        or permission_profile.get("extends") is not None
+    ):
+        raise ValueError("Task SSH isolation profile was not selected")
+    sandbox = response.get("sandbox")
+    if not isinstance(sandbox, dict) or sandbox.get("networkAccess") is not False:
+        raise ValueError("Task SSH isolation did not disable direct network")
 
 
 def _tool_free_disabled_skill_config(
@@ -2378,6 +2424,7 @@ class CodexAppServer:
         skill_context: str = "",
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
+        task_ssh_protected_paths: Sequence[str] = (),
         disable_autonomous_features: bool = False,
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
@@ -2427,6 +2474,15 @@ class CodexAppServer:
                     resume_session_id,
                 )
                 resume_session_id = None
+        if task_ssh_protected_paths:
+            if tools_disabled:
+                raise CodexRequiredMcpPreTurnError(
+                    "Task SSH isolation cannot be combined with tool-free mode"
+                )
+            if sandbox_mode != "workspace-write":
+                raise CodexRequiredMcpPreTurnError(
+                    "Task SSH isolation requires workspace-write admission"
+                )
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2575,6 +2631,21 @@ class CodexAppServer:
                     "project_doc_fallback_filenames": [],
                 },
             )
+        elif task_ssh_protected_paths:
+            _deep_merge_config(
+                thread_config,
+                {
+                    "default_permissions": _TASK_SSH_PERMISSION_PROFILE,
+                    "permissions": {
+                        _TASK_SSH_PERMISSION_PROFILE: (
+                            _task_ssh_permission_config(
+                                cwd=cwd,
+                                protected_paths=task_ssh_protected_paths,
+                            )
+                        ),
+                    },
+                },
+            )
         try:
             await self.ensure_started()
         except CodexAppServerBusyError:
@@ -2680,13 +2751,21 @@ class CodexAppServer:
                 service_tier=service_tier,
             )
         launch_started = time.perf_counter()
-        if git_env:
+        if git_env or task_ssh_protected_paths:
             # Per-project git credentials must remain thread-scoped.  A global
             # app-server environment would leak one project's identity into
             # every other concurrently running task.
+            shell_environment = dict(git_env or {})
+            if task_ssh_protected_paths:
+                shell_environment.update({
+                    "CCM_TASK_SSH_GUARD": "1",
+                    "SSH_AUTH_SOCK": "",
+                    "SSH_AGENT_PID": "",
+                    "SSH_ASKPASS": "",
+                })
             thread_config["shell_environment_policy"] = {
                 "inherit": "all",
-                "set": git_env,
+                "set": shell_environment,
             }
 
         common: dict[str, Any] = {
@@ -2829,6 +2908,14 @@ class CodexAppServer:
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex tool-free profile was not proven by the "
+                    f"{thread_method} response"
+                ) from exc
+        elif task_ssh_protected_paths:
+            try:
+                _audit_task_ssh_thread_response(response)
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task SSH isolation profile was not proven by the "
                     f"{thread_method} response"
                 ) from exc
         self._known_threads.add(thread_id)

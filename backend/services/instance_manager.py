@@ -892,6 +892,7 @@ class InstanceManager:
         codex_monitor_enabled = False
         pr_review_task = False
         task_ssh_capabilities: set[str] = set()
+        task_ssh_protected_path_values: tuple[str, ...] = ()
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -924,6 +925,8 @@ class InstanceManager:
                 pr_review_task = is_pr_sandbox_task(task)
                 if not pr_review_task:
                     from backend.services.task_ssh_access import (
+                        task_ssh_policy_context,
+                        task_ssh_protected_paths,
                         valid_task_ssh_capabilities,
                     )
 
@@ -931,6 +934,10 @@ class InstanceManager:
                         db,
                         task,
                     )
+                    if task_ssh_capabilities:
+                        task_ssh_protected_path_values = (
+                            await task_ssh_protected_paths(db)
+                        )
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -956,6 +963,15 @@ class InstanceManager:
                         provider=provider,
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
+                    )
+                if task_ssh_capabilities:
+                    ssh_policy = task_ssh_policy_context(
+                        task_ssh_capabilities
+                    )
+                    task_skill_context = "\n\n".join(
+                        value
+                        for value in (task_skill_context.strip(), ssh_policy)
+                        if value
                     )
                 if pr_review_task:
                     # PR input is already snapshotted into the fixed prompt.
@@ -1020,11 +1036,32 @@ class InstanceManager:
                 task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
             )
 
-        # ask_user：把 AskUserQuestion 拦截 hook 注入本次使用的 config_dir（-p 与 PTY 统一）。
-        # config_dir 为空时落到默认 ~/.claude。失败不阻断 launch。
+        # AskUser and Task SSH guards share Claude's account settings so PTY
+        # and direct ``-p`` launches receive the same PreToolUse policy.
         if provider == "claude" and not pr_review_task:
             from backend.services.ask_user_settings import ensure_ask_user_hook
-            ensure_ask_user_hook(config_dir or os.path.expanduser("~/.claude"))
+            hooks_ready = ensure_ask_user_hook(
+                config_dir or os.path.expanduser("~/.claude"),
+                ssh_guard=bool(task_ssh_capabilities),
+                ssh_protected_paths=task_ssh_protected_path_values,
+            )
+            if task_ssh_capabilities and not hooks_ready:
+                raise RuntimeError(
+                    "Task SSH guard could not be installed for Claude"
+                )
+
+        if task_ssh_capabilities:
+            # These variables are inherited by Claude PTY, Claude direct, and
+            # Codex shell environments. Empty agent coordinates prevent the
+            # OpenSSH client from reaching a service-level agent even if a
+            # future tool bypasses the command hook.
+            git_env = dict(git_env or {})
+            git_env.update({
+                "CCM_TASK_SSH_GUARD": "1",
+                "SSH_AUTH_SOCK": "",
+                "SSH_AGENT_PID": "",
+                "SSH_ASKPASS": "",
+            })
 
         # Check if shared project → prepare Docker container wrapper for PTY
         _container_project_id = None
@@ -1167,6 +1204,16 @@ class InstanceManager:
                 "sandbox; exec fallback is disabled"
             )
 
+        if (
+            provider == "codex"
+            and codex_ssh_mcp_required
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexRequiredMcpError(
+                "Codex Task SSH requires the app-server isolated permission "
+                "profile; exec fallback is disabled"
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
@@ -1198,7 +1245,16 @@ class InstanceManager:
                         sandbox_mode=(
                             "read-only"
                             if pr_review_task
-                            else "danger-full-access"
+                            else (
+                                "workspace-write"
+                                if codex_ssh_mcp_required
+                                else "danger-full-access"
+                            )
+                        ),
+                        task_ssh_protected_paths=(
+                            task_ssh_protected_path_values
+                            if codex_ssh_mcp_required
+                            else ()
                         ),
                         disable_autonomous_features=pr_review_task,
                         tools_disabled=pr_review_task,
@@ -1223,10 +1279,14 @@ class InstanceManager:
                             "Codex Fast could not be confirmed before "
                             "turn/start; exec fallback is disabled for Fast"
                         ) from exc
+                    if codex_ssh_mcp_required:
+                        raise CodexRequiredMcpError(
+                            "Codex Task SSH isolation could not be confirmed "
+                            "before turn/start"
+                        ) from exc
                     if (
                         (
                             codex_main_mcp_required
-                            or codex_ssh_mcp_required
                         )
                         and not codex_sub_agent_mcp_required
                     ):
@@ -2090,6 +2150,7 @@ class InstanceManager:
         disable_project_config: bool = False,
         codex_service_tier: str = "default",
         sandbox_mode: str = "danger-full-access",
+        task_ssh_protected_paths: Sequence[str] = (),
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
     ) -> int:
@@ -2112,6 +2173,7 @@ class InstanceManager:
             skill_context=skill_context,
             codex_service_tier=codex_service_tier,
             sandbox_mode=sandbox_mode,
+            task_ssh_protected_paths=task_ssh_protected_paths,
             disable_autonomous_features=disable_autonomous_features,
             tools_disabled=tools_disabled,
         )

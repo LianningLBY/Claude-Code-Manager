@@ -1257,7 +1257,7 @@ describe('ChatView', () => {
       ));
       expect(api.sendTaskChat).not.toHaveBeenCalled();
       expect(api.startFrontendReviewGoal).not.toHaveBeenCalled();
-      expect(await screen.findByText('Test Harness · current_workspace')).toBeInTheDocument();
+      expect(await screen.findByText('Test Harness · 当前工作区')).toBeInTheDocument();
       expect(screen.getAllByText('正在校验本地仓库').length).toBeGreaterThan(0);
     });
 

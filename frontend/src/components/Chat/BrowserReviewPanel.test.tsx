@@ -3,6 +3,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 
 import type {
   BrowserReviewJob,
+  TestHarnessCapabilities,
   TestHarnessRun,
   TestHarnessRuntimeConfig,
   WorkspaceReviewRun,
@@ -16,6 +17,7 @@ vi.mock('../../api/client', () => ({
     cancelTestRun: vi.fn(),
     repeatTestRun: vi.fn(),
     startTestRun: vi.fn(),
+    getTestHarnessCapabilities: vi.fn(),
     getTestHarnessRuntimeConfig: vi.fn(),
     updateTestHarnessRuntimeConfig: vi.fn(),
   },
@@ -63,6 +65,45 @@ const defaultRuntimeConfig: TestHarnessRuntimeConfig = {
     'gpt-5.6-sol': ['default', 'priority'],
     'gpt-5.6-terra': ['default', 'priority'],
   },
+};
+
+const defaultCapabilities: TestHarnessCapabilities = {
+  contract_version: 1,
+  available: true,
+  reason: null,
+  provider: 'codex',
+  task_provider: 'codex',
+  provider_browser_capability: true,
+  runtime_configurable: true,
+  runtime: defaultRuntimeConfig,
+  context_policy: 'isolated_black_box_v1',
+  targets: {
+    current_workspace: true,
+    fixed_url: true,
+    pull_request: true,
+    git_ref: true,
+  },
+  target_reasons: {
+    pull_request: null,
+    git_ref: null,
+  },
+  sandbox: {
+    available: true,
+    backend: 'docker',
+    reason: null,
+    image: 'ccm-test-harness-sandbox:local',
+    image_id: `sha256:${'1'.repeat(64)}`,
+  },
+  preview: {
+    available: true,
+    reason: null,
+    repo_path: '/repo',
+    configured: true,
+    config: null,
+    suggested_config: null,
+  },
+  supports_repeat: true,
+  supports_compare: true,
 };
 
 const completedJob: BrowserReviewJob = {
@@ -171,6 +212,7 @@ function makeHarnessRun(overrides: Partial<TestHarnessRun> = {}): TestHarnessRun
     agent_task_id: workspace?.agent_task_id ?? browser?.task_id ?? null,
     target_kind: workspace ? 'current_workspace' : 'fixed_url',
     target: workspace ? {} : { url: browser?.url || 'http://127.0.0.1:5173' },
+    resolved_target: null,
     test_plan: { version: 1, objective, scenarios: [] },
     runtime: { context_policy: 'isolated_black_box_v1' },
     request_fingerprint: 'f'.repeat(64),
@@ -220,6 +262,7 @@ function makeHarnessRun(overrides: Partial<TestHarnessRun> = {}): TestHarnessRun
 
 beforeEach(() => {
   vi.mocked(api.listTestRuns).mockResolvedValue([]);
+  vi.mocked(api.getTestHarnessCapabilities).mockResolvedValue(defaultCapabilities);
   vi.mocked(api.getTestHarnessRuntimeConfig).mockResolvedValue(defaultRuntimeConfig);
   vi.mocked(api.updateTestHarnessRuntimeConfig).mockImplementation(async (_taskId, update) => ({
     ...defaultRuntimeConfig,
@@ -307,7 +350,7 @@ describe('BrowserReviewPanel', () => {
       />,
     );
 
-    expect(await screen.findByText('Test Harness · current_workspace')).toBeInTheDocument();
+    expect(await screen.findByText('Test Harness · 当前工作区')).toBeInTheDocument();
     expect(screen.getAllByText('验证当前分支的设置页')).toHaveLength(1);
     expect(screen.getByText(/工作区指纹 abcdef1234/)).toBeInTheDocument();
     expect(screen.getAllByText('正在启动隔离预览').length).toBeGreaterThan(0);
@@ -369,7 +412,7 @@ describe('BrowserReviewPanel', () => {
     await waitFor(() => expect(onAvailableChange).toHaveBeenCalledWith(false));
     expect(await screen.findByTestId('frontend-test-idle')).toBeInTheDocument();
     expect(screen.getByText('尚未启动前端测试')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: '配置网站测试' }));
+    fireEvent.click(screen.getByRole('button', { name: '配置并启动测试' }));
     expect(screen.getByTestId('frontend-test-settings')).toBeInTheDocument();
     expect(screen.getByLabelText('待检测网站')).toBeInTheDocument();
   });
@@ -410,7 +453,7 @@ describe('BrowserReviewPanel', () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: '配置网站测试' }));
+    fireEvent.click(await screen.findByRole('button', { name: '配置并启动测试' }));
     expect(await screen.findByText(/Codex · gpt-5.6-sol · effort high · Fast/)).toBeInTheDocument();
     fireEvent.change(screen.getByLabelText('待检测网站'), {
       target: { value: 'http://127.0.0.1:5173' },
@@ -439,8 +482,163 @@ describe('BrowserReviewPanel', () => {
       max_steps: 20,
       max_actions: 60,
     }));
-    expect(await screen.findByText('Test Harness · fixed_url')).toBeInTheDocument();
+    expect(await screen.findByText('Test Harness · 固定 URL')).toBeInTheDocument();
     expect(screen.queryByTestId('frontend-test-settings')).not.toBeInTheDocument();
+  });
+
+  it('starts an exact GitHub PR sandbox run and shows its frozen target', async () => {
+    const startedRun = makeHarnessRun({
+      id: 'harness-pr-99',
+      root_run_id: 'harness-pr-99',
+      project_id: 4,
+      target_kind: 'pull_request',
+      target: { remote: 'origin', pr_number: 99 },
+      resolved_target: {
+        kind: 'pull_request',
+        repository: 'zjw49246/CC-Manager',
+        base_sha: 'a'.repeat(40),
+        head_sha: 'b'.repeat(40),
+        pr_number: 99,
+        source_ref: 'feature/browser-review',
+        changed_files: [
+          { path: 'frontend/src/App.tsx', status: 'modified' },
+          { path: 'frontend/src/styles.css', status: 'added' },
+        ],
+      },
+      source_git_head: 'b'.repeat(40),
+      status: 'preparing_environment',
+      stage: 'target_resolved',
+      test_plan: { version: 1, objective: '验收 PR #99 前端改动', scenarios: [] },
+      browser_review: null,
+      report: null,
+      verdict: null,
+      completed_at: null,
+      cleanup_status: 'pending',
+    });
+    vi.mocked(api.startTestRun).mockResolvedValue(startedRun);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        canStartConfiguredReview
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置并启动测试' }));
+    fireEvent.change(screen.getByLabelText('测试目标类型'), {
+      target: { value: 'pull_request' },
+    });
+    expect(await screen.findByText(/Sandbox 已就绪/)).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Pull Request 编号'), {
+      target: { value: '99' },
+    });
+    fireEvent.change(screen.getByLabelText('测试目标'), {
+      target: { value: '验收 PR #99 前端改动' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '开始 GitHub PR 测试' }));
+
+    await waitFor(() => expect(api.startTestRun).toHaveBeenCalledWith(73, expect.objectContaining({
+      target_kind: 'pull_request',
+      target: { remote: 'origin', pr_number: 99 },
+      goal: '验收 PR #99 前端改动',
+    })));
+    expect(await screen.findByText('Test Harness · GitHub PR')).toBeInTheDocument();
+    expect(screen.getByText('zjw49246/CC-Manager')).toBeInTheDocument();
+    expect(screen.getByText('PR #99')).toBeInTheDocument();
+    expect(screen.getByText('frontend/src/App.tsx')).toBeInTheDocument();
+    expect(screen.getByText('变更文件 2')).toBeInTheDocument();
+  });
+
+  it('shows the exact sandbox admission reason before a PR run can start', async () => {
+    vi.mocked(api.getTestHarnessCapabilities).mockResolvedValue({
+      ...defaultCapabilities,
+      targets: {
+        ...defaultCapabilities.targets,
+        pull_request: false,
+        git_ref: false,
+      },
+      target_reasons: {
+        pull_request: 'Docker sandbox image is not installed',
+        git_ref: 'Docker sandbox image is not installed',
+      },
+      sandbox: {
+        ...defaultCapabilities.sandbox,
+        available: false,
+        reason: 'Docker sandbox image is not installed',
+      },
+    });
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        canStartConfiguredReview
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置并启动测试' }));
+    fireEvent.change(screen.getByLabelText('测试目标类型'), {
+      target: { value: 'pull_request' },
+    });
+    expect(await screen.findByText('Docker sandbox image is not installed')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '开始 GitHub PR 测试' })).toBeDisabled();
+    expect(api.startTestRun).not.toHaveBeenCalled();
+  });
+
+  it('shows the workspace Preview admission reason for the workspace target', async () => {
+    vi.mocked(api.getTestHarnessCapabilities).mockResolvedValue({
+      ...defaultCapabilities,
+      available: false,
+      reason: 'Project Preview configuration has not been confirmed',
+      targets: {
+        ...defaultCapabilities.targets,
+        current_workspace: false,
+      },
+      target_reasons: {
+        ...defaultCapabilities.target_reasons,
+        current_workspace: 'Project Preview configuration has not been confirmed',
+      },
+      preview: {
+        ...defaultCapabilities.preview,
+        available: false,
+        configured: false,
+        reason: 'Project Preview configuration has not been confirmed',
+      },
+    });
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        canStartConfiguredReview
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(await screen.findByRole('button', { name: '配置并启动测试' }));
+    fireEvent.change(screen.getByLabelText('测试目标类型'), {
+      target: { value: 'current_workspace' },
+    });
+    expect(await screen.findByText('Project Preview configuration has not been confirmed')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '开始 当前工作区 测试' })).toBeDisabled();
   });
 
   it('runs the Browser Agent with a model and effort independent from the Task', async () => {
@@ -479,7 +677,7 @@ describe('BrowserReviewPanel', () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole('button', { name: '配置网站测试' }));
+    fireEvent.click(await screen.findByRole('button', { name: '配置并启动测试' }));
     await screen.findByText('Browser Agent 独立运行配置');
     fireEvent.click(screen.getByRole('checkbox', { name: /跟随当前 Task/ }));
     fireEvent.change(screen.getByLabelText('审查 Provider'), { target: { value: 'claude' } });

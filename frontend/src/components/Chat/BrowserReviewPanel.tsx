@@ -8,8 +8,10 @@ import { api } from '../../api/client';
 import type {
   BrowserReviewJob,
   CodexServiceTier,
+  TestHarnessCapabilities,
   TestHarnessRun,
   TestHarnessRuntimeConfig,
+  TestHarnessTargetKind,
   WorkspaceReviewRun,
 } from '../../api/client';
 import {
@@ -59,11 +61,23 @@ const STAGE_LABELS: Record<string, string> = {
   failed: '审查失败',
   stale: '结果已过期',
   interrupted: '服务重启中断',
+  resolving_target: '正在解析 Git 目标',
+  target_resolved: '已锁定精确 Git 提交',
+  preparing_sandbox: '正在创建隔离 Sandbox',
+  acquiring_source: '正在 Sandbox 内获取源码',
+  preparing_preview: '正在隔离环境准备 Preview',
   resolving_git_target: '正在解析 Git 目标',
   detached_worktree_ready: '隔离 Git worktree 已就绪',
   preparing_environment: '正在准备测试环境',
   collecting_evidence: '正在归档测试证据',
   evaluating: '正在生成结构化结论',
+};
+
+const TARGET_LABELS: Record<TestHarnessTargetKind, string> = {
+  current_workspace: '当前工作区',
+  fixed_url: '固定 URL',
+  pull_request: 'GitHub PR',
+  git_ref: 'Git ref / 分支',
 };
 
 interface BrowserReviewPanelProps {
@@ -183,13 +197,18 @@ export function BrowserReviewPanel({
   const [cancellingJobId, setCancellingJobId] = useState<string | null>(null);
   const [repeatingRunId, setRepeatingRunId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [configuredTargetKind, setConfiguredTargetKind] = useState<TestHarnessTargetKind>('fixed_url');
   const [configuredUrl, setConfiguredUrl] = useState('');
+  const [configuredPrNumber, setConfiguredPrNumber] = useState('');
+  const [configuredGitRef, setConfiguredGitRef] = useState('');
   const [configuredGoal, setConfiguredGoal] = useState(DEFAULT_REVIEW_GOAL);
   const [configuredProfile, setConfiguredProfile] = useState<'quick' | 'standard' | 'exhaustive'>('standard');
   const [configuredViewport, setConfiguredViewport] = useState('1440x900');
   const [configuredBrowserChannel, setConfiguredBrowserChannel] = useState<'chrome' | 'chromium'>('chrome');
   const [configuredAllowActions, setConfiguredAllowActions] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<TestHarnessRuntimeConfig | null>(null);
+  const [capabilities, setCapabilities] = useState<TestHarnessCapabilities | null>(null);
+  const [capabilitiesLoading, setCapabilitiesLoading] = useState(false);
   const [runtimeConfigLoading, setRuntimeConfigLoading] = useState(false);
   const [runtimeConfigSaving, setRuntimeConfigSaving] = useState(false);
   const [inheritTaskRuntime, setInheritTaskRuntime] = useState(true);
@@ -233,6 +252,20 @@ export function BrowserReviewPanel({
       setRuntimeConfigLoading(false);
     }
   }, [applyRuntimeConfig, taskId]);
+
+  const loadCapabilities = useCallback(async () => {
+    setCapabilitiesLoading(true);
+    try {
+      const nextCapabilities = await api.getTestHarnessCapabilities(taskId);
+      setCapabilities(nextCapabilities);
+      return nextCapabilities;
+    } catch (nextError) {
+      setError(`加载测试能力失败：${errorText(nextError)}`);
+      return null;
+    } finally {
+      setCapabilitiesLoading(false);
+    }
+  }, [taskId]);
 
   const refresh = useCallback(async () => {
     try {
@@ -308,7 +341,12 @@ export function BrowserReviewPanel({
     setLoading(true);
     setWaitingForWorkspaceReview(false);
     setSettingsOpen(false);
+    setConfiguredTargetKind('fixed_url');
     setConfiguredUrl('');
+    setConfiguredPrNumber('');
+    setConfiguredGitRef('');
+    setCapabilities(null);
+    setCapabilitiesLoading(false);
     latestReviewIdRef.current = null;
     onAvailableChange(false);
     void refresh();
@@ -391,6 +429,21 @@ export function BrowserReviewPanel({
   const workspaceRun: WorkspaceReviewRun | null = displayedRun?.workspace_review ?? null;
   const job: BrowserReviewJob | null = displayedRun?.browser_review ?? null;
   const displayedObjective = String(displayedRun?.test_plan.objective || '前端黑盒测试').trim();
+  const resolvedTarget = displayedRun?.resolved_target || null;
+  const resolvedRepository = typeof resolvedTarget?.repository === 'string'
+    ? resolvedTarget.repository
+    : null;
+  const resolvedHead = typeof resolvedTarget?.head_sha === 'string'
+    ? resolvedTarget.head_sha
+    : displayedRun?.source_git_head || null;
+  const resolvedBase = typeof resolvedTarget?.base_sha === 'string'
+    ? resolvedTarget.base_sha
+    : null;
+  const resolvedChangedFiles = Array.isArray(resolvedTarget?.changed_files)
+    ? resolvedTarget.changed_files.filter((item): item is Record<string, unknown> => (
+      item != null && typeof item === 'object' && !Array.isArray(item)
+    ))
+    : [];
   const showBrowserGoal = Boolean(
     job?.goal?.trim()
     && job.goal.trim() !== displayedObjective
@@ -446,10 +499,26 @@ export function BrowserReviewPanel({
       || runtimeConfig?.codex_service_tiers
       || ['default']
     : ['default'];
+  const selectedTargetAvailable = capabilities
+    ? Boolean(capabilities.targets[configuredTargetKind])
+    : configuredTargetKind === 'fixed_url';
+  const selectedTargetReason = capabilities?.target_reasons[configuredTargetKind]
+    || (configuredTargetKind === 'current_workspace' ? capabilities?.preview.reason : null)
+    || (configuredTargetKind === 'pull_request' || configuredTargetKind === 'git_ref'
+      ? capabilities?.sandbox.reason
+      : null)
+    || null;
+  const configuredTargetReady = configuredTargetKind === 'current_workspace'
+    || (configuredTargetKind === 'fixed_url' && Boolean(configuredUrl.trim()))
+    || (configuredTargetKind === 'pull_request'
+      && /^\d+$/.test(configuredPrNumber.trim())
+      && Number(configuredPrNumber.trim()) > 0)
+    || (configuredTargetKind === 'git_ref' && Boolean(configuredGitRef.trim()));
 
   const openRuntimeSettings = () => {
     setSettingsOpen(true);
     if (!runtimeConfig && !runtimeConfigLoading) void loadRuntimeConfig();
+    if (!capabilities && !capabilitiesLoading) void loadCapabilities();
   };
 
   const selectReviewProvider = (provider: 'claude' | 'codex') => {
@@ -571,19 +640,32 @@ export function BrowserReviewPanel({
     event.preventDefault();
     if (startingConfiguredReview || taskActive || hasActiveReview || !canStartConfiguredReview) return;
 
-    const url = configuredUrl.trim();
     const goal = configuredGoal.trim();
-    if (!url || !goal) return;
-    try {
-      const parsed = new URL(url);
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        throw new Error('只支持 http:// 或 https:// 地址');
-      }
-    } catch (nextError) {
-      setError(nextError instanceof Error && nextError.message === '只支持 http:// 或 https:// 地址'
-        ? nextError.message
-        : '请输入完整的 http:// 或 https:// 网站地址');
+    if (!goal || !configuredTargetReady) return;
+    if (!selectedTargetAvailable) {
+      setError(selectedTargetReason || `${TARGET_LABELS[configuredTargetKind]} 当前不可用`);
       return;
+    }
+
+    let target: Record<string, unknown> = {};
+    if (configuredTargetKind === 'fixed_url') {
+      const url = configuredUrl.trim();
+      try {
+        const parsed = new URL(url);
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+          throw new Error('只支持 http:// 或 https:// 地址');
+        }
+      } catch (nextError) {
+        setError(nextError instanceof Error && nextError.message === '只支持 http:// 或 https:// 地址'
+          ? nextError.message
+          : '请输入完整的 http:// 或 https:// 网站地址');
+        return;
+      }
+      target = { url };
+    } else if (configuredTargetKind === 'pull_request') {
+      target = { remote: 'origin', pr_number: Number(configuredPrNumber.trim()) };
+    } else if (configuredTargetKind === 'git_ref') {
+      target = { remote: 'origin', ref: configuredGitRef.trim(), fetch: false };
     }
 
     setStartingConfiguredReview(true);
@@ -592,8 +674,8 @@ export function BrowserReviewPanel({
     try {
       const savedRuntime = await persistRuntimeConfig();
       const started = await api.startTestRun(taskId, {
-        target_kind: 'fixed_url',
-        target: { url },
+        target_kind: configuredTargetKind,
+        target,
         goal,
         profile: configuredProfile,
         allow_actions: configuredAllowActions,
@@ -729,7 +811,7 @@ export function BrowserReviewPanel({
           className={`rounded p-1.5 transition-colors ${settingsOpen
             ? 'bg-indigo-500/15 text-indigo-300'
             : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'}`}
-          title={settingsOpen ? '返回测试进度' : '配置并启动网站测试'}
+          title={settingsOpen ? '返回测试进度' : '配置并启动前端测试'}
           aria-label="Configure frontend test"
           aria-pressed={settingsOpen}
         >
@@ -796,7 +878,7 @@ export function BrowserReviewPanel({
             >
               {runs.map((item, index) => (
                 <option key={item.id} value={item.id}>
-                  #{runs.length - index} · {item.target_kind} · {STAGE_LABELS[item.stage] || item.stage} · {String(item.test_plan.objective || '')}
+                  #{runs.length - index} · {TARGET_LABELS[item.target_kind]} · {STAGE_LABELS[item.stage] || item.stage} · {String(item.test_plan.objective || '')}
                 </option>
               ))}
             </select>
@@ -829,10 +911,10 @@ export function BrowserReviewPanel({
           <form onSubmit={startConfiguredReview} className="space-y-4" data-testid="frontend-test-settings">
             <section className="rounded-lg border border-indigo-500/25 bg-indigo-500/8 p-3">
               <div className="flex items-center gap-2 text-sm font-medium text-indigo-300">
-                <Settings size={15} />网站测试配置
+                <Settings size={15} />前端测试配置
               </div>
               <p className="mt-1 text-[11px] leading-relaxed text-gray-400">
-                直接在当前 Task 中创建固定 URL 的独立 Harness Run。当前分支和循环审查仍可从输入框上方的测试按钮启动。
+                在当前 Task 中直接创建当前工作区、固定 URL、GitHub PR 或 Git ref 的独立 Harness Run。
               </p>
             </section>
 
@@ -960,21 +1042,99 @@ export function BrowserReviewPanel({
               )}
             </section>
 
-            <div>
-              <label htmlFor={`frontend-test-url-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">待检测网站</label>
-              <input
-                id={`frontend-test-url-${taskId}`}
-                type="url"
-                required
-                value={configuredUrl}
-                onChange={(event) => setConfiguredUrl(event.target.value)}
-                placeholder="https://example.com"
-                className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2.5 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
-              />
-              <p className="mt-1.5 text-[10px] leading-relaxed text-gray-500">
-                固定 URL 只允许公网地址，并通过受控网络出口访问。本机 Preview 请使用输入框上方的“单次审查”。
-              </p>
-            </div>
+            <section className="space-y-3 rounded-lg border border-gray-600/60 bg-gray-900/55 p-3">
+              <div>
+                <label htmlFor={`frontend-test-target-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">测试目标类型</label>
+                <select
+                  id={`frontend-test-target-${taskId}`}
+                  value={configuredTargetKind}
+                  onChange={(event) => {
+                    setConfiguredTargetKind(event.target.value as TestHarnessTargetKind);
+                    setError(null);
+                  }}
+                  className="w-full rounded-lg border border-gray-600/60 bg-gray-950 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
+                >
+                  <option value="current_workspace">当前工作区</option>
+                  <option value="fixed_url">固定 URL</option>
+                  <option value="pull_request">GitHub PR</option>
+                  <option value="git_ref">Git ref / 分支</option>
+                </select>
+              </div>
+
+              {configuredTargetKind === 'fixed_url' && (
+                <div>
+                  <label htmlFor={`frontend-test-url-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">待检测网站</label>
+                  <input
+                    id={`frontend-test-url-${taskId}`}
+                    type="url"
+                    required
+                    value={configuredUrl}
+                    onChange={(event) => setConfiguredUrl(event.target.value)}
+                    placeholder="https://example.com"
+                    className="w-full rounded-lg border border-gray-600/60 bg-gray-950 px-3 py-2.5 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                  />
+                  <p className="mt-1.5 text-[10px] leading-relaxed text-gray-500">
+                    仅允许公网 HTTP(S)，浏览器所有连接都经过受控网络出口。
+                  </p>
+                </div>
+              )}
+
+              {configuredTargetKind === 'pull_request' && (
+                <div>
+                  <label htmlFor={`frontend-test-pr-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">Pull Request 编号</label>
+                  <input
+                    id={`frontend-test-pr-${taskId}`}
+                    type="number"
+                    min={1}
+                    step={1}
+                    required
+                    value={configuredPrNumber}
+                    onChange={(event) => setConfiguredPrNumber(event.target.value)}
+                    placeholder="99"
+                    className="w-full rounded-lg border border-gray-600/60 bg-gray-950 px-3 py-2.5 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+              )}
+
+              {configuredTargetKind === 'git_ref' && (
+                <div>
+                  <label htmlFor={`frontend-test-ref-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">Git ref 或分支名</label>
+                  <input
+                    id={`frontend-test-ref-${taskId}`}
+                    type="text"
+                    required
+                    value={configuredGitRef}
+                    onChange={(event) => setConfiguredGitRef(event.target.value)}
+                    placeholder="feature/browser-review"
+                    className="w-full rounded-lg border border-gray-600/60 bg-gray-950 px-3 py-2.5 text-sm text-gray-100 outline-none placeholder:text-gray-500 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
+                  />
+                </div>
+              )}
+
+              {configuredTargetKind === 'current_workspace' && (
+                <p className="text-[10px] leading-relaxed text-gray-500">
+                  使用 Task 绑定的可信本地 Git 工作区和管理员已确认的 Preview 配置；不会切换或覆盖当前分支。
+                </p>
+              )}
+
+              {capabilitiesLoading && configuredTargetKind !== 'fixed_url' && (
+                <div className="flex items-center gap-2 text-[10px] text-gray-500">
+                  <Loader2 size={11} className="animate-spin" />正在检查目标与 Sandbox 能力…
+                </div>
+              )}
+              {!capabilitiesLoading && !selectedTargetAvailable && selectedTargetReason && (
+                <div role="alert" className="flex items-start gap-2 rounded border border-amber-500/30 bg-amber-500/10 px-2.5 py-2 text-[10px] leading-relaxed text-amber-300">
+                  <AlertCircle size={12} className="mt-0.5 shrink-0" />
+                  <span>{selectedTargetReason}</span>
+                </div>
+              )}
+              {(configuredTargetKind === 'pull_request' || configuredTargetKind === 'git_ref') && capabilities?.sandbox.available && (
+                <div className="flex items-start gap-2 rounded border border-emerald-500/25 bg-emerald-500/8 px-2.5 py-2 text-[10px] leading-relaxed text-emerald-300">
+                  <Shield size={12} className="mt-0.5 shrink-0" />
+                  <span>Sandbox 已就绪 · {capabilities.sandbox.backend || 'isolated runtime'} · exact SHA 获取、依赖与 Preview 均不在 Manager 宿主机执行。</span>
+                </div>
+              )}
+            </section>
 
             <div>
               <label htmlFor={`frontend-test-goal-${taskId}`} className="mb-1.5 block text-xs font-medium text-gray-300">测试目标</label>
@@ -1045,11 +1205,15 @@ export function BrowserReviewPanel({
 
             <button
               type="submit"
-              disabled={startingConfiguredReview || runtimeConfigSaving || runtimeConfigLoading || taskActive || hasActiveReview || !canStartConfiguredReview || !configuredUrl.trim() || !configuredGoal.trim() || (!inheritTaskRuntime && (!reviewModel || !reviewEffort))}
+              disabled={startingConfiguredReview || runtimeConfigSaving || runtimeConfigLoading || capabilitiesLoading || taskActive || hasActiveReview || !canStartConfiguredReview || !configuredTargetReady || !selectedTargetAvailable || !configuredGoal.trim() || (!inheritTaskRuntime && (!reviewModel || !reviewEffort))}
               className="inline-flex w-full items-center justify-center gap-2 rounded-lg bg-indigo-600 px-4 py-2.5 text-sm font-medium text-white shadow-md shadow-indigo-600/20 transition-colors hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-45"
             >
               {startingConfiguredReview ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
-              {startingConfiguredReview ? '正在创建测试…' : '开始网站测试'}
+              {startingConfiguredReview
+                ? '正在创建测试…'
+                : configuredTargetKind === 'fixed_url'
+                  ? '开始网站测试'
+                  : `开始 ${TARGET_LABELS[configuredTargetKind]} 测试`}
             </button>
             {(taskActive || hasActiveReview || !canStartConfiguredReview) && (
               <p className="text-center text-[10px] leading-relaxed text-amber-300">
@@ -1129,7 +1293,7 @@ export function BrowserReviewPanel({
               onClick={openRuntimeSettings}
               className="mt-5 inline-flex items-center gap-2 rounded-lg border border-indigo-500/35 bg-indigo-500/10 px-3.5 py-2 text-xs font-medium text-indigo-300 transition-colors hover:bg-indigo-500/15"
             >
-              <Settings size={14} />配置网站测试
+              <Settings size={14} />配置并启动测试
             </button>
             <div className="mt-4 max-w-72 text-[10px] leading-relaxed text-gray-500">
               也可以使用输入框上方的“单次审查”或“循环审查”，测试当前分支的新功能。
@@ -1146,7 +1310,7 @@ export function BrowserReviewPanel({
           <section data-testid="test-harness-progress" className="rounded-lg border border-indigo-500/25 bg-indigo-500/8 p-3">
             <div className="flex items-start justify-between gap-2">
               <div className="min-w-0">
-                <div className="text-xs font-medium text-indigo-300">Test Harness · {displayedRun.target_kind}</div>
+                <div className="text-xs font-medium text-indigo-300">Test Harness · {TARGET_LABELS[displayedRun.target_kind]}</div>
                 <div className="mt-0.5 line-clamp-2 text-[10px] text-gray-500">
                   {displayedObjective}
                 </div>
@@ -1197,6 +1361,49 @@ export function BrowserReviewPanel({
                 {displayedRun.stale ? '代码已变化 · 结果过期' : `结论 ${displayedRun.verdict || '待定'}`}
               </div>
             </div>
+            {resolvedTarget && (
+              <div data-testid="git-target-resolution" className="mt-2 rounded border border-cyan-500/20 bg-cyan-500/5 p-2 text-[10px] text-gray-400">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate font-medium text-cyan-300" title={resolvedRepository || ''}>
+                    {resolvedRepository || 'GitHub target'}
+                  </span>
+                  {typeof resolvedTarget.pr_number === 'number' && (
+                    <span className="shrink-0 rounded border border-cyan-500/25 px-1.5 py-0.5 text-cyan-300">PR #{resolvedTarget.pr_number}</span>
+                  )}
+                </div>
+                {resolvedHead && (
+                  <div className="mt-1 font-mono text-[9px] text-gray-500" title={resolvedHead}>
+                    {resolvedBase ? `${resolvedBase.slice(0, 10)} → ` : ''}{resolvedHead.slice(0, 12)}
+                  </div>
+                )}
+                {resolvedChangedFiles.length > 0 && (
+                  <div className="mt-2">
+                    <div className="mb-1 text-[9px] uppercase tracking-wide text-gray-500">
+                      变更文件 {resolvedChangedFiles.length}
+                    </div>
+                    <div className="space-y-1">
+                      {resolvedChangedFiles.slice(0, 6).map((item, index) => (
+                        <div key={`${String(item.path || '')}-${index}`} className="flex min-w-0 items-center gap-1.5">
+                          <span className="w-10 shrink-0 uppercase text-cyan-300/75">{String(item.status || 'changed')}</span>
+                          <span className="truncate" title={String(item.path || '')}>{String(item.path || '')}</span>
+                        </div>
+                      ))}
+                      {resolvedChangedFiles.length > 6 && (
+                        <div className="text-gray-500">另有 {resolvedChangedFiles.length - 6} 个文件…</div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+            {displayedRun.cleanup_status !== 'pending' && (
+              <div className={`mt-2 flex items-center gap-1.5 text-[10px] ${displayedRun.cleanup_status === 'completed' ? 'text-emerald-300' : 'text-red-300'}`}>
+                <Shield size={11} />
+                {displayedRun.cleanup_status === 'completed'
+                  ? '隔离资源已完成身份校验与清理'
+                  : `隔离资源清理：${displayedRun.cleanup_status}`}
+              </div>
+            )}
             {workspaceRun && (
               <div data-testid="workspace-review-progress" className="mt-2 border-t border-gray-600/40 pt-2 text-[10px] text-gray-500">
                 <div className="truncate" title={workspaceRun.workspace_fingerprint}>

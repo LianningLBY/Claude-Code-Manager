@@ -279,6 +279,30 @@ export interface TestHarnessRuntimeConfigUpdate {
   codex_service_tier?: CodexServiceTier;
 }
 
+export interface TestHarnessCapabilities {
+  contract_version: number;
+  available: boolean;
+  reason: string | null;
+  provider: string;
+  task_provider: string;
+  provider_browser_capability: boolean;
+  runtime_configurable: boolean;
+  runtime: TestHarnessRuntimeConfig;
+  context_policy: string;
+  targets: Record<TestHarnessTargetKind, boolean>;
+  target_reasons: Partial<Record<TestHarnessTargetKind, string | null>>;
+  sandbox: {
+    available: boolean;
+    backend: string | null;
+    reason: string | null;
+    image: string | null;
+    image_id: string | null;
+  };
+  preview: WorkspaceReviewCapabilities;
+  supports_repeat: boolean;
+  supports_compare: boolean;
+}
+
 export interface WorkspaceReviewStart {
   goal: string;
   mode?: 'review_only' | 'fix_loop';
@@ -2488,7 +2512,7 @@ export const api = {
 
   // Durable, provider-neutral frontend Test Harness
   getTestHarnessCapabilities: (taskId: number) =>
-    request<Record<string, unknown>>(`/api/tasks/${taskId}/test-runs/capabilities`),
+    request<TestHarnessCapabilities>(`/api/tasks/${taskId}/test-runs/capabilities`),
   getTestHarnessRuntimeConfig: (taskId: number) =>
     request<TestHarnessRuntimeConfig>(`/api/tasks/${taskId}/test-runs/config`),
   updateTestHarnessRuntimeConfig: (taskId: number, data: TestHarnessRuntimeConfigUpdate) =>

@@ -104,8 +104,10 @@ function findDelimiter(
   source: string,
   closingCharacter: '(' | ')' | '[' | ']',
   fromIndex: number,
+  toIndex: number = source.length,
 ): number {
-  for (let index = fromIndex; index < source.length - 1; index += 1) {
+  const boundedEnd = Math.min(toIndex, source.length);
+  for (let index = fromIndex; index + 1 < boundedEnd; index += 1) {
     if (
       source[index] === '\\'
       && source[index + 1] === closingCharacter
@@ -152,18 +154,42 @@ function stripOneLineEnding(value: string, fromStart: boolean): string {
   return value.replace(/(?:\r\n|\r|\n)$/, '');
 }
 
-function parseDisplayMathSource(raw: string): MarkdownNode | null {
-  const leadingWhitespace = raw.match(/^[ \t]*/)?.[0].length || 0;
-  const opening = findDelimiter(raw, '[', leadingWhitespace);
-  if (opening !== leadingWhitespace) return null;
+function containsProtectedNode(node: MarkdownNode): boolean {
+  return SKIP_DESCENDANTS.has(node.type)
+    || Boolean(node.children?.some((child) => containsProtectedNode(child)));
+}
 
-  const closing = findDelimiter(raw, ']', opening + 2);
-  if (closing < 0 || !/^[ \t]*$/.test(raw.slice(closing + 2))) return null;
+function findDisplayMathOpening(node: MarkdownNode, source: string): {
+  start: number;
+  opening: number;
+} | null {
+  const start = node.position?.start?.offset;
+  const end = node.position?.end?.offset;
+  if (
+    typeof start !== 'number'
+    || typeof end !== 'number'
+    || start < 0
+    || end < start
+    || end > source.length
+  ) {
+    return null;
+  }
 
-  let value = raw.slice(opening + 2, closing);
-  value = stripOneLineEnding(value, true);
-  value = stripOneLineEnding(value, false);
-  return displayMathNode(value);
+  let opening = start;
+  while (opening < end && (source[opening] === ' ' || source[opening] === '\t')) {
+    opening += 1;
+  }
+  if (opening + 1 >= end || source[opening] !== '\\' || source[opening + 1] !== '[') {
+    return null;
+  }
+  return { start, opening };
+}
+
+function containsOnlyHorizontalWhitespace(source: string, start: number, end: number): boolean {
+  for (let index = start; index < end; index += 1) {
+    if (source[index] !== ' ' && source[index] !== '\t') return false;
+  }
+  return true;
 }
 
 function parseDisplayMathRange(
@@ -171,29 +197,39 @@ function parseDisplayMathRange(
   startIndex: number,
   source: string,
 ): { node: MarkdownNode; endIndex: number } | null {
-  if (SKIP_DESCENDANTS.has(children[startIndex].type)) return null;
-  const start = children[startIndex].position?.start?.offset;
-  if (typeof start !== 'number') return null;
+  const openingRange = findDisplayMathOpening(children[startIndex], source);
+  if (!openingRange) return null;
 
-  const openingSource = sourceForNode(children[startIndex], source);
-  if (openingSource === null) return null;
-  const leadingWhitespace = openingSource.match(/^[ \t]*/)?.[0].length || 0;
-  if (findDelimiter(openingSource, '[', leadingWhitespace) !== leadingWhitespace) {
-    return null;
-  }
+  const { start, opening } = openingRange;
+  let searchFrom = opening + 2;
+  let previousEnd = start;
 
   for (let endIndex = startIndex; endIndex < children.length; endIndex += 1) {
-    if (SKIP_DESCENDANTS.has(children[endIndex].type)) return null;
+    if (containsProtectedNode(children[endIndex])) return null;
     const end = children[endIndex].position?.end?.offset;
-    if (typeof end !== 'number' || end < start) return null;
+    if (
+      typeof end !== 'number'
+      || end < previousEnd
+      || end > source.length
+    ) {
+      return null;
+    }
     if (end - start > MAX_DISPLAY_MATH_SOURCE_LENGTH) return null;
 
-    const raw = source.slice(start, end);
-    const node = parseDisplayMathSource(raw);
-    if (node) return { node, endIndex };
+    const closing = findDelimiter(source, ']', searchFrom, end);
+    if (closing >= 0) {
+      if (!containsOnlyHorizontalWhitespace(source, closing + 2, end)) return null;
 
-    const opening = findDelimiter(raw, '[', leadingWhitespace);
-    if (findDelimiter(raw, ']', opening + 2) >= 0) return null;
+      let value = source.slice(opening + 2, closing);
+      value = stripOneLineEnding(value, true);
+      value = stripOneLineEnding(value, false);
+      return { node: displayMathNode(value), endIndex };
+    }
+
+    // Keep one character of overlap so a delimiter split at an AST boundary
+    // is still found, while every other source character is scanned once.
+    searchFrom = Math.max(searchFrom, end - 1);
+    previousEnd = end;
   }
   return null;
 }

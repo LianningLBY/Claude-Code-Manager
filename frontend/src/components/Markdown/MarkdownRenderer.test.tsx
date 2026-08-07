@@ -1,11 +1,16 @@
 import { render } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MarkdownRenderer } from './MarkdownRenderer';
+import { remarkBackslashMath } from './markdownMath';
 
 interface CapturedNode {
   type?: string;
   value?: string;
   children?: CapturedNode[];
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
+  };
 }
 
 function nodesOfType(root: CapturedNode | null, type: string): CapturedNode[] {
@@ -58,6 +63,86 @@ O\left(\sum_{i=1}^d D_i \sqrt{G_{T,i}}\right)
 
     expect(container.querySelector('li .katex-display')).not.toBeNull();
     expect(container.querySelector('li .katex-html')?.textContent).toContain('Ω');
+  });
+
+  it('scans a large unclosed display formula without repeatedly copying prefixes', () => {
+    const chunks = [String.raw`\[`, ...Array.from({ length: 20_000 }, () => 'x')];
+    const source = chunks.join('\n\n');
+    let offset = 0;
+    const children = chunks.map((chunk) => {
+      const start = offset;
+      const end = start + chunk.length;
+      offset = end + 2;
+      return {
+        type: 'paragraph',
+        position: { start: { offset: start }, end: { offset: end } },
+        children: [{
+          type: 'text',
+          value: chunk,
+          position: { start: { offset: start }, end: { offset: end } },
+        }],
+      };
+    });
+    const tree = {
+      type: 'root',
+      position: { start: { offset: 0 }, end: { offset: source.length } },
+      children,
+    };
+
+    const originalSlice = String.prototype.slice;
+    let copiedCharacters = 0;
+    const sliceSpy = vi.spyOn(String.prototype, 'slice').mockImplementation(function (
+      this: string,
+      start?: number,
+      end?: number,
+    ) {
+      const result = originalSlice.call(this, start, end);
+      copiedCharacters += result.length;
+      return result;
+    });
+
+    let elapsedMs = 0;
+    try {
+      const startedAt = performance.now();
+      remarkBackslashMath()(tree, { value: source });
+      elapsedMs = performance.now() - startedAt;
+    } finally {
+      sliceSpy.mockRestore();
+    }
+
+    expect(source.length).toBeGreaterThan(60_000);
+    expect(copiedCharacters).toBeLessThan(source.length * 2);
+    expect(elapsedMs).toBeLessThan(1_000);
+  });
+
+  it('preserves fenced code nested between display delimiters', () => {
+    const markdown = [
+      String.raw`\[`,
+      '',
+      '> ```tex',
+      '> protected_code',
+      '> ```',
+      '',
+      String.raw`\]`,
+    ].join('\n');
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('.katex')).toBeNull();
+    expect(container.querySelector('blockquote pre code')?.textContent).toContain('protected_code');
+  });
+
+  it('preserves a link nested between display delimiters', () => {
+    const markdown = String.raw`\[
+
+> [protected link](https://example.test/protected)
+
+\]`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('.katex')).toBeNull();
+    expect(container.querySelector('blockquote a')?.getAttribute('href')).toBe(
+      'https://example.test/protected',
+    );
   });
 
   it('repairs an escaped superscript star only inside confirmed math nodes', () => {

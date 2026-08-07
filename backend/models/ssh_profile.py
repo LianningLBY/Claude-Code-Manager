@@ -35,6 +35,12 @@ class SSHProfile(Base):
         default=list,
         server_default="[]",
     )
+    allowed_roots: Mapped[list[str]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=lambda: ["/"],
+        server_default='["/"]',
+    )
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_test_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

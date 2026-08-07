@@ -28,6 +28,7 @@ const profile: SSHProfile = {
   enabled: true,
   task_access_enabled: true,
   task_capabilities: ['read', 'exec', 'write'],
+  allowed_roots: ['/'],
   created_by: 1,
   last_tested_at: null,
   last_test_ok: null,
@@ -51,6 +52,7 @@ const grant: TaskSSHGrant = {
   capabilities: ['read'],
   profile_task_access_enabled: true,
   profile_task_capabilities: ['read', 'exec', 'write'],
+  profile_allowed_roots: ['/'],
   valid: true,
   invalid_reason: null,
   created_by: 1,
@@ -87,6 +89,7 @@ describe('Task SSH authorization UI', () => {
     expect(api.listSSHProfiles).not.toHaveBeenCalled();
     await user.click(screen.getByRole('button', { name: /SSH access/i }));
     await screen.findByText('production-box');
+    expect(screen.getByText('Files: /')).toBeInTheDocument();
     await user.click(screen.getByLabelText('Grant production-box'));
 
     expect(api.listSSHProfiles).toHaveBeenCalledWith(true);

@@ -186,6 +186,7 @@ async def create_ssh_profile(
         enabled=body.enabled,
         task_access_enabled=body.task_access_enabled,
         task_capabilities=body.task_capabilities,
+        allowed_roots=body.allowed_roots,
         created_by=get_current_user_id(request),
         **material,
     )
@@ -266,6 +267,8 @@ async def update_ssh_profile(
     policy_changed = (
         next_task_access_enabled != profile.task_access_enabled
         or next_task_capabilities != profile.task_capabilities
+        or values.get("allowed_roots", profile.allowed_roots)
+        != profile.allowed_roots
     )
     if identity_changed:
         try:

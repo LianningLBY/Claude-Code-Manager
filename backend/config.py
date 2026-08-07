@@ -79,6 +79,15 @@ class Settings(BaseSettings):
     # Browser-uploaded SSH Profile keys. Files are private host credentials;
     # only opaque one-time upload tokens are returned to the frontend.
     ssh_key_storage_dir: str = "~/.ccm/ssh-keys"
+    ssh_sftp_max_concurrency: int = 8
+    ssh_sftp_queue_timeout_seconds: float = 5.0
+    ssh_sftp_operation_timeout_seconds: float = 30.0
+    ssh_sftp_download_timeout_seconds: float = 120.0
+    ssh_sftp_channel_timeout_seconds: float = 15.0
+    # Task-scoped MCP credentials and Claude security settings live outside
+    # world-readable/shared temporary directories. Agent sandboxes deny this
+    # complete root after the trusted CLI has loaded its own files.
+    task_runtime_secret_dir: str = "~/.ccm/task-runtime-secrets"
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
     worker_enabled: bool = True

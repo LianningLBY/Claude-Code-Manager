@@ -1,4 +1,5 @@
 from datetime import datetime
+import posixpath
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -17,6 +18,38 @@ def _validate_task_policy(
         raise ValueError("select at least one Task capability when Task access is enabled")
     if not enabled and capabilities:
         raise ValueError("Task capabilities require Task access to be enabled")
+
+
+def normalize_allowed_roots(value: list[str]) -> list[str]:
+    """Validate and collapse absolute POSIX roots."""
+
+    normalized: list[str] = []
+    for candidate in value:
+        if not isinstance(candidate, str):
+            raise ValueError("SSH allowed roots must be strings")
+        candidate = candidate.strip()
+        if not candidate or "\x00" in candidate or not candidate.startswith("/"):
+            raise ValueError("SSH allowed roots must be absolute POSIX paths")
+        root = "/" + posixpath.normpath(candidate).lstrip("/")
+        if len(root) > 4096:
+            raise ValueError("SSH allowed roots must be no longer than 4096 characters")
+        if any(
+            parent == "/"
+            or root == parent
+            or root.startswith(parent.rstrip("/") + "/")
+            for parent in normalized
+        ):
+            continue
+        normalized = [
+            existing
+            for existing in normalized
+            if not existing.startswith(root.rstrip("/") + "/")
+        ]
+        normalized.append(root)
+        normalized.sort(key=lambda item: (len(item), item))
+    if not normalized:
+        raise ValueError("select at least one SSH allowed root")
+    return normalized
 
 
 class _SSHProfileConnectionFields(BaseModel):
@@ -41,6 +74,7 @@ class SSHProfileCreate(_SSHProfileConnectionFields):
     enabled: bool = True
     task_access_enabled: bool = False
     task_capabilities: list[SSHCapability] = Field(default_factory=list, max_length=3)
+    allowed_roots: list[str] = Field(default_factory=lambda: ["/"], max_length=32)
 
     @field_validator("task_capabilities")
     @classmethod
@@ -49,6 +83,11 @@ class SSHProfileCreate(_SSHProfileConnectionFields):
         value: list[SSHCapability],
     ) -> list[SSHCapability]:
         return _unique_capabilities(value)
+
+    @field_validator("allowed_roots")
+    @classmethod
+    def valid_allowed_roots(cls, value: list[str]) -> list[str]:
+        return normalize_allowed_roots(value)
 
     @model_validator(mode="after")
     def exactly_one_key_source(self):
@@ -72,6 +111,7 @@ class SSHProfileUpdate(BaseModel):
         default=None,
         max_length=3,
     )
+    allowed_roots: list[str] | None = Field(default=None, max_length=32)
 
     @field_validator("task_capabilities")
     @classmethod
@@ -82,6 +122,16 @@ class SSHProfileUpdate(BaseModel):
         if value is None:
             raise ValueError("task_capabilities must not be null")
         return _unique_capabilities(value)
+
+    @field_validator("allowed_roots")
+    @classmethod
+    def valid_optional_allowed_roots(
+        cls,
+        value: list[str] | None,
+    ) -> list[str]:
+        if value is None:
+            raise ValueError("allowed_roots must not be null")
+        return normalize_allowed_roots(value)
 
     @field_validator("task_access_enabled")
     @classmethod
@@ -150,6 +200,7 @@ class SSHProfileResponse(BaseModel):
     enabled: bool
     task_access_enabled: bool
     task_capabilities: list[SSHCapability]
+    allowed_roots: list[str]
     created_by: int | None
     last_tested_at: datetime | None
     last_test_ok: bool | None

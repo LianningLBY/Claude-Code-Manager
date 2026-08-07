@@ -36,21 +36,22 @@ async def test_managed_ssh_files_use_profile_id_without_browser_credentials(
         deleted_at=None,
         task_access_enabled=False,
         task_capabilities=[],
+        allowed_roots=["/srv"],
     )
     observed = []
 
     def fake_list(resolved_profile, path):
         observed.append((resolved_profile, path))
-        return [{
+        return "/srv", [{
             "name": "report.txt",
             "path": "/srv/report.txt",
             "is_dir": False,
             "size": 12,
-        }]
+        }], False
 
     def fake_read(resolved_profile, path):
         observed.append((resolved_profile, path))
-        return "managed content", 15
+        return "/srv/report.txt", "managed content", 15
 
     monkeypatch.setattr(files_module, "_managed_ssh_list_sync", fake_list)
     monkeypatch.setattr(files_module, "_managed_ssh_read_sync", fake_read)
@@ -137,6 +138,12 @@ def test_managed_ssh_download_enforces_stream_limit_and_cleans_partial_file(
             return next(self.chunks)
 
     class FakeSFTP:
+        def get_channel(self):
+            return SimpleNamespace(settimeout=lambda _timeout: None)
+
+        def normalize(self, path):
+            return path
+
         def stat(self, _path):
             return SimpleNamespace(st_size=3)
 
@@ -167,7 +174,7 @@ def test_managed_ssh_download_enforces_stream_limit_and_cleans_partial_file(
 
     try:
         files_module._managed_ssh_download_sync(
-            SimpleNamespace(),
+            SimpleNamespace(allowed_roots=["/"]),
             "/remote/growing.bin",
         )
     except HTTPException as exc:

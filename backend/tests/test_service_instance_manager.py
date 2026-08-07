@@ -23,6 +23,7 @@ from backend.services.instance_manager import (
     InstanceManager,
     LaunchSupersededError,
     LiveAttachmentInjectionUnsupportedError,
+    _OutputConsumerRecord,
 )
 from backend.services.claude_pool import ClaudePool
 from backend.services.codex_pool import CodexPool
@@ -70,6 +71,87 @@ def _no_pty_no_skills(monkeypatch):
 
 def test_codex_main_mcp_capability_defaults_on():
     assert Settings.model_fields["codex_main_mcp_enabled"].default is True
+
+
+def test_claude_terminal_result_suppresses_only_exact_assistant_duplicate():
+    record = _OutputConsumerRecord(
+        process=MagicMock(),
+        task=MagicMock(),
+        chat_initiated=True,
+        provider="claude",
+    )
+    assistant = {
+        "event_type": "message",
+        "role": "assistant",
+        "content": "Finished safely.\r\n",
+        "is_error": False,
+    }
+    terminal = {
+        "event_type": "result",
+        "role": "assistant",
+        "content": " Finished safely. ",
+        "is_error": False,
+    }
+
+    assert InstanceManager._suppress_duplicate_claude_result(
+        assistant,
+        record,
+        "claude",
+    ) is assistant
+    suppressed = InstanceManager._suppress_duplicate_claude_result(
+        terminal,
+        record,
+        "claude",
+    )
+    assert suppressed["content"] is None
+    assert suppressed["duplicate_of_assistant"] is True
+    assert terminal["content"] == " Finished safely. "
+
+    different = {**terminal, "content": "Additional final detail"}
+    assert InstanceManager._suppress_duplicate_claude_result(
+        different,
+        record,
+        "claude",
+    )["content"] == "Additional final detail"
+    errored = {**terminal, "is_error": True}
+    assert InstanceManager._suppress_duplicate_claude_result(
+        errored,
+        record,
+        "claude",
+    )["content"] == " Finished safely. "
+
+
+def test_claude_hot_runtime_fingerprint_covers_mcp_and_ask_user_token(
+    tmp_path,
+):
+    settings_path = tmp_path / "settings.json"
+    mcp_path = tmp_path / "mcp.json"
+    settings_path.write_text('{"sandbox":true}')
+    mcp_path.write_text('{"mcpServers":{}}')
+
+    baseline = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+    )
+    assert baseline == InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+    )
+
+    mcp_path.write_text('{"mcpServers":{"ccm_ssh":{}}}')
+    assert baseline != InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+    )
+    mcp_path.write_text('{"mcpServers":{}}')
+    assert baseline != InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={"CCM_ASK_USER_TOKEN": "token-b"},
+    )
 
 
 def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
@@ -1683,9 +1765,12 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     env = exec_mock.await_args.kwargs["env"]
     assert env["CCM_TASK_SSH_GUARD"] == "1"
     assert env["SSH_AUTH_SOCK"] == ""
-    settings_data = json.loads(
-        (tmp_path / "claude-task-ssh-home" / "settings.json").read_text()
-    )
+    settings_path = Path(argv[argv.index("--settings") + 1])
+    settings_data = json.loads(settings_path.read_text())
+    assert "--dangerously-skip-permissions" not in argv
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert settings_data["sandbox"]["failIfUnavailable"] is True
+    assert settings_data["sandbox"]["network"]["allowedDomains"] == []
     assert any(
         "task_ssh_guard_hook.py" in hook.get("command", "")
         for entry in settings_data["hooks"]["PreToolUse"]
@@ -1741,12 +1826,15 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
     kwargs = im._launch_pty.await_args.kwargs
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert kwargs["claude_isolation_settings_path"].name == (
+        "claude-security.json"
+    )
     assert "ccm_ssh.list_connections" in kwargs["skill_context"]
     assert "known_hosts" in kwargs["skill_context"]
 
 
 @pytest.mark.asyncio
-async def test_claude_task_ssh_refuses_launch_when_guard_install_fails(
+async def test_claude_task_ssh_refuses_launch_when_isolation_preflight_fails(
     db_factory,
     tmp_path,
 ):
@@ -1774,8 +1862,9 @@ async def test_claude_task_ssh_refuses_launch_when_guard_install_fails(
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     with (
         patch(
-            "backend.services.ask_user_settings.ensure_ask_user_hook",
-            return_value=False,
+            "backend.services.task_agent_isolation."
+            "validate_claude_task_isolation_settings",
+            side_effect=RuntimeError("sandbox unavailable"),
         ),
         patch(
             "backend.services.instance_manager.asyncio.create_subprocess_exec",
@@ -1784,7 +1873,7 @@ async def test_claude_task_ssh_refuses_launch_when_guard_install_fails(
     ):
         with pytest.raises(
             RuntimeError,
-            match="Task SSH guard could not be installed",
+            match="sandbox unavailable",
         ):
             await im.launch(
                 instance_id=inst.id,
@@ -1910,6 +1999,7 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
     )
     kwargs = im._launch_codex_app_server.await_args.kwargs
     assert kwargs["sandbox_mode"] == "workspace-write"
+    assert kwargs["task_ssh_disable_network"] is True
     assert "/private/test/id_ed25519" in kwargs["task_ssh_protected_paths"]
     assert any(path.endswith("/.ssh") for path in kwargs["task_ssh_protected_paths"])
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
@@ -1957,7 +2047,7 @@ async def test_codex_task_ssh_isolation_failure_never_falls_back_to_exec(
     ) as exec_mock:
         with pytest.raises(
             CodexRequiredMcpError,
-            match="Task SSH isolation could not be confirmed",
+            match="Task credential isolation could not be confirmed",
         ):
             await im.launch(
                 instance_id=inst.id,
@@ -2305,8 +2395,8 @@ async def test_api_codex_exec_forces_project_config_untrusted(
 
 
 @pytest.mark.asyncio
-async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
-    db_factory, monkeypatch, tmp_path, caplog,
+async def test_codex_task_requires_isolated_app_server_when_disabled(
+    db_factory, monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -2325,41 +2415,26 @@ async def test_codex_main_mcp_uses_exec_when_app_server_is_disabled(
         await db.refresh(inst)
         await db.refresh(task)
 
-    mock_proc = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     im.task_message_enqueuer = AsyncMock()
-    with (
-        caplog.at_level("INFO", logger="backend.services.instance_manager"),
-        patch(
-            "backend.services.instance_manager.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=mock_proc,
-        ) as exec_mock,
-    ):
-        await im.launch(
-            instance_id=inst.id,
-            prompt="use CCM help",
-            task_id=task.id,
-            cwd="/tmp",
-            provider="codex",
-            config_dir=str(tmp_path / "codex-main-mcp-exec-home"),
-        )
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="credential protection requires the app-server",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="use CCM help",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-main-mcp-exec-home"),
+            )
 
-    argv = list(exec_mock.await_args.args)
-    expected_mcp_args = render_codex_exec_config_args(
-        build_mcp_server_specs(
-            task.id,
-            {},
-            provider="codex",
-            codex_monitor_enabled=True,
-        )
-    )
-    flag_index = argv.index("-c")
-    assert argv[flag_index : flag_index + 2] == expected_mcp_args
-    assert argv[-1] == "use CCM help"
-    assert "route=direct-exec" in caplog.text
-    assert "required_mcp=True" in caplog.text
-    await asyncio.sleep(0.1)
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2401,7 +2476,7 @@ async def test_invalid_required_exec_mcp_fails_before_subprocess_spawn(
     ):
         with pytest.raises(
             CodexRequiredMcpError,
-            match="Invalid required Codex exec MCP configuration",
+            match="credential protection requires the app-server",
         ):
             await im.launch(
                 instance_id=inst.id,
@@ -3133,8 +3208,8 @@ async def test_launch_codex_falls_back_to_exec_when_app_server_fails(
     "failure_mode",
     ["startup", "missing-thread"],
 )
-async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
-    db_factory, monkeypatch, tmp_path, failure_mode, caplog,
+async def test_task_isolation_pre_turn_failure_never_falls_back_to_exec(
+    db_factory, monkeypatch, tmp_path, failure_mode,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
@@ -3160,7 +3235,6 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     im._codex_actual_tier_route_for_home = MagicMock(return_value=(
         CodexTierProxyRoute("https://upstream.example/v1")
     ))
-    mock_proc = _make_mock_process()
     startup_error = (
         CodexAppServerError("initialize failed")
         if failure_mode == "startup"
@@ -3177,7 +3251,6 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
         server._actual_tier_proxy = proxy
 
     with (
-        caplog.at_level("INFO", logger="backend.services.instance_manager"),
         patch(
             "backend.services.skill_context.build_task_skill_context",
             new=AsyncMock(
@@ -3200,17 +3273,20 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
         patch(
             "backend.services.instance_manager.asyncio.create_subprocess_exec",
             new_callable=AsyncMock,
-            return_value=mock_proc,
         ) as exec_mock,
     ):
-        await im.launch(
-            instance_id=inst.id,
-            prompt="must keep required MCP",
-            task_id=task.id,
-            cwd="/tmp",
-            provider="codex",
-            config_dir=str(tmp_path / "codex-required-mcp-home"),
-        )
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="credential isolation could not be confirmed",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must keep required MCP",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                config_dir=str(tmp_path / "codex-required-mcp-home"),
+            )
 
     if failure_mode == "startup":
         ensure_started.assert_awaited_once()
@@ -3218,27 +3294,7 @@ async def test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec(
     elif failure_mode == "missing-thread":
         ensure_started.assert_awaited_once()
         request.assert_awaited_once()
-    exec_mock.assert_awaited_once()
-    argv = list(exec_mock.await_args.args)
-    expected_mcp_args = render_codex_exec_config_args(
-        build_mcp_server_specs(
-            task.id,
-            {},
-            provider="codex",
-            codex_monitor_enabled=True,
-        )
-    )
-    flag_index = argv.index("-c")
-    assert argv[flag_index : flag_index + 2] == expected_mcp_args
-    assert argv[-1] == (
-        "<ccm-task-skill-context>\n"
-        "## Available Skills\n- **review**: Review changes\n"
-        "</ccm-task-skill-context>\n\n"
-        "must keep required MCP"
-    )
-    assert "route=safe-fallback" in caplog.text
-    assert "reason=required-mcp-pre-turn" in caplog.text
-    await asyncio.sleep(0.1)
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3379,8 +3435,8 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
         new_callable=AsyncMock,
     ) as exec_mock:
         with pytest.raises(
-            CodexRequiredMcpPreTurnError,
-            match="before turn/start",
+            CodexRequiredMcpError,
+            match="credential isolation could not be confirmed",
         ):
             await im.launch(
                 instance_id=inst.id,
@@ -3776,6 +3832,8 @@ async def test_codex_main_mcp_capability_does_not_change_claude_launch(
 
 @pytest.mark.asyncio
 async def test_codex_registry_lifecycle_facades_delegate():
+    codex_a = str(Path("/tmp/codex-a").resolve())
+    codex_b = str(Path("/tmp/codex-b").resolve())
     registry = MagicMock()
     registry.begin_home_maintenance = AsyncMock(return_value=True)
     registry.end_home_maintenance = AsyncMock()
@@ -3798,13 +3856,13 @@ async def test_codex_registry_lifecycle_facades_delegate():
         "require_idle": True,
     }
     assert registry.begin_home_maintenance.await_args_list[0].args == (
-        "/tmp/codex-a",
+        codex_a,
     )
-    registry.end_home_maintenance.assert_any_await("/tmp/codex-a")
+    registry.end_home_maintenance.assert_any_await(codex_a)
     registry.begin_home_maintenance.assert_any_await(
-        "/tmp/codex-b", require_idle=True,
+        codex_b, require_idle=True,
     )
-    registry.end_home_maintenance.assert_any_await("/tmp/codex-b")
+    registry.end_home_maintenance.assert_any_await(codex_b)
     registry.rebind_thread.assert_awaited_once_with(
         "thread-1",
         source_codex_home="/tmp/codex-a",
@@ -3935,6 +3993,7 @@ async def test_codex_registry_legacy_rebind_facade_still_delegates():
 
 @pytest.mark.asyncio
 async def test_codex_shutdown_home_uses_idle_maintenance_gate():
+    codex_home = str(Path("/tmp/codex-a").resolve())
     registry = MagicMock()
     registry.begin_home_maintenance = AsyncMock(return_value=True)
     registry.end_home_maintenance = AsyncMock()
@@ -3945,9 +4004,9 @@ async def test_codex_shutdown_home_uses_idle_maintenance_gate():
         "/tmp/codex-a", require_idle=True,
     ) is True
     registry.begin_home_maintenance.assert_awaited_once_with(
-        "/tmp/codex-a", require_idle=True,
+        codex_home, require_idle=True,
     )
-    registry.end_home_maintenance.assert_awaited_once_with("/tmp/codex-a")
+    registry.end_home_maintenance.assert_awaited_once_with(codex_home)
 
 
 @pytest.mark.asyncio
@@ -9632,6 +9691,16 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     calls = {}
 
     class FakeBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
         async def launch_for_ccm(self, **kwargs):
             calls.update(kwargs)
             im.processes[kwargs["instance_id"]] = MagicMock(pid=4242)
@@ -9656,6 +9725,16 @@ async def test_pty_launch_injects_canonical_task_skill_context():
     calls = {}
 
     class FakeBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="claude",
+                dangerously_skip_permissions=True,
+            )
+
         async def launch_for_ccm(self, **kwargs):
             calls.update(kwargs)
             im.processes[kwargs["instance_id"]] = MagicMock(pid=4244)

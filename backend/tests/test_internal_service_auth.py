@@ -14,10 +14,12 @@ def _internal_auth_state(monkeypatch):
     monkeypatch.setattr(settings, "auth_token", "deployment-secret")
     with auth._revocation_lock:
         auth._owner_tokens.clear()
+        auth._owner_token_cache.clear()
         auth._revoked_tokens.clear()
     yield
     with auth._revocation_lock:
         auth._owner_tokens.clear()
+        auth._owner_token_cache.clear()
         auth._revoked_tokens.clear()
 
 
@@ -117,6 +119,12 @@ def test_skills_credential_cannot_use_the_general_task_update_route():
             "POST",
             "/api/tasks/42/sub-agent-sessions/9/result",
         ),
+        (
+            "ccm_ask_user",
+            {"task_id": 42},
+            "POST",
+            "/api/ask-user/wait",
+        ),
     ],
 )
 def test_each_mcp_audience_accepts_only_its_callback_surface(
@@ -178,6 +186,35 @@ def test_tampered_expired_and_revoked_credentials_are_rejected(monkeypatch):
             method="GET",
             path="/api/tasks/42/ssh-access",
         )
+
+
+def test_identical_owner_scope_reuses_token_until_revoked(monkeypatch):
+    monkeypatch.setattr(auth.time, "time", lambda: 1_000)
+    first = auth.issue_internal_service_token(
+        audience="ccm_ssh",
+        task_id=42,
+        owner_kind="task-turn",
+        owner_id=42,
+        ttl_seconds=600,
+    )
+    second = auth.issue_internal_service_token(
+        audience="ccm_ssh",
+        task_id=42,
+        owner_kind="task-turn",
+        owner_id=42,
+        ttl_seconds=600,
+    )
+    assert second == first
+
+    auth.revoke_internal_service_owner("task-turn", 42)
+    replacement = auth.issue_internal_service_token(
+        audience="ccm_ssh",
+        task_id=42,
+        owner_kind="task-turn",
+        owner_id=42,
+        ttl_seconds=600,
+    )
+    assert replacement != first
 
 
 @pytest.mark.asyncio

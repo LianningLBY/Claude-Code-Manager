@@ -929,6 +929,7 @@ async def create_task(
             worker_id=data.get("worker_id"),
             shared_from_id=data.get("shared_from_id"),
             metadata=data.get("metadata_"),
+            project_id=data.get("project_id"),
         )
     except TaskSSHAccessError as exc:
         raise HTTPException(exc.status_code, exc.detail) from exc

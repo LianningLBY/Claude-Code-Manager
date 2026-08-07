@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -159,6 +160,10 @@ class _OutputConsumerRecord:
     # A matching stop may take over this quiescent wait immediately instead of
     # burning the generic 30-second terminal-consumer timeout.
     pty_background_waiting: bool = False
+    # Claude stream-json may emit the final assistant body once as an
+    # ``assistant`` envelope and again in the terminal ``result`` envelope.
+    # Keep terminal metadata but suppress only that exact repeated body.
+    last_claude_assistant_text: str | None = None
 
 
 @dataclass
@@ -934,10 +939,13 @@ class InstanceManager:
                         db,
                         task,
                     )
-                    if task_ssh_capabilities:
-                        task_ssh_protected_path_values = (
-                            await task_ssh_protected_paths(db)
-                        )
+                    # Every local Task must be unable to inspect Manager SSH,
+                    # provider-account, and scoped runtime credentials. A Task
+                    # with grants additionally loses direct network access and
+                    # reaches SSH only through the broker MCP.
+                    task_ssh_protected_path_values = (
+                        await task_ssh_protected_paths(db)
+                    )
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -1021,6 +1029,16 @@ class InstanceManager:
                 logger.warning("Could not enforce 0700 on CODEX_HOME %s", config_dir)
             self._config_dirs[instance_id] = config_dir
 
+        if task_id is not None and config_dir:
+            from backend.services.task_ssh_access import (
+                _protected_path_variants,
+            )
+
+            task_ssh_protected_path_values = tuple(sorted({
+                *task_ssh_protected_path_values,
+                *_protected_path_variants(config_dir),
+            }))
+
         # New turn → clear per-turn flags.
         self._transient_seen.discard(instance_id)
         self._pty_rate_limit_seen.discard(instance_id)
@@ -1028,6 +1046,7 @@ class InstanceManager:
         self._effective_exit_codes.pop(instance_id, None)
 
         mcp_config_path = None
+        claude_isolation_settings_path = None
         if provider == "claude" and task_id and not pr_review_task:
             from backend.services.mcp_config import generate_mcp_config
             mcp_config_path = generate_mcp_config(
@@ -1036,9 +1055,27 @@ class InstanceManager:
                 task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
             )
 
-        # AskUser and Task SSH guards share Claude's account settings so PTY
-        # and direct ``-p`` launches receive the same PreToolUse policy.
-        if provider == "claude" and not pr_review_task:
+            from backend.services.task_agent_isolation import (
+                generate_claude_task_isolation_settings,
+                validate_claude_task_isolation_settings,
+            )
+
+            claude_isolation_settings_path = (
+                generate_claude_task_isolation_settings(
+                    task_id,
+                    task_ssh_protected_path_values,
+                    ssh_capabilities=task_ssh_capabilities,
+                )
+            )
+            await asyncio.to_thread(
+                validate_claude_task_isolation_settings,
+                claude_isolation_settings_path,
+                claude_binary=settings.claude_binary,
+            )
+
+        # Prompt-only Claude launches have no Task-scoped exact settings file;
+        # retain the legacy account-level AskUser compatibility hook for them.
+        if provider == "claude" and not pr_review_task and task_id is None:
             from backend.services.ask_user_settings import ensure_ask_user_hook
             hooks_ready = ensure_ask_user_hook(
                 config_dir or os.path.expanduser("~/.claude"),
@@ -1050,18 +1087,39 @@ class InstanceManager:
                     "Task SSH guard could not be installed for Claude"
                 )
 
-        if task_ssh_capabilities:
+        if (
+            provider == "claude"
+            and task_id is not None
+            and not pr_review_task
+            and settings.ask_user_enabled
+        ):
+            from backend.services.internal_service_auth import (
+                ASK_USER_TOKEN_ENV,
+                issue_internal_service_token,
+            )
+
+            ask_user_token = issue_internal_service_token(
+                audience="ccm_ask_user",
+                task_id=task_id,
+                owner_kind="task-turn",
+                owner_id=task_id,
+            )
+            if ask_user_token:
+                git_env = dict(git_env or {})
+                git_env[ASK_USER_TOKEN_ENV] = ask_user_token
+
+        if task_id is not None and not pr_review_task:
             # These variables are inherited by Claude PTY, Claude direct, and
-            # Codex shell environments. Empty agent coordinates prevent the
-            # OpenSSH client from reaching a service-level agent even if a
-            # future tool bypasses the command hook.
+            # Codex shell environments. Empty agent coordinates prevent any
+            # Task (granted or not) from reaching a service-level SSH agent.
             git_env = dict(git_env or {})
             git_env.update({
-                "CCM_TASK_SSH_GUARD": "1",
                 "SSH_AUTH_SOCK": "",
                 "SSH_AGENT_PID": "",
                 "SSH_ASKPASS": "",
             })
+            if task_ssh_capabilities:
+                git_env["CCM_TASK_SSH_GUARD"] = "1"
 
         # Check if shared project → prepare Docker container wrapper for PTY
         _container_project_id = None
@@ -1133,6 +1191,12 @@ class InstanceManager:
             and task_id is not None
             and bool(task_ssh_capabilities)
             and not pr_review_task
+        )
+        codex_task_isolation_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and not pr_review_task
+            and task_ssh_protected_path_values
         )
         codex_mcp_required = (
             codex_main_mcp_required
@@ -1206,11 +1270,12 @@ class InstanceManager:
 
         if (
             provider == "codex"
-            and codex_ssh_mcp_required
+            and codex_task_isolation_required
             and not settings.codex_app_server_enabled
         ):
             raise CodexRequiredMcpError(
-                "Codex Task SSH requires the app-server isolated permission "
+                "Codex Task credential protection requires the app-server "
+                "isolated permission "
                 "profile; exec fallback is disabled"
             )
 
@@ -1247,14 +1312,17 @@ class InstanceManager:
                             if pr_review_task
                             else (
                                 "workspace-write"
-                                if codex_ssh_mcp_required
+                                if codex_task_isolation_required
                                 else "danger-full-access"
                             )
                         ),
                         task_ssh_protected_paths=(
                             task_ssh_protected_path_values
-                            if codex_ssh_mcp_required
+                            if codex_task_isolation_required
                             else ()
+                        ),
+                        task_ssh_disable_network=bool(
+                            task_ssh_capabilities
                         ),
                         disable_autonomous_features=pr_review_task,
                         tools_disabled=pr_review_task,
@@ -1279,9 +1347,9 @@ class InstanceManager:
                             "Codex Fast could not be confirmed before "
                             "turn/start; exec fallback is disabled for Fast"
                         ) from exc
-                    if codex_ssh_mcp_required:
+                    if codex_task_isolation_required:
                         raise CodexRequiredMcpError(
-                            "Codex Task SSH isolation could not be confirmed "
+                            "Codex Task credential isolation could not be confirmed "
                             "before turn/start"
                         ) from exc
                     if (
@@ -1353,7 +1421,7 @@ class InstanceManager:
                             "Codex Fast could not be confirmed before "
                             "turn/start; refusing unverified exec fallback"
                         ) from exc
-                    if codex_mcp_required:
+                    if codex_mcp_required or codex_task_isolation_required:
                         # Once required ccm_skills was selected, every unknown
                         # app-server failure must fail closed instead of
                         # silently replaying without tools.
@@ -1395,6 +1463,12 @@ class InstanceManager:
             and self.pty_mode_enabled
             and not pr_review_task
         ):
+            if _container_wrapper is not None:
+                # Shared Projects already execute in their dedicated,
+                # read-only-root container and cannot receive managed Task
+                # SSH grants. Host-only settings/MCP paths are not visible
+                # inside that container, so retain its existing PTY boundary.
+                claude_isolation_settings_path = None
             return await self._launch_pty(
                 instance_id=instance_id,
                 prompt=prompt,
@@ -1419,6 +1493,9 @@ class InstanceManager:
                 source_log_id=source_log_id,
                 current_message=current_message,
                 queue_timestamp=queue_timestamp,
+                claude_isolation_settings_path=(
+                    claude_isolation_settings_path
+                ),
             )
 
         if provider == "codex" and pr_review_task:
@@ -1443,6 +1520,7 @@ class InstanceManager:
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
             tools_disabled=pr_review_task,
+            claude_isolation_settings_path=claude_isolation_settings_path,
         )
         if provider == "codex":
             logger.info(
@@ -2168,6 +2246,7 @@ class InstanceManager:
         codex_service_tier: str = "default",
         sandbox_mode: str = "danger-full-access",
         task_ssh_protected_paths: Sequence[str] = (),
+        task_ssh_disable_network: bool = False,
         disable_autonomous_features: bool = False,
         tools_disabled: bool = False,
     ) -> int:
@@ -2191,6 +2270,7 @@ class InstanceManager:
             codex_service_tier=codex_service_tier,
             sandbox_mode=sandbox_mode,
             task_ssh_protected_paths=task_ssh_protected_paths,
+            task_ssh_disable_network=task_ssh_disable_network,
             disable_autonomous_features=disable_autonomous_features,
             tools_disabled=tools_disabled,
         )
@@ -2941,6 +3021,35 @@ class InstanceManager:
             expected_codex_home=expected_codex_home,
         )
 
+    @staticmethod
+    def _claude_task_runtime_fingerprint(
+        settings_path: Path,
+        *,
+        mcp_config_path: str | Path | None,
+        git_env: dict | None,
+    ) -> str:
+        """Fingerprint every launch input retained by a hot Claude process."""
+
+        digest = hashlib.sha256()
+
+        def add_component(label: str, value: bytes) -> None:
+            encoded_label = label.encode("utf-8")
+            digest.update(len(encoded_label).to_bytes(4, "big"))
+            digest.update(encoded_label)
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+
+        add_component("settings", settings_path.read_bytes())
+        if mcp_config_path is not None:
+            add_component("mcp", Path(mcp_config_path).read_bytes())
+        add_component(
+            "ask-user-token",
+            str((git_env or {}).get("CCM_ASK_USER_TOKEN", "")).encode(
+                "utf-8"
+            ),
+        )
+        return digest.hexdigest()
+
     async def _launch_pty(
         self,
         instance_id: int,
@@ -2966,6 +3075,7 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        claude_isolation_settings_path: Path | None = None,
     ) -> int:
         """PTY-mode launch: delegate to claude_pty, mirror -p bookkeeping.
 
@@ -2974,6 +3084,34 @@ class InstanceManager:
         so everything downstream (DB, WebSocket, dispatcher wait) is
         unchanged.
         """
+        isolation_fingerprint = None
+        if claude_isolation_settings_path is not None:
+            isolation_fingerprint = (
+                self._claude_task_runtime_fingerprint(
+                    claude_isolation_settings_path,
+                    mcp_config_path=mcp_config_path,
+                    git_env=git_env,
+                )
+            )
+            if resume_session_id:
+                existing_session = (
+                    self._pty_backend._pool._sessions.get(
+                        resume_session_id
+                    )
+                )
+                existing_fingerprint = getattr(
+                    getattr(existing_session, "config", None),
+                    "_ccm_task_isolation_fingerprint",
+                    None,
+                )
+                if (
+                    existing_session is not None
+                    and existing_fingerprint != isolation_fingerprint
+                ):
+                    # A hot process cannot absorb changed CLI settings. Stop
+                    # it while idle and cold-resume the same native session.
+                    await self.release_pty_session(resume_session_id)
+
         is_cold_start = (
             resume_session_id
             and resume_session_id not in self._pty_backend._pool._sessions
@@ -3021,19 +3159,37 @@ class InstanceManager:
             # admission lock across patch -> config construction -> restore so
             # a container wrapper can never leak into another launch.
             async with self._pty_build_config_lock:
-                original_build_config = self._pty_backend.build_config
+                original_build_config = getattr(
+                    self._pty_backend,
+                    "build_config",
+                    None,
+                )
                 wrapper = claude_binary_override
+                if original_build_config is None and (
+                    claude_isolation_settings_path is not None
+                    or cloudrouter_api
+                    or wrapper is not None
+                ):
+                    raise RuntimeError(
+                        "PTY backend cannot apply the required launch boundary"
+                    )
 
                 def _patched_build_config(**kw):
+                    if original_build_config is None:
+                        raise RuntimeError(
+                            "PTY backend does not expose secure config construction"
+                        )
                     cfg = original_build_config(**kw)
-                    overrides = dict(cfg.env_overrides or {})
+                    overrides = dict(
+                        getattr(cfg, "env_overrides", None) or {}
+                    )
                     # claude-pty inherits the Manager environment. Shadow the
                     # deployment credential for every Task PTY; MCP servers
                     # receive their own scoped token from their config entry.
                     overrides["AUTH_TOKEN"] = ""
                     overrides["CCM_INTERNAL_SERVICE_TOKEN"] = ""
+                    final_binary = wrapper or cfg.claude_binary
                     if cloudrouter_api:
-                        final_binary = wrapper or cfg.claude_binary
                         cloudrouter_wrapper = Path(__file__).with_name(
                             "cloudrouter_claude_wrapper.sh"
                         )
@@ -3049,13 +3205,48 @@ class InstanceManager:
                         overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
                             final_binary
                         )
-                        cfg.claude_binary = str(cloudrouter_wrapper)
-                    elif wrapper:
-                        cfg.claude_binary = wrapper
+                        final_binary = str(cloudrouter_wrapper)
+                    if claude_isolation_settings_path is not None:
+                        from backend.services.task_agent_isolation import (
+                            CLAUDE_TASK_BUILTIN_TOOLS,
+                        )
+
+                        task_wrapper = Path(__file__).with_name(
+                            "task_claude_wrapper.sh"
+                        )
+                        if not (
+                            task_wrapper.is_file()
+                            and os.access(task_wrapper, os.X_OK)
+                        ):
+                            raise RuntimeError(
+                                "Task Claude isolation wrapper is unavailable"
+                            )
+                        overrides.update({
+                            "CCM_TASK_CLAUDE_SETTINGS": str(
+                                claude_isolation_settings_path
+                            ),
+                            "CCM_TASK_CLAUDE_BINARY": str(final_binary),
+                            "CCM_TASK_CLAUDE_TOOLS": ",".join(
+                                CLAUDE_TASK_BUILTIN_TOOLS
+                            ),
+                        })
+                        cfg.claude_binary = str(task_wrapper)
+                        cfg.dangerously_skip_permissions = False
+                        setattr(
+                            cfg,
+                            "_ccm_task_isolation_fingerprint",
+                            isolation_fingerprint,
+                        )
+                    else:
+                        cfg.claude_binary = str(final_binary)
                     cfg.env_overrides = overrides
                     return cfg
 
-                self._pty_backend.build_config = _patched_build_config
+                setattr(
+                    self._pty_backend,
+                    "build_config",
+                    _patched_build_config,
+                )
                 try:
                     from backend.services.skill_context import (
                         wrap_skill_context,
@@ -3079,7 +3270,10 @@ class InstanceManager:
                         mcp_config_path=mcp_config_path,
                     )
                 finally:
-                    self._pty_backend.build_config = original_build_config
+                    if original_build_config is None:
+                        delattr(self._pty_backend, "build_config")
+                    else:
+                        self._pty_backend.build_config = original_build_config
 
             process = self.processes.get(instance_id)
             consumer = self._tasks.get(instance_id)
@@ -5328,16 +5522,36 @@ class InstanceManager:
         codex_api_account: bool = False,
         codex_service_tier: str = "default",
         tools_disabled: bool = False,
+        claude_isolation_settings_path: Path | None = None,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
             cmd = [
                 settings.claude_binary,
                 "-p", prompt,
-                "--dangerously-skip-permissions",
                 "--output-format", "stream-json",
                 "--verbose",
             ]
+            if claude_isolation_settings_path is not None:
+                from backend.services.task_agent_isolation import (
+                    CLAUDE_TASK_BUILTIN_TOOLS,
+                )
+
+                cmd.extend([
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--settings",
+                    str(claude_isolation_settings_path),
+                    "--setting-sources",
+                    "",
+                    "--strict-mcp-config",
+                    "--disable-slash-commands",
+                    "--no-chrome",
+                    "--tools",
+                    ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                ])
+            else:
+                cmd.append("--dangerously-skip-permissions")
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:
@@ -8118,6 +8332,38 @@ class InstanceManager:
             return content
         return None
 
+    @staticmethod
+    def _suppress_duplicate_claude_result(
+        event: dict,
+        record: _OutputConsumerRecord | None,
+        provider: str,
+    ) -> dict:
+        """Remove only an exact successful Claude assistant/result repeat."""
+
+        if (
+            provider != "claude"
+            or record is None
+            or event.get("role") != "assistant"
+            or event.get("event_type") not in {"message", "result"}
+            or event.get("is_error")
+            or event.get("orphan")
+            or event.get("autonomous")
+        ):
+            return event
+        content = event.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return event
+        normalized = content.replace("\r\n", "\n").strip()
+        if event["event_type"] == "message":
+            object.__setattr__(record, "last_claude_assistant_text", normalized)
+            return event
+        if normalized != record.last_claude_assistant_text:
+            return event
+        suppressed = dict(event)
+        suppressed["content"] = None
+        suppressed["duplicate_of_assistant"] = True
+        return suppressed
+
     async def _process_event(
         self,
         instance_id: int,
@@ -8148,6 +8394,8 @@ class InstanceManager:
                 else self._consumer_records.get(instance_id)
             )
         )
+        if event_record is not None:
+            provider = str(event_record.provider or provider).lower()
 
         def owns_event_generation() -> bool:
             if event_record is None:
@@ -8471,6 +8719,12 @@ class InstanceManager:
                 except (ValueError, TypeError):
                     pass
 
+        event = self._suppress_duplicate_claude_result(
+            event,
+            event_record,
+            provider,
+        )
+
         # Store the event and related heartbeat/session/unread updates in one
         # transaction.  The old path committed 2-4 times per Codex event,
         # serializing the stream behind SQLite fsyncs before WebSocket delivery.
@@ -8529,6 +8783,7 @@ class InstanceManager:
                 if (
                     event.get("role") == "assistant"
                     and event["event_type"] in ("message", "result")
+                    and event.get("content")
                 ):
                     task_values["has_unread"] = True
                 if task_values:

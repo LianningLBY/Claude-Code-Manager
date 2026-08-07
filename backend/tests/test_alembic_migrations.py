@@ -46,7 +46,8 @@ FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
 PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
 SSH_PROFILES_REVISION = "73c4a9e1b2d0"
 TASK_SSH_GRANTS_REVISION = "84d5b0f2c3e1"
-CURRENT_HEAD_REVISION = "91e6a4c8d2f0"
+TASK_SSH_POLICY_REVISION = "91e6a4c8d2f0"
+CURRENT_HEAD_REVISION = "a6d9f2c4e8b1"
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -1646,7 +1647,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_task_ssh_grants(self, tmp_path):
+    def test_migration_graph_has_one_head_after_ssh_allowed_roots(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -1654,6 +1655,10 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == TASK_SSH_POLICY_REVISION
+        )
+        assert (
+            script.get_revision(TASK_SSH_POLICY_REVISION).down_revision
             == TASK_SSH_GRANTS_REVISION
         )
         assert (
@@ -1725,11 +1730,12 @@ class TestPublishedMigrationHistory:
         engine = create_engine(f"sqlite:///{db_path}")
         with engine.connect() as conn:
             row = conn.execute(text("""
-                SELECT task_access_enabled, task_capabilities
+                SELECT task_access_enabled, task_capabilities, allowed_roots
                 FROM ssh_profiles WHERE name = 'existing'
             """)).one()
         assert bool(row[0]) is True
         assert json.loads(row[1]) == ["exec", "read", "write"]
+        assert json.loads(row[2]) == ["/"]
         engine.dispose()
 
     @pytest.mark.parametrize(

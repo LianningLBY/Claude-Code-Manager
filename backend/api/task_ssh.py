@@ -1,4 +1,3 @@
-import asyncio
 import errno
 import posixpath
 import socket
@@ -34,6 +33,16 @@ from backend.services.ssh_executor import (
     SSHKeyPreflightError,
 )
 from backend.services.ssh_profiles import executor_for_profile
+from backend.services.ssh_remote_paths import (
+    resolve_existing_remote_path,
+    resolve_remote_write_path,
+)
+from backend.services.ssh_sftp import (
+    SSHSFTPBusyError,
+    SSHSFTPOperationTimeout,
+    configure_sftp_channel_timeout,
+    run_bounded_sftp,
+)
 from backend.services.task_ssh_access import (
     TaskSSHAccessError,
     replace_task_ssh_grants,
@@ -58,6 +67,10 @@ def _operation_error(exc: Exception) -> HTTPException:
         return HTTPException(409, "SSH host key does not match the pinned identity")
     if isinstance(exc, SSHKeyPreflightError):
         return HTTPException(409, "SSH private key is no longer usable")
+    if isinstance(exc, SSHSFTPBusyError):
+        return HTTPException(503, "SSH file capacity is busy; try again shortly")
+    if isinstance(exc, SSHSFTPOperationTimeout):
+        return HTTPException(504, "SSH file operation timed out")
     if isinstance(exc, FileNotFoundError):
         return HTTPException(404, "Remote path not found")
     if isinstance(exc, PermissionError):
@@ -72,11 +85,17 @@ def _operation_error(exc: Exception) -> HTTPException:
 def _list_directory_sync(
     profile: SSHProfile,
     path: str,
-) -> tuple[list[dict], bool]:
+) -> tuple[str, list[dict], bool]:
     client = executor_for_profile(profile).connect(timeout=10)
     try:
         sftp = client.open_sftp()
         try:
+            configure_sftp_channel_timeout(sftp)
+            path = resolve_existing_remote_path(
+                sftp,
+                path,
+                profile.allowed_roots or (),
+            )
             attrs = []
             for attr in sftp.listdir_iter(path, read_aheads=10):
                 attrs.append(attr)
@@ -99,7 +118,7 @@ def _list_directory_sync(
                     "is_dir": is_dir,
                     "size": attr.st_size if not is_dir else None,
                 })
-            return entries, truncated
+            return path, entries, truncated
         finally:
             sftp.close()
     finally:
@@ -110,16 +129,23 @@ def _read_file_sync(
     profile: SSHProfile,
     path: str,
     max_bytes: int,
-) -> tuple[str, int, bool]:
+) -> tuple[str, str, int, bool]:
     client = executor_for_profile(profile).connect(timeout=10)
     try:
         sftp = client.open_sftp()
         try:
+            configure_sftp_channel_timeout(sftp)
+            path = resolve_existing_remote_path(
+                sftp,
+                path,
+                profile.allowed_roots or (),
+            )
             size = sftp.stat(path).st_size or 0
             with sftp.open(path, "rb") as remote_file:
                 raw = remote_file.read(max_bytes + 1)
             truncated = len(raw) > max_bytes or size > max_bytes
             return (
+                path,
                 raw[:max_bytes].decode("utf-8", errors="replace"),
                 size,
                 truncated,
@@ -135,7 +161,7 @@ def _write_file_sync(
     path: str,
     content: str,
     overwrite: bool,
-) -> int:
+) -> tuple[str, int]:
     payload = content.encode("utf-8")
     if len(payload) > MAX_TASK_SSH_WRITE_BYTES:
         raise HTTPException(413, "Remote write exceeds the 1 MB limit")
@@ -143,10 +169,16 @@ def _write_file_sync(
     try:
         sftp = client.open_sftp()
         try:
+            configure_sftp_channel_timeout(sftp)
+            path = resolve_remote_write_path(
+                sftp,
+                path,
+                profile.allowed_roots or (),
+            )
             mode = "wb" if overwrite else "wx"
             with sftp.open(path, mode) as remote_file:
                 remote_file.write(payload)
-            return len(payload)
+            return path, len(payload)
         finally:
             sftp.close()
     finally:
@@ -262,7 +294,7 @@ async def internal_task_ssh_list_directory(
             profile_id=profile_id,
             required_capability="read",
         )
-        entries, truncated = await asyncio.to_thread(
+        canonical_path, entries, truncated = await run_bounded_sftp(
             _list_directory_sync,
             profile,
             body.path,
@@ -271,7 +303,7 @@ async def internal_task_ssh_list_directory(
         raise _access_error(exc) from exc
     except Exception as exc:
         raise _operation_error(exc) from exc
-    return {"path": body.path, "entries": entries, "truncated": truncated}
+    return {"path": canonical_path, "entries": entries, "truncated": truncated}
 
 
 @router.post(
@@ -293,7 +325,7 @@ async def internal_task_ssh_read_file(
             profile_id=profile_id,
             required_capability="read",
         )
-        content, size, truncated = await asyncio.to_thread(
+        canonical_path, content, size, truncated = await run_bounded_sftp(
             _read_file_sync,
             profile,
             body.path,
@@ -304,7 +336,7 @@ async def internal_task_ssh_read_file(
     except Exception as exc:
         raise _operation_error(exc) from exc
     return {
-        "path": body.path,
+        "path": canonical_path,
         "content": content,
         "size": size,
         "truncated": truncated,
@@ -330,7 +362,7 @@ async def internal_task_ssh_write_file(
             profile_id=profile_id,
             required_capability="write",
         )
-        bytes_written = await asyncio.to_thread(
+        canonical_path, bytes_written = await run_bounded_sftp(
             _write_file_sync,
             profile,
             body.path,
@@ -341,4 +373,4 @@ async def internal_task_ssh_write_file(
         raise _access_error(exc) from exc
     except Exception as exc:
         raise _operation_error(exc) from exc
-    return {"path": body.path, "bytes_written": bytes_written}
+    return {"path": canonical_path, "bytes_written": bytes_written}

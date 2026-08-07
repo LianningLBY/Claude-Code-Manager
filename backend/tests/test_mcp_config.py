@@ -1,6 +1,5 @@
 """Tests for MCP config generation and cleanup."""
 import json
-import tempfile
 import tomllib
 from pathlib import Path
 
@@ -115,7 +114,11 @@ def test_generate_mcp_config_monitor_enabled():
 
 def test_generate_mcp_config_file_path():
     path = generate_mcp_config(42, {"monitor": True}, api_base="http://localhost:8000")
-    expected = Path(tempfile.gettempdir()) / "ccm_mcp_42.json"
+    expected = (
+        Path(settings.task_runtime_secret_dir)
+        / "task-42"
+        / "mcp.json"
+    )
     assert path == expected
     path.unlink(missing_ok=True)
 
@@ -422,6 +425,7 @@ def test_task_ssh_spec_exposes_only_tools_for_granted_capabilities(monkeypatch):
         "read_file",
     )
     assert spec.args[spec.args.index("--task-id") + 1] == "42"
+    assert spec.args[spec.args.index("--capability") + 1] == "read"
     assert spec.args[spec.args.index("-m") + 1] == (
         "backend.mcp.ccm_ssh_server"
     )
@@ -467,6 +471,15 @@ def test_ccm_ssh_module_registers_expected_tools():
         "read_file",
         "write_file",
     } <= registered
+
+
+def test_ccm_ssh_server_hides_tools_outside_granted_capabilities(monkeypatch):
+    removed: list[str] = []
+    monkeypatch.setattr(ccm_ssh_server.mcp, "remove_tool", removed.append)
+
+    ccm_ssh_server._restrict_tools_for_capabilities({"read"})
+
+    assert set(removed) == {"run_command", "write_file"}
 
 
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():

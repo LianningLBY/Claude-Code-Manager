@@ -719,6 +719,11 @@ class TaskQueue:
             await self.db.rollback()
             return False
         await self.db.commit()
+        from backend.services.internal_service_auth import (
+            revoke_internal_service_owner,
+        )
+
+        revoke_internal_service_owner("task-turn", task_id)
         return True
 
     async def dequeue(

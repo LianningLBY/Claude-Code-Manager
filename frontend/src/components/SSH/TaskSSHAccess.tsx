@@ -96,6 +96,7 @@ export function SSHGrantPicker({
       enabled: profile.enabled,
       taskAccessEnabled: profile.task_access_enabled,
       taskCapabilities: profile.task_capabilities,
+      allowedRoots: profile.allowed_roots,
     }));
     for (const grant of snapshots) {
       if (items.some((profile) => profile.id === grant.profile_id)) continue;
@@ -108,6 +109,7 @@ export function SSHGrantPicker({
         enabled: grant.valid,
         taskAccessEnabled: grant.profile_task_access_enabled,
         taskCapabilities: grant.profile_task_capabilities,
+        allowedRoots: grant.profile_allowed_roots,
       });
     }
     return items;
@@ -209,6 +211,9 @@ export function SSHGrantPicker({
                     <span className="min-w-0 flex-1">
                       <span className="block truncate font-medium text-gray-200">{profile.name}</span>
                       <span className="block truncate text-gray-500">{profile.username}@{profile.host}:{profile.port}</span>
+                      <span className="block truncate font-mono text-[10px] text-violet-300" title={profile.allowedRoots.join(', ')}>
+                        Files: {profile.allowedRoots.join(', ')}
+                      </span>
                     </span>
                     {snapshot && !snapshot.valid && <span className="text-[10px] text-red-300">re-authorize</span>}
                   </label>
@@ -238,7 +243,7 @@ export function SSHGrantPicker({
           </div>
 
           {!readOnly && value.some((grant) => grant.capabilities.includes('exec')) && (
-            <div className="mt-2 text-[10px] text-amber-300">Run commands grants broad access as the configured remote user.</div>
+            <div className="mt-2 text-[10px] text-amber-300">Run commands grants broad access as the configured remote user; allowed file roots do not restrict command execution.</div>
           )}
           {!readOnly && onSave && (
             <div className="mt-3 flex justify-end border-t border-gray-700 pt-2">

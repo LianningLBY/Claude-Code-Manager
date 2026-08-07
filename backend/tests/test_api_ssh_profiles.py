@@ -44,6 +44,7 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
     assert profile["revision"] == 1
     assert profile["task_access_enabled"] is False
     assert profile["task_capabilities"] == []
+    assert profile["allowed_roots"] == ["/"]
     assert profile["key_path_hint"] == "…/managed-ssh-key"
     assert "key_path" not in profile
     assert profile["public_key_fingerprint"].startswith("SHA256:")
@@ -131,6 +132,37 @@ async def test_profile_endpoint_change_requires_new_host_key(client, tmp_path):
 
     assert rejected.status_code == 400
     assert "newly confirmed host key" in rejected.text
+
+
+@pytest.mark.asyncio
+async def test_profile_allowed_roots_are_normalized_and_revisioned(client, tmp_path):
+    key_path = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(key_path)
+    created = await client.post("/api/ssh-profiles", json={
+        "name": "root-policy",
+        "host": "roots.example.internal",
+        "username": "deploy",
+        "key_path": str(key_path),
+        "host_key_value": host_key,
+        "allowed_roots": ["/srv/app/", "/srv/app/logs", "/var//data"],
+    })
+    assert created.status_code == 201, created.text
+    profile = created.json()
+    assert profile["allowed_roots"] == ["/srv/app", "/var/data"]
+
+    updated = await client.put(
+        f"/api/ssh-profiles/{profile['id']}",
+        json={"allowed_roots": ["/srv/app"]},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["revision"] == 2
+
+    for invalid in ([], ["relative/path"], None):
+        rejected = await client.put(
+            f"/api/ssh-profiles/{profile['id']}",
+            json={"allowed_roots": invalid},
+        )
+        assert rejected.status_code == 422
 
 
 @pytest.mark.asyncio

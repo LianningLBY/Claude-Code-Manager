@@ -708,6 +708,7 @@ describe('TaskForm SSH grants', () => {
       enabled: true,
       task_access_enabled: true,
       task_capabilities: ['read', 'exec', 'write'],
+      allowed_roots: ['/'],
       created_by: 1,
       last_tested_at: null,
       last_test_ok: null,

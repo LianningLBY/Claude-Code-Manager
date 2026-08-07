@@ -85,6 +85,10 @@ claude-manager/
 │       ├── ssh_executor.py      # pinned host key SSH/SFTP/rsync 执行层
 │       ├── ssh_key_store.py     # 浏览器上传私钥的一次性令牌与 0600 托管存储
 │       ├── ssh_profiles.py      # SSH Profile 密钥预检与执行器装配
+│       ├── ssh_remote_paths.py  # SFTP 远端路径规范化与授权根校验
+│       ├── ssh_sftp.py          # SFTP 并发、超时与延迟清理边界
+│       ├── task_agent_isolation.py # Task provider 凭据/网络 OS 沙箱策略
+│       ├── task_runtime_secrets.py # Task 临时 MCP/settings 私有文件生命周期
 │       ├── task_ssh_access.py   # Task grant revision/capability 校验
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
 │       ├── update_runtime.py    # 更新脚本可信快照的专用目录与进程身份回收
@@ -143,7 +147,11 @@ claude-manager/
 
 ## 关键约定
 
-- **SSH 工作台与 Task 授权**: Files 的 `SSH workspace` 只提供一套 Manager 托管 Profile 新建/编辑入口，同一 Profile 总是可用于管理员文件浏览；新建默认 Files-only，只有开启 `task_access_enabled` 并指定 `task_capabilities` 后才可在 Task 中显式授权，Task grant 绝不得超过 Profile 的 `exec/read/write` 上限。旧浏览器连接只在统一列表显示为待迁移项，不再提供第二套新建入口；密码不自动迁移，须重新上传/选择私钥。可填写既有私钥绝对路径，或经一次性令牌把未加密 PEM/私钥上传到 `SSH_KEY_STORAGE_DIR` 的 `0700/0600` 后端托管目录。私钥内容不入库、不回传前端，数据库只保存经 owner/mode/no-symlink 预检的绝对路径，并强制固定服务端 host key；上传失败/取消需清理临时文件，Profile 轮换或删除只清理不再引用的 CCM 托管密钥。端点、用户、密钥、host key 或 Task 暴露策略变化会推进 Profile revision 并令旧授权失效，须在 Chat 显式重新授权。本机、非 Shared、非 Worker Task 才能获得授权；`ccm_ssh` 按有效 capability 裁剪工具并作为 Claude/Codex required MCP 注入，不受 Codex main-MCP 开关影响，PR Review 等隔离链路不得继承。CCM 自有 MCP spec 必须用 `PYTHONPATH` 显式绑定当前运行代码根，不能依赖 provider 是否支持 `cwd` 或 editable venv 记录的旧 checkout。每个带有效 grant 的 turn 还必须注入 provider-neutral 的权威路由说明：先调 `ccm_ssh.list_connections`，不得把本机 `~/.ssh`/`known_hosts` 当作授权来源；清空继承的 SSH agent。Claude 的标准 Bash/文件工具由 fail-closed PreToolUse guard 拦截直接 SSH 和凭据路径（这是工具层边界，不等同于同 UID 的 OS 沙箱）；Codex 必须在 app-server 中使用经响应审计的 request-local permission profile，拒绝凭据路径与直接网络，无法证明时禁止 exec fallback；选择该命名 Profile 后禁止在同次 thread/turn 再传内置 sandbox selector 覆盖它。Task 物理删除必须在同一代次 CAS 事务内显式删除 grant，不依赖数据库 FK cascade；Secrets 仍只负责向 Task 注入环境变量，不保存 SSH 私钥。
+- **MCP 内部回调地址**: MCP/AskUser 子进程回调 origin 统一由 `internal_api_endpoint.py` 解析：显式配置优先，否则使用可信 ASGI `scope["server"]` 捕获的真实监听地址，最后才回退 `settings.host/port`；禁止依赖可能与 Uvicorn `--port` 不一致的静态端口。
+- **CCM MCP 模块隔离**: Task-scoped CCM stdio MCP 必须使用 `python -P` 并把运行中 Manager checkout 固定为 `PYTHONPATH`；不能依赖 MCP 配置里的非标准 `cwd`，否则 Claude 在审查另一个 CCM checkout 时可能误导入目标分支中的旧 `backend`。
+- **SSH 工作台与 Task 授权**: Files 的 `SSH workspace` 是唯一的 Manager 托管 Profile 入口；同一 Profile 可供管理员浏览文件，新建默认 Files-only，只有开启 `task_access_enabled` 并指定 `task_capabilities` 后才可由 Task 显式授权，grant 不得超过 Profile 的 `exec/read/write` 上限。`allowed_roots` 只约束 Files/SFTP 的列举、读写和传输，不约束 `exec` 命令；开启 exec 时 UI 必须明确告警。旧浏览器连接只显示为待迁移项，不再提供第二套新建入口。私钥可引用既有绝对路径，或经一次性令牌上传到 `SSH_KEY_STORAGE_DIR` 的 `0700/0600` 托管目录；内容不入库、不回传，路径须通过 owner/mode/no-symlink 预检且连接强制固定 host key。端点、用户、密钥、host key、远端根或 Task 暴露策略变化会推进 revision，使旧 grant 失效并要求重新授权。SFTP 操作必须先规范化路径并校验授权根，统一受并发、连接/操作超时和延迟清理约束。
+- **Task SSH 隔离边界**: 只有本机、非 Shared、非 Worker Task 可获得 SSH grant；Task/Project 的 Team 或 outbound share 与 SSH grant 互斥，写事务固定按 Project→Task 加锁，执行时仍须重验共享状态、revision 与 capability。有效 grant 只通过 required `ccm_ssh` MCP 暴露，并关闭该 turn 的直接网络；模型必须先调 `list_connections`，不得读取本机 SSH/Manager/provider 凭据或绕过 broker。所有本地 Task（包括 Monitor/Sub-Agent）均使用 provider 的精确 OS 沙箱隐藏 `~/.ssh`、Manager 密钥、provider homes、临时运行配置、`.env` 与本地 SQLite 文件：Claude 使用每 turn 私有 settings、`failIfUnavailable` 且不传 dangerous bypass；Codex 只走经响应审计的 request-local app-server permission profile，无法证明时禁止 exec fallback。CCM MCP 与 AskUser 使用有 audience/route/task 约束的短期签名 token，deployment token 不得进入模型环境；同一 Task 的等价 scope 在 Claude PTY 热会话中复用，到期或 MCP/AskUser 策略变化时用完整运行指纹强制冷恢复。配置统一写入 `TASK_RUNTIME_SECRET_DIR` 的 `0700/0600` 文件并在 turn 后回收，Task 删除时吊销残留 token。Task 删除须显式删除 grant；Secrets 仍只注入普通环境变量，不保存 SSH 私钥。
+- **Claude 终态去重**: stream-json 中成功的 terminal `result` 若与本 turn 最近一次已持久化的 assistant 正文完全相同，只保留终态元数据并把内容置空，避免 Claude 页面重复显示；错误、不同内容、孤立 result 与 autonomous turn 不得折叠。
 - **优先级**: 数字越小优先级越高 (P0 > P1 > P2)，排序用 `.asc()`
 - **Session 绑定**: `session_id` 和 `last_cwd` 在 **Task** 上（不是 Instance），因为 instance 是轮换执行不同 task 的 worker
 - **Instance 并发容量**: `max_concurrent_instances` 约束所有仍有运行证据的实例：正常 `idle/running` 会占槽，`error/stopped` 仅在 PID 与反向 owner 证据都已清除后才是免费历史。API 创建与 Dispatcher 补槽共用 `instance_capacity_lock`，idle 选择到 launch 之间用 owner reservation；运行时下调 cap 不强杀现有 turn，但在占用降到 cap 以下前禁止新领取。Task retry 可先推进权威代次再进入旧 lifecycle finally；收尾必须扫描同 Task 的非权威反向 owner，仅在 PID 已确定死亡且 runtime/launch reservation 全空时按 PID/start identity 清除，活 PID 或不确定证据继续阻塞。物理删除仍走 `DELETE /api/instances/cleanup`。systemd 部署必须使用 `OOMPolicy=continue`，让单个模型子进程 OOM 由任务生命周期记录/重试，不能连带停止整个 CCM 服务

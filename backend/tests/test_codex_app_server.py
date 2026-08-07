@@ -175,6 +175,7 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
             "/Users/operator/.ssh",
             "/private/ccm/ssh-keys/profile.pem",
         ),
+        task_ssh_disable_network=True,
     )
 
     thread_call, turn_call = server._request.await_args_list
@@ -205,6 +206,108 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
 
 
 @pytest.mark.asyncio
+async def test_task_credential_profile_keeps_network_without_ssh_grants():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-task-credentials",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+            "activePermissionProfile": {
+                "id": "ccm_task_ssh_isolated_v1",
+                "extends": None,
+            },
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": True,
+            },
+        },
+        {"turn": {"id": "turn-task-credentials"}},
+    ])
+
+    await server.start_turn(
+        prompt="work in the repository",
+        cwd="/workspace/project",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=993,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_ssh_disable_network=False,
+    )
+
+    thread_params = server._request.await_args_list[0].args[1]
+    profile = thread_params["config"]["permissions"][
+        "ccm_task_ssh_isolated_v1"
+    ]
+    assert profile["network"] == {
+        "enabled": True,
+        "allow_local_binding": False,
+    }
+    assert "CCM_TASK_SSH_GUARD" not in thread_params["config"][
+        "shell_environment_policy"
+    ]["set"]
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_credential_profile_preserves_read_only_sandbox():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-read-only-credentials",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+            "activePermissionProfile": {
+                "id": "ccm_task_ssh_isolated_v1",
+                "extends": None,
+            },
+            "sandbox": {
+                "type": "readOnly",
+                "networkAccess": False,
+            },
+        },
+        {"turn": {"id": "turn-read-only-credentials"}},
+    ])
+
+    await server.start_turn(
+        prompt="inspect without editing",
+        cwd="/workspace/project",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=994,
+        sandbox_mode="read-only",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_ssh_disable_network=False,
+        disable_autonomous_features=True,
+    )
+
+    thread_params = server._request.await_args_list[0].args[1]
+    profile = thread_params["config"]["permissions"][
+        "ccm_task_ssh_isolated_v1"
+    ]
+    assert profile["filesystem"] == {
+        "/": "read",
+        "/Users/operator/.ssh": "deny",
+    }
+    assert profile["network"] == {
+        "enabled": False,
+        "allow_local_binding": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_task_ssh_profile_fails_before_model_input_when_not_admitted():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -224,7 +327,7 @@ async def test_task_ssh_profile_fails_before_model_input_when_not_admitted():
 
     with pytest.raises(
         CodexRequiredMcpPreTurnError,
-        match="Task SSH isolation profile was not proven",
+        match="Task isolation profile was not proven",
     ):
         await server.start_turn(
             prompt="must not run",
@@ -236,6 +339,7 @@ async def test_task_ssh_profile_fails_before_model_input_when_not_admitted():
             task_id=992,
             sandbox_mode="workspace-write",
             task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
         )
 
     assert server._request.await_count == 1

@@ -210,6 +210,7 @@ export interface SSHProfile {
   enabled: boolean;
   task_access_enabled: boolean;
   task_capabilities: TaskSSHCapability[];
+  allowed_roots: string[];
   created_by: number | null;
   last_tested_at: string | null;
   last_test_ok: boolean | null;
@@ -230,6 +231,7 @@ export interface SSHProfileInput {
   enabled: boolean;
   task_access_enabled: boolean;
   task_capabilities: TaskSSHCapability[];
+  allowed_roots: string[];
 }
 
 export interface SSHPrivateKeyUpload {
@@ -271,6 +273,7 @@ export interface TaskSSHGrant {
   capabilities: TaskSSHCapability[];
   profile_task_access_enabled: boolean;
   profile_task_capabilities: TaskSSHCapability[];
+  profile_allowed_roots: string[];
   valid: boolean;
   invalid_reason: string | null;
   created_by: number | null;
@@ -2120,7 +2123,7 @@ export const api = {
   testSSHProfile: (id: number) =>
     request<SSHProfileTestResult>(`/api/ssh-profiles/${id}/test`, { method: 'POST' }),
   managedSSHListDir: (profileId: number, path: string) =>
-    request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[] }>(`/api/files/ssh/${profileId}/list`, { method: 'POST', body: JSON.stringify({ path }) }),
+    request<{ path: string; entries: { name: string; path: string; is_dir: boolean; size: number | null }[]; truncated: boolean }>(`/api/files/ssh/${profileId}/list`, { method: 'POST', body: JSON.stringify({ path }) }),
   managedSSHReadFile: (profileId: number, path: string) =>
     request<{ path: string; content: string; size: number }>(`/api/files/ssh/${profileId}/read`, { method: 'POST', body: JSON.stringify({ path }) }),
   managedSSHDownloadFile: async (profileId: number, path: string) => {

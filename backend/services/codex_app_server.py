@@ -391,16 +391,21 @@ def _task_ssh_permission_config(
     *,
     cwd: str,
     protected_paths: Sequence[str],
+    disable_network: bool,
+    sandbox_mode: str,
 ) -> dict[str, Any]:
-    """Build a request-local Codex profile that hides host SSH material."""
+    """Build a request-local Codex profile that hides host credentials."""
 
     filesystem: dict[str, str] = {"/": "read"}
-    for writable in {
-        os.path.abspath(cwd),
-        os.path.abspath(os.environ.get("TMPDIR") or "/tmp"),
-        "/tmp",
-    }:
-        filesystem[writable] = "write"
+    if sandbox_mode == "workspace-write":
+        for writable in {
+            os.path.abspath(cwd),
+            os.path.abspath(os.environ.get("TMPDIR") or "/tmp"),
+            "/tmp",
+        }:
+            filesystem[writable] = "write"
+    elif sandbox_mode != "read-only":
+        raise ValueError("Task isolation requires a sandboxed Codex mode")
     for value in protected_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))
         if path == "/":
@@ -409,14 +414,22 @@ def _task_ssh_permission_config(
     return {
         "filesystem": filesystem,
         "network": {
-            "enabled": False,
+            # Preserve Codex's read-only default (no network). Workspace
+            # Tasks retain normal network unless an SSH grant requires the
+            # broker-only network boundary.
+            "enabled": sandbox_mode == "workspace-write" and not disable_network,
             "allow_local_binding": False,
         },
     }
 
 
-def _audit_task_ssh_thread_response(response: Any) -> None:
-    """Prove Codex admitted CCM's exact SSH-isolation profile."""
+def _audit_task_ssh_thread_response(
+    response: Any,
+    *,
+    disable_network: bool,
+    sandbox_mode: str,
+) -> None:
+    """Prove Codex admitted CCM's exact Task-isolation profile."""
 
     if not isinstance(response, dict):
         raise ValueError("thread response is not an object")
@@ -426,10 +439,21 @@ def _audit_task_ssh_thread_response(response: Any) -> None:
         or permission_profile.get("id") != _TASK_SSH_PERMISSION_PROFILE
         or permission_profile.get("extends") is not None
     ):
-        raise ValueError("Task SSH isolation profile was not selected")
+        raise ValueError("Task isolation profile was not selected")
     sandbox = response.get("sandbox")
-    if not isinstance(sandbox, dict) or sandbox.get("networkAccess") is not False:
-        raise ValueError("Task SSH isolation did not disable direct network")
+    expected_type = {
+        "workspace-write": "workspaceWrite",
+        "read-only": "readOnly",
+    }.get(sandbox_mode)
+    expected_network = (
+        sandbox_mode == "workspace-write" and not disable_network
+    )
+    if (
+        not isinstance(sandbox, dict)
+        or sandbox.get("type") != expected_type
+        or sandbox.get("networkAccess") is not expected_network
+    ):
+        raise ValueError("Task isolation resolved an unexpected sandbox policy")
 
 
 def _tool_free_disabled_skill_config(
@@ -2425,6 +2449,7 @@ class CodexAppServer:
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         task_ssh_protected_paths: Sequence[str] = (),
+        task_ssh_disable_network: bool = False,
         disable_autonomous_features: bool = False,
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
@@ -2479,10 +2504,14 @@ class CodexAppServer:
                 raise CodexRequiredMcpPreTurnError(
                     "Task SSH isolation cannot be combined with tool-free mode"
                 )
-            if sandbox_mode != "workspace-write":
+            if sandbox_mode not in {"workspace-write", "read-only"}:
                 raise CodexRequiredMcpPreTurnError(
-                    "Task SSH isolation requires workspace-write admission"
+                    "Task isolation requires workspace-write or read-only admission"
                 )
+        elif task_ssh_disable_network:
+            raise CodexRequiredMcpPreTurnError(
+                "Task network isolation requires protected filesystem paths"
+            )
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2641,6 +2670,8 @@ class CodexAppServer:
                             _task_ssh_permission_config(
                                 cwd=cwd,
                                 protected_paths=task_ssh_protected_paths,
+                                disable_network=task_ssh_disable_network,
+                                sandbox_mode=sandbox_mode,
                             )
                         ),
                     },
@@ -2758,11 +2789,12 @@ class CodexAppServer:
             shell_environment = dict(git_env or {})
             if task_ssh_protected_paths:
                 shell_environment.update({
-                    "CCM_TASK_SSH_GUARD": "1",
                     "SSH_AUTH_SOCK": "",
                     "SSH_AGENT_PID": "",
                     "SSH_ASKPASS": "",
                 })
+                if task_ssh_disable_network:
+                    shell_environment["CCM_TASK_SSH_GUARD"] = "1"
             thread_config["shell_environment_policy"] = {
                 "inherit": "all",
                 "set": shell_environment,
@@ -2916,10 +2948,14 @@ class CodexAppServer:
                 ) from exc
         elif task_ssh_protected_paths:
             try:
-                _audit_task_ssh_thread_response(response)
+                _audit_task_ssh_thread_response(
+                    response,
+                    disable_network=task_ssh_disable_network,
+                    sandbox_mode=sandbox_mode,
+                )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
-                    "Codex Task SSH isolation profile was not proven by the "
+                    "Codex Task isolation profile was not proven by the "
                     f"{thread_method} response"
                 ) from exc
         self._known_threads.add(thread_id)

@@ -39,6 +39,7 @@ const managedProfile: SSHProfile = {
   enabled: true,
   task_access_enabled: true,
   task_capabilities: ['read', 'exec'],
+  allowed_roots: ['/'],
   created_by: 1,
   last_tested_at: null,
   last_test_ok: null,
@@ -122,6 +123,7 @@ describe('FilesPage managed SSH workspace', () => {
         key_path: '/keys/id_ed25519',
         host_key_value: 'ssh-ed25519 AAAAhost',
         enabled: true,
+        allowed_roots: ['/'],
         task_access_enabled: false,
         task_capabilities: [],
       });
@@ -162,6 +164,7 @@ describe('FilesPage managed SSH workspace', () => {
         key_upload_token: 'upload-token-1',
         host_key_value: 'ssh-ed25519 AAAAhost',
         enabled: true,
+        allowed_roots: ['/'],
         task_access_enabled: false,
         task_capabilities: [],
       });

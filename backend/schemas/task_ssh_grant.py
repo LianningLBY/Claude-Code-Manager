@@ -38,6 +38,7 @@ class TaskSSHGrantResponse(BaseModel):
     capabilities: list[SSHCapability]
     profile_task_access_enabled: bool
     profile_task_capabilities: list[SSHCapability]
+    profile_allowed_roots: list[str]
     valid: bool
     invalid_reason: str | None
     created_by: int | None

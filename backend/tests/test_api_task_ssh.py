@@ -443,7 +443,7 @@ async def test_task_ssh_read_and_write_operations_enforce_capabilities(
     task_id = created.json()["id"]
     monkeypatch.setattr(
         "backend.api.task_ssh._list_directory_sync",
-        lambda _profile, path: ([{
+        lambda _profile, path: (path, [{
             "name": "app.conf",
             "path": f"{path}/app.conf",
             "is_dir": False,
@@ -452,14 +452,19 @@ async def test_task_ssh_read_and_write_operations_enforce_capabilities(
     )
     monkeypatch.setattr(
         "backend.api.task_ssh._read_file_sync",
-        lambda _profile, _path, max_bytes: ("PORT=8000\n", 10, max_bytes < 10),
+        lambda _profile, path, max_bytes: (
+            path,
+            "PORT=8000\n",
+            10,
+            max_bytes < 10,
+        ),
     )
     observed_write = []
     monkeypatch.setattr(
         "backend.api.task_ssh._write_file_sync",
         lambda _profile, path, content, overwrite: observed_write.append(
             (path, content, overwrite)
-        ) or len(content.encode()),
+        ) or (path, len(content.encode())),
     )
 
     listed = await client.post(
@@ -508,6 +513,15 @@ def test_task_ssh_non_overwrite_write_uses_remote_exclusive_create(monkeypatch):
             observed["payload"] = payload
 
     class SFTP:
+        def get_channel(self):
+            return type("Channel", (), {"settimeout": lambda self, timeout: None})()
+
+        def normalize(self, path):
+            return path
+
+        def lstat(self, _path):
+            raise FileNotFoundError
+
         def open(self, path, mode):
             observed["open"] = (path, mode)
             return RemoteFile()
@@ -530,8 +544,14 @@ def test_task_ssh_non_overwrite_write_uses_remote_exclusive_create(monkeypatch):
     )
     from backend.api.task_ssh import _write_file_sync
 
-    count = _write_file_sync(object(), "/tmp/new.txt", "hello", False)
+    path, count = _write_file_sync(
+        type("Profile", (), {"allowed_roots": ["/"]})(),
+        "/tmp/new.txt",
+        "hello",
+        False,
+    )
 
+    assert path == "/tmp/new.txt"
     assert count == 5
     assert observed == {
         "open": ("/tmp/new.txt", "wx"),

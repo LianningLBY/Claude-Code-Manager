@@ -21,6 +21,7 @@ from typing import Any, Mapping
 
 
 INTERNAL_TOKEN_ENV = "CCM_INTERNAL_SERVICE_TOKEN"
+ASK_USER_TOKEN_ENV = "CCM_ASK_USER_TOKEN"
 _TOKEN_PREFIX = "ccm-internal-v1"
 _TOKEN_TTL_SECONDS = 24 * 60 * 60
 _CLOCK_SKEW_SECONDS = 30
@@ -54,6 +55,10 @@ class InternalServiceClaims:
 _revocation_lock = threading.Lock()
 _owner_tokens: dict[tuple[str, str], set[str]] = {}
 _revoked_tokens: dict[str, int] = {}
+_owner_token_cache: dict[
+    tuple[str, ...],
+    tuple[str, int, str],
+] = {}
 
 
 def _b64encode(value: bytes) -> str:
@@ -90,6 +95,19 @@ def _safe_segment(value: Any, field: str, *, optional: bool = True) -> str | Non
 
 
 def _cleanup_revocations(now: int) -> None:
+    expired_cached = [
+        (cache_key, cached[2])
+        for cache_key, cached in _owner_token_cache.items()
+        if cached[1] <= now
+    ]
+    for cache_key, token_id in expired_cached:
+        _owner_token_cache.pop(cache_key, None)
+        owner = (cache_key[0], cache_key[1])
+        token_ids = _owner_tokens.get(owner)
+        if token_ids is not None:
+            token_ids.discard(token_id)
+            if not token_ids:
+                _owner_tokens.pop(owner, None)
     expired = [token_id for token_id, expiry in _revoked_tokens.items() if expiry < now]
     for token_id in expired:
         _revoked_tokens.pop(token_id, None)
@@ -140,13 +158,36 @@ def issue_internal_service_token(
         raise ValueError("Internal credential TTL is out of range")
 
     now = int(time.time())
+    expires_at = now + ttl_seconds
+    cache_key = (
+        owner_kind,
+        owner_id_value,
+        audience,
+        str(task_id or ""),
+        str(monitor_session_id or ""),
+        str(sub_agent_session_id or ""),
+        job_id or "",
+        str(ttl_seconds),
+        hashlib.sha256(secret).hexdigest(),
+    )
+    with _revocation_lock:
+        _cleanup_revocations(now)
+        cached = _owner_token_cache.get(cache_key)
+        # Reusing an identical scoped credential keeps a persistent Claude PTY
+        # session's MCP children and AskUser hook valid across follow-up turns.
+        # Refresh shortly before expiry; the caller's runtime fingerprint then
+        # cold-resumes the PTY with the replacement credential.
+        refresh_window = min(60, max(1, ttl_seconds // 10))
+        if cached is not None and cached[1] > now + refresh_window:
+            return cached[0]
+
     token_id = secrets.token_urlsafe(18)
     payload: dict[str, Any] = {
         "v": 1,
         "aud": audience,
         "jti": token_id,
         "iat": now,
-        "exp": now + ttl_seconds,
+        "exp": expires_at,
         "owner_kind": owner_kind,
         "owner_id": owner_id_value,
     }
@@ -167,7 +208,11 @@ def issue_internal_service_token(
 
     with _revocation_lock:
         _cleanup_revocations(now)
+        cached = _owner_token_cache.get(cache_key)
+        if cached is not None and cached[1] > now + refresh_window:
+            return cached[0]
         _owner_tokens.setdefault((owner_kind, owner_id_value), set()).add(token_id)
+        _owner_token_cache[cache_key] = (token, expires_at, token_id)
     return token
 
 
@@ -180,6 +225,10 @@ def revoke_internal_service_owner(owner_kind: str, owner_id: str | int) -> None:
         _cleanup_revocations(now)
         for token_id in _owner_tokens.pop(owner, set()):
             _revoked_tokens[token_id] = now + _TOKEN_TTL_SECONDS
+        for cache_key in [
+            key for key in _owner_token_cache if key[:2] == owner
+        ]:
+            _owner_token_cache.pop(cache_key, None)
 
 
 def revoke_internal_service_owner_prefix(owner_kind: str, owner_id_prefix: str) -> None:
@@ -197,6 +246,13 @@ def revoke_internal_service_owner_prefix(owner_kind: str, owner_id_prefix: str) 
         for owner in owners:
             for token_id in _owner_tokens.pop(owner, set()):
                 _revoked_tokens[token_id] = now + _TOKEN_TTL_SECONDS
+        for cache_key in [
+            key
+            for key in _owner_token_cache
+            if key[0] == str(owner_kind)
+            and key[1].startswith(str(owner_id_prefix))
+        ]:
+            _owner_token_cache.pop(cache_key, None)
 
 
 def _decode_claims(token: str) -> InternalServiceClaims:
@@ -271,6 +327,9 @@ def _route_allowed(claims: InternalServiceClaims, method: str, path: str) -> boo
             method == "POST"
             and _fullmatch(rf"{base}/[1-9][0-9]*/(execute|list|read|write)", path)
         )
+
+    if claims.audience == "ccm_ask_user" and task_id is not None:
+        return method == "POST" and path == "/api/ask-user/wait"
 
     if claims.audience == "ccm_skills" and task_id is not None:
         task_path = f"/api/tasks/{task_id}"

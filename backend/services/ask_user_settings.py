@@ -1,11 +1,9 @@
-"""把 AskUserQuestion 的 PreToolUse hook 合并进 {config_dir}/settings.json。
+"""Build exact Task hooks and maintain the legacy account-level AskUser hook.
 
-为什么走 settings.json 而不是 CLI flag：claude-pty 的命令构建是固定字段、不接受
-`--settings`，且本仓库对 PTY 仓库只有 READ 权限无法 bump 依赖。好在 `-p` 和 PTY 两条
-链路都用 CLAUDE_CONFIG_DIR，Claude Code 在 --dangerously-skip-permissions 下会自动
-加载 {CLAUDE_CONFIG_DIR}/settings.json 的 hook（无审批弹窗，已实测）。
-
-在 instance_manager.launch()（两路统一入口）每次启动前调用，幂等：
+Normal Tasks receive ``ask_user_hook_entry()`` in a private exact ``--settings``
+file; ambient account/project settings are disabled. ``ensure_ask_user_hook``
+remains only for prompt-only Claude processes that have no Task-scoped file.
+It is idempotent:
   enabled  → 确保我们的 hook 项存在且参数最新；
   disabled → 移除我们的 hook 项（保持文件干净）。
 靠 command 里包含 "ask_user_hook.py" 识别"我们的"项，避免重复追加。
@@ -44,10 +42,22 @@ def _hook_command() -> str:
         "--api-base", api_base,
         "--timeout", str(timeout),
     ]
-    token = getattr(settings, "auth_token", "") or ""
-    if token:
-        parts.extend(["--auth-token", token])
     return " ".join(shlex.quote(p) for p in parts)
+
+
+def ask_user_hook_entry() -> dict:
+    """Return CCM's secret-free AskUser hook entry for exact settings."""
+
+    from backend.config import settings
+
+    return {
+        "matcher": _MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": _hook_command(),
+            "timeout": int(getattr(settings, "ask_user_timeout", 1800)) + 60,
+        }],
+    }
 
 
 def _is_our_pretool_entry(entry: dict) -> bool:
@@ -80,6 +90,19 @@ def _ssh_guard_command(protected_paths: tuple[str, ...]) -> str:
     return " ".join(shlex.quote(part) for part in parts)
 
 
+def task_ssh_guard_hook_entry(protected_paths: tuple[str, ...]) -> dict:
+    """Return the advisory SSH guard used inside the OS-enforced sandbox."""
+
+    return {
+        "matcher": _SSH_GUARD_MATCHER,
+        "hooks": [{
+            "type": "command",
+            "command": _ssh_guard_command(protected_paths),
+            "timeout": 5,
+        }],
+    }
+
+
 def ensure_ask_user_hook(
     config_dir: str,
     *,
@@ -88,9 +111,8 @@ def ensure_ask_user_hook(
 ) -> bool:
     """Merge CCM's Claude hooks into ``settings.json``.
 
-    ``ssh_guard`` is security-sensitive: callers must check the return value
-    and fail the Task launch when it is false.  The AskUser hook retains its
-    historical fail-open behavior at its call sites.
+    This compatibility path is not the enforcement boundary for normal Tasks;
+    they use an exact private settings file plus the provider OS sandbox.
     """
     from backend.config import settings
 
@@ -126,28 +148,15 @@ def ensure_ask_user_hook(
         changed = len(new_pretool) != len(pretool)
 
         if enabled:
-            new_pretool.append({
-                "matcher": _MATCHER,
-                "hooks": [{
-                    "type": "command",
-                    "command": _hook_command(),
-                    # CLI 对 hook 命令默认 600s 就杀；必须显式抬到服务端等待窗口
-                    # 之上，否则 hook 在 /wait 阻塞中途被杀 → 放行原生
-                    # AskUserQuestion → PTY 弹无人应答的交互框冻死整个 turn。
-                    "timeout": int(getattr(settings, "ask_user_timeout", 1800)) + 60,
-                }],
-            })
+            # CLI 对 hook 命令默认 600s 就杀；这里的 entry 抬高到服务端
+            # 等待窗口之上，避免 PTY 回退为无人应答的原生交互框。
+            new_pretool.append(ask_user_hook_entry())
             changed = True
 
         if ssh_guard:
-            new_pretool.append({
-                "matcher": _SSH_GUARD_MATCHER,
-                "hooks": [{
-                    "type": "command",
-                    "command": _ssh_guard_command(ssh_protected_paths),
-                    "timeout": 5,
-                }],
-            })
+            new_pretool.append(
+                task_ssh_guard_hook_entry(ssh_protected_paths)
+            )
             changed = True
 
         # Ensure thinking summaries are visible in stream output —

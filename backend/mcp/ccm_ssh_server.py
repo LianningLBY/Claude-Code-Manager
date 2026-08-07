@@ -27,6 +27,25 @@ mcp = FastMCP(
 _TASK_ID = 0
 _API_BASE = "http://localhost:8000"
 _AUTH_TOKEN = ""
+_CAPABILITY_TOOLS = {
+    "exec": {"run_command"},
+    "read": {"list_directory", "read_file"},
+    "write": {"write_file"},
+}
+
+
+def _restrict_tools_for_capabilities(capabilities: set[str]) -> None:
+    """Hide ungranted tools in providers without an MCP tool allow-list."""
+
+    allowed = {"list_connections"}
+    for capability in capabilities:
+        allowed.update(_CAPABILITY_TOOLS.get(capability, set()))
+    for tool_name in {
+        tool
+        for tools in _CAPABILITY_TOOLS.values()
+        for tool in tools
+    } - allowed:
+        mcp.remove_tool(tool_name)
 
 
 def _url(path: str) -> str:
@@ -85,7 +104,8 @@ async def list_connections() -> str:
 
     Use the returned numeric ``profile_id`` in other ccm_ssh tools. Invalid or
     stale grants are included with ``valid=false`` so you can report that an
-    administrator must re-authorize them.
+    administrator must re-authorize them. ``profile_allowed_roots`` limits
+    file tools only; command execution is not path-scoped.
     """
 
     try:
@@ -127,7 +147,7 @@ async def run_command(
 
 @mcp.tool()
 async def list_directory(profile_id: int, path: str) -> str:
-    """List one absolute remote directory using the ``read`` capability."""
+    """List an allowed absolute remote directory using ``read``."""
 
     try:
         data = await _request(
@@ -196,9 +216,16 @@ if __name__ == "__main__":
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--api-base", default="http://localhost:8000")
     parser.add_argument("--auth-token", default="")
+    parser.add_argument(
+        "--capability",
+        action="append",
+        choices=tuple(_CAPABILITY_TOOLS),
+        default=[],
+    )
     args = parser.parse_args()
 
     _TASK_ID = args.task_id
     _API_BASE = args.api_base.rstrip("/")
     _AUTH_TOKEN = os.environ.get("CCM_INTERNAL_SERVICE_TOKEN", "") or args.auth_token
+    _restrict_tools_for_capabilities(set(args.capability))
     mcp.run(transport="stdio")

@@ -206,6 +206,7 @@ interface ManagedProfileDraft {
   hostKeyFingerprint: string;
   hostKeyConfirmed: boolean;
   enabled: boolean;
+  allowedRootsText: string;
   taskAccessEnabled: boolean;
   taskCapabilities: TaskSSHCapability[];
 }
@@ -226,6 +227,7 @@ function emptyManagedDraft(): ManagedProfileDraft {
     hostKeyFingerprint: '',
     hostKeyConfirmed: false,
     enabled: true,
+    allowedRootsText: '/',
     taskAccessEnabled: false,
     taskCapabilities: [],
   };
@@ -286,6 +288,7 @@ function ManagedSSHPanel({
       hostKeyFingerprint: profile.host_key_fingerprint,
       hostKeyConfirmed: true,
       enabled: profile.enabled,
+      allowedRootsText: profile.allowed_roots.join('\n'),
       taskAccessEnabled: profile.task_access_enabled,
       taskCapabilities: profile.task_capabilities,
     });
@@ -385,12 +388,21 @@ function ManagedSSHPanel({
     setBusy(true);
     setMessage(null);
     try {
+      const allowedRoots = editing.allowedRootsText
+        .split(/\r?\n/)
+        .map((root) => root.trim())
+        .filter(Boolean);
+      if (!allowedRoots.length || allowedRoots.some((root) => !root.startsWith('/'))) {
+        setMessage('Enter at least one absolute POSIX allowed root.');
+        return;
+      }
       const common = {
         name: editing.name.trim(),
         host: editing.host.trim(),
         port: editing.port,
         username: editing.username.trim(),
         enabled: editing.enabled,
+        allowed_roots: allowedRoots,
         task_access_enabled: editing.taskAccessEnabled,
         task_capabilities: editing.taskAccessEnabled
           ? editing.taskCapabilities
@@ -492,6 +504,9 @@ function ManagedSSHPanel({
               </div>
               <div className="mt-2 flex flex-wrap gap-1">
                 <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] text-indigo-300">Files</span>
+                {profile.allowed_roots.map((root) => (
+                  <span key={root} className="max-w-full truncate rounded bg-violet-500/15 px-1.5 py-0.5 font-mono text-[10px] text-violet-300" title={root}>root: {root}</span>
+                ))}
                 {profile.task_access_enabled ? (
                   profile.task_capabilities.map((capability) => (
                     <span key={capability} className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] text-cyan-300">Task: {capability}</span>
@@ -581,6 +596,20 @@ function ManagedSSHPanel({
               </label>
             )}
           </div>
+          <label className="block text-xs text-gray-400">
+            Allowed remote roots
+            <textarea
+              aria-label="Allowed remote roots"
+              rows={3}
+              value={editing.allowedRootsText}
+              onChange={(event) => setEditing({ ...editing, allowedRootsText: event.target.value })}
+              placeholder="/srv/app\n/var/log/my-app"
+              className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 font-mono text-gray-200"
+            />
+            <span className="mt-1 block text-[10px] text-gray-500">
+              One absolute POSIX path per line. This limits Files and Task file operations; command execution is not path-scoped. Changing roots requires existing Task grants to be re-authorized.
+            </span>
+          </label>
           <div className="rounded border border-gray-700 bg-gray-900/50 p-3">
             <label className="flex items-start gap-2 text-xs text-gray-300">
               <input
@@ -843,6 +872,7 @@ export function FilesPage() {
       const res = connection.kind === 'managed'
         ? await api.managedSSHListDir(connection.profile.id, path)
         : await api.sshListDir(profileToCreds(connection.profile), path);
+      setSshPath(res.path);
       setSshEntries(res.entries);
     } catch (e) {
       setSshError((e as Error).message);
@@ -865,11 +895,15 @@ export function FilesPage() {
   };
 
   const activateSSHConnection = (connection: SSHConnection) => {
+    const initialPath = connection.kind === 'managed'
+      ? (connection.profile.allowed_roots[0] || '/')
+      : sshPath;
     setActiveConnection(connection);
+    setSshPath(initialPath);
     setSshEntries(null);
     setSelectedFile(null);
     setFileContent(null);
-    loadSshRoot(connection, sshPath);
+    loadSshRoot(connection, initialPath);
   };
 
   // --- shared file opener ---

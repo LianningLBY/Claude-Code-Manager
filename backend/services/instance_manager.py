@@ -1455,13 +1455,26 @@ class InstanceManager:
                 codex_main_mcp_required,
             )
 
-        # Must unset CLAUDE_CODE env var to avoid nested session detection
-        env = {k: v for k, v in os.environ.items() if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        # Task-launched model processes must not inherit the deployment bearer
+        # credential. Their CCM MCP children receive separate, route-scoped
+        # credentials through each server spec instead.
+        task_secret_env = {
+            "AUTH_TOKEN",
+            "CCM_INTERNAL_SERVICE_TOKEN",
+        }
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.upper()
+            not in {"CLAUDECODE", "CLAUDE_CODE", *task_secret_env}
+        }
 
         # Inject per-project git identity and credentials as environment variables.
         # These take precedence over any global ~/.gitconfig or system credential helper.
         if git_env:
             env.update(git_env)
+        for key in task_secret_env:
+            env.pop(key, None)
 
         if cloudrouter_account is not None:
             auth_keys = (
@@ -1843,9 +1856,13 @@ class InstanceManager:
             yield current
 
     def _codex_env_remove_for_home(self, codex_home: str) -> set[str]:
+        removed = {
+            "AUTH_TOKEN",
+            "CCM_INTERNAL_SERVICE_TOKEN",
+        }
         if self._cloudrouter_account_for_runtime_home("codex", codex_home):
-            return set(_CLOUDROUTER_CODEX_AUTH_ENV_KEYS)
-        return set()
+            removed.update(_CLOUDROUTER_CODEX_AUTH_ENV_KEYS)
+        return removed
 
     def is_cloudrouter_transient(
         self,
@@ -3004,38 +3021,41 @@ class InstanceManager:
             # admission lock across patch -> config construction -> restore so
             # a container wrapper can never leak into another launch.
             async with self._pty_build_config_lock:
-                original_build_config = None
-                if claude_binary_override or cloudrouter_api:
-                    original_build_config = self._pty_backend.build_config
-                    wrapper = claude_binary_override
+                original_build_config = self._pty_backend.build_config
+                wrapper = claude_binary_override
 
-                    def _patched_build_config(**kw):
-                        cfg = original_build_config(**kw)
-                        if cloudrouter_api:
-                            final_binary = wrapper or cfg.claude_binary
-                            cloudrouter_wrapper = Path(__file__).with_name(
-                                "cloudrouter_claude_wrapper.sh"
+                def _patched_build_config(**kw):
+                    cfg = original_build_config(**kw)
+                    overrides = dict(cfg.env_overrides or {})
+                    # claude-pty inherits the Manager environment. Shadow the
+                    # deployment credential for every Task PTY; MCP servers
+                    # receive their own scoped token from their config entry.
+                    overrides["AUTH_TOKEN"] = ""
+                    overrides["CCM_INTERNAL_SERVICE_TOKEN"] = ""
+                    if cloudrouter_api:
+                        final_binary = wrapper or cfg.claude_binary
+                        cloudrouter_wrapper = Path(__file__).with_name(
+                            "cloudrouter_claude_wrapper.sh"
+                        )
+                        if not (
+                            cloudrouter_wrapper.is_file()
+                            and os.access(cloudrouter_wrapper, os.X_OK)
+                        ):
+                            raise RuntimeError(
+                                "CloudRouter Claude wrapper is unavailable"
                             )
-                            if not (
-                                cloudrouter_wrapper.is_file()
-                                and os.access(cloudrouter_wrapper, os.X_OK)
-                            ):
-                                raise RuntimeError(
-                                    "CloudRouter Claude wrapper is unavailable"
-                                )
-                            overrides = dict(cfg.env_overrides or {})
-                            for key in _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS:
-                                overrides.pop(key, None)
-                            overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
-                                final_binary
-                            )
-                            cfg.env_overrides = overrides
-                            cfg.claude_binary = str(cloudrouter_wrapper)
-                        elif wrapper:
-                            cfg.claude_binary = wrapper
-                        return cfg
+                        for key in _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS:
+                            overrides.pop(key, None)
+                        overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
+                            final_binary
+                        )
+                        cfg.claude_binary = str(cloudrouter_wrapper)
+                    elif wrapper:
+                        cfg.claude_binary = wrapper
+                    cfg.env_overrides = overrides
+                    return cfg
 
-                    self._pty_backend.build_config = _patched_build_config
+                self._pty_backend.build_config = _patched_build_config
                 try:
                     from backend.services.skill_context import (
                         wrap_skill_context,
@@ -3059,8 +3079,7 @@ class InstanceManager:
                         mcp_config_path=mcp_config_path,
                     )
                 finally:
-                    if original_build_config is not None:
-                        self._pty_backend.build_config = original_build_config
+                    self._pty_backend.build_config = original_build_config
 
             process = self.processes.get(instance_id)
             consumer = self._tasks.get(instance_id)

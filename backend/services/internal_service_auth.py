@@ -1,0 +1,367 @@
+"""Short-lived, route-scoped credentials for CCM child processes.
+
+The deployment ``AUTH_TOKEN`` is an administrator credential and must never be
+handed to a Task-launched MCP process.  This module derives signed bearer
+tokens whose audience and identifiers are checked against every HTTP request.
+The raw deployment secret never leaves the Manager process.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import threading
+import time
+from dataclasses import dataclass
+from typing import Any, Mapping
+
+
+INTERNAL_TOKEN_ENV = "CCM_INTERNAL_SERVICE_TOKEN"
+_TOKEN_PREFIX = "ccm-internal-v1"
+_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_CLOCK_SKEW_SECONDS = 30
+_MAX_TOKEN_LENGTH = 4096
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+_RUN_SEGMENT = r"[A-Za-z0-9_-]{1,160}"
+
+
+class InternalServiceTokenError(ValueError):
+    """Authentication or route-authorization failure for a scoped token."""
+
+    def __init__(self, status_code: int, detail: str):
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
+@dataclass(frozen=True, slots=True)
+class InternalServiceClaims:
+    audience: str
+    token_id: str
+    expires_at: int
+    task_id: int | None = None
+    monitor_session_id: int | None = None
+    sub_agent_session_id: int | None = None
+    job_id: str | None = None
+    owner_kind: str | None = None
+    owner_id: str | None = None
+
+
+_revocation_lock = threading.Lock()
+_owner_tokens: dict[tuple[str, str], set[str]] = {}
+_revoked_tokens: dict[str, int] = {}
+
+
+def _b64encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _b64decode(value: str) -> bytes:
+    if not value or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise ValueError("invalid base64url")
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _deployment_secret() -> bytes:
+    from backend.config import settings
+
+    return (getattr(settings, "auth_token", "") or "").encode("utf-8")
+
+
+def _positive_int(value: Any, field: str, *, optional: bool = True) -> int | None:
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise InternalServiceTokenError(401, f"Invalid internal {field}")
+    return value
+
+
+def _safe_segment(value: Any, field: str, *, optional: bool = True) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not _SEGMENT_RE.fullmatch(value):
+        raise InternalServiceTokenError(401, f"Invalid internal {field}")
+    return value
+
+
+def _cleanup_revocations(now: int) -> None:
+    expired = [token_id for token_id, expiry in _revoked_tokens.items() if expiry < now]
+    for token_id in expired:
+        _revoked_tokens.pop(token_id, None)
+    if not expired:
+        return
+    expired_set = set(expired)
+    for owner, token_ids in list(_owner_tokens.items()):
+        token_ids.difference_update(expired_set)
+        if not token_ids:
+            _owner_tokens.pop(owner, None)
+
+
+def issue_internal_service_token(
+    *,
+    audience: str,
+    task_id: int | None = None,
+    monitor_session_id: int | None = None,
+    sub_agent_session_id: int | None = None,
+    job_id: str | None = None,
+    owner_kind: str,
+    owner_id: str | int,
+    ttl_seconds: int = _TOKEN_TTL_SECONDS,
+) -> str:
+    """Create one signed credential whose routes are derived from its audience."""
+
+    secret = _deployment_secret()
+    if not secret:
+        return ""
+    audience = _safe_segment(audience, "audience", optional=False) or ""
+    owner_kind = _safe_segment(owner_kind, "owner kind", optional=False) or ""
+    owner_id_value = _safe_segment(str(owner_id), "owner id", optional=False) or ""
+    task_id = _positive_int(task_id, "task id")
+    monitor_session_id = _positive_int(
+        monitor_session_id,
+        "monitor session id",
+    )
+    sub_agent_session_id = _positive_int(
+        sub_agent_session_id,
+        "sub-agent session id",
+    )
+    job_id = _safe_segment(job_id, "browser job id")
+    if (
+        isinstance(ttl_seconds, bool)
+        or not isinstance(ttl_seconds, int)
+        or ttl_seconds <= 0
+        or ttl_seconds > _TOKEN_TTL_SECONDS
+    ):
+        raise ValueError("Internal credential TTL is out of range")
+
+    now = int(time.time())
+    token_id = secrets.token_urlsafe(18)
+    payload: dict[str, Any] = {
+        "v": 1,
+        "aud": audience,
+        "jti": token_id,
+        "iat": now,
+        "exp": now + ttl_seconds,
+        "owner_kind": owner_kind,
+        "owner_id": owner_id_value,
+    }
+    for key, value in (
+        ("task_id", task_id),
+        ("monitor_session_id", monitor_session_id),
+        ("sub_agent_session_id", sub_agent_session_id),
+        ("job_id", job_id),
+    ):
+        if value is not None:
+            payload[key] = value
+    encoded = _b64encode(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    signed = f"{_TOKEN_PREFIX}.{encoded}"
+    signature = _b64encode(hmac.new(secret, signed.encode("ascii"), hashlib.sha256).digest())
+    token = f"{signed}.{signature}"
+
+    with _revocation_lock:
+        _cleanup_revocations(now)
+        _owner_tokens.setdefault((owner_kind, owner_id_value), set()).add(token_id)
+    return token
+
+
+def revoke_internal_service_owner(owner_kind: str, owner_id: str | int) -> None:
+    """Revoke all credentials issued for one exact process/config lifecycle."""
+
+    owner = (str(owner_kind), str(owner_id))
+    now = int(time.time())
+    with _revocation_lock:
+        _cleanup_revocations(now)
+        for token_id in _owner_tokens.pop(owner, set()):
+            _revoked_tokens[token_id] = now + _TOKEN_TTL_SECONDS
+
+
+def revoke_internal_service_owner_prefix(owner_kind: str, owner_id_prefix: str) -> None:
+    """Revoke all generations belonging to one long-lived child session."""
+
+    now = int(time.time())
+    with _revocation_lock:
+        _cleanup_revocations(now)
+        owners = [
+            owner
+            for owner in _owner_tokens
+            if owner[0] == str(owner_kind)
+            and owner[1].startswith(str(owner_id_prefix))
+        ]
+        for owner in owners:
+            for token_id in _owner_tokens.pop(owner, set()):
+                _revoked_tokens[token_id] = now + _TOKEN_TTL_SECONDS
+
+
+def _decode_claims(token: str) -> InternalServiceClaims:
+    if len(token) > _MAX_TOKEN_LENGTH:
+        raise InternalServiceTokenError(401, "Invalid internal service credential")
+    try:
+        prefix, encoded, signature = token.split(".", 2)
+    except ValueError as exc:
+        raise InternalServiceTokenError(401, "Invalid internal service credential") from exc
+    if prefix != _TOKEN_PREFIX:
+        raise InternalServiceTokenError(401, "Invalid internal service credential")
+    secret = _deployment_secret()
+    if not secret:
+        raise InternalServiceTokenError(401, "Internal service authentication is disabled")
+    signed = f"{prefix}.{encoded}"
+    expected = _b64encode(hmac.new(secret, signed.encode("ascii"), hashlib.sha256).digest())
+    if not hmac.compare_digest(signature, expected):
+        raise InternalServiceTokenError(401, "Invalid internal service credential")
+    try:
+        payload = json.loads(_b64decode(encoded))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise InternalServiceTokenError(401, "Invalid internal service credential") from exc
+    if not isinstance(payload, dict) or payload.get("v") != 1:
+        raise InternalServiceTokenError(401, "Invalid internal service credential")
+
+    issued_at = _positive_int(payload.get("iat"), "issued-at", optional=False)
+    expires_at = _positive_int(payload.get("exp"), "expiry", optional=False)
+    assert issued_at is not None and expires_at is not None
+    now = int(time.time())
+    if issued_at > now + _CLOCK_SKEW_SECONDS or expires_at <= now:
+        raise InternalServiceTokenError(401, "Internal service credential expired")
+    if expires_at - issued_at > _TOKEN_TTL_SECONDS:
+        raise InternalServiceTokenError(401, "Invalid internal service credential lifetime")
+
+    claims = InternalServiceClaims(
+        audience=_safe_segment(payload.get("aud"), "audience", optional=False) or "",
+        token_id=_safe_segment(payload.get("jti"), "token id", optional=False) or "",
+        expires_at=expires_at,
+        task_id=_positive_int(payload.get("task_id"), "task id"),
+        monitor_session_id=_positive_int(
+            payload.get("monitor_session_id"),
+            "monitor session id",
+        ),
+        sub_agent_session_id=_positive_int(
+            payload.get("sub_agent_session_id"),
+            "sub-agent session id",
+        ),
+        job_id=_safe_segment(payload.get("job_id"), "browser job id"),
+        owner_kind=_safe_segment(payload.get("owner_kind"), "owner kind"),
+        owner_id=_safe_segment(payload.get("owner_id"), "owner id"),
+    )
+    with _revocation_lock:
+        _cleanup_revocations(now)
+        if claims.token_id in _revoked_tokens:
+            raise InternalServiceTokenError(401, "Internal service credential revoked")
+    return claims
+
+
+def _fullmatch(pattern: str, path: str) -> bool:
+    return re.fullmatch(pattern, path) is not None
+
+
+def _route_allowed(claims: InternalServiceClaims, method: str, path: str) -> bool:
+    method = method.upper()
+    task_id = claims.task_id
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+
+    if claims.audience == "ccm_ssh" and task_id is not None:
+        base = rf"/api/tasks/{task_id}/ssh-access"
+        return (method == "GET" and path == base) or (
+            method == "POST"
+            and _fullmatch(rf"{base}/[1-9][0-9]*/(execute|list|read|write)", path)
+        )
+
+    if claims.audience == "ccm_skills" and task_id is not None:
+        task_path = f"/api/tasks/{task_id}"
+        if path == task_path and method == "GET":
+            return True
+        if path == f"{task_path}/internal/enabled-skills" and method == "PUT":
+            return True
+        if path in {
+            f"{task_path}/monitor-sessions",
+            f"{task_path}/sub-agent-sessions",
+        } and method in {"GET", "POST"}:
+            return True
+        return method == "DELETE" and _fullmatch(
+            rf"{re.escape(task_path)}/(monitor-sessions|sub-agent-sessions)/[1-9][0-9]*",
+            path,
+        )
+
+    if claims.audience in {"ccm_frontend_review", "ccm_workspace_review"} and task_id is not None:
+        base = rf"/api/tasks/{task_id}/test-runs"
+        if method == "POST" and path == f"{base}/internal/start":
+            return True
+        if claims.audience == "ccm_workspace_review" and method == "GET" and path == f"{base}/capabilities":
+            return True
+        if method == "GET" and _fullmatch(rf"{base}/{_RUN_SEGMENT}/internal/status", path):
+            return True
+        if method == "POST" and _fullmatch(rf"{base}/{_RUN_SEGMENT}/internal/stop", path):
+            return True
+        return (
+            claims.audience == "ccm_workspace_review"
+            and method == "GET"
+            and _fullmatch(rf"{base}/{_RUN_SEGMENT}/compare/{_RUN_SEGMENT}", path)
+        )
+
+    if claims.audience == "ccm_browser_review" and claims.job_id is not None:
+        base = f"/api/browser-reviews/{claims.job_id}/internal"
+        return (method, path) in {
+            ("GET", f"{base}/context"),
+            ("POST", f"{base}/events"),
+        }
+
+    if (
+        claims.audience == "ccm_monitor_agent"
+        and task_id is not None
+        and claims.monitor_session_id is not None
+    ):
+        base = f"/api/tasks/{task_id}/monitor-sessions/{claims.monitor_session_id}"
+        return (method, path) in {
+            ("GET", base),
+            ("POST", f"{base}/checks"),
+            ("POST", f"{base}/complete"),
+        }
+
+    if (
+        claims.audience == "ccm_sub_agent"
+        and task_id is not None
+        and claims.sub_agent_session_id is not None
+    ):
+        base = f"/api/tasks/{task_id}/sub-agent-sessions/{claims.sub_agent_session_id}"
+        return (method, path) in {
+            ("GET", f"{base}/context"),
+            ("POST", f"{base}/progress"),
+            ("POST", f"{base}/result"),
+        }
+    return False
+
+
+def authenticate_internal_service_token(
+    token: str,
+    *,
+    method: str,
+    path: str,
+) -> InternalServiceClaims:
+    """Verify signature, expiry, revocation, audience, and exact HTTP route."""
+
+    claims = _decode_claims(token)
+    if not _route_allowed(claims, method, path):
+        raise InternalServiceTokenError(
+            403,
+            "Internal service credential is not authorized for this route",
+        )
+    return claims
+
+
+def is_internal_service_token(token: str) -> bool:
+    return token.startswith(f"{_TOKEN_PREFIX}.")
+
+
+def internal_task_id(claims: object) -> int | None:
+    if isinstance(claims, InternalServiceClaims):
+        return claims.task_id
+    if isinstance(claims, Mapping):
+        value = claims.get("task_id")
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+    return None

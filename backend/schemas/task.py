@@ -269,6 +269,14 @@ class TaskUpdate(BaseModel):
         return _normalize_attention_tag(value)
 
 
+class InternalTaskSkillsUpdate(BaseModel):
+    """Narrow payload accepted from the Task-scoped skills MCP server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled_skills: dict
+
+
 class TaskResponse(BaseModel):
     id: int
     worker_id: int | None = None

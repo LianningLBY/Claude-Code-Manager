@@ -1236,8 +1236,8 @@ async def test_launch_saves_cwd(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_launch_unsets_claude_env(db_factory):
-    """Environment passed to subprocess excludes CLAUDECODE/CLAUDE_CODE."""
+async def test_launch_unsets_claude_and_manager_secret_env(db_factory):
+    """Task subprocesses cannot inherit nested-session or Manager tokens."""
     async with db_factory() as db:
         inst = Instance(name="env-inst")
         db.add(inst)
@@ -1250,14 +1250,27 @@ async def test_launch_unsets_claude_env(db_factory):
     broadcaster.broadcast = AsyncMock()
     im = InstanceManager(db_factory, broadcaster)
 
-    with patch.dict(os.environ, {"CLAUDECODE": "1", "CLAUDE_CODE": "1"}, clear=False), \
+    inherited = {
+        "CLAUDECODE": "1",
+        "CLAUDE_CODE": "1",
+        "AUTH_TOKEN": "deployment-secret",
+        "CCM_INTERNAL_SERVICE_TOKEN": "unrelated-scoped-token",
+    }
+    with patch.dict(os.environ, inherited, clear=False), \
          patch("backend.services.instance_manager.asyncio.create_subprocess_exec", new_callable=AsyncMock, return_value=mock_proc) as mock_exec:
-        await im.launch(instance_id=inst_id, prompt="hi", cwd="/tmp")
+        await im.launch(
+            instance_id=inst_id,
+            prompt="hi",
+            cwd="/tmp",
+            git_env={"AUTH_TOKEN": "must-still-be-removed"},
+        )
 
     call_kwargs = mock_exec.call_args[1]
     env = call_kwargs["env"]
     assert "CLAUDECODE" not in env
     assert "CLAUDE_CODE" not in env
+    assert "AUTH_TOKEN" not in env
+    assert "CCM_INTERNAL_SERVICE_TOKEN" not in env
     await asyncio.sleep(0.1)
 
 
@@ -1390,6 +1403,8 @@ async def test_cloudrouter_claude_pty_wraps_binary_and_removes_auth_overrides(
         "CLAUDE_CODE_OAUTH_TOKEN",
     ):
         assert key not in observed["env"]
+    assert observed["env"]["AUTH_TOKEN"] == ""
+    assert observed["env"]["CCM_INTERNAL_SERVICE_TOKEN"] == ""
     assert im.get_config_dir(inst.id) == str(config_dir)
     assert im._launch_params[inst.id]["prompt"] == "hi"
     assert im._launch_params[inst.id]["provider"] == "claude"
@@ -1465,6 +1480,8 @@ def test_api_codex_home_scrubs_all_inherited_gateway_keys(db_factory):
     im.cloudrouter_store = store
 
     assert im._codex_env_remove_for_home("/api/apex/codex") == {
+        "AUTH_TOKEN",
+        "CCM_INTERNAL_SERVICE_TOKEN",
         "OPENAI_API_KEY",
         "CODEX_API_KEY",
         "CLOUDROUTER_API_KEY",
@@ -1654,7 +1671,12 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     config_path = Path(argv[argv.index("--mcp-config") + 1])
     try:
         config = json.loads(config_path.read_text())
-        assert set(config["mcpServers"]) == {"ccm_skills", "ccm_ssh"}
+        assert set(config["mcpServers"]) == {
+            "ccm_skills",
+            "ccm_frontend_review",
+            "ccm_workspace_review",
+            "ccm_ssh",
+        }
         assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
     finally:
         config_path.unlink(missing_ok=True)
@@ -1874,9 +1896,14 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
 
     assert pid == 45_678
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
-    assert [spec.name for spec in specs] == ["ccm_ssh"]
-    assert specs[0].required is True
-    assert specs[0].enabled_tools == (
+    assert [spec.name for spec in specs] == [
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+        "ccm_ssh",
+    ]
+    ssh_spec = next(spec for spec in specs if spec.name == "ccm_ssh")
+    assert ssh_spec.required is True
+    assert ssh_spec.enabled_tools == (
         "list_connections",
         "list_directory",
         "read_file",

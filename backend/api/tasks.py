@@ -20,6 +20,7 @@ from backend.schemas.task import (
     TaskActionRequest,
     PlanApprovalRequest,
     TaskCreate,
+    InternalTaskSkillsUpdate,
     TaskMigrationImport,
     TaskResponse,
     TaskRoutingExpectation,
@@ -2419,6 +2420,27 @@ async def update_task(
     if not task:
         raise HTTPException(404, "Task not found")
     return task
+
+
+@router.put(
+    "/{task_id}/internal/enabled-skills",
+    response_model=TaskResponse,
+)
+async def update_task_enabled_skills_internal(
+    task_id: int,
+    body: InternalTaskSkillsUpdate,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Apply only the skill toggle exposed to the scoped skills MCP."""
+
+    require_internal_service(request)
+    return await update_task(
+        task_id,
+        TaskUpdate(enabled_skills=body.enabled_skills),
+        request,
+        queue,
+    )
 
 
 async def _settle_task_launch_barrier(

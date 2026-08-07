@@ -95,13 +95,10 @@ class McpServerSpec:
         object.__setattr__(self, "enabled_tools", tuple(self.enabled_tools))
 
 
-def _api_base_and_auth_token(api_base: str | None) -> tuple[str, str]:
-    from backend.config import settings
+def _api_base(api_base: str | None) -> str:
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
 
-    if api_base is None:
-        host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-        api_base = f"http://{host}:{settings.port}"
-    return api_base, getattr(settings, "auth_token", "") or ""
+    return resolve_internal_api_base(api_base)
 
 
 def _ccm_server_spec(
@@ -111,8 +108,19 @@ def _ccm_server_spec(
     context_args: Sequence[str],
     enabled_tools: tuple[str, ...],
     api_base: str | None,
+    task_id: int | None = None,
+    monitor_session_id: int | None = None,
+    sub_agent_session_id: int | None = None,
+    job_id: str | None = None,
+    credential_owner_kind: str,
+    credential_owner_id: str | int,
 ) -> McpServerSpec:
-    resolved_api_base, auth_token = _api_base_and_auth_token(api_base)
+    from backend.services.internal_service_auth import (
+        INTERNAL_TOKEN_ENV,
+        issue_internal_service_token,
+    )
+
+    resolved_api_base = _api_base(api_base)
     args = [
         "-m",
         module,
@@ -120,14 +128,25 @@ def _ccm_server_spec(
         "--api-base",
         resolved_api_base,
     ]
-    if auth_token:
-        args.extend(["--auth-token", auth_token])
+    scoped_token = issue_internal_service_token(
+        audience=name,
+        task_id=task_id,
+        monitor_session_id=monitor_session_id,
+        sub_agent_session_id=sub_agent_session_id,
+        job_id=job_id,
+        owner_kind=credential_owner_kind,
+        owner_id=credential_owner_id,
+    )
+    server_env = {"PYTHONPATH": _CCM_ROOT}
+    if scoped_token:
+        server_env[INTERNAL_TOKEN_ENV] = scoped_token
 
     return McpServerSpec(
         name=name,
         command=_VENV_PYTHON,
         args=tuple(args),
         cwd=_CCM_ROOT,
+        env=server_env,
         required=True,
         enabled_tools=enabled_tools,
         # These are CCM-owned, task-scoped tools whose handlers enforce the
@@ -176,6 +195,9 @@ def build_mcp_server_specs(
             context_args=("--task-id", str(task_id)),
             enabled_tools=enabled_tools,
             api_base=api_base,
+            task_id=task_id,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
         ),
     )
 
@@ -200,6 +222,9 @@ def build_task_ssh_mcp_server_specs(
             context_args=("--task-id", str(task_id)),
             enabled_tools=tuple(enabled_tools),
             api_base=api_base,
+            task_id=task_id,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
         ),
     )
 
@@ -229,6 +254,14 @@ def build_monitor_agent_mcp_server_specs(
             context_args=tuple(context_args),
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
             api_base=api_base,
+            task_id=task_id,
+            monitor_session_id=monitor_session_id,
+            credential_owner_kind="monitor-turn",
+            credential_owner_id=(
+                f"{monitor_session_id}:{turn_generation}"
+                if turn_generation is not None
+                else f"{monitor_session_id}:legacy"
+            ),
         ),
     )
 
@@ -246,6 +279,9 @@ def build_sub_agent_controller_mcp_server_specs(
             context_args=("--task-id", str(task_id)),
             enabled_tools=CCM_SUB_AGENT_CONTROLLER_TOOLS,
             api_base=api_base,
+            task_id=task_id,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
         ),
     )
 
@@ -269,6 +305,10 @@ def build_sub_agent_mcp_server_specs(
             ),
             enabled_tools=CCM_SUB_AGENT_TOOLS,
             api_base=api_base,
+            task_id=task_id,
+            sub_agent_session_id=session_id,
+            credential_owner_kind="sub-agent",
+            credential_owner_id=session_id,
         ),
     )
 
@@ -452,8 +492,13 @@ def generate_mcp_config(
 
 def cleanup_mcp_config(task_id: int):
     """清理临时 MCP config 文件。"""
+    from backend.services.internal_service_auth import (
+        revoke_internal_service_owner,
+    )
+
     config_path = Path(tempfile.gettempdir()) / f"ccm_mcp_{task_id}.json"
     config_path.unlink(missing_ok=True)
+    revoke_internal_service_owner("task-turn", task_id)
 
 
 def generate_monitor_agent_mcp_config(
@@ -488,6 +533,11 @@ def cleanup_monitor_agent_mcp_config(
     turn_generation: int | None = None,
 ):
     """清理 monitor 子 agent 的 MCP config 文件。"""
+    from backend.services.internal_service_auth import (
+        revoke_internal_service_owner,
+        revoke_internal_service_owner_prefix,
+    )
+
     generation_suffix = (
         f"_{turn_generation}" if turn_generation is not None else ""
     )
@@ -496,6 +546,16 @@ def cleanup_monitor_agent_mcp_config(
         / f"ccm_monitor_agent_{monitor_session_id}{generation_suffix}.json"
     )
     config_path.unlink(missing_ok=True)
+    if turn_generation is None:
+        revoke_internal_service_owner_prefix(
+            "monitor-turn",
+            f"{monitor_session_id}:",
+        )
+    else:
+        revoke_internal_service_owner(
+            "monitor-turn",
+            f"{monitor_session_id}:{turn_generation}",
+        )
 
 
 def generate_sub_agent_mcp_config(
@@ -513,5 +573,10 @@ def generate_sub_agent_mcp_config(
 
 def cleanup_sub_agent_mcp_config(session_id: int):
     """清理 sub-agent 的 MCP config 文件。"""
+    from backend.services.internal_service_auth import (
+        revoke_internal_service_owner,
+    )
+
     config_path = Path(tempfile.gettempdir()) / f"ccm_sub_agent_{session_id}.json"
     config_path.unlink(missing_ok=True)
+    revoke_internal_service_owner("sub-agent", session_id)

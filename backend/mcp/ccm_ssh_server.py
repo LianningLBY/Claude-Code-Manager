@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import json
+import os
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -199,5 +200,5 @@ if __name__ == "__main__":
 
     _TASK_ID = args.task_id
     _API_BASE = args.api_base.rstrip("/")
-    _AUTH_TOKEN = args.auth_token
+    _AUTH_TOKEN = os.environ.get("CCM_INTERNAL_SERVICE_TOKEN", "") or args.auth_token
     mcp.run(transport="stdio")

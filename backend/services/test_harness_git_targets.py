@@ -242,8 +242,11 @@ class PublicGitTargetResolver:
         payload = await self.client.get(f"/repos/{repository}/pulls/{number}")
         if not isinstance(payload, dict):
             raise GitTargetResolutionError("GitHub pull request response is malformed")
-        if payload.get("state") != "open" or payload.get("draft") is not False:
-            raise GitTargetResolutionError("pull request must be open and non-draft")
+        state = payload.get("state")
+        if state not in {"open", "closed"} or payload.get("draft") is not False:
+            raise GitTargetResolutionError(
+                "pull request must be a public non-draft GitHub PR"
+            )
         base = payload.get("base")
         head = payload.get("head")
         base_repo = base.get("repo") if isinstance(base, dict) else None

@@ -14,9 +14,11 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import ipaddress
+import json
 import os
 import re
-import socket
+import ssl
+from urllib.parse import quote
 
 
 _HOST_RE = re.compile(
@@ -24,6 +26,9 @@ _HOST_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
 )
 _MAX_HEADER_BYTES = 64 * 1024
+_MAX_DOH_BODY_BYTES = 64 * 1024
+_DOH_HOST = "cloudflare-dns.com"
+_DOH_ENDPOINTS = ("1.1.1.1", "1.0.0.1")
 
 
 class EgressPolicyError(ValueError):
@@ -75,19 +80,162 @@ def require_public_addresses(addresses: list[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(normalized))
 
 
-async def resolve_public_host(host: str, port: int) -> tuple[str, ...]:
-    loop = asyncio.get_running_loop()
+def _parse_doh_payload(
+    payload: bytes,
+    *,
+    host: str,
+    record_type: int,
+) -> list[str]:
     try:
-        records = await loop.getaddrinfo(
-            host,
-            port,
-            family=socket.AF_UNSPEC,
-            type=socket.SOCK_STREAM,
-            proto=socket.IPPROTO_TCP,
-        )
-    except socket.gaierror as exc:
-        raise EgressPolicyError("egress DNS lookup failed") from exc
-    return require_public_addresses([record[4][0] for record in records])
+        document = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise EgressPolicyError("egress DoH response is malformed") from exc
+    if not isinstance(document, dict) or document.get("Status") != 0:
+        raise EgressPolicyError("egress DoH lookup failed")
+    question = document.get("Question")
+    if not isinstance(question, list) or len(question) != 1:
+        raise EgressPolicyError("egress DoH question is malformed")
+    expected_name = host.lower().rstrip(".")
+    asked = question[0]
+    if (
+        not isinstance(asked, dict)
+        or not isinstance(asked.get("name"), str)
+        or asked["name"].lower().rstrip(".") != expected_name
+        or asked.get("type") != record_type
+    ):
+        raise EgressPolicyError("egress DoH question does not match the request")
+    answers = document.get("Answer", [])
+    if not isinstance(answers, list) or len(answers) > 64:
+        raise EgressPolicyError("egress DoH answer is malformed")
+    records: list[tuple[str, int, str]] = []
+    for answer in answers:
+        if not isinstance(answer, dict):
+            raise EgressPolicyError("egress DoH answer is malformed")
+        answer_name = answer.get("name")
+        answer_type = answer.get("type")
+        data = answer.get("data")
+        if answer_type not in {1, 5, 28}:
+            continue
+        if not isinstance(answer_name, str) or not isinstance(data, str):
+            raise EgressPolicyError("egress DoH answer is malformed")
+        normalized_name = answer_name.lower().rstrip(".")
+        if _HOST_RE.fullmatch(normalized_name) is None:
+            raise EgressPolicyError("egress DoH answer name is invalid")
+        if answer_type == 5:
+            normalized_data = data.lower().rstrip(".")
+            if _HOST_RE.fullmatch(normalized_data) is None:
+                raise EgressPolicyError("egress DoH CNAME is invalid")
+            data = normalized_data
+        records.append((normalized_name, answer_type, data))
+
+    reachable_names = {expected_name}
+    for _ in range(len(records)):
+        additions = {
+            data
+            for name, answer_type, data in records
+            if answer_type == 5 and name in reachable_names
+        }
+        if additions.issubset(reachable_names):
+            break
+        reachable_names.update(additions)
+    addresses = [
+        data
+        for name, answer_type, data in records
+        if answer_type == record_type and name in reachable_names
+    ]
+    if any(
+        answer_type == record_type and name not in reachable_names
+        for name, answer_type, _ in records
+    ):
+        raise EgressPolicyError("egress DoH answer is unrelated to the request")
+    return addresses
+
+
+async def _doh_query(host: str, *, record_name: str, record_type: int) -> list[str]:
+    path = f"/dns-query?name={quote(host, safe='')}&type={record_name}"
+    request = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {_DOH_HOST}\r\n"
+        "Accept: application/dns-json\r\n"
+        "Connection: close\r\n\r\n"
+    ).encode("ascii")
+    context = ssl.create_default_context()
+    last_error: BaseException | None = None
+    for endpoint in _DOH_ENDPOINTS:
+        writer: asyncio.StreamWriter | None = None
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    endpoint,
+                    443,
+                    ssl=context,
+                    server_hostname=_DOH_HOST,
+                    limit=_MAX_HEADER_BYTES,
+                ),
+                timeout=10,
+            )
+            writer.write(request)
+            await asyncio.wait_for(writer.drain(), timeout=10)
+            header = await asyncio.wait_for(
+                reader.readuntil(b"\r\n\r\n"),
+                timeout=10,
+            )
+            if len(header) > _MAX_HEADER_BYTES:
+                raise EgressPolicyError("egress DoH header is too large")
+            lines = header.decode("ascii", errors="strict").split("\r\n")
+            if lines[0] not in {"HTTP/1.1 200 OK", "HTTP/1.0 200 OK"}:
+                raise EgressPolicyError("egress DoH returned a non-success status")
+            headers: dict[str, str] = {}
+            for line in lines[1:]:
+                if not line:
+                    continue
+                if ":" not in line:
+                    raise EgressPolicyError("egress DoH header is malformed")
+                name, value = line.split(":", 1)
+                normalized_name = name.strip().lower()
+                if normalized_name in headers:
+                    raise EgressPolicyError("egress DoH header is ambiguous")
+                headers[normalized_name] = value.strip()
+            if headers.get("content-type", "").split(";", 1)[0].strip().lower() != (
+                "application/dns-json"
+            ):
+                raise EgressPolicyError("egress DoH content type is invalid")
+            raw_length = headers.get("content-length")
+            if raw_length is None or not raw_length.isdigit():
+                raise EgressPolicyError("egress DoH content length is invalid")
+            length = int(raw_length)
+            if not 1 <= length <= _MAX_DOH_BODY_BYTES:
+                raise EgressPolicyError("egress DoH body is too large")
+            payload = await asyncio.wait_for(reader.readexactly(length), timeout=10)
+            return _parse_doh_payload(
+                payload,
+                host=host,
+                record_type=record_type,
+            )
+        except (
+            asyncio.IncompleteReadError,
+            asyncio.TimeoutError,
+            OSError,
+            UnicodeError,
+            EgressPolicyError,
+        ) as exc:
+            last_error = exc
+        finally:
+            if writer is not None and not writer.is_closing():
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+    raise EgressPolicyError("egress DoH lookup failed") from last_error
+
+
+async def resolve_public_host(host: str, port: int) -> tuple[str, ...]:
+    if port != 443 or _HOST_RE.fullmatch(host) is None:
+        raise EgressPolicyError("egress DNS request is invalid")
+    ipv4, ipv6 = await asyncio.gather(
+        _doh_query(host, record_name="A", record_type=1),
+        _doh_query(host, record_name="AAAA", record_type=28),
+    )
+    return require_public_addresses([*ipv4, *ipv6])
 
 
 async def _copy_limited(

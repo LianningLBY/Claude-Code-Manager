@@ -15,7 +15,11 @@ RUN apt-get update \
 
 COPY backend/services/test_harness_egress_proxy.py /opt/ccm/egress_proxy.py
 COPY backend/services/test_harness_process_wrapper.py /opt/ccm/process_wrapper.py
-RUN chmod 0555 /opt/ccm/egress_proxy.py /opt/ccm/process_wrapper.py
+COPY backend/services/test_harness_preview_relay.py /opt/ccm/preview_relay.py
+RUN chmod 0555 \
+        /opt/ccm/egress_proxy.py \
+        /opt/ccm/process_wrapper.py \
+        /opt/ccm/preview_relay.py
 
 USER 10001:10001
 WORKDIR /workspace

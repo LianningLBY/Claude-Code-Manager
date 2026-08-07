@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from backend.services.test_harness_egress_proxy import (
     EgressPolicyError,
+    _parse_doh_payload,
     normalize_allowed_hosts,
     require_public_addresses,
 )
@@ -55,3 +58,60 @@ def test_egress_accepts_only_fully_public_answer_sets():
         "8.8.8.8",
         "1.1.1.1",
     )
+
+
+def test_doh_response_is_bound_to_the_exact_question_and_record_type():
+    payload = json.dumps(
+        {
+            "Status": 0,
+            "Question": [{"name": "github.com", "type": 1}],
+            "Answer": [
+                {"name": "github.com", "type": 1, "data": "140.82.116.4"},
+                {"name": "github.com", "type": 28, "data": "2001:db8::1"},
+            ],
+        }
+    ).encode()
+
+    assert _parse_doh_payload(payload, host="github.com", record_type=1) == [
+        "140.82.116.4"
+    ]
+    with pytest.raises(EgressPolicyError, match="does not match"):
+        _parse_doh_payload(payload, host="registry.npmjs.org", record_type=1)
+
+
+def test_doh_response_accepts_only_addresses_on_the_question_cname_chain():
+    payload = json.dumps(
+        {
+            "Status": 0,
+            "Question": [{"name": "registry.npmjs.org", "type": 1}],
+            "Answer": [
+                {
+                    "name": "registry.npmjs.org",
+                    "type": 5,
+                    "data": "registry.npmjs.org.cdn.cloudflare.net",
+                },
+                {
+                    "name": "registry.npmjs.org.cdn.cloudflare.net",
+                    "type": 1,
+                    "data": "104.16.1.35",
+                },
+            ],
+        }
+    ).encode()
+
+    assert _parse_doh_payload(
+        payload,
+        host="registry.npmjs.org",
+        record_type=1,
+    ) == ["104.16.1.35"]
+
+    poisoned = json.loads(payload)
+    poisoned["Answer"].append(
+        {"name": "unrelated.example", "type": 1, "data": "8.8.8.8"}
+    )
+    with pytest.raises(EgressPolicyError, match="unrelated"):
+        _parse_doh_payload(
+            json.dumps(poisoned).encode(),
+            host="registry.npmjs.org",
+            record_type=1,
+        )

@@ -176,6 +176,7 @@ class SandboxPreviewSnapshot:
     internal_port: int
     process_names: tuple[str, ...]
     setup_logs: tuple[dict[str, object], ...]
+    relay_container_id: str | None = None
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
@@ -544,49 +545,58 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         if binary is None:  # pragma: no cover - probe is the authority.
             raise TestHarnessSandboxError("isolated sandbox Docker client disappeared")
         name = self._resource_name(run_id, lease_nonce)
-        create_args = [
-            binary,
-            "create",
-            "--name",
-            name,
-            *self._labels(run_id, lease_id, lease_nonce, role="source"),
-            "--init",
-            "--user",
-            "10001:10001",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges:true",
-            "--read-only",
-            "--network",
-            "none",
-            "--pids-limit",
-            str(self.pids_limit),
-            "--memory",
-            self.memory,
-            "--cpus",
-            str(self.cpus),
-            "--stop-timeout",
-            "5",
-            "--publish",
-            f"127.0.0.1::{settings.test_harness_sandbox_preview_port}",
-            "--tmpfs",
-            f"/workspace:rw,nosuid,nodev,mode=1777,size={self.workspace_bytes}",
-            "--tmpfs",
-            f"/tmp:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
-            "--tmpfs",
-            f"/home/sandbox:rw,nosuid,nodev,size={self.tmp_bytes}",
-            "--tmpfs",
-            "/run:rw,noexec,nosuid,nodev,mode=1777,size=67108864",
-            "--workdir",
-            "/workspace",
-            "--entrypoint",
-            "/usr/bin/tail",
-            capability.image_id,
-            "-f",
-            "/dev/null",
-        ]
         try:
+            internal_id = await self._create_network(
+                binary=binary,
+                name=f"{name}-int",
+                run_id=run_id,
+                lease_id=lease_id,
+                lease_nonce=lease_nonce,
+                role="internal-network",
+                internal=True,
+            )
+            create_args = [
+                binary,
+                "create",
+                "--name",
+                name,
+                *self._labels(run_id, lease_id, lease_nonce, role="source"),
+                "--init",
+                "--user",
+                "10001:10001",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges:true",
+                "--read-only",
+                "--network",
+                internal_id,
+                "--network-alias",
+                "source",
+                "--pids-limit",
+                str(self.pids_limit),
+                "--memory",
+                self.memory,
+                "--cpus",
+                str(self.cpus),
+                "--stop-timeout",
+                "5",
+                "--tmpfs",
+                f"/workspace:rw,nosuid,nodev,mode=1777,size={self.workspace_bytes}",
+                "--tmpfs",
+                f"/tmp:rw,noexec,nosuid,nodev,size={self.tmp_bytes}",
+                "--tmpfs",
+                f"/home/sandbox:rw,nosuid,nodev,size={self.tmp_bytes}",
+                "--tmpfs",
+                "/run:rw,noexec,nosuid,nodev,mode=1777,size=67108864",
+                "--workdir",
+                "/workspace",
+                "--entrypoint",
+                "/usr/bin/tail",
+                capability.image_id,
+                "-f",
+                "/dev/null",
+            ]
             code, output = await self._runner(create_args, 30.0)
             container_id = output.strip().lower()
             if code != 0 or _CONTAINER_ID_RE.fullmatch(container_id) is None:
@@ -604,7 +614,11 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 lease_nonce=lease_nonce,
                 expected_role="source",
                 require_running=True,
-                require_network_none=True,
+            )
+            await self._verify_source_internal_only(
+                binary=binary,
+                resource_id=container_id,
+                internal_network_id=internal_id,
             )
             return SandboxResource(
                 backend="docker",
@@ -613,7 +627,8 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 image_ref=self.image,
                 image_digest=capability.image_id,
                 metadata={
-                    "network_mode": "none",
+                    "network_mode": "internal-only",
+                    "internal_network_id": internal_id,
                     "read_only_root": True,
                     "host_mounts": 0,
                     "credential_mounts": 0,
@@ -649,7 +664,6 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         lease_nonce: str,
         expected_role: str | None,
         require_running: bool,
-        require_network_none: bool = False,
     ) -> None:
         if _CONTAINER_ID_RE.fullmatch(resource_id) is None:
             raise TestHarnessSandboxError("sandbox container identity is invalid")
@@ -676,7 +690,7 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             expected_role if expected_role is not None else fields[5] if len(fields) > 5 else "",
             "true" if require_running else fields[6] if len(fields) > 6 else "",
             "true",
-            "none" if require_network_none else fields[8] if len(fields) > 8 else "",
+            fields[8] if len(fields) > 8 else "",
         ]
         if code != 0 or len(fields) != len(expected) or fields != expected:
             raise TestHarnessSandboxError(
@@ -766,6 +780,84 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             raise TestHarnessSandboxError("sandbox network role mismatch")
         return network_id
 
+    async def _find_network(
+        self,
+        *,
+        binary: str,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        role: str,
+    ) -> str:
+        code, output = await self._runner(
+            [
+                binary,
+                "network",
+                "ls",
+                "-q",
+                "--no-trunc",
+                "--filter",
+                f"label={_OWNER_LABEL}={_OWNER_VALUE}",
+                "--filter",
+                f"label={_RUN_LABEL}={run_id}",
+                "--filter",
+                f"label={_LEASE_LABEL}={lease_id}",
+                "--filter",
+                f"label={_NONCE_LABEL}={lease_nonce}",
+                "--filter",
+                f"label={_ROLE_LABEL}={role}",
+            ],
+            10.0,
+        )
+        network_ids = [line.strip().lower() for line in output.splitlines() if line.strip()]
+        if code != 0 or len(network_ids) != 1:
+            raise TestHarnessSandboxError(
+                f"sandbox {role} identity could not be resolved"
+            )
+        network_id = network_ids[0]
+        observed_role = await self._verify_network(
+            binary=binary,
+            network_id=network_id,
+            run_id=run_id,
+            lease_id=lease_id,
+            lease_nonce=lease_nonce,
+        )
+        if observed_role != role:
+            raise TestHarnessSandboxError("sandbox network role mismatch")
+        return network_id
+
+    async def _verify_source_internal_only(
+        self,
+        *,
+        binary: str,
+        resource_id: str,
+        internal_network_id: str,
+    ) -> None:
+        template = "{{json .NetworkSettings.Networks}}"
+        inspect_code, inspect_output = await self._runner(
+            [binary, "inspect", "--format", template, resource_id],
+            10.0,
+        )
+        try:
+            networks = json.loads(inspect_output)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise TestHarnessSandboxError(
+                "sandbox source network state is invalid"
+            ) from exc
+        if inspect_code != 0 or not isinstance(networks, dict) or not networks:
+            raise TestHarnessSandboxError(
+                "sandbox source network state could not be proven"
+            )
+        network_ids = {
+            item.get("NetworkID")
+            for item in networks.values()
+            if isinstance(item, dict)
+        }
+        if network_ids != {internal_network_id}:
+            raise TestHarnessSandboxError(
+                "sandbox source retained an unexpected network attachment"
+            )
+
     async def _exec_source(
         self,
         *,
@@ -806,8 +898,17 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         command.extend([resource_id, *argv])
         code, output = await self._runner(command, timeout)
         if code != 0:
+            diagnostic = ""
+            if argv[0] == "/usr/bin/git":
+                safe_tail = re.sub(
+                    r"[^\x20-\x7e\n\r\t]",
+                    "?",
+                    output[-2000:],
+                ).strip()
+                if safe_tail:
+                    diagnostic = f": {safe_tail}"
             raise TestHarnessSandboxError(
-                f"sandbox source command failed: {argv[0]}"
+                f"sandbox source command failed: {argv[0]}{diagnostic}"
             )
         if len(output.encode("utf-8", errors="replace")) > 4 * 1024 * 1024:
             raise TestHarnessSandboxError("sandbox source command output is too large")
@@ -856,18 +957,20 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         allowed = normalize_allowed_hosts(
             ",".join(sorted(_DEFAULT_GIT_EGRESS_HOSTS | set(additional_allowed_hosts)))
         )
-        internal_name = f"{resource_name}-int"
         egress_name = f"{resource_name}-out"
         proxy_name = f"{resource_name}-proxy"
         try:
-            internal_id = await self._create_network(
+            internal_id = await self._find_network(
                 binary=binary,
-                name=internal_name,
                 run_id=run_id,
                 lease_id=lease_id,
                 lease_nonce=lease_nonce,
                 role="internal-network",
-                internal=True,
+            )
+            await self._verify_source_internal_only(
+                binary=binary,
+                resource_id=resource_id,
+                internal_network_id=internal_id,
             )
             egress_id = await self._create_network(
                 binary=binary,
@@ -878,22 +981,6 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 role="egress-network",
                 internal=False,
             )
-            connect_code, _ = await self._runner(
-                [
-                    binary,
-                    "network",
-                    "connect",
-                    "--alias",
-                    "source",
-                    internal_id,
-                    resource_id,
-                ],
-                30.0,
-            )
-            if connect_code != 0:
-                raise TestHarnessSandboxError(
-                    "sandbox source could not join its internal network"
-                )
             proxy_args = [
                 binary,
                 "create",
@@ -914,9 +1001,7 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 "no-new-privileges:true",
                 "--read-only",
                 "--network",
-                internal_id,
-                "--network-alias",
-                "egress-proxy",
+                egress_id,
                 "--pids-limit",
                 "64",
                 "--memory",
@@ -942,12 +1027,20 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             if proxy_code != 0 or _CONTAINER_ID_RE.fullmatch(proxy_id) is None:
                 raise TestHarnessSandboxError("sandbox egress proxy creation failed")
             proxy_connect_code, _ = await self._runner(
-                [binary, "network", "connect", egress_id, proxy_id],
+                [
+                    binary,
+                    "network",
+                    "connect",
+                    "--alias",
+                    "egress-proxy",
+                    internal_id,
+                    proxy_id,
+                ],
                 30.0,
             )
             if proxy_connect_code != 0:
                 raise TestHarnessSandboxError(
-                    "sandbox egress proxy could not join its outbound network"
+                    "sandbox egress proxy could not join its internal relay network"
                 )
             proxy_start_code, _ = await self._runner(
                 [binary, "start", proxy_id],
@@ -1135,30 +1228,11 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         if network_remove_code != 0:
             raise TestHarnessSandboxError("sandbox egress network removal failed")
 
-        template = "{{json .NetworkSettings.Networks}}"
-        inspect_code, inspect_output = await self._runner(
-            [binary, "inspect", "--format", template, resource_id],
-            10.0,
+        await self._verify_source_internal_only(
+            binary=binary,
+            resource_id=resource_id,
+            internal_network_id=source.internal_network_id,
         )
-        try:
-            networks = json.loads(inspect_output)
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise TestHarnessSandboxError(
-                "sandbox source network state is invalid"
-            ) from exc
-        if inspect_code != 0 or not isinstance(networks, dict) or not networks:
-            raise TestHarnessSandboxError(
-                "sandbox source network state could not be proven"
-            )
-        network_ids = {
-            item.get("NetworkID")
-            for item in networks.values()
-            if isinstance(item, dict)
-        }
-        if network_ids != {source.internal_network_id}:
-            raise TestHarnessSandboxError(
-                "sandbox source retained an unexpected network attachment"
-            )
 
     async def _published_preview_port(
         self,
@@ -1185,6 +1259,87 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         if not 1024 <= port <= 65535:
             raise TestHarnessSandboxError("sandbox preview host port is invalid")
         return port
+
+    async def _start_preview_relay(
+        self,
+        *,
+        binary: str,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        internal_network_id: str,
+    ) -> tuple[str, int]:
+        capability = await self.probe()
+        if not capability.available or capability.image_id is None:
+            raise TestHarnessSandboxError(
+                capability.reason or "isolated sandbox runtime is unavailable"
+            )
+        relay_name = f"{self._resource_name(run_id, lease_nonce)}-preview"
+        create_args = [
+            binary,
+            "create",
+            "--name",
+            relay_name,
+            *self._labels(
+                run_id,
+                lease_id,
+                lease_nonce,
+                role="preview-relay",
+            ),
+            "--init",
+            "--user",
+            "10001:10001",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--read-only",
+            "--network",
+            "bridge",
+            "--pids-limit",
+            "64",
+            "--memory",
+            "128m",
+            "--cpus",
+            "0.25",
+            "--publish",
+            f"127.0.0.1::{settings.test_harness_sandbox_preview_port}",
+            "--tmpfs",
+            "/tmp:rw,noexec,nosuid,nodev,size=33554432",
+            "--entrypoint",
+            "/usr/bin/python3",
+            capability.image_id,
+            "/opt/ccm/preview_relay.py",
+        ]
+        code, output = await self._runner(create_args, 30.0)
+        relay_id = output.strip().lower()
+        if code != 0 or _CONTAINER_ID_RE.fullmatch(relay_id) is None:
+            raise TestHarnessSandboxError("sandbox preview relay creation failed")
+        connect_code, _ = await self._runner(
+            [binary, "network", "connect", internal_network_id, relay_id],
+            30.0,
+        )
+        if connect_code != 0:
+            raise TestHarnessSandboxError(
+                "sandbox preview relay could not join the internal network"
+            )
+        start_code, _ = await self._runner([binary, "start", relay_id], 30.0)
+        if start_code != 0:
+            raise TestHarnessSandboxError("sandbox preview relay could not start")
+        await self._verify_resource(
+            binary=binary,
+            resource_id=relay_id,
+            run_id=run_id,
+            lease_id=lease_id,
+            lease_nonce=lease_nonce,
+            expected_role="preview-relay",
+            require_running=True,
+        )
+        host_port = await self._published_preview_port(
+            binary=binary,
+            resource_id=relay_id,
+        )
+        return relay_id, host_port
 
     async def _preview_process_error(
         self,
@@ -1399,9 +1554,12 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                 resource_id=resource_id,
                 source=source,
             )
-            host_port = await self._published_preview_port(
+            relay_container_id, host_port = await self._start_preview_relay(
                 binary=binary,
-                resource_id=resource_id,
+                run_id=run_id,
+                lease_id=lease_id,
+                lease_nonce=lease_nonce,
+                internal_network_id=source.internal_network_id,
             )
             host_variables = {**variables, "preview_port": str(host_port)}
             url = _format_sandbox_preview_value(url_template, host_variables)
@@ -1447,6 +1605,7 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
                                 internal_port=internal_port,
                                 process_names=tuple(process_names),
                                 setup_logs=tuple(setup_logs),
+                                relay_container_id=relay_container_id,
                             )
                         last_error = (
                             f"health check returned HTTP {response.status_code}"
@@ -1956,6 +2115,7 @@ class TestHarnessSandboxManager:
                     "internal_port": preview.internal_port,
                     "process_names": list(preview.process_names),
                     "setup_logs": list(preview.setup_logs),
+                    "preview_relay_container_id": preview.relay_container_id,
                     "egress_revoked": True,
                 }
                 lease.status = "preview_ready"

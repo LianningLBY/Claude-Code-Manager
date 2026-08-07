@@ -128,6 +128,30 @@ async def test_public_pr_resolution_freezes_exact_sha_and_changed_manifest():
 
 
 @pytest.mark.asyncio
+async def test_public_pr_resolution_allows_closed_pr_at_its_frozen_head():
+    client = _Client(
+        {
+            "/repos/zjw49246/CC-Manager/pulls/99": _pull_payload(
+                state="closed",
+                changed_files=1,
+            ),
+            "/repos/zjw49246/CC-Manager/pulls/99/files?per_page=100&page=1": [
+                _file("frontend/src/App.tsx"),
+            ],
+        }
+    )
+
+    target = await PublicGitTargetResolver(client).resolve(
+        project=_project(),
+        kind="pull_request",
+        target={"pr_number": 99},
+    )
+
+    assert target.head_sha == "b" * 40
+    assert target.fetch_ref == "refs/pull/99/head"
+
+
+@pytest.mark.asyncio
 async def test_public_pr_resolution_rejects_private_or_mismatched_base():
     private = _pull_payload()
     private["head"]["repo"]["private"] = True

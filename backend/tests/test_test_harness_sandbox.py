@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 
+import httpx
 import pytest
 from sqlalchemy import select
 
+from backend.models.project import Project
 from backend.models.test_harness import (
     TestHarnessSandboxLease as SandboxLeaseModel,
 )
@@ -17,10 +20,18 @@ from backend.services.test_harness_sandbox import (
     TestHarnessSandboxError as SandboxError,
     TestHarnessSandboxManager as SandboxManager,
 )
-from backend.services.test_harness_git_targets import ResolvedGitTarget
+from backend.services.test_harness_git_targets import (
+    PublicGitTargetResolver,
+    ResolvedGitTarget,
+)
 from backend.services import test_harness_sandbox as sandbox_module
 from backend.services.test_harness import TestHarnessService as HarnessService
 from backend.services.test_harness_contracts import TestHarnessSpec as HarnessSpec
+
+
+_RUN_DOCKER_INTEGRATION = (
+    os.getenv("CCM_RUN_DOCKER_SANDBOX_INTEGRATION", "").strip() == "1"
+)
 
 
 @pytest.mark.asyncio
@@ -100,6 +111,7 @@ async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch
     lease_id = "b" * 32
     nonce = "c" * 48
     container_id = "d" * 64
+    internal_id = "f" * 64
     calls: list[list[str]] = []
 
     async def runner(argv: list[str], _timeout: float) -> tuple[int, str]:
@@ -109,11 +121,27 @@ async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch
             return 0, "27.5.1"
         if action == "image":
             return 0, "sha256:" + "e" * 64
+        if argv[1:3] == ["network", "create"]:
+            return 0, internal_id
+        if argv[1:3] == ["network", "inspect"]:
+            return 0, "\t".join(
+                [
+                    internal_id,
+                    "test-harness",
+                    run_id,
+                    lease_id,
+                    nonce,
+                    "internal-network",
+                    "true",
+                ]
+            )
         if action == "create":
             return 0, container_id
         if action == "start":
             return 0, container_id
         if action == "inspect":
+            if any("{{json" in item for item in argv):
+                return 0, '{"internal":{"NetworkID":"' + internal_id + '"}}'
             return 0, "\t".join(
                 [
                     container_id,
@@ -124,7 +152,7 @@ async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch
                     "source",
                     "true",
                     "true",
-                    "none",
+                    internal_id,
                 ]
             )
         raise AssertionError(argv)
@@ -150,13 +178,19 @@ async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch
     create = next(call for call in calls if call[1] == "create")
     assert resource.resource_id == container_id
     assert "--read-only" in create
-    assert create[create.index("--network") + 1] == "none"
+    assert create[create.index("--network") + 1] == internal_id
+    assert create[create.index("--network-alias") + 1] == "source"
     assert create[create.index("--cap-drop") + 1] == "ALL"
     assert create[create.index("--user") + 1] == "10001:10001"
     assert "--mount" not in create
     assert "-v" not in create
+    assert "--publish" not in create
     assert "/var/run/docker.sock" not in " ".join(create)
     assert all(".claude" not in value and ".codex" not in value for value in create)
+    network_create = next(call for call in calls if call[1:3] == ["network", "create"])
+    assert "--internal" in network_create
+    assert resource.metadata["network_mode"] == "internal-only"
+    assert resource.metadata["internal_network_id"] == internal_id
 
 
 @pytest.mark.asyncio
@@ -328,6 +362,79 @@ async def _fixed_url_run(db_factory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not _RUN_DOCKER_INTEGRATION,
+    reason="set CCM_RUN_DOCKER_SANDBOX_INTEGRATION=1 to use local Docker and GitHub",
+)
+async def test_real_pr99_source_preview_and_identity_cleanup(db_factory):
+    """Opt-in proof that an exact public PR never executes on the host."""
+
+    run = await _fixed_url_run(db_factory)
+    runtime = DockerTestHarnessSandboxRuntime(
+        enabled=True,
+        image=os.getenv(
+            "TEST_HARNESS_SANDBOX_IMAGE",
+            "ccm-test-harness-sandbox:local",
+        ),
+        probe_ttl_seconds=0,
+    )
+    capability = await runtime.probe(force=True)
+    assert capability.available, capability.reason
+    resolved = await PublicGitTargetResolver().resolve(
+        project=Project(
+            name="CCM PR #99 integration fixture",
+            git_url="https://github.com/zjw49246/CC-Manager.git",
+        ),
+        kind="pull_request",
+        target={"pr_number": 99},
+    )
+    assert resolved.head_sha == "512e9baa10a8f361e8f732c28a14e3554880d612"
+
+    manager = SandboxManager(runtime=runtime, db_factory=db_factory)
+    try:
+        lease = await manager.provision(run.id)
+        assert lease.runtime_metadata["host_mounts"] == 0
+        source = await manager.acquire_source(run.id, resolved)
+        assert source.head_sha == resolved.head_sha
+        preview = await manager.prepare_preview(
+            run.id,
+            source,
+            preview_config={
+                "setup": [],
+                "processes": [
+                    {
+                        "name": "web",
+                        "command": [
+                            "/usr/local/bin/node",
+                            "-e",
+                            (
+                                "require('http').createServer((request,response)=>"
+                                "{response.end('ccm-pr99-sandbox-ok')}).listen("
+                                "Number(process.argv[1]),'0.0.0.0')"
+                            ),
+                            "{preview_port}",
+                        ],
+                        "cwd": ".",
+                        "env": {},
+                    }
+                ],
+            },
+            startup_timeout_seconds=30,
+            url_template="http://127.0.0.1:{preview_port}/",
+            health_url_template="http://127.0.0.1:{preview_port}/",
+        )
+        async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+            response = await client.get(preview.url)
+        assert response.text == "ccm-pr99-sandbox-ok"
+    finally:
+        cleaned = await manager.cleanup(run.id)
+
+    assert cleaned is not None
+    assert cleaned.cleanup_status == "completed"
+    assert cleaned.status == "cleaned"
+
+
+@pytest.mark.asyncio
 async def test_sandbox_manager_persists_identity_before_cleanup(db_factory):
     run = await _fixed_url_run(db_factory)
     runtime = _ManagedRuntime()
@@ -425,9 +532,10 @@ async def test_source_acquisition_uses_internal_network_and_exact_sha(monkeypatc
             return 0, "27.5.1"
         if argv[1:3] == ["image", "inspect"]:
             return 0, "sha256:" + "3" * 64
+        if argv[1:3] == ["network", "ls"]:
+            return 0, internal_id
         if argv[1:3] == ["network", "create"]:
-            role = next(value for value in argv if "harness.role=" in value)
-            return 0, internal_id if role.endswith("internal-network") else egress_id
+            return 0, egress_id
         if argv[1:3] == ["network", "inspect"]:
             network_id = argv[-1]
             if network_id == internal_id:
@@ -446,6 +554,8 @@ async def test_source_acquisition_uses_internal_network_and_exact_sha(monkeypatc
                 ]
             )
         if argv[1:3] == ["network", "connect"]:
+            assert argv[-2:] == [internal_id, proxy_id]
+            assert argv[3:5] == ["--alias", "egress-proxy"]
             return 0, ""
         if argv[1] == "create":
             assert any(value.endswith("egress-proxy") for value in argv)
@@ -453,9 +563,11 @@ async def test_source_acquisition_uses_internal_network_and_exact_sha(monkeypatc
         if argv[1] == "start":
             return 0, proxy_id
         if argv[1] == "inspect":
+            if any("{{json" in item for item in argv):
+                return 0, '{"internal":{"NetworkID":"' + internal_id + '"}}'
             resource_id = argv[-1]
             role = "source" if resource_id == source_id else "egress-proxy"
-            network = "none" if resource_id == source_id else internal_id
+            network = internal_id
             return 0, "\t".join(
                 [
                     resource_id,
@@ -512,13 +624,25 @@ async def test_source_acquisition_uses_internal_network_and_exact_sha(monkeypatc
     assert snapshot.egress_network_id == egress_id
     assert snapshot.proxy_container_id == proxy_id
     network_creates = [call for call in calls if call[1:3] == ["network", "create"]]
-    assert "--internal" in network_creates[0]
-    assert "--internal" not in network_creates[1]
+    assert len(network_creates) == 1
+    assert "--internal" not in network_creates[0]
+    assert any(call[1:3] == ["network", "ls"] for call in calls)
+    network_connects = [
+        call for call in calls if call[1:3] == ["network", "connect"]
+    ]
+    assert len(network_connects) == 1
+    assert network_connects[0][-2:] == [internal_id, proxy_id]
+    assert network_connects[0][3:5] == ["--alias", "egress-proxy"]
     proxy_create = next(call for call in calls if call[1] == "create")
     assert "--read-only" in proxy_create
+    assert proxy_create[proxy_create.index("--network") + 1] == egress_id
     assert "--mount" not in proxy_create and "-v" not in proxy_create
     assert any(
-        value == "CCM_ALLOWED_HOSTS=api.github.com,codeload.github.com,github.com,objects.githubusercontent.com,registry.npmjs.org"
+        value
+        == (
+            "CCM_ALLOWED_HOSTS=api.github.com,codeload.github.com,github.com,"
+            "objects.githubusercontent.com,registry.npmjs.org"
+        )
         for value in proxy_create
     )
     fetch = next(call for call in calls if "fetch" in call)
@@ -536,15 +660,26 @@ async def test_sandbox_preview_revokes_egress_before_loopback_health(monkeypatch
     internal_id = "e" * 64
     egress_id = "f" * 64
     proxy_id = "1" * 64
+    relay_id = "3" * 64
     calls: list[list[str]] = []
 
     async def runner(argv: list[str], _timeout: float) -> tuple[int, str]:
         calls.append(argv)
+        if argv[1] == "version":
+            return 0, "27.5.1"
+        if argv[1:3] == ["image", "inspect"]:
+            return 0, "sha256:" + "4" * 64
         if argv[1] == "inspect" and any("{{json" in item for item in argv):
             return 0, '{"internal":{"NetworkID":"' + internal_id + '"}}'
         if argv[1] == "inspect":
             resource_id = argv[-1]
-            role = "source" if resource_id == source_id else "egress-proxy"
+            if resource_id == source_id:
+                role, network = "source", internal_id
+            elif resource_id == proxy_id:
+                role, network = "egress-proxy", egress_id
+            else:
+                assert resource_id == relay_id
+                role, network = "preview-relay", "bridge"
             return 0, "\t".join(
                 [
                     resource_id,
@@ -555,7 +690,7 @@ async def test_sandbox_preview_revokes_egress_before_loopback_health(monkeypatch
                     role,
                     "true",
                     "true",
-                    "none" if role == "source" else internal_id,
+                    network,
                 ]
             )
         if argv[1:3] == ["network", "inspect"]:
@@ -572,7 +707,19 @@ async def test_sandbox_preview_revokes_egress_before_loopback_health(monkeypatch
             )
         if argv[1:3] == ["network", "rm"] or argv[1] == "rm":
             return 0, ""
+        if argv[1:3] == ["network", "connect"]:
+            assert argv[-2:] == [internal_id, relay_id]
+            return 0, ""
+        if argv[1] == "create":
+            assert any(value.endswith("preview-relay") for value in argv)
+            assert argv[argv.index("--network") + 1] == "bridge"
+            assert "--publish" in argv
+            return 0, relay_id
+        if argv[1] == "start":
+            assert argv[-1] == relay_id
+            return 0, relay_id
         if argv[1] == "port":
+            assert argv[-2] == relay_id
             return 0, "127.0.0.1:43123\n"
         if argv[1] == "exec":
             if "/usr/bin/cat" in argv:
@@ -644,6 +791,7 @@ async def test_sandbox_preview_revokes_egress_before_loopback_health(monkeypatch
     )
 
     assert preview.url == "http://127.0.0.1:43123/"
+    assert preview.relay_container_id == relay_id
     setup_call = next(
         call for call in calls if call[1] == "exec" and "npm" in call and "ci" in call
     )

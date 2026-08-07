@@ -45,6 +45,7 @@ class TestHarnessRun(Base):
 
     target_kind: Mapped[str] = mapped_column(String(24), nullable=False, index=True)
     target_spec: Mapped[dict] = mapped_column(JSON, nullable=False)
+    resolved_target: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     test_plan: Mapped[dict] = mapped_column(JSON, nullable=False)
     runtime_config: Mapped[dict] = mapped_column(JSON, nullable=False)
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)

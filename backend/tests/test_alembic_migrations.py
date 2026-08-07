@@ -48,7 +48,8 @@ FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
 PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
 BROWSER_PLAN_MERGE_REVISION = "9f2c6b4d8a10"
 SANDBOX_LEASE_REVISION = "c8f1a2d4e6b9"
-CURRENT_HEAD_REVISION = SANDBOX_LEASE_REVISION
+RESOLVED_TARGET_REVISION = "d9a2b4c6e8f1"
+CURRENT_HEAD_REVISION = RESOLVED_TARGET_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -1654,6 +1655,10 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(RESOLVED_TARGET_REVISION).down_revision
+            == SANDBOX_LEASE_REVISION
+        )
         assert (
             script.get_revision(SANDBOX_LEASE_REVISION).down_revision
             == BROWSER_PLAN_MERGE_REVISION

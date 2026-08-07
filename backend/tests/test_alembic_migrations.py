@@ -47,7 +47,8 @@ TEST_HARNESS_REVISION = "7d2f4b9a6c10"
 FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
 PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
 BROWSER_PLAN_MERGE_REVISION = "9f2c6b4d8a10"
-CURRENT_HEAD_REVISION = BROWSER_PLAN_MERGE_REVISION
+SANDBOX_LEASE_REVISION = "c8f1a2d4e6b9"
+CURRENT_HEAD_REVISION = SANDBOX_LEASE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -438,7 +439,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "workspace_review_runs", "test_harness_runs", "test_harness_attempts", "test_harness_events", "test_harness_evidence", "test_harness_findings"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "workspace_review_runs", "test_harness_runs", "test_harness_attempts", "test_harness_events", "test_harness_evidence", "test_harness_findings", "test_harness_sandbox_leases"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -1647,14 +1648,18 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_browser_harness_merge(self, tmp_path):
+    def test_migration_graph_has_one_head_after_sandbox_lease(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
-            script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            script.get_revision(SANDBOX_LEASE_REVISION).down_revision
+            == BROWSER_PLAN_MERGE_REVISION
+        )
+        assert (
+            script.get_revision(BROWSER_PLAN_MERGE_REVISION).down_revision
             == (TEST_HARNESS_REVISION, PLAN_MAIN_MERGE_REVISION)
         )
         assert (

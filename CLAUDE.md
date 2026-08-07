@@ -55,7 +55,7 @@ claude-manager/
 │   │   ├── instance.py          # Claude Code 实例
 │   │   ├── project.py           # Project (含可信 preview_config)
 │   │   ├── workspace_review.py  # 持久化当前工作区审查运行/指纹/报告
-│   │   ├── test_harness.py      # Run/Attempt/Event/Evidence/Finding 持久记录
+│   │   ├── test_harness.py      # Run/Attempt/Event/Evidence/Finding/SandboxLease 持久记录
 │   │   ├── project_todo.py      # ProjectTodo (per-project prompt 模板/清单, status open/done/archived, created_task_id 溯源)
 │   │   ├── sub_agent.py         # SubAgentSession + SubAgentReport (通用子 agent 表, agent_type 分类)
 │   │   ├── monitor_session.py   # 兼容 shim: MonitorSession/MonitorCheck = sub_agent 别名
@@ -108,7 +108,7 @@ claude-manager/
 │       ├── test_harness_artifacts.py # 私有持久证据、配额/保留期与原子归档
 │       ├── test_harness_runtime.py # Browser Agent 独立 provider/model/effort 配置解析
 │       ├── test_harness_contracts.py # Target/TestPlan/Verdict/Finding 契约
-│       ├── test_harness_sandbox.py # PR/ref 临时 Sandbox Runtime 契约与动态能力探测
+│       ├── test_harness_sandbox.py # PR/ref 临时 Sandbox Runtime、持久 Lease 与动态能力探测
 │       ├── test_harness_targets.py # PR/ref 隔离 sandbox 未接入前的 fail-closed 门禁
 │       ├── ws_broadcaster.py    # WebSocket channel 广播
 │       ├── whisper_client.py    # OpenAI Whisper 客户端

@@ -167,3 +167,27 @@ class TestHarnessFinding(Base):
     evidence_names: Mapped[list] = mapped_column(JSON, nullable=False, default=list)
     confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class TestHarnessSandboxLease(Base):
+    """Durable identity for one ephemeral untrusted-code environment."""
+
+    __tablename__ = "test_harness_sandbox_leases"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    run_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
+    backend: Mapped[str] = mapped_column(String(24), nullable=False)
+    lease_nonce: Mapped[str] = mapped_column(String(48), nullable=False, unique=True)
+    image_ref: Mapped[str] = mapped_column(String(500), nullable=False)
+    image_digest: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    resource_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    resource_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="reserved", index=True)
+    phase: Mapped[str] = mapped_column(String(48), nullable=False, default="reserved")
+    runtime_metadata: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    cleanup_status: Mapped[str] = mapped_column(String(24), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cleanup_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

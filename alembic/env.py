@@ -49,6 +49,7 @@ from backend.models.test_harness import (  # noqa: F401
     TestHarnessEvidence,
     TestHarnessFinding,
     TestHarnessRun,
+    TestHarnessSandboxLease,
 )
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep  # noqa: F401
 from backend.models.plan import Plan, PlanVersion, PlanInputRequest, PlanApplication, PlanLegacyTaskLink  # noqa: F401

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _SSHProfileConnectionFields(BaseModel):
@@ -19,9 +19,16 @@ class _SSHProfileConnectionFields(BaseModel):
 
 
 class SSHProfileCreate(_SSHProfileConnectionFields):
-    key_path: str = Field(min_length=1, max_length=1000)
+    key_path: str | None = Field(default=None, min_length=1, max_length=1000)
+    key_upload_token: str | None = Field(default=None, min_length=1, max_length=128)
     host_key_value: str = Field(min_length=1, max_length=16384)
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def exactly_one_key_source(self):
+        if bool(self.key_path) == bool(self.key_upload_token):
+            raise ValueError("provide exactly one of key_path or key_upload_token")
+        return self
 
 
 class SSHProfileUpdate(BaseModel):
@@ -30,6 +37,7 @@ class SSHProfileUpdate(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     username: str | None = Field(default=None, min_length=1, max_length=255)
     key_path: str | None = Field(default=None, max_length=1000)
+    key_upload_token: str | None = Field(default=None, min_length=1, max_length=128)
     host_key_value: str | None = Field(default=None, min_length=1, max_length=16384)
     enabled: bool | None = None
 
@@ -49,6 +57,12 @@ class SSHProfileUpdate(BaseModel):
         if value is None or not value.strip():
             return None
         return value.strip()
+
+    @model_validator(mode="after")
+    def one_key_source_at_most(self):
+        if self.key_path and self.key_upload_token:
+            raise ValueError("provide only one of key_path or key_upload_token")
+        return self
 
 
 class SSHHostKeyProbeRequest(BaseModel):
@@ -95,3 +109,9 @@ class SSHProfileTestResponse(BaseModel):
     ok: bool
     error_code: str | None = None
     detail: str | None = None
+
+
+class SSHPrivateKeyUploadResponse(BaseModel):
+    upload_token: str
+    filename: str
+    public_key_fingerprint: str

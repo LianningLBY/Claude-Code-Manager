@@ -30,7 +30,7 @@ claude-manager/
 │   │   ├── plan_resources.py    # 一等 Plan/Version/Run/Input/Application API
 │   │   ├── chat.py              # 多轮对话 (基于 task, --resume)
 │   │   ├── task_artifacts.py    # Task 工作区内安全文件下载 + Worker 分流
-│   │   ├── ssh_profiles.py      # 管理员 SSH Profile CRUD + 主机指纹确认/测试
+│   │   ├── ssh_profiles.py      # 管理员 SSH Profile CRUD + 私钥上传/主机指纹/测试
 │   │   ├── task_ssh.py          # Task SSH 授权 + 内部受限执行/文件 API
 │   │   ├── instances.py         # 实例 CRUD + Ralph Loop 控制 + Dispatcher 端点
 │   │   ├── projects.py          # Project CRUD + git clone
@@ -82,6 +82,7 @@ claude-manager/
 │       ├── mcp_config.py        # Provider-neutral MCP specs + Claude/Codex renderers
 │       ├── skill_context.py     # Task-scoped 普通/User Skill 目录与 provider adapter
 │       ├── ssh_executor.py      # pinned host key SSH/SFTP/rsync 执行层
+│       ├── ssh_key_store.py     # 浏览器上传私钥的一次性令牌与 0600 托管存储
 │       ├── ssh_profiles.py      # SSH Profile 密钥预检与执行器装配
 │       ├── task_ssh_access.py   # Task grant revision/capability 校验
 │       ├── tmp_space_manager.py # /tmp 容量/inode 看门狗与白名单安全清理
@@ -141,7 +142,7 @@ claude-manager/
 
 ## 关键约定
 
-- **SSH 工作台与 Task 授权**: Files 的一级 `SSH workspace` 统一管理 Manager 本机 Profile 和远程文件浏览；私钥内容不入库、不下发前端，数据库只保存经 owner/mode/no-symlink 预检的绝对路径，并强制固定服务端 host key。Task 只允许管理员按 Profile 授予 `exec/read/write`，授权固定 Profile revision；端点、用户、密钥或 host key 变化会令旧授权失效，须在 Chat 显式重新授权。本机、非 Shared、非 Worker Task 才能获得授权；`ccm_ssh` 按有效 capability 裁剪工具并作为 Claude/Codex required MCP 注入，不受 Codex main-MCP 开关影响，PR Review 等隔离链路不得继承。Files 中旧的浏览器临时密码连接只用于交互文件浏览，绝不能成为 Task grant；Secrets 仍只负责向 Task 注入环境变量，不保存 SSH 私钥。
+- **SSH 工作台与 Task 授权**: Files 的一级 `SSH workspace` 统一管理 Manager 本机 Profile 和远程文件浏览；可填写既有绝对路径，或经一次性令牌把未加密私钥上传到 `SSH_KEY_STORAGE_DIR` 的 `0700/0600` 后端托管目录。私钥内容不入库、不回传前端，数据库只保存经 owner/mode/no-symlink 预检的绝对路径，并强制固定服务端 host key；上传失败/取消需清理临时文件，Profile 轮换或删除只清理不再引用的 CCM 托管密钥。Task 只允许管理员按 Profile 授予 `exec/read/write`，授权固定 Profile revision；端点、用户、密钥或 host key 变化会令旧授权失效，须在 Chat 显式重新授权。本机、非 Shared、非 Worker Task 才能获得授权；`ccm_ssh` 按有效 capability 裁剪工具并作为 Claude/Codex required MCP 注入，不受 Codex main-MCP 开关影响，PR Review 等隔离链路不得继承。Files 中旧的浏览器临时密码连接只用于交互文件浏览，绝不能成为 Task grant；Secrets 仍只负责向 Task 注入环境变量，不保存 SSH 私钥。
 - **优先级**: 数字越小优先级越高 (P0 > P1 > P2)，排序用 `.asc()`
 - **Session 绑定**: `session_id` 和 `last_cwd` 在 **Task** 上（不是 Instance），因为 instance 是轮换执行不同 task 的 worker
 - **Instance 并发容量**: `max_concurrent_instances` 约束所有仍有运行证据的实例：正常 `idle/running` 会占槽，`error/stopped` 仅在 PID 与反向 owner 证据都已清除后才是免费历史。API 创建与 Dispatcher 补槽共用 `instance_capacity_lock`，idle 选择到 launch 之间用 owner reservation；运行时下调 cap 不强杀现有 turn，但在占用降到 cap 以下前禁止新领取。Task retry 可先推进权威代次再进入旧 lifecycle finally；收尾必须扫描同 Task 的非权威反向 owner，仅在 PID 已确定死亡且 runtime/launch reservation 全空时按 PID/start identity 清除，活 PID 或不确定证据继续阻塞。物理删除仍走 `DELETE /api/instances/cleanup`。systemd 部署必须使用 `OOMPolicy=continue`，让单个模型子进程 OOM 由任务生命周期记录/重试，不能连带停止整个 CCM 服务

@@ -33,6 +33,7 @@ os.environ.update({
     "CLOUDROUTER_ACCOUNTS_DIR": str(
         _GLOBAL_TEST_DB_DIR / "cloudrouter-accounts"
     ),
+    "SSH_KEY_STORAGE_DIR": str(_GLOBAL_TEST_DB_DIR / "ssh-key-store"),
     "WORKSPACE_DIR": str(_GLOBAL_TEST_DB_DIR / "workspace"),
     "WORKER_ENABLED": "false",
     "POOL_ENABLED": "false",

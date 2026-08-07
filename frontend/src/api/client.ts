@@ -133,7 +133,16 @@ async function formRequest<T>(path: string, formData: FormData): Promise<T> {
   }
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(typeof err.detail === 'string' ? err.detail : res.statusText);
+    const detail = err.detail;
+    const message = typeof detail === 'string'
+      ? detail
+      : detail && typeof detail === 'object' && typeof detail.message === 'string'
+        ? detail.message
+        : res.statusText;
+    const requestError = new Error(message) as ApiRequestError;
+    requestError.status = res.status;
+    requestError.detail = detail;
+    throw requestError;
   }
   const refreshedToken = res.headers.get('X-Refreshed-Token');
   if (refreshedToken) setToken(refreshedToken);
@@ -213,9 +222,16 @@ export interface SSHProfileInput {
   host: string;
   port: number;
   username: string;
-  key_path: string;
+  key_path?: string;
+  key_upload_token?: string;
   host_key_value: string;
   enabled: boolean;
+}
+
+export interface SSHPrivateKeyUpload {
+  upload_token: string;
+  filename: string;
+  public_key_fingerprint: string;
 }
 
 export interface SSHHostKeyProbe {
@@ -2064,6 +2080,15 @@ export const api = {
     request<SSHProfile>('/api/ssh-profiles', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  uploadSSHPrivateKey: (file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return formRequest<SSHPrivateKeyUpload>('/api/ssh-profiles/upload-key', formData);
+  },
+  cancelSSHPrivateKeyUpload: (uploadToken: string) =>
+    request<{ ok: boolean }>(`/api/ssh-profiles/upload-key/${encodeURIComponent(uploadToken)}`, {
+      method: 'DELETE',
     }),
   listTaskSSHGrants: (taskId: number) =>
     request<TaskSSHGrant[]>(`/api/tasks/${taskId}/ssh-grants`),

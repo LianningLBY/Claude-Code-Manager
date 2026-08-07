@@ -286,6 +286,9 @@ interface ManagedProfileDraft {
   port: number;
   username: string;
   keyPath: string;
+  keyUploadToken: string;
+  keyUploadFilename: string;
+  keyUploadFingerprint: string;
   hostKeyValue: string;
   hostKeyFingerprint: string;
   hostKeyConfirmed: boolean;
@@ -300,6 +303,9 @@ function emptyManagedDraft(): ManagedProfileDraft {
     port: 22,
     username: '',
     keyPath: '',
+    keyUploadToken: '',
+    keyUploadFilename: '',
+    keyUploadFingerprint: '',
     hostKeyValue: '',
     hostKeyFingerprint: '',
     hostKeyConfirmed: false,
@@ -311,20 +317,77 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
   const [editing, setEditing] = useState<ManagedProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
+  const keyUploadInputRef = useRef<HTMLInputElement>(null);
+
+  const abandonUploadedKey = (draft: ManagedProfileDraft | null) => {
+    if (draft?.keyUploadToken) {
+      void api.cancelSSHPrivateKeyUpload(draft.keyUploadToken).catch(() => undefined);
+    }
+  };
+
+  const beginEditing = (draft: ManagedProfileDraft) => {
+    abandonUploadedKey(editing);
+    setMessage(null);
+    setEditing(draft);
+  };
 
   const startEdit = (profile: ManagedSSHProfile) => {
-    setMessage(null);
-    setEditing({
+    beginEditing({
       id: profile.id,
       name: profile.name,
       host: profile.host,
       port: profile.port,
       username: profile.username,
       keyPath: '',
+      keyUploadToken: '',
+      keyUploadFilename: '',
+      keyUploadFingerprint: '',
       hostKeyValue: '',
       hostKeyFingerprint: profile.host_key_fingerprint,
       hostKeyConfirmed: true,
       enabled: profile.enabled,
+    });
+  };
+
+  const uploadPrivateKey = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file || !editing) return;
+    if (file.size > 1024 * 1024) {
+      setMessage('Private keys must be no larger than 1 MB.');
+      return;
+    }
+    const previousToken = editing.keyUploadToken;
+    setBusy(true);
+    setMessage(null);
+    try {
+      const uploaded = await api.uploadSSHPrivateKey(file);
+      if (previousToken) {
+        void api.cancelSSHPrivateKeyUpload(previousToken).catch(() => undefined);
+      }
+      setEditing((current) => current ? {
+        ...current,
+        keyPath: '',
+        keyUploadToken: uploaded.upload_token,
+        keyUploadFilename: uploaded.filename,
+        keyUploadFingerprint: uploaded.public_key_fingerprint,
+      } : current);
+      setMessage('Private key uploaded securely. Save the profile to finish.');
+    } catch (error) {
+      setMessage((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeUploadedKey = () => {
+    if (!editing?.keyUploadToken) return;
+    void api.cancelSSHPrivateKeyUpload(editing.keyUploadToken).catch(() => undefined);
+    setEditing({
+      ...editing,
+      keyUploadToken: '',
+      keyUploadFilename: '',
+      keyUploadFingerprint: '',
     });
   };
 
@@ -354,8 +417,8 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
       setMessage('Name, host, and username are required.');
       return;
     }
-    if (editing.id === null && (!editing.keyPath.trim() || !editing.hostKeyValue)) {
-      setMessage('A private-key path and a verified host fingerprint are required.');
+    if (editing.id === null && ((!editing.keyPath.trim() && !editing.keyUploadToken) || !editing.hostKeyValue)) {
+      setMessage('Upload a private key or enter its Manager path, then verify the host fingerprint.');
       return;
     }
     if (editing.hostKeyValue && !editing.hostKeyConfirmed) {
@@ -376,14 +439,18 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
       if (editing.id === null) {
         const input: SSHProfileInput = {
           ...common,
-          key_path: editing.keyPath.trim(),
+          ...(editing.keyUploadToken
+            ? { key_upload_token: editing.keyUploadToken }
+            : { key_path: editing.keyPath.trim() }),
           host_key_value: editing.hostKeyValue,
         };
         saved = await api.createSSHProfile(input);
       } else {
         saved = await api.updateSSHProfile(editing.id, {
           ...common,
-          ...(editing.keyPath.trim() ? { key_path: editing.keyPath.trim() } : {}),
+          ...(editing.keyUploadToken
+            ? { key_upload_token: editing.keyUploadToken }
+            : editing.keyPath.trim() ? { key_path: editing.keyPath.trim() } : {}),
           ...(editing.hostKeyValue ? { host_key_value: editing.hostKeyValue } : {}),
         });
       }
@@ -416,7 +483,10 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
     setMessage(null);
     try {
       await api.deleteSSHProfile(profile.id);
-      if (editing?.id === profile.id) setEditing(null);
+      if (editing?.id === profile.id) {
+        abandonUploadedKey(editing);
+        setEditing(null);
+      }
       await onRefresh();
     } catch (error) {
       setMessage((error as Error).message);
@@ -433,8 +503,9 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
           <div className="text-xs text-gray-500">Keys stay on the Manager host; connections verify a pinned host fingerprint.</div>
         </div>
         <button
-          onClick={() => { setEditing(emptyManagedDraft()); setMessage(null); }}
-          className="flex items-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700"
+          disabled={busy}
+          onClick={() => beginEditing(emptyManagedDraft())}
+          className="flex items-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700 disabled:opacity-50"
         >
           <Plus size={12} /> Add profile
         </button>
@@ -459,8 +530,8 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
             </button>
             <div className="mt-2 flex gap-2 text-xs">
               <button disabled={busy} onClick={() => testManagedProfile(profile)} className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50">test</button>
-              <button onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300">edit</button>
-              <button onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300"><Trash2 size={12} /></button>
+              <button disabled={busy} onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">edit</button>
+              <button disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>
             </div>
           </div>
         ))}
@@ -477,7 +548,31 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
             <label className="text-xs text-gray-400">Username<input value={editing.username} onChange={(e) => setEditing({ ...editing, username: e.target.value })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
             <label className="text-xs text-gray-400">Host<input value={editing.host} onChange={(e) => setEditing({ ...editing, host: e.target.value, hostKeyValue: '', hostKeyFingerprint: '', hostKeyConfirmed: false })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
             <label className="text-xs text-gray-400">Port<input type="number" min={1} max={65535} value={editing.port} onChange={(e) => setEditing({ ...editing, port: Number(e.target.value), hostKeyValue: '', hostKeyFingerprint: '', hostKeyConfirmed: false })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
-            <label className="text-xs text-gray-400 md:col-span-2">Private key path on Manager<input value={editing.keyPath} onChange={(e) => setEditing({ ...editing, keyPath: e.target.value })} placeholder={editing.id === null ? '/absolute/path/to/id_ed25519' : 'Leave blank to keep the current key'} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
+            <div className="text-xs text-gray-400 md:col-span-2">
+              <div className="flex items-center justify-between gap-2">
+                <span>Private key</span>
+                <button disabled={busy} onClick={() => keyUploadInputRef.current?.click()} className="flex items-center gap-1 rounded bg-gray-700 px-2 py-1 text-indigo-300 hover:bg-gray-600 disabled:opacity-50">
+                  <Upload size={12} /> Upload PEM or private key
+                </button>
+                <input ref={keyUploadInputRef} aria-label="Upload SSH private key" type="file" className="hidden" onChange={uploadPrivateKey} />
+              </div>
+              {editing.keyUploadToken ? (
+                <div className="mt-1 flex flex-wrap items-center gap-2 rounded border border-emerald-800 bg-emerald-950/30 px-2 py-1.5">
+                  <span className="text-emerald-300">Uploaded: {editing.keyUploadFilename}</span>
+                  <span className="min-w-0 truncate font-mono text-[10px] text-gray-500">{editing.keyUploadFingerprint}</span>
+                  <button disabled={busy} onClick={removeUploadedKey} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50">remove</button>
+                </div>
+              ) : (
+                <input
+                  aria-label="Private key path on Manager"
+                  value={editing.keyPath}
+                  onChange={(e) => setEditing({ ...editing, keyPath: e.target.value })}
+                  placeholder={editing.id === null ? '/absolute/path/to/id_ed25519' : 'Leave blank to keep the current key'}
+                  className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200"
+                />
+              )}
+              <div className="mt-1 text-[10px] text-gray-500">Uploaded keys are validated and stored only on the CCM server with mode 0600.</div>
+            </div>
           </div>
           <div className="flex flex-wrap items-center gap-2 rounded bg-gray-900/70 p-2">
             <button disabled={busy || !editing.host.trim()} onClick={probeHostKey} className="px-2 py-1 rounded bg-amber-600 text-white text-xs hover:bg-amber-700 disabled:opacity-50">Probe host identity</button>
@@ -492,7 +587,7 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
           <label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} />Enabled</label>
           <div className="flex gap-2">
             <button disabled={busy} onClick={saveManagedProfile} className="px-3 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700 disabled:opacity-50">{busy ? 'Working…' : 'Save'}</button>
-            <button onClick={() => setEditing(null)} className="px-3 py-1 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600">Cancel</button>
+            <button disabled={busy} onClick={() => { abandonUploadedKey(editing); setEditing(null); }} className="px-3 py-1 bg-gray-700 text-gray-300 rounded text-xs hover:bg-gray-600 disabled:opacity-50">Cancel</button>
           </div>
         </div>
       )}

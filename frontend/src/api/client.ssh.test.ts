@@ -56,4 +56,31 @@ describe('Task SSH grant API', () => {
       { profile_id: 41, capabilities: ['exec'] },
     ])).rejects.toThrow('Re-authorize this SSH profile');
   });
+
+  it('uploads private keys as authenticated multipart without forcing JSON headers', async () => {
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      json: async () => ({
+        upload_token: 'one-time-token',
+        filename: 'server.pem',
+        public_key_fingerprint: 'SHA256:key',
+      }),
+    });
+    const file = new File(['private-key'], 'server.pem', {
+      type: 'application/x-pem-file',
+    });
+
+    await api.uploadSSHPrivateKey(file);
+
+    const options = fetchMock.mock.calls[0][1] as RequestInit;
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'https://ccm.example.com/api/ssh-profiles/upload-key',
+    );
+    expect(options.method).toBe('POST');
+    expect(options.headers).toEqual({ Authorization: 'Bearer task-token' });
+    expect(options.body).toBeInstanceOf(FormData);
+    expect((options.body as FormData).get('file')).toBe(file);
+  });
 });

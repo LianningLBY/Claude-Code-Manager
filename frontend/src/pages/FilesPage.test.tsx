@@ -14,6 +14,8 @@ vi.mock('../api/client', () => ({
     managedSSHReadFile: vi.fn(),
     managedSSHDownloadFile: vi.fn(),
     probeSSHHostKey: vi.fn(),
+    uploadSSHPrivateKey: vi.fn(),
+    cancelSSHPrivateKeyUpload: vi.fn(),
     createSSHProfile: vi.fn(),
     updateSSHProfile: vi.fn(),
     deleteSSHProfile: vi.fn(),
@@ -57,6 +59,12 @@ describe('FilesPage managed SSH workspace', () => {
       fingerprint: 'SHA256:verified-host',
     });
     vi.mocked(api.createSSHProfile).mockResolvedValue(managedProfile);
+    vi.mocked(api.uploadSSHPrivateKey).mockResolvedValue({
+      upload_token: 'upload-token-1',
+      filename: 'production.pem',
+      public_key_fingerprint: 'SHA256:uploaded-client-key',
+    });
+    vi.mocked(api.cancelSSHPrivateKeyUpload).mockResolvedValue({ ok: true });
   });
 
   afterEach(() => {
@@ -111,5 +119,62 @@ describe('FilesPage managed SSH workspace', () => {
         enabled: true,
       });
     });
+  });
+
+  it('uploads a private key and saves only its one-time token', async () => {
+    vi.mocked(api.listSSHProfiles)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([managedProfile]);
+    const user = userEvent.setup();
+    render(<FilesPage />);
+
+    await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
+    await user.click(await screen.findByRole('button', { name: /Add profile/i }));
+    const key = new File(['private-key'], 'production.pem', {
+      type: 'application/x-pem-file',
+    });
+    await user.upload(screen.getByLabelText('Upload SSH private key'), key);
+
+    expect(await screen.findByText('Uploaded: production.pem')).toBeInTheDocument();
+    expect(screen.getByText('SHA256:uploaded-client-key')).toBeInTheDocument();
+    expect(api.uploadSSHPrivateKey).toHaveBeenCalledWith(key);
+
+    await user.type(screen.getByLabelText('Name'), 'production-box');
+    await user.type(screen.getByLabelText('Username'), 'deploy');
+    await user.type(screen.getByLabelText('Host'), 'ssh.internal');
+    await user.click(screen.getByRole('button', { name: /Probe host identity/i }));
+    await user.click(screen.getByLabelText('I verified this host fingerprint'));
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => {
+      expect(api.createSSHProfile).toHaveBeenCalledWith({
+        name: 'production-box',
+        host: 'ssh.internal',
+        port: 22,
+        username: 'deploy',
+        key_upload_token: 'upload-token-1',
+        host_key_value: 'ssh-ed25519 AAAAhost',
+        enabled: true,
+      });
+    });
+    expect(api.cancelSSHPrivateKeyUpload).not.toHaveBeenCalled();
+  });
+
+  it('cancels a pending private-key upload when the editor is cancelled', async () => {
+    vi.mocked(api.listSSHProfiles).mockResolvedValueOnce([]);
+    const user = userEvent.setup();
+    render(<FilesPage />);
+
+    await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
+    await user.click(await screen.findByRole('button', { name: /Add profile/i }));
+    await user.upload(
+      screen.getByLabelText('Upload SSH private key'),
+      new File(['private-key'], 'production.pem'),
+    );
+    await screen.findByText('Uploaded: production.pem');
+    await user.click(screen.getByRole('button', { name: /^Cancel$/i }));
+
+    expect(api.cancelSSHPrivateKeyUpload).toHaveBeenCalledWith('upload-token-1');
+    expect(screen.queryByText('Uploaded: production.pem')).not.toBeInTheDocument();
   });
 });

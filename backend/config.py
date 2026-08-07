@@ -76,6 +76,9 @@ class Settings(BaseSettings):
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
+    # Browser-uploaded SSH Profile keys. Files are private host credentials;
+    # only opaque one-time upload tokens are returned to the frontend.
+    ssh_key_storage_dir: str = "~/.ccm/ssh-keys"
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
     worker_enabled: bool = True

@@ -1,12 +1,14 @@
 import asyncio
+import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import get_current_user_id, require_admin
+from backend.config import settings
 from backend.database import get_db
 from backend.models.ssh_profile import SSHProfile
 from backend.schemas.ssh_profile import (
@@ -16,8 +18,14 @@ from backend.schemas.ssh_profile import (
     SSHProfileResponse,
     SSHProfileTestResponse,
     SSHProfileUpdate,
+    SSHPrivateKeyUploadResponse,
 )
 from backend.services.ssh_executor import SSHKeyPreflightError, probe_ssh_host_key
+from backend.services.ssh_key_store import (
+    MAX_SSH_PRIVATE_KEY_UPLOAD_BYTES,
+    SSHManagedKeyStore,
+    SSHManagedKeyStoreError,
+)
 from backend.services.ssh_profiles import (
     CONNECTION_IDENTITY_FIELDS,
     test_profile,
@@ -30,12 +38,35 @@ router = APIRouter(
     tags=["ssh-profiles"],
     dependencies=[Depends(require_admin)],
 )
+logger = logging.getLogger(__name__)
 
 
 def _profile_error(exc: Exception) -> HTTPException:
-    if isinstance(exc, SSHKeyPreflightError):
+    if isinstance(exc, (SSHKeyPreflightError, SSHManagedKeyStoreError)):
         return HTTPException(400, {"code": exc.code, "message": exc.detail})
     return HTTPException(400, str(exc))
+
+
+def _key_store() -> SSHManagedKeyStore:
+    return SSHManagedKeyStore(settings.ssh_key_storage_dir)
+
+
+async def _discard_unreferenced_managed_key(
+    db: AsyncSession, store: SSHManagedKeyStore, key_path: str,
+) -> None:
+    try:
+        referenced = await db.scalar(
+            select(SSHProfile.id).where(
+                SSHProfile.key_path == key_path,
+                SSHProfile.deleted_at.is_(None),
+            ).limit(1)
+        )
+        if referenced is None:
+            store.discard_managed_key(key_path)
+    except Exception:
+        # Profile mutation has already committed. A retained mode-0600 key is
+        # safer than turning a successful API operation into an ambiguous one.
+        logger.exception("Failed to clean up an unreferenced managed SSH key")
 
 
 async def _live_profile(db: AsyncSession, profile_id: int) -> SSHProfile:
@@ -75,18 +106,58 @@ async def probe_host_key(body: SSHHostKeyProbeRequest):
     )
 
 
+@router.post("/upload-key", response_model=SSHPrivateKeyUploadResponse)
+async def upload_private_key(file: UploadFile = File(...)):
+    try:
+        data = await file.read(MAX_SSH_PRIVATE_KEY_UPLOAD_BYTES + 1)
+        if len(data) > MAX_SSH_PRIVATE_KEY_UPLOAD_BYTES:
+            raise SSHManagedKeyStoreError(
+                "key_size", "SSH private key must be no larger than 1 MB",
+            )
+        uploaded = _key_store().store_upload(data, file.filename)
+    except Exception as exc:
+        raise _profile_error(exc) from exc
+    finally:
+        await file.close()
+    return SSHPrivateKeyUploadResponse(
+        upload_token=uploaded.upload_token,
+        filename=uploaded.filename,
+        public_key_fingerprint=uploaded.public_key_fingerprint,
+    )
+
+
+@router.delete("/upload-key/{upload_token}")
+async def cancel_private_key_upload(upload_token: str):
+    try:
+        removed = _key_store().cancel_upload(upload_token)
+    except Exception as exc:
+        raise _profile_error(exc) from exc
+    if not removed:
+        raise HTTPException(404, "SSH private-key upload not found")
+    return {"ok": True}
+
+
 @router.post("", response_model=SSHProfileResponse, status_code=201)
 async def create_ssh_profile(
     body: SSHProfileCreate,
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    store = _key_store()
+    claimed_key_path: str | None = None
+    committed = False
     try:
+        key_path = body.key_path
+        if body.key_upload_token:
+            claimed_key_path = store.claim_upload(body.key_upload_token)
+            key_path = claimed_key_path
         material = validated_profile_material(
-            key_path=body.key_path,
+            key_path=key_path or "",
             host_key_value=body.host_key_value,
         )
     except Exception as exc:
+        if claimed_key_path:
+            store.discard_managed_key(claimed_key_path)
         raise _profile_error(exc) from exc
     profile = SSHProfile(
         name=body.name,
@@ -100,9 +171,18 @@ async def create_ssh_profile(
     db.add(profile)
     try:
         await db.commit()
+        committed = True
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(409, "SSH profile name already exists") from exc
+    finally:
+        if claimed_key_path and not committed:
+            store.discard_managed_key(claimed_key_path)
+    if body.key_upload_token:
+        try:
+            store.finalize_upload(body.key_upload_token)
+        except Exception:
+            logger.exception("Failed to finalize a committed managed SSH key upload")
     await db.refresh(profile)
     return profile
 
@@ -122,6 +202,7 @@ async def update_ssh_profile(
 ):
     profile = await _live_profile(db, profile_id)
     values = body.model_dump(exclude_unset=True)
+    upload_token = values.pop("key_upload_token", None)
     if values.get("key_path") is None:
         values.pop("key_path", None)
     if (
@@ -132,6 +213,16 @@ async def update_ssh_profile(
             400,
             "Changing the SSH endpoint requires a newly confirmed host key",
         )
+    store = _key_store()
+    claimed_key_path: str | None = None
+    committed = False
+    old_key_path = profile.key_path
+    if upload_token:
+        try:
+            claimed_key_path = store.claim_upload(upload_token)
+        except Exception as exc:
+            raise _profile_error(exc) from exc
+        values["key_path"] = claimed_key_path
     # An explicitly re-entered key or host key is a re-authorization request,
     # even when its path/value string is unchanged. The file at a stable path
     # may have been rotated outside CCM and must receive a new revision.
@@ -148,6 +239,8 @@ async def update_ssh_profile(
                 ),
             )
         except Exception as exc:
+            if claimed_key_path:
+                store.discard_managed_key(claimed_key_path)
             raise _profile_error(exc) from exc
         values.update(material)
         profile.revision += 1
@@ -159,10 +252,21 @@ async def update_ssh_profile(
         setattr(profile, field, value)
     try:
         await db.commit()
+        committed = True
     except IntegrityError as exc:
         await db.rollback()
         raise HTTPException(409, "SSH profile name already exists") from exc
+    finally:
+        if claimed_key_path and not committed:
+            store.discard_managed_key(claimed_key_path)
+    if upload_token:
+        try:
+            store.finalize_upload(upload_token)
+        except Exception:
+            logger.exception("Failed to finalize a committed managed SSH key upload")
     await db.refresh(profile)
+    if old_key_path != profile.key_path:
+        await _discard_unreferenced_managed_key(db, store, old_key_path)
     return profile
 
 
@@ -203,8 +307,10 @@ async def delete_ssh_profile(
     profile_id: int, db: AsyncSession = Depends(get_db),
 ):
     profile = await _live_profile(db, profile_id)
+    key_path = profile.key_path
     profile.enabled = False
     profile.revision += 1
     profile.deleted_at = datetime.utcnow()
     await db.commit()
+    await _discard_unreferenced_managed_key(db, _key_store(), key_path)
     return {"ok": True}

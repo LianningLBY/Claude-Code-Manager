@@ -5,7 +5,7 @@ CCM 的 SSH 能力分成两层：Files 页的管理员工作台负责连接配�
 ## 管理员使用流程
 
 1. 打开 **Files → SSH workspace → Add profile**。
-2. 填写远端地址、用户名和 Manager 本机的私钥绝对路径。
+2. 填写远端地址和用户名，然后上传未加密的 PEM/OpenSSH 私钥；也可继续填写 Manager 本机已有私钥的绝对路径。
 3. 探测主机公钥，通过可信渠道核对 SHA-256 指纹后勾选确认并保存。
 4. 用 **Test connection** 验证连接；随后可在同页浏览和下载远程文件。
 5. 新建 Task 时打开 **SSH access**，选择 Profile，并只勾选需要的 `Run commands`、`Read files`、`Write files`。
@@ -23,7 +23,8 @@ CCM 的 SSH 能力分成两层：Files 页的管理员工作台负责连接配�
 
 ## 凭据边界
 
-- SSH Profile 数据库只保存私钥路径和公钥指纹，不保存私钥内容；公开 API 只返回脱敏后的路径提示。
+- SSH Profile 数据库只保存私钥路径和公钥指纹，不保存私钥内容；公开 Profile API 只返回脱敏后的路径提示。
+- 浏览器上传最多 1 MB，后端先验证私钥格式，再以一次性令牌认领到 `SSH_KEY_STORAGE_DIR`（默认 `~/.ccm/ssh-keys`）；目录为 `0700`、文件为 `0600`。取消会删除待认领文件，保存失败会回滚已认领副本并允许原令牌重试；未认领令牌有效期为 24 小时，Profile 轮换或删除会清理不再引用的 CCM 托管密钥。
 - 私钥必须是 Manager 服务用户拥有的普通文件，不得是符号链接或 group/other 可读写文件；加密私钥暂不支持无人值守 Task。
 - Files 页折叠区中的 legacy 用户名/密码连接仅保存在浏览器，用于人工文件浏览，不能授权给 Task。
 - Secrets 用于把普通密钥值以环境变量注入 Task，与 SSH Profile 无关；不要把 SSH 私钥内容放进 Secrets。
@@ -32,6 +33,7 @@ CCM 的 SSH 能力分成两层：Files 页的管理员工作台负责连接配�
 ## API 与执行链路
 
 - 管理 Profile：`/api/ssh-profiles`
+- 上传/取消待认领私钥：`POST /api/ssh-profiles/upload-key`、`DELETE /api/ssh-profiles/upload-key/{token}`
 - 查看/替换 Task grant：`/api/tasks/{task_id}/ssh-grants`
 - MCP 内部操作：`/api/tasks/{task_id}/ssh-access/...`，只接受 Manager 内部服务认证
 

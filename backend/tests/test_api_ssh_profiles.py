@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -8,6 +9,7 @@ from backend.services.ssh_executor import (
     SSHProbeResult,
     derive_openssh_public_key,
 )
+from backend.config import settings
 
 
 def _private_key_file(tmp_path: Path) -> Path:
@@ -157,3 +159,171 @@ async def test_probe_host_key_returns_confirmable_identity(client, monkeypatch):
     assert response.status_code == 200
     assert response.json()["key_type"] == "ssh-ed25519"
     assert response.json()["fingerprint"] == "SHA256:test"
+
+
+@pytest.mark.asyncio
+async def test_upload_private_key_creates_and_deletes_managed_profile_key(
+    client, tmp_path, monkeypatch,
+):
+    store_root = tmp_path / "ssh-key-store"
+    monkeypatch.setattr(settings, "ssh_key_storage_dir", str(store_root))
+    source = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(source)
+
+    uploaded = await client.post(
+        "/api/ssh-profiles/upload-key",
+        files={"file": ("production.pem", source.read_bytes(), "application/x-pem-file")},
+    )
+
+    assert uploaded.status_code == 200, uploaded.text
+    upload = uploaded.json()
+    assert upload["filename"] == "production.pem"
+    assert upload["public_key_fingerprint"].startswith("SHA256:")
+    assert "path" not in upload
+    token = upload["upload_token"]
+    pending = store_root / "pending" / token
+    assert pending.is_file()
+    assert pending.stat().st_mode & 0o777 == 0o600
+
+    created = await client.post("/api/ssh-profiles", json={
+        "name": "uploaded-production",
+        "host": "ssh.example.internal",
+        "username": "deploy",
+        "key_upload_token": token,
+        "host_key_value": host_key,
+    })
+
+    assert created.status_code == 201, created.text
+    assert "key_path" not in created.json()
+    managed = store_root / "managed" / token
+    assert managed.is_file()
+    assert not pending.exists()
+
+    reused = await client.post("/api/ssh-profiles", json={
+        "name": "token-reuse",
+        "host": "ssh.example.internal",
+        "username": "deploy",
+        "key_upload_token": token,
+        "host_key_value": host_key,
+    })
+    assert reused.status_code == 400
+    assert reused.json()["detail"]["code"] == "upload_token_invalid"
+
+    replacement = ed25519.Ed25519PrivateKey.generate().private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.OpenSSH,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    replacement_upload = await client.post(
+        "/api/ssh-profiles/upload-key",
+        files={"file": ("replacement.pem", replacement, "application/x-pem-file")},
+    )
+    replacement_token = replacement_upload.json()["upload_token"]
+    rotated = await client.put(
+        f"/api/ssh-profiles/{created.json()['id']}",
+        json={"key_upload_token": replacement_token},
+    )
+    assert rotated.status_code == 200, rotated.text
+    assert rotated.json()["revision"] == 2
+    assert not managed.exists()
+    managed = store_root / "managed" / replacement_token
+    assert managed.is_file()
+
+    deleted = await client.delete(f"/api/ssh-profiles/{created.json()['id']}")
+    assert deleted.status_code == 200
+    assert not managed.exists()
+
+
+@pytest.mark.asyncio
+async def test_invalid_or_cancelled_private_key_upload_is_not_claimable(
+    client, tmp_path, monkeypatch,
+):
+    store_root = tmp_path / "ssh-key-store"
+    monkeypatch.setattr(settings, "ssh_key_storage_dir", str(store_root))
+
+    invalid = await client.post(
+        "/api/ssh-profiles/upload-key",
+        files={"file": ("not-a-key.pem", b"not a private key", "application/octet-stream")},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"]["code"] == "key_invalid"
+    assert not list((store_root / "pending").iterdir())
+
+    source = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(source)
+    expired_upload = await client.post(
+        "/api/ssh-profiles/upload-key",
+        files={"file": ("expired.pem", source.read_bytes(), "application/octet-stream")},
+    )
+    expired_token = expired_upload.json()["upload_token"]
+    expired_path = store_root / "pending" / expired_token
+    old_time = expired_path.stat().st_mtime - 25 * 60 * 60
+    os.utime(expired_path, (old_time, old_time))
+    expired = await client.post("/api/ssh-profiles", json={
+        "name": "expired-upload",
+        "host": "ssh.example.internal",
+        "username": "deploy",
+        "key_upload_token": expired_token,
+        "host_key_value": host_key,
+    })
+    assert expired.status_code == 400
+    assert expired.json()["detail"]["code"] == "upload_token_invalid"
+    assert not expired_path.exists()
+
+    uploaded = await client.post(
+        "/api/ssh-profiles/upload-key",
+        files={"file": ("id_ed25519", source.read_bytes(), "application/octet-stream")},
+    )
+    token = uploaded.json()["upload_token"]
+    cancelled = await client.delete(f"/api/ssh-profiles/upload-key/{token}")
+    assert cancelled.status_code == 200
+
+    rejected = await client.post("/api/ssh-profiles", json={
+        "name": "cancelled-upload",
+        "host": "ssh.example.internal",
+        "username": "deploy",
+        "key_upload_token": token,
+        "host_key_value": host_key,
+    })
+    assert rejected.status_code == 400
+    assert rejected.json()["detail"]["code"] == "upload_token_invalid"
+
+
+@pytest.mark.asyncio
+async def test_failed_profile_save_keeps_upload_token_retryable(
+    client, tmp_path, monkeypatch,
+):
+    store_root = tmp_path / "ssh-key-store"
+    monkeypatch.setattr(settings, "ssh_key_storage_dir", str(store_root))
+    source = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(source)
+    base = {
+        "name": "duplicate-upload",
+        "host": "ssh.example.internal",
+        "username": "deploy",
+        "key_path": str(source),
+        "host_key_value": host_key,
+    }
+    assert (await client.post("/api/ssh-profiles", json=base)).status_code == 201
+
+    uploaded = await client.post(
+        "/api/ssh-profiles/upload-key",
+        files={"file": ("retry.pem", source.read_bytes(), "application/octet-stream")},
+    )
+    token = uploaded.json()["upload_token"]
+    failed = await client.post("/api/ssh-profiles", json={
+        **{key: value for key, value in base.items() if key != "key_path"},
+        "key_upload_token": token,
+    })
+    assert failed.status_code == 409
+    assert (store_root / "pending" / token).is_file()
+    assert not (store_root / "managed" / token).exists()
+
+    retried = await client.post("/api/ssh-profiles", json={
+        **{key: value for key, value in base.items() if key not in {"name", "key_path"}},
+        "name": "retry-succeeded",
+        "key_upload_token": token,
+    })
+    assert retried.status_code == 201, retried.text
+    assert not (store_root / "pending" / token).exists()
+    assert (store_root / "managed" / token).is_file()

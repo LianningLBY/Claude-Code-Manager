@@ -1093,6 +1093,8 @@ def _managed_ssh_profile(name: str = "launch-ssh") -> SSHProfile:
         host_key_fingerprint="SHA256:host",
         revision=1,
         enabled=True,
+        task_access_enabled=True,
+        task_capabilities=["exec", "read", "write"],
     )
 
 

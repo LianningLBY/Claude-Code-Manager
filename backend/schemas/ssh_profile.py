@@ -2,6 +2,22 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from backend.schemas.task_ssh_grant import SSHCapability
+
+
+def _unique_capabilities(value: list[SSHCapability]) -> list[SSHCapability]:
+    return list(dict.fromkeys(value))
+
+
+def _validate_task_policy(
+    enabled: bool,
+    capabilities: list[SSHCapability],
+) -> None:
+    if enabled and not capabilities:
+        raise ValueError("select at least one Task capability when Task access is enabled")
+    if not enabled and capabilities:
+        raise ValueError("Task capabilities require Task access to be enabled")
+
 
 class _SSHProfileConnectionFields(BaseModel):
     name: str = Field(min_length=1, max_length=100)
@@ -23,11 +39,22 @@ class SSHProfileCreate(_SSHProfileConnectionFields):
     key_upload_token: str | None = Field(default=None, min_length=1, max_length=128)
     host_key_value: str = Field(min_length=1, max_length=16384)
     enabled: bool = True
+    task_access_enabled: bool = False
+    task_capabilities: list[SSHCapability] = Field(default_factory=list, max_length=3)
+
+    @field_validator("task_capabilities")
+    @classmethod
+    def unique_task_capabilities(
+        cls,
+        value: list[SSHCapability],
+    ) -> list[SSHCapability]:
+        return _unique_capabilities(value)
 
     @model_validator(mode="after")
     def exactly_one_key_source(self):
         if bool(self.key_path) == bool(self.key_upload_token):
             raise ValueError("provide exactly one of key_path or key_upload_token")
+        _validate_task_policy(self.task_access_enabled, self.task_capabilities)
         return self
 
 
@@ -40,6 +67,31 @@ class SSHProfileUpdate(BaseModel):
     key_upload_token: str | None = Field(default=None, min_length=1, max_length=128)
     host_key_value: str | None = Field(default=None, min_length=1, max_length=16384)
     enabled: bool | None = None
+    task_access_enabled: bool | None = None
+    task_capabilities: list[SSHCapability] | None = Field(
+        default=None,
+        max_length=3,
+    )
+
+    @field_validator("task_capabilities")
+    @classmethod
+    def unique_optional_task_capabilities(
+        cls,
+        value: list[SSHCapability] | None,
+    ) -> list[SSHCapability] | None:
+        if value is None:
+            raise ValueError("task_capabilities must not be null")
+        return _unique_capabilities(value)
+
+    @field_validator("task_access_enabled")
+    @classmethod
+    def task_access_switch_must_not_be_null(
+        cls,
+        value: bool | None,
+    ) -> bool | None:
+        if value is None:
+            raise ValueError("task_access_enabled must not be null")
+        return value
 
     @field_validator("name", "host", "username")
     @classmethod
@@ -96,6 +148,8 @@ class SSHProfileResponse(BaseModel):
     host_key_fingerprint: str
     revision: int
     enabled: bool
+    task_access_enabled: bool
+    task_capabilities: list[SSHCapability]
     created_by: int | None
     last_tested_at: datetime | None
     last_test_ok: bool | None

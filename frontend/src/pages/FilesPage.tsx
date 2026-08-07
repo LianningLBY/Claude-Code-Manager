@@ -9,6 +9,7 @@ import type {
   Project,
   SSHProfile as ManagedSSHProfile,
   SSHProfileInput,
+  TaskSSHCapability,
 } from '../api/client';
 
 // ---------------------------------------------------------------------------
@@ -61,10 +62,6 @@ function loadProfiles(): LegacySSHProfile[] {
 
 function saveProfiles(profiles: LegacySSHProfile[]) {
   localStorage.setItem(SSH_PROFILES_KEY, JSON.stringify(profiles));
-}
-
-function newProfile(): LegacySSHProfile {
-  return { id: crypto.randomUUID(), label: '', host: '', port: 22, username: '', password: '', key_path: '' };
 }
 
 // ---------------------------------------------------------------------------
@@ -181,106 +178,22 @@ function formatSize(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(1)}M`;
 }
 
-// ---------------------------------------------------------------------------
-// SSH profile editor panel
-// ---------------------------------------------------------------------------
-
-interface SSHPanelProps {
-  profiles: LegacySSHProfile[];
-  active: LegacySSHProfile | null;
-  onActivate: (p: LegacySSHProfile) => void;
-  onSave: (profiles: LegacySSHProfile[]) => void;
-}
-
-function SSHPanel({ profiles, active, onActivate, onSave, isAdmin = true }: SSHPanelProps & { isAdmin?: boolean }) {
-  const [editing, setEditing] = useState<LegacySSHProfile | null>(null);
-
-  const startNew = () => setEditing(newProfile());
-  const startEdit = (p: LegacySSHProfile) => setEditing({ ...p });
-
-  const handleSave = () => {
-    if (!editing) return;
-    const exists = profiles.find((p) => p.id === editing.id);
-    const next = exists ? profiles.map((p) => (p.id === editing.id ? editing : p)) : [...profiles, editing];
-    onSave(next.filter((profile) => !profile.id.startsWith('worker-')));
-    setEditing(null);
-  };
-
-  const handleDelete = (id: string) => {
-    onSave(profiles.filter((p) => p.id !== id));
-  };
-
-  return (
-    <div className="space-y-3">
-      {/* Saved profiles */}
-      <div className="space-y-1">
-        {profiles.map((p) => (
-          <div
-            key={p.id}
-            className={`flex items-center gap-2 px-3 py-2 rounded cursor-pointer text-sm ${
-              active?.id === p.id ? 'bg-indigo-700 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-            }`}
-          >
-            <Server size={14} className="flex-shrink-0" />
-            <span className="flex-1 truncate" onClick={() => onActivate(p)}>
-              {p.label || `${p.username}@${p.host}`}
-            </span>
-            {isAdmin && !p.id.startsWith('worker-') && <button onClick={() => startEdit(p)} className="text-gray-400 hover:text-gray-200 text-xs px-1">edit</button>}
-            {isAdmin && !p.id.startsWith('worker-') && <button onClick={() => handleDelete(p.id)} className="text-red-400 hover:text-red-300"><Trash2 size={12} /></button>}
-          </div>
-        ))}
-      </div>
-
-      {isAdmin && (
-        <button
-          onClick={startNew}
-          className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300"
-        >
-          <Plus size={12} /> Add server
-        </button>
-      )}
-
-      {/* Inline editor */}
-      {editing && (
-        <div className="bg-gray-700 rounded p-3 space-y-2 text-sm">
-          {[
-            { label: 'Label', key: 'label', placeholder: 'My Server' },
-            { label: 'Host', key: 'host', placeholder: '192.168.1.1' },
-            { label: 'Port', key: 'port', placeholder: '22' },
-            { label: 'Username', key: 'username', placeholder: 'ubuntu' },
-            { label: 'Password', key: 'password', placeholder: '(optional if key is set)', type: 'password' },
-            { label: 'Key File', key: 'key_path', placeholder: '~/.ssh/id_rsa  (optional, leave empty to use password)' },
-          ].map(({ label, key, placeholder, type }) => (
-            <div key={key} className="flex items-center gap-2">
-              <span className="w-20 text-gray-400 flex-shrink-0">{label}</span>
-              <input
-                type={type || 'text'}
-                value={String((editing as unknown as Record<string, unknown>)[key] ?? '')}
-                onChange={(e) => setEditing({ ...editing, [key]: key === 'port' ? Number(e.target.value) : e.target.value })}
-                placeholder={placeholder}
-                className="flex-1 bg-gray-600 text-gray-200 rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500"
-              />
-            </div>
-          ))}
-          <div className="flex gap-2 pt-1">
-            <button onClick={handleSave} className="px-3 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700">Save</button>
-            <button onClick={() => setEditing(null)} className="px-3 py-1 bg-gray-600 text-gray-300 rounded text-xs hover:bg-gray-500">Cancel</button>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 interface ManagedSSHPanelProps {
   profiles: ManagedSSHProfile[];
+  legacyProfiles: LegacySSHProfile[];
   activeId: number | null;
+  activeLegacyId: string | null;
   onActivate: (profile: ManagedSSHProfile) => void;
+  onActivateLegacy: (profile: LegacySSHProfile) => void;
   onRefresh: (preferredId?: number) => Promise<void>;
+  onLegacyMigrated: (legacyId: string) => void;
+  onDeleteLegacy: (legacyId: string) => void;
+  isAdmin: boolean;
 }
 
 interface ManagedProfileDraft {
   id: number | null;
+  legacyId: string | null;
   name: string;
   host: string;
   port: number;
@@ -293,11 +206,14 @@ interface ManagedProfileDraft {
   hostKeyFingerprint: string;
   hostKeyConfirmed: boolean;
   enabled: boolean;
+  taskAccessEnabled: boolean;
+  taskCapabilities: TaskSSHCapability[];
 }
 
 function emptyManagedDraft(): ManagedProfileDraft {
   return {
     id: null,
+    legacyId: null,
     name: '',
     host: '',
     port: 22,
@@ -310,10 +226,33 @@ function emptyManagedDraft(): ManagedProfileDraft {
     hostKeyFingerprint: '',
     hostKeyConfirmed: false,
     enabled: true,
+    taskAccessEnabled: false,
+    taskCapabilities: [],
   };
 }
 
-function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedSSHPanelProps) {
+const TASK_CAPABILITY_OPTIONS: Array<{
+  key: TaskSSHCapability;
+  label: string;
+  detail: string;
+}> = [
+  { key: 'read', label: 'Read files', detail: 'List directories and read files' },
+  { key: 'exec', label: 'Run commands', detail: 'Execute non-interactive shell commands' },
+  { key: 'write', label: 'Write files', detail: 'Create or replace remote files' },
+];
+
+function ManagedSSHPanel({
+  profiles,
+  legacyProfiles,
+  activeId,
+  activeLegacyId,
+  onActivate,
+  onActivateLegacy,
+  onRefresh,
+  onLegacyMigrated,
+  onDeleteLegacy,
+  isAdmin,
+}: ManagedSSHPanelProps) {
   const [editing, setEditing] = useState<ManagedProfileDraft | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -334,6 +273,7 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
   const startEdit = (profile: ManagedSSHProfile) => {
     beginEditing({
       id: profile.id,
+      legacyId: null,
       name: profile.name,
       host: profile.host,
       port: profile.port,
@@ -346,7 +286,24 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
       hostKeyFingerprint: profile.host_key_fingerprint,
       hostKeyConfirmed: true,
       enabled: profile.enabled,
+      taskAccessEnabled: profile.task_access_enabled,
+      taskCapabilities: profile.task_capabilities,
     });
+  };
+
+  const startLegacyMigration = (profile: LegacySSHProfile) => {
+    beginEditing({
+      ...emptyManagedDraft(),
+      legacyId: profile.id,
+      name: profile.label || `${profile.username}@${profile.host}`,
+      host: profile.host,
+      port: profile.port,
+      username: profile.username,
+      keyPath: profile.key_path,
+    });
+    setMessage(profile.password && !profile.key_path
+      ? 'Legacy passwords are not copied. Upload a PEM/private key to migrate this connection.'
+      : 'Verify the host fingerprint, review Task access, and save to finish migration.');
   };
 
   const uploadPrivateKey = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -434,6 +391,10 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
         port: editing.port,
         username: editing.username.trim(),
         enabled: editing.enabled,
+        task_access_enabled: editing.taskAccessEnabled,
+        task_capabilities: editing.taskAccessEnabled
+          ? editing.taskCapabilities
+          : [],
       };
       let saved: ManagedSSHProfile;
       if (editing.id === null) {
@@ -454,8 +415,10 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
           ...(editing.hostKeyValue ? { host_key_value: editing.hostKeyValue } : {}),
         });
       }
+      const migratedLegacyId = editing.legacyId;
       setEditing(null);
       await onRefresh(saved.id);
+      if (migratedLegacyId) onLegacyMigrated(migratedLegacyId);
     } catch (error) {
       setMessage((error as Error).message);
     } finally {
@@ -499,16 +462,16 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
     <div className="space-y-3">
       <div className="flex items-center justify-between gap-2">
         <div>
-          <div className="text-sm font-medium text-gray-200">Managed SSH profiles</div>
-          <div className="text-xs text-gray-500">Keys stay on the Manager host; connections verify a pinned host fingerprint.</div>
+          <div className="text-sm font-medium text-gray-200">SSH connections</div>
+          <div className="text-xs text-gray-500">Every managed connection can browse files. You decide whether Tasks may use it.</div>
         </div>
-        <button
+        {isAdmin && <button
           disabled={busy}
           onClick={() => beginEditing(emptyManagedDraft())}
           className="flex items-center gap-1 px-2 py-1 bg-indigo-600 text-white rounded text-xs hover:bg-indigo-700 disabled:opacity-50"
         >
-          <Plus size={12} /> Add profile
-        </button>
+          <Plus size={12} /> Add SSH connection
+        </button>}
       </div>
 
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
@@ -527,22 +490,56 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
               <div className="mt-1 truncate font-mono text-[10px] text-gray-600" title={profile.host_key_fingerprint}>
                 host {profile.host_key_fingerprint}
               </div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] text-indigo-300">Files</span>
+                {profile.task_access_enabled ? (
+                  profile.task_capabilities.map((capability) => (
+                    <span key={capability} className="rounded bg-cyan-500/15 px-1.5 py-0.5 text-[10px] text-cyan-300">Task: {capability}</span>
+                  ))
+                ) : (
+                  <span className="rounded bg-gray-700 px-1.5 py-0.5 text-[10px] text-gray-400">Not exposed to Tasks</span>
+                )}
+              </div>
             </button>
             <div className="mt-2 flex gap-2 text-xs">
               <button disabled={busy} onClick={() => testManagedProfile(profile)} className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50">test</button>
-              <button disabled={busy} onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">edit</button>
-              <button disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>
+              {isAdmin && <button disabled={busy} onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">edit</button>}
+              {isAdmin && <button disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>}
             </div>
           </div>
         ))}
-        {profiles.length === 0 && (
-          <div className="rounded border border-dashed border-gray-700 p-4 text-xs text-gray-500">No managed SSH profiles yet.</div>
+        {legacyProfiles.map((profile) => (
+          <div
+            key={`legacy-${profile.id}`}
+            className={`rounded border p-3 ${activeLegacyId === profile.id ? 'border-amber-500 bg-amber-500/10' : 'border-gray-700 bg-gray-800/70'}`}
+          >
+            <button onClick={() => onActivateLegacy(profile)} className="w-full text-left">
+              <div className="flex items-center gap-2 text-sm text-gray-200">
+                <Server size={14} className="text-amber-400" />
+                <span className="truncate font-medium">{profile.label || `${profile.username}@${profile.host}`}</span>
+              </div>
+              <div className="mt-1 truncate text-xs text-gray-500">{profile.username}@{profile.host}:{profile.port}</div>
+              <div className="mt-2 flex flex-wrap gap-1">
+                <span className="rounded bg-indigo-500/15 px-1.5 py-0.5 text-[10px] text-indigo-300">Files</span>
+                <span className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-300">Legacy · migrate to expose to Tasks</span>
+              </div>
+            </button>
+            {isAdmin && !profile.id.startsWith('worker-') && (
+              <div className="mt-2 flex gap-2 text-xs">
+                <button disabled={busy} onClick={() => startLegacyMigration(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">migrate</button>
+                <button disabled={busy} onClick={() => onDeleteLegacy(profile.id)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>
+              </div>
+            )}
+          </div>
+        ))}
+        {profiles.length === 0 && legacyProfiles.length === 0 && (
+          <div className="rounded border border-dashed border-gray-700 p-4 text-xs text-gray-500">No SSH connections yet.</div>
         )}
       </div>
 
       {editing && (
         <div className="rounded border border-gray-700 bg-gray-800 p-3 space-y-3">
-          <div className="text-sm font-medium text-gray-200">{editing.id === null ? 'New SSH profile' : 'Edit SSH profile'}</div>
+          <div className="text-sm font-medium text-gray-200">{editing.legacyId ? 'Migrate SSH connection' : editing.id === null ? 'New SSH connection' : 'Edit SSH connection'}</div>
           <div className="grid gap-2 md:grid-cols-2">
             <label className="text-xs text-gray-400">Name<input value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
             <label className="text-xs text-gray-400">Username<input value={editing.username} onChange={(e) => setEditing({ ...editing, username: e.target.value })} className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200" /></label>
@@ -582,6 +579,51 @@ function ManagedSSHPanel({ profiles, activeId, onActivate, onRefresh }: ManagedS
                 <input type="checkbox" checked={editing.hostKeyConfirmed} onChange={(e) => setEditing({ ...editing, hostKeyConfirmed: e.target.checked })} />
                 I verified this host fingerprint
               </label>
+            )}
+          </div>
+          <div className="rounded border border-gray-700 bg-gray-900/50 p-3">
+            <label className="flex items-start gap-2 text-xs text-gray-300">
+              <input
+                aria-label="Allow Tasks to use this connection"
+                type="checkbox"
+                checked={editing.taskAccessEnabled}
+                onChange={(event) => setEditing({
+                  ...editing,
+                  taskAccessEnabled: event.target.checked,
+                  taskCapabilities: event.target.checked
+                    ? (editing.taskCapabilities.length ? editing.taskCapabilities : ['read'])
+                    : [],
+                })}
+                className="mt-0.5 accent-cyan-500"
+              />
+              <span>
+                <span className="block font-medium">Allow Tasks to use this connection</span>
+                <span className="block text-[10px] text-gray-500">Off means this connection is available only in Files.</span>
+              </span>
+            </label>
+            {editing.taskAccessEnabled && (
+              <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                {TASK_CAPABILITY_OPTIONS.map((capability) => (
+                  <label key={capability.key} className="rounded bg-gray-800 p-2 text-xs text-gray-300" title={capability.detail}>
+                    <span className="flex items-center gap-1.5">
+                      <input
+                        type="checkbox"
+                        aria-label={`Task capability: ${capability.label}`}
+                        checked={editing.taskCapabilities.includes(capability.key)}
+                        onChange={(event) => {
+                          const next = event.target.checked
+                            ? [...editing.taskCapabilities, capability.key]
+                            : editing.taskCapabilities.filter((item) => item !== capability.key);
+                          if (next.length) setEditing({ ...editing, taskCapabilities: next });
+                        }}
+                        className="accent-cyan-500"
+                      />
+                      {capability.label}
+                    </span>
+                    <span className="mt-1 block text-[10px] text-gray-500">{capability.detail}</span>
+                  </label>
+                ))}
+              </div>
             )}
           </div>
           <label className="flex items-center gap-2 text-xs text-gray-400"><input type="checkbox" checked={editing.enabled} onChange={(e) => setEditing({ ...editing, enabled: e.target.checked })} />Enabled</label>
@@ -858,6 +900,17 @@ export function FilesPage() {
     saveProfiles(next);
   };
 
+  const removeLegacyProfile = (legacyId: string) => {
+    const next = profiles.filter((profile) => profile.id !== legacyId);
+    handleSaveProfiles(next);
+    if (activeConnection?.kind === 'legacy' && activeConnection.profile.id === legacyId) {
+      setActiveConnection(null);
+      setSshEntries(null);
+      setSelectedFile(null);
+      setFileContent(null);
+    }
+  };
+
   const handleDownload = async () => {
     if (!selectedFile) return;
     const filename = selectedFile.split('/').pop() || 'download';
@@ -999,26 +1052,16 @@ export function FilesPage() {
           <div className="space-y-3">
             <ManagedSSHPanel
               profiles={managedProfiles}
+              legacyProfiles={allProfiles}
               activeId={activeConnection?.kind === 'managed' ? activeConnection.profile.id : null}
+              activeLegacyId={activeConnection?.kind === 'legacy' ? activeConnection.profile.id : null}
               onActivate={(profile) => activateSSHConnection({ kind: 'managed', profile })}
+              onActivateLegacy={(profile) => activateSSHConnection({ kind: 'legacy', profile })}
               onRefresh={refreshManagedProfiles}
+              onLegacyMigrated={removeLegacyProfile}
+              onDeleteLegacy={removeLegacyProfile}
+              isAdmin={isAdmin}
             />
-
-            <details className="rounded border border-gray-700 bg-gray-900/40 p-3">
-              <summary className="cursor-pointer text-xs text-gray-400">Legacy browser-only connections</summary>
-              <div className="mt-2 rounded border border-amber-500/20 bg-amber-500/5 px-2 py-1.5 text-xs text-amber-300">
-                These older profiles may keep passwords in this browser. They cannot be granted to Tasks.
-              </div>
-              <div className="mt-3">
-                <SSHPanel
-                  profiles={allProfiles}
-                  active={activeConnection?.kind === 'legacy' ? activeConnection.profile : null}
-                  onActivate={(profile) => activateSSHConnection({ kind: 'legacy', profile })}
-                  onSave={handleSaveProfiles}
-                  isAdmin={isAdmin}
-                />
-              </div>
-            </details>
 
             {activeConnection && (
               <div className="flex gap-2">

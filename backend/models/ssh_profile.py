@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -23,6 +23,18 @@ class SSHProfile(Base):
     host_key_fingerprint: Mapped[str] = mapped_column(String(100), nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="1")
+    task_access_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="0",
+    )
+    task_capabilities: Mapped[list[str]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     last_test_ok: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

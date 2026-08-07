@@ -36,6 +36,8 @@ class TaskSSHGrantResponse(BaseModel):
     profile_revision: int
     current_profile_revision: int
     capabilities: list[SSHCapability]
+    profile_task_access_enabled: bool
+    profile_task_capabilities: list[SSHCapability]
     valid: bool
     invalid_reason: str | None
     created_by: int | None

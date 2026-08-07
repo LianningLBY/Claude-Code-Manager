@@ -37,6 +37,8 @@ const managedProfile: SSHProfile = {
   host_key_fingerprint: 'SHA256:server-key',
   revision: 1,
   enabled: true,
+  task_access_enabled: true,
+  task_capabilities: ['read', 'exec'],
   created_by: 1,
   last_tested_at: null,
   last_test_ok: null,
@@ -59,6 +61,7 @@ describe('FilesPage managed SSH workspace', () => {
       fingerprint: 'SHA256:verified-host',
     });
     vi.mocked(api.createSSHProfile).mockResolvedValue(managedProfile);
+    vi.mocked(api.updateSSHProfile).mockResolvedValue(managedProfile);
     vi.mocked(api.uploadSSHPrivateKey).mockResolvedValue({
       upload_token: 'upload-token-1',
       filename: 'production.pem',
@@ -73,7 +76,7 @@ describe('FilesPage managed SSH workspace', () => {
     vi.clearAllMocks();
   });
 
-  it('browses through a managed profile id and keeps legacy connections separate', async () => {
+  it('browses through a managed profile id from the unified connection list', async () => {
     const user = userEvent.setup();
     render(<FilesPage />);
 
@@ -83,7 +86,9 @@ describe('FilesPage managed SSH workspace', () => {
     await waitFor(() => {
       expect(api.managedSSHListDir).toHaveBeenCalledWith(41, '/');
     });
-    expect(screen.getByText('Legacy browser-only connections')).toBeInTheDocument();
+    expect(screen.getByText('SSH connections')).toBeInTheDocument();
+    expect(screen.getByText('Task: read')).toBeInTheDocument();
+    expect(screen.queryByText('Legacy browser-only connections')).not.toBeInTheDocument();
     expect(screen.queryByText('/absolute/path/to/id_ed25519')).not.toBeInTheDocument();
   });
 
@@ -95,7 +100,7 @@ describe('FilesPage managed SSH workspace', () => {
     render(<FilesPage />);
 
     await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
-    await user.click(await screen.findByRole('button', { name: /Add profile/i }));
+    await user.click(await screen.findByRole('button', { name: /Add SSH connection/i }));
     await user.type(screen.getByLabelText('Name'), 'production-box');
     await user.type(screen.getByLabelText('Username'), 'deploy');
     await user.type(screen.getByLabelText('Host'), 'ssh.internal');
@@ -117,6 +122,8 @@ describe('FilesPage managed SSH workspace', () => {
         key_path: '/keys/id_ed25519',
         host_key_value: 'ssh-ed25519 AAAAhost',
         enabled: true,
+        task_access_enabled: false,
+        task_capabilities: [],
       });
     });
   });
@@ -129,7 +136,7 @@ describe('FilesPage managed SSH workspace', () => {
     render(<FilesPage />);
 
     await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
-    await user.click(await screen.findByRole('button', { name: /Add profile/i }));
+    await user.click(await screen.findByRole('button', { name: /Add SSH connection/i }));
     const key = new File(['private-key'], 'production.pem', {
       type: 'application/x-pem-file',
     });
@@ -155,6 +162,8 @@ describe('FilesPage managed SSH workspace', () => {
         key_upload_token: 'upload-token-1',
         host_key_value: 'ssh-ed25519 AAAAhost',
         enabled: true,
+        task_access_enabled: false,
+        task_capabilities: [],
       });
     });
     expect(api.cancelSSHPrivateKeyUpload).not.toHaveBeenCalled();
@@ -166,7 +175,7 @@ describe('FilesPage managed SSH workspace', () => {
     render(<FilesPage />);
 
     await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
-    await user.click(await screen.findByRole('button', { name: /Add profile/i }));
+    await user.click(await screen.findByRole('button', { name: /Add SSH connection/i }));
     await user.upload(
       screen.getByLabelText('Upload SSH private key'),
       new File(['private-key'], 'production.pem'),
@@ -176,5 +185,70 @@ describe('FilesPage managed SSH workspace', () => {
 
     expect(api.cancelSSHPrivateKeyUpload).toHaveBeenCalledWith('upload-token-1');
     expect(screen.queryByText('Uploaded: production.pem')).not.toBeInTheDocument();
+  });
+
+  it('configures the maximum capabilities exposed to Tasks', async () => {
+    vi.mocked(api.listSSHProfiles)
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([managedProfile]);
+    const user = userEvent.setup();
+    render(<FilesPage />);
+
+    await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
+    await user.click(await screen.findByRole('button', { name: /Add SSH connection/i }));
+    await user.type(screen.getByLabelText('Name'), 'task-readable');
+    await user.type(screen.getByLabelText('Username'), 'deploy');
+    await user.type(screen.getByLabelText('Host'), 'ssh.internal');
+    await user.type(screen.getByLabelText('Private key path on Manager'), '/keys/id_ed25519');
+    await user.click(screen.getByRole('button', { name: /Probe host identity/i }));
+    await user.click(screen.getByLabelText('I verified this host fingerprint'));
+    await user.click(screen.getByLabelText('Allow Tasks to use this connection'));
+    await user.click(screen.getByLabelText('Task capability: Run commands'));
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(api.createSSHProfile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        task_access_enabled: true,
+        task_capabilities: ['read', 'exec'],
+      }),
+    ));
+  });
+
+  it('keeps a legacy connection in the unified list and migrates it through PEM upload', async () => {
+    localStorage.setItem('cc_ssh_profiles', JSON.stringify([{
+      id: 'legacy-1',
+      label: 'files-box',
+      host: 'legacy.internal',
+      port: 22,
+      username: 'reader',
+      password: 'not-copied',
+      key_path: '',
+    }]));
+    const user = userEvent.setup();
+    render(<FilesPage />);
+
+    await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
+    expect(await screen.findByText('Legacy · migrate to expose to Tasks')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'migrate' }));
+    expect(screen.getByDisplayValue('files-box')).toBeInTheDocument();
+    expect(screen.getByText(/Legacy passwords are not copied/)).toBeInTheDocument();
+
+    await user.upload(
+      screen.getByLabelText('Upload SSH private key'),
+      new File(['private-key'], 'files-box.pem'),
+    );
+    await user.click(screen.getByRole('button', { name: /Probe host identity/i }));
+    await user.click(screen.getByLabelText('I verified this host fingerprint'));
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(api.createSSHProfile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: 'files-box',
+        key_upload_token: 'upload-token-1',
+        task_access_enabled: false,
+        task_capabilities: [],
+      }),
+    ));
+    expect(JSON.parse(localStorage.getItem('cc_ssh_profiles') || '[]')).toEqual([]);
   });
 });

@@ -706,6 +706,8 @@ describe('TaskForm SSH grants', () => {
       host_key_fingerprint: 'SHA256:server-key',
       revision: 1,
       enabled: true,
+      task_access_enabled: true,
+      task_capabilities: ['read', 'exec', 'write'],
       created_by: 1,
       last_tested_at: null,
       last_test_ok: null,
@@ -726,8 +728,6 @@ describe('TaskForm SSH grants', () => {
     );
     await user.click(screen.getByRole('button', { name: /^SSH access/ }));
     await user.click(await screen.findByLabelText('Grant production-box'));
-    await user.click(screen.getByLabelText('production-box: Read files'));
-    await user.click(screen.getByLabelText('production-box: Run commands'));
     await user.click(screen.getByRole('button', { name: /create/i }));
 
     await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(

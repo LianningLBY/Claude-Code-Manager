@@ -208,6 +208,8 @@ export interface SSHProfile {
   host_key_fingerprint: string;
   revision: number;
   enabled: boolean;
+  task_access_enabled: boolean;
+  task_capabilities: TaskSSHCapability[];
   created_by: number | null;
   last_tested_at: string | null;
   last_test_ok: boolean | null;
@@ -226,6 +228,8 @@ export interface SSHProfileInput {
   key_upload_token?: string;
   host_key_value: string;
   enabled: boolean;
+  task_access_enabled: boolean;
+  task_capabilities: TaskSSHCapability[];
 }
 
 export interface SSHPrivateKeyUpload {
@@ -265,6 +269,8 @@ export interface TaskSSHGrant {
   profile_revision: number;
   current_profile_revision: number;
   capabilities: TaskSSHCapability[];
+  profile_task_access_enabled: boolean;
+  profile_task_capabilities: TaskSSHCapability[];
   valid: boolean;
   invalid_reason: string | null;
   created_by: number | null;
@@ -2074,8 +2080,10 @@ export const api = {
   },
 
   // Files (SSH)
-  listSSHProfiles: () =>
-    request<SSHProfile[]>('/api/ssh-profiles'),
+  listSSHProfiles: (taskEligibleOnly = false) =>
+    request<SSHProfile[]>(
+      `/api/ssh-profiles${taskEligibleOnly ? '?task_eligible_only=true' : ''}`,
+    ),
   createSSHProfile: (data: SSHProfileInput) =>
     request<SSHProfile>('/api/ssh-profiles', {
       method: 'POST',

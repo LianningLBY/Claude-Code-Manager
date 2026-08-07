@@ -15,8 +15,8 @@ const CAPABILITIES: Array<{
   label: string;
   description: string;
 }> = [
-  { key: 'exec', label: 'Run commands', description: 'Arbitrary non-interactive shell commands' },
   { key: 'read', label: 'Read files', description: 'List directories and preview text files' },
+  { key: 'exec', label: 'Run commands', description: 'Arbitrary non-interactive shell commands' },
   { key: 'write', label: 'Write files', description: 'Create or replace remote text files' },
 ];
 
@@ -55,7 +55,7 @@ export function SSHGrantPicker({
   const loadProfiles = () => {
     if (readOnly || profilesLoaded || loadingProfiles) return;
     setLoadingProfiles(true);
-    api.listSSHProfiles()
+    api.listSSHProfiles(true)
       .then(setProfiles)
       .catch((loadError) => setProfilesError(
         loadError instanceof Error ? loadError.message : 'Failed to load SSH profiles',
@@ -94,6 +94,8 @@ export function SSHGrantPicker({
       port: profile.port,
       username: profile.username,
       enabled: profile.enabled,
+      taskAccessEnabled: profile.task_access_enabled,
+      taskCapabilities: profile.task_capabilities,
     }));
     for (const grant of snapshots) {
       if (items.some((profile) => profile.id === grant.profile_id)) continue;
@@ -104,6 +106,8 @@ export function SSHGrantPicker({
         port: grant.port,
         username: grant.username,
         enabled: grant.valid,
+        taskAccessEnabled: grant.profile_task_access_enabled,
+        taskCapabilities: grant.profile_task_capabilities,
       });
     }
     return items;
@@ -115,15 +119,22 @@ export function SSHGrantPicker({
   const toggleProfile = (profileId: number) => {
     if (readOnly || busy) return;
     const current = selected(profileId);
+    const profile = visibleProfiles.find((item) => item.id === profileId);
+    const defaultCapability = CAPABILITIES.find((capability) => (
+      profile?.taskCapabilities.includes(capability.key)
+    ))?.key;
+    if (!current && (!profile?.taskAccessEnabled || !defaultCapability)) return;
     onChange(current
       ? value.filter((grant) => grant.profile_id !== profileId)
-      : [...value, { profile_id: profileId, capabilities: ['exec'] }]);
+      : [...value, { profile_id: profileId, capabilities: [defaultCapability!] }]);
   };
   const toggleCapability = (
     profileId: number,
     capability: TaskSSHCapability,
   ) => {
     if (readOnly || busy) return;
+    const profile = visibleProfiles.find((item) => item.id === profileId);
+    if (!profile?.taskCapabilities.includes(capability)) return;
     onChange(value.map((grant) => {
       if (grant.profile_id !== profileId) return grant;
       const has = grant.capabilities.includes(capability);
@@ -176,7 +187,7 @@ export function SSHGrantPicker({
           )}
           {!loadingProfiles && visibleProfiles.length === 0 && (
             <div className="rounded border border-dashed border-gray-700 px-3 py-4 text-center text-xs text-gray-500">
-              No managed SSH profiles. Create one in <a href="#/files" className="text-indigo-400 hover:text-indigo-300">Files → SSH workspace</a>.
+              No SSH connections are currently exposed to Tasks. Enable Task access in <a href="#/files" className="text-indigo-400 hover:text-indigo-300">Files → SSH workspace</a>.
             </div>
           )}
 
@@ -191,7 +202,7 @@ export function SSHGrantPicker({
                       type="checkbox"
                       aria-label={`Grant ${profile.name}`}
                       checked={Boolean(grant)}
-                      disabled={readOnly || busy || (!profile.enabled && !grant)}
+                      disabled={readOnly || busy || ((!profile.enabled || !profile.taskAccessEnabled) && !grant)}
                       onChange={() => toggleProfile(profile.id)}
                       className="mt-0.5 accent-cyan-500"
                     />
@@ -204,12 +215,12 @@ export function SSHGrantPicker({
                   {grant && (
                     <div className="mt-2 grid gap-1 pl-6 sm:grid-cols-3">
                       {CAPABILITIES.map((capability) => (
-                        <label key={capability.key} className="flex items-start gap-1.5 rounded bg-gray-800 px-2 py-1.5 text-[11px] text-gray-300" title={capability.description}>
+                        <label key={capability.key} className={`flex items-start gap-1.5 rounded bg-gray-800 px-2 py-1.5 text-[11px] ${profile.taskCapabilities.includes(capability.key) ? 'text-gray-300' : 'text-gray-600'}`} title={profile.taskCapabilities.includes(capability.key) ? capability.description : 'This connection does not expose this capability to Tasks'}>
                           <input
                             type="checkbox"
                             aria-label={`${profile.name}: ${capability.label}`}
                             checked={grant.capabilities.includes(capability.key)}
-                            disabled={readOnly || busy}
+                            disabled={readOnly || busy || !profile.taskCapabilities.includes(capability.key)}
                             onChange={() => toggleCapability(profile.id, capability.key)}
                             className="mt-0.5 accent-cyan-500"
                           />
@@ -265,7 +276,11 @@ export function TaskSSHAccessBadge({ task }: { task: Task }) {
       setSnapshots(grants);
       setValue(grants.map((grant) => ({
         profile_id: grant.profile_id,
-        capabilities: grant.capabilities,
+        capabilities: grant.profile_task_access_enabled
+          ? grant.capabilities.filter((capability) => (
+            grant.profile_task_capabilities.includes(capability)
+          ))
+          : grant.capabilities,
       })));
       setError('');
     } catch (loadError) {
@@ -296,7 +311,9 @@ export function TaskSSHAccessBadge({ task }: { task: Task }) {
       setSnapshots(grants);
       setValue(grants.map((grant) => ({
         profile_id: grant.profile_id,
-        capabilities: grant.capabilities,
+        capabilities: grant.capabilities.filter((capability) => (
+          grant.profile_task_capabilities.includes(capability)
+        )),
       })));
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : 'Failed to save SSH grants');

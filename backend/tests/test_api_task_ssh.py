@@ -38,9 +38,106 @@ async def _create_profile(client, tmp_path: Path) -> tuple[int, Path]:
         "username": "deploy",
         "key_path": str(key_path),
         "host_key_value": host_key,
+        "task_access_enabled": True,
+        "task_capabilities": ["exec", "read", "write"],
     })
     assert response.status_code == 201, response.text
     return response.json()["id"], key_path
+
+
+@pytest.mark.asyncio
+async def test_files_only_profile_cannot_be_granted_to_task(client, tmp_path):
+    key_path = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(key_path)
+    profile = await client.post("/api/ssh-profiles", json={
+        "name": "files-only",
+        "host": "ssh.files.internal",
+        "username": "reader",
+        "key_path": str(key_path),
+        "host_key_value": host_key,
+    })
+    assert profile.status_code == 201, profile.text
+    assert profile.json()["task_access_enabled"] is False
+    assert profile.json()["task_capabilities"] == []
+
+    eligible = await client.get(
+        "/api/ssh-profiles?task_eligible_only=true"
+    )
+    assert eligible.status_code == 200
+    assert eligible.json() == []
+
+    task = await client.post("/api/tasks", json={
+        "description": "Try to use a Files-only connection",
+        "ssh_grants": [{
+            "profile_id": profile.json()["id"],
+            "capabilities": ["read"],
+        }],
+    })
+    assert task.status_code == 409
+    assert "available only in Files" in task.text
+
+
+@pytest.mark.asyncio
+async def test_task_grant_cannot_exceed_profile_policy(client, tmp_path):
+    key_path = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(key_path)
+    profile = await client.post("/api/ssh-profiles", json={
+        "name": "read-only-tasks",
+        "host": "ssh.read.internal",
+        "username": "reader",
+        "key_path": str(key_path),
+        "host_key_value": host_key,
+        "task_access_enabled": True,
+        "task_capabilities": ["read"],
+    })
+    assert profile.status_code == 201, profile.text
+
+    denied = await client.post("/api/tasks", json={
+        "description": "Run a command",
+        "ssh_grants": [{
+            "profile_id": profile.json()["id"],
+            "capabilities": ["exec"],
+        }],
+    })
+    assert denied.status_code == 422
+    assert "does not allow Task capabilities: exec" in denied.text
+
+    allowed = await client.post("/api/tasks", json={
+        "description": "Read a file",
+        "ssh_grants": [{
+            "profile_id": profile.json()["id"],
+            "capabilities": ["read"],
+        }],
+    })
+    assert allowed.status_code == 201, allowed.text
+    snapshot = await client.get(
+        f"/api/tasks/{allowed.json()['id']}/ssh-grants"
+    )
+    assert snapshot.json()[0]["profile_task_access_enabled"] is True
+    assert snapshot.json()[0]["profile_task_capabilities"] == ["read"]
+
+
+@pytest.mark.asyncio
+async def test_profile_policy_change_invalidates_existing_grant(client, tmp_path):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post("/api/tasks", json={
+        "description": "Inspect remote files",
+        "ssh_grants": [{"profile_id": profile_id, "capabilities": ["read"]}],
+    })
+    assert created.status_code == 201, created.text
+
+    changed = await client.put(f"/api/ssh-profiles/{profile_id}", json={
+        "task_access_enabled": False,
+        "task_capabilities": [],
+    })
+    assert changed.status_code == 200, changed.text
+    assert changed.json()["revision"] == 2
+
+    snapshot = await client.get(
+        f"/api/tasks/{created.json()['id']}/ssh-grants"
+    )
+    assert snapshot.json()[0]["valid"] is False
+    assert snapshot.json()[0]["invalid_reason"] == "profile_task_access_disabled"
 
 
 @pytest.mark.asyncio

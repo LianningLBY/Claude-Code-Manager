@@ -30,7 +30,13 @@ def _managed_files_app(profile):
 async def test_managed_ssh_files_use_profile_id_without_browser_credentials(
     monkeypatch,
 ):
-    profile = SimpleNamespace(id=7, enabled=True, deleted_at=None)
+    profile = SimpleNamespace(
+        id=7,
+        enabled=True,
+        deleted_at=None,
+        task_access_enabled=False,
+        task_capabilities=[],
+    )
     observed = []
 
     def fake_list(resolved_profile, path):

@@ -41,6 +41,19 @@ router = APIRouter(
 logger = logging.getLogger(__name__)
 
 
+def _validate_task_policy(enabled: bool, capabilities: list[str]) -> None:
+    if enabled and not capabilities:
+        raise HTTPException(
+            422,
+            "Select at least one Task capability when Task access is enabled",
+        )
+    if not enabled and capabilities:
+        raise HTTPException(
+            422,
+            "Task capabilities require Task access to be enabled",
+        )
+
+
 def _profile_error(exc: Exception) -> HTTPException:
     if isinstance(exc, (SSHKeyPreflightError, SSHManagedKeyStoreError)):
         return HTTPException(400, {"code": exc.code, "message": exc.detail})
@@ -79,11 +92,17 @@ async def _live_profile(db: AsyncSession, profile_id: int) -> SSHProfile:
 @router.get("", response_model=list[SSHProfileResponse])
 async def list_ssh_profiles(
     include_disabled: bool = True,
+    task_eligible_only: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
     stmt = select(SSHProfile).where(SSHProfile.deleted_at.is_(None))
     if not include_disabled:
         stmt = stmt.where(SSHProfile.enabled.is_(True))
+    if task_eligible_only:
+        stmt = stmt.where(
+            SSHProfile.enabled.is_(True),
+            SSHProfile.task_access_enabled.is_(True),
+        )
     result = await db.execute(stmt.order_by(SSHProfile.name.asc()))
     return list(result.scalars().all())
 
@@ -165,6 +184,8 @@ async def create_ssh_profile(
         port=body.port,
         username=body.username,
         enabled=body.enabled,
+        task_access_enabled=body.task_access_enabled,
+        task_capabilities=body.task_capabilities,
         created_by=get_current_user_id(request),
         **material,
     )
@@ -205,6 +226,18 @@ async def update_ssh_profile(
     upload_token = values.pop("key_upload_token", None)
     if values.get("key_path") is None:
         values.pop("key_path", None)
+    next_task_access_enabled = values.get(
+        "task_access_enabled",
+        profile.task_access_enabled,
+    )
+    next_task_capabilities = values.get(
+        "task_capabilities",
+        profile.task_capabilities,
+    )
+    _validate_task_policy(
+        next_task_access_enabled,
+        next_task_capabilities,
+    )
     if (
         any(field in values and values[field] != getattr(profile, field) for field in ("host", "port"))
         and "host_key_value" not in values
@@ -230,6 +263,10 @@ async def update_ssh_profile(
         field in values and values[field] != getattr(profile, field)
         for field in CONNECTION_IDENTITY_FIELDS - {"key_path", "host_key_value"}
     )
+    policy_changed = (
+        next_task_access_enabled != profile.task_access_enabled
+        or next_task_capabilities != profile.task_capabilities
+    )
     if identity_changed:
         try:
             material = validated_profile_material(
@@ -248,6 +285,11 @@ async def update_ssh_profile(
         profile.last_test_ok = None
         profile.last_error_code = None
         profile.last_error_detail = None
+    elif policy_changed:
+        # Grants snapshot the profile revision. Any policy change requires an
+        # administrator to explicitly re-authorize existing Tasks, while the
+        # runtime policy checks below remain an independent fail-closed gate.
+        profile.revision += 1
     for field, value in values.items():
         setattr(profile, field, value)
     try:

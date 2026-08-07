@@ -26,6 +26,8 @@ const profile: SSHProfile = {
   host_key_fingerprint: 'SHA256:server-key',
   revision: 2,
   enabled: true,
+  task_access_enabled: true,
+  task_capabilities: ['read', 'exec', 'write'],
   created_by: 1,
   last_tested_at: null,
   last_test_ok: null,
@@ -47,6 +49,8 @@ const grant: TaskSSHGrant = {
   profile_revision: 2,
   current_profile_revision: 2,
   capabilities: ['read'],
+  profile_task_access_enabled: true,
+  profile_task_capabilities: ['read', 'exec', 'write'],
   valid: true,
   invalid_reason: null,
   created_by: 1,
@@ -75,7 +79,7 @@ describe('Task SSH authorization UI', () => {
     vi.clearAllMocks();
   });
 
-  it('loads profiles lazily and defaults a new grant to command execution', async () => {
+  it('loads only Task-eligible profiles lazily and defaults to read access', async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
     render(<SSHGrantPicker value={[]} onChange={onChange} />);
@@ -85,9 +89,27 @@ describe('Task SSH authorization UI', () => {
     await screen.findByText('production-box');
     await user.click(screen.getByLabelText('Grant production-box'));
 
+    expect(api.listSSHProfiles).toHaveBeenCalledWith(true);
     expect(onChange).toHaveBeenCalledWith([
-      { profile_id: 41, capabilities: ['exec'] },
+      { profile_id: 41, capabilities: ['read'] },
     ]);
+  });
+
+  it('disables capabilities that the connection policy does not expose', async () => {
+    vi.mocked(api.listSSHProfiles).mockResolvedValue([{
+      ...profile,
+      task_capabilities: ['read'],
+    }]);
+    const user = userEvent.setup();
+    render(<SSHGrantPicker
+      value={[{ profile_id: 41, capabilities: ['read'] }]}
+      onChange={vi.fn()}
+    />);
+
+    await user.click(screen.getByRole('button', { name: /SSH access/i }));
+    expect(await screen.findByLabelText('production-box: Read files')).toBeEnabled();
+    expect(screen.getByLabelText('production-box: Run commands')).toBeDisabled();
+    expect(screen.getByLabelText('production-box: Write files')).toBeDisabled();
   });
 
   it('does not persist edits until the administrator explicitly saves them', async () => {

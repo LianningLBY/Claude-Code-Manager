@@ -79,6 +79,18 @@ async def prepare_task_ssh_grants(
             raise TaskSSHAccessError(404, f"SSH profile {value.profile_id} not found")
         if not profile.enabled:
             raise TaskSSHAccessError(409, f"SSH profile {value.profile_id} is disabled")
+        if not profile.task_access_enabled:
+            raise TaskSSHAccessError(
+                409,
+                f"SSH profile {value.profile_id} is available only in Files",
+            )
+        disallowed = set(value.capabilities) - set(profile.task_capabilities or [])
+        if disallowed:
+            raise TaskSSHAccessError(
+                422,
+                f"SSH profile {value.profile_id} does not allow Task capabilities: "
+                + ", ".join(sorted(disallowed)),
+            )
         prepared.append(PreparedTaskSSHGrant(
             profile_id=profile.id,
             profile_revision=profile.revision,
@@ -117,6 +129,12 @@ def _invalid_reason(task: Task, grant: TaskSSHGrant, profile: SSHProfile) -> str
         return "profile_deleted"
     if not profile.enabled:
         return "profile_disabled"
+    if not profile.task_access_enabled:
+        return "profile_task_access_disabled"
+    if not set(grant.capabilities or []).issubset(
+        set(profile.task_capabilities or [])
+    ):
+        return "profile_task_capabilities_changed"
     if profile.revision != grant.profile_revision:
         return "profile_revision_changed"
     return None
@@ -147,6 +165,8 @@ async def task_ssh_grant_snapshots(
             "profile_revision": grant.profile_revision,
             "current_profile_revision": profile.revision,
             "capabilities": grant.capabilities,
+            "profile_task_access_enabled": profile.task_access_enabled,
+            "profile_task_capabilities": profile.task_capabilities,
             "valid": invalid_reason is None,
             "invalid_reason": invalid_reason,
             "created_by": grant.created_by,
@@ -243,19 +263,21 @@ async def valid_task_ssh_capabilities(
     ) is not None:
         return set()
     rows = (await db.execute(
-        select(TaskSSHGrant.capabilities)
+        select(TaskSSHGrant, SSHProfile)
         .join(SSHProfile, SSHProfile.id == TaskSSHGrant.ssh_profile_id)
         .where(
             TaskSSHGrant.task_id == task.id,
             TaskSSHGrant.profile_revision == SSHProfile.revision,
             SSHProfile.enabled.is_(True),
+            SSHProfile.task_access_enabled.is_(True),
             SSHProfile.deleted_at.is_(None),
         )
-    )).scalars().all()
+    )).all()
     return {
         capability
-        for capabilities in rows
-        for capability in (capabilities or [])
+        for grant, profile in rows
+        if _invalid_reason(task, grant, profile) is None
+        for capability in (grant.capabilities or [])
         if capability in {"exec", "read", "write"}
     }
 

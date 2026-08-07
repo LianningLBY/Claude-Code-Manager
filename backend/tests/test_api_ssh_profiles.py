@@ -42,23 +42,36 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
     assert create.status_code == 201, create.text
     profile = create.json()
     assert profile["revision"] == 1
+    assert profile["task_access_enabled"] is False
+    assert profile["task_capabilities"] == []
     assert profile["key_path_hint"] == "…/managed-ssh-key"
     assert "key_path" not in profile
     assert profile["public_key_fingerprint"].startswith("SHA256:")
     original_key_fingerprint = profile["public_key_fingerprint"]
     assert profile["host_key_fingerprint"].startswith("SHA256:")
 
+    task_policy = await client.put(
+        f"/api/ssh-profiles/{profile['id']}",
+        json={
+            "task_access_enabled": True,
+            "task_capabilities": ["read", "read", "exec"],
+        },
+    )
+    assert task_policy.status_code == 200, task_policy.text
+    assert task_policy.json()["revision"] == 2
+    assert task_policy.json()["task_capabilities"] == ["read", "exec"]
+
     rename = await client.put(
         f"/api/ssh-profiles/{profile['id']}", json={"name": "staging-a"},
     )
     assert rename.status_code == 200
-    assert rename.json()["revision"] == 1
+    assert rename.json()["revision"] == 2
 
     identity = await client.put(
         f"/api/ssh-profiles/{profile['id']}", json={"username": "release"},
     )
     assert identity.status_code == 200
-    assert identity.json()["revision"] == 2
+    assert identity.json()["revision"] == 3
     assert identity.json()["last_test_ok"] is None
 
     replacement = ed25519.Ed25519PrivateKey.generate()
@@ -73,7 +86,7 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
         json={"key_path": str(key_path)},
     )
     assert rotated.status_code == 200
-    assert rotated.json()["revision"] == 3
+    assert rotated.json()["revision"] == 4
     assert rotated.json()["public_key_fingerprint"] != original_key_fingerprint
 
     monkeypatch.setattr(
@@ -118,6 +131,48 @@ async def test_profile_endpoint_change_requires_new_host_key(client, tmp_path):
 
     assert rejected.status_code == 400
     assert "newly confirmed host key" in rejected.text
+
+
+@pytest.mark.asyncio
+async def test_profile_rejects_inconsistent_task_policy(client, tmp_path):
+    key_path = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(key_path)
+    base = {
+        "name": "policy",
+        "host": "ssh.policy.internal",
+        "username": "deploy",
+        "key_path": str(key_path),
+        "host_key_value": host_key,
+    }
+
+    capabilities_without_switch = await client.post(
+        "/api/ssh-profiles",
+        json={**base, "task_capabilities": ["read"]},
+    )
+    assert capabilities_without_switch.status_code == 422
+
+    switch_without_capabilities = await client.post(
+        "/api/ssh-profiles",
+        json={
+            **base,
+            "name": "empty-policy",
+            "task_access_enabled": True,
+        },
+    )
+    assert switch_without_capabilities.status_code == 422
+
+    created = await client.post("/api/ssh-profiles", json=base)
+    inconsistent_update = await client.put(
+        f"/api/ssh-profiles/{created.json()['id']}",
+        json={"task_access_enabled": True},
+    )
+    assert inconsistent_update.status_code == 422
+
+    null_policy = await client.put(
+        f"/api/ssh-profiles/{created.json()['id']}",
+        json={"task_capabilities": None},
+    )
+    assert null_policy.status_code == 422
 
 
 @pytest.mark.asyncio

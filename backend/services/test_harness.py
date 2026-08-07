@@ -32,7 +32,7 @@ from backend.services.test_harness_contracts import (
     normalize_verdict,
     request_fingerprint,
 )
-from backend.services.test_harness_targets import UNTRUSTED_GIT_TARGETS_REASON
+from backend.services.test_harness_targets import untrusted_git_target_capability
 from backend.services.test_harness_runtime import resolve_harness_runtime
 from backend.services.test_harness_artifacts import (
     OpenedHarnessArtifact,
@@ -99,7 +99,10 @@ class TestHarnessService:
     ) -> TestHarnessRun:
         normalized = spec.normalized()
         if normalized.target_kind in {"pull_request", "git_ref"}:
-            raise TestHarnessError(UNTRUSTED_GIT_TARGETS_REASON)
+            capability = await untrusted_git_target_capability()
+            raise TestHarnessError(
+                capability.reason or "PR/ref sandbox target is unavailable"
+            )
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
             if task is None:

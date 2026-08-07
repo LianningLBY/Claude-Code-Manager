@@ -36,10 +36,7 @@ from backend.services.test_harness_runtime import (
     harness_runtime_config_payload,
 )
 from backend.services.workspace_review import workspace_review_capability
-from backend.services.test_harness_targets import (
-    UNTRUSTED_GIT_TARGETS_AVAILABLE,
-    UNTRUSTED_GIT_TARGETS_REASON,
-)
+from backend.services.test_harness_targets import untrusted_git_target_capability
 
 
 router = APIRouter(prefix="/api/tasks", tags=["test-harness"])
@@ -152,6 +149,7 @@ async def get_test_harness_capabilities(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     provider = runtime["provider"]
+    git_targets = await untrusted_git_target_capability()
     return {
         "contract_version": 1,
         "available": workspace["available"],
@@ -165,13 +163,14 @@ async def get_test_harness_capabilities(
         "targets": {
             "current_workspace": workspace["available"],
             "fixed_url": True,
-            "pull_request": UNTRUSTED_GIT_TARGETS_AVAILABLE,
-            "git_ref": UNTRUSTED_GIT_TARGETS_AVAILABLE,
+            "pull_request": git_targets.available,
+            "git_ref": git_targets.available,
         },
         "target_reasons": {
-            "pull_request": UNTRUSTED_GIT_TARGETS_REASON,
-            "git_ref": UNTRUSTED_GIT_TARGETS_REASON,
+            "pull_request": git_targets.reason,
+            "git_ref": git_targets.reason,
         },
+        "sandbox": git_targets.sandbox.as_dict(),
         "preview": workspace,
         "supports_repeat": True,
         "supports_compare": True,

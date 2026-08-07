@@ -174,9 +174,10 @@ async def test_git_target(
         reasoning_effort,
         codex_service_tier,
     )
-    from backend.services.test_harness_targets import UNTRUSTED_GIT_TARGETS_REASON
+    from backend.services.test_harness_targets import untrusted_git_target_capability
 
-    raise RuntimeError(UNTRUSTED_GIT_TARGETS_REASON)
+    capability = await untrusted_git_target_capability()
+    raise RuntimeError(capability.reason or "PR/ref sandbox target is unavailable")
 
 
 @mcp.tool(structured_output=False)

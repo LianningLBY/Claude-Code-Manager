@@ -32,6 +32,56 @@ describe('MarkdownRenderer math support', () => {
     expect(container.querySelector('.katex-html')).not.toBeNull();
   });
 
+  it('renders display math split into Markdown nodes by a standalone equals line', () => {
+    const markdown = String.raw`Diagonal AdaGrad gives
+
+\[
+R_T
+=
+\sum_{t=1}^T f_t(x_t)-\sum_{t=1}^T f_t(x^\*)
+\le
+O\left(\sum_{i=1}^d D_i \sqrt{G_{T,i}}\right)
+\]`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelectorAll('.katex-display')).toHaveLength(1);
+    expect(container.querySelector('.katex-error')).toBeNull();
+    expect(container.querySelector('h1, h2')).toBeNull();
+    expect(container.querySelector('.katex-html')?.textContent).toContain('≤');
+  });
+
+  it('renders compact display math nested in a list item', () => {
+    const markdown = String.raw`- Gaussian lower bound
+
+  \[ \Omega\!\left(\min\left\{\frac{\sigma^2 A^2 d^2}{\eta^4},\frac{\sigma^2 H R^2 d^2}{\eta^3}\right\}\right) \]`;
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelector('li .katex-display')).not.toBeNull();
+    expect(container.querySelector('li .katex-html')?.textContent).toContain('Ω');
+  });
+
+  it('repairs an escaped superscript star only inside confirmed math nodes', () => {
+    const markdown = [
+      String.raw`Inline \(x^\*\).`,
+      '',
+      '```tex',
+      String.raw`x^\*`,
+      '```',
+      '',
+      '$$',
+      String.raw`y^{\*}`,
+      '$$',
+    ].join('\n');
+    const { container } = render(<MarkdownRenderer content={markdown} />);
+
+    expect(container.querySelectorAll('.katex')).toHaveLength(2);
+    expect(container.querySelector('[style*="color:#cc0000"]')).toBeNull();
+    expect(
+      Array.from(container.querySelectorAll('annotation')).map((node) => node.textContent),
+    ).toEqual(['x^*', 'y^{*}']);
+    expect(container.querySelector('pre code')?.textContent).toContain(String.raw`x^\*`);
+  });
+
   it('keeps Markdown-like tokens inside whole-paragraph display math', () => {
     const markdown = String.raw`\[
 \text{**not Markdown strong**}

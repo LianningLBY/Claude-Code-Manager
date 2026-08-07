@@ -347,6 +347,53 @@ async def test_ready_result_can_be_consumed_while_new_admission_is_disabled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["consume", "cancel"])
+async def test_public_mutation_rejects_agent_resume_invocation(
+    client,
+    session_factory,
+    operation,
+):
+    """Human advisory endpoints cannot consume or cancel Agent G+1 state."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityResumeOutbox,
+    )
+    from backend.tests.test_api_tasks import (
+        _seed_waiting_capability_for_terminal_api,
+    )
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="ready",
+            )
+        )
+        stored = await capability_service.get_invocation(db, invocation_id)
+        state_version = stored.state_version
+
+    response = await client.post(
+        f"/api/capability-invocations/{invocation_id}/{operation}",
+        json={"expected_state_version": state_version},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Workflow-owned" in response.json()["detail"]
+    async with session_factory() as db:
+        stored = await capability_service.get_invocation(db, invocation_id)
+        current_task = await db.get(Task, task_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+    assert stored.status == "ready"
+    assert stored.state_version == state_version
+    assert stored.active_task_id == task_id
+    assert current_task.status == "waiting_capability"
+    assert execution.status == "completed"
+    assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_code_review_result_is_readable_through_parent_task_acl(
     client,
     session_factory,

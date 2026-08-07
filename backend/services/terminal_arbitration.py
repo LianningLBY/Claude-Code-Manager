@@ -43,6 +43,10 @@ class TerminalOutputSelection:
     """The exact durable provider output selected for later interpretation."""
 
     output_log: LogEntry
+    # Exact provider terminal boundary for the selected output. Claude result
+    # rows (and its PTY message fallback) are their own boundary; Codex keeps
+    # the final agent message and turn.completed envelope separate.
+    terminal_log: LogEntry
     native_turn_id: str | None
 
 
@@ -752,7 +756,7 @@ def select_terminal_output(
                 for row in scoped
             ):
                 return None
-            return TerminalOutputSelection(terminal, None)
+            return TerminalOutputSelection(terminal, terminal, None)
         if effective_transport != "claude_pty":
             return None
         messages = [
@@ -772,7 +776,7 @@ def select_terminal_output(
             for row in scoped
         ):
             return None
-        return TerminalOutputSelection(selected_message, None)
+        return TerminalOutputSelection(selected_message, selected_message, None)
 
     codex_app_server = effective_transport == "codex_app_server"
     # Select the latest terminal envelope before validating success. Filtering
@@ -863,7 +867,7 @@ def select_terminal_output(
                 idless_messages.append(row)
         if not idless_messages:
             return None
-        return TerminalOutputSelection(idless_messages[-1], None)
+        return TerminalOutputSelection(idless_messages[-1], terminal, None)
 
     messages: list[LogEntry] = []
     for row in scoped:
@@ -880,7 +884,7 @@ def select_terminal_output(
             messages.append(row)
     if not messages:
         return None
-    return TerminalOutputSelection(messages[-1], terminal_native_id)
+    return TerminalOutputSelection(messages[-1], terminal, terminal_native_id)
 
 
 def select_terminal_tail(

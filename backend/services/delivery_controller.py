@@ -238,6 +238,7 @@ class CoreDeliveryCapabilityGateway:
                     db,
                     invocation_id=snapshot.invocation_id,
                     expected_state_version=snapshot.state_version,
+                    allow_workflow_owned=True,
                 )
         except CapabilityConflictError:
             current = await self.observe(snapshot.invocation_id)

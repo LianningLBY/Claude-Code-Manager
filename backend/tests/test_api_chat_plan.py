@@ -2778,10 +2778,39 @@ async def test_inject_capabilities_advertise_attachment_protocol(
 
 
 @pytest.mark.asyncio
+async def test_inject_rejects_inactive_task_before_transport(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(return_value=True)
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        MagicMock(broadcast=AsyncMock()),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "must not steer an inactive task"},
+        )
+
+    assert response.status_code == 409
+    assert "no active provider turn" in response.json()["detail"]
+    mock_im.inject_pty_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inject_requires_pty_mode(client, session_factory):
     """PTY 模式关闭时注入返回 400。"""
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
 
     mock_im = MagicMock()
@@ -2800,7 +2829,7 @@ async def test_inject_rejects_direct_turn_when_global_pty_is_enabled(
     client, session_factory
 ):
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = True
@@ -2827,7 +2856,7 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     from backend.models.task import Task
 
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
 
     mock_im = MagicMock()
@@ -2889,6 +2918,7 @@ async def test_inject_delivers_uploaded_image_to_pty_and_persists_metadata(
         client,
         session_factory,
         provider="claude",
+        status="executing",
     )
 
     mock_im = MagicMock()
@@ -2961,7 +2991,7 @@ async def test_inject_no_live_session_409(client, session_factory):
     from backend.models.task import Task
 
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
 
     mock_im = MagicMock()
@@ -2985,7 +3015,7 @@ async def test_codex_inject_steers_without_pty_mode(
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex"
+        client, session_factory, provider="codex", status="executing"
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = False
@@ -3046,6 +3076,7 @@ async def test_codex_inject_uses_native_image_and_file_inputs(
         client,
         session_factory,
         provider="codex",
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock(return_value=True)
@@ -3106,6 +3137,7 @@ async def test_inject_rejects_non_upload_path_without_side_effects(
         client,
         session_factory,
         provider="codex",
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock(return_value=True)
@@ -3159,6 +3191,7 @@ async def test_inject_container_attachment_fails_before_persisting(
         client,
         session_factory,
         provider="claude",
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = True
@@ -3211,6 +3244,7 @@ async def test_codex_inject_rejects_stale_fast_view_before_steer(
         client,
         session_factory,
         provider="codex",
+        status="executing",
         model="gpt-5.6-sol",
         codex_service_tier="default",
     )
@@ -3246,7 +3280,7 @@ async def test_codex_inject_without_live_app_server_turn_returns_409(
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex"
+        client, session_factory, provider="codex", status="executing"
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock(return_value=False)
@@ -3269,7 +3303,7 @@ async def test_codex_inject_requires_app_server_enabled(
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex"
+        client, session_factory, provider="codex", status="executing"
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock()
@@ -3287,7 +3321,11 @@ async def test_codex_inject_requires_app_server_enabled(
 @pytest.mark.asyncio
 async def test_inject_rejects_remote_worker_task(client, session_factory):
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex", worker_id=7
+        client,
+        session_factory,
+        provider="codex",
+        worker_id=7,
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock()

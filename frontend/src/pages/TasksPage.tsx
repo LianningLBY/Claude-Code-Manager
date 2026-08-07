@@ -315,7 +315,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
 
-  const statusOptions = ['pending', 'in_progress', 'executing', 'delivery_waiting', 'plan_review', 'completed', 'superseded', 'failed'];
+  const statusOptions = ['pending', 'in_progress', 'executing', 'waiting_capability', 'delivery_waiting', 'plan_review', 'completed', 'superseded', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   const filterDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -334,6 +334,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     pending: 'Pending',
     in_progress: 'In Progress',
     executing: 'Executing',
+    waiting_capability: 'Waiting Capability',
     delivery_waiting: 'Delivery Waiting',
     plan_review: 'Plan Review',
     completed: 'Completed',
@@ -345,6 +346,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     pending: 'bg-yellow-500',
     in_progress: 'bg-blue-500',
     executing: 'bg-blue-400',
+    waiting_capability: 'bg-violet-400',
     delivery_waiting: 'bg-indigo-500',
     plan_review: 'bg-purple-500',
     completed: 'bg-green-500',
@@ -687,6 +689,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       pending: 'bg-yellow-500',
       in_progress: 'bg-blue-500',
       executing: 'bg-blue-400 animate-pulse',
+      waiting_capability: 'bg-violet-400 animate-pulse',
       background: 'bg-teal-400 animate-pulse',
       delivery_waiting: 'bg-indigo-400',
       delivery_paused: 'bg-amber-400',

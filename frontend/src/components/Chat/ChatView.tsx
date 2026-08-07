@@ -716,9 +716,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [distillInstruction, setDistillInstruction] = useState('');
   const effectiveStatus = localStatus || task.status;
   const backgroundActive = localBackgroundActive ?? task.background_active === true;
+  const isWaitingCapability = effectiveStatus === 'waiting_capability';
+  const canInjectNow = canInject && !isWaitingCapability;
+  const effectiveStatusRef = useRef(effectiveStatus);
+  effectiveStatusRef.current = effectiveStatus;
+  useEffect(() => {
+    if (isWaitingCapability && injectMode) setInjectMode(false);
+  }, [injectMode, isWaitingCapability]);
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
-  const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  const isProcessing = sending || backgroundActive || ['in_progress', 'executing', 'waiting_capability'].includes(effectiveStatus);
   useEffect(() => {
     if (!stillRunning) return;
     const timer = window.setTimeout(() => {
@@ -993,7 +1000,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // triggers autoDequeue in the same cycle as setSending(false) and the
     // ref still reads true → skips the queued message.
     const timer = setTimeout(() => {
-      if (sendingRef.current || backgroundActiveRef.current) return;
+      if (
+        sendingRef.current
+        || backgroundActiveRef.current
+        || ['in_progress', 'executing', 'waiting_capability'].includes(
+          effectiveStatusRef.current,
+        )
+      ) return;
       const queue = messageQueueRef.current;
       if (queue.length > 0) {
         const next = queue[0];
@@ -1989,7 +2002,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       return;
     }
     // 注入模式：文本和已上传附件直达当前 turn，不新开 turn、不排队。
-    if (injectMode && canInject && !fromQueue) {
+    if (injectMode && canInjectNow && !fromQueue) {
       if (!isProcessing) {
         setError('注入仅在 turn 正在运行时可用；空闲时请关闭注入模式发送普通消息。');
         return;
@@ -2828,7 +2841,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         {isProcessing && (
           <div className="flex gap-2 items-center text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
-            <span>{providerLabel} is thinking...</span>
+            <span>
+              {isWaitingCapability
+                ? 'Waiting for requested capability...'
+                : `${providerLabel} is thinking...`}
+            </span>
           </div>
         )}
         <div ref={bottomRef} className="h-4" />
@@ -3065,7 +3082,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Paperclip size={18} />
             </button>
-            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInject)} />
+            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInjectNow)} />
             <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || (!task.session_id && !task.shared_from_id)} />
             {/* Temp model override (one-shot) */}
             <div className="relative" data-temp-model>
@@ -3117,7 +3134,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               )}
             </div>
             {/* Live-turn injection: Claude PTY or Codex app-server steering. */}
-            {canInject && (
+            {canInjectNow && (
               <button
                 type="button"
                 onClick={() => setInjectMode((v) => !v)}
@@ -3161,7 +3178,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
           </div>
           {/* Row 2: full-width input */}
-          {injectMode && canInject && (
+          {injectMode && canInjectNow && (
             <div className="text-[10px] leading-relaxed text-teal-300/80">
               文本、图片和文件会注入当前 turn；只有服务器明确确认成功后才会清空输入和附件。
             </div>
@@ -3175,7 +3192,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               placeholder={
                 !task.session_id && !task.shared_from_id
                   ? 'Run the task first to start a session...'
-                  : injectMode && canInject
+                  : injectMode && canInjectNow
                     ? '注入模式：消息将直接注入运行中的 turn...'
                     : isProcessing
                       ? 'Type next message to queue...'
@@ -3188,18 +3205,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || (!task.session_id && !task.shared_from_id) || (injectMode && canInjectNow && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
-                : injectMode && canInject
+                : injectMode && canInjectNow
                 ? (isProcessing ? '注入到运行中的 turn (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
                 : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
-                injectMode && canInject ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
+                injectMode && canInjectNow ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {injectMode && canInject ? <Syringe size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+              {injectMode && canInjectNow ? <Syringe size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
             </button>
           </div>
           </div>

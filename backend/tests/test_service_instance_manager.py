@@ -12286,8 +12286,7 @@ async def test_direct_chat_terminal_transaction_locks_task_before_instance(
     )
     await consumer
 
-    assert update_tables[:2] == ["tasks", "tasks"]
-    assert update_tables[2] == "instances"
+    assert update_tables[:2] == ["tasks", "instances"]
 
 
 @pytest.mark.asyncio
@@ -14411,7 +14410,12 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
     dispatcher._compact_session = AsyncMock(return_value="durable summary")
     dispatcher.enqueue_message = AsyncMock()
 
-    with patch("backend.main.dispatcher", dispatcher):
+    settle_previous_resume = AsyncMock()
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.services.capability_resume."
+        "settle_previous_resume_in_terminal_tx",
+        settle_previous_resume,
+    ):
         consumer = asyncio.create_task(
             manager._consume_output(
                 instance_id,
@@ -14434,6 +14438,7 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
         )
         await consumer
 
+    settle_previous_resume.assert_not_awaited()
     dispatcher._compact_session.assert_awaited_once()
     assert (
         dispatcher._compact_session.await_args.kwargs[

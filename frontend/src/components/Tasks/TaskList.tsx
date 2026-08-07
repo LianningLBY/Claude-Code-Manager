@@ -28,6 +28,7 @@ const statusColors: Record<string, string> = {
   pending: 'bg-yellow-500',
   in_progress: 'bg-blue-500',
   executing: 'bg-blue-400 animate-pulse',
+  waiting_capability: 'bg-violet-400 animate-pulse',
   background: 'bg-teal-400 animate-pulse',
   delivery_waiting: 'bg-indigo-400',
   plan_review: 'bg-purple-500',
@@ -349,7 +350,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                     >
                       <UserPlus size={14} /> Team Share
                     </button>
-                    {(t.background_active || ['in_progress', 'executing'].includes(t.status)) && (
+                    {(t.background_active || ['in_progress', 'executing', 'waiting_capability'].includes(t.status)) && (
                       <button
                         onClick={() => { handleCancel(t); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-yellow-400 hover:bg-gray-800 text-left"

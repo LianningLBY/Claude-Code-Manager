@@ -1217,11 +1217,26 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 |----------|----------|------|
 | `frontend/src/components/Chat/ChatView.test.tsx` | `copies a user message without its sender prefix` | 用户消息保留 `[发送者]` 的界面显示，但复制时只写入消息正文 |
 
-## Auto Capability policy（dark rollout）
+## Auto Capability policy、terminal admission 与 durable resume
 
 ```bash
 uv run pytest -q backend/tests/test_auto_capability_policy.py \
-  backend/tests/test_api_system.py -k 'auto_capability or policy'
+  backend/tests/test_agent_capability_admission.py \
+  backend/tests/test_agent_capability_production_adapters.py \
+  backend/tests/test_capability_result.py \
+  backend/tests/test_capability_resume.py \
+  backend/tests/test_capability_resume_outbox_schema.py \
+  backend/tests/test_instance_manager_capability_terminal.py
+uv run pytest -q backend/tests/test_api_tasks.py -k waiting_capability
+uv run pytest -q backend/tests/test_service_dispatcher.py \
+  -k 'capability_resume or initial_capability or background_capability_retry or auto_terminal'
+uv run pytest -q backend/tests/test_api_capabilities.py \
+  -k 'public_mutation_rejects_agent_resume_invocation'
+cd frontend && npx vitest run \
+  src/components/Chat/ChatView.test.tsx \
+  src/components/Tasks/TaskForm.test.tsx \
+  src/components/Tasks/TaskList.test.tsx \
+  src/components/Tasks/taskStatus.test.ts
 ```
 
 | 测试 | 覆盖 |
@@ -1232,10 +1247,21 @@ uv run pytest -q backend/tests/test_auto_capability_policy.py \
 | `test_project_worker_resolution_rejects_policy_before_task_write` | Project 解析出远端 Worker 后仍在任何 Task 副作用前 fail closed |
 | `test_clone_requires_explicit_policy_opt_in` | clone 不继承源 Task 的自动能力授权 |
 | `test_auto_capability_switch_is_independent_and_fail_closed` | `AUTO_CAPABILITY_ENABLED` 独立默认关闭，且 Capability Core 关闭时有效值仍为 false |
+| `test_agent_capability_admission.py` | 只接受当前 exact source/output/terminal 的严格 terminal action，并在 provider 提供时校验 native turn；原子消费总预算与分类预算，失败请求不退预算 |
+| `test_agent_capability_production_adapters.py` | Agent Plan/Review 请求进入真实 executor，原 Task 保持 `waiting_capability`，结果 identity 反向验证 |
+| `test_capability_result.py` | completed Execution、结果类型/id/hash 与 Plan/Review 权威聚合必须完整反向匹配 |
+| `test_capability_resume.py` | `pending → ready → claiming → claimed → launched → completed` outbox、lease、G+1 重放、崩溃恢复与 provider boundary |
+| `test_capability_resume_outbox_schema.py` | SQLite/PostgreSQL/MySQL migration preflight、约束、partial schema crash replay 与 downgrade writer gate |
+| `test_instance_manager_capability_terminal.py` | Claude/Codex 终态先 settle 旧 resume，再按同一 exact generation 接纳连续 Capability |
+| `test_waiting_capability_*` | stop/cancel 先静止 queue consumer 与 executor，再终态化 Invocation/outbox/Task；claimed/launched 分界 fail closed |
+| `test_initial_capability_*` / `test_background_capability_retry_*` | PTY autonomous tail、exact state、marker 清除与 termination receipt 竞态下不提前 admission、不重复 ledger |
+| `test_capability_resume_releases_fence_before_terminal_consumer` | Phase 1 持 capability fence，Phase 2 在等待 output consumer 前释放，防止 G+1 自锁 |
+| `test_public_mutation_rejects_agent_resume_invocation` | 人工 advisory consume/cancel 不能改写 Agent/Controller-owned resume 状态机 |
+| 前端 Chat/TaskForm/TaskList/taskStatus | policy 总预算与分类预算配置、`waiting_capability` 状态/等待提示和旧 turn 事件隔离 |
 
-本阶段只部署 policy/API/类型边界；`create_agent_invocation` 必须继续拒绝，直到
-exact terminal output、原子预算消费、`waiting_capability` 与 durable resume outbox
-全部接通并通过崩溃恢复测试。
+两项开关仍默认关闭；开启后也只有创建时显式冻结了 `capability_policy` 的本地
+普通 Auto Task 可由模型请求 Plan/Review。Worker、Shared、Delivery、Plan、Loop、
+Goal 与迁移导入继续 fail closed。
 
 ## 开发规范
 

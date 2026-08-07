@@ -4,6 +4,7 @@ import os
 import shutil
 import uuid
 from contextlib import AsyncExitStack
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -32,6 +33,7 @@ from backend.schemas.task import (
 )
 from backend.services.task_queue import (
     TaskQueue,
+    TaskWaitingCapabilityConflict,
     is_task_status_deletable,
     task_delete_fence,
 )
@@ -128,6 +130,17 @@ _WORKER_SKILL_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 _PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
     {"approved", "merged", "commented", "error"}
 )
+
+
+def _require_not_waiting_capability(task: Task, *, action: str) -> None:
+    """Keep ordinary Task management outside the durable resume protocol."""
+
+    if task.status == "waiting_capability":
+        raise HTTPException(
+            409,
+            f"Task is waiting for its requested capability and cannot be {action} "
+            "until the durable resume completes",
+        )
 
 
 class WorkerTerminationPutRequest(BaseModel):
@@ -599,6 +612,7 @@ def _find_session_jsonl(session_id: str, provider: str = "claude") -> Path | Non
         return None
 
     config_dir: str | None = None
+    transition_error: tuple[str, Exception] | None = None
     try:
         from backend.main import dispatcher
 
@@ -1537,6 +1551,7 @@ async def _lock_worker_local_routing_task(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="routing-configured")
+        _require_not_waiting_capability(current, action="edited")
         if await active_worker_task_termination_receipt(db, task_id):
             await db.rollback()
             raise HTTPException(
@@ -1564,6 +1579,7 @@ async def _lock_worker_local_routing_task(
         raise HTTPException(404, "Task not found")
     await require_task_control(request, current, db)
     _require_not_delivery_owned_task(current, action="routing-configured")
+    _require_not_waiting_capability(current, action="edited")
     reverse_owner = (
         await db.execute(
             select(Instance.id)
@@ -2154,6 +2170,7 @@ async def _update_local_task_with_routing_config(
         if observed is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, observed, queue.db)
+        _require_not_waiting_capability(observed, action="edited")
         if observed.worker_id is not None or observed.shared_from_id is not None:
             raise HTTPException(
                 409,
@@ -2264,6 +2281,7 @@ async def _update_worker_task_with_routing_config(
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, queue.db)
+        _require_not_waiting_capability(current, action="edited")
         if current.worker_id != expected_worker_id:
             raise HTTPException(
                 409,
@@ -2426,6 +2444,7 @@ async def _update_worker_task_with_skill_configuration(
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, queue.db)
+        _require_not_waiting_capability(current, action="edited")
         if current.worker_id != expected_worker_id:
             raise HTTPException(
                 409,
@@ -2446,7 +2465,10 @@ async def _update_worker_task_with_skill_configuration(
                 operation_lock_held=True,
                 **updates,
             )
-        except DurableWorkerTerminationConflict as exc:
+        except (
+            DurableWorkerTerminationConflict,
+            TaskWaitingCapabilityConflict,
+        ) as exc:
             raise HTTPException(409, str(exc)) from exc
         if updated is None:
             raise HTTPException(404, "Task not found")
@@ -2470,6 +2492,7 @@ async def _update_worker_task_with_handoff_fence(
         if current is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, queue.db)
+        _require_not_waiting_capability(current, action="edited")
         if current.worker_id != expected_worker_id:
             raise HTTPException(
                 409,
@@ -2482,7 +2505,10 @@ async def _update_worker_task_with_handoff_fence(
                 operation_lock_held=True,
                 **updates,
             )
-        except DurableWorkerTerminationConflict as exc:
+        except (
+            DurableWorkerTerminationConflict,
+            TaskWaitingCapabilityConflict,
+        ) as exc:
             raise HTTPException(409, str(exc)) from exc
         if updated is None:
             raise HTTPException(404, "Task not found")
@@ -2501,6 +2527,7 @@ async def update_task(
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, queue.db)
     _require_not_delivery_owned_task(task, action="edited")
+    _require_not_waiting_capability(task, action="edited")
     await _require_not_pr_review_task_mutation(
         queue.db,
         task_id,
@@ -2738,7 +2765,10 @@ async def update_task(
         )
     try:
         task = await queue.update_task(task_id, **updates)
-    except DurableWorkerTerminationConflict as exc:
+    except (
+        DurableWorkerTerminationConflict,
+        TaskWaitingCapabilityConflict,
+    ) as exc:
         raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
@@ -3005,6 +3035,7 @@ async def delete_task(
     if task is None:
         raise HTTPException(404, "Task not found")
     _require_not_delivery_owned_task(task, action="deleted")
+    _require_not_waiting_capability(task, action="deleted")
     await _require_no_pr_review_publication(db, task_id)
     await _require_not_pr_review_task_mutation(
         db,
@@ -3051,6 +3082,7 @@ async def delete_task(
             if worker_task is None:
                 raise HTTPException(404, "Task not found")
             await require_task_control(request, worker_task, db)
+            _require_not_waiting_capability(worker_task, action="deleted")
             if worker_task.worker_id is None:
                 raise HTTPException(
                     409,
@@ -3170,6 +3202,10 @@ async def delete_task(
             )
         ok = await queue.delete(task_id)
     if not ok:
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is not None:
+            _require_not_waiting_capability(current, action="deleted")
         raise HTTPException(
             400, "Cannot delete task (not found or not in deletable state)"
         )
@@ -3573,6 +3609,688 @@ async def _lock_local_termination_effect_authority(
     return task, receipt
 
 
+@dataclass(frozen=True)
+class _ExecutingCapabilityResumeClaim:
+    """Exact durable + volatile identity needed to quiesce claimed G+1."""
+
+    outbox_id: int
+    invocation_id: int
+    lease_token: str
+    task_incarnation_id: str
+    retry_count: int
+    turn_generation: int
+    instance_id: int
+    session_id: str | None
+    from_turn_generation: int
+    request_source_log_id: int
+    request_output_log_id: int
+    request_terminal_log_id: int
+    request_native_turn_id: str | None
+    resume_source_log_id: int
+
+
+async def _executing_pre_provider_capability_resume_claim(
+    db: AsyncSession,
+    task: Task,
+) -> _ExecutingCapabilityResumeClaim | None:
+    """Return only one canonical live-worker G+1 claim.
+
+    This is a quiescence hint, not terminal authority.  The queue worker still
+    owns ``capability_task_lock`` in this window, so this helper deliberately
+    performs read-only inspection and never waits on that lock.  After the
+    worker is joined, the caller must freshly prove the restored waiting
+    aggregate before cancelling anything durable.
+    """
+
+    if task.status != "executing":
+        return None
+
+    from backend.models.capability import (
+        ACTIVE_EXECUTION_STATUSES,
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.log_entry import LogEntry
+    from backend.services.terminal_arbitration import source_shape_is_canonical
+
+    claimed_outboxes = list(
+        (
+            await db.execute(
+                select(CapabilityResumeOutbox)
+                .where(
+                    CapabilityResumeOutbox.task_id == task.id,
+                    CapabilityResumeOutbox.status == "claimed",
+                )
+                .order_by(CapabilityResumeOutbox.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    if not claimed_outboxes:
+        return None
+    if len(claimed_outboxes) != 1:
+        raise HTTPException(
+            409,
+            "Executing Task has multiple claimed Capability resume outboxes",
+        )
+    outbox = claimed_outboxes[0]
+    invocation = await db.get(
+        CapabilityInvocation,
+        outbox.invocation_id,
+        populate_existing=True,
+    )
+    executions = list(
+        (
+            await db.execute(
+                select(CapabilityExecution)
+                .where(CapabilityExecution.invocation_id == outbox.invocation_id)
+                .order_by(CapabilityExecution.attempt, CapabilityExecution.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    source = (
+        await db.get(
+            LogEntry,
+            outbox.resume_source_log_id,
+            populate_existing=True,
+        )
+        if type(outbox.resume_source_log_id) is int
+        else None
+    )
+    exact = bool(
+        task.mode == "auto"
+        and task.worker_id is None
+        and task.shared_from_id is None
+        and task.delivery_run_id is None
+        and task.delivery_role is None
+        and task.plan_target_task_id is None
+        and type(task.instance_id) is int
+        and task.instance_id > 0
+        and task.completed_at is None
+        and task.pty_background_generation is None
+        and outbox.request_task_incarnation_id == task.incarnation_id
+        and outbox.request_task_retry_count == task.retry_count
+        and outbox.request_task_session_id == task.session_id
+        and outbox.from_turn_generation + 1 == task.turn_generation
+        and outbox.claimed_turn_generation == task.turn_generation
+        and outbox.resume_source_log_id == task.turn_source_log_id
+        and type(outbox.resume_source_log_id) is int
+        and outbox.resume_source_log_id > 0
+        and isinstance(outbox.lease_token, str)
+        and len(outbox.lease_token) == 64
+        and outbox.lease_expires_at is not None
+        and outbox.claimed_at is not None
+        and outbox.resume_actual_transport is None
+        and outbox.launched_at is None
+        and outbox.active_task_id == task.id
+        and invocation is not None
+        and outbox.active_invocation_id == invocation.id
+        and invocation.task_id == task.id
+        and invocation.status == "resuming"
+        and invocation.source == "agent_request"
+        and invocation.purpose == "advisory"
+        and invocation.resume_policy == "resume_task"
+        and invocation.active_task_id == task.id
+        and invocation.request_task_incarnation_id == task.incarnation_id
+        and invocation.request_task_incarnation_id
+        == outbox.request_task_incarnation_id
+        and invocation.request_task_retry_count == task.retry_count
+        and invocation.request_task_retry_count
+        == outbox.request_task_retry_count
+        and invocation.request_task_turn_generation
+        == outbox.from_turn_generation
+        and invocation.request_task_session_id == task.session_id
+        and invocation.request_task_session_id
+        == outbox.request_task_session_id
+        and invocation.request_source_log_id == outbox.request_source_log_id
+        and invocation.request_output_log_id == outbox.request_output_log_id
+        and invocation.request_terminal_log_id
+        == outbox.request_terminal_log_id
+        and invocation.request_native_turn_id == outbox.request_native_turn_id
+        and not any(
+            execution.status in ACTIVE_EXECUTION_STATUSES
+            or execution.active_invocation_id is not None
+            for execution in executions
+        )
+        and source is not None
+        and source.task_id == task.id
+        and source.task_retry_count == task.retry_count
+        and source.task_turn_generation == task.turn_generation
+        and source.turn_scope == "source"
+        and source.instance_id == task.instance_id
+        and source.actual_transport is None
+        and source_shape_is_canonical(source)
+    )
+    if not exact:
+        raise HTTPException(
+            409,
+            "Executing Task Capability resume identity cannot be proven",
+        )
+    assert invocation is not None
+    assert source is not None
+    assert isinstance(outbox.lease_token, str)
+    return _ExecutingCapabilityResumeClaim(
+        outbox_id=outbox.id,
+        invocation_id=invocation.id,
+        lease_token=outbox.lease_token,
+        task_incarnation_id=task.incarnation_id,
+        retry_count=task.retry_count,
+        turn_generation=task.turn_generation,
+        instance_id=task.instance_id,
+        session_id=task.session_id,
+        from_turn_generation=outbox.from_turn_generation,
+        request_source_log_id=outbox.request_source_log_id,
+        request_output_log_id=outbox.request_output_log_id,
+        request_terminal_log_id=outbox.request_terminal_log_id,
+        request_native_turn_id=outbox.request_native_turn_id,
+        resume_source_log_id=source.id,
+    )
+
+
+async def _waiting_capability_outbox_is_pre_provider(
+    db: AsyncSession,
+    task: Task,
+    outbox,
+) -> bool:
+    """Accept baseline G or a released, provably pre-provider G+1 claim."""
+
+    from backend.models.log_entry import LogEntry
+    from backend.services.terminal_arbitration import source_shape_is_canonical
+
+    if outbox.status in {"completed", "launched"}:
+        return False
+    claimed_shape = (
+        outbox.status == "claimed"
+        or outbox.claimed_turn_generation is not None
+        or outbox.resume_source_log_id is not None
+        or outbox.claimed_at is not None
+    )
+    if not claimed_shape:
+        return bool(
+            task.turn_generation == outbox.from_turn_generation
+            and outbox.claimed_turn_generation is None
+            and outbox.resume_source_log_id is None
+            and outbox.claimed_at is None
+            and outbox.resume_actual_transport is None
+            and outbox.launched_at is None
+        )
+    if (
+        outbox.claimed_turn_generation != outbox.from_turn_generation + 1
+        or task.turn_generation != outbox.claimed_turn_generation
+        or task.turn_source_log_id != outbox.resume_source_log_id
+        or task.instance_id is not None
+        or type(outbox.resume_source_log_id) is not int
+        or outbox.resume_source_log_id <= 0
+        or outbox.resume_actual_transport is not None
+        or outbox.launched_at is not None
+    ):
+        return False
+    source = await db.get(
+        LogEntry,
+        outbox.resume_source_log_id,
+        populate_existing=True,
+    )
+    return bool(
+        source is not None
+        and source.task_id == task.id
+        and source.task_retry_count == task.retry_count
+        and source.task_turn_generation == task.turn_generation
+        and source.turn_scope == "source"
+        and source.actual_transport is None
+        and type(source.instance_id) is int
+        and source.instance_id > 0
+        and source_shape_is_canonical(source)
+    )
+
+
+async def _cancel_waiting_task_capability_before_queue_abort(
+    task_id: int,
+    db: AsyncSession,
+) -> bool:
+    """Stop an exact Auto Capability before cancelling its resume outbox.
+
+    ``clear_task_queue`` deliberately refuses to cancel an outbox while its
+    executor may still own a runtime.  A Task-wide stop therefore has to
+    settle the linked Invocation first, without holding a Task database lock
+    across the executor callback.  The surrounding queue-cancellation lease
+    prevents a pre-provider resume from being admitted while this runs.
+    """
+
+    from backend.models.capability import (
+        ACTIVE_EXECUTION_STATUSES,
+        TERMINAL_INVOCATION_STATUSES,
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.services.capability_registry import resolve_capability
+    from backend.services.capability_service import (
+        CapabilityError,
+        cancel_invocation,
+    )
+
+    await db.rollback()
+    db.expire_all()
+    task = await db.get(Task, task_id, populate_existing=True)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    executing_claim = None
+    if task.status == "executing":
+        executing_claim = (
+            await _executing_pre_provider_capability_resume_claim(db, task)
+        )
+        if executing_claim is None:
+            await db.rollback()
+            return False
+    elif task.status != "waiting_capability":
+        await db.rollback()
+        return False
+
+    # Stop an already-dequeued resume before changing the Invocation.  The
+    # Dispatcher keeps admission closed while allowing that consumer to
+    # release a claimed-but-pre-provider G+1 back to waiting state.
+    from backend.main import dispatcher
+    from backend.services.dispatcher import TaskQueueAbortTimeoutError
+
+    await db.rollback()
+    try:
+        quiesced = (
+            await dispatcher.quiesce_task_queue_consumer_for_capability_cancel(
+                task_id,
+                **(
+                    {
+                        "expected_outbox_id": executing_claim.outbox_id,
+                        "expected_lease_token": executing_claim.lease_token,
+                        "expected_retry_count": executing_claim.retry_count,
+                        "expected_turn_generation": (
+                            executing_claim.turn_generation
+                        ),
+                        "expected_instance_id": executing_claim.instance_id,
+                    }
+                    if executing_claim is not None
+                    else {}
+                ),
+            )
+        )
+    except TaskQueueAbortTimeoutError as exc:
+        raise HTTPException(
+            409,
+            "Capability resume queue worker could not be proven stopped",
+        ) from exc
+    if executing_claim is not None and not quiesced:
+        raise HTTPException(
+            409,
+            "Capability resume queue worker identity cannot be proven",
+        )
+    db.expire_all()
+    task = await db.get(Task, task_id, populate_existing=True)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    if task.status != "waiting_capability":
+        await db.rollback()
+        if executing_claim is not None:
+            raise HTTPException(
+                409,
+                "Capability resume did not restore its exact pre-provider claim",
+            )
+        return False
+    if executing_claim is not None and (
+        task.incarnation_id != executing_claim.task_incarnation_id
+        or task.retry_count != executing_claim.retry_count
+        or task.turn_generation != executing_claim.turn_generation
+        or task.session_id != executing_claim.session_id
+        or task.instance_id is not None
+        or task.turn_source_log_id != executing_claim.resume_source_log_id
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Capability resume Task identity changed while its worker stopped",
+        )
+
+    outboxes = list(
+        (
+            await db.execute(
+                select(CapabilityResumeOutbox)
+                .where(
+                    CapabilityResumeOutbox.task_id == task.id,
+                    CapabilityResumeOutbox.request_task_incarnation_id
+                    == task.incarnation_id,
+                    CapabilityResumeOutbox.request_task_retry_count
+                    == task.retry_count,
+                )
+                .order_by(CapabilityResumeOutbox.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    live_outboxes = [
+        outbox
+        for outbox in outboxes
+        if outbox.status in {"pending", "ready", "claiming", "claimed", "launched"}
+    ]
+    if len(live_outboxes) > 1:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Waiting Task has multiple live Capability resume outboxes",
+        )
+    if live_outboxes:
+        outbox = live_outboxes[0]
+    else:
+        # Recover a process crash after the outbox commit but before the Task
+        # terminal CAS.  Only a row whose G or claimed G+1 equals the current
+        # Task generation is eligible.
+        terminal_candidates = [
+            candidate
+            for candidate in outboxes
+            if candidate.status in {"cancelled", "failed", "completed"}
+            and task.turn_generation
+            in {
+                candidate.from_turn_generation,
+                candidate.claimed_turn_generation,
+            }
+        ]
+        if len(terminal_candidates) != 1:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Waiting Task does not have one exact Capability resume outbox",
+            )
+        outbox = terminal_candidates[0]
+    if executing_claim is not None and (
+        outbox.id != executing_claim.outbox_id
+        or outbox.invocation_id != executing_claim.invocation_id
+        or outbox.from_turn_generation
+        != executing_claim.from_turn_generation
+        or outbox.request_source_log_id
+        != executing_claim.request_source_log_id
+        or outbox.request_output_log_id
+        != executing_claim.request_output_log_id
+        or outbox.request_terminal_log_id
+        != executing_claim.request_terminal_log_id
+        or outbox.request_native_turn_id
+        != executing_claim.request_native_turn_id
+        or outbox.resume_source_log_id
+        != executing_claim.resume_source_log_id
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Capability resume aggregate changed while its worker stopped",
+        )
+    if outbox.status == "completed":
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Capability resume already completed for the waiting Task generation",
+        )
+
+    invocation = await db.get(
+        CapabilityInvocation,
+        outbox.invocation_id,
+        populate_existing=True,
+    )
+    executions = list(
+        (
+            await db.execute(
+                select(CapabilityExecution)
+                .where(CapabilityExecution.invocation_id == outbox.invocation_id)
+                .order_by(CapabilityExecution.attempt, CapabilityExecution.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    exact_identity = bool(
+        invocation is not None
+        and invocation.task_id == task.id
+        and invocation.source == "agent_request"
+        and invocation.purpose == "advisory"
+        and invocation.resume_policy == "resume_task"
+        and invocation.request_task_incarnation_id == task.incarnation_id
+        and invocation.request_task_incarnation_id
+        == outbox.request_task_incarnation_id
+        and invocation.request_task_retry_count == task.retry_count
+        and invocation.request_task_retry_count
+        == outbox.request_task_retry_count
+        and invocation.request_task_turn_generation
+        == outbox.from_turn_generation
+        and invocation.request_task_session_id == task.session_id
+        and invocation.request_task_session_id
+        == outbox.request_task_session_id
+        and invocation.request_source_log_id == outbox.request_source_log_id
+        and invocation.request_output_log_id == outbox.request_output_log_id
+        and invocation.request_terminal_log_id
+        == outbox.request_terminal_log_id
+        and invocation.request_native_turn_id == outbox.request_native_turn_id
+        and (
+            (
+                outbox.status in {"pending", "ready", "claiming", "claimed"}
+                and outbox.active_task_id == task.id
+                and outbox.active_invocation_id == invocation.id
+            )
+            or (
+                outbox.status in {"cancelled", "failed"}
+                and outbox.active_task_id is None
+                and outbox.active_invocation_id is None
+            )
+        )
+    )
+    if not exact_identity or not await _waiting_capability_outbox_is_pre_provider(
+        db,
+        task,
+        outbox,
+    ):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Waiting Task Capability identity cannot be proven",
+        )
+    assert invocation is not None
+
+    active = [
+        execution
+        for execution in executions
+        if execution.status in ACTIVE_EXECUTION_STATUSES
+        or execution.active_invocation_id is not None
+    ]
+    outbox_id = outbox.id
+    invocation_id = invocation.id
+    invocation_status = invocation.status
+    invocation_state_version = invocation.state_version
+    expected_identity = (
+        task.incarnation_id,
+        task.retry_count,
+        task.turn_generation,
+        task.session_id,
+        outbox.from_turn_generation,
+        outbox.request_source_log_id,
+        outbox.request_output_log_id,
+        outbox.request_terminal_log_id,
+        outbox.request_native_turn_id,
+    )
+
+    transition_error: tuple[str, BaseException] | None = None
+    try:
+        if invocation_status == "queued":
+            # A queued row is safe to settle without an adapter only when no
+            # durable field can possibly identify an already-started runtime.
+            if (
+                len(active) != 1
+                or active[0].status != "queued"
+                or active[0].active_invocation_id != invocation.id
+                or active[0].executor_kind != invocation.executor_kind
+                or active[0].handle_kind is not None
+                or active[0].handle_id is not None
+                or active[0].handle_generation is not None
+                or active[0].lease_token is not None
+                or active[0].lease_expires_at is not None
+                or active[0].heartbeat_at is not None
+                or active[0].started_at is not None
+            ):
+                raise HTTPException(
+                    409,
+                    "Queued Capability lacks a durable no-runtime proof",
+                )
+            await db.rollback()
+            await cancel_invocation(
+                db,
+                invocation_id=invocation_id,
+                expected_state_version=invocation_state_version,
+                allow_workflow_owned=True,
+            )
+        elif invocation_status in {"ready", "resuming"}:
+            if active:
+                raise HTTPException(
+                    409,
+                    "Result-ready Capability retained an active execution",
+                )
+            await db.rollback()
+            await cancel_invocation(
+                db,
+                invocation_id=invocation_id,
+                expected_state_version=invocation_state_version,
+                allow_workflow_owned=True,
+            )
+        elif invocation_status in {"running", "waiting_user", "cancelling"}:
+            expected_execution_status = {
+                "running": "running",
+                "waiting_user": "waiting_user",
+                "cancelling": "cancelling",
+            }[invocation_status]
+            if (
+                len(active) != 1
+                or active[0].status != expected_execution_status
+                or active[0].active_invocation_id != invocation.id
+                or active[0].executor_kind != invocation.executor_kind
+            ):
+                raise HTTPException(
+                    409,
+                    "Active Capability execution identity cannot be proven",
+                )
+            definition = resolve_capability(invocation.capability_key)
+            executor = definition.executor if definition is not None else None
+            callback = getattr(executor, "cancel", None)
+            if (
+                definition is None
+                or definition.executor_kind != invocation.executor_kind
+                or not callable(callback)
+            ):
+                raise HTTPException(
+                    409,
+                    "Active Capability executor is unavailable or mismatched",
+                )
+            await db.rollback()
+            await callback(db, invocation_id=invocation_id)
+        elif invocation_status not in TERMINAL_INVOCATION_STATUSES:
+            raise HTTPException(
+                409,
+                f"Capability is in unsupported status {invocation_status!r}",
+            )
+    except HTTPException:
+        await db.rollback()
+        raise
+    except asyncio.CancelledError:
+        await db.rollback()
+        raise
+    except CapabilityError as exc:
+        await db.rollback()
+        transition_error = (
+            "Capability cancellation conflicted with another state transition",
+            exc,
+        )
+    except Exception as exc:
+        await db.rollback()
+        transition_error = (
+            "Capability executor cancellation could not be confirmed",
+            exc,
+        )
+
+    # Re-read every durable row after the adapter returns.  Its callback may
+    # commit several lower-level transitions; its return value is never proof.
+    await db.rollback()
+    db.expire_all()
+    task = await db.get(Task, task_id, populate_existing=True)
+    outbox = await db.get(
+        CapabilityResumeOutbox,
+        outbox_id,
+        populate_existing=True,
+    )
+    invocation = await db.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    executions = list(
+        (
+            await db.execute(
+                select(CapabilityExecution)
+                .where(CapabilityExecution.invocation_id == invocation_id)
+                .order_by(CapabilityExecution.attempt, CapabilityExecution.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    final_pre_provider = bool(
+        task is not None
+        and outbox is not None
+        and await _waiting_capability_outbox_is_pre_provider(db, task, outbox)
+    )
+    settled = not (
+        task is None
+        or task.status != "waiting_capability"
+        or (
+            task.incarnation_id,
+            task.retry_count,
+            task.turn_generation,
+            task.session_id,
+            outbox.from_turn_generation if outbox is not None else None,
+            outbox.request_source_log_id if outbox is not None else None,
+            outbox.request_output_log_id if outbox is not None else None,
+            outbox.request_terminal_log_id if outbox is not None else None,
+            outbox.request_native_turn_id if outbox is not None else None,
+        )
+        != expected_identity
+        or outbox is None
+        or outbox.task_id != task_id
+        or outbox.invocation_id != invocation_id
+        or outbox.status == "completed"
+        or not final_pre_provider
+        or invocation is None
+        or invocation.task_id != task_id
+        or invocation.source != "agent_request"
+        or invocation.resume_policy != "resume_task"
+        or invocation.request_task_incarnation_id != expected_identity[0]
+        or invocation.request_task_retry_count != expected_identity[1]
+        or invocation.request_task_turn_generation != expected_identity[4]
+        or invocation.request_task_session_id != expected_identity[3]
+        or invocation.request_source_log_id != expected_identity[5]
+        or invocation.request_output_log_id != expected_identity[6]
+        or invocation.request_terminal_log_id != expected_identity[7]
+        or invocation.request_native_turn_id != expected_identity[8]
+        or invocation.status not in TERMINAL_INVOCATION_STATUSES
+        or invocation.active_task_id is not None
+        or any(
+            execution.status in ACTIVE_EXECUTION_STATUSES
+            or execution.active_invocation_id is not None
+            for execution in executions
+        )
+    )
+    if not settled:
+        await db.rollback()
+        if transition_error is not None:
+            message, cause = transition_error
+            raise HTTPException(409, message) from cause
+        raise HTTPException(
+            409,
+            "Capability cancellation did not reach one durable terminal state",
+        )
+    await db.rollback()
+    return True
+
+
 async def _stop_task_session_local_impl(
     task_id: int,
     db: AsyncSession,
@@ -3631,6 +4349,20 @@ async def _stop_task_session_local_under_cancellation_lease(
     )
     termination_operation = (
         "supersede" if worker_supersede else "stop_session"
+    )
+    await _cancel_waiting_task_capability_before_queue_abort(
+        task_id,
+        db,
+    )
+    await _require_local_termination_effect_authority(
+        task_id,
+        db,
+        worker_termination_operation_id=worker_termination_operation_id,
+        expected_operation=termination_operation,
+        worker_termination_execution_token=(
+            worker_termination_execution_token
+        ),
+        worker_termination_state_version=worker_termination_state_version,
     )
     await db.rollback()
     try:
@@ -3889,6 +4621,7 @@ async def _stop_task_session_local_under_cancellation_lease(
     stoppable_statuses = {
         "executing",
         "in_progress",
+        "waiting_capability",
         "failed",
         "completed",
         "cancelled",
@@ -3940,7 +4673,11 @@ async def _stop_task_session_local_under_cancellation_lease(
     observed_session_id = active_task.session_id
     observed_completed_at = active_task.completed_at
     observed_background_generation = active_task.pty_background_generation
-    transitioning_statuses = {"executing", "in_progress"}
+    transitioning_statuses = {
+        "executing",
+        "in_progress",
+        "waiting_capability",
+    }
     if worker_supersede:
         transitioning_statuses.add("merging")
     if expected_generations:
@@ -4785,6 +5522,20 @@ async def _cancel_local_task_under_cancellation_lease(
         ),
         worker_termination_state_version=worker_termination_state_version,
     )
+    await _cancel_waiting_task_capability_before_queue_abort(
+        task_id,
+        db,
+    )
+    await _require_local_termination_effect_authority(
+        task_id,
+        db,
+        worker_termination_operation_id=worker_termination_operation_id,
+        expected_operation="cancel",
+        worker_termination_execution_token=(
+            worker_termination_execution_token
+        ),
+        worker_termination_state_version=worker_termination_state_version,
+    )
     await db.rollback()
     try:
         await dispatcher.abort_task_queue(
@@ -4888,6 +5639,7 @@ async def _cancel_local_task_under_cancellation_lease(
         "in_progress",
         "executing",
         "merging",
+        "waiting_capability",
     )
     if active_task is None or active_task.status not in (
         *active_statuses,
@@ -5325,6 +6077,7 @@ async def retry_task(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="retried")
+        _require_not_waiting_capability(current, action="retried")
         if has_worker_execution_quarantine(current.metadata_):
             raise HTTPException(
                 409,

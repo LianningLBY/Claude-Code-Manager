@@ -64,6 +64,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [priority, setPriority] = useState(0);
   const [mode, setMode] = useState('auto');
   const [deliveryLoopEnabled, setDeliveryLoopEnabled] = useState(false);
+  const [autoCapabilityAvailable, setAutoCapabilityAvailable] = useState(false);
+  const [autoPlanBudget, setAutoPlanBudget] = useState(0);
+  const [autoReviewBudget, setAutoReviewBudget] = useState(0);
+  const [autoCapabilityMaxInvocations, setAutoCapabilityMaxInvocations] = useState(1);
   const [monitoredRepos, setMonitoredRepos] = useState<MonitoredRepo[]>([]);
   const [deliveryRepoId, setDeliveryRepoId] = useState<number | ''>('');
   const [deliveryReposLoading, setDeliveryReposLoading] = useState(false);
@@ -169,6 +173,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexCapabilitiesLoaded(true);
       const deliveryEnabled = c.delivery_loop_enabled === true;
       setDeliveryLoopEnabled(deliveryEnabled);
+      setAutoCapabilityAvailable(
+        c.capability_core_enabled === true
+        && c.auto_capability_enabled === true,
+      );
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
       applyStoredDefaults(readStoredTaskDefaults(), configuredProvider, deliveryEnabled);
@@ -176,6 +184,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexModelServiceTiers({});
       setCodexCapabilitiesLoaded(true);
       setDeliveryLoopEnabled(false);
+      setAutoCapabilityAvailable(false);
       applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
     });
     api.getRuntimeSettings()
@@ -231,6 +240,53 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   );
   const remoteTaskScope = Boolean(workerId)
     || selectedProject?.worker_id != null;
+  const autoCapabilityEligible = autoCapabilityAvailable
+    && mode === 'auto'
+    && !remoteTaskScope;
+  const autoCapabilityBudgetSum = autoPlanBudget + autoReviewBudget;
+  const autoCapabilityMinTotal = Math.max(
+    1,
+    autoPlanBudget,
+    autoReviewBudget,
+  );
+  const autoCapabilityMaxTotal = Math.min(8, autoCapabilityBudgetSum);
+  const normalizedAutoCapabilityMaxInvocations = autoCapabilityBudgetSum === 0
+    ? 1
+    : Math.min(
+        autoCapabilityMaxTotal,
+        Math.max(autoCapabilityMinTotal, autoCapabilityMaxInvocations),
+      );
+
+  useEffect(() => {
+    if (
+      normalizedAutoCapabilityMaxInvocations
+      !== autoCapabilityMaxInvocations
+    ) {
+      setAutoCapabilityMaxInvocations(
+        normalizedAutoCapabilityMaxInvocations,
+      );
+    }
+  }, [
+    autoCapabilityMaxInvocations,
+    normalizedAutoCapabilityMaxInvocations,
+  ]);
+
+  useEffect(() => {
+    // Policy is create-only and local ordinary-Task only.  Drop a previous
+    // selection as soon as its scope becomes ineligible so a hidden opt-in
+    // cannot silently come back after a mode/project switch.
+    if (autoCapabilityEligible) return;
+    if (autoPlanBudget !== 0) setAutoPlanBudget(0);
+    if (autoReviewBudget !== 0) setAutoReviewBudget(0);
+    if (autoCapabilityMaxInvocations !== 1) {
+      setAutoCapabilityMaxInvocations(1);
+    }
+  }, [
+    autoCapabilityEligible,
+    autoCapabilityMaxInvocations,
+    autoPlanBudget,
+    autoReviewBudget,
+  ]);
 
   useEffect(() => {
     if (
@@ -375,7 +431,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [defaultSaved, setDefaultSaved] = useState(false);
   const hasStoredDefault = !!localStorage.getItem(STORAGE_KEY);
 
-  const hasNonDefaultConfig = priority !== 0 || mode !== 'auto' || provider !== defaultProvider || model !== '' || effort !== '' || codexServiceTier !== 'default' || thinkingBudget !== '' || timeoutHours !== '';
+  const hasNonDefaultConfig = priority !== 0 || mode !== 'auto' || provider !== defaultProvider || model !== '' || effort !== '' || codexServiceTier !== 'default' || thinkingBudget !== '' || timeoutHours !== '' || autoCapabilityBudgetSum > 0;
 
   const activeDefaultModel = provider === 'codex' ? defaultCodexModel : defaultModel;
   const activeModelOptions = provider === 'codex' ? codexModelOptions : modelOptions;
@@ -558,6 +614,18 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
           ...(workerId ? { worker_id: parseInt(workerId) } : {}),
+          ...(autoCapabilityEligible && autoCapabilityBudgetSum > 0 ? {
+            capability_policy: {
+              version: 1 as const,
+              max_invocations: normalizedAutoCapabilityMaxInvocations,
+              capabilities: {
+                ...(autoPlanBudget > 0 ? { plan: autoPlanBudget } : {}),
+                ...(autoReviewBudget > 0
+                  ? { code_review: autoReviewBudget }
+                  : {}),
+              },
+            },
+          } : {}),
           provider,
           model: model || activeDefaultModel,
           ...(effort ? { effort_level: effort } : {}),
@@ -597,6 +665,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       fileUpload.clear();
       setSelectedSecretIds([]);
       setCloneFromTaskId('');
+      setAutoPlanBudget(0);
+      setAutoReviewBudget(0);
+      setAutoCapabilityMaxInvocations(1);
       // Restore localStorage defaults (or fall back to server defaults)
       applyStoredDefaults(
         readStoredTaskDefaults(),
@@ -894,6 +965,86 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     <option value="delivery_loop">Delivery Loop</option>
                   )}
                 </select>
+
+                {autoCapabilityEligible && (
+                  <>
+                    <span className="text-gray-400 self-start pt-1">Auto help</span>
+                    <div className="space-y-1.5 rounded border border-indigo-500/25 bg-indigo-500/10 p-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="flex items-center gap-1.5 text-indigo-200">
+                          <input
+                            type="checkbox"
+                            aria-label="Allow automatic Plan"
+                            checked={autoPlanBudget > 0}
+                            onChange={(e) => setAutoPlanBudget(e.target.checked ? 1 : 0)}
+                            className="accent-indigo-500"
+                          />
+                          Plan
+                        </label>
+                        {autoPlanBudget > 0 && (
+                          <select
+                            aria-label="Automatic Plan budget"
+                            value={autoPlanBudget}
+                            onChange={(e) => setAutoPlanBudget(Number(e.target.value))}
+                            className="bg-gray-700 text-foreground rounded px-1.5 py-0.5 text-xs"
+                          >
+                            {Array.from({ length: 8 }, (_, index) => index + 1).map((limit) => (
+                              <option key={limit} value={limit}>{limit}×</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="flex items-center gap-1.5 text-indigo-200">
+                          <input
+                            type="checkbox"
+                            aria-label="Allow automatic Code Review"
+                            checked={autoReviewBudget > 0}
+                            onChange={(e) => setAutoReviewBudget(e.target.checked ? 1 : 0)}
+                            className="accent-indigo-500"
+                          />
+                          Code Review
+                        </label>
+                        {autoReviewBudget > 0 && (
+                          <select
+                            aria-label="Automatic Code Review budget"
+                            value={autoReviewBudget}
+                            onChange={(e) => setAutoReviewBudget(Number(e.target.value))}
+                            className="bg-gray-700 text-foreground rounded px-1.5 py-0.5 text-xs"
+                          >
+                            {Array.from({ length: 8 }, (_, index) => index + 1).map((limit) => (
+                              <option key={limit} value={limit}>{limit}×</option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+                      {autoCapabilityBudgetSum > 0 && (
+                        <label className="flex items-center justify-between gap-2 border-t border-indigo-500/20 pt-1.5 text-indigo-200">
+                          <span>Total limit</span>
+                          <select
+                            aria-label="Automatic capability total limit"
+                            value={normalizedAutoCapabilityMaxInvocations}
+                            onChange={(e) => setAutoCapabilityMaxInvocations(Number(e.target.value))}
+                            className="bg-gray-700 text-foreground rounded px-1.5 py-0.5 text-xs"
+                          >
+                            {Array.from(
+                              {
+                                length: autoCapabilityMaxTotal - autoCapabilityMinTotal + 1,
+                              },
+                              (_, index) => autoCapabilityMinTotal + index,
+                            ).map((limit) => (
+                              <option key={limit} value={limit}>{limit}×</option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                      <p className="max-w-56 text-[10px] leading-relaxed text-indigo-200/65">
+                        Lets the coding agent yield to these advisory capabilities,
+                        then resume the same Task. Budgets are non-refundable.
+                      </p>
+                    </div>
+                  </>
+                )}
 
                 {false && (
                   <>

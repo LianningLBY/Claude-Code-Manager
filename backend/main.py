@@ -64,6 +64,7 @@ from backend.services.deployment_start_guard import (
 from backend.services.sub_agent_watcher import SubAgentWatcher
 from backend.services.cloudrouter_accounts import CloudRouterAccountStore
 from backend.services.capability_coordinator import CapabilityCoordinator
+from backend.services.capability_resume import CapabilityResumeCoordinator
 from backend.services.capability_registry import register_capability
 from backend.services.code_review_capability import (
     CodeReviewCapabilityExecutor,
@@ -139,6 +140,12 @@ capability_coordinator = CapabilityCoordinator(
     ),
     max_backoff_seconds=settings.capability_coordinator_max_backoff_seconds,
 )
+capability_resume_coordinator = CapabilityResumeCoordinator(
+    db_factory=async_session,
+    publisher=dispatcher.enqueue_capability_resume,
+)
+dispatcher.capability_invocation_wake = capability_coordinator.wake
+_dispatcher_runtime_lifecycle_lock = asyncio.Lock()
 delivery_controller = DeliveryController(
     db_factory=async_session,
     capability_coordinator=capability_coordinator,
@@ -148,6 +155,134 @@ delivery_controller = DeliveryController(
     # to recover exact work admitted by an earlier process/configuration.
     enabled=True,
 )
+
+
+async def _await_dispatcher_runtime_transition(
+    operation: asyncio.Task[None],
+) -> None:
+    """Delay caller cancellation until one paired runtime transition settles."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except BaseException:
+            break
+    operation.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _restore_capability_resume_after_stop_failure(
+    *,
+    stop_error: BaseException,
+) -> None:
+    """Restore the resume producer when Dispatcher pause is unconfirmed."""
+
+    try:
+        await capability_resume_coordinator.start()
+    except BaseException as restore_error:
+        # GlobalDispatcher.stop() closes its public admission flag before it
+        # waits for the exact background loops.  If both that wait and this
+        # restoration fail, fresh work remains fail-closed even though the
+        # retained loop could not be reaped synchronously.
+        raise RuntimeError(
+            "Dispatcher stop was not confirmed and the capability resume "
+            "coordinator could not be restored; new Dispatcher admission "
+            "remains closed"
+        ) from restore_error
+    raise stop_error
+
+
+async def _start_dispatcher_runtime_locked() -> None:
+    await dispatcher.start()
+    try:
+        await capability_resume_coordinator.start()
+    except BaseException as start_error:
+        # start() can fail during its synchronous recovery pass before its
+        # runner is published.  shutdown() is still required so a future
+        # implementation cannot leak a partially published runner.
+        shutdown_error: BaseException | None = None
+        try:
+            await capability_resume_coordinator.shutdown()
+        except BaseException as exc:
+            shutdown_error = exc
+            logger.exception(
+                "Capability resume coordinator start rollback failed"
+            )
+        try:
+            await dispatcher.stop()
+        except BaseException as stop_error:
+            logger.exception(
+                "Dispatcher rollback failed after capability resume "
+                "coordinator start failure"
+            )
+            await _restore_capability_resume_after_stop_failure(
+                stop_error=stop_error,
+            )
+        if shutdown_error is not None:
+            raise RuntimeError(
+                "Capability resume coordinator failed to start and its "
+                "rollback could not be confirmed; Dispatcher was paused"
+            ) from start_error
+        raise
+
+
+async def start_dispatcher_runtime() -> None:
+    """Start Dispatcher and its durable resume producer as one lifecycle."""
+
+    async def transition() -> None:
+        async with _dispatcher_runtime_lifecycle_lock:
+            await _start_dispatcher_runtime_locked()
+
+    operation = asyncio.create_task(
+        transition(),
+        name="dispatcher-runtime-start",
+    )
+    await _await_dispatcher_runtime_transition(operation)
+
+
+async def _stop_dispatcher_runtime_locked() -> None:
+    try:
+        await capability_resume_coordinator.shutdown()
+    except BaseException as shutdown_error:
+        # A shutdown exception does not prove whether the runner crossed its
+        # terminal boundary.  Re-start is idempotent and restores the original
+        # running state before returning the failed transition to the caller.
+        try:
+            await capability_resume_coordinator.start()
+        except BaseException as restore_error:
+            raise RuntimeError(
+                "Capability resume coordinator shutdown failed and its "
+                "running state could not be restored"
+            ) from restore_error
+        raise shutdown_error
+
+    try:
+        await dispatcher.stop()
+    except BaseException as stop_error:
+        logger.exception(
+            "Dispatcher stop failed; restoring capability resume coordinator"
+        )
+        await _restore_capability_resume_after_stop_failure(
+            stop_error=stop_error,
+        )
+
+
+async def stop_dispatcher_runtime() -> None:
+    """Pause Dispatcher and its durable resume producer atomically."""
+
+    async def transition() -> None:
+        async with _dispatcher_runtime_lifecycle_lock:
+            await _stop_dispatcher_runtime_locked()
+
+    operation = asyncio.create_task(
+        transition(),
+        name="dispatcher-runtime-stop",
+    )
+    await _await_dispatcher_runtime_transition(operation)
 
 # Codex account pool (optional, CODEX_POOL_ENABLED=true)
 codex_pool = None
@@ -592,6 +727,14 @@ async def _shutdown_runtime_services(
         failures.append(exc)
         logger.exception("Delivery Controller shutdown failed")
 
+    # Resume publication is a downstream producer of Dispatcher queue work.
+    # Quiesce it before Capability callbacks and queue transports are removed.
+    try:
+        await capability_resume_coordinator.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Capability resume coordinator shutdown failed")
+
     # Capability callbacks may wake or stop Dispatcher-owned Plan/review
     # lifecycles. Close their admission and await exact callbacks before
     # dismantling Dispatcher transports.
@@ -692,7 +835,10 @@ async def _start_execution_runtimes() -> None:
         include_manager=False
     )
     if settings.auto_start_dispatcher:
-        await dispatcher.start()
+        # Dispatcher and the durable resume producer form one public runtime.
+        # Start them adjacently so a failed recovery scan can roll back the
+        # Dispatcher before any upstream producer is exposed.
+        await start_dispatcher_runtime()
     if worker_relay is not None:
         await worker_relay.start()
     await worker_task_termination_coordinator.start()

@@ -579,7 +579,8 @@ def _turn_failure_marker(
 
 
 def test_terminal_selection_result_is_immutable():
-    result = TerminalOutputSelection(_row(101, event_type="result"), None)
+    row = _row(101, event_type="result")
+    result = TerminalOutputSelection(row, row, None)
     with pytest.raises(FrozenInstanceError):
         result.native_turn_id = "changed"  # type: ignore[misc]
 
@@ -757,6 +758,7 @@ def test_claude_prefers_latest_result_over_later_assistant_message():
     assert selected is not None
     assert selected.output_log.id == 125
     assert selected.output_log.content == "final result"
+    assert selected.terminal_log is selected.output_log
     assert selected.native_turn_id is None
 
 
@@ -1192,6 +1194,7 @@ def test_select_terminal_tail_alias_preserves_the_same_contract():
 def test_codex_selects_last_agent_message_of_last_successful_native_turn():
     source = _source("codex_app_server")
     expected = _codex_message(118, "native-2", "final answer")
+    terminal = _codex_terminal(120, "native-2")
     rows = [
         _codex_terminal(112, "native-1"),
         _row(
@@ -1208,7 +1211,7 @@ def test_codex_selects_last_agent_message_of_last_successful_native_turn():
             native_turn_id="native-2",
         ),
         _codex_message(116, "native-2", "draft answer"),
-        _codex_terminal(120, "native-2"),
+        terminal,
         expected,
         _codex_message(119, "another-native", "wrong native"),
         _codex_message(119, "native-2", "autonomous", scope="autonomous"),
@@ -1228,6 +1231,7 @@ def test_codex_selects_last_agent_message_of_last_successful_native_turn():
 
     assert selected is not None
     assert selected.output_log is expected
+    assert selected.terminal_log is terminal
     assert selected.native_turn_id == "native-2"
 
 
@@ -1414,6 +1418,7 @@ def test_codex_exec_native_id_cannot_cross_an_earlier_terminal_boundary():
 def test_codex_exec_selects_last_real_idless_agent_message_in_boundary():
     source = _source("codex_exec")
     expected = _codex_exec_message(118, "final answer")
+    terminal = _codex_exec_terminal(120)
     rows = [
         _codex_exec_message(110, "draft answer"),
         _row(
@@ -1427,7 +1432,7 @@ def test_codex_exec_selects_last_real_idless_agent_message_in_boundary():
             },
             native_turn_id=None,
         ),
-        _codex_exec_terminal(120),
+        terminal,
         expected,
     ]
 
@@ -1440,6 +1445,7 @@ def test_codex_exec_selects_last_real_idless_agent_message_in_boundary():
 
     assert selected is not None
     assert selected.output_log is expected
+    assert selected.terminal_log is terminal
     assert selected.native_turn_id is None
 
 

@@ -341,7 +341,11 @@ def _developer_generation_matches(
         and invocation.subject_hash == capability_value_hash(subject)
         and (
             invocation.source != "agent_request"
-            or invocation.request_task_turn_generation == task.turn_generation
+            or (
+                invocation.request_task_incarnation_id == task.incarnation_id
+                and invocation.request_task_turn_generation
+                == task.turn_generation
+            )
         )
     )
 
@@ -1518,6 +1522,7 @@ class CodeReviewCapabilityExecutor:
                 db,
                 invocation_id=invocation.id,
                 expected_state_version=invocation.state_version,
+                allow_workflow_owned=True,
             )
             execution = await active_execution_for(db, invocation.id)
             if execution is None:
@@ -1581,6 +1586,7 @@ class CodeReviewCapabilityExecutor:
                 db,
                 invocation_id=invocation.id,
                 expected_state_version=invocation.state_version,
+                allow_workflow_owned=True,
             )
             return _observation(invocation, execution)
         if invocation.status == "queued":
@@ -1588,6 +1594,7 @@ class CodeReviewCapabilityExecutor:
                 db,
                 invocation_id=invocation.id,
                 expected_state_version=invocation.state_version,
+                allow_workflow_owned=True,
             )
             return _observation(invocation, execution)
 
@@ -1597,6 +1604,7 @@ class CodeReviewCapabilityExecutor:
                 db,
                 invocation_id=invocation.id,
                 expected_state_version=invocation.state_version,
+                allow_workflow_owned=True,
             )
             execution = await active_execution_for(db, invocation.id)
             if execution is None:

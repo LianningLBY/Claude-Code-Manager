@@ -1622,6 +1622,1098 @@ async def test_update_task(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "suffix", "payload"),
+    [
+        ("PUT", "", {"title": "must not change"}),
+        ("POST", "/retry", None),
+        ("DELETE", "", None),
+    ],
+)
+async def test_waiting_capability_rejects_ordinary_task_management(
+    client,
+    session_factory,
+    method,
+    suffix,
+    payload,
+):
+    """Only the durable resume protocol may advance a waiting Task."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="durable capability wait",
+            description="d",
+            status="waiting_capability",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    response = await client.request(
+        method,
+        f"/api/tasks/{task_id}{suffix}",
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "waiting" in response.json()["detail"].lower()
+    assert "capability" in response.json()["detail"].lower()
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "waiting_capability"
+        assert current.title == "durable capability wait"
+        assert current.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_keeps_independent_task_preferences_available(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="waiting preferences",
+            description="d",
+            status="waiting_capability",
+            has_unread=True,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    for suffix in ("star", "read", "unread", "archive"):
+        response = await client.post(f"/api/tasks/{task_id}/{suffix}")
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "waiting_capability"
+
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "waiting_capability"
+        assert current.starred is True
+        assert current.has_unread is True
+        assert current.archived is True
+
+
+async def _seed_waiting_capability_for_terminal_api(
+    db,
+    *,
+    capability_key: str = "plan",
+    executor_kind: str = "plan_agent",
+    invocation_status: str = "queued",
+    queued_runtime_evidence: bool = False,
+):
+    """Create one exact agent-request aggregate for Task terminal tests."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    digest = "d" * 64
+    task = Task(
+        title=f"waiting {capability_key}",
+        description="terminalize the exact capability wait",
+        status="waiting_capability",
+        mode="auto",
+        provider="claude",
+        retry_count=2,
+        turn_generation=7,
+        session_id="waiting-capability-session",
+    )
+    db.add(task)
+    await db.flush()
+    source_log_id = task.id * 10 + 1
+    output_log_id = task.id * 10 + 2
+    terminal_log_id = task.id * 10 + 3
+    result_ready = invocation_status in {"ready", "resuming"}
+    invocation = CapabilityInvocation(
+        task_id=task.id,
+        capability_key=capability_key,
+        source="agent_request",
+        purpose="advisory",
+        status=invocation_status,
+        state_version=1,
+        idempotency_key=f"waiting-api-{task.id}",
+        input_payload={"focus": "safe cancellation"},
+        input_hash=digest,
+        subject_kind="task_generation",
+        subject_ref={
+            "task_id": task.id,
+            "incarnation_id": task.incarnation_id,
+            "retry_count": task.retry_count,
+            "turn_generation": task.turn_generation,
+        },
+        subject_hash=digest,
+        executor_kind=executor_kind,
+        executor_config={},
+        executor_config_hash=digest,
+        policy_snapshot={"enabled": True},
+        policy_hash=digest,
+        resume_policy="resume_task",
+        max_attempts=1,
+        active_task_id=task.id,
+        request_task_incarnation_id=task.incarnation_id,
+        request_task_retry_count=task.retry_count,
+        request_task_instance_id=None,
+        request_task_started_at=None,
+        request_task_session_id=task.session_id,
+        request_task_turn_generation=task.turn_generation,
+        request_source_log_id=source_log_id,
+        request_output_log_id=output_log_id,
+        request_terminal_log_id=terminal_log_id,
+        request_reason="Need capability guidance",
+        request_protocol_version=1,
+        request_output_hash=digest,
+        result_kind=("plan_version" if result_ready else None),
+        result_id=(task.id if result_ready else None),
+        result_hash=(digest if result_ready else None),
+        ready_at=(datetime.utcnow() if result_ready else None),
+    )
+    db.add(invocation)
+    await db.flush()
+    running = invocation_status in {"running", "waiting_user", "cancelling"}
+    execution = CapabilityExecution(
+        invocation_id=invocation.id,
+        attempt=1,
+        status=("completed" if result_ready else invocation_status),
+        state_version=1,
+        active_invocation_id=(None if result_ready else invocation.id),
+        idempotency_key=f"waiting-api-execution-{task.id}",
+        executor_kind=executor_kind,
+        input_hash=digest,
+        handle_kind=(
+            f"{capability_key}_runtime"
+            if running or queued_runtime_evidence
+            else None
+        ),
+        handle_id=(
+            str(task.id) if running or queued_runtime_evidence else None
+        ),
+        handle_generation=(1 if running or queued_runtime_evidence else None),
+        lease_token=(digest if running else None),
+        heartbeat_at=(datetime.utcnow() if running else None),
+        started_at=(datetime.utcnow() if running else None),
+        output_kind=("plan_version" if result_ready else None),
+        output_id=(task.id if result_ready else None),
+        output_hash=(digest if result_ready else None),
+        completed_at=(datetime.utcnow() if result_ready else None),
+    )
+    db.add(execution)
+    await db.flush()
+    outbox = CapabilityResumeOutbox(
+        task_id=task.id,
+        invocation_id=invocation.id,
+        active_task_id=task.id,
+        active_invocation_id=invocation.id,
+        status="pending",
+        state_version=1,
+        request_task_incarnation_id=task.incarnation_id,
+        request_task_retry_count=task.retry_count,
+        from_turn_generation=task.turn_generation,
+        request_task_session_id=task.session_id,
+        request_source_log_id=source_log_id,
+        request_output_log_id=output_log_id,
+        request_terminal_log_id=terminal_log_id,
+    )
+    db.add(outbox)
+    await db.commit()
+    return task.id, invocation.id, execution.id, outbox.id
+
+
+async def _promote_waiting_capability_to_released_claimed_g_plus_one(
+    db,
+    *,
+    task_id: int,
+    invocation_id: int,
+    execution_id: int,
+    outbox_id: int,
+) -> None:
+    """Model the canonical claimed G+1 state after pre-provider release."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    from backend.services.terminal_arbitration import bind_turn_source
+
+    digest = "d" * 64
+    task = await db.get(Task, task_id, populate_existing=True)
+    invocation = await db.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    execution = await db.get(
+        CapabilityExecution,
+        execution_id,
+        populate_existing=True,
+    )
+    outbox = await db.get(
+        CapabilityResumeOutbox,
+        outbox_id,
+        populate_existing=True,
+    )
+    task.turn_generation = outbox.from_turn_generation + 1
+    task.instance_id = 77
+    source = await bind_turn_source(
+        db,
+        task,
+        None,
+        instance_id=77,
+        transport=None,
+    )
+    task.status = "waiting_capability"
+    task.instance_id = None
+
+    now = datetime.utcnow()
+    invocation.status = "resuming"
+    invocation.state_version += 1
+    invocation.result_kind = "plan_version"
+    invocation.result_id = task.id
+    invocation.result_hash = digest
+    invocation.ready_at = now
+    execution.status = "completed"
+    execution.state_version += 1
+    execution.active_invocation_id = None
+    execution.output_kind = "plan_version"
+    execution.output_id = task.id
+    execution.output_hash = digest
+    execution.completed_at = now
+    outbox.status = "claimed"
+    outbox.state_version += 1
+    outbox.invocation_terminal_status = "completed"
+    outbox.invocation_result_kind = "plan_version"
+    outbox.invocation_result_id = task.id
+    outbox.invocation_result_hash = digest
+    outbox.resume_payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "result": {"kind": "plan_version", "id": task.id},
+    }
+    outbox.resume_payload_hash = digest
+    outbox.resume_source_log_id = source.id
+    outbox.claimed_turn_generation = task.turn_generation
+    outbox.attempt_count = 1
+    outbox.ready_at = now
+    outbox.claimed_at = now
+    outbox.lease_token = None
+    outbox.lease_expires_at = None
+    await db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_waiting_capability_queued_terminal_request_is_atomic(
+    client,
+    session_factory,
+    endpoint,
+    terminal_status,
+):
+    """No-runtime queued work, its outbox, and Task settle in this order."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(db)
+        )
+
+    response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == terminal_status
+        assert invocation.status == "cancelled"
+        assert invocation.active_task_id is None
+        assert execution.status == "cancelled"
+        assert execution.active_invocation_id is None
+        assert outbox.status == "cancelled"
+        assert outbox.active_task_id is None
+        assert outbox.active_invocation_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_waiting_capability_released_claimed_g_plus_one_can_stop(
+    client,
+    session_factory,
+    endpoint,
+    terminal_status,
+):
+    """A released pre-provider G+1 is replayable, but also stoppable."""
+
+    from backend.models.capability import (
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="resuming",
+            )
+        )
+    async with session_factory() as db:
+        await _promote_waiting_capability_to_released_claimed_g_plus_one(
+            db,
+            task_id=task_id,
+            invocation_id=invocation_id,
+            execution_id=execution_id,
+            outbox_id=outbox_id,
+        )
+
+    response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == terminal_status
+        assert task.turn_generation == 8
+        assert invocation.status == "cancelled"
+        assert outbox.status == "cancelled"
+        assert outbox.claimed_turn_generation == 8
+        assert outbox.resume_source_log_id == task.turn_source_log_id
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_quiesces_inflight_claim_before_cancelling(
+    client,
+    session_factory,
+):
+    """A consumer claiming G+1 on cancellation cannot race the Invocation."""
+
+    from backend.models.capability import (
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="resuming",
+            )
+        )
+
+    worker_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def claim_while_unwinding():
+        worker_started.set()
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            async with session_factory() as db:
+                await _promote_waiting_capability_to_released_claimed_g_plus_one(
+                    db,
+                    task_id=task_id,
+                    invocation_id=invocation_id,
+                    execution_id=execution_id,
+                    outbox_id=outbox_id,
+                )
+
+    worker = asyncio.create_task(claim_while_unwinding())
+    backend.main.dispatcher._task_queue_workers[task_id] = worker
+    await worker_started.wait()
+    try:
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+    finally:
+        backend.main.dispatcher._task_queue_workers.pop(task_id, None)
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "cancelled"
+        assert task.turn_generation == 8
+        assert invocation.status == "cancelled"
+        assert outbox.status == "cancelled"
+        assert outbox.resume_actual_transport is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_claimed_capability_resume_live_worker_stops_before_outbox_cancel(
+    client,
+    session_factory,
+    monkeypatch,
+    endpoint,
+    terminal_status,
+):
+    """Stop/cancel joins real claimed G+1 before settling its outbox."""
+
+    import backend.api.tasks as tasks_module
+    import backend.main
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.instance import Instance
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    from backend.services.capability_resume import materialize_resume_outbox
+    from backend.tests.test_capability_resume import (
+        _install_fake_result,
+        _seed_resume,
+    )
+    from backend.tests.test_service_dispatcher import _make_dispatcher
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_find_session_jsonl",
+        lambda _session_id, provider="claude": "/tmp/fake.jsonl",
+    )
+    dispatcher = _make_dispatcher(session_factory)
+    dispatcher._resolve_resume_config_dir = AsyncMock(return_value=None)
+
+    async with session_factory() as db:
+        seed = await _seed_resume(db, invocation_status="ready")
+        instance = Instance(name="claimed-resume-stop", status="idle")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+    _install_fake_result(monkeypatch, seed.execution_id)
+    async with session_factory() as db:
+        ready = await materialize_resume_outbox(db, seed.outbox_id)
+    assert ready is not None and ready.status == "ready"
+
+    launch_entered = asyncio.Event()
+    async def block_before_provider_boundary(**kwargs):
+        assert kwargs["task_id"] == seed.task_id
+        assert kwargs["instance_id"] == instance_id
+        assert kwargs["task_turn_generation"] == 8
+        assert callable(kwargs["on_launch_admitted"])
+        launch_entered.set()
+        # Never invoke the provider-boundary callback. Cancellation must join
+        # this exact pre-provider worker before changing the durable outbox.
+        await asyncio.Event().wait()
+
+    dispatcher.instance_manager.launch = AsyncMock(
+        side_effect=block_before_provider_boundary
+    )
+
+    with (
+        patch.object(backend.main, "dispatcher", dispatcher),
+        patch.object(
+            backend.main,
+            "instance_manager",
+            dispatcher.instance_manager,
+        ),
+    ):
+        assert await dispatcher.enqueue_capability_resume(seed.outbox_id)
+        await asyncio.wait_for(launch_entered.wait(), timeout=2)
+
+        async with session_factory() as db:
+            claimed_task = await db.get(Task, seed.task_id)
+            claimed_outbox = await db.get(
+                CapabilityResumeOutbox,
+                seed.outbox_id,
+            )
+            claimed_source = await db.get(
+                LogEntry,
+                claimed_outbox.resume_source_log_id,
+            )
+            claimed_lease = claimed_outbox.lease_token
+            claimed_source_id = claimed_source.id
+            assert claimed_task.status == "executing"
+            assert claimed_task.turn_generation == 8
+            assert claimed_task.instance_id == instance_id
+            assert claimed_task.turn_source_log_id == claimed_source.id
+            assert claimed_outbox.status == "claimed"
+            assert claimed_outbox.claimed_turn_generation == 8
+            assert isinstance(claimed_lease, str) and len(claimed_lease) == 64
+            assert claimed_source.actual_transport is None
+            assert claimed_source.instance_id == instance_id
+
+        response = await client.post(
+            f"/api/tasks/{seed.task_id}/{endpoint}"
+        )
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, seed.task_id)
+        invocation = await db.get(
+            CapabilityInvocation,
+            seed.invocation_id,
+        )
+        execution = await db.get(
+            CapabilityExecution,
+            seed.execution_id,
+        )
+        outbox = await db.get(CapabilityResumeOutbox, seed.outbox_id)
+        source = await db.get(LogEntry, claimed_source_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == terminal_status
+        assert task.turn_generation == 8
+        assert task.instance_id is None
+        assert task.turn_source_log_id == claimed_source_id
+        assert invocation.status == "cancelled"
+        assert invocation.active_task_id is None
+        assert execution.status == "completed"
+        assert execution.active_invocation_id is None
+        assert outbox.status == "cancelled"
+        assert outbox.claimed_turn_generation == 8
+        assert outbox.resume_source_log_id == claimed_source_id
+        assert outbox.lease_token is None
+        assert outbox.resume_actual_transport is None
+        assert outbox.launched_at is None
+        assert source.actual_transport is None
+        assert source.instance_id == instance_id
+        assert instance.status == "idle"
+        assert instance.current_task_id is None
+
+    assert seed.task_id not in dispatcher._task_queue_workers
+    assert seed.task_id not in dispatcher._task_queue_active_messages
+    assert seed.task_id not in dispatcher._task_queue_inflight
+    assert seed.outbox_id not in dispatcher._queued_capability_resume_ids
+    assert instance_id not in dispatcher._instance_claim_owners
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_launched_outbox_fails_closed(
+    client,
+    session_factory,
+):
+    """Provider-boundary evidence must survive an inconsistent waiting Task."""
+
+    from backend.models.capability import (
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="resuming",
+            )
+        )
+    async with session_factory() as db:
+        await _promote_waiting_capability_to_released_claimed_g_plus_one(
+            db,
+            task_id=task_id,
+            invocation_id=invocation_id,
+            execution_id=execution_id,
+            outbox_id=outbox_id,
+        )
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        source = await db.get(LogEntry, outbox.resume_source_log_id)
+        now = datetime.utcnow()
+        source.actual_transport = "claude_exec"
+        outbox.status = "launched"
+        outbox.state_version += 1
+        outbox.active_task_id = None
+        outbox.active_invocation_id = None
+        outbox.resume_actual_transport = "claude_exec"
+        outbox.launched_at = now
+        await db.commit()
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort:
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert invocation.status == "resuming"
+        assert outbox.status == "launched"
+        assert outbox.resume_actual_transport == "claude_exec"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability_key", "executor_kind", "endpoint", "terminal_status"),
+    (
+        pytest.param(
+            "plan",
+            "plan_agent",
+            "stop-session",
+            "completed",
+            id="running-plan-stop",
+        ),
+        pytest.param(
+            "code_review",
+            "code_review_task",
+            "cancel",
+            "cancelled",
+            id="running-review-cancel",
+        ),
+    ),
+)
+async def test_waiting_capability_running_executor_stops_before_outbox(
+    client,
+    session_factory,
+    capability_key,
+    executor_kind,
+    endpoint,
+    terminal_status,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                capability_key=capability_key,
+                executor_kind=executor_kind,
+                invocation_status="running",
+            )
+        )
+
+    order: list[str] = []
+
+    async def cancel_executor(callback_db, *, invocation_id: int):
+        order.append("executor")
+        invocation = await callback_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        execution = await callback_db.get(
+            CapabilityExecution,
+            execution_id,
+            populate_existing=True,
+        )
+        now = datetime.utcnow()
+        execution.status = "cancelled"
+        execution.state_version += 1
+        execution.active_invocation_id = None
+        execution.completed_at = now
+        invocation.status = "cancelled"
+        invocation.state_version += 1
+        invocation.active_task_id = None
+        invocation.completed_at = now
+        await callback_db.commit()
+
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=cancel_executor)
+    definition = MagicMock(
+        executor_kind=executor_kind,
+        executor=executor,
+    )
+    original_abort = backend.main.dispatcher.abort_task_queue
+
+    async def observed_abort(*args, **kwargs):
+        assert order == ["executor"]
+        order.append("outbox")
+        return await original_abort(*args, **kwargs)
+
+    with (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=definition,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            side_effect=observed_abort,
+        ),
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    assert order == ["executor", "outbox"]
+    executor.cancel.assert_awaited_once()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == terminal_status
+        assert outbox.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_executor_failure_preserves_task_and_outbox(
+    client,
+    session_factory,
+):
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, _invocation_id, _execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=RuntimeError("stop failed"))
+    definition = MagicMock(executor_kind="plan_agent", executor=executor)
+
+    with (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=definition,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+        ) as abort,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invocation_status", ("queued", "running"))
+async def test_waiting_capability_noop_cancellation_fails_closed(
+    client,
+    session_factory,
+    invocation_status,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status=invocation_status,
+            )
+        )
+
+    noop = AsyncMock(return_value=None)
+    registry_patch = (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=MagicMock(
+                executor_kind="plan_agent",
+                executor=MagicMock(cancel=noop),
+            ),
+        )
+        if invocation_status == "running"
+        else patch(
+            "backend.services.capability_service.cancel_invocation",
+            new=noop,
+        )
+    )
+    with (
+        registry_patch,
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+        ) as abort,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "did not reach one durable terminal state" in response.json()["detail"]
+    noop.assert_awaited_once()
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert invocation.status == invocation_status
+        assert execution.status == invocation_status
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_case", ["missing", "mismatched"])
+async def test_waiting_capability_active_executor_registry_fails_closed(
+    client,
+    session_factory,
+    registry_case,
+):
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, _invocation_id, _execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+    definition = None
+    if registry_case == "mismatched":
+        definition = MagicMock(
+            executor_kind="wrong_executor_kind",
+            executor=MagicMock(cancel=AsyncMock()),
+        )
+
+    with (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=definition,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+        ) as abort,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "unavailable or mismatched" in response.json()["detail"]
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_executor_ack_loss_uses_durable_readback(
+    client,
+    session_factory,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+
+    async def cancel_then_lose_ack(callback_db, *, invocation_id: int):
+        invocation = await callback_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        execution = await callback_db.get(
+            CapabilityExecution,
+            execution_id,
+            populate_existing=True,
+        )
+        now = datetime.utcnow()
+        invocation.status = "cancelled"
+        invocation.state_version += 1
+        invocation.active_task_id = None
+        invocation.completed_at = now
+        execution.status = "cancelled"
+        execution.state_version += 1
+        execution.active_invocation_id = None
+        execution.completed_at = now
+        await callback_db.commit()
+        raise ConnectionError("response acknowledgement lost")
+
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=cancel_then_lose_ack)
+    definition = MagicMock(executor_kind="plan_agent", executor=executor)
+    with patch(
+        "backend.services.capability_registry.resolve_capability",
+        return_value=definition,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "cancelled"
+        assert invocation.status == "cancelled"
+        assert execution.status == "cancelled"
+        assert outbox.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_client_cancel_cannot_break_cleanup_barrier(
+    client,
+    session_factory,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+    entered = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def delayed_cancel(callback_db, *, invocation_id: int):
+        entered.set()
+        await allow_finish.wait()
+        invocation = await callback_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        execution = await callback_db.get(
+            CapabilityExecution,
+            execution_id,
+            populate_existing=True,
+        )
+        now = datetime.utcnow()
+        invocation.status = "cancelled"
+        invocation.state_version += 1
+        invocation.active_task_id = None
+        invocation.completed_at = now
+        execution.status = "cancelled"
+        execution.state_version += 1
+        execution.active_invocation_id = None
+        execution.completed_at = now
+        await callback_db.commit()
+
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=delayed_cancel)
+    definition = MagicMock(executor_kind="plan_agent", executor=executor)
+    with patch(
+        "backend.services.capability_registry.resolve_capability",
+        return_value=definition,
+    ):
+        request = asyncio.create_task(
+            client.post(f"/api/tasks/{task_id}/cancel")
+        )
+        await entered.wait()
+        request.cancel()
+        await asyncio.sleep(0)
+        assert not request.done()
+        allow_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "cancelled"
+        assert invocation.status == "cancelled"
+        assert execution.status == "cancelled"
+        assert outbox.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_queued_runtime_evidence_fails_closed(
+    client,
+    session_factory,
+):
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, _invocation_id, _execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                queued_runtime_evidence=True,
+            )
+        )
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort:
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "no-runtime proof" in response.json()["detail"]
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_update_task_yields_to_receipt_after_api_precheck(
     client,
     session_factory,

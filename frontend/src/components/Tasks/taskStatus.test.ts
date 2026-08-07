@@ -39,3 +39,13 @@ describe('getTaskStatusLabel Delivery projection', () => {
     }))).toBe('Delivery Failed');
   });
 });
+
+describe('getTaskStatusLabel Capability projection', () => {
+  it('renders the durable waiting state as a user-facing status', () => {
+    expect(getTaskStatusLabel({
+      mode: 'auto',
+      status: 'waiting_capability',
+      background_active: false,
+    } as Task)).toBe('Waiting Capability');
+  });
+});

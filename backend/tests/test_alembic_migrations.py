@@ -61,7 +61,8 @@ CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
 AUTO_CAPABILITY_TURN_REVISION = "c3a7e9f1b2d4"
 TERMINAL_ARBITRATION_REVISION = "4b8d2f6a1c90"
-CURRENT_HEAD_REVISION = TERMINAL_ARBITRATION_REVISION
+CAPABILITY_RESUME_OUTBOX_REVISION = "7c1e4a9d2f60"
+CURRENT_HEAD_REVISION = CAPABILITY_RESUME_OUTBOX_REVISION
 PUBLISHED_PLAN_CLEANUP_SHA256 = (
     "dd8cce93f05599ebc580cb95cad5d7d8875f03415775312718d3e42ef4369d16"
 )
@@ -117,6 +118,23 @@ def _load_terminal_arbitration_migration(module_suffix: str = "test"):
     )
     spec = importlib.util.spec_from_file_location(
         f"terminal_arbitration_migration_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_capability_resume_outbox_migration(module_suffix: str = "test"):
+    migration_path = (
+        PROJECT_ROOT
+        / "alembic"
+        / "versions"
+        / "7c1e4a9d2f60_add_capability_resume_outbox.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"capability_resume_outbox_migration_{module_suffix}",
         migration_path,
     )
     assert spec is not None and spec.loader is not None
@@ -2811,6 +2829,272 @@ class TestTerminalArbitrationMigration:
                     module._mysql_upgrade_auxiliary_online()
 
 
+class TestCapabilityResumeOutboxDialectMigration:
+    def test_postgresql_offline_sql_fences_preflight_before_ddl(self):
+        module = _load_capability_resume_outbox_migration("postgresql_offline")
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        upgrade_output = io.StringIO()
+        upgrade_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": upgrade_output},
+        )
+        with patch.object(module, "op", Operations(upgrade_context)):
+            module.upgrade()
+        upgrade_ddl = upgrade_output.getvalue().lower()
+        upgrade_lock = (
+            "lock table capability_invocations in access exclusive mode"
+        )
+        upgrade_guard = "do $ccm_capability_resume_outbox_upgrade$"
+        first_upgrade_ddl = min(
+            upgrade_ddl.index("alter table"),
+            upgrade_ddl.index("create table capability_resume_outbox"),
+        )
+        assert upgrade_ddl.index(upgrade_lock) < upgrade_ddl.index(upgrade_guard)
+        assert upgrade_ddl.index(upgrade_guard) < first_upgrade_ddl
+        assert "where source = 'agent_request'" in upgrade_ddl
+        assert "exact identities cannot be reconstructed" in upgrade_ddl
+
+        downgrade_output = io.StringIO()
+        downgrade_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": downgrade_output},
+        )
+        with patch.object(module, "op", Operations(downgrade_context)):
+            module.downgrade()
+        downgrade_ddl = downgrade_output.getvalue().lower()
+        downgrade_lock = (
+            "lock table capability_invocations, capability_resume_outbox "
+            "in access exclusive mode"
+        )
+        guard = "do $ccm_capability_resume_outbox$"
+        first_drop = min(
+            downgrade_ddl.index("drop index"),
+            downgrade_ddl.index("drop table"),
+        )
+        assert downgrade_ddl.index(downgrade_lock) < downgrade_ddl.index(guard)
+        assert downgrade_ddl.index(guard) < first_drop
+        assert "select 1 from capability_resume_outbox" in downgrade_ddl
+        assert "where source = 'agent_request'" in downgrade_ddl
+        assert downgrade_ddl.count("raise exception") == 2
+
+    @pytest.mark.parametrize("direction", ("upgrade", "downgrade"))
+    def test_mysql_offline_sql_is_refused_before_output(self, direction):
+        module = _load_capability_resume_outbox_migration(
+            f"mysql_offline_{direction}"
+        )
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(context)),
+            pytest.raises(RuntimeError, match="refuses MySQL offline SQL"),
+        ):
+            getattr(module, direction)()
+        assert output.getvalue() == ""
+
+    def test_mysql_check_reflection_accepts_charset_introducers_only(self):
+        module = _load_capability_resume_outbox_migration(
+            "mysql_charset_reflection"
+        )
+        reflected = module._NEW_AGENT_REQUEST_IDENTITY
+        for literal in ("agent_request", "advisory", "resume_task"):
+            reflected = reflected.replace(
+                f"'{literal}'",
+                f"_utf8mb4'{literal}'",
+            )
+        reflected = f"CHECK ((({reflected.replace('source <>', '`source` <>', 1)})))"
+
+        assert module._check_shape(reflected) == module._check_shape(
+            module._NEW_AGENT_REQUEST_IDENTITY
+        )
+        assert module._check_shape(
+            reflected.replace(
+                "request_protocol_version >= 1",
+                "request_protocol_version >= 0",
+            )
+        ) != module._check_shape(module._NEW_AGENT_REQUEST_IDENTITY)
+
+    def test_mysql_partial_outbox_preflight_precedes_capability_ddl(self):
+        module = _load_capability_resume_outbox_migration(
+            "mysql_partial_outbox_preflight"
+        )
+        with (
+            patch.object(
+                module,
+                "_mysql_capability_state",
+                side_effect=("old", "new"),
+            ),
+            patch.object(
+                module,
+                "_mysql_outbox_state",
+                side_effect=RuntimeError("partial column set"),
+            ),
+            patch.object(module, "_assert_zero_agent_requests"),
+            patch.object(module, "_mysql_alter_capability") as alter,
+            patch.object(module, "_create_outbox_table") as create_table,
+            pytest.raises(RuntimeError, match="partial column set"),
+        ):
+            module._upgrade_mysql()
+        alter.assert_not_called()
+        create_table.assert_not_called()
+
+    def test_mysql_legacy_preflight_rejects_before_any_ddl(self):
+        module = _load_capability_resume_outbox_migration(
+            "mysql_legacy_preflight"
+        )
+        with (
+            patch.object(module, "_mysql_capability_state", return_value="old"),
+            patch.object(module, "_mysql_outbox_state", return_value=False),
+            patch.object(
+                module,
+                "_assert_zero_agent_requests",
+                side_effect=RuntimeError("zero agent requests required"),
+            ),
+            patch.object(module, "_mysql_alter_capability") as alter,
+            patch.object(module, "_create_outbox_table") as create_table,
+            patch.object(module, "op") as fake_op,
+            pytest.raises(RuntimeError, match="zero agent requests required"),
+        ):
+            module._upgrade_mysql()
+        alter.assert_not_called()
+        create_table.assert_not_called()
+        fake_op.create_index.assert_not_called()
+
+    def test_mysql_missing_index_suffix_replays_without_recreating_table(self):
+        module = _load_capability_resume_outbox_migration(
+            "mysql_outbox_index_replay"
+        )
+        due = "ix_cap_resume_outbox_due"
+        reflected_indexes = [
+            {"ix_cap_resume_outbox_task_created": ("task_id", "created_at")},
+            dict(module._OUTBOX_INDEXES),
+        ]
+        with (
+            patch.object(module, "_mysql_capability_state", return_value="new"),
+            patch.object(module, "_mysql_outbox_state", return_value=True),
+            patch.object(
+                module,
+                "_mysql_outbox_indexes",
+                side_effect=reflected_indexes,
+            ),
+            patch.object(module, "op") as fake_op,
+            patch.object(module, "_mysql_alter_capability") as alter,
+            patch.object(module, "_create_outbox_table") as create_table,
+        ):
+            module._upgrade_mysql()
+        fake_op.create_index.assert_called_once_with(
+            due,
+            "capability_resume_outbox",
+            ["status", "next_attempt_at"],
+            unique=False,
+        )
+        alter.assert_not_called()
+        create_table.assert_not_called()
+
+    def test_mysql_completed_capability_alter_replays_missing_outbox_only(self):
+        module = _load_capability_resume_outbox_migration(
+            "mysql_outbox_create_replay"
+        )
+        reflected_indexes = [
+            {},
+            dict(module._OUTBOX_INDEXES),
+        ]
+        with (
+            patch.object(module, "_mysql_capability_state", return_value="new"),
+            patch.object(
+                module,
+                "_mysql_outbox_state",
+                side_effect=(False, True),
+            ) as outbox_state,
+            patch.object(
+                module,
+                "_mysql_outbox_indexes",
+                side_effect=reflected_indexes,
+            ),
+            patch.object(module, "op") as fake_op,
+            patch.object(module, "_mysql_alter_capability") as alter,
+            patch.object(module, "_create_outbox_table") as create_table,
+        ):
+            module._upgrade_mysql()
+        create_table.assert_called_once_with()
+        assert outbox_state.call_count == 2
+        alter.assert_not_called()
+        assert fake_op.create_index.call_count == len(module._OUTBOX_INDEXES)
+        for name, columns in module._OUTBOX_INDEXES.items():
+            fake_op.create_index.assert_any_call(
+                name,
+                "capability_resume_outbox",
+                list(columns),
+                unique=False,
+            )
+
+    def test_mysql_downgrade_never_drops_before_both_writer_gates(self):
+        module = _load_capability_resume_outbox_migration(
+            "mysql_downgrade_gate_order"
+        )
+        events: list[str] = []
+        capability_checks: set[str] = set()
+        outbox_checks: set[str] = set(module._OUTBOX_CHECKS)
+
+        def alter(actions):
+            joined = " ".join(actions)
+            if joined.startswith(
+                f"ADD CONSTRAINT {module._MYSQL_CAPABILITY_GATE}"
+            ):
+                capability_checks.add(module._MYSQL_CAPABILITY_GATE)
+                events.append("capability_gate")
+            else:
+                capability_checks.discard(module._MYSQL_CAPABILITY_GATE)
+                events.append("capability_downgrade")
+
+        def execute(statement):
+            assert module._MYSQL_OUTBOX_GATE in str(statement)
+            outbox_checks.add(module._MYSQL_OUTBOX_GATE)
+            events.append("outbox_gate")
+
+        def drop_table(table_name):
+            assert table_name == "capability_resume_outbox"
+            assert events[:2] == ["capability_gate", "outbox_gate"]
+            events.append("drop_outbox")
+
+        fake_op = SimpleNamespace(execute=execute, drop_table=drop_table)
+        with (
+            patch.object(module, "_mysql_capability_state", side_effect=("new", "old")),
+            patch.object(module, "_mysql_outbox_state", return_value=True),
+            patch.object(
+                module,
+                "_mysql_capability_has_gate",
+                side_effect=lambda: module._MYSQL_CAPABILITY_GATE
+                in capability_checks,
+            ),
+            patch.object(
+                module,
+                "_mysql_outbox_has_gate",
+                side_effect=lambda: module._MYSQL_OUTBOX_GATE in outbox_checks,
+            ),
+            patch.object(module, "_assert_downgrade_empty"),
+            patch.object(module, "_mysql_alter_capability", side_effect=alter),
+            patch.object(module, "op", fake_op),
+        ):
+            module._downgrade_mysql()
+
+        assert events == [
+            "capability_gate",
+            "outbox_gate",
+            "drop_outbox",
+            "capability_downgrade",
+        ]
+
+
 class TestCodeReviewMigration:
     def test_refuses_review_history_or_reviewer_task_downgrade(self, tmp_path):
         db_path = str(tmp_path / "code-review-downgrade-guard.db")
@@ -2870,7 +3154,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -4335,6 +4619,10 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(CAPABILITY_RESUME_OUTBOX_REVISION).down_revision
+            == TERMINAL_ARBITRATION_REVISION
+        )
         assert (
             script.get_revision(TERMINAL_ARBITRATION_REVISION).down_revision
             == AUTO_CAPABILITY_TURN_REVISION

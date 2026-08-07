@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.dialects import mysql, postgresql, sqlite
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.sql.dml import Update
@@ -15,7 +15,11 @@ from backend.config import settings
 from backend.database import Base
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
-from backend.models.capability import CapabilityExecution, CapabilityInvocation
+from backend.models.capability import (
+    CapabilityExecution,
+    CapabilityInvocation,
+    CapabilityResumeOutbox,
+)
 from backend.models.code_review import CodeReviewResult, CodeReviewRun
 from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
 from backend.models.plan import Plan
@@ -30,6 +34,7 @@ from backend.services.delivery_service import DeliveryCreateSpec, create_deliver
 from backend.services.task_sharing import lock_task_share_authority
 from backend.services.task_queue import (
     TaskQueue,
+    TaskWaitingCapabilityConflict,
     _effective_key_expr,
     task_delete_fence,
     task_generation_fence,
@@ -151,6 +156,27 @@ async def test_update_task_honors_already_held_operation_lock(queue):
 
 
 @pytest.mark.asyncio
+async def test_update_task_rejects_waiting_capability_but_allows_read_marker(queue):
+    task = await queue.create(title="waiting edit", description="d")
+    task.status = "waiting_capability"
+    task.has_unread = True
+    await queue.db.commit()
+    task_id = task.id
+
+    with pytest.raises(TaskWaitingCapabilityConflict, match="waiting"):
+        await queue.update_task(task_id, title="must not change")
+
+    marked = await queue.update_task(
+        task_id,
+        has_unread=False,
+    )
+    assert marked is not None
+    assert marked.status == "waiting_capability"
+    assert marked.title == "waiting edit"
+    assert marked.has_unread is False
+
+
+@pytest.mark.asyncio
 async def test_update_task_loses_cleanly_to_concurrent_wal_receipt(tmp_path):
     """An authorization snapshot cannot produce BUSY_SNAPSHOT on edit."""
 
@@ -200,6 +226,56 @@ async def test_update_task_loses_cleanly_to_concurrent_wal_receipt(tmp_path):
         async with sessions() as verify:
             current = await verify.get(Task, task_id)
             assert current is not None
+            assert current.title == "old title"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_update_task_loses_cleanly_to_concurrent_wal_capability_wait(tmp_path):
+    """A stale authorization read cannot edit across capability admission."""
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'task-update-capability.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            task = Task(title="old title", description="d", status="completed")
+            setup.add(task)
+            await setup.commit()
+            task_id = task.id
+
+        async with sessions() as editor:
+            observed = await editor.get(Task, task_id)
+            assert observed is not None
+            assert editor.in_transaction()
+            async with sessions() as admission:
+                await admission.execute(
+                    update(Task)
+                    .where(Task.id == task_id)
+                    .values(status="waiting_capability")
+                )
+                await admission.commit()
+
+            with pytest.raises(TaskWaitingCapabilityConflict, match="waiting"):
+                await TaskQueue(editor).update_task(
+                    task_id,
+                    title="must not cross capability admission",
+                )
+
+        async with sessions() as verify:
+            current = await verify.get(Task, task_id)
+            assert current is not None
+            assert current.status == "waiting_capability"
             assert current.title == "old title"
     finally:
         await engine.dispose()
@@ -495,6 +571,26 @@ async def test_retry_increments_count(queue):
     assert retried.status == "pending"
     assert retried.retry_count == 1
     assert retried.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_retry_cannot_opt_waiting_capability_into_retryable_statuses(queue):
+    task = await queue.create(title="waiting retry", description="d")
+    task.status = "waiting_capability"
+    await queue.db.commit()
+    task_id = task.id
+
+    retried = await queue.retry(
+        task_id,
+        expected_statuses=("waiting_capability",),
+    )
+
+    assert retried is None
+    queue.db.expire_all()
+    current = await queue.db.get(Task, task_id)
+    assert current is not None
+    assert current.status == "waiting_capability"
+    assert current.retry_count == 0
 
 
 @pytest.mark.asyncio
@@ -1137,6 +1233,52 @@ def _capability_invocation_for_delete(
     )
 
 
+def _capability_outbox_for_delete(
+    task: Task,
+    invocation: CapabilityInvocation,
+    *,
+    status: str,
+) -> CapabilityResumeOutbox:
+    terminal = status in {"completed", "cancelled", "failed"}
+    now = datetime.utcnow()
+    return CapabilityResumeOutbox(
+        task_id=task.id,
+        invocation_id=invocation.id,
+        active_task_id=(task.id if not terminal else None),
+        active_invocation_id=(invocation.id if not terminal else None),
+        status=status,
+        state_version=1,
+        request_task_incarnation_id=task.incarnation_id,
+        request_task_retry_count=task.retry_count,
+        from_turn_generation=task.turn_generation,
+        request_task_session_id=task.session_id,
+        request_source_log_id=101,
+        request_output_log_id=102,
+        request_terminal_log_id=103,
+        error_code="settled" if status in {"cancelled", "failed"} else None,
+        error_message=(
+            "resume settled before launch"
+            if status in {"cancelled", "failed"}
+            else None
+        ),
+        created_at=now,
+        updated_at=now,
+        completed_at=now if terminal else None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_delete_waiting_capability_task_rejected(queue):
+    task = await queue.create(title="waiting capability", description="d")
+    task.status = "waiting_capability"
+    await queue.db.commit()
+    task_id = task.id
+
+    assert await queue.delete(task_id) is False
+    queue.db.expire_all()
+    assert await queue.db.get(Task, task_id) is not None
+
+
 @pytest.mark.asyncio
 async def test_delete_task_rejects_active_capability(queue):
     task = await queue.create(title="active capability", description="d")
@@ -1168,6 +1310,27 @@ async def test_delete_task_rejects_active_capability(queue):
 
 
 @pytest.mark.asyncio
+async def test_delete_task_rejects_active_capability_resume_outbox(queue):
+    task = await queue.create(title="active resume outbox", description="d")
+    task.status = "completed"
+    invocation = _capability_invocation_for_delete(task.id, status="failed")
+    queue.db.add(invocation)
+    await queue.db.flush()
+    outbox = _capability_outbox_for_delete(task, invocation, status="pending")
+    queue.db.add(outbox)
+    await queue.db.commit()
+    task_id = task.id
+    invocation_id = invocation.id
+    outbox_id = outbox.id
+
+    assert await queue.delete(task_id) is False
+    queue.db.expire_all()
+    assert await queue.db.get(Task, task_id) is not None
+    assert await queue.db.get(CapabilityInvocation, invocation_id) is not None
+    assert await queue.db.get(CapabilityResumeOutbox, outbox_id) is not None
+
+
+@pytest.mark.asyncio
 async def test_delete_task_explicitly_removes_terminal_capability_history(queue):
     task = await queue.create(title="terminal capability", description="d")
     task.status = "completed"
@@ -1186,15 +1349,24 @@ async def test_delete_task_explicitly_removes_terminal_capability_history(queue)
         error_code="finished",
     )
     queue.db.add(execution)
+    await queue.db.flush()
+    outbox = _capability_outbox_for_delete(
+        task,
+        invocation,
+        status="cancelled",
+    )
+    queue.db.add(outbox)
     await queue.db.commit()
     task_id = task.id
     invocation_id = invocation.id
     execution_id = execution.id
+    outbox_id = outbox.id
 
     assert await queue.delete(task_id) is True
     assert await queue.db.get(Task, task_id) is None
     assert await queue.db.get(CapabilityInvocation, invocation_id) is None
     assert await queue.db.get(CapabilityExecution, execution_id) is None
+    assert await queue.db.get(CapabilityResumeOutbox, outbox_id) is None
 
 
 @pytest.mark.asyncio

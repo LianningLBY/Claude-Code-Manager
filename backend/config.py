@@ -75,8 +75,8 @@ class Settings(BaseSettings):
     plan_structured_output_whitespace_limit: int = 4_096
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
-    # Generic Plan/review capability admission. The storage/API can deploy
-    # dark; new invocations remain disabled until an executor adapter ships.
+    # Generic Plan/review capability admission. Dark by default; disabling it
+    # blocks only new admission, while already accepted work still recovers.
     capability_core_enabled: bool = False
     capability_coordinator_poll_interval_seconds: float = 2.0
     capability_coordinator_max_concurrency: int = 4

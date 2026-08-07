@@ -11,6 +11,8 @@ function titleCaseStatus(status: string): string {
 export function getTaskStatusLabel(task: Task): string {
   if (task.background_active) return 'Background';
 
+  if (task.status === 'waiting_capability') return 'Waiting Capability';
+
   if (task.mode === 'delivery_loop' && task.delivery_run_id != null) {
     if (task.delivery_phase === 'done') {
       if (task.delivery_outcome === 'success') return 'Ready to Merge';

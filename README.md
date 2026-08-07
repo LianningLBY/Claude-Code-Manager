@@ -79,11 +79,20 @@ Dispatcher 只负责分配任务和判断成败，Claude Code 自主完成整个
 **状态流转：**
 ```
 pending → in_progress → executing → completed
+                           ├─ (显式 Auto Capability policy，可选)
                            ↓
-                        (fail)
+                    waiting_capability
+                           ↓  Plan / Code Review 完成并恢复同一会话 G+1
+                       executing
                            ↓
-                        pending (retry)
+                         (fail)
+                           ↓
+                     pending (retry)
 ```
+
+Auto Capability 默认关闭。创建本地普通 Auto Task 时可显式允许 Plan / Code
+Review 并设置总预算与分类预算；任务卡片和聊天页会展示 policy、剩余预算及
+`waiting_capability` 等待状态。Worker、Shared 和其他 Task mode 不接受该 policy。
 
 ## 技术栈
 
@@ -527,7 +536,7 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `MAX_CONCURRENT_INSTANCES` | `5` | 最大并发 worker 数 |
 | `AUTO_START_DISPATCHER` | `true` | 启动时自动开始调度 |
 | `CAPABILITY_CORE_ENABLED` | `false` | 允许新建人工/Controller Capability invocation；已接纳工作不受关闭影响 |
-| `AUTO_CAPABILITY_ENABLED` | `false` | 独立允许模型请求 Plan/Code Review；同时要求 Capability Core，当前执行入口仍保持关闭 |
+| `AUTO_CAPABILITY_ENABLED` | `false` | 允许带显式 `capability_policy` 的本地普通 Auto Task 通过 exact terminal action 请求 Plan/Code Review，并由 durable outbox 恢复下一轮；同时要求 Capability Core |
 | `DELIVERY_LOOP_ENABLED` | `false` | 允许新建 Delivery Loop；同时要求 Capability Core |
 | `TASK_TIMEOUT_SECONDS` | `1800` | 单个任务最长执行时间（秒） |
 | `SERVICE_NAME` | (自动检测) | systemd 服务名，一键更新重启时使用 |

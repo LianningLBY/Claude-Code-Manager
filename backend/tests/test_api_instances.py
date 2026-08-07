@@ -49,6 +49,13 @@ def _make_mock_dispatcher():
     return mock
 
 
+def _make_mock_capability_resume_coordinator():
+    mock = MagicMock()
+    mock.start = AsyncMock()
+    mock.shutdown = AsyncMock()
+    return mock
+
+
 async def _assign_running_task(
     session_factory,
     instance_id: int,
@@ -1149,19 +1156,100 @@ async def test_dispatcher_status(client):
 @pytest.mark.asyncio
 async def test_dispatcher_start(client):
     mock_disp = _make_mock_dispatcher()
-    with patch("backend.main.dispatcher", mock_disp):
+    mock_resume = _make_mock_capability_resume_coordinator()
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
         resp = await client.post("/api/dispatcher/start")
     assert resp.status_code == 200
     mock_disp.start.assert_awaited_once()
+    mock_resume.start.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_stop(client):
     mock_disp = _make_mock_dispatcher()
-    with patch("backend.main.dispatcher", mock_disp):
+    mock_resume = _make_mock_capability_resume_coordinator()
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
         resp = await client.post("/api/dispatcher/stop")
     assert resp.status_code == 200
+    mock_resume.shutdown.assert_awaited_once()
     mock_disp.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_start_rolls_back_when_resume_start_fails(client):
+    state = {"dispatcher": False, "resume": False}
+
+    async def start_dispatcher_runtime():
+        state["dispatcher"] = True
+
+    async def stop_dispatcher_runtime():
+        state["dispatcher"] = False
+
+    async def start_resume_runtime():
+        raise RuntimeError("resume recovery failed")
+
+    async def stop_resume_runtime():
+        state["resume"] = False
+
+    mock_disp = _make_mock_dispatcher()
+    mock_disp.start.side_effect = start_dispatcher_runtime
+    mock_disp.stop.side_effect = stop_dispatcher_runtime
+    mock_resume = _make_mock_capability_resume_coordinator()
+    mock_resume.start.side_effect = start_resume_runtime
+    mock_resume.shutdown.side_effect = stop_resume_runtime
+
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
+        response = await client.post("/api/dispatcher/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "resume recovery failed"
+    assert state == {"dispatcher": False, "resume": False}
+    mock_resume.shutdown.assert_awaited_once_with()
+    mock_disp.stop.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_stop_restores_resume_when_dispatcher_stop_fails(
+    client,
+):
+    state = {"dispatcher": True, "resume": True}
+
+    async def stop_dispatcher_runtime():
+        raise RuntimeError("dispatch loop ignored cancellation")
+
+    async def stop_resume_runtime():
+        state["resume"] = False
+
+    async def start_resume_runtime():
+        state["resume"] = True
+
+    mock_disp = _make_mock_dispatcher()
+    mock_disp.stop.side_effect = stop_dispatcher_runtime
+    mock_resume = _make_mock_capability_resume_coordinator()
+    mock_resume.shutdown.side_effect = stop_resume_runtime
+    mock_resume.start.side_effect = start_resume_runtime
+
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
+        response = await client.post("/api/dispatcher/stop")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "dispatch loop ignored cancellation"
+    assert state == {"dispatcher": True, "resume": True}
+    mock_resume.shutdown.assert_awaited_once_with()
+    mock_disp.stop.assert_awaited_once_with()
+    mock_resume.start.assert_awaited_once_with()
 
 
 # === Ralph ===

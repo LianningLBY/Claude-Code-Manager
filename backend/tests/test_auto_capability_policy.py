@@ -4,9 +4,12 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import text
 
+from backend.config import settings
+from backend.models.task import Task
 from backend.schemas.capability import AutoCapabilityPolicy
 from backend.schemas.task import TaskCreate, TaskMigrationImport, TaskUpdate
 from backend.services.auto_capability_policy import (
+    build_auto_capability_instructions,
     normalize_auto_capability_policy,
 )
 
@@ -19,6 +22,70 @@ VALID_POLICY = {
         "code_review": 1,
     },
 }
+
+
+def test_model_protocol_requires_both_rollout_switches(monkeypatch):
+    task = Task(
+        title="protocol",
+        description="d",
+        mode="auto",
+        capability_policy=VALID_POLICY,
+    )
+
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "auto_capability_enabled", False)
+    assert build_auto_capability_instructions(task) is None
+
+    monkeypatch.setattr(settings, "capability_core_enabled", False)
+    monkeypatch.setattr(settings, "auto_capability_enabled", True)
+    assert build_auto_capability_instructions(task) is None
+
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    instructions = build_auto_capability_instructions(task)
+    assert instructions is not None
+    assert '"code_review"' in instructions
+    assert '"plan"' in instructions
+    assert instructions.count("<ccm_terminal_action>") == 1
+    assert 'For "plan"' in instructions
+    assert 'non-empty string "prompt"' in instructions
+    assert 'For "code_review"' in instructions
+    assert 'exactly string "base_sha" and "head_sha"' in instructions
+    assert "full immutable Git commit IDs" in instructions
+
+
+def test_model_protocol_only_describes_enabled_request_contracts(monkeypatch):
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "auto_capability_enabled", True)
+    task = Task(
+        title="plan only",
+        description="d",
+        mode="auto",
+        capability_policy={
+            "version": 1,
+            "max_invocations": 1,
+            "capabilities": {"plan": 1},
+        },
+    )
+
+    instructions = build_auto_capability_instructions(task)
+
+    assert instructions is not None
+    assert 'For "plan"' in instructions
+    assert 'For "code_review"' not in instructions
+
+
+def test_model_protocol_revalidates_persisted_task_scope(monkeypatch):
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "auto_capability_enabled", True)
+    task = Task(
+        title="invalid persisted scope",
+        description="d",
+        mode="goal",
+        capability_policy=VALID_POLICY,
+    )
+
+    with pytest.raises(ValueError, match="mode=auto"):
+        build_auto_capability_instructions(task)
 
 
 def test_policy_normalizes_capability_order_without_changing_budgets():

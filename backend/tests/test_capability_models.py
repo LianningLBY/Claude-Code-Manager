@@ -245,10 +245,12 @@ async def test_agent_invocation_exact_turn_shape_is_accepted(db_session):
     invocation = _invocation(task.id, "valid-agent-evidence")
     invocation.source = "agent_request"
     invocation.resume_policy = "resume_task"
+    invocation.request_task_incarnation_id = task.incarnation_id
     invocation.request_task_retry_count = 0
     invocation.request_task_turn_generation = 1
     invocation.request_source_log_id = 41
     invocation.request_output_log_id = 42
+    invocation.request_terminal_log_id = 43
     invocation.request_reason = "Review the completed turn"
     invocation.request_protocol_version = 1
     invocation.request_output_hash = "4" * 64

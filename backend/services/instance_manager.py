@@ -6383,6 +6383,156 @@ class InstanceManager:
                     state.session_id,
                 )
 
+    @asynccontextmanager
+    async def _chat_terminal_locks(self, task_id: int, instance_id: int):
+        """Acquire the shared capability -> Instance terminal lock order."""
+
+        from backend.services.capability_service import capability_task_lock
+
+        async with capability_task_lock(task_id):
+            async with self._instance_lifecycle_lock(instance_id):
+                yield
+
+    @asynccontextmanager
+    async def _chat_terminal_db(self, task_id: int, instance_id: int):
+        """Open one Task terminal transaction under the global lock order."""
+
+        async with self._chat_terminal_locks(task_id, instance_id):
+            async with self.db_factory() as db:
+                yield db
+
+    async def _apply_chat_terminal_to_locked_task(
+        self,
+        db: AsyncSession,
+        task: Task,
+        *,
+        instance_id: int,
+        successful_terminal: bool,
+        admit_agent_action: bool,
+        failure_sets_completed_at: bool,
+        failure_message: str,
+        settle_previous_resume: bool = True,
+    ) -> Any | None:
+        """Settle one exact chat turn inside a caller-owned transaction.
+
+        The caller owns ``capability_task_lock(task.id)``, the Instance
+        lifecycle lock, and the Task row lock, in that order.  The previous
+        resume outbox must be settled before interpreting this turn so a G+1
+        terminal action can atomically acquire the just-released capability
+        slot for G+2.  The returned admission is intentionally published only
+        after the caller also releases the exact Instance in the same commit.
+        """
+
+        if task.status not in {"executing", "in_progress"}:
+            raise RuntimeError(
+                "Capability resume settlement requires an active Task turn"
+            )
+
+        if settle_previous_resume:
+            from backend.services.capability_resume import (
+                settle_previous_resume_in_terminal_tx,
+            )
+
+            await settle_previous_resume_in_terminal_tx(db, task)
+        admission = None
+        if successful_terminal:
+            if (
+                admit_agent_action
+                and task.mode == "auto"
+                and task.capability_policy is not None
+            ):
+                from backend.services.agent_capability_admission import (
+                    AgentTerminalExpectation,
+                    admit_agent_terminal_action_locked,
+                )
+
+                if (
+                    not isinstance(task.incarnation_id, str)
+                    or len(task.incarnation_id) != 32
+                    or type(task.retry_count) is not int
+                    or task.retry_count < 0
+                    or type(task.turn_generation) is not int
+                    or task.turn_generation < 0
+                    or type(task.turn_source_log_id) is not int
+                    or task.turn_source_log_id <= 0
+                    or task.instance_id != instance_id
+                ):
+                    task.status = "failed"
+                    task.completed_at = datetime.utcnow()
+                    task.error_message = (
+                        "Auto capability terminal admission lost its exact "
+                        "Task/source identity"
+                    )
+                    task.pty_background_generation = None
+                else:
+                    admission = await admit_agent_terminal_action_locked(
+                        db,
+                        task,
+                        expected=AgentTerminalExpectation(
+                            task_id=task.id,
+                            task_incarnation_id=task.incarnation_id,
+                            retry_count=task.retry_count,
+                            turn_generation=task.turn_generation,
+                            instance_id=instance_id,
+                            source_log_id=task.turn_source_log_id,
+                        ),
+                    )
+                    if admission.outcome == "stale":
+                        return admission
+                    if admission.outcome == "ordinary_completion":
+                        task.status = "completed"
+                        task.completed_at = datetime.utcnow()
+                        task.error_message = None
+                        task.pty_background_generation = None
+            else:
+                task.status = "completed"
+                task.completed_at = datetime.utcnow()
+                task.error_message = None
+                task.pty_background_generation = None
+        else:
+            task.status = "failed"
+            if failure_sets_completed_at:
+                task.completed_at = datetime.utcnow()
+            task.error_message = failure_message[:2000]
+            task.pty_background_generation = None
+        await db.flush()
+        return admission
+
+    async def _publish_agent_terminal_admission(self, admission: Any | None) -> None:
+        """Publish creation only while its exact waiting generation survives."""
+
+        if (
+            admission is None
+            or not getattr(admission, "created", False)
+            or getattr(admission, "invocation_id", None) is None
+        ):
+            return
+        from backend.services.agent_capability_admission import (
+            publish_agent_terminal_admission_locked,
+        )
+        from backend.services.capability_service import capability_task_lock
+
+        try:
+            async with capability_task_lock(admission.task_id):
+                async with self.db_factory() as db:
+                    if not await publish_agent_terminal_admission_locked(
+                        db,
+                        admission,
+                    ):
+                        await db.rollback()
+                        return
+                    await db.commit()
+        except Exception:
+            # Admission and Instance release are already durable.  A transient
+            # invalidation failure must not turn that successful terminal
+            # transaction into output-consumer recovery or a Task failure.
+            logger.exception(
+                "Capability creation event publication failed for task %s "
+                "invocation %s",
+                admission.task_id,
+                admission.invocation_id,
+            )
+
     async def finalize_pty_chat_generation(
         self,
         instance_id: int,
@@ -6427,17 +6577,17 @@ class InstanceManager:
                 and self.processes.get(instance_id) is process
             )
 
-        lifecycle_lock = self._instance_lifecycle_lock(instance_id)
         ec = exit_code if exit_code is not None else 0
         interrupted = ec in (-2, 130)
-        final_status = "completed" if ec == 0 or interrupted else "failed"
+        successful_terminal = ec == 0 or interrupted
+        final_status = "completed" if successful_terminal else "failed"
         completed_at = datetime.utcnow()
         provider_error = (record.fatal_provider_error or "").strip()
         failure_notice_data = None
 
         def background_handoff_pending() -> bool:
             return bool(
-                final_status == "completed"
+                successful_terminal
                 and background_generation is None
                 and background_session_id
                 and self.has_pty_autonomous_activity_handoff(
@@ -6515,7 +6665,229 @@ class InstanceManager:
             await self.broadcaster.broadcast(f"task:{task_id}", payload)
             return True
 
-        async with lifecycle_lock:
+        async def arm_original_background_handoff(db) -> bool:
+            """Arm after rolling an uncommitted terminal admission back."""
+
+            if not background_handoff_pending():
+                return False
+            generation = secrets.token_urlsafe(24)
+            task_armed = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.status.in_(("executing", "in_progress")),
+                    Task.instance_id == instance_id,
+                    Task.retry_count == expected_retry_count,
+                    Task.turn_generation == expected_turn_generation,
+                    Task.completed_at.is_(None),
+                    Task.pty_background_generation.is_(None),
+                    task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(
+                    status="executing",
+                    completed_at=None,
+                    error_message=None,
+                    pty_background_generation=generation,
+                )
+            )
+            instance_armed = await db.execute(
+                update(Instance)
+                .where(
+                    Instance.id == instance_id,
+                    Instance.status == "running",
+                    Instance.pid == (getattr(process, "pid", 0) or 0),
+                    Instance.current_task_id == task_id,
+                    Instance.started_at == expected_started_at,
+                )
+                .values(status="running")
+            )
+            if (
+                not task_armed.rowcount
+                or not instance_armed.rowcount
+                or not owns_generation()
+            ):
+                await db.rollback()
+                return False
+            await db.commit()
+            state = self.register_pty_background_generation(
+                task_id,
+                background_session_id,
+                generation,
+                getattr(process, "session", None),
+                task_retry_count=expected_retry_count,
+                task_turn_generation=expected_turn_generation,
+            )
+            state.last_event_monotonic = time.monotonic()
+            payload = {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": task_id,
+                "task_retry_count": expected_retry_count,
+                "task_turn_generation": expected_turn_generation,
+                "background_active": True,
+            }
+            await self.broadcaster.broadcast("tasks", payload)
+            await self.broadcaster.broadcast(f"task:{task_id}", payload)
+            return True
+
+        async def withdraw_admission_for_background_handoff(db) -> bool:
+            """Withdraw only a pristine, unpublished PTY admission.
+
+            ``finalize_pty_chat_generation`` still owns both the capability
+            Task lock and Instance lifecycle lock here.  A same-process
+            coordinator therefore cannot start the new Invocation.  The
+            durable checks below additionally fail closed if any other actor
+            advanced a row during the commit acknowledgement window.
+            """
+
+            nonlocal admission
+            if not background_handoff_pending() or final_status == "completed":
+                return False
+            generation = secrets.token_urlsafe(24)
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.status == final_status,
+                        Task.instance_id == instance_id,
+                        Task.retry_count == expected_retry_count,
+                        Task.turn_generation == expected_turn_generation,
+                        Task.pty_background_generation.is_(None),
+                        task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if task is None:
+                await db.rollback()
+                return False
+
+            if admission is not None and getattr(admission, "created", False):
+                from backend.models.capability import (
+                    CapabilityExecution,
+                    CapabilityInvocation,
+                    CapabilityResumeOutbox,
+                )
+
+                invocation = (
+                    await db.execute(
+                        select(CapabilityInvocation)
+                        .where(
+                            CapabilityInvocation.id
+                            == admission.invocation_id,
+                            CapabilityInvocation.task_id == task_id,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                executions = list(
+                    (
+                        await db.scalars(
+                            select(CapabilityExecution)
+                            .where(
+                                CapabilityExecution.invocation_id
+                                == admission.invocation_id
+                            )
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).all()
+                )
+                outbox = (
+                    await db.execute(
+                        select(CapabilityResumeOutbox)
+                        .where(
+                            CapabilityResumeOutbox.id == admission.outbox_id,
+                            CapabilityResumeOutbox.invocation_id
+                            == admission.invocation_id,
+                            CapabilityResumeOutbox.task_id == task_id,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                pristine = bool(
+                    invocation is not None
+                    and invocation.source == "agent_request"
+                    and invocation.status == "queued"
+                    and invocation.state_version == 1
+                    and invocation.active_task_id == task_id
+                    and len(executions) == 1
+                    and executions[0].status == "queued"
+                    and executions[0].state_version == 1
+                    and executions[0].active_invocation_id == invocation.id
+                    and executions[0].handle_kind is None
+                    and executions[0].handle_id is None
+                    and outbox is not None
+                    and outbox.status == "pending"
+                    and outbox.state_version == 1
+                    and outbox.attempt_count == 0
+                    and outbox.active_task_id == task_id
+                    and outbox.active_invocation_id == invocation.id
+                    and outbox.resume_payload is None
+                )
+                if not pristine:
+                    await db.rollback()
+                    return False
+                await db.delete(outbox)
+                await db.delete(executions[0])
+                await db.delete(invocation)
+
+            instance = (
+                await db.execute(
+                    select(Instance)
+                    .where(
+                        Instance.id == instance_id,
+                        Instance.status == "idle",
+                        Instance.pid.is_(None),
+                        Instance.current_task_id.is_(None),
+                        Instance.started_at == expected_started_at,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if instance is None or not owns_generation():
+                await db.rollback()
+                return False
+            task.status = "executing"
+            task.completed_at = None
+            task.error_message = None
+            task.pty_background_generation = generation
+            instance.status = "running"
+            instance.pid = getattr(process, "pid", 0) or 0
+            instance.current_task_id = task_id
+            await db.flush()
+            await db.commit()
+            admission = None
+            state = self.register_pty_background_generation(
+                task_id,
+                background_session_id,
+                generation,
+                getattr(process, "session", None),
+                task_retry_count=expected_retry_count,
+                task_turn_generation=expected_turn_generation,
+            )
+            state.last_event_monotonic = time.monotonic()
+            payload = {
+                "event": "background_activity",
+                "event_type": "background_activity",
+                "task_id": task_id,
+                "task_retry_count": expected_retry_count,
+                "task_turn_generation": expected_turn_generation,
+                "background_active": True,
+            }
+            await self.broadcaster.broadcast("tasks", payload)
+            await self.broadcaster.broadcast(f"task:{task_id}", payload)
+            return True
+
+        admission = None
+        async with self._chat_terminal_locks(task_id, instance_id):
             if instance_id in self._stopping or not owns_generation():
                 return None
 
@@ -6523,7 +6895,7 @@ class InstanceManager:
                 # Lock/update the Task first.  Cancellation and retry use the
                 # same global Task -> Instance order.
                 if preserve_background_failure:
-                    if final_status != "failed" or (
+                    if successful_terminal or (
                         background_generation is not None
                     ):
                         return None
@@ -6541,28 +6913,6 @@ class InstanceManager:
                         .values(status=Task.status)
                     )
                 else:
-                    task_values: dict = {
-                        "status": final_status,
-                        "pty_background_generation": (
-                            background_generation
-                            if final_status == "completed"
-                            else None
-                        ),
-                    }
-                    if final_status == "completed":
-                        task_values.update(
-                            completed_at=completed_at,
-                            error_message=None,
-                        )
-                    else:
-                        task_values.update(
-                            completed_at=completed_at,
-                            error_message=(
-                                provider_error[:2000]
-                                if provider_error
-                                else f"Process exited with code {ec}"
-                            ),
-                        )
                     task_result = await db.execute(
                         update(Task)
                         .where(
@@ -6580,11 +6930,67 @@ class InstanceManager:
                             Task.turn_generation == expected_turn_generation,
                             no_active_worker_task_termination_predicate(),
                         )
-                        .values(**task_values)
+                        .values(status=Task.status)
                     )
                 if not task_result.rowcount:
                     await db.rollback()
                     return None
+
+                task = (
+                    await db.execute(
+                        select(Task)
+                        .where(Task.id == task_id)
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one()
+                if not preserve_background_failure and task.status in {
+                    "executing",
+                    "in_progress",
+                }:
+                    admission = await self._apply_chat_terminal_to_locked_task(
+                        db,
+                        task,
+                        instance_id=instance_id,
+                        successful_terminal=successful_terminal,
+                        admit_agent_action=(ec == 0),
+                        failure_sets_completed_at=True,
+                        failure_message=(
+                            provider_error[:2000]
+                            if provider_error
+                            else f"Process exited with code {ec}"
+                        ),
+                    )
+                    if (
+                        admission is not None
+                        and admission.outcome == "stale"
+                    ):
+                        await db.rollback()
+                        return None
+                    final_status = task.status
+                elif not preserve_background_failure:
+                    final_status = (
+                        "completed" if successful_terminal else "failed"
+                    )
+                    task.status = final_status
+                    task.pty_background_generation = None
+                    task.completed_at = datetime.utcnow()
+                    task.error_message = (
+                        None
+                        if successful_terminal
+                        else (
+                            provider_error[:2000]
+                            if provider_error
+                            else f"Process exited with code {ec}"
+                        )
+                    )
+                    await db.flush()
+                if not preserve_background_failure:
+                    if (
+                        final_status == "completed"
+                        and background_generation is not None
+                    ):
+                        task.pty_background_generation = background_generation
+                        await db.flush()
 
                 instance_result = await db.execute(
                     update(Instance)
@@ -6598,7 +7004,7 @@ class InstanceManager:
                     .values(
                         status=(
                             "idle"
-                            if final_status == "completed" or interrupted
+                            if successful_terminal
                             else "error"
                         ),
                         pid=None,
@@ -6613,7 +7019,7 @@ class InstanceManager:
                 # event still needs a visible chat entry; process_exit alone
                 # only stops the frontend spinner.
                 if (
-                    final_status == "failed"
+                    not successful_terminal
                     and not provider_error
                     and not preserve_background_failure
                 ):
@@ -6652,18 +7058,26 @@ class InstanceManager:
                 # Python microseconds.  Re-read the locked row before commit
                 # and use that database value for the publication fence.
                 if not preserve_background_failure:
-                    completed_at = (
+                    final_status, completed_at = (
                         await db.execute(
-                            select(Task.completed_at).where(
+                            select(Task.status, Task.completed_at).where(
                                 Task.id == task_id
                             )
                         )
-                    ).scalar_one()
-                    if (
-                        background_handoff_pending()
-                        and await restore_background_handoff(db)
-                    ):
-                        return "background_armed"
+                    ).one()
+                    if background_handoff_pending():
+                        if final_status == "completed":
+                            if await restore_background_handoff(db):
+                                return "background_armed"
+                        else:
+                            # The admission is still uncommitted here. Roll it
+                            # back rather than charging budget for a foreground
+                            # boundary invalidated by autonomous PTY activity.
+                            await db.rollback()
+                            admission = None
+                            if await arm_original_background_handoff(db):
+                                return "background_armed"
+                            return None
                 await db.commit()
 
             if preserve_background_failure:
@@ -6696,12 +7110,12 @@ class InstanceManager:
                     )
                     .values(status=final_status)
                 )
-                if (
-                    publish_guard.rowcount
-                    and background_handoff_pending()
-                    and await restore_background_handoff(db)
-                ):
-                    return "background_armed"
+                if publish_guard.rowcount and background_handoff_pending():
+                    if final_status == "completed":
+                        if await restore_background_handoff(db):
+                            return "background_armed"
+                    elif await withdraw_admission_for_background_handoff(db):
+                        return "background_armed"
                 if publish_guard.rowcount:
                     if failure_notice_data is not None:
                         await self.broadcaster.broadcast(
@@ -6757,6 +7171,7 @@ class InstanceManager:
                         },
                     )
                 await db.commit()
+        await self._publish_agent_terminal_admission(admission)
         return final_status
 
     def _build_command(
@@ -7842,6 +8257,7 @@ class InstanceManager:
                 ),
             )
 
+        structured_preflight_rejection = False
         if task_id and chat_initiated and exit_code not in (0, -2, 130):
             # Human-readable overflow text is not replay evidence: a failed
             # turn may already have emitted assistant output or performed a
@@ -7860,6 +8276,7 @@ class InstanceManager:
                 )
             )
             if context_preflight_permit is not None:
+                structured_preflight_rejection = True
                 try:
                     from backend.main import dispatcher
                     from backend.services.dispatcher import (
@@ -8017,10 +8434,10 @@ class InstanceManager:
             # cooperative admission handoff is released.
             terminal_operation_lock.release()
 
-        # Commit terminal bookkeeping in the global Task -> Instance lock
-        # order. Cancellation/retry/delete use the same order; taking the
-        # Instance write first here can deadlock those paths on PostgreSQL or
-        # MySQL.
+        # Commit terminal bookkeeping in the global capability -> lifecycle
+        # -> Task -> Instance lock order. Cancellation/retry/delete use the
+        # same order; taking either database row first can deadlock those paths
+        # on PostgreSQL or MySQL.
         successful_terminal = self._chat_terminal_succeeded(
             process,
             exit_code,
@@ -8029,8 +8446,17 @@ class InstanceManager:
         final_status = None
         task_publication_generation: dict | None = None
         failure_notice_data = None
-        async with self.db_factory() as db:
+        admission = None
+        terminal_db_context = (
+            self._chat_terminal_db(task_id, instance_id)
+            if task_id and chat_initiated
+            else self.db_factory()
+        )
+        async with terminal_db_context as db:
             if task_id and chat_initiated:
+                if instance_id in self._stopping or not owns_instance_turn():
+                    await db.rollback()
+                    return
                 # Lock this exact Task generation even when cancellation has
                 # already made it terminal. The terminal Task must still allow
                 # its exact reverse Instance owner to be released.
@@ -8067,16 +8493,11 @@ class InstanceManager:
 
                 current_task_generation = (
                     await db.execute(
-                        select(
-                            Task.status,
-                            Task.retry_count,
-                            Task.turn_generation,
-                            Task.instance_id,
-                            Task.started_at,
-                            Task.completed_at,
-                        ).where(Task.id == task_id)
+                        select(Task)
+                        .where(Task.id == task_id)
+                        .execution_options(populate_existing=True)
                     )
-                ).one()
+                ).scalar_one()
                 chat_active_statuses = {
                     "executing",
                     "in_progress",
@@ -8084,35 +8505,54 @@ class InstanceManager:
                     "pending",
                 }
                 if current_task_generation.status in chat_active_statuses:
-                    final_status = (
-                        "completed"
-                        if successful_terminal
-                        else "failed"
-                    )
-                    task_values: dict = {"status": final_status}
-                    if final_status == "completed":
-                        task_values.update(
-                            completed_at=datetime.utcnow(),
-                            error_message=None,
+                    if current_task_generation.status in {
+                        "executing",
+                        "in_progress",
+                    }:
+                        admission = (
+                            await self._apply_chat_terminal_to_locked_task(
+                                db,
+                                current_task_generation,
+                                instance_id=instance_id,
+                                successful_terminal=successful_terminal,
+                                admit_agent_action=(exit_code == 0),
+                                failure_sets_completed_at=False,
+                                failure_message=(
+                                    failure_text[:2000]
+                                    if failure_text
+                                    else f"Process exited with code {exit_code}"
+                                ),
+                                settle_previous_resume=(
+                                    not structured_preflight_rejection
+                                ),
+                            )
                         )
+                        if (
+                            admission is not None
+                            and admission.outcome == "stale"
+                        ):
+                            await db.rollback()
+                            return
                     else:
-                        task_values["error_message"] = (
-                            failure_text[:2000]
-                            if failure_text
-                            else f"Process exited with code {exit_code}"
+                        current_task_generation.status = (
+                            "completed"
+                            if successful_terminal
+                            else "failed"
                         )
-                    task_update = await db.execute(
-                        update(Task)
-                        .where(
-                            *task_generation_predicates,
-                            Task.status == current_task_generation.status,
-                        )
-                        .values(**task_values)
-                    )
-                    if not task_update.rowcount:
-                        await db.rollback()
-                        return
-                    if final_status == "failed" and not _fatal_provider_error:
+                        if successful_terminal:
+                            current_task_generation.completed_at = (
+                                datetime.utcnow()
+                            )
+                            current_task_generation.error_message = None
+                        else:
+                            current_task_generation.error_message = (
+                                failure_text[:2000]
+                                if failure_text
+                                else f"Process exited with code {exit_code}"
+                            )
+                        await db.flush()
+                    final_status = current_task_generation.status
+                    if not successful_terminal and not _fatal_provider_error:
                         process_label = self._provider_process_label(
                             instance_id, provider
                         )
@@ -8231,6 +8671,8 @@ class InstanceManager:
                 )
                 return
             await db.commit()
+
+        await self._publish_agent_terminal_admission(admission)
 
         # Publish only while no-op writes hold the exact terminal generation.
         # A retry/reclaim must take the same locks and therefore cannot be

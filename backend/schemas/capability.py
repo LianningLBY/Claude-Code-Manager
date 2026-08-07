@@ -146,6 +146,7 @@ class CapabilityInvocationResource(BaseModel):
     resume_policy: str
     max_attempts: int
     requested_by_user_id: int | None
+    request_task_incarnation_id: str | None
     request_task_retry_count: int | None
     request_task_instance_id: int | None
     request_task_started_at: datetime | None
@@ -153,6 +154,7 @@ class CapabilityInvocationResource(BaseModel):
     request_task_turn_generation: int | None
     request_source_log_id: int | None
     request_output_log_id: int | None
+    request_terminal_log_id: int | None
     request_reason: str | None
     request_protocol_version: int | None
     request_output_hash: str | None

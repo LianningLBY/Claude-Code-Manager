@@ -355,6 +355,14 @@ describe('TaskList', () => {
       expect(screen.getByText('Cancel')).toBeInTheDocument();
     });
 
+    it('shows Cancel while a Task is waiting on an Auto capability', async () => {
+      const tasks = [makeTask({ status: 'waiting_capability' })];
+      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+
+      await userEvent.click(screen.getByTitle('More actions'));
+      expect(screen.getByText('Cancel')).toBeInTheDocument();
+    });
+
     it('shows stop action and hides Delete while detached background work is active', async () => {
       const tasks = [makeTask({ status: 'completed', background_active: true })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);

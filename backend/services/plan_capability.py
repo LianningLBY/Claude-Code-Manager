@@ -187,7 +187,11 @@ def _task_generation_matches(
         and invocation.request_task_session_id == task.session_id
         and (
             invocation.source != "agent_request"
-            or invocation.request_task_turn_generation == task.turn_generation
+            or (
+                invocation.request_task_incarnation_id == task.incarnation_id
+                and invocation.request_task_turn_generation
+                == task.turn_generation
+            )
         )
     )
 
@@ -948,6 +952,7 @@ class PlanCapabilityExecutor:
                 db,
                 invocation_id=invocation.id,
                 expected_state_version=invocation.state_version,
+                allow_workflow_owned=True,
             )
             if invocation.status == "cancelled":
                 return _observation(invocation, execution)

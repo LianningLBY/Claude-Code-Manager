@@ -160,6 +160,10 @@ class QueuedAdmissionCommitOutcomeUncertainError(RuntimeError):
     """A queued turn admission commit could not be proven committed or absent."""
 
 
+class CapabilityResumeLeaseLostError(RuntimeError):
+    """Another durable owner superseded this volatile outbox publication."""
+
+
 class TaskQueueAbortTimeoutError(RuntimeError):
     """A dequeued message worker did not settle after cancellation."""
 
@@ -311,6 +315,7 @@ def _agent_doc_preamble(task: Task) -> str:
 
 
 # Priority levels for the per-task message queue
+PRIORITY_CAPABILITY_RESUME = -1
 PRIORITY_USER = 0
 PRIORITY_MONITOR_COMPLETE = 1
 PRIORITY_MONITOR_IMPORTANT = 2
@@ -529,6 +534,20 @@ class QueuedMessage:
     # startup recovery may request admission, but only one in-memory item is
     # accepted for this key.
     delivery_key: str | None = field(compare=False, default=None)
+    # Durable Auto-Capability resume identity.  The coordinator publishes only
+    # the row id and its committed publication lease; the queue consumer must
+    # reconstruct and hash-check the model-facing payload from the database.
+    # A claimed retry reuses ``claimed_*`` below and therefore can never turn
+    # one Capability result into G+2.
+    capability_resume_outbox_id: int | None = field(
+        compare=False,
+        default=None,
+    )
+    capability_resume_lease_token: str | None = field(
+        compare=False,
+        default=None,
+        repr=False,
+    )
     # Manager -> Worker ordinary-chat receipt.  Unlike ``delivery_key`` this
     # is not a PlanApplicationReceipt; its durable outbox is the Worker-local
     # user LogEntry.  The three fields authorize exactly retry/G -> G+1.
@@ -864,6 +883,9 @@ class GlobalDispatcher:
         self.db_factory = db_factory
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
+        # Injected by backend.main after the generic Capability coordinator is
+        # constructed.  Durable polling remains the fallback source of truth.
+        self.capability_invocation_wake: Callable[[], None] | None = None
         # Detached PTY chat epochs finalize outside the dispatcher lifecycle.
         # Route their exact terminal point back through the same PR completion
         # consumer used by ordinary foreground tasks.
@@ -943,15 +965,30 @@ class GlobalDispatcher:
         self._task_queue_workers: dict[int, asyncio.Task] = {}
         self._task_queue_activity: dict[int, float] = {}
         self._queued_delivery_keys: set[str] = set()
+        self._queued_capability_resume_ids: set[int] = set()
         self._queued_worker_turn_handoffs: set[str] = set()
         self._cancel_durable_queue_tasks: set[int] = set()
         self._task_queue_cancellation_lease_counts: dict[int, int] = {}
+        # A waiting-Capability stop first reaps an already-dequeued resume
+        # consumer, then cancels the Invocation, and only then terminalizes the
+        # outbox.  During that first phase the queue remains admission-closed,
+        # but the consumer must release (not cancel) its publication lease.
+        self._preserve_capability_resume_on_queue_cancel: dict[int, int] = {}
         # A receipt stages against both this process epoch and the task queue
         # generation. A same-process stop that completes before the receipt is
         # committed still invalidates that staged admission; a later process
         # may safely recover the durable pending row under its new epoch.
         self._queue_admission_epoch = secrets.token_hex(16)
         self._task_queue_dequeued: dict[int, QueuedMessage] = {}
+        # Exact volatile owner for the one message currently admitted by each
+        # per-Task consumer.  Durable state can prove that a Capability resume
+        # claimed G+1, but stop/cancel must also prove the local worker it is
+        # about to cancel owns that same outbox/lease/generation.  A count or
+        # the task-wide dedup set alone cannot distinguish an active message
+        # from one merely queued behind it.
+        self._task_queue_active_messages: dict[
+            int, tuple[asyncio.Task, QueuedMessage]
+        ] = {}
         # A queued or currently-consumed resume is task work even before its DB
         # status becomes executing. Keeping it as a maintenance blocker avoids
         # restarting after accepting a chat/monitor message but before launch.
@@ -1748,6 +1785,60 @@ class GlobalDispatcher:
             )
             live_task_ids.update(termination_task_ids)
 
+            # A Capability resume owns a complete immutable G -> G+1 queue
+            # envelope.  Reconcile it before the generic stale-task logic and
+            # before taking any Instance/source locks: a claimed row whose
+            # exact source still has no actual transport is the one modern
+            # G>1 shape that is safe to replay after restart.  The Task rows
+            # are already write-locked and startup/maintenance admission is
+            # closed, so taking capability_task_lock here would invert the
+            # process-lock -> Task-row order used by normal execution.
+            from backend.services.capability_resume import (
+                reconcile_stale_resume_in_tx,
+            )
+
+            prequarantine_unmanaged_pids: dict[int, int] = {}
+            for stale_instance, pid_may_be_alive in stale_instances:
+                if (
+                    pid_may_be_alive
+                    and stale_instance.current_task_id is not None
+                    and stale_instance.pid is not None
+                ):
+                    prequarantine_unmanaged_pids.setdefault(
+                        stale_instance.current_task_id,
+                        stale_instance.pid,
+                    )
+            capability_resume_outcomes: dict[int, str] = {}
+            reset_tasks: list[_TaskStatusGeneration] = []
+            for active_task in sorted(active_tasks, key=lambda row: row.id):
+                if active_task.id in termination_task_ids:
+                    continue
+                resume_outcome = await reconcile_stale_resume_in_tx(
+                    db,
+                    active_task,
+                    has_live_runtime=active_task.id in live_task_ids,
+                    unmanaged_pid=prequarantine_unmanaged_pids.get(
+                        active_task.id
+                    ),
+                )
+                if resume_outcome == "not_resume":
+                    continue
+                capability_resume_outcomes[active_task.id] = resume_outcome
+                if resume_outcome in {"replayable", "failed"}:
+                    resulting_generation = (
+                        await self._read_task_status_generation(
+                            db,
+                            active_task.id,
+                        )
+                    )
+                    if resulting_generation is not None:
+                        reset_tasks.append(resulting_generation)
+                logger.warning(
+                    "Reconciled Capability resume for task %s as %s",
+                    active_task.id,
+                    resume_outcome,
+                )
+
             # Decisions below must use receipt/source evidence read after the
             # Task write fences above.  Startup cleanup can race explicit
             # cancel and launch-boundary transitions, so a pre-lock snapshot
@@ -1819,7 +1910,6 @@ class GlobalDispatcher:
 
             from backend.models.sub_agent import SubAgentSession
 
-            reset_tasks: list[_TaskStatusGeneration] = []
             recovered_background_task_ids: set[int] = set()
             for task in stale_background_tasks:
                 if task.id in termination_task_ids:
@@ -1942,6 +2032,13 @@ class GlobalDispatcher:
                 if t.id in termination_task_ids:
                     continue
                 if t.id in recovered_background_task_ids:
+                    continue
+                if t.id in capability_resume_outcomes:
+                    # The exact outbox helper already preserved, replayed, or
+                    # failed this generation.  Let Instance quarantine below
+                    # retain/clear the reverse owner according to the same live
+                    # runtime and unmanaged-PID evidence; never reinterpret the
+                    # Task through generic source-less G>1 recovery.
                     continue
                 if t.id in live_task_ids:
                     continue
@@ -6164,6 +6261,13 @@ class GlobalDispatcher:
                 task_description = command_args
             parts.append(command.prompt_template)
         parts.append(f"任务:\n{task_description}")
+        from backend.services.auto_capability_policy import (
+            build_auto_capability_instructions,
+        )
+
+        capability_instructions = build_auto_capability_instructions(task)
+        if capability_instructions:
+            parts.append(capability_instructions)
         return "\n\n".join(parts)
 
     async def _relaunch_and_wait(
@@ -7485,57 +7589,366 @@ class GlobalDispatcher:
         generation: _TaskLifecycleGeneration,
         *,
         count_completion: bool = False,
+        admit_agent_capability: bool = False,
     ) -> tuple[bool, bool]:
         """Return ``(completed, background_active_at_commit)``."""
 
-        async with self.db_factory() as db:
-            task = await self._read_owned_lifecycle_task(
-                db,
-                generation,
-                for_update=True,
-            )
-            if task is None:
-                return False, False
-            background_active = task.pty_background_generation is not None
-            observed_generation = self._task_status_generation(task)
-            changed = await db.execute(
-                update(Task)
-                .where(
-                    *self._task_status_generation_predicates(observed_generation),
-                    task_retry_not_superseded_predicate(),
-                    no_active_worker_task_termination_predicate(),
+        from backend.services.capability_service import capability_task_lock
+
+        admission = None
+        async with capability_task_lock(generation.task_id):
+            async with self.db_factory() as db:
+                # This is the common terminal writer fence for both ordinary
+                # completion and Agent capability admission.  In particular,
+                # protocol-failure/waiting-capability paths commit inside the
+                # admission branch and therefore never reach the later
+                # completion CAS.  Acquire the Task writer before reading any
+                # terminal evidence so a committed Worker stop/cancel receipt
+                # always wins, while a capability admission that wins this
+                # fence commits before receipt admission can inspect the Task.
+                # The conditional no-op UPDATE is required for SQLite, where
+                # SELECT FOR UPDATE does not establish a writer fence.
+                writer_fence = await db.execute(
+                    update(Task)
+                    .where(
+                        *self._task_lifecycle_generation_predicates(generation),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(turn_source_log_id=Task.turn_source_log_id)
                 )
-                .values(
-                    status="completed",
-                    completed_at=datetime.utcnow(),
-                    error_message=None,
+                if writer_fence.rowcount != 1:
+                    await db.rollback()
+                    return False, False
+                task = await self._read_owned_lifecycle_task(
+                    db,
+                    generation,
+                    for_update=True,
                 )
+                if task is None:
+                    return False, False
+                background_active = task.pty_background_generation is not None
+                if task.session_id:
+                    handoff_lookup = getattr(
+                        self.instance_manager,
+                        "has_pty_autonomous_activity_handoff",
+                        None,
+                    )
+                    if callable(handoff_lookup):
+                        background_active = background_active or bool(
+                            handoff_lookup(task.id, task.session_id)
+                        )
+                if admit_agent_capability and task.capability_policy is not None:
+                    if background_active:
+                        # A native PTY tail is still part of this logical turn.
+                        # Keep the Task executing and retain its Instance owner;
+                        # the lifecycle caller captures and waits for the exact
+                        # background state before retrying terminal admission.
+                        # Completing here would let a capability resume launch
+                        # G+1 while autonomous output can still write G.
+                        await db.rollback()
+                        return False, True
+                    from backend.services.agent_capability_admission import (
+                        AgentTerminalExpectation,
+                        admit_agent_terminal_action_locked,
+                    )
+
+                    if (
+                        not isinstance(task.incarnation_id, str)
+                        or len(task.incarnation_id) != 32
+                        or type(task.turn_source_log_id) is not int
+                        or task.turn_source_log_id <= 0
+                        or type(generation.instance_id) is not int
+                        or generation.instance_id <= 0
+                    ):
+                        task.status = "failed"
+                        task.completed_at = datetime.utcnow()
+                        task.error_message = (
+                            "Auto capability terminal admission lost its exact "
+                            "Task/source identity"
+                        )
+                        admission_status = "protocol_failed"
+                    else:
+                        admission = await admit_agent_terminal_action_locked(
+                            db,
+                            task,
+                            expected=AgentTerminalExpectation(
+                                task_id=task.id,
+                                task_incarnation_id=task.incarnation_id,
+                                retry_count=generation.retry_count,
+                                turn_generation=generation.turn_generation,
+                                instance_id=generation.instance_id,
+                                source_log_id=task.turn_source_log_id,
+                            ),
+                        )
+                        admission_status = admission.outcome
+                    if admission_status == "stale":
+                        await db.rollback()
+                        return False, False
+                    if admission_status != "ordinary_completion":
+                        resulting_generation = (
+                            await self._read_task_status_generation(
+                                db,
+                                generation.task_id,
+                            )
+                        )
+                        if resulting_generation is None:
+                            await db.rollback()
+                            return False, False
+                        await db.commit()
+                        completed = False
+                    else:
+                        resulting_generation = None
+                        completed = True
+                else:
+                    resulting_generation = None
+                    completed = True
+
+                if completed:
+                    observed_generation = self._task_status_generation(task)
+                    changed = await db.execute(
+                        update(Task)
+                        .where(
+                            *self._task_status_generation_predicates(
+                                observed_generation
+                            ),
+                            task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
+                        )
+                        .values(
+                            status="completed",
+                            completed_at=datetime.utcnow(),
+                            error_message=None,
+                        )
+                    )
+                    if not changed.rowcount:
+                        await db.rollback()
+                        return False, False
+                    if count_completion:
+                        # Global lifecycle order is Task -> Instance. The Task
+                        # row is already locked above before this accounting.
+                        await db.execute(
+                            update(Instance)
+                            .where(Instance.id == generation.instance_id)
+                            .values(
+                                total_tasks_completed=(
+                                    Instance.total_tasks_completed + 1
+                                )
+                            )
+                        )
+                    resulting_generation = (
+                        await self._read_task_status_generation(
+                            db,
+                            generation.task_id,
+                        )
+                    )
+                    if resulting_generation is None:
+                        await db.rollback()
+                        return False, False
+                    await db.commit()
+
+        if admission is not None and admission.created:
+            # Reuse the chat terminal publisher: it re-enters the Task-scoped
+            # capability fence and verifies the exact waiting generation
+            # before emitting the invalidation.  A stop/cancel that wins after
+            # the terminal commit must not be followed by a stale "created"
+            # event for the old generation.
+            await self.instance_manager._publish_agent_terminal_admission(
+                admission
             )
-            if not changed.rowcount:
-                await db.rollback()
-                return False, False
-            if count_completion:
-                # Global lifecycle order is Task -> Instance.  The Task row is
-                # already locked above before this accounting write.
-                await db.execute(
-                    update(Instance)
-                    .where(Instance.id == generation.instance_id)
-                    .values(total_tasks_completed=Instance.total_tasks_completed + 1)
-                )
-            resulting_generation = await self._read_task_status_generation(
-                db, generation.task_id
-            )
-            if resulting_generation is None:
-                await db.rollback()
-                return False, False
-            await db.commit()
+            if self.capability_invocation_wake is not None:
+                self.capability_invocation_wake()
 
         await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
             extra={"background_active": background_active},
         )
-        return True, background_active
+        return completed, (background_active if completed else False)
+
+    async def _complete_owned_task_after_pty_background(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        count_completion: bool,
+    ) -> tuple[bool, bool]:
+        """Wait one exact PTY tail, then retry initial terminal admission.
+
+        The durable Task remains ``executing`` throughout the wait.  Capture
+        the exact in-memory state while holding the Task/session transition
+        lock, then wait on that object after releasing the lock.  A key-based
+        lookup after the watcher removes the state would otherwise lose the
+        wake-up and strand the authoritative lifecycle.
+        """
+
+        while True:
+            async with self.db_factory() as db:
+                task = await self._read_owned_lifecycle_task(db, generation)
+                if task is None:
+                    return False, False
+                session_id = task.session_id
+                marker = task.pty_background_generation
+                capability_policy = task.capability_policy
+
+            if capability_policy is None:
+                return await self._complete_owned_task_result(
+                    generation,
+                    count_completion=count_completion,
+                    admit_agent_capability=True,
+                )
+            if not session_id:
+                if marker is not None:
+                    raise RuntimeError(
+                        "Auto capability terminal admission found a durable "
+                        "PTY background epoch without its exact session identity"
+                    )
+                return await self._complete_owned_task_result(
+                    generation,
+                    count_completion=count_completion,
+                    admit_agent_capability=True,
+                )
+
+            if marker is None:
+                handoff_pending = False
+                handoff_lookup = getattr(
+                    self.instance_manager,
+                    "has_pty_autonomous_activity_handoff",
+                    None,
+                )
+                if callable(handoff_lookup):
+                    handoff_pending = bool(
+                        handoff_lookup(generation.task_id, session_id)
+                    )
+
+            transition = getattr(
+                self.instance_manager,
+                "pty_background_transition",
+                None,
+            )
+            state_lookup = getattr(
+                self.instance_manager,
+                "pty_background_state_for",
+                None,
+            )
+            wait_outcome = getattr(
+                self.instance_manager,
+                "wait_pty_background_outcome",
+                None,
+            )
+            if not (
+                callable(transition)
+                and callable(state_lookup)
+                and callable(wait_outcome)
+            ):
+                raise RuntimeError(
+                    "Auto capability terminal admission cannot prove the "
+                    "exact PTY background generation"
+                )
+
+            exact_state = None
+            ready_to_admit = False
+            post_cutoff_handoff = False
+            async with transition(generation.task_id, session_id):
+                async with self.db_factory() as db:
+                    task = await self._read_owned_lifecycle_task(db, generation)
+                    if task is None:
+                        return False, False
+                    if task.session_id != session_id:
+                        continue
+                    marker = task.pty_background_generation
+                    if marker is not None:
+                        exact_state = state_lookup(
+                            generation.task_id,
+                            session_id,
+                            marker,
+                        )
+                        if exact_state is None:
+                            raise RuntimeError(
+                                "Auto capability terminal admission lost its "
+                                "exact PTY background state while the durable "
+                                "marker remained active"
+                            )
+                    else:
+                        handoff_lookup = getattr(
+                            self.instance_manager,
+                            "has_pty_autonomous_activity_handoff",
+                            None,
+                        )
+                        handoff_pending = bool(
+                            callable(handoff_lookup)
+                            and handoff_lookup(generation.task_id, session_id)
+                        )
+                        if not handoff_pending:
+                            # Retained post-exit proof is the only authority a
+                            # newly arriving autonomous callback can use after
+                            # the foreground proxy/consumer maps disappear.
+                            # Revoke it synchronously under the same transition
+                            # lock before terminal admission. A callback that
+                            # already noted activity is observed above; one
+                            # arriving after this cutoff cannot arm against the
+                            # soon-to-be waiting/completed Task generation.
+                            discard_post_exit = getattr(
+                                self.instance_manager,
+                                "discard_pty_post_exit_generations",
+                                None,
+                            )
+                            if not callable(discard_post_exit):
+                                raise RuntimeError(
+                                    "Auto capability terminal admission cannot "
+                                    "establish its PTY post-exit cutoff"
+                                )
+                            discard_post_exit(
+                                task_id=generation.task_id,
+                                session_id=session_id,
+                                instance_id=generation.instance_id,
+                                invalidate_handoffs=True,
+                            )
+                            ready_to_admit = True
+
+                if ready_to_admit:
+                    # Keep the transition lock through admission. A callback
+                    # that notes activity during a DB await has already lost
+                    # its post-exit proof and cannot attach after this commit.
+                    terminal = await self._complete_owned_task_result(
+                        generation,
+                        count_completion=count_completion,
+                        admit_agent_capability=True,
+                    )
+                    if terminal != (False, True):
+                        return terminal
+                    # note_pty_autonomous_activity() can run synchronously
+                    # during an admission DB await. The cutoff already revoked
+                    # that callback's post-exit proof, so it cannot arm, but
+                    # _complete_owned_task_result deliberately observes the
+                    # handoff and defers. Release the transition lock and let
+                    # the callback clear its now-unusable token, then retry.
+                    post_cutoff_handoff = True
+
+            if exact_state is None:
+                if post_cutoff_handoff:
+                    await asyncio.sleep(0)
+                    continue
+                if not handoff_pending:
+                    continue
+                # note_pty_autonomous_activity() publishes the handoff before
+                # its callback waits for the transition lock.  Yield after
+                # releasing the lock so that exact callback can arm/register
+                # the durable generation, then capture its state on the next
+                # pass. This wait remains cancellable but has no arbitrary
+                # retry ceiling: the callback itself owns the authoritative
+                # arm-or-clear transition.
+                await asyncio.sleep(0)
+                continue
+
+            background_outcome = await wait_outcome(exact_state)
+            if background_outcome != "completed":
+                # failed/abandoned/superseded all revoke this lifecycle's
+                # authority to interpret the foreground terminal action. The
+                # owning failure/stop/replacement path either already changed
+                # the durable Task or will win the final exact-generation CAS.
+                return False, False
+            # The watcher clears the durable marker before setting state.done.
+            # Re-read the same active lifecycle on the next pass; a stop,
+            # retry, replacement marker, or failed tail wins over admission.
 
     async def _complete_owned_task(
         self,
@@ -8403,9 +8816,11 @@ class GlobalDispatcher:
                 return
 
             # === Claude Code completed successfully ===
-            completed, background_active = await self._complete_owned_task_result(
-                lifecycle_generation,
-                count_completion=True,
+            completed, background_active = (
+                await self._complete_owned_task_after_pty_background(
+                    lifecycle_generation,
+                    count_completion=True,
+                )
             )
             if not completed:
                 return
@@ -13933,6 +14348,89 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         )
         return True
 
+    async def enqueue_capability_resume(self, outbox_id: int) -> bool:
+        """Publish one durable Capability resume without trusting caller data.
+
+        The outbox row is the sole source of the prompt, route, and exact
+        generation.  A committed publication lease fences other CCM processes;
+        the in-memory id set only removes duplicate queue entries in this one.
+        """
+
+        if type(outbox_id) is not int or outbox_id <= 0:
+            raise ValueError("Capability resume outbox id must be positive")
+        async with self._dispatch_claim_lock:
+            if outbox_id in self._queued_capability_resume_ids:
+                return False
+
+        from backend.services.capability_resume import (
+            claim_resume_publication,
+            release_resume_publication,
+        )
+
+        envelope = None
+        async with self.db_factory() as db:
+            envelope = await claim_resume_publication(db, outbox_id)
+        if envelope is None:
+            return False
+
+        msg = QueuedMessage(
+            priority=PRIORITY_CAPABILITY_RESUME,
+            timestamp=envelope.queue_timestamp,
+            prompt=envelope.prompt,
+            source=f"capability-resume:{outbox_id}",
+            expected_task_routing=(
+                envelope.provider,
+                envelope.model,
+                envelope.service_tier,
+            ),
+            current_message=envelope.current_message,
+            allow_new_session=envelope.request_session_id is None,
+            capability_resume_outbox_id=outbox_id,
+            capability_resume_lease_token=envelope.lease_token,
+            claimed_retry_count=(
+                envelope.request_retry_count
+                if envelope.claimed_generation is not None
+                else None
+            ),
+            claimed_turn_generation=envelope.claimed_generation,
+        )
+        if not isinstance(msg.capability_resume_lease_token, str):
+            raise RuntimeError("Capability resume publication omitted its lease")
+
+        admitted = False
+        try:
+            async with self._dispatch_claim_lock:
+                admitted = self._admit_queued_message_locked(
+                    envelope.task_id,
+                    msg,
+                )
+        except BaseException:
+            async with self.db_factory() as db:
+                await release_resume_publication(
+                    db,
+                    outbox_id,
+                    lease_token=msg.capability_resume_lease_token,
+                    error_code="queue_publication_interrupted",
+                    error_message="Dispatcher queue publication was interrupted",
+                )
+            raise
+        if not admitted:
+            async with self.db_factory() as db:
+                await release_resume_publication(
+                    db,
+                    outbox_id,
+                    lease_token=msg.capability_resume_lease_token,
+                    error_code="queue_publication_deferred",
+                    error_message="Dispatcher already owns this resume or is paused",
+                )
+            return False
+        logger.info(
+            "Enqueued capability resume outbox %s for task %s",
+            outbox_id,
+            envelope.task_id,
+        )
+        return True
+
     def _assert_queue_admission_locked(self, task_id: int) -> None:
         if self._shutting_down:
             raise RuntimeError(
@@ -13972,6 +14470,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         ):
             return False
         if (
+            msg.capability_resume_outbox_id is not None
+            and msg.capability_resume_outbox_id
+            in self._queued_capability_resume_ids
+        ):
+            return False
+        if (
             msg.worker_turn_handoff_id is not None
             and msg.worker_turn_handoff_id
             in self._queued_worker_turn_handoffs
@@ -13982,6 +14486,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         q.put_nowait(msg)
         if msg.delivery_key is not None:
             self._queued_delivery_keys.add(msg.delivery_key)
+        if msg.capability_resume_outbox_id is not None:
+            self._queued_capability_resume_ids.add(
+                msg.capability_resume_outbox_id
+            )
         if msg.worker_turn_handoff_id is not None:
             self._queued_worker_turn_handoffs.add(
                 msg.worker_turn_handoff_id
@@ -14996,6 +15504,39 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             ):
                 return None
 
+            if msg.capability_resume_outbox_id is not None:
+                if not isinstance(msg.capability_resume_lease_token, str):
+                    return None
+                from backend.services.capability_resume import (
+                    load_resume_envelope,
+                )
+
+                resume = await load_resume_envelope(
+                    db,
+                    msg.capability_resume_outbox_id,
+                    expected_lease_token=(
+                        msg.capability_resume_lease_token
+                    ),
+                    for_update=for_update,
+                )
+                if (
+                    resume is None
+                    or resume.task_id != admitted_generation.task_id
+                    or resume.status != "claimed"
+                    or resume.request_retry_count
+                    != admitted_generation.retry_count
+                    or resume.claimed_generation
+                    != admitted_generation.turn_generation
+                    or resume.source_log_id != bound_source_id
+                    or (
+                        resume.provider,
+                        resume.model,
+                        resume.service_tier,
+                    )
+                    != (provider, model, service_tier or "default")
+                ):
+                    return None
+
             # Global joint-state lock order is Task -> Worker -> Plan.  Stop,
             # cancel, recovery, and ACK reconciliation must never acquire the
             # Plan row before the linked Worker receipt.
@@ -15254,6 +15795,27 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     receipt.delivery_status = "uncertain"
                     receipt.delivery_error = reason[:2000]
                     receipt.updated_at = datetime.utcnow()
+            if msg.capability_resume_outbox_id is not None:
+                from backend.services.capability_resume import (
+                    fail_or_cancel_resume_outbox_in_tx,
+                )
+
+                failed_task = await db.get(
+                    Task,
+                    admitted_generation.task_id,
+                    populate_existing=True,
+                )
+                if failed_task is None:
+                    await db.rollback()
+                    return None
+                await fail_or_cancel_resume_outbox_in_tx(
+                    db,
+                    task=failed_task,
+                    outbox_id=msg.capability_resume_outbox_id,
+                    status="failed",
+                    error_code="resume_launch_interrupted",
+                    error_message=reason,
+                )
             resulting = await self._read_task_status_generation(
                 db, admitted_generation.task_id
             )
@@ -16289,6 +16851,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         processed (if any) is not affected — callers stop the process separately.
         """
         delivery_keys: list[str] = []
+        capability_resumes: list[tuple[int, str | None]] = []
         worker_handoffs: list[tuple[str, int | None]] = []
         released_deliveries: list[tuple[str, list[int], int | None]] = []
         async with self._dispatch_claim_lock:
@@ -16309,6 +16872,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 handoff.queue_clear_handled = True
                 if handoff.delivery_key is not None:
                     delivery_keys.append(handoff.delivery_key)
+                if handoff.capability_resume_outbox_id is not None:
+                    capability_resumes.append(
+                        (
+                            handoff.capability_resume_outbox_id,
+                            handoff.capability_resume_lease_token,
+                        )
+                    )
                 if handoff.worker_turn_handoff_id is not None:
                     worker_handoffs.append(
                         (
@@ -16325,6 +16895,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         break
                     if queued.delivery_key is not None:
                         delivery_keys.append(queued.delivery_key)
+                    if queued.capability_resume_outbox_id is not None:
+                        capability_resumes.append(
+                            (
+                                queued.capability_resume_outbox_id,
+                                queued.capability_resume_lease_token,
+                            )
+                        )
                     if queued.worker_turn_handoff_id is not None:
                         worker_handoffs.append(
                             (
@@ -16412,6 +16989,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # together in the branch above.
             for handoff_id, _source_log_id in worker_handoffs:
                 self._queued_worker_turn_handoffs.discard(handoff_id)
+            for outbox_id, _lease_token in capability_resumes:
+                self._queued_capability_resume_ids.discard(outbox_id)
         for receipt_key, plan_ids, target_task_id in released_deliveries:
             await self._broadcast_plan_delivery_change(
                 receipt_key=receipt_key,
@@ -16426,6 +17005,48 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 delivery_keys,
                 cancel=task_id in self._cancel_durable_queue_tasks,
             )
+        if capability_resumes or cancel_all_worker_handoffs:
+            from backend.services.capability_resume import (
+                cancel_task_resume_outbox_in_tx,
+                release_resume_publication,
+            )
+
+            if cancel_all_worker_handoffs:
+                async def cancel_resume(session) -> None:
+                    task = (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if task is not None:
+                        await cancel_task_resume_outbox_in_tx(
+                            session,
+                            task,
+                            reason="Task queue was explicitly cleared",
+                        )
+                    await session.commit()
+
+                if durable_db is None:
+                    async with self.db_factory() as db:
+                        await cancel_resume(db)
+                else:
+                    await cancel_resume(durable_db)
+            else:
+                for outbox_id, lease_token in set(capability_resumes):
+                    if not isinstance(lease_token, str):
+                        continue
+                    async with self.db_factory() as db:
+                        await release_resume_publication(
+                            db,
+                            outbox_id,
+                            lease_token=lease_token,
+                            error_code="queue_owner_released",
+                            error_message=(
+                                "Dispatcher queue ownership ended before launch"
+                            ),
+                        )
         if cleared:
             logger.info(
                 f"Cleared {cleared} pending queued message(s) for task {task_id} on interrupt"
@@ -16516,6 +17137,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
     ) -> bool:
         """Register a dequeued message unless a queue clear invalidated it."""
         cancelled_delivery_key: str | None = None
+        cancelled_capability_resume: tuple[int, str] | None = None
         cancelled_worker_handoff_id: str | None = None
         cancel_delivery = False
         async with self._dispatch_claim_lock:
@@ -16523,6 +17145,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 cancelled_delivery_key = (
                     None if msg.queue_clear_handled else msg.delivery_key
                 )
+                if (
+                    not msg.queue_clear_handled
+                    and msg.capability_resume_outbox_id is not None
+                    and isinstance(msg.capability_resume_lease_token, str)
+                ):
+                    cancelled_capability_resume = (
+                        msg.capability_resume_outbox_id,
+                        msg.capability_resume_lease_token,
+                    )
+                    self._queued_capability_resume_ids.discard(
+                        msg.capability_resume_outbox_id
+                    )
                 if not msg.queue_clear_handled:
                     cancelled_worker_handoff_id = (
                         msg.worker_turn_handoff_id
@@ -16533,6 +17167,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
                 cancel_delivery = task_id in self._cancel_durable_queue_tasks
             else:
+                current = asyncio.current_task()
+                if current is None:
+                    raise RuntimeError(
+                        "Dequeued Task message has no asyncio worker identity"
+                    )
+                existing = self._task_queue_active_messages.get(task_id)
+                if existing is not None and existing[0] is not current:
+                    raise RuntimeError(
+                        "Task queue admitted two concurrent message workers"
+                    )
+                self._task_queue_active_messages[task_id] = (current, msg)
                 self._task_queue_inflight[task_id] = (
                     self._task_queue_inflight.get(task_id, 0) + 1
                 )
@@ -16543,6 +17188,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 [cancelled_delivery_key],
                 cancel=cancel_delivery,
             )
+        if cancelled_capability_resume is not None:
+            from backend.services.capability_resume import (
+                release_resume_publication,
+            )
+
+            outbox_id, lease_token = cancelled_capability_resume
+            async with self.db_factory() as db:
+                await release_resume_publication(
+                    db,
+                    outbox_id,
+                    lease_token=lease_token,
+                    error_code="queue_generation_changed",
+                    error_message="Task queue generation changed before claim",
+                )
         return False
 
     async def abort_task_queue(
@@ -16601,6 +17260,106 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 durable_db=durable_db,
             )
         return cleared
+
+    async def quiesce_task_queue_consumer_for_capability_cancel(
+        self,
+        task_id: int,
+        *,
+        timeout: float = TASK_QUEUE_ABORT_TIMEOUT,
+        expected_outbox_id: int | None = None,
+        expected_lease_token: str | None = None,
+        expected_retry_count: int | None = None,
+        expected_turn_generation: int | None = None,
+        expected_instance_id: int | None = None,
+    ) -> bool:
+        """Reap one volatile consumer without cancelling its resume outbox.
+
+        The caller must already own ``task_queue_cancellation_lease`` so no
+        successor can be admitted.  A dequeued Capability resume may have
+        claimed G+1 before it observes cancellation; its ``finally`` path is
+        allowed to restore that exact pre-provider claim to waiting state.
+
+        Supplying ``expected_outbox_id`` turns this into an exact live-owner
+        fence.  It succeeds only when the registered worker is actively
+        processing that outbox with the same lease, G+1, retry, and Instance
+        reservation.  This keeps an unrelated ``executing`` Task from being
+        mistaken for a pre-provider Capability resume.
+        """
+
+        async with self._dispatch_claim_lock:
+            if not self._task_queue_cancellation_lease_counts.get(task_id, 0):
+                raise RuntimeError(
+                    "Capability queue quiescence requires a cancellation lease"
+                )
+            worker = self._task_queue_workers.get(task_id)
+            if expected_outbox_id is not None:
+                active = self._task_queue_active_messages.get(task_id)
+                active_worker = active[0] if active is not None else None
+                message = active[1] if active is not None else None
+                instance_claim = (
+                    message.instance_claim if message is not None else None
+                )
+                exact_live_owner = bool(
+                    worker is not None
+                    and worker is not asyncio.current_task()
+                    and not worker.done()
+                    and active_worker is worker
+                    and message is not None
+                    and message.capability_resume_outbox_id
+                    == expected_outbox_id
+                    and isinstance(expected_lease_token, str)
+                    and message.capability_resume_lease_token
+                    == expected_lease_token
+                    and message.claimed_retry_count == expected_retry_count
+                    and message.claimed_turn_generation
+                    == expected_turn_generation
+                    and isinstance(instance_claim, tuple)
+                    and len(instance_claim) == 2
+                    and instance_claim[0] == expected_instance_id
+                    and self._task_queue_inflight.get(task_id, 0) == 1
+                    and expected_outbox_id
+                    in self._queued_capability_resume_ids
+                )
+                if not exact_live_owner:
+                    return False
+            self._preserve_capability_resume_on_queue_cancel[task_id] = (
+                self._preserve_capability_resume_on_queue_cancel.get(task_id, 0)
+                + 1
+            )
+        try:
+            if (
+                worker is None
+                or worker is asyncio.current_task()
+                or worker.done()
+            ):
+                return expected_outbox_id is None
+            worker.cancel()
+            done, pending = await asyncio.wait({worker}, timeout=timeout)
+            if pending:
+                raise TaskQueueAbortTimeoutError(
+                    f"Task {task_id} queue worker did not stop within "
+                    f"{timeout:.1f}s"
+                )
+            await asyncio.gather(*done, return_exceptions=True)
+            return True
+        finally:
+            async with self._dispatch_claim_lock:
+                remaining = (
+                    self._preserve_capability_resume_on_queue_cancel.get(
+                        task_id,
+                        0,
+                    )
+                    - 1
+                )
+                if remaining > 0:
+                    self._preserve_capability_resume_on_queue_cancel[
+                        task_id
+                    ] = remaining
+                else:
+                    self._preserve_capability_resume_on_queue_cancel.pop(
+                        task_id,
+                        None,
+                    )
 
     @asynccontextmanager
     async def task_queue_cancellation_lease(self, task_id: int):
@@ -16693,6 +17452,96 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 "请检查账号启用状态与模型支持；若是旧会话多副本，"
                 "请先手动指定正确账号后重新发送。"
             )
+        if (
+            queued_message is not None
+            and queued_message.capability_resume_outbox_id is not None
+        ):
+            from backend.services.capability_resume import (
+                fail_or_cancel_resume_outbox_in_tx,
+            )
+            from backend.services.capability_service import capability_task_lock
+
+            generation = None
+            async with capability_task_lock(task_id):
+                async with self.db_factory() as db:
+                    task_fence = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.status.in_((
+                                "waiting_capability",
+                                "in_progress",
+                                "executing",
+                            )),
+                        )
+                        .values(status=Task.status)
+                    )
+                    if task_fence.rowcount != 1:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent Capability resume refusal lost its Task"
+                        )
+                    task = await db.get(Task, task_id, populate_existing=True)
+                    if task is None:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent Capability resume refusal lost its Task"
+                        )
+                    changed = await fail_or_cancel_resume_outbox_in_tx(
+                        db,
+                        task=task,
+                        outbox_id=(
+                            queued_message.capability_resume_outbox_id
+                        ),
+                        status="failed",
+                        error_code="resume_routing_refused",
+                        error_message=str(exc)[:2000],
+                    )
+                    if not changed:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent Capability resume refusal lost its outbox"
+                        )
+                    task.status = "failed"
+                    task.completed_at = datetime.utcnow()
+                    task.error_message = str(exc)[:2000]
+                    entry = LogEntry(
+                        instance_id=None,
+                        task_id=task_id,
+                        event_type="system_event",
+                        role="system",
+                        content=notice,
+                        is_error=True,
+                    )
+                    db.add(entry)
+                    generation = self._task_status_generation(task)
+                    await db.commit()
+            async with self._dispatch_claim_lock:
+                self._queued_capability_resume_ids.discard(
+                    queued_message.capability_resume_outbox_id
+                )
+            if generation is not None:
+                await self._broadcast_task_status_generation(
+                    generation,
+                    instance_id=None,
+                )
+            try:
+                await self.broadcaster.broadcast(
+                    f"task:{task_id}",
+                    {
+                        "event_type": "system_event",
+                        "role": "system",
+                        "content": notice,
+                        "is_error": True,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Capability resume refusal committed but notification "
+                    "failed for task %s",
+                    task_id,
+                )
+            return
         released_plan: tuple[list[int], int | None] | None = None
         commit_cancellation: asyncio.CancelledError | None = None
         async with self.db_factory() as db:
@@ -16881,7 +17730,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         InstanceAlreadyRunningError,
                     )
 
-                    if isinstance(
+                    if isinstance(exc, CapabilityResumeLeaseLostError):
+                        # The durable lease, not this queue object, decides who
+                        # may advance the Task.  Drop the stale volatile owner;
+                        # the winning coordinator publication remains intact.
+                        logger.info(
+                            "Dropping superseded capability resume for task %s: %s",
+                            task_id,
+                            exc,
+                        )
+                    elif isinstance(
                         exc,
                         (
                             QueuedAdmissionCommitOutcomeUncertainError,
@@ -17039,8 +17897,48 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             self._queued_worker_turn_handoffs.discard(
                                 msg.worker_turn_handoff_id
                             )
+                    if (
+                        msg.capability_resume_outbox_id is not None
+                        and not message_requeued
+                    ):
+                        if (
+                            isinstance(msg.capability_resume_lease_token, str)
+                            and (
+                                task_id not in self._cancel_durable_queue_tasks
+                                or task_id
+                                in self._preserve_capability_resume_on_queue_cancel
+                            )
+                        ):
+                            from backend.services.capability_resume import (
+                                release_resume_publication,
+                            )
+
+                            async with self.db_factory() as release_db:
+                                await release_resume_publication(
+                                    release_db,
+                                    msg.capability_resume_outbox_id,
+                                    lease_token=(
+                                        msg.capability_resume_lease_token
+                                    ),
+                                    error_code="queue_owner_released",
+                                    error_message=(
+                                        "Dispatcher queue owner settled before "
+                                        "a durable launch acknowledgement"
+                                    ),
+                                )
+                        async with self._dispatch_claim_lock:
+                            self._queued_capability_resume_ids.discard(
+                                msg.capability_resume_outbox_id
+                            )
                     q.task_done()
                     async with self._dispatch_claim_lock:
+                        active = self._task_queue_active_messages.get(task_id)
+                        if (
+                            active is not None
+                            and active[0] is asyncio.current_task()
+                            and active[1] is msg
+                        ):
+                            self._task_queue_active_messages.pop(task_id, None)
                         inflight = self._task_queue_inflight.get(task_id, 0) - 1
                         if inflight > 0:
                             self._task_queue_inflight[task_id] = inflight
@@ -17052,6 +17950,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             hb_task.cancel()
             await asyncio.gather(hb_task, return_exceptions=True)
             orphaned_delivery_key = None
+            orphaned_capability_resume: tuple[int, str] | None = None
             orphaned_worker_handoff_id = None
             async with self._dispatch_claim_lock:
                 handoff = self._task_queue_dequeued.get(task_id)
@@ -17062,15 +17961,53 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
                     if not handoff.queue_clear_handled:
                         orphaned_delivery_key = handoff.delivery_key
+                        if (
+                            handoff.capability_resume_outbox_id is not None
+                            and isinstance(
+                                handoff.capability_resume_lease_token,
+                                str,
+                            )
+                        ):
+                            orphaned_capability_resume = (
+                                handoff.capability_resume_outbox_id,
+                                handoff.capability_resume_lease_token,
+                            )
                 if orphaned_worker_handoff_id is not None:
                     self._queued_worker_turn_handoffs.discard(
                         orphaned_worker_handoff_id
+                    )
+                if orphaned_capability_resume is not None:
+                    self._queued_capability_resume_ids.discard(
+                        orphaned_capability_resume[0]
                     )
             if orphaned_delivery_key is not None:
                 await self._reset_plan_deliveries_after_queue_clear(
                     [orphaned_delivery_key],
                     cancel=task_id in self._cancel_durable_queue_tasks,
                 )
+            if (
+                orphaned_capability_resume is not None
+                and (
+                    task_id not in self._cancel_durable_queue_tasks
+                    or task_id
+                    in self._preserve_capability_resume_on_queue_cancel
+                )
+            ):
+                from backend.services.capability_resume import (
+                    release_resume_publication,
+                )
+
+                outbox_id, lease_token = orphaned_capability_resume
+                async with self.db_factory() as release_db:
+                    await release_resume_publication(
+                        release_db,
+                        outbox_id,
+                        lease_token=lease_token,
+                        error_code="queue_consumer_interrupted",
+                        error_message=(
+                            "Queue consumer stopped before registering the resume"
+                        ),
+                    )
             # Only deregister if THIS task is still the registered worker. The
             # watchdog (_ensure_queue_worker) may have already cancelled us and
             # registered a fresh consumer; popping unconditionally would erase
@@ -17187,29 +18124,68 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             "has_temp_skills": False,
             "original_skills": {},
             "temporary_skill_token": None,
+            "capability_phase_fence": None,
         }
-        try:
-            return await self._process_queued_message_inner(
-                task_id, msg, launch_admission, cleanup_state
-            )
-        finally:
-            if launch_admission["held"]:
-                launch_admission["held"] = False
-                self._chat_launch_admission_lock.release()
-            # Covers failures during account resolution/compaction/DB writes,
-            # before the narrower launch try/finally is reached.
-            if msg.instance_claim is not None:
-                instance_id, claim_token = msg.instance_claim
-                await self._release_instance_reservation(instance_id, claim_token)
-                msg.instance_claim = None
-            if cleanup_state["has_temp_skills"]:
-                await self._restore_queued_message_skills(
-                    task_id,
-                    msg,
-                    cleanup_state["original_skills"],
-                    cleanup_state["temporary_skill_token"],
+
+        async def process_and_cleanup():
+            try:
+                return await self._process_queued_message_inner(
+                    task_id, msg, launch_admission, cleanup_state
                 )
-                cleanup_state["has_temp_skills"] = False
+            finally:
+                try:
+                    if launch_admission["held"]:
+                        launch_admission["held"] = False
+                        self._chat_launch_admission_lock.release()
+                    # Covers failures during account resolution/compaction/DB
+                    # writes, before the narrower launch try/finally is reached.
+                    if msg.instance_claim is not None:
+                        instance_id, claim_token = msg.instance_claim
+                        await self._release_instance_reservation(
+                            instance_id,
+                            claim_token,
+                        )
+                        msg.instance_claim = None
+                    if cleanup_state["has_temp_skills"]:
+                        await self._restore_queued_message_skills(
+                            task_id,
+                            msg,
+                            cleanup_state["original_skills"],
+                            cleanup_state["temporary_skill_token"],
+                        )
+                        cleanup_state["has_temp_skills"] = False
+                finally:
+                    # Phase-1 failures and early returns never reach the
+                    # explicit release immediately before the provider wait.
+                    # Release even when cleanup itself fails.
+                    self._release_capability_resume_phase_fence(cleanup_state)
+
+        if msg.capability_resume_outbox_id is not None:
+            from backend.services.capability_service import capability_task_lock
+
+            if msg.command_skills:
+                raise QueuedMessageRoutingMismatchError(
+                    "Capability resume cannot carry temporary skill overrides"
+                )
+            # Hold the non-reentrant fence only through Phase 1: envelope and
+            # route validation, exact G+1 claim, launch, provider-boundary
+            # promotion, and prelaunch cleanup. The output consumer needs the
+            # same lock to settle this turn, so Phase 2 must not retain it.
+            phase_fence = capability_task_lock(task_id)
+            await phase_fence.acquire()
+            cleanup_state["capability_phase_fence"] = phase_fence
+            return await process_and_cleanup()
+        return await process_and_cleanup()
+
+    @staticmethod
+    def _release_capability_resume_phase_fence(cleanup_state: dict) -> None:
+        """Release the queue-owned Capability fence at the Phase 1 boundary."""
+
+        phase_fence = cleanup_state.get("capability_phase_fence")
+        if phase_fence is None:
+            return
+        cleanup_state["capability_phase_fence"] = None
+        phase_fence.release()
 
     async def _restore_queued_message_skills(
         self,
@@ -17293,6 +18269,40 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             "settled": False,
         }
         async with self.db_factory() as db:
+            if msg.capability_resume_outbox_id is not None:
+                from backend.services.capability_resume import (
+                    load_resume_envelope,
+                )
+
+                if not isinstance(msg.capability_resume_lease_token, str):
+                    raise CapabilityResumeLeaseLostError(
+                        "Capability resume has no publication lease"
+                    )
+                envelope = await load_resume_envelope(
+                    db,
+                    msg.capability_resume_outbox_id,
+                    expected_lease_token=msg.capability_resume_lease_token,
+                )
+                if envelope is None:
+                    raise CapabilityResumeLeaseLostError(
+                        "Capability resume publication lease is no longer current"
+                    )
+                if envelope.task_id != task_id:
+                    raise QueuedMessageRoutingMismatchError(
+                        "Capability resume belongs to a different Task"
+                    )
+                msg.prompt = envelope.prompt
+                msg.current_message = envelope.current_message
+                msg.timestamp = envelope.queue_timestamp
+                msg.expected_task_routing = (
+                    envelope.provider,
+                    envelope.model,
+                    envelope.service_tier,
+                )
+                msg.allow_new_session = envelope.request_session_id is None
+                if envelope.claimed_generation is not None:
+                    msg.claimed_retry_count = envelope.request_retry_count
+                    msg.claimed_turn_generation = envelope.claimed_generation
             task = await db.get(Task, task_id)
             if not task:
                 logger.warning(f"Task {task_id} not found, skipping queued message")
@@ -17300,6 +18310,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if await active_worker_task_termination_receipt(db, task_id):
                 raise QueuedMessagePrelaunchError(
                     "Task has an active Worker termination receipt"
+                )
+            if (
+                task.status == "waiting_capability"
+                and msg.capability_resume_outbox_id is None
+            ):
+                # The terminal Agent turn deliberately yielded ownership to a
+                # durable Capability.  Ordinary user/monitor/Plan messages stay
+                # queued until its exact outbox resume advances G -> G+1.
+                raise QueuedMessagePrelaunchError(
+                    "Task is waiting for its Capability resume outbox"
                 )
             if task.mode == "plan":
                 # Plan Tasks are read-only planning records. Their planner /
@@ -17459,6 +18479,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 raise QueuedMessagePrelaunchError(
                     "Task has an active Worker termination receipt"
                 )
+            if (
+                task.status == "waiting_capability"
+                and msg.capability_resume_outbox_id is None
+            ):
+                raise QueuedMessagePrelaunchError(
+                    "Task is waiting for its Capability resume outbox"
+                )
             if task.mode == "plan":
                 logger.warning(
                     "Discarding queued message after task %s became a Plan",
@@ -17487,7 +18514,15 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 bool(task.session_id)
                 and _find_session_jsonl(task.session_id, provider=provider) is None
             )
-            if task.session_id and (task.status == "failed" or session_gone):
+            if msg.capability_resume_outbox_id is not None and session_gone:
+                raise QueuedMessageRoutingMismatchError(
+                    "Capability resume lost its frozen native session"
+                )
+            if (
+                msg.capability_resume_outbox_id is None
+                and task.session_id
+                and (task.status == "failed" or session_gone)
+            ):
                 # Snapshot the complete resume generation before any clone /
                 # compaction awaits.  A concurrent cancel, retry, or owner/session
                 # change must win and keep this exact QueuedMessage unconsumed.
@@ -17779,7 +18814,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             effective_skills = dict(task.enabled_skills or {})
 
             # 上下文超阈值时自动摘要 + 新 session（无限续聊）
-            if task.session_id and task.context_window_usage:
+            if (
+                msg.capability_resume_outbox_id is None
+                and task.session_id
+                and task.context_window_usage
+            ):
                 usage = task.context_window_usage
                 used_tokens = context_tokens_used(task.provider, usage)
                 # context_window 可能被 CC 低报（1M 模型报 200K），用模型名兜底；
@@ -18022,6 +19061,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         "Queued task disappeared after launch barrier"
                     )
                 task = current
+                if (
+                    task.status == "waiting_capability"
+                    and msg.capability_resume_outbox_id is None
+                ):
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Task entered waiting_capability before final claim"
+                    )
                 if not _context_retry_permit_matches(task, msg):
                     await db.rollback()
                     logger.info(
@@ -18157,15 +19204,36 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 task_provider = (task.provider or "claude").lower()
                 launch_kwargs["enabled_skills"] = effective_skills
 
-                task.status = "executing"
-                task.instance_id = inst.id
-                task.completed_at = None
-                # This transaction is the durable admission point for one
-                # logical model turn. Pre-launch routing may await for a long
-                # time, so increment only after every final ownership and
-                # policy fence above has been revalidated.
-                if not claimed_turn_retry:
-                    task.turn_generation = task.turn_generation + 1
+                capability_turn_claim = None
+                if msg.capability_resume_outbox_id is not None:
+                    from backend.services.capability_resume import (
+                        claim_resume_turn_locked,
+                    )
+
+                    if not isinstance(msg.capability_resume_lease_token, str):
+                        await db.rollback()
+                        raise CapabilityResumeLeaseLostError(
+                            "Capability resume lost its exact publication lease"
+                        )
+                    capability_turn_claim = await claim_resume_turn_locked(
+                        db,
+                        task=task,
+                        outbox_id=msg.capability_resume_outbox_id,
+                        lease_token=msg.capability_resume_lease_token,
+                        instance_id=inst.id,
+                        transport=_turn_transport_name(task),
+                    )
+                    claimed_turn_retry = capability_turn_claim.replay
+                else:
+                    task.status = "executing"
+                    task.instance_id = inst.id
+                    task.completed_at = None
+                    # This transaction is the durable admission point for one
+                    # logical model turn. Pre-launch routing may await for a long
+                    # time, so increment only after every final ownership and
+                    # policy fence above has been revalidated.
+                    if not claimed_turn_retry:
+                        task.turn_generation = task.turn_generation + 1
                 if msg.command_skills:
                     # The skill view becomes visible atomically with launch
                     # ownership, before the process can make its first MCP
@@ -18349,6 +19417,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     instance_id=inst.id,
                     transport=_turn_transport_name(task),
                 )
+                if (
+                    capability_turn_claim is not None
+                    and bound_source.id != capability_turn_claim.source_log_id
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Capability resume bound a different exact turn source"
+                    )
                 launch_source_log_id = (
                     source_log_id
                     if source_log_id is not None
@@ -18539,6 +19615,73 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             "Worker termination receipt or newer Task generation"
                         )
                     await permit_db.commit()
+                if msg.capability_resume_outbox_id is not None:
+                    from backend.services.capability_resume import (
+                        mark_resume_launch_boundary_in_tx,
+                    )
+
+                    # InstanceManager writes source.actual_transport before it
+                    # invokes this callback.  From here onward the external
+                    # effect may already exist even if outbox promotion loses
+                    # its commit acknowledgement.
+                    worker_handoff_boundary["crossed"] = True
+                    async def promote_resume_boundary() -> bool:
+                        async with self.db_factory() as boundary_db:
+                            fence = await boundary_db.execute(
+                                update(Task)
+                                .where(
+                                    *self._task_status_generation_predicates(
+                                        queued_turn_generation
+                                    ),
+                                    no_active_worker_task_termination_predicate(),
+                                )
+                                .values(status=Task.status)
+                            )
+                            if fence.rowcount != 1:
+                                await boundary_db.rollback()
+                                return False
+                            boundary_task = await boundary_db.get(
+                                Task,
+                                task_id,
+                                populate_existing=True,
+                            )
+                            if boundary_task is None:
+                                await boundary_db.rollback()
+                                return False
+                            changed = await mark_resume_launch_boundary_in_tx(
+                                boundary_db,
+                                task=boundary_task,
+                                outbox_id=msg.capability_resume_outbox_id,
+                                retry_count=queued_turn_generation.retry_count,
+                                turn_generation=(
+                                    queued_turn_generation.turn_generation
+                                ),
+                                source_log_id=bound_source.id,
+                            )
+                            if changed:
+                                await boundary_db.commit()
+                            else:
+                                await boundary_db.rollback()
+                            return changed
+
+                    promoted, cancellation = await _settle_despite_cancellation(
+                        promote_resume_boundary()
+                    )
+                    try:
+                        promotion_succeeded = promoted.result()
+                    except Exception as exc:
+                        raise QueuedTurnLaunchOutcomeUncertainError(
+                            "Capability resume crossed the provider boundary "
+                            "but its outbox promotion failed"
+                        ) from exc
+                    if not promotion_succeeded:
+                        raise QueuedTurnLaunchOutcomeUncertainError(
+                            "Capability resume provider boundary could not be "
+                            "reconciled with its durable outbox"
+                        )
+                    if cancellation is not None:
+                        raise cancellation
+                    return
                 if msg.worker_turn_handoff_id is not None:
                     transition, cancellation = await _settle_despite_cancellation(
                         self._persist_worker_handoff_transition(
@@ -18583,13 +19726,22 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # finally so a failed launch can't leak the claim and wedge the
             # instance out of the dispatch pool forever.
             try:
-                await self.instance_manager.launch(**launch_kwargs)
-                # Tests and third-party InstanceManager stand-ins may accept
-                # arbitrary kwargs without invoking the real boundary hook. A
-                # successful return is already beyond that boundary, so advance
-                # it here before recording launch completion.
-                if not worker_handoff_boundary["crossed"]:
-                    await mark_launch_boundary()
+                if msg.capability_resume_outbox_id is not None:
+                    # _process_queued_message already owns the Capability
+                    # Phase-1 fence before any Instance reservation. Re-taking
+                    # this non-reentrant lock would deadlock the queue worker.
+                    await self.instance_manager.launch(**launch_kwargs)
+                    # Tests/embedders may return without calling the real
+                    # boundary hook. A successful return is already past that
+                    # boundary, so promote while the same lock is held.
+                    if not worker_handoff_boundary["crossed"]:
+                        await mark_launch_boundary()
+                else:
+                    await self.instance_manager.launch(**launch_kwargs)
+                    # Tests and third-party InstanceManager stand-ins may accept
+                    # arbitrary kwargs without invoking the real boundary hook.
+                    if not worker_handoff_boundary["crossed"]:
+                        await mark_launch_boundary()
                 if msg.worker_turn_handoff_id is not None:
                     settled, settlement_cancellation = (
                         await _settle_despite_cancellation(
@@ -18647,6 +19799,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     and (
                         msg.delivery_key is not None
                         or msg.worker_turn_handoff_id is not None
+                        or msg.capability_resume_outbox_id is not None
                     )
                 ):
                     reconciliation, delayed_cancellation = (
@@ -18794,6 +19947,42 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         task_id,
                     )
                 handoff_prelaunch_proven = msg.worker_turn_handoff_id is None
+                capability_prelaunch_proven = (
+                    msg.capability_resume_outbox_id is None
+                )
+                if (
+                    msg.capability_resume_outbox_id is not None
+                    and not worker_handoff_boundary["crossed"]
+                    and isinstance(msg.capability_resume_lease_token, str)
+                ):
+                    try:
+                        from backend.services.capability_resume import (
+                            load_resume_envelope,
+                        )
+
+                        capability_envelope = await load_resume_envelope(
+                            db,
+                            msg.capability_resume_outbox_id,
+                            expected_lease_token=(
+                                msg.capability_resume_lease_token
+                            ),
+                        )
+                        capability_prelaunch_proven = bool(
+                            capability_envelope is not None
+                            and capability_envelope.status == "claimed"
+                            and capability_envelope.claimed_generation
+                            == queued_turn_generation.turn_generation
+                            and capability_envelope.source_log_id
+                            == bound_source.id
+                        )
+                    except Exception:
+                        await db.rollback()
+                        capability_prelaunch_proven = False
+                        logger.exception(
+                            "Could not prove Capability resume %s remained "
+                            "prelaunch",
+                            msg.capability_resume_outbox_id,
+                        )
                 exact_handoff_status: str | None = None
                 if (
                     msg.worker_turn_handoff_id is not None
@@ -18847,6 +20036,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     not worker_handoff_boundary["crossed"]
                     and source_preflight_proven
                     and handoff_prelaunch_proven
+                    and capability_prelaunch_proven
+                    and not (
+                        msg.capability_resume_outbox_id is not None
+                        and permanent_prelaunch
+                    )
                     and (
                         known_prelaunch
                         or self.instance_manager.processes.get(inst_id) is None
@@ -18984,6 +20178,36 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             updated_at=datetime.utcnow(),
                         )
                     )
+                if (
+                    not safe_to_retry
+                    and msg.capability_resume_outbox_id is not None
+                ):
+                    from backend.services.capability_resume import (
+                        fail_or_cancel_resume_outbox_in_tx,
+                    )
+
+                    failed_task = await db.get(
+                        Task,
+                        task_id,
+                        populate_existing=True,
+                    )
+                    if failed_task is None:
+                        await db.rollback()
+                        raise QueuedTurnLaunchOutcomeUncertainError(
+                            "Capability resume Task disappeared during failure "
+                            "settlement"
+                        ) from exc
+                    await fail_or_cancel_resume_outbox_in_tx(
+                        db,
+                        task=failed_task,
+                        outbox_id=msg.capability_resume_outbox_id,
+                        status="failed",
+                        error_code="resume_launch_uncertain",
+                        error_message=(
+                            "Capability resume launch could not be proven "
+                            f"pre-boundary: {exc}"
+                        ),
+                    )
                 await db.commit()
                 if permanent_notice_data is not None:
                     await self.broadcaster.broadcast(
@@ -19031,6 +20255,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         if launch_admission["held"]:
             launch_admission["held"] = False
             self._chat_launch_admission_lock.release()
+
+        # Provider admission and all Phase-1 launch cleanup are durable.
+        # InstanceManager's terminal consumer needs this same lock to settle
+        # the previous outbox and optionally admit a following capability.
+        self._release_capability_resume_phase_fence(cleanup_state)
 
         # Phase 2: wait for process to finish (no DB held)
         try:

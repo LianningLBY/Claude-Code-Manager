@@ -600,17 +600,20 @@ async def dispatcher_status():
 @dispatcher_router.post("/start")
 async def start_dispatcher(request: Request):
     require_admin(request)
-    from backend.main import dispatcher
-    await dispatcher.start()
+    from backend.main import start_dispatcher_runtime
+    try:
+        await start_dispatcher_runtime()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "message": "Dispatcher started"}
 
 
 @dispatcher_router.post("/stop")
 async def stop_dispatcher(request: Request):
     require_admin(request)
-    from backend.main import dispatcher
+    from backend.main import stop_dispatcher_runtime
     try:
-        await dispatcher.stop()
+        await stop_dispatcher_runtime()
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return {"ok": True, "message": "Dispatcher stopped"}

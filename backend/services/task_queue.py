@@ -38,6 +38,10 @@ TASK_KIND_RELATED_PLAN = "related_plan"
 TASK_KIND_MAIN = "main"
 
 
+class TaskWaitingCapabilityConflict(RuntimeError):
+    """An ordinary Task mutation raced with its durable capability wait."""
+
+
 def _dispatcher_scope_predicate():
     """Require durable Controller admission for Delivery-owned Tasks.
 
@@ -484,6 +488,7 @@ class TaskQueue:
 
         if not values:
             return await self.get(task_id)
+        waiting_capability_safe = set(values).issubset({"has_unread"})
 
         # This must be the first statement in the mutation transaction.  The
         # correlated receipt predicate and receipt admission's own Task write
@@ -493,6 +498,11 @@ class TaskQueue:
             update(Task)
             .where(
                 Task.id == task_id,
+                *(
+                    ()
+                    if waiting_capability_safe
+                    else (Task.status != "waiting_capability",)
+                ),
                 no_active_worker_task_termination_predicate(),
             )
             .values(**values)
@@ -505,6 +515,15 @@ class TaskQueue:
                 raise WorkerTaskTerminationConflict(
                     f"Task {task_id} has an active Worker termination receipt"
                 )
+            if not waiting_capability_safe:
+                current_status = await self.db.scalar(
+                    select(Task.status).where(Task.id == task_id)
+                )
+                await self.db.rollback()
+                if current_status == "waiting_capability":
+                    raise TaskWaitingCapabilityConflict(
+                        f"Task {task_id} is waiting for a capability resume"
+                    )
             await self.db.rollback()
             return None
         await self.db.commit()
@@ -531,6 +550,8 @@ class TaskQueue:
             observed_background_generation,
             observed_turn_generation,
         ) = expected_fence or task_delete_fence(task)
+        if observed_status == "waiting_capability":
+            return False
         if (
             not remote_worker_deleted
             and not is_task_status_deletable(
@@ -623,8 +644,10 @@ class TaskQueue:
         from backend.models.capability import (
             ACTIVE_EXECUTION_STATUSES,
             ACTIVE_INVOCATION_STATUSES,
+            ACTIVE_RESUME_OUTBOX_STATUSES,
             CapabilityExecution,
             CapabilityInvocation,
+            CapabilityResumeOutbox,
         )
 
         capability_invocations = list(
@@ -665,6 +688,36 @@ class TaskQueue:
         ) or any(
             execution.status in ACTIVE_EXECUTION_STATUSES
             for execution in capability_executions
+        ):
+            await self.db.rollback()
+            return False
+
+        # Resume delivery is the final child in the global Task -> Invocation
+        # -> Execution -> Outbox lock order.  A live row owns the exact G -> G+1
+        # handoff even when its Invocation/Execution already became terminal.
+        # Lock and reject it before inspecting adapter-specific reverse links.
+        capability_outbox_predicates = [
+            CapabilityResumeOutbox.task_id == task_id,
+        ]
+        if capability_invocation_ids:
+            capability_outbox_predicates.append(
+                CapabilityResumeOutbox.invocation_id.in_(
+                    capability_invocation_ids
+                )
+            )
+        capability_outboxes = list(
+            (
+                await self.db.execute(
+                    select(CapabilityResumeOutbox)
+                    .where(or_(*capability_outbox_predicates))
+                    .order_by(CapabilityResumeOutbox.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        if any(
+            outbox.status in ACTIVE_RESUME_OUTBOX_STATUSES
+            for outbox in capability_outboxes
         ):
             await self.db.rollback()
             return False
@@ -950,6 +1003,18 @@ class TaskQueue:
         # prevents future Task-id reuse from inheriting stale access.
         await purge_task_access_grants(self.db, task_id)
         await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
+        if capability_outboxes:
+            # SQLite deployments commonly run without FK enforcement.  Remove
+            # terminal outbox history explicitly and before its Execution /
+            # Invocation parents so every supported dialect has identical
+            # deletion behavior.
+            await self.db.execute(
+                sa_delete(CapabilityResumeOutbox).where(
+                    CapabilityResumeOutbox.id.in_(
+                        [outbox.id for outbox in capability_outboxes]
+                    )
+                )
+            )
         if capability_invocation_ids:
             await self.db.execute(
                 sa_delete(CapabilityExecution).where(
@@ -1269,6 +1334,7 @@ class TaskQueue:
         predicates = [
             Task.id == task_id,
             Task.status.in_(expected_statuses),
+            Task.status != "waiting_capability",
             Task.pty_background_generation.is_(None),
             task_retry_not_superseded_predicate(),
             no_active_worker_task_termination_predicate(),

@@ -17,6 +17,9 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     async def start_dispatcher() -> None:
         await record("dispatcher")
 
+    async def start_capability_resume() -> None:
+        await record("capability_resume")
+
     async def start_worker_relay() -> None:
         await record("worker_relay")
 
@@ -38,6 +41,11 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
         main.dispatcher,
         "start",
         AsyncMock(side_effect=start_dispatcher),
+    )
+    monkeypatch.setattr(
+        main.capability_resume_coordinator,
+        "start",
+        AsyncMock(side_effect=start_capability_resume),
     )
     worker_relay = MagicMock(
         start=AsyncMock(side_effect=start_worker_relay)
@@ -69,6 +77,7 @@ async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     assert calls == [
         "worker_termination_recover",
         "dispatcher",
+        "capability_resume",
         "worker_relay",
         "worker_termination",
         "capability",
@@ -94,6 +103,9 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
     async def stop_capability() -> None:
         await record("capability")
 
+    async def stop_capability_resume() -> None:
+        await record("capability_resume")
+
     async def stop_worker_relay() -> None:
         await record("worker_relay")
 
@@ -113,6 +125,11 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
         main.capability_coordinator,
         "shutdown",
         AsyncMock(side_effect=stop_capability),
+    )
+    monkeypatch.setattr(
+        main.capability_resume_coordinator,
+        "shutdown",
+        AsyncMock(side_effect=stop_capability_resume),
     )
     worker_relay = MagicMock(
         shutdown=AsyncMock(side_effect=stop_worker_relay)
@@ -147,11 +164,84 @@ async def test_execution_runtime_shutdown_is_reverse_order_and_best_effort(
 
     assert calls == [
         "delivery",
+        "capability_resume",
         "capability",
         "worker_termination",
         "worker_relay",
         "dispatcher",
     ]
+
+
+@pytest.mark.asyncio
+async def test_execution_runtime_start_rolls_back_dispatcher_when_resume_fails(
+    monkeypatch,
+):
+    import backend.main as main
+
+    calls: list[str] = []
+
+    async def start_dispatcher() -> None:
+        calls.append("dispatcher.start")
+
+    async def stop_dispatcher() -> None:
+        calls.append("dispatcher.stop")
+
+    async def start_resume() -> None:
+        calls.append("resume.start")
+        raise RuntimeError("resume recovery failed")
+
+    async def stop_resume() -> None:
+        calls.append("resume.shutdown")
+
+    monkeypatch.setattr(main.settings, "auto_start_dispatcher", True)
+    monkeypatch.setattr(
+        main.dispatcher,
+        "start",
+        AsyncMock(side_effect=start_dispatcher),
+    )
+    monkeypatch.setattr(
+        main.dispatcher,
+        "stop",
+        AsyncMock(side_effect=stop_dispatcher),
+    )
+    monkeypatch.setattr(
+        main.capability_resume_coordinator,
+        "start",
+        AsyncMock(side_effect=start_resume),
+    )
+    monkeypatch.setattr(
+        main.capability_resume_coordinator,
+        "shutdown",
+        AsyncMock(side_effect=stop_resume),
+    )
+    worker_relay = MagicMock(start=AsyncMock())
+    monkeypatch.setattr(main, "worker_relay", worker_relay)
+    monkeypatch.setattr(
+        main.worker_task_termination_coordinator,
+        "recover_once",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        main.worker_task_termination_coordinator,
+        "start",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(main.capability_coordinator, "start", AsyncMock())
+    monkeypatch.setattr(main.delivery_controller, "start", AsyncMock())
+
+    with pytest.raises(RuntimeError, match="resume recovery failed"):
+        await main._start_execution_runtimes()
+
+    assert calls == [
+        "dispatcher.start",
+        "resume.start",
+        "resume.shutdown",
+        "dispatcher.stop",
+    ]
+    worker_relay.start.assert_not_awaited()
+    main.worker_task_termination_coordinator.start.assert_not_awaited()
+    main.capability_coordinator.start.assert_not_awaited()
+    main.delivery_controller.start.assert_not_awaited()
 
 
 @pytest.mark.asyncio

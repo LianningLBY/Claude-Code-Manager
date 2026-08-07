@@ -545,12 +545,34 @@ async def create_controller_invocation(
     )
 
 
-async def create_agent_invocation(*args, **kwargs):
-    """Reject Agent/MCP calls until CCM has an exact native-turn fence."""
+async def create_agent_invocation(
+    db: AsyncSession,
+    *,
+    expected=None,
+    **legacy_unfenced_fields,
+):
+    """Admit only a controller-proven exact terminal Task generation.
 
-    raise CapabilityUnsupportedScopeError(
-        "agent_request requires an exact task-turn generation and is not available"
+    The loose historical stub accepted arbitrary keyword shapes only to reject
+    them. Keep that rejection explicit for stale callers; the enabled entry
+    point requires the typed expectation produced at a provider terminal
+    boundary and atomically creates its resume outbox.
+    """
+
+    if expected is None or legacy_unfenced_fields:
+        raise CapabilityUnsupportedScopeError(
+            "agent_request requires an exact terminal Task generation"
+        )
+    from backend.services.agent_capability_admission import (
+        AgentTerminalExpectation,
+        admit_agent_terminal_action,
     )
+
+    if not isinstance(expected, AgentTerminalExpectation):
+        raise CapabilityValidationError(
+            "agent_request expectation has an invalid type"
+        )
+    return await admit_agent_terminal_action(db, expected=expected)
 
 
 async def get_invocation(
@@ -1356,11 +1378,20 @@ async def consume_ready_invocation(
     *,
     invocation_id: int,
     expected_state_version: int,
+    allow_workflow_owned: bool = False,
 ) -> CapabilityInvocation:
     task_id = await _invocation_task_id(db, invocation_id)
     async with capability_task_lock(task_id):
         try:
             _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            if not allow_workflow_owned and (
+                invocation.source != "human_request"
+                or invocation.resume_policy != "attach_only"
+            ):
+                raise CapabilityConflictError(
+                    "Workflow-owned Capability results cannot be consumed "
+                    "through the public advisory lifecycle"
+                )
             _expect_version(invocation.state_version, expected_state_version, resource="invocation")
             if invocation.status != "ready":
                 raise CapabilityConflictError("Capability result is not ready")
@@ -1385,6 +1416,7 @@ async def cancel_invocation(
     *,
     invocation_id: int,
     expected_state_version: int,
+    allow_workflow_owned: bool = False,
 ) -> CapabilityInvocation:
     """Request cancellation; queued/ready work terminates synchronously."""
 
@@ -1392,6 +1424,14 @@ async def cancel_invocation(
     async with capability_task_lock(task_id):
         try:
             _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            if not allow_workflow_owned and (
+                invocation.source != "human_request"
+                or invocation.resume_policy != "attach_only"
+            ):
+                raise CapabilityConflictError(
+                    "Workflow-owned Capabilities must be cancelled through "
+                    "their owning Task or Controller lifecycle"
+                )
             _expect_version(invocation.state_version, expected_state_version, resource="invocation")
             if invocation.status in TERMINAL_INVOCATION_STATUSES:
                 await db.commit()

@@ -694,6 +694,165 @@ describe('TaskForm persisted defaults', () => {
   });
 });
 
+describe('TaskForm Auto capabilities', () => {
+  const enabledConfig = {
+    default_provider: 'claude',
+    provider_options: ['claude', 'codex'],
+    default_model: 'claude-opus-4-6',
+    model_options: ['claude-opus-4-6'],
+    default_codex_model: 'gpt-5.6-sol',
+    codex_model_options: ['gpt-5.6-sol'],
+    default_effort: 'medium',
+    effort_options: ['low', 'medium', 'high'],
+    codex_effort_options: ['low', 'medium', 'high', 'xhigh'],
+    codex_model_efforts: {},
+    codex_model_service_tiers: {},
+    capability_core_enabled: true,
+    auto_capability_enabled: true,
+    delivery_loop_enabled: false,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.config).mockResolvedValue(enabledConfig as never);
+    vi.mocked(api.listProjects).mockResolvedValue([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+    ] as never);
+  });
+
+  it.each([
+    ['Capability Core', { capability_core_enabled: false }],
+    ['Auto Capability', { auto_capability_enabled: false }],
+  ])('keeps controls hidden when the %s rollout gate is disabled', async (_name, override) => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...enabledConfig,
+      ...override,
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await openConfigPanel();
+
+    expect(screen.queryByLabelText('Allow automatic Plan')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Allow automatic Code Review')).not.toBeInTheDocument();
+  });
+
+  it('fails closed when the server capability config cannot be loaded', async () => {
+    vi.mocked(api.config).mockRejectedValueOnce(new Error('config unavailable'));
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    expect(screen.queryByLabelText('Allow automatic Plan')).not.toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Create without unconfirmed capability support',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls[0][0]).not.toHaveProperty(
+      'capability_policy',
+    );
+  });
+
+  it('submits an explicit allowlist with total and per-capability budgets', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    await userEvent.click(screen.getByLabelText('Allow automatic Plan'));
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic Plan budget'),
+      '2',
+    );
+    await userEvent.click(screen.getByLabelText('Allow automatic Code Review'));
+    await waitFor(() => {
+      expect(screen.getByLabelText('Automatic capability total limit')).toHaveValue('2');
+    });
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic capability total limit'),
+      '3',
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Implement with advisory help',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        capability_policy: {
+          version: 1,
+          max_invocations: 3,
+          capabilities: { plan: 2, code_review: 1 },
+        },
+      }),
+    ));
+  });
+
+  it('keeps the maximum edge policy within every backend budget bound', async () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    await userEvent.click(screen.getByLabelText('Allow automatic Plan'));
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic Plan budget'),
+      '8',
+    );
+    await userEvent.click(screen.getByLabelText('Allow automatic Code Review'));
+    await userEvent.selectOptions(
+      screen.getByLabelText('Automatic Code Review budget'),
+      '8',
+    );
+    expect(screen.getByLabelText('Automatic capability total limit')).toHaveValue('8');
+
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Use bounded advisory help',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        capability_policy: {
+          version: 1,
+          max_invocations: 8,
+          capabilities: { plan: 8, code_review: 8 },
+        },
+      }),
+    ));
+  });
+
+  it('clears a local opt-in and omits policy after switching to a Worker project', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+      { id: 2, name: 'worker-project', git_url: '', has_remote: false, local_path: '/tmp/worker', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: 9 },
+    ] as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+
+    await userEvent.click(screen.getByLabelText('Allow automatic Plan'));
+    await userEvent.click(screen.getByText('test-project'));
+    await userEvent.click(await screen.findByText('worker-project'));
+    await openConfigPanel();
+
+    expect(screen.queryByLabelText('Allow automatic Plan')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Allow automatic Code Review')).not.toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'Run only on the Worker',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls[0][0]).not.toHaveProperty(
+      'capability_policy',
+    );
+  });
+});
+
 describe('TaskForm Delivery Loop mode', () => {
   const config = {
     default_provider: 'codex',

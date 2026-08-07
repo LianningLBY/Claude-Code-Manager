@@ -30,6 +30,10 @@ import httpx
 from sqlalchemy import JSON, and_, or_, select, update
 
 from backend.config import settings
+from backend.models.capability import (
+    ACTIVE_RESUME_OUTBOX_STATUSES,
+    CapabilityResumeOutbox,
+)
 from backend.models.project import Project
 from backend.models.plan import Plan
 from backend.models.task import Task
@@ -86,6 +90,20 @@ _COORDINATED_TASK_UPDATE_FIELDS = frozenset({
 
 class MigrationError(Exception):
     pass
+
+
+def _no_active_capability_resume_outbox_predicate():
+    """Fence migration against a durable capability G -> G+1 handoff."""
+
+    return ~(
+        select(CapabilityResumeOutbox.id)
+        .where(
+            CapabilityResumeOutbox.task_id == Task.id,
+            CapabilityResumeOutbox.status.in_(ACTIVE_RESUME_OUTBOX_STATUSES),
+        )
+        .correlate(Task)
+        .exists()
+    )
 
 
 @dataclass(frozen=True)
@@ -284,6 +302,27 @@ class TaskMigrator:
             task = await db.get(Task, task_id)
             if not task:
                 raise MigrationError("task 不存在")
+            if task.status == "waiting_capability":
+                raise MigrationError(
+                    "Task is waiting for its requested capability; durable "
+                    "resume must finish before migration"
+                )
+            active_resume_outbox_id = await db.scalar(
+                select(CapabilityResumeOutbox.id)
+                .where(
+                    CapabilityResumeOutbox.task_id == task_id,
+                    CapabilityResumeOutbox.status.in_(
+                        ACTIVE_RESUME_OUTBOX_STATUSES
+                    ),
+                )
+                .order_by(CapabilityResumeOutbox.id)
+                .limit(1)
+            )
+            if active_resume_outbox_id is not None:
+                raise MigrationError(
+                    "Task has an active capability resume outbox; durable "
+                    "resume must finish before migration"
+                )
             if await active_worker_task_termination_receipt(db, task_id):
                 raise MigrationError(
                     "Worker task termination is still active; reconcile the "
@@ -678,6 +717,7 @@ class TaskMigrator:
                     Task.pty_background_generation.is_(None),
                     Task.worker_turn_handoff_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    _no_active_capability_resume_outbox_predicate(),
                     no_active_worker_task_termination_predicate(),
                 )
                 .values(status="migrating")
@@ -687,6 +727,27 @@ class TaskMigrator:
                 current = await db.get(Task, observed.task_id)
                 if current is None:
                     raise MigrationError("task 不存在")
+                if current.status == "waiting_capability":
+                    raise MigrationError(
+                        "Task is waiting for its requested capability; durable "
+                        "resume must finish before migration"
+                    )
+                active_resume_outbox_id = await db.scalar(
+                    select(CapabilityResumeOutbox.id)
+                    .where(
+                        CapabilityResumeOutbox.task_id == observed.task_id,
+                        CapabilityResumeOutbox.status.in_(
+                            ACTIVE_RESUME_OUTBOX_STATUSES
+                        ),
+                    )
+                    .order_by(CapabilityResumeOutbox.id)
+                    .limit(1)
+                )
+                if active_resume_outbox_id is not None:
+                    raise MigrationError(
+                        "Task has an active capability resume outbox; durable "
+                        "resume must finish before migration"
+                    )
                 raise MigrationError(
                     "task 在迁移认领前已被并发修改"
                     f"（status={current.status}, worker_id={current.worker_id}）"

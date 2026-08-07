@@ -9,6 +9,10 @@ from sqlalchemy import update
 
 import backend.main as main_module
 import backend.services.task_migrator as task_migrator_module
+from backend.models.capability import (
+    CapabilityInvocation,
+    CapabilityResumeOutbox,
+)
 from backend.models.task import Task
 from backend.models.plan import Plan
 from backend.models.plan_agent import PlanAgentRun
@@ -64,6 +68,56 @@ async def _mk_task(session_factory, **fields) -> Task:
         await db.commit()
         await db.refresh(t)
         return t
+
+
+async def _mk_active_resume_outbox(session_factory, task_id: int) -> int:
+    digest = "d" * 64
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        invocation = CapabilityInvocation(
+            task_id=task.id,
+            capability_key="plan",
+            source="human_request",
+            purpose="advisory",
+            status="failed",
+            state_version=2,
+            idempotency_key=f"migration-outbox-{task.id}",
+            input_payload={},
+            input_hash=digest,
+            subject_kind="task_generation",
+            subject_ref={"task_id": task.id},
+            subject_hash=digest,
+            executor_kind="fake",
+            executor_config={},
+            executor_config_hash=digest,
+            policy_snapshot={},
+            policy_hash=digest,
+            resume_policy="attach_only",
+            max_attempts=1,
+            active_task_id=None,
+            error_code="settled",
+        )
+        db.add(invocation)
+        await db.flush()
+        outbox = CapabilityResumeOutbox(
+            task_id=task.id,
+            invocation_id=invocation.id,
+            active_task_id=task.id,
+            active_invocation_id=invocation.id,
+            status="pending",
+            state_version=1,
+            request_task_incarnation_id=task.incarnation_id,
+            request_task_retry_count=task.retry_count,
+            from_turn_generation=task.turn_generation,
+            request_task_session_id=task.session_id,
+            request_source_log_id=201,
+            request_output_log_id=202,
+            request_terminal_log_id=203,
+        )
+        db.add(outbox)
+        await db.commit()
+        return outbox.id
 
 
 def _migrator(db_factory, relay=None) -> TaskMigrator:
@@ -168,6 +222,75 @@ async def test_auto_capability_policy_rejects_migration_before_side_effects(
         await migrator.migrate(task.id, worker.id)
 
     migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+async def test_waiting_capability_rejects_migration_before_side_effects(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="waiting_capability")
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="waiting.*capability"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+async def test_active_capability_resume_outbox_rejects_migration(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory)
+    await _mk_active_resume_outbox(session_factory, task.id)
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="active capability resume outbox"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+async def test_capability_resume_outbox_wins_before_migration_claim(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory)
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+
+    async def admit_resume_before_claim(_worker_id):
+        await _mk_active_resume_outbox(session_factory, task.id)
+        return worker
+
+    migrator._get_worker = AsyncMock(side_effect=admit_resume_before_claim)
+
+    with pytest.raises(MigrationError, match="active capability resume outbox"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_awaited_once_with(worker.id)
     migrator._sync_workspace.assert_not_awaited()
     migrator._move_session.assert_not_awaited()
     migrator._ensure_worker_task.assert_not_awaited()

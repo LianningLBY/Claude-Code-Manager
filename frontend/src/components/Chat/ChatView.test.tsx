@@ -700,6 +700,71 @@ describe('ChatView', () => {
       },
     );
 
+    it('queues follow-ups and disables live injection while waiting on a capability', async () => {
+      const task = makeTask({
+        id: 303,
+        provider: 'codex',
+        status: 'waiting_capability',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Waiting for requested capability...')).toBeInTheDocument();
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+      expect(screen.queryByTitle(/Codex turn\/steer/)).not.toBeInTheDocument();
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        'continue after the review',
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('does not auto-dequeue a queued message when the yielding source process exits', async () => {
+      const task = makeTask({
+        id: 304,
+        status: 'waiting_capability',
+        retry_count: 2,
+        turn_generation: 7,
+      });
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'wait for durable resume' }]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_250));
+      });
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
       render(<ChatView task={task} projects={projects} onBack={onBack} />);

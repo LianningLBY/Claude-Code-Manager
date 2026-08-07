@@ -666,6 +666,12 @@ async def send_chat_message(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
+    if task.status == "waiting_capability":
+        raise HTTPException(
+            409,
+            "Task is waiting for its requested capability and cannot accept "
+            "another chat turn",
+        )
     if await active_worker_task_termination_receipt(db, task_id):
         raise HTTPException(
             409,
@@ -759,6 +765,12 @@ async def send_chat_message(
         if task is None:
             raise HTTPException(404, "Task not found")
         await require_task_access(request, task, db)
+        if task.status == "waiting_capability":
+            raise HTTPException(
+                409,
+                "Task is waiting for its requested capability and cannot "
+                "accept another chat turn",
+            )
         if await active_worker_task_termination_receipt(db, task_id):
             raise HTTPException(
                 409,
@@ -1067,6 +1079,13 @@ async def send_chat_message(
         from backend.services.plan_service import build_versioned_plan_prompt
 
         prompt = build_versioned_plan_prompt(approved_versions, prompt)
+    from backend.services.auto_capability_policy import (
+        build_auto_capability_instructions,
+    )
+
+    capability_instructions = build_auto_capability_instructions(task)
+    if capability_instructions:
+        prompt = f"{prompt}\n\n{capability_instructions}"
 
     # Build file attachment metadata for storage and display
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
@@ -1651,7 +1670,12 @@ async def fork_codex_task(
         raise HTTPException(409, "Remote Worker task forks are not supported yet")
     if not source.session_id:
         raise HTTPException(400, "This task has no Codex session to fork")
-    if source.status in {"in_progress", "executing", "migrating"}:
+    if source.status in {
+        "in_progress",
+        "executing",
+        "migrating",
+        "waiting_capability",
+    }:
         raise HTTPException(409, "Wait for the current Codex turn to finish")
 
     rows = list((await db.execute(
@@ -3363,6 +3387,14 @@ async def inject_message(
             db,
             task_id,
         )
+        if task.status not in {"in_progress", "executing"}:
+            detail = (
+                "Task is waiting for its requested capability and has no "
+                "active provider turn to inject"
+                if task.status == "waiting_capability"
+                else "Task has no active provider turn to inject"
+            )
+            raise HTTPException(409, detail)
 
         _require_expected_task_routing(
             task,
@@ -3387,6 +3419,7 @@ async def inject_message(
             sa_update(Task)
             .where(
                 Task.id == task_id,
+                Task.status.in_(("in_progress", "executing")),
                 Task.status == task.status,
                 Task.retry_count == task.retry_count,
                 Task.turn_generation == task.turn_generation,
@@ -3410,7 +3443,8 @@ async def inject_message(
             await db.rollback()
             raise HTTPException(
                 409,
-                "Task has an active Worker termination receipt",
+                "Task state changed or it has an active Worker termination "
+                "receipt",
             )
 
         from backend.main import instance_manager, broadcaster

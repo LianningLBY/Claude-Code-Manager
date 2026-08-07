@@ -1,8 +1,8 @@
 # CCM Autonomous Delivery Loop — V1 实现基线与后续 Backlog
 
 - 文档状态：Delivery Loop V1 已实现；自动合并、部署、Worker 等后续范围仍是 Backlog
-- 文档版本：v0.3
-- 更新日期：2026-08-05
+- 文档版本：v0.4
+- 更新日期：2026-08-07
 - 文档类型：当前实现基线 + 可领取、可验收的长期 Backlog
 - V1 目标：用持久状态机驱动“Plan → Code → Pre-PR Review → PR → CI/PR Monitor → 修复循环 → ready_to_merge”
 - 当前安全范围：Codex app-server 本地执行、一个仓库、一个 Developer Task、一个 PR、exact-head CI + Reviewer Panel、人工合并
@@ -17,8 +17,8 @@
 
 - 普通任务仍是 `mode=auto`；Delivery Loop 是独立的 `mode=delivery_loop`。
 - Delivery Run 只能通过 `POST /api/delivery-runs` 创建。Run、Developer Task 和首个 Cycle 在同一事务提交，普通 Task API 无法伪造 Delivery ownership。
-- Plan 与 Pre-PR Code Review 都通过通用 `CapabilityInvocation/CapabilityExecution` 接口调用。Delivery Controller 使用 required-gate invocation；普通 Auto Task 可创建 human advisory invocation。
-- Capability executor 与调用者解耦。以后把 Plan/Review 接成 Auto Task 的 tool/sub-agent 时复用同一 terminal-action/Invocation 接口，不新增四种组合式状态机。模型自助调用在 exact native-turn fence 完成前保持 fail closed。
+- Plan 与 Pre-PR Code Review 都通过通用 `CapabilityInvocation/CapabilityExecution` 接口调用。Delivery Controller 使用 required-gate invocation；普通 Auto Task 可创建 human advisory invocation，也可在创建时显式冻结 `capability_policy`，由模型通过 exact terminal action 请求 Plan/Review。
+- Capability executor 与调用者解耦。Auto 请求严格绑定 exact source/output/terminal，并在 provider 提供时绑定 native turn；原子消费预算后进入 `waiting_capability`，完成结果经 durable resume outbox 推进同一 Task 的 G→G+1。`CAPABILITY_CORE_ENABLED` 与 `AUTO_CAPABILITY_ENABLED` 均默认关闭，Worker/Shared 及非普通 Auto scope 继续 fail closed。
 
 ### 0.2 当前闭环
 
@@ -64,6 +64,7 @@ Create DeliveryRun
 - Controller 在每次 drive 前领取带 generation 的 Run lease；发生 takeover 或续租失败时，旧 Controller 不再开始新 effect。发布 Action 另有随机 token lease，Publisher 不接受只凭内存传入的授权。
 - Controller commit 后、数据库 finalize 前崩溃时，只接受“旧 head 的唯一直接子 commit + exact Run/Turn trailer”作为恢复证据；其他 head advance 一律视为 subject changed。
 - push、PR create 和 Monitor bind 都在 effect 前后重验 exact subject；未知远端结果走 query-before-retry。服务启动会恢复已接纳的 Capability 与 Delivery work，并继续收敛到 waiting/terminal，而不是重新创建一套 Run。
+- Auto Capability 完成后由 outbox 冻结原请求 generation、session、路由和结果 hash；provider boundary 前只可重放同一 G+1/source，boundary 后禁止自动重放。G+1 终态先 settle 旧 outbox，再允许同轮请求下一项 Capability；stop/cancel 会先静止 queue consumer 与 executor。
 
 ### 0.6 当前非目标
 
@@ -157,12 +158,12 @@ Developer Agent 不可以：
 
 ### 2.5 Checkpoint 协议必须 Provider-neutral
 
-Plan/Review Capability 以后要同时作为 Delivery required gate 和普通 Auto Task 的 tool/sub-agent 使用，不能把调用协议绑死到某个 provider 的 MCP 形态。因此：
+Plan/Review Capability 同时服务 Delivery required gate、人工 advisory 和普通 Auto Task 的模型请求，调用协议不能绑死到某个 provider 的 MCP 形态。因此：
 
 - 不把 `report_delivery_checkpoint` MCP 工具作为必需协议。
 - Controller 在唤醒前持久化 `DeliveryTurn`。
 - 当前 V1 以 exact Task/Instance/Turn terminal generation 和 Controller 自己读取的 Git 状态为准，不相信 Agent 声称已经 commit/push/通过 Gate。
-- Capability Core 的 terminal-action/Invocation 协议是未来 Auto tool/sub-agent 的唯一接入点；没有 exact native-turn fence 时模型自助创建 invocation 必须 fail closed。
+- Capability Core 的 terminal-action/Invocation 协议是 Auto 模型请求的唯一接入点；必须有当前 exact terminal proof，provider 提供 native turn 时还必须精确匹配，不能用旧 turn 或日志邻接关系代替。
 - 后续若恢复受限 JSON checkpoint，也只能保存为 advisory evidence；回合结束后仍必须重新读取 Git 和 GitHub。
 
 ### 2.6 验证对象不只有 PR head SHA
@@ -192,13 +193,14 @@ V1 默认值：
 
 ```text
 CAPABILITY_CORE_ENABLED = false
+AUTO_CAPABILITY_ENABLED = false
 DELIVERY_LOOP_ENABLED   = false
 delivery auto merge     = unsupported/off
 delivery deployment     = unsupported/off
 delivery auto rollback  = unsupported/off
 ```
 
-两个开关只阻止新 admission，不抛弃已接纳 work。V1 开启后也只运行到 `ready_to_merge`；自动 merge/deploy 没有可被误开的隐式路径。后续能力必须独立 opt-in 并保留同样的 exact-subject fence。
+三个开关只阻止各自的新 admission，不抛弃已接纳 work。V1 开启后也只运行到 `ready_to_merge`；自动 merge/deploy 没有可被误开的隐式路径。后续能力必须独立 opt-in 并保留同样的 exact-subject fence。
 
 ---
 
@@ -240,7 +242,6 @@ delivery auto rollback  = unsupported/off
 ### 3.3 后续完整目标
 
 - Worker 上执行 Developer / Reviewer Turn。
-- Auto Task 内由模型通过 exact-turn fenced tool/sub-agent 自助调用 Plan/Review Capability。
 - Controller-only Merge Queue。
 - 可插拔 Deployment Adapter。
 - child remediation Run。
@@ -906,16 +907,22 @@ POST   /api/delivery-runs/{run_id}/cancel
 
 V1 不暴露 take-over/reconcile/retry-action/merge/deploy 管理 API；Controller 的 crash takeover 与 reconcile 由持久 lease 和启动扫描内部完成。Decision/attention/system-status 属于后续运维 Backlog。
 
-普通 Auto Task 当前可人工调用 advisory Capability：
+普通 Auto Task 可人工调用 advisory Capability：
 
 ```http
 POST /api/tasks/{task_id}/capability-invocations
 GET  /api/tasks/{task_id}/capability-invocations
 GET  /api/capability-invocations/{invocation_id}
+GET  /api/capability-invocations/{invocation_id}/result
+POST /api/capability-invocations/{invocation_id}/consume
 POST /api/capability-invocations/{invocation_id}/cancel
 ```
 
-Delivery required-gate invocation 只由 Controller 的内部服务入口创建，不能借普通 Task API修改或取消。
+带显式 policy 的本地普通 Auto Task 还可在成功终态输出中提交严格
+`request_capability` action；后端绑定 exact turn、消费预算并通过 durable outbox
+恢复 G+1，不暴露伪造 Agent source 的 HTTP 创建入口。人工 consume/cancel 只允许
+`human_request + attach_only`。Delivery required-gate 与 Agent resume invocation 都由
+所属 Controller/Task 生命周期收口，不能借普通 Capability API 修改或取消。
 
 V1 的 pause/cancel 请求只携带必填 reason；resume 的 reason 可选：
 

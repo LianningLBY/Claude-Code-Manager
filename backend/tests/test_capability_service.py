@@ -386,7 +386,7 @@ async def test_unregistered_and_agent_requests_are_explicitly_rejected(
 
     with pytest.raises(
         service.CapabilityUnsupportedScopeError,
-        match="exact task-turn generation",
+        match="exact terminal Task generation",
     ):
         # The dark-rollout switch must not enable this stub before exact
         # terminal arbitration and durable resume admission are connected.

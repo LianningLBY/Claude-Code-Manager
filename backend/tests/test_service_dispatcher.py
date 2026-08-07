@@ -10,7 +10,7 @@ import pytest
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -79,6 +79,7 @@ def _make_dispatcher(db_factory):
         )
     )
     instance_manager.wait_for_output_consumer = AsyncMock()
+    instance_manager._publish_agent_terminal_admission = AsyncMock()
     # Model the real InstanceManager interface used by failure classification.
     instance_manager.pty_mode_enabled = False
     instance_manager.is_pty_managed_turn = MagicMock(return_value=False)
@@ -95,6 +96,9 @@ def _make_dispatcher(db_factory):
     # PTY proactive pool switch path (dispatcher._process_task_lifecycle)
     instance_manager.pty_rate_limit_seen = MagicMock(return_value=False)
     instance_manager._try_proactive_pool_switch = AsyncMock()
+    instance_manager.has_pty_autonomous_activity_handoff = MagicMock(
+        return_value=False
+    )
 
     @asynccontextmanager
     async def runtime_admission(
@@ -895,6 +899,432 @@ async def test_lifecycle_defers_pr_completion_until_background_epoch_finishes(
     await d.instance_manager.pty_background_completion_handler(task_id)
     d._handle_pr_review_completion.assert_awaited_once()
     assert d._handle_pr_review_completion.await_args.args[0].id == task_id
+
+
+@pytest.mark.asyncio
+async def test_initial_capability_admission_waits_for_live_background_epoch(
+    db_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.services.capability_protocol import (
+        TERMINAL_ACTION_CLOSE_TAG,
+        TERMINAL_ACTION_OPEN_TAG,
+    )
+    from backend.services.capability_registry import (
+        CapabilityDefinition,
+        register_capability,
+        unregister_capability,
+    )
+
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "auto_capability_enabled", True)
+    unregister_capability("plan")
+    register_capability(
+        CapabilityDefinition(
+            capability_key="plan",
+            executor_kind="fake_plan",
+            executor_config={"route": "initial-background-test"},
+            policy_snapshot={"local_only": True},
+            max_attempts=2,
+        )
+    )
+    try:
+        d = _make_dispatcher(db_factory)
+        d.capability_invocation_wake = MagicMock()
+        d._handle_pr_review_completion = AsyncMock()
+
+        async with db_factory() as db:
+            instance = Instance(name="background-capability-worker")
+            task = Task(
+                title="background capability request",
+                description="request a plan after the foreground turn",
+                target_repo="/repo",
+                mode="auto",
+                provider="claude",
+                capability_policy={
+                    "version": 1,
+                    "max_invocations": 1,
+                    "capabilities": {"plan": 1},
+                },
+            )
+            db.add_all([instance, task])
+            await db.commit()
+            await db.refresh(instance)
+            await db.refresh(task)
+            instance_id = instance.id
+            task_id = task.id
+
+        action = json.dumps(
+            {
+                "schema_version": 1,
+                "terminal_action": "request_capability",
+                "capability": "plan",
+                "reason": "Need an exact implementation plan",
+                "request": {"focus": "background-safe rollout"},
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        terminal_content = (
+            "Yielding control.\n"
+            f"{TERMINAL_ACTION_OPEN_TAG}{action}{TERMINAL_ACTION_CLOSE_TAG}"
+        )
+
+        async def finish_foreground_and_arm_background():
+            async with db_factory() as db:
+                current = await db.get(Task, task_id)
+                assert current.status == "executing"
+                assert type(current.turn_source_log_id) is int
+                source = await db.get(LogEntry, current.turn_source_log_id)
+                assert source is not None
+                source.actual_transport = "claude_exec"
+                current.session_id = "background-capability-session"
+                current.pty_background_generation = "exact-background-epoch"
+                db.add(
+                    LogEntry(
+                        task_id=task_id,
+                        instance_id=instance_id,
+                        task_retry_count=current.retry_count,
+                        task_turn_generation=current.turn_generation,
+                        turn_scope="foreground",
+                        event_type="result",
+                        content=terminal_content,
+                        is_error=False,
+                    )
+                )
+                await db.commit()
+            return 0
+
+        background_state = SimpleNamespace(
+            generation="exact-background-epoch",
+            done=asyncio.Event(),
+        )
+        state_registered = True
+        transition_count = 0
+
+        @asynccontextmanager
+        async def background_transition(task_arg, session_arg):
+            nonlocal state_registered, transition_count
+            assert task_arg == task_id
+            assert session_arg == "background-capability-session"
+            transition_count += 1
+            try:
+                yield
+            finally:
+                if transition_count != 1:
+                    return
+                # Model the real watcher clearing its durable marker and
+                # removing the key immediately after this exact state was
+                # captured, but before the lifecycle begins to await it.
+                async with db_factory() as db:
+                    current = await db.get(Task, task_id)
+                    assert current.status == "executing"
+                    assert current.instance_id == instance_id
+                    assert (
+                        current.pty_background_generation
+                        == background_state.generation
+                    )
+                    assert (
+                        await db.scalar(select(CapabilityInvocation.id).limit(1))
+                        is None
+                    )
+                    assert (
+                        await db.scalar(select(CapabilityResumeOutbox.id).limit(1))
+                        is None
+                    )
+                    current.pty_background_generation = None
+                    await db.commit()
+                state_registered = False
+                background_state.done.set()
+
+        def background_state_for(task_arg, session_arg, generation_arg):
+            assert task_arg == task_id
+            assert session_arg == "background-capability-session"
+            assert generation_arg == background_state.generation
+            return background_state if state_registered else None
+
+        async def finish_exact_background(state_arg):
+            assert state_arg is background_state
+            assert state_registered is False
+            await state_arg.done.wait()
+            return "completed"
+
+        process = MagicMock(returncode=0)
+        process.wait = AsyncMock(side_effect=finish_foreground_and_arm_background)
+        d.instance_manager.processes = {instance_id: process}
+        d.instance_manager.pty_background_transition = background_transition
+        d.instance_manager.pty_background_state_for = MagicMock(
+            side_effect=background_state_for
+        )
+        d.instance_manager.wait_pty_background_outcome = AsyncMock(
+            side_effect=finish_exact_background
+        )
+        d.instance_manager.discard_pty_post_exit_generations = MagicMock()
+        # Calls 1/2 see no handoff and establish the first cutoff. Call 3
+        # models a callback synchronously noting activity during an admission
+        # DB await, after its post-exit proof was revoked. It clears before the
+        # next loop, which must establish a new cutoff and admit normally.
+        handoff_states = iter([False, False, True, False, False, False])
+        d.instance_manager.has_pty_autonomous_activity_handoff = MagicMock(
+            side_effect=lambda *_args: next(handoff_states)
+        )
+
+        await _run_claimed_lifecycle(d, db_factory, instance_id, task)
+
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            invocations = list(
+                (await db.scalars(select(CapabilityInvocation))).all()
+            )
+            executions = list(
+                (await db.scalars(select(CapabilityExecution))).all()
+            )
+            outboxes = list(
+                (await db.scalars(select(CapabilityResumeOutbox))).all()
+            )
+            assert current.status == "waiting_capability"
+            assert current.pty_background_generation is None
+            assert len(invocations) == len(executions) == len(outboxes) == 1
+            assert invocations[0].request_source_log_id == current.turn_source_log_id
+            assert invocations[0].request_output_log_id == outboxes[0].request_output_log_id
+            assert invocations[0].request_terminal_log_id == outboxes[0].request_terminal_log_id
+
+        d.instance_manager.pty_background_state_for.assert_called_once_with(
+            task_id, "background-capability-session", "exact-background-epoch"
+        )
+        d.instance_manager.wait_pty_background_outcome.assert_awaited_once_with(
+            background_state
+        )
+        assert (
+            d.instance_manager.discard_pty_post_exit_generations.call_count == 2
+        )
+        d.instance_manager.discard_pty_post_exit_generations.assert_called_with(
+            task_id=task_id,
+            session_id="background-capability-session",
+            instance_id=instance_id,
+            invalidate_handoffs=True,
+        )
+        d.instance_manager._publish_agent_terminal_admission.assert_awaited_once()
+        d.capability_invocation_wake.assert_called_once_with()
+        d._handle_pr_review_completion.assert_not_awaited()
+    finally:
+        unregister_capability("plan")
+
+
+@pytest.mark.asyncio
+async def test_background_capability_retry_yields_to_termination_receipt(
+    db_factory,
+    monkeypatch,
+):
+    """A receipt committed while the exact tail settles owns terminal work."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.services.worker_task_termination import (
+        active_worker_task_termination_receipt,
+    )
+
+    d = _make_dispatcher(db_factory)
+    session_id = "receipt-background-session"
+    marker = "receipt-background-epoch"
+    async with db_factory() as db:
+        instance = Instance(name="receipt-background-capability")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="receipt wins background capability retry",
+            status="executing",
+            mode="auto",
+            instance_id=instance.id,
+            session_id=session_id,
+            capability_policy={
+                "version": 1,
+                "max_invocations": 1,
+                "capabilities": {"plan": 1},
+            },
+            pty_background_generation=marker,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+        generation = d._task_lifecycle_generation(task)
+
+    state = SimpleNamespace(generation=marker)
+
+    @asynccontextmanager
+    async def background_transition(task_arg, session_arg):
+        assert (task_arg, session_arg) == (task_id, session_id)
+        yield
+
+    async def finish_exact_background(state_arg):
+        assert state_arg is state
+        # The watcher commits marker removal before publishing completion.
+        # A Worker stop/cancel can therefore become the exact Task owner in
+        # this window; the lifecycle retry must not create durable work.
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            assert current is not None
+            assert current.status == "executing"
+            assert current.pty_background_generation == marker
+            current.pty_background_generation = None
+            await db.commit()
+        await persist_active_worker_receipt(db_factory, task_id)
+        return "completed"
+
+    d.instance_manager.pty_background_transition = background_transition
+    d.instance_manager.pty_background_state_for = MagicMock(return_value=state)
+    d.instance_manager.wait_pty_background_outcome = AsyncMock(
+        side_effect=finish_exact_background
+    )
+    d.instance_manager.discard_pty_post_exit_generations = MagicMock()
+    admit = AsyncMock()
+    monkeypatch.setattr(
+        "backend.services.agent_capability_admission."
+        "admit_agent_terminal_action_locked",
+        admit,
+    )
+
+    assert await d._complete_owned_task_after_pty_background(
+        generation,
+        count_completion=True,
+    ) == (False, False)
+
+    admit.assert_not_awaited()
+    d.instance_manager._publish_agent_terminal_admission.assert_not_awaited()
+    d.instance_manager.pty_background_state_for.assert_called_once_with(
+        task_id,
+        session_id,
+        marker,
+    )
+    d.instance_manager.wait_pty_background_outcome.assert_awaited_once_with(state)
+    d.instance_manager.discard_pty_post_exit_generations.assert_called_once_with(
+        task_id=task_id,
+        session_id=session_id,
+        instance_id=instance_id,
+        invalidate_handoffs=True,
+    )
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "executing"
+        assert current.instance_id == instance_id
+        assert current.pty_background_generation is None
+        assert list((await db.scalars(select(CapabilityInvocation))).all()) == []
+        assert list((await db.scalars(select(CapabilityExecution))).all()) == []
+        assert list((await db.scalars(select(CapabilityResumeOutbox))).all()) == []
+        assert (
+            await active_worker_task_termination_receipt(db, task_id)
+            is not None
+        )
+
+
+@pytest.mark.asyncio
+async def test_initial_capability_background_marker_without_session_fails_closed(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="background-capability-missing-session")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="background marker without session",
+            status="executing",
+            mode="auto",
+            instance_id=instance.id,
+            capability_policy={
+                "version": 1,
+                "max_invocations": 1,
+                "capabilities": {"plan": 1},
+            },
+            pty_background_generation="orphaned-background-epoch",
+            session_id=None,
+        )
+        db.add(task)
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id = task.id
+
+    with pytest.raises(
+        RuntimeError,
+        match="without its exact session identity",
+    ):
+        await d._complete_owned_task_after_pty_background(
+            generation,
+            count_completion=True,
+        )
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "executing"
+        assert current.pty_background_generation == "orphaned-background-epoch"
+
+
+@pytest.mark.asyncio
+async def test_initial_capability_abandoned_background_epoch_is_not_admitted(
+    db_factory,
+):
+    d = _make_dispatcher(db_factory)
+    session_id = "abandoned-background-session"
+    marker = "abandoned-background-epoch"
+    async with db_factory() as db:
+        instance = Instance(name="abandoned-background-capability")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="abandoned background capability",
+            status="executing",
+            mode="auto",
+            instance_id=instance.id,
+            session_id=session_id,
+            capability_policy={
+                "version": 1,
+                "max_invocations": 1,
+                "capabilities": {"plan": 1},
+            },
+            pty_background_generation=marker,
+        )
+        db.add(task)
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id = task.id
+
+    state = SimpleNamespace(generation=marker)
+
+    @asynccontextmanager
+    async def background_transition(task_arg, session_arg):
+        assert (task_arg, session_arg) == (task_id, session_id)
+        yield
+
+    d.instance_manager.pty_background_transition = background_transition
+    d.instance_manager.pty_background_state_for = MagicMock(return_value=state)
+    d.instance_manager.wait_pty_background_outcome = AsyncMock(
+        return_value="abandoned"
+    )
+    d.instance_manager.discard_pty_post_exit_generations = MagicMock()
+
+    assert await d._complete_owned_task_after_pty_background(
+        generation,
+        count_completion=True,
+    ) == (False, False)
+
+    d.instance_manager.wait_pty_background_outcome.assert_awaited_once_with(state)
+    d.instance_manager.discard_pty_post_exit_generations.assert_not_called()
+    d.instance_manager._publish_agent_terminal_admission.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "executing"
+        assert current.pty_background_generation == marker
 
 
 @pytest.mark.asyncio
@@ -8676,6 +9106,63 @@ async def test_task_queue_cancellation_lease_is_reentrant_and_outlives_abort(
 
 
 @pytest.mark.asyncio
+async def test_capability_cancel_quiescence_releases_inflight_resume_lease(
+    db_factory,
+):
+    """Phase one keeps admission closed but preserves durable resume state."""
+
+    dispatcher = _make_dispatcher(db_factory)
+    task_id = 820
+    entered = asyncio.Event()
+    never = asyncio.Event()
+
+    async def block_inflight(_task_id, _message):
+        entered.set()
+        await never.wait()
+
+    dispatcher._process_queued_message = AsyncMock(side_effect=block_inflight)
+    message = QueuedMessage(
+        priority=1,
+        timestamp=1.0,
+        prompt="resume exact capability result",
+        source="capability-resume:91",
+        capability_resume_outbox_id=91,
+        capability_resume_lease_token="a" * 64,
+    )
+    queue = dispatcher._get_task_queue(task_id)
+    queue.put_nowait(message)
+    dispatcher._queued_capability_resume_ids.add(91)
+    worker = asyncio.create_task(dispatcher._task_queue_consumer(task_id))
+    dispatcher._task_queue_workers[task_id] = worker
+    await entered.wait()
+
+    with patch(
+        "backend.services.capability_resume.release_resume_publication",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as release:
+        async with dispatcher.task_queue_cancellation_lease(task_id):
+            await dispatcher.quiesce_task_queue_consumer_for_capability_cancel(
+                task_id
+            )
+            assert task_id in dispatcher._cancel_durable_queue_tasks
+
+    assert worker.done()
+    release.assert_awaited_once_with(
+        ANY,
+        91,
+        lease_token="a" * 64,
+        error_code="queue_owner_released",
+        error_message=(
+            "Dispatcher queue owner settled before a durable launch "
+            "acknowledgement"
+        ),
+    )
+    assert task_id not in dispatcher._preserve_capability_resume_on_queue_cancel
+    assert 91 not in dispatcher._queued_capability_resume_ids
+
+
+@pytest.mark.asyncio
 async def test_internal_queue_fence_rejects_enqueue_after_abort(db_factory):
     dispatcher = _make_dispatcher(db_factory)
     dispatcher._ensure_queue_worker = MagicMock()
@@ -10843,6 +11330,530 @@ async def test_completion_publication_fence_rejects_late_background_arm(
         current = await db.get(Task, task_id)
         assert current.status == "completed"
         assert current.pty_background_generation == "late-background-epoch"
+
+
+@pytest.mark.asyncio
+async def test_auto_terminal_uses_generation_fenced_capability_publication(
+    db_factory,
+    monkeypatch,
+):
+    d = _make_dispatcher(db_factory)
+    d.capability_invocation_wake = MagicMock()
+    async with db_factory() as db:
+        instance = Instance(name="auto-capability-publication")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="auto capability publication",
+            status="executing",
+            mode="auto",
+            instance_id=instance.id,
+            capability_policy={
+                "version": 1,
+                "max_invocations": 1,
+                "capabilities": {"plan": 1},
+            },
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            instance_id=instance.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            content="hidden source",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+
+    admission = SimpleNamespace(
+        outcome="waiting_capability",
+        created=True,
+        task_id=task.id,
+        invocation_id=91,
+    )
+
+    async def admit(_db, locked_task, *, expected):
+        assert expected.task_id == task.id
+        locked_task.status = "waiting_capability"
+        locked_task.completed_at = None
+        return admission
+
+    monkeypatch.setattr(
+        "backend.services.agent_capability_admission."
+        "admit_agent_terminal_action_locked",
+        admit,
+    )
+
+    assert await d._complete_owned_task_result(
+        generation,
+        admit_agent_capability=True,
+    ) == (False, False)
+    d.instance_manager._publish_agent_terminal_admission.assert_awaited_once_with(
+        admission
+    )
+    d.capability_invocation_wake.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_auto_terminal_capability_admission_yields_to_termination_receipt(
+    db_factory,
+    monkeypatch,
+):
+    """A receipt committed first owns the Task before any ledger is staged."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.services.worker_task_termination import (
+        active_worker_task_termination_receipt,
+    )
+
+    d = _make_dispatcher(db_factory)
+    d.capability_invocation_wake = MagicMock()
+    async with db_factory() as db:
+        instance = Instance(name="receipt-first-auto-capability")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="receipt owns auto terminal admission",
+            status="executing",
+            mode="auto",
+            instance_id=instance.id,
+            capability_policy={
+                "version": 1,
+                "max_invocations": 1,
+                "capabilities": {"plan": 1},
+            },
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            instance_id=instance.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="turn_source",
+            content="hidden source",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+        generation = d._task_lifecycle_generation(task)
+
+    await persist_active_worker_receipt(db_factory, task_id)
+    admit = AsyncMock()
+    monkeypatch.setattr(
+        "backend.services.agent_capability_admission."
+        "admit_agent_terminal_action_locked",
+        admit,
+    )
+
+    assert await d._complete_owned_task_result(
+        generation,
+        admit_agent_capability=True,
+    ) == (False, False)
+
+    admit.assert_not_awaited()
+    d.instance_manager._publish_agent_terminal_admission.assert_not_awaited()
+    d.capability_invocation_wake.assert_not_called()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "executing"
+        assert current.instance_id == generation.instance_id
+        assert list((await db.scalars(select(CapabilityInvocation))).all()) == []
+        assert list((await db.scalars(select(CapabilityExecution))).all()) == []
+        assert list((await db.scalars(select(CapabilityResumeOutbox))).all()) == []
+        assert (
+            await active_worker_task_termination_receipt(db, task_id)
+            is not None
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_terminal_admission_commits_before_late_termination_receipt(
+    db_factory,
+    monkeypatch,
+):
+    """Admission winning the Task fence leaves one ledger and no receipt."""
+
+    from backend.config import settings
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.services.capability_protocol import (
+        TERMINAL_ACTION_CLOSE_TAG,
+        TERMINAL_ACTION_OPEN_TAG,
+    )
+    from backend.services.capability_registry import (
+        CapabilityDefinition,
+        register_capability,
+        unregister_capability,
+    )
+    from backend.services.terminal_arbitration import bind_turn_source
+    from backend.services.worker_task_termination import (
+        WorkerTaskTerminationConflict,
+        active_worker_task_termination_receipt,
+        canonical_json_digest,
+        stage_worker_receipt,
+    )
+
+    monkeypatch.setattr(settings, "capability_core_enabled", True)
+    monkeypatch.setattr(settings, "auto_capability_enabled", True)
+    unregister_capability("plan")
+    register_capability(
+        CapabilityDefinition(
+            capability_key="plan",
+            executor_kind="fake_plan",
+            executor_config={"route": "admission-first-receipt-test"},
+            policy_snapshot={"local_only": True},
+            max_attempts=2,
+        )
+    )
+    try:
+        d = _make_dispatcher(db_factory)
+        d.capability_invocation_wake = MagicMock()
+        async with db_factory() as db:
+            instance = Instance(name="admission-first-auto-capability")
+            db.add(instance)
+            await db.flush()
+            task = Task(
+                title="auto terminal admission owns Task",
+                status="executing",
+                mode="auto",
+                provider="claude",
+                instance_id=instance.id,
+                capability_policy={
+                    "version": 1,
+                    "max_invocations": 1,
+                    "capabilities": {"plan": 1},
+                },
+            )
+            db.add(task)
+            await db.flush()
+            source = await bind_turn_source(
+                db,
+                task,
+                None,
+                instance_id=instance.id,
+            )
+            source.actual_transport = "claude_exec"
+            action = json.dumps(
+                {
+                    "schema_version": 1,
+                    "terminal_action": "request_capability",
+                    "capability": "plan",
+                    "reason": "Need a termination-safe plan",
+                    "request": {"focus": "writer-fence ordering"},
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            db.add(
+                LogEntry(
+                    task_id=task.id,
+                    instance_id=instance.id,
+                    task_retry_count=task.retry_count,
+                    task_turn_generation=task.turn_generation,
+                    turn_scope="foreground",
+                    event_type="result",
+                    content=(
+                        "Yielding control.\n"
+                        f"{TERMINAL_ACTION_OPEN_TAG}{action}"
+                        f"{TERMINAL_ACTION_CLOSE_TAG}"
+                    ),
+                    is_error=False,
+                )
+            )
+            await db.commit()
+            task_id = task.id
+            generation = d._task_lifecycle_generation(task)
+
+        assert await d._complete_owned_task_result(
+            generation,
+            admit_agent_capability=True,
+        ) == (False, False)
+
+        # Model a real late Worker request: the Manager froze the source while
+        # it was still executing, but admission committed before the receipt
+        # reached this node.  The request must not adopt waiting_capability as
+        # a new source generation or coexist with the queued ledger.
+        operation_id = hashlib.sha256(
+            f"late-receipt:{task_id}".encode()
+        ).hexdigest()[:32]
+        payload = {
+            "version": 2,
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "operation": "stop_session",
+            "manager_worker_id": 41,
+            "expected_remote": {
+                "status": "executing",
+                "retry_count": generation.retry_count,
+                "turn_generation": generation.turn_generation,
+            },
+            "manager_handoff": None,
+        }
+        async with db_factory() as receipt_db:
+            with pytest.raises(
+                WorkerTaskTerminationConflict,
+                match="no longer matches the requested exact generation",
+            ):
+                await stage_worker_receipt(
+                    receipt_db,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    operation="stop_session",
+                    request_payload=payload,
+                    request_digest=canonical_json_digest(payload),
+                )
+
+        async with db_factory() as db:
+            current = await db.get(Task, task_id)
+            invocations = list(
+                (await db.scalars(select(CapabilityInvocation))).all()
+            )
+            executions = list(
+                (await db.scalars(select(CapabilityExecution))).all()
+            )
+            outboxes = list(
+                (await db.scalars(select(CapabilityResumeOutbox))).all()
+            )
+            assert current is not None
+            assert current.status == "waiting_capability"
+            assert len(invocations) == len(executions) == len(outboxes) == 1
+            assert invocations[0].status == "queued"
+            assert executions[0].status == "queued"
+            assert outboxes[0].status == "pending"
+            assert (
+                await active_worker_task_termination_receipt(db, task_id)
+                is None
+            )
+
+        d.instance_manager._publish_agent_terminal_admission.assert_awaited_once()
+        d.capability_invocation_wake.assert_called_once_with()
+    finally:
+        unregister_capability("plan")
+
+
+@pytest.mark.asyncio
+async def test_capability_resume_prelaunch_cleanup_holds_task_fence(
+    db_factory,
+    monkeypatch,
+):
+    d = _make_dispatcher(db_factory)
+    events: list[str] = []
+
+    class CapabilityLock:
+        async def acquire(self):
+            events.append("capability-enter")
+
+        def release(self):
+            events.append("capability-exit")
+
+    def capability_lock(task_id):
+        assert task_id == 73
+        return CapabilityLock()
+
+    async def process_inner(_task_id, _msg, _launch, cleanup):
+        events.append("process")
+        cleanup["has_temp_skills"] = True
+
+    async def restore(*_args):
+        events.append("cleanup")
+
+    monkeypatch.setattr(
+        "backend.services.capability_service.capability_task_lock",
+        capability_lock,
+    )
+    d._process_queued_message_inner = AsyncMock(side_effect=process_inner)
+    d._restore_queued_message_skills = AsyncMock(side_effect=restore)
+    msg = QueuedMessage(
+        priority=0,
+        timestamp=1.0,
+        prompt="resume",
+        capability_resume_outbox_id=11,
+    )
+
+    await d._process_queued_message(73, msg)
+
+    assert events == [
+        "capability-enter",
+        "process",
+        "cleanup",
+        "capability-exit",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capability_resume_releases_fence_before_terminal_consumer(
+    db_factory,
+    monkeypatch,
+):
+    """G+1 Phase 2 must not deadlock its exact terminal consumer."""
+
+    import backend.api.tasks as tasks_module
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.services.capability_resume import (
+        claim_resume_publication,
+        materialize_resume_outbox,
+        settle_previous_resume_in_terminal_tx,
+    )
+    from backend.services.capability_service import capability_task_lock
+    from backend.services.dispatcher import PRIORITY_CAPABILITY_RESUME
+    from backend.tests.test_capability_resume import _seed_resume
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_find_session_jsonl",
+        lambda _session_id, provider="claude": "/tmp/fake.jsonl",
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._resolve_resume_config_dir = AsyncMock(return_value=None)
+
+    async with db_factory() as db:
+        seed = await _seed_resume(db, invocation_status="failed")
+        instance = Instance(name="capability-resume-phase2", status="idle")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+
+    async with db_factory() as db:
+        ready = await materialize_resume_outbox(db, seed.outbox_id)
+    assert ready is not None and ready.status == "ready"
+    async with db_factory() as db:
+        envelope = await claim_resume_publication(
+            db,
+            seed.outbox_id,
+            lease_seconds=30,
+        )
+    assert envelope is not None and envelope.status == "claiming"
+    assert isinstance(envelope.lease_token, str)
+
+    msg = QueuedMessage(
+        priority=PRIORITY_CAPABILITY_RESUME,
+        timestamp=envelope.queue_timestamp,
+        prompt=envelope.prompt,
+        source=f"capability-resume:{seed.outbox_id}",
+        expected_task_routing=(
+            envelope.provider,
+            envelope.model,
+            envelope.service_tier,
+        ),
+        current_message=envelope.current_message,
+        allow_new_session=envelope.request_session_id is None,
+        capability_resume_outbox_id=seed.outbox_id,
+        capability_resume_lease_token=envelope.lease_token,
+    )
+
+    phase2_waiting = asyncio.Event()
+    provider_exit = asyncio.Event()
+    terminal_fence_acquired = asyncio.Event()
+    consumers: list[asyncio.Task] = []
+
+    class Process:
+        pid = 4242
+        returncode = None
+
+        def __init__(self, queue_task):
+            self.queue_task = queue_task
+
+        async def wait(self):
+            if asyncio.current_task() is self.queue_task:
+                phase2_waiting.set()
+            await provider_exit.wait()
+            self.returncode = 0
+            return 0
+
+    async def launch(**kwargs):
+        assert kwargs["task_id"] == seed.task_id
+        assert kwargs["task_turn_generation"] == 8
+        assert kwargs["instance_id"] == instance_id
+        assert callable(kwargs.get("on_launch_admitted"))
+        assert type(kwargs.get("source_log_id")) is int
+
+        process = Process(asyncio.current_task())
+        async with db_factory() as db:
+            source = await db.get(LogEntry, kwargs["source_log_id"])
+            current_instance = await db.get(Instance, instance_id)
+            assert source is not None and source.actual_transport is None
+            source.actual_transport = "claude_exec"
+            current_instance.status = "running"
+            current_instance.pid = process.pid
+            current_instance.current_task_id = seed.task_id
+            await db.commit()
+
+        await kwargs["on_launch_admitted"]()
+        dispatcher.instance_manager.processes[instance_id] = process
+
+        async def consume_terminal():
+            await process.wait()
+            async with capability_task_lock(seed.task_id):
+                terminal_fence_acquired.set()
+                async with db_factory() as db:
+                    task = (
+                        await db.execute(
+                            select(Task)
+                            .where(Task.id == seed.task_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one()
+                    assert task.status == "executing"
+                    assert await settle_previous_resume_in_terminal_tx(db, task)
+                    task.status = "completed"
+                    task.completed_at = datetime.utcnow()
+                    current_instance = await db.get(Instance, instance_id)
+                    current_instance.status = "idle"
+                    current_instance.pid = None
+                    current_instance.current_task_id = None
+                    await db.commit()
+
+        consumer = asyncio.create_task(consume_terminal())
+        consumers.append(consumer)
+        dispatcher.instance_manager._tasks[instance_id] = consumer
+        return process.pid
+
+    dispatcher.instance_manager.launch = AsyncMock(side_effect=launch)
+    queued = asyncio.create_task(
+        dispatcher._process_queued_message(seed.task_id, msg)
+    )
+    try:
+        await asyncio.wait_for(phase2_waiting.wait(), timeout=1)
+        provider_exit.set()
+        await asyncio.wait_for(queued, timeout=2)
+    finally:
+        provider_exit.set()
+        if not queued.done():
+            queued.cancel()
+        await asyncio.gather(queued, return_exceptions=True)
+        for consumer in consumers:
+            if not consumer.done():
+                consumer.cancel()
+        await asyncio.gather(*consumers, return_exceptions=True)
+
+    assert terminal_fence_acquired.is_set()
+    async with db_factory() as db:
+        task = await db.get(Task, seed.task_id)
+        outbox = await db.get(CapabilityResumeOutbox, seed.outbox_id)
+    assert task.status == "completed"
+    assert task.turn_generation == 8
+    assert outbox.status == "completed"
+    assert outbox.claimed_turn_generation == 8
+    assert outbox.resume_actual_transport == "claude_exec"
 
 
 @pytest.mark.asyncio

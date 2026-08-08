@@ -1222,6 +1222,27 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 |----------|----------|------|
 | `frontend/src/components/Chat/ChatView.test.tsx` | `copies a user message without its sender prefix` | 用户消息保留 `[发送者]` 的界面显示，但复制时只写入消息正文 |
 
+## Delivery Loop V1
+
+```bash
+# Run/Controller/worktree/publisher/PR Monitor 的本地 Git、故障注入与状态机回归
+uv run pytest -q backend/tests/test_delivery_*.py
+
+# 真实 Codex 0.144.6 app-server 隔离探针（显式 opt-in）
+CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
+  backend/tests/test_codex_app_server.py::test_real_codex_delivery_permission_profile_blocks_host_reads
+```
+
+真实探针只调用 `initialize` / `thread/start` / `command/exec`，不调用
+`turn/start`，因此不发送模型请求。它使用临时 `CODEX_HOME` 和 workspace，验证
+宿主文件不可读、GitHub/SSH 凭据环境变量不进入 shell、workspace 可写，
+且 linked-worktree `.git` pointer 不可覆盖。需要已安装项目锁定的
+`codex-cli 0.144.6`；缺少 CLI 时用例会跳过。
+
+真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
+一次性 canary 仓库执行；V1 的成功终点必须是 `ready_to_merge`，不得自动
+merge 或 deploy。
+
 ## Auto Capability policy、terminal admission 与 durable resume
 
 ```bash

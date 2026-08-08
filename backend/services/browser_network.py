@@ -1,10 +1,11 @@
 """Fail-closed network policy for Browser Review targets.
 
-User supplied URLs are reached through a small loopback HTTP CONNECT proxy.  The
-proxy resolves every new upstream connection itself, rejects any non-public
-answer, and connects to the validated numeric address.  This makes the network
-decision apply to redirects, subresources, and WebSockets as well as the first
-page navigation, without trusting Chromium's DNS cache.
+Every browser target is reached through a small loopback HTTP CONNECT proxy.
+External targets resolve every new upstream connection and reject any
+non-public answer.  Managed previews pin every connection to one literal
+loopback address and port.  This makes the network decision apply to redirects,
+subresources, and WebSockets as well as the first page navigation, without
+trusting Chromium routing or DNS caches.
 """
 
 from __future__ import annotations
@@ -72,9 +73,9 @@ def canonical_target_origin(
             raise BrowserNetworkPolicyError("managed previews must use http")
         if port is None:
             raise BrowserNetworkPolicyError("managed previews require an explicit port")
-        if hostname != "localhost" and (address is None or not address.is_loopback):
+        if address is None or not address.is_loopback:
             raise BrowserNetworkPolicyError(
-                "managed previews must use an exact loopback address"
+                "managed previews must use a literal loopback address"
             )
     elif policy == "external_public":
         if hostname in _BLOCKED_HOSTS or hostname == "localhost" or hostname.endswith(
@@ -143,22 +144,26 @@ async def resolve_public_endpoint(hostname: str, port: int) -> ResolvedEndpoint:
     return endpoints[0]
 
 
-class PublicEgressProxy:
-    """Loopback-only validating proxy used by one external Browser Review."""
+class _ValidatingBrowserProxy:
+    """Loopback-only proxy with a frozen per-connection network policy."""
 
     def __init__(
         self,
         *,
-        resolver: EndpointResolver = resolve_public_endpoint,
+        resolver: EndpointResolver,
+        network_policy: BrowserNetworkPolicy,
+        target_origin: str | None,
         on_blocked: BlockedCallback | None = None,
     ) -> None:
         self._resolver = resolver
+        self._network_policy = network_policy
+        self._target_origin = target_origin
         self._on_blocked = on_blocked
         self._server: asyncio.AbstractServer | None = None
         self._connections: set[asyncio.Task[None]] = set()
         self.url = ""
 
-    async def __aenter__(self) -> "PublicEgressProxy":
+    async def __aenter__(self) -> "_ValidatingBrowserProxy":
         self._server = await asyncio.start_server(
             self._accept,
             host="127.0.0.1",
@@ -191,7 +196,7 @@ class PublicEgressProxy:
     def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.create_task(
             self._handle_client(reader, writer),
-            name="browser-public-egress",
+            name=f"browser-{self._network_policy.replace('_', '-')}-proxy",
         )
         self._connections.add(task)
         task.add_done_callback(self._connections.discard)
@@ -232,7 +237,18 @@ class PublicEgressProxy:
                 await client_writer.drain()
             else:
                 parsed = urlsplit(target_raw)
-                canonical_target_origin(target_raw, policy="external_public")
+                request_origin = canonical_target_origin(
+                    target_raw,
+                    policy=self._network_policy,
+                )
+                if (
+                    self._target_origin is not None
+                    and request_origin != self._target_origin
+                ):
+                    raise BrowserNetworkPolicyError(
+                        f"managed preview request {request_origin} is outside "
+                        f"{self._target_origin}"
+                    )
                 assert parsed.hostname is not None
                 hostname = _canonical_hostname(parsed.hostname)
                 port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -286,6 +302,66 @@ class PublicEgressProxy:
                 await _wait_closed(upstream_writer)
             client_writer.close()
             await _wait_closed(client_writer)
+
+
+class PublicEgressProxy(_ValidatingBrowserProxy):
+    """Validating proxy used by one external-public Browser Review."""
+
+    def __init__(
+        self,
+        *,
+        resolver: EndpointResolver = resolve_public_endpoint,
+        on_blocked: BlockedCallback | None = None,
+    ) -> None:
+        super().__init__(
+            resolver=resolver,
+            network_policy="external_public",
+            target_origin=None,
+            on_blocked=on_blocked,
+        )
+
+
+class ManagedPreviewProxy(_ValidatingBrowserProxy):
+    """Proxy that permits exactly one literal loopback origin."""
+
+    def __init__(
+        self,
+        target_url: str,
+        *,
+        on_blocked: BlockedCallback | None = None,
+    ) -> None:
+        target_origin = canonical_target_origin(
+            target_url,
+            policy="managed_preview",
+        )
+        parsed = urlsplit(target_origin)
+        assert parsed.hostname is not None and parsed.port is not None
+        hostname = _canonical_hostname(parsed.hostname)
+        address = _literal_address(hostname)
+        assert address is not None and address.is_loopback
+        expected_port = parsed.port
+        family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+
+        async def resolve_managed_endpoint(
+            requested_hostname: str,
+            requested_port: int,
+        ) -> ResolvedEndpoint:
+            if (
+                _canonical_hostname(requested_hostname) != hostname
+                or requested_port != expected_port
+            ):
+                raise BrowserNetworkPolicyError(
+                    f"managed preview endpoint {requested_hostname}:{requested_port} "
+                    f"is outside {hostname}:{expected_port}"
+                )
+            return ResolvedEndpoint(str(address), family, expected_port)
+
+        super().__init__(
+            resolver=resolve_managed_endpoint,
+            network_policy="managed_preview",
+            target_origin=target_origin,
+            on_blocked=on_blocked,
+        )
 
 
 async def _relay_bidirectionally(

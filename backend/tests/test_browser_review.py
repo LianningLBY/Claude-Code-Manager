@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
+import websockets
 
 from backend.services import browser_review
 from backend.services.browser_review import (
@@ -31,6 +32,7 @@ from backend.services.browser_review import (
 )
 from backend.services.browser_network import (
     BrowserNetworkPolicyError,
+    ManagedPreviewProxy,
     PublicEgressProxy,
     resolve_public_endpoint,
 )
@@ -101,12 +103,166 @@ def test_validate_target_url_rejects_unsafe_targets(url: str):
     ("url", "origin"),
     [
         ("http://127.0.0.1:5173/tasks?x=1", "http://127.0.0.1:5173"),
-        ("http://localhost:8000/", "http://localhost:8000"),
         ("http://[::1]:8000/", "http://[::1]:8000"),
     ],
 )
 def test_managed_preview_policy_allows_only_explicit_loopback(url: str, origin: str):
     assert validate_target_url(url, network_policy="managed_preview") == origin
+
+
+def test_managed_preview_rejects_hostname_aliases():
+    with pytest.raises(ValueError, match="literal loopback"):
+        validate_target_url(
+            "http://localhost:8000/",
+            network_policy="managed_preview",
+        )
+
+
+@pytest.mark.asyncio
+async def test_managed_preview_proxy_allows_only_frozen_endpoint():
+    allowed_hits = 0
+    blocked_hits = 0
+
+    async def allowed_handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        nonlocal allowed_hits
+        allowed_hits += 1
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async def blocked_handler(
+        _reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        nonlocal blocked_hits
+        blocked_hits += 1
+        writer.close()
+        await writer.wait_closed()
+
+    allowed_server = await asyncio.start_server(allowed_handler, "127.0.0.1", 0)
+    blocked_server = await asyncio.start_server(blocked_handler, "127.0.0.1", 0)
+    allowed_port = int(allowed_server.sockets[0].getsockname()[1])
+    blocked_port = int(blocked_server.sockets[0].getsockname()[1])
+    blocked_events: list[tuple[str, str]] = []
+    try:
+        async with ManagedPreviewProxy(
+            f"http://127.0.0.1:{allowed_port}",
+            on_blocked=lambda target, reason: blocked_events.append((target, reason)),
+        ) as proxy:
+            async with httpx.AsyncClient(proxy=proxy.url, trust_env=False) as client:
+                allowed = await client.get(f"http://127.0.0.1:{allowed_port}/ok")
+                denied = await client.get(f"http://127.0.0.1:{blocked_port}/secret")
+        assert allowed.text == "ok"
+        assert denied.status_code == 403
+        assert allowed_hits == 1
+        assert blocked_hits == 0
+        assert blocked_events and "outside" in blocked_events[-1][1]
+    finally:
+        allowed_server.close()
+        blocked_server.close()
+        await allowed_server.wait_closed()
+        await blocked_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_managed_preview_proxy_blocks_real_cross_origin_redirect():
+    blocked_hits = 0
+
+    async def redirect_handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        request = await reader.readuntil(b"\r\n\r\n")
+        assert request.startswith(b"GET /redirect ")
+        writer.write(
+            b"HTTP/1.1 302 Found\r\n"
+            + f"Location: http://127.0.0.1:{blocked_port}/secret\r\n".encode()
+            + b"Content-Length: 0\r\n\r\n"
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    async def blocked_handler(
+        _reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        nonlocal blocked_hits
+        blocked_hits += 1
+        writer.close()
+        await writer.wait_closed()
+
+    blocked_server = await asyncio.start_server(blocked_handler, "127.0.0.1", 0)
+    blocked_port = int(blocked_server.sockets[0].getsockname()[1])
+    redirect_server = await asyncio.start_server(redirect_handler, "127.0.0.1", 0)
+    redirect_port = int(redirect_server.sockets[0].getsockname()[1])
+    try:
+        async with ManagedPreviewProxy(
+            f"http://127.0.0.1:{redirect_port}"
+        ) as proxy:
+            async with httpx.AsyncClient(
+                proxy=proxy.url,
+                follow_redirects=True,
+                trust_env=False,
+            ) as client:
+                response = await client.get(
+                    f"http://127.0.0.1:{redirect_port}/redirect"
+                )
+        assert response.status_code == 403
+        assert blocked_hits == 0
+    finally:
+        redirect_server.close()
+        blocked_server.close()
+        await redirect_server.wait_closed()
+        await blocked_server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_managed_preview_proxy_allows_same_origin_websocket_and_blocks_other_port():
+    allowed_hits = 0
+    blocked_hits = 0
+
+    async def allowed_handler(websocket):
+        nonlocal allowed_hits
+        allowed_hits += 1
+        await websocket.send("managed-preview-ok")
+
+    async def blocked_handler(websocket):
+        nonlocal blocked_hits
+        blocked_hits += 1
+        await websocket.send("unexpected")
+
+    allowed_server = await websockets.serve(allowed_handler, "127.0.0.1", 0)
+    blocked_server = await websockets.serve(blocked_handler, "127.0.0.1", 0)
+    allowed_port = int(allowed_server.sockets[0].getsockname()[1])
+    blocked_port = int(blocked_server.sockets[0].getsockname()[1])
+    try:
+        async with ManagedPreviewProxy(
+            f"http://127.0.0.1:{allowed_port}"
+        ) as proxy:
+            async with websockets.connect(
+                f"ws://127.0.0.1:{allowed_port}/socket",
+                proxy=proxy.url,
+            ) as websocket:
+                assert await websocket.recv() == "managed-preview-ok"
+            with pytest.raises(Exception):
+                async with websockets.connect(
+                    f"ws://127.0.0.1:{blocked_port}/socket",
+                    proxy=proxy.url,
+                ):
+                    pass
+        assert allowed_hits == 1
+        assert blocked_hits == 0
+    finally:
+        allowed_server.close()
+        blocked_server.close()
+        await allowed_server.wait_closed()
+        await blocked_server.wait_closed()
 
 
 @pytest.mark.asyncio
@@ -486,7 +642,7 @@ async def test_run_browser_review_completes_loop_and_writes_artifacts(
 
     result = await run_browser_review(
             BrowserReviewOptions(
-                url="http://localhost:5173",
+                url="http://127.0.0.1:5173",
                 network_policy="managed_preview",
                 output_dir=tmp_path,
             action_delay_ms=0,

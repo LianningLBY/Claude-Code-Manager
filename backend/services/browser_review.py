@@ -19,6 +19,7 @@ import httpx
 
 from backend.services.browser_network import (
     BrowserNetworkPolicy,
+    ManagedPreviewProxy,
     PublicEgressProxy,
     canonical_target_origin,
 )
@@ -738,10 +739,17 @@ async def _browser_page(
 
     try:
         async with AsyncExitStack() as stack:
-            proxy: PublicEgressProxy | None = None
+            proxy: PublicEgressProxy | ManagedPreviewProxy
             if options.network_policy == "external_public":
                 proxy = await stack.enter_async_context(
                     PublicEgressProxy(on_blocked=telemetry.add_blocked_navigation)
+                )
+            else:
+                proxy = await stack.enter_async_context(
+                    ManagedPreviewProxy(
+                        target_origin,
+                        on_blocked=telemetry.add_blocked_navigation,
+                    )
                 )
             playwright = await stack.enter_async_context(async_playwright())
             launch_options = _browser_launch_options(
@@ -788,6 +796,19 @@ async def _browser_page(
                 )
                 await download.cancel()
 
+            async def guard_websocket(websocket: Any) -> None:
+                violation = _request_policy_violation(
+                    options,
+                    target_origin=target_origin,
+                    request_url=websocket.url,
+                    top_level_navigation=False,
+                )
+                if violation is not None:
+                    telemetry.add_blocked_navigation(websocket.url, violation)
+                    await websocket.close(code=1008, reason="blocked by browser policy")
+                    return
+                websocket.connect_to_server()
+
             def on_popup(popup: Any) -> None:
                 asyncio.create_task(close_popup(popup))
 
@@ -795,6 +816,7 @@ async def _browser_page(
                 asyncio.create_task(cancel_download(download))
 
             await context.route("**/*", guard_navigation)
+            await context.route_web_socket("**/*", guard_websocket)
             page.on("popup", on_popup)
             page.on("download", on_download)
             try:

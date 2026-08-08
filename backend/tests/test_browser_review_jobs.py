@@ -66,7 +66,7 @@ async def test_job_manager_tracks_progress_and_artifacts(monkeypatch, tmp_path):
     )
     job = await manager.start(
         BrowserReviewOptions(
-            url="http://localhost:5173",
+            url="http://127.0.0.1:5173",
             network_policy="managed_preview",
         ),
         capture_only=False,
@@ -111,7 +111,7 @@ async def test_job_manager_allows_only_one_job_and_can_cancel(monkeypatch, tmp_p
         artifact_store=_artifact_store(tmp_path),
     )
     options = BrowserReviewOptions(
-        url="http://localhost:5173",
+        url="http://127.0.0.1:5173",
         network_policy="managed_preview",
     )
     job = await manager.start(options, capture_only=True, api_key=None)
@@ -161,7 +161,7 @@ async def test_agent_job_tracks_task_and_browser_events(monkeypatch, tmp_path):
     )
     job = await manager.prepare_agent(
         BrowserReviewOptions(
-            url="http://localhost:5173",
+            url="http://127.0.0.1:5173",
             network_policy="managed_preview",
         ),
         provider="codex",
@@ -245,7 +245,7 @@ async def test_inline_task_tool_completes_and_allows_a_later_run(
         artifact_store=_artifact_store(tmp_path),
     )
     options = BrowserReviewOptions(
-        url="http://localhost:5173",
+        url="http://127.0.0.1:5173",
         network_policy="managed_preview",
     )
     first = await manager.prepare_task_tool(

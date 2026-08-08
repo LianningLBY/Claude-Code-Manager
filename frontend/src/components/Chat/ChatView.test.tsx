@@ -313,6 +313,30 @@ describe('ChatView', () => {
     }
   });
 
+  it('stacks mobile header actions below wrapping task badges', async () => {
+    render(
+      <ChatView
+        task={makeTask({ provider: 'codex', project_id: 7 })}
+        projects={[{ id: 7, name: 'A long mobile project name' } as Project]}
+        onBack={onBack}
+      />,
+    );
+
+    await screen.findByTestId('codex-main-mcp-status');
+
+    const header = screen.getByTestId('chat-header-primary');
+    expect(header.className).toContain('flex-col');
+    expect(header.className).toContain('sm:flex-row');
+
+    const badges = screen.getByTestId('chat-task-badges');
+    expect(badges.className).toContain('flex-wrap');
+    expect(badges.className).toContain('sm:flex-nowrap');
+
+    const actions = screen.getByTestId('chat-header-actions');
+    expect(actions.className).toContain('self-end');
+    expect(actions.className).toContain('sm:self-auto');
+  });
+
   describe('chat conflict state', () => {
     it('does not show Interrupt for a non-busy 409 rejection', async () => {
       const rejection = Object.assign(

@@ -2035,49 +2035,60 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       {/* Header — two rows */}
       <div className="px-3 sm:px-4 py-1.5 pt-[max(0.375rem,env(safe-area-inset-top))] border-b border-gray-800 bg-gray-900">
         {/* Row 1: back + task info + action buttons */}
-        <div className="flex items-center gap-2 sm:gap-3">
-          <button onClick={onBack} className="text-gray-400 hover:text-foreground shrink-0">
-            <ArrowLeft size={20} />
-          </button>
-          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-            <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
-            {task.mode === 'plan' ? (
-              <PlanPipelineBadge task={task} />
-            ) : (
-              <>
-                <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-                  {providerLabel}
+        <div
+          data-testid="chat-header-primary"
+          className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3"
+        >
+          <div className="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1 sm:items-center sm:gap-3">
+            <button onClick={onBack} className="mt-0.5 shrink-0 text-gray-400 hover:text-foreground sm:mt-0">
+              <ArrowLeft size={20} />
+            </button>
+            <div
+              data-testid="chat-task-badges"
+              className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1.5 gap-y-1 sm:flex-nowrap"
+            >
+              <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
+              {task.mode === 'plan' ? (
+                <PlanPipelineBadge task={task} />
+              ) : (
+                <>
+                  <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                    {providerLabel}
+                  </span>
+                  <FastModeBadge task={task} />
+                </>
+              )}
+              {backgroundActive && (
+                <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
+                  后台运行中
                 </span>
-                <FastModeBadge task={task} />
-              </>
-            )}
-            {backgroundActive && (
-              <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
-                后台运行中
-              </span>
-            )}
-            {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
-              <span
-                data-testid="codex-main-mcp-status"
-                className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
-                  codexMainMcpEnabled
-                    ? 'bg-teal-600/25 text-teal-300'
-                    : 'bg-gray-700 text-gray-400'
-                }`}
-                title={
-                  codexMainMcpEnabled
-                    ? 'Codex 主任务 MCP 已启用'
-                    : 'Codex 主任务 MCP 已关闭'
-                }
-              >
-                MCP {codexMainMcpEnabled ? '已启用' : '已关闭'}
-              </span>
-            )}
-            {projectName && (
-              <span className="text-xs bg-emerald-600/30 text-emerald-300 px-1.5 rounded font-medium whitespace-nowrap truncate">{projectName}</span>
-            )}
+              )}
+              {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
+                <span
+                  data-testid="codex-main-mcp-status"
+                  className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
+                    codexMainMcpEnabled
+                      ? 'bg-teal-600/25 text-teal-300'
+                      : 'bg-gray-700 text-gray-400'
+                  }`}
+                  title={
+                    codexMainMcpEnabled
+                      ? 'Codex 主任务 MCP 已启用'
+                      : 'Codex 主任务 MCP 已关闭'
+                  }
+                >
+                  MCP {codexMainMcpEnabled ? '已启用' : '已关闭'}
+                </span>
+              )}
+              {projectName && (
+                <span className="max-w-full truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300">{projectName}</span>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div
+            data-testid="chat-header-actions"
+            className="flex shrink-0 items-center gap-1 self-end sm:self-auto"
+          >
             <SubAgentIndicator
               taskId={task.id}
               count={monitorCount}

@@ -186,6 +186,15 @@ export interface TestHarnessAttempt {
   codex_service_tier: CodexServiceTier;
   agent_task_id: number | null;
   browser_review_job_id: string | null;
+  archive_state: 'staging' | 'archiving' | 'complete' | 'retryable_error' | 'incomplete';
+  archive_error: string | null;
+  archive_manifest: {
+    version: number;
+    expected: string[];
+    archived: string[];
+    terminal_status: string | null;
+  };
+  archived_at: string | null;
   error: string | null;
   created_at: string;
   started_at: string | null;
@@ -218,6 +227,8 @@ export interface TestHarnessRun {
   error: string | null;
   cleanup_status: string;
   cleanup_error: string | null;
+  evidence_archive_state: TestHarnessAttempt['archive_state'] | null;
+  evidence_archive_error: string | null;
   created_at: string;
   started_at: string | null;
   completed_at: string | null;

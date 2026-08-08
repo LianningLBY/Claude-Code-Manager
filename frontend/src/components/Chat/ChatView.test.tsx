@@ -1186,6 +1186,8 @@ describe('ChatView', () => {
         error: null,
         cleanup_status: 'pending',
         cleanup_error: null,
+        evidence_archive_state: 'staging',
+        evidence_archive_error: null,
         created_at: '2026-08-06T00:00:00Z',
         started_at: null,
         completed_at: null,

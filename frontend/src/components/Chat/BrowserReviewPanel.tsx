@@ -1404,6 +1404,27 @@ export function BrowserReviewPanel({
                   : `隔离资源清理：${displayedRun.cleanup_status}`}
               </div>
             )}
+            {displayedRun.evidence_archive_state && (
+              <div
+                data-testid="evidence-archive-state"
+                className={`mt-1.5 flex items-start gap-1.5 text-[10px] ${displayedRun.evidence_archive_state === 'complete'
+                  ? 'text-emerald-600 dark:text-emerald-300'
+                  : displayedRun.evidence_archive_state === 'staging' || displayedRun.evidence_archive_state === 'archiving'
+                    ? 'text-sky-600 dark:text-sky-300'
+                    : 'text-red-600 dark:text-red-300'}`}
+              >
+                <Shield size={11} className="mt-0.5 shrink-0" />
+                <span className="min-w-0 break-words">
+                  {displayedRun.evidence_archive_state === 'complete'
+                    ? '截图与报告已完成哈希校验和持久化归档'
+                    : displayedRun.evidence_archive_state === 'archiving'
+                      ? '正在校验并归档截图与报告'
+                      : displayedRun.evidence_archive_state === 'staging'
+                        ? '正在收集截图与报告'
+                        : `证据归档未完成：${displayedRun.evidence_archive_error || displayedRun.evidence_archive_state}`}
+                </span>
+              </div>
+            )}
             {workspaceRun && (
               <div data-testid="workspace-review-progress" className="mt-2 border-t border-gray-600/40 pt-2 text-[10px] text-gray-500">
                 <div className="truncate" title={workspaceRun.workspace_fingerprint}>

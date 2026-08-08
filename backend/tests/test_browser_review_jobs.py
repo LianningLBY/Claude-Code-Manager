@@ -287,7 +287,7 @@ async def test_inline_task_tool_completes_and_allows_a_later_run(
 
 
 @pytest.mark.asyncio
-async def test_terminal_job_history_is_bounded_and_prunes_only_managed_staging(
+async def test_terminal_job_history_is_bounded_without_deleting_staging(
     tmp_path,
 ):
     store = _artifact_store(tmp_path)
@@ -319,10 +319,11 @@ async def test_terminal_job_history_is_bounded_and_prunes_only_managed_staging(
     )
 
     assert await manager.get(first.id) is None
-    assert not first_dir.exists()
+    assert first_dir.exists()
     assert [job.id for job in await manager.list()] == [third.id, second.id]
     await manager.fail_start(third.id, RuntimeError("done"))
     await manager.shutdown()
+    assert first_dir.exists()
 
 
 def test_trace_tool_arguments_redact_typed_text_and_hide_report_body():

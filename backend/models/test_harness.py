@@ -95,7 +95,30 @@ class TestHarnessAttempt(Base):
     browser_review_job_id: Mapped[str | None] = mapped_column(
         String(32), nullable=True, unique=True
     )
+    # Legacy compatibility projection. New code treats the explicit staging
+    # and archive fields below as authoritative.
     artifact_root: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    artifact_staging_root: Mapped[str | None] = mapped_column(
+        String(1000), nullable=True
+    )
+    artifact_archive_prefix: Mapped[str | None] = mapped_column(
+        String(1000), nullable=True
+    )
+    archive_state: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="staging",
+        server_default="staging",
+        index=True,
+    )
+    archive_manifest: Mapped[dict] = mapped_column(
+        JSON,
+        nullable=False,
+        default=dict,
+        server_default="{}",
+    )
+    archive_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     result_data: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)

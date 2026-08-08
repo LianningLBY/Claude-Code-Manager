@@ -346,7 +346,9 @@ class BrowserReviewJobManager:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._artifact_store.cleanup_job_dirs(active_job_ids=set())
+        # Staging retention is owned by TestHarnessService, which can consult
+        # durable archive state. A Browser manager shutdown cannot prove that
+        # a terminal/in-memory job has been archived safely.
 
     async def context(self, job_id: str) -> dict[str, Any] | None:
         job = await self.get(job_id)
@@ -694,7 +696,9 @@ class BrowserReviewJobManager:
         excess = max(0, len(terminal_ids) - self._history_limit + 1)
         for job_id in terminal_ids[:excess]:
             self._jobs.pop(job_id, None)
-            self._artifact_store.remove_job_dir(job_id)
+            # Durable Harness archive state decides when staging can be
+            # reclaimed. Removing it here could destroy the only retry source
+            # after an interrupted or failed archive transaction.
 
     @staticmethod
     def _merge_trace_events(job: BrowserReviewJob, events: Any) -> None:

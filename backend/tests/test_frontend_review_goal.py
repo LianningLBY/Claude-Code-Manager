@@ -43,6 +43,7 @@ def test_frontend_review_goal_condition_and_protocol_require_browser_recheck():
     assert "ccm_workspace_review.test_current_changes" in protocol
     assert "check_current_changes_review" in protocol
     assert "cleanup_status=completed" in protocol
+    assert "evidence_archive_state=complete" in protocol
     assert "安全上限为 5 轮" in protocol
 
 
@@ -116,6 +117,7 @@ async def test_frontend_review_evidence_gate_accepts_latest_completed_proof(monk
             "verdict": "passed",
             "stale": False,
             "cleanup_status": "completed",
+            "evidence_archive_state": "complete",
             "report": report,
             "evidence": [{"kind": "screenshot", "name": "final.png"}],
             "findings": [],
@@ -147,3 +149,35 @@ async def test_frontend_review_evidence_gate_accepts_latest_completed_proof(monk
     assert "Run 2 (older superseded run): id=review-baseline" in summary
     assert "only authoritative latest run" in summary
     assert "门禁已满足" in reason
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_evidence_gate_rejects_incomplete_archive(monkeypatch):
+    run = {
+        "id": "review-incomplete",
+        "target_kind": "current_workspace",
+        "status": "completed",
+        "stage": "completed",
+        "verdict": "passed",
+        "stale": False,
+        "cleanup_status": "completed",
+        "evidence_archive_state": "retryable_error",
+        "report": "## Passed",
+        "evidence": [{"kind": "screenshot", "name": "final.png"}],
+        "findings": [],
+    }
+    service = type(
+        "FakeHarnessService",
+        (),
+        {"list_for_task": AsyncMock(return_value=[run])},
+    )()
+    monkeypatch.setattr(
+        "backend.services.test_harness.test_harness_service",
+        service,
+    )
+
+    summary, ready, reason = await collect_frontend_review_goal_evidence(73)
+
+    assert not ready
+    assert "archive=retryable_error" in summary
+    assert "尚未完成持久化归档" in reason

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import uuid
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -104,10 +105,19 @@ def test_git_browser_context_exposes_metadata_not_diff_content():
     assert "clone_url" not in context
 
 
-def _completed_job(tmp_path, *, title: str, severity: str = "high") -> BrowserReviewJob:
+def _completed_job(
+    tmp_path,
+    *,
+    title: str,
+    severity: str = "high",
+    artifact_store: ArtifactStore | None = None,
+) -> BrowserReviewJob:
     job_id = uuid.uuid4().hex
-    output = tmp_path / job_id
-    output.mkdir(mode=0o700)
+    if artifact_store is not None:
+        output = artifact_store.create_job_dir(job_id)
+    else:
+        output = tmp_path / job_id
+        output.mkdir(mode=0o700)
     output.joinpath("initial.png").write_bytes(b"\x89PNG\r\n\x1a\ninitial image")
     output.joinpath("final.png").write_bytes(b"\x89PNG\r\n\x1a\nfinal image")
     output.joinpath("report.md").write_text("# Result\n\nVerdict: pass", encoding="utf-8")
@@ -392,13 +402,29 @@ async def test_fixed_url_run_is_idempotent_and_persists_structured_evidence(
             ),
         )
 
-    job = _completed_job(tmp_path, title="Save confirmation is missing")
+    job = _completed_job(
+        tmp_path,
+        title="Save confirmation is missing",
+        artifact_store=artifact_store,
+    )
     await service.attach_browser_job(run_id=run.id, job=job, watch_terminal=False)
     payload = await service.get_run(run.id)
 
     assert payload is not None
     assert payload["status"] == "completed"
     assert payload["verdict"] == "passed"
+    assert payload["evidence_archive_state"] == "complete"
+    assert payload["evidence_archive_error"] is None
+    assert payload["attempts"][-1]["archive_manifest"]["expected"] == [
+        "final.png",
+        "initial.png",
+        "report.md",
+    ]
+    assert payload["attempts"][-1]["archive_manifest"]["archived"] == [
+        "final.png",
+        "initial.png",
+        "report.md",
+    ]
     assert payload["browser_review"]["coverage"] == {"scenarios": ["primary-flow"]}
     assert payload["findings"][0]["title"] == "Save confirmation is missing"
     assert {item["name"] for item in payload["evidence"]} >= {
@@ -419,6 +445,18 @@ async def test_fixed_url_run_is_idempotent_and_persists_structured_evidence(
         )
         assert evidence is not None
         assert not evidence.storage_path.startswith("/")
+        attempt = await db.scalar(
+            select(AttemptModel).where(AttemptModel.run_id == run.id)
+        )
+        assert attempt is not None
+        assert attempt.archive_state == "complete"
+        assert attempt.artifact_staging_root is None
+        assert attempt.artifact_archive_prefix == artifact_store.run_prefix(
+            task_id=task_id,
+            run_id=run.id,
+            attempt_id=attempt.id,
+        )
+        assert attempt.archived_at is not None
 
     assert job.options.output_dir is not None
     for source_file in job.options.output_dir.iterdir():
@@ -459,12 +497,192 @@ async def test_fixed_url_run_is_idempotent_and_persists_structured_evidence(
 
 
 @pytest.mark.asyncio
+async def test_terminal_archive_missing_staging_fails_closed_and_keeps_pointer(
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    store = ArtifactStore(tmp_path / "archive")
+    service = HarnessService(db_factory=db_factory, artifact_store=store)
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Require durable evidence",
+        ),
+    )
+    job = _completed_job(
+        tmp_path,
+        title="Missing staging",
+        artifact_store=store,
+    )
+    assert job.options.output_dir is not None
+    staging_root = str(job.options.output_dir)
+    for candidate in job.options.output_dir.iterdir():
+        candidate.unlink()
+    job.options.output_dir.rmdir()
+
+    await service.attach_browser_job(
+        run_id=run.id,
+        job=job,
+        watch_terminal=False,
+    )
+
+    payload = await service.get_run(run.id)
+    assert payload is not None
+    assert payload["status"] == "failed"
+    assert payload["stage"] == "evidence_incomplete"
+    assert payload["verdict"] == "error"
+    assert payload["evidence_archive_state"] == "retryable_error"
+    assert "staging directory is missing or unmanaged" in (
+        payload["evidence_archive_error"] or ""
+    )
+    assert payload["evidence"] == []
+    async with db_factory() as db:
+        attempt = await db.scalar(
+            select(AttemptModel).where(AttemptModel.run_id == run.id)
+        )
+        assert attempt is not None
+        assert attempt.artifact_staging_root == staging_root
+        assert attempt.artifact_archive_prefix is None
+        assert attempt.archived_at is None
+
+
+@pytest.mark.asyncio
+async def test_partial_terminal_archive_retries_from_retained_staging(
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    store = ArtifactStore(tmp_path / "archive")
+    service = HarnessService(db_factory=db_factory, artifact_store=store)
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Retry a partial evidence archive",
+        ),
+    )
+    job_id = uuid.uuid4().hex
+    output = store.create_job_dir(job_id)
+    output.joinpath("report.md").write_text("# Passed", encoding="utf-8")
+    now = datetime.utcnow().isoformat()
+    job = BrowserReviewJob(
+        id=job_id,
+        options=BrowserReviewOptions(
+            url="https://example.com",
+            goal="Retry evidence",
+            output_dir=output,
+        ),
+        capture_only=False,
+        provider="codex",
+        codex_service_tier="default",
+        status="completed",
+        stage="completed",
+        verdict="passed",
+        latest_screenshot="final.png",
+        created_at=now,
+        started_at=now,
+        completed_at=now,
+    )
+
+    await service.attach_browser_job(
+        run_id=run.id,
+        job=job,
+        watch_terminal=False,
+    )
+    partial = await service.get_run(run.id)
+    assert partial is not None
+    assert partial["status"] == "failed"
+    assert partial["stage"] == "evidence_incomplete"
+    assert partial["evidence_archive_state"] == "retryable_error"
+    assert "final.png" in (partial["evidence_archive_error"] or "")
+    assert [item["name"] for item in partial["evidence"]] == ["report.md"]
+    assert output.exists()
+
+    output.joinpath("final.png").write_bytes(b"\x89PNG\r\n\x1a\nrecovered")
+    await service.sync_browser_job(job)
+    recovered = await service.get_run(run.id)
+    assert recovered is not None
+    assert recovered["status"] == "completed"
+    assert recovered["verdict"] == "passed"
+    assert recovered["evidence_archive_state"] == "complete"
+    assert {item["name"] for item in recovered["evidence"]} == {
+        "final.png",
+        "report.md",
+    }
+
+
+@pytest.mark.asyncio
+async def test_hash_verification_failure_rearchives_from_retained_staging(
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    store = ArtifactStore(tmp_path / "archive")
+    service = HarnessService(db_factory=db_factory, artifact_store=store)
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Repair corrupted persistent evidence",
+        ),
+    )
+    job = _completed_job(
+        tmp_path,
+        title="Integrity evidence",
+        artifact_store=store,
+    )
+    await service.attach_browser_job(
+        run_id=run.id,
+        job=job,
+        watch_terminal=False,
+    )
+    async with db_factory() as db:
+        evidence = await db.scalar(
+            select(EvidenceModel).where(
+                EvidenceModel.run_id == run.id,
+                EvidenceModel.name == "final.png",
+            )
+        )
+        assert evidence is not None
+        archive_path = store.resolve_path(evidence.storage_path)
+        original = archive_path.read_bytes()
+    archive_path.write_bytes(original[:-1] + bytes([original[-1] ^ 0x01]))
+
+    await service.sync_browser_job(job)
+    rejected = await service.get_run(run.id)
+    assert rejected is not None
+    assert rejected["status"] == "failed"
+    assert rejected["evidence_archive_state"] == "retryable_error"
+    assert "integrity check failed" in (
+        rejected["evidence_archive_error"] or ""
+    )
+
+    await service.sync_browser_job(job)
+    repaired = await service.get_run(run.id)
+    assert repaired is not None
+    assert repaired["status"] == "completed"
+    assert repaired["evidence_archive_state"] == "complete"
+    opened = await service.open_evidence(run.id, "final.png")
+    assert opened is not None
+    try:
+        assert b"".join(opened.chunks()) == original
+    finally:
+        opened.close()
+
+
+@pytest.mark.asyncio
 async def test_repeat_and_compare_use_stable_finding_fingerprints(db_factory, tmp_path):
     task_id = await _task(db_factory)
+    artifact_store = ArtifactStore(tmp_path / "archive")
     service = HarnessService(
         db_factory=db_factory,
         poll_interval=0.01,
-        artifact_store=ArtifactStore(tmp_path / "archive"),
+        artifact_store=artifact_store,
     )
     first = await service.start_task_run(
         task_id=task_id,
@@ -476,7 +694,12 @@ async def test_repeat_and_compare_use_stable_finding_fingerprints(db_factory, tm
     )
     await service.attach_browser_job(
         run_id=first.id,
-        job=_completed_job(tmp_path, title="Save confirmation is missing", severity="high"),
+        job=_completed_job(
+            tmp_path,
+            title="Save confirmation is missing",
+            severity="high",
+            artifact_store=artifact_store,
+        ),
         watch_terminal=False,
     )
 
@@ -486,7 +709,12 @@ async def test_repeat_and_compare_use_stable_finding_fingerprints(db_factory, tm
     assert repeated.attempt_number == 2
     await service.attach_browser_job(
         run_id=repeated.id,
-        job=_completed_job(tmp_path, title="Save confirmation is missing", severity="medium"),
+        job=_completed_job(
+            tmp_path,
+            title="Save confirmation is missing",
+            severity="medium",
+            artifact_store=artifact_store,
+        ),
         watch_terminal=False,
     )
 
@@ -515,7 +743,7 @@ async def test_sync_terminal_workspace_run_records_cleanup_event(db_factory):
         stage="completed",
         cleanup_status="completed",
         cleanup_error=None,
-        browser_review_job_id=None,
+        browser_review_job_id="workspace-browser-job",
         agent_task_id=321,
         git_head="a" * 40,
         workspace_fingerprint="b" * 64,
@@ -525,6 +753,31 @@ async def test_sync_terminal_workspace_run_records_cleanup_event(db_factory):
         started_at=now,
         completed_at=now,
     )
+
+    async with db_factory() as db:
+        db.add(
+            AttemptModel(
+                id=uuid.uuid4().hex,
+                run_id=run.id,
+                ordinal=1,
+                status="completed",
+                stage="completed",
+                provider="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+                codex_service_tier="default",
+                browser_review_job_id="workspace-browser-job",
+                archive_state="complete",
+                archive_manifest={
+                    "version": 1,
+                    "expected": [],
+                    "archived": {},
+                    "terminal_status": "completed",
+                },
+                result_data={"verdict": "passed"},
+            )
+        )
+        await db.commit()
 
     await service._sync_workspace_run(run.id, workspace_run)
 
@@ -643,24 +896,43 @@ async def test_git_target_pipeline_runs_browser_then_proves_sandbox_cleanup(
             return 0
 
     sandbox_manager = _SandboxManager()
+    artifact_store = ArtifactStore(tmp_path / "git-archive")
     service = HarnessService(
         db_factory=db_factory,
         poll_interval=0.001,
         target_manager=_TargetManager(),
         sandbox_manager=sandbox_manager,
+        artifact_store=artifact_store,
     )
-    job = _completed_job(tmp_path, title="No issue", severity="info")
+    job = _completed_job(
+        tmp_path,
+        title="No issue",
+        severity="info",
+        artifact_store=artifact_store,
+    )
 
     async def _start_browser(*, run_id, url):
         assert url == "http://127.0.0.1:43123/"
+        assert artifact_store.list_job_artifacts(job.options.output_dir) == [
+            "final.png",
+            "initial.png",
+            "report.md",
+        ]
         job.harness_run_id = run_id
+        await service.attach_browser_job(
+            run_id=run_id,
+            job=job,
+            watch_terminal=False,
+        )
+        attached = await service.get_run(run_id)
+        assert attached is not None
+        assert attached["evidence_archive_state"] == "complete", (
+            attached["evidence_archive_error"],
+            [(item["name"], item["sha256"]) for item in attached["evidence"]],
+        )
         return job
 
-    async def _sync(_job):
-        return None
-
     service.start_managed_preview_browser = _start_browser
-    service.sync_browser_job = _sync
 
     class _BrowserManager:
         async def get(self, job_id):
@@ -695,15 +967,17 @@ async def test_git_target_pipeline_runs_browser_then_proves_sandbox_cleanup(
             goal="Verify PR 7",
         ),
     )
-    for _ in range(200):
-        payload = await service.get_run(run.id)
-        if payload is not None and payload["status"] == "completed":
-            break
-        await asyncio.sleep(0.005)
-    else:
-        pytest.fail("Git target pipeline did not complete")
+    pipeline = service._pipelines.get(run.id)
+    assert pipeline is not None
+    await asyncio.wait_for(asyncio.shield(pipeline), timeout=1)
+    payload = await service.get_run(run.id)
 
     assert payload is not None
+    assert payload["status"] == "completed", (
+        payload["error"],
+        payload["attempts"],
+        payload["events"],
+    )
     assert payload["source_git_head"] == "b" * 40
     assert payload["verdict"] == "passed"
     assert payload["cleanup_status"] == "completed"
@@ -767,8 +1041,166 @@ async def test_restart_reconciles_managed_job_files_before_marking_run_interrupt
     async with db_factory() as db:
         attempt = await db.get(AttemptModel, attempt_id)
         assert attempt is not None
+        assert attempt.archive_state == "complete"
+        assert attempt.archive_error is None
+        assert attempt.artifact_staging_root is None
+        assert attempt.artifact_archive_prefix == store.run_prefix(
+            task_id=task_id,
+            run_id=run.id,
+            attempt_id=attempt_id,
+        )
+        assert attempt.archived_at is not None
         assert attempt.artifact_root == store.run_prefix(
             task_id=task_id,
             run_id=run.id,
             attempt_id=attempt_id,
         )
+
+
+@pytest.mark.asyncio
+async def test_restart_marks_completed_run_failed_when_staging_cannot_be_recovered(
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    store = ArtifactStore(tmp_path / "archive")
+    service = HarnessService(
+        db_factory=db_factory,
+        artifact_store=store,
+        retention_interval=0,
+    )
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Reject an unrecoverable archive",
+        ),
+    )
+    attempt_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
+    missing_staging = store.jobs_root / job_id
+    async with db_factory() as db:
+        persisted_run = await db.get(RunModel, run.id)
+        assert persisted_run is not None
+        persisted_run.status = "completed"
+        persisted_run.stage = "completed"
+        persisted_run.verdict = "passed"
+        persisted_run.report = "# Passed"
+        persisted_run.cleanup_status = "completed"
+        persisted_run.completed_at = datetime.utcnow()
+        db.add(
+            AttemptModel(
+                id=attempt_id,
+                run_id=run.id,
+                ordinal=1,
+                status="completed",
+                stage="completed",
+                provider="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="medium",
+                codex_service_tier="default",
+                browser_review_job_id=job_id,
+                artifact_root=str(missing_staging),
+                artifact_staging_root=str(missing_staging),
+                archive_state="retryable_error",
+                archive_manifest={
+                    "version": 1,
+                    "expected": ["final.png", "report.md"],
+                    "archived": {},
+                    "terminal_status": "completed",
+                },
+                result_data={
+                    "artifacts": ["final.png", "report.md"],
+                    "latest_screenshot": "final.png",
+                    "report": "# Passed",
+                },
+            )
+        )
+        await db.commit()
+
+    assert await service.recover_interrupted_runs() == 0
+    recovered = await service.get_run(run.id)
+    assert recovered is not None
+    assert recovered["status"] == "failed"
+    assert recovered["stage"] == "evidence_incomplete"
+    assert recovered["verdict"] == "error"
+    assert recovered["evidence_archive_state"] == "incomplete"
+    assert "staging directory is unavailable" in (
+        recovered["evidence_archive_error"] or ""
+    )
+    assert recovered["events"][-1]["title"] == "测试证据恢复失败"
+    assert await service.recover_interrupted_runs() == 0
+    recovered_again = await service.get_run(run.id)
+    assert recovered_again is not None
+    assert sum(
+        event["title"] == "测试证据恢复失败"
+        for event in recovered_again["events"]
+    ) == 1
+    async with db_factory() as db:
+        attempt = await db.get(AttemptModel, attempt_id)
+        assert attempt is not None
+        assert attempt.artifact_staging_root == str(missing_staging)
+        assert attempt.artifact_archive_prefix is None
+
+
+@pytest.mark.asyncio
+async def test_retention_keeps_incomplete_staging_until_archive_is_complete(
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    store = ArtifactStore(tmp_path / "archive", retention_days=1)
+    service = HarnessService(db_factory=db_factory, artifact_store=store)
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Protect retry staging",
+        ),
+    )
+    job_id = uuid.uuid4().hex
+    attempt_id = uuid.uuid4().hex
+    job_dir = store.create_job_dir(job_id)
+    job_dir.joinpath("report.md").write_text("retry me", encoding="utf-8")
+    old = (datetime.utcnow() - timedelta(days=2)).timestamp()
+    os.utime(job_dir, (old, old))
+    async with db_factory() as db:
+        persisted_run = await db.get(RunModel, run.id)
+        assert persisted_run is not None
+        persisted_run.status = "failed"
+        persisted_run.stage = "evidence_incomplete"
+        persisted_run.verdict = "error"
+        persisted_run.completed_at = datetime.utcnow()
+        db.add(
+            AttemptModel(
+                id=attempt_id,
+                run_id=run.id,
+                ordinal=1,
+                status="completed",
+                stage="completed",
+                provider="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="medium",
+                codex_service_tier="default",
+                browser_review_job_id=job_id,
+                artifact_root=str(job_dir),
+                artifact_staging_root=str(job_dir),
+                archive_state="retryable_error",
+                archive_manifest={"version": 1, "expected": ["report.md"]},
+                result_data={"artifacts": ["report.md"]},
+            )
+        )
+        await db.commit()
+
+    await service.cleanup_evidence()
+    assert job_dir.exists()
+
+    async with db_factory() as db:
+        attempt = await db.get(AttemptModel, attempt_id)
+        assert attempt is not None
+        attempt.archive_state = "complete"
+        await db.commit()
+    await service.cleanup_evidence()
+    assert not job_dir.exists()

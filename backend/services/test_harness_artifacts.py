@@ -236,12 +236,11 @@ class TestHarnessArtifactStore:
                 raise TestHarnessArtifactQuotaError("Test Harness Task evidence quota exceeded")
             if total_size_before + delta > self.max_total_bytes:
                 raise TestHarnessArtifactQuotaError("Test Harness evidence storage is full")
-            if final.exists():
-                if existing_size != total:
-                    raise TestHarnessArtifactError("Existing Test Harness evidence is inconsistent")
-                temporary.unlink()
-            else:
-                os.replace(temporary, final)
+            # The destination name is content-addressed from the verified
+            # source bytes. Always replace it atomically: size equality alone
+            # cannot prove that an existing archive was not corrupted, and a
+            # retained staging directory must be able to repair that damage.
+            os.replace(temporary, final)
             temporary = None
             os.chmod(final, 0o600, follow_symlinks=False)
             directory_fd = os.open(

@@ -173,8 +173,14 @@ claude-manager/
 │       ├── browser_review.py    # 隔离 Playwright 浏览器、安全动作与 CLI harness
 │       ├── browser_review_jobs.py # CCM Task-backed browser review job/证据管理
 │       ├── test_harness.py      # provider-neutral 测试门面与持久化生命周期
+│       ├── test_harness_artifacts.py # 私有证据、哈希归档与保留策略
 │       ├── test_harness_runtime.py # 每 Task 独立 Browser Agent 模型/强度配置
-│       ├── test_harness_targets.py # 精确 PR/ref detached worktree
+│       ├── test_harness_children.py # Browser Agent 子 Task 持久所有权/停止恢复
+│       ├── test_harness_git_targets.py # 公共 GitHub 元数据与 exact SHA 冻结
+│       ├── test_harness_sandbox.py # PR/ref Docker Sandbox 与持久 Lease
+│       ├── test_harness_egress_proxy.py # Sandbox 依赖出口白名单代理
+│       ├── test_harness_preview_relay.py # 只读 loopback Preview relay
+│       ├── test_harness_targets.py # PR/ref 隔离目标编排门禁
 │       ├── ask_user.py          # ask_user 注册表 + Future 管理
 │       ├── ask_user_settings.py # ask_user hook 注入/移除
 │       ├── ws_broadcaster.py    # WebSocket channel 广播
@@ -271,7 +277,8 @@ CCM 的 Web 浏览器测试现在统一由持久化 Test Harness 管理。普通
 目标、TestPlan、provider/model 和预算，并持续记录 Attempt、阶段事件、截图/报告、
 结构化 Finding 与最终 Verdict。右侧栏或浮窗会自动切到同一 Task 的最新 Run；终态
 Run 可以直接“重新测试”，也可以比较两轮 finding fingerprint。服务重启后历史记录
-仍在，未完成的运行会明确标为 interrupted，而不会伪装成通过。
+仍在；截图/报告只有复制到私有内容寻址存储并重新通过 SHA-256 校验后才进入
+`complete`，缺失或中断会保留 staging 供恢复并让 Run fail closed，不会伪装成通过。
 
 Browser Agent 的 provider、模型、推理强度和 Codex Fast/Standard 可在右侧测试栏单独
 配置，默认才跟随父 Task。该选择按 Task 保存，并统一用于普通对话触发、一次性测试、
@@ -279,16 +286,16 @@ Goal 复查、固定 URL 以及 PR/ref 审查；每个 Run 启动后会冻结实
 黑盒审查 Agent 可以使用不同模型，也不会在运行中因设置变化而漂移。
 
 当前工作区测试会先使用 Project 中管理员确认过的 Preview 配置启动 loopback 隔离
-预览；PR/ref 测试会解析精确 Git SHA，在临时 detached worktree 中启动预览，绝不
-切换当前开发工作树。独立 Browser Agent 只收到 URL、冻结后的测试计划和浏览器工具，
+预览；PR/ref 测试会解析精确 Git SHA，把源码 fetch、依赖安装、构建和 Preview 全部
+放进临时 Docker Sandbox，绝不在 Manager 宿主机执行不可信提交或切换当前开发工作树。
+独立 Browser Agent 只收到 URL、冻结后的测试计划和浏览器工具，
 不继承父 Task 的会话或仓库上下文，因此更接近黑盒验收。浏览器会收集截图、console、
 页面异常、失败请求和 HTTP 4xx/5xx，并阻止跨源导航、弹窗、下载、凭证输入和破坏性
 动作。Claude 与 Codex 复用同一套 Harness/MCP；这项能力不绑定某一个模型厂商。
 
-管理员也可打开 `http://localhost:5173/#/browser-review` 输入固定 URL 做演示。轨迹
-只展示可公开的进度/决策摘要、Harness 生命周期和浏览器工具调用，不暴露隐藏推理。
-Web 页面不需要单独的 `OPENAI_API_KEY`，尚未接入 PR Monitor webhook 自动触发或
-远程 Worker。
+固定 URL 测试也从 Task 右侧测试栏配置和启动。轨迹只展示可公开的进度/决策摘要、
+Harness 生命周期和浏览器工具调用，不暴露隐藏推理。Web 页面不需要单独的
+`OPENAI_API_KEY`；远程 Worker 暂不执行本机浏览器测试。
 
 默认是只读模式，并限制跨域顶层导航、弹窗、下载和 Service Worker。网页文本、DOM
 和遥测始终作为不可信证据，不能改变 Agent 任务。独立 CLI 仍保留，可用于脱离 CCM

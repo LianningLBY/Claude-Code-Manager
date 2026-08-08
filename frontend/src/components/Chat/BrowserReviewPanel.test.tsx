@@ -229,6 +229,8 @@ function makeHarnessRun(overrides: Partial<TestHarnessRun> = {}): TestHarnessRun
     error: browser?.error ?? workspace?.error ?? null,
     cleanup_status: workspace?.cleanup_status ?? (browser && browser.status === 'completed' ? 'completed' : 'pending'),
     cleanup_error: workspace?.cleanup_error ?? null,
+    evidence_archive_state: (browser?.status === 'completed' || workspace?.status === 'completed') ? 'complete' : 'staging',
+    evidence_archive_error: null,
     created_at: workspace?.created_at ?? browser?.created_at ?? '2026-08-06T00:00:00Z',
     started_at: workspace?.started_at ?? browser?.started_at ?? null,
     completed_at: workspace?.completed_at ?? browser?.completed_at ?? null,
@@ -384,12 +386,46 @@ describe('BrowserReviewPanel', () => {
     expect(screen.getByText(/首屏存在横向溢出/)).toBeInTheDocument();
     expect(screen.getByText('page errors: 1')).toBeInTheDocument();
     expect(screen.getByText('审查结论')).toBeInTheDocument();
+    expect(screen.getByText('截图与报告已完成哈希校验和持久化归档')).toBeInTheDocument();
     expect(screen.getByText('Goal 循环审查 · 模型自动判断')).toBeInTheDocument();
     expect(screen.getByText(/还需要复查窄屏页面/)).toBeInTheDocument();
     const harnessSummary = screen.getByTestId('test-harness-progress');
     const goalSummary = screen.getByTestId('frontend-review-goal-progress');
     expect(harnessSummary.compareDocumentPosition(goalSummary) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     await waitFor(() => expect(onAvailableChange).toHaveBeenCalledWith(true));
+  });
+
+  it('shows a persistent evidence archive failure instead of a false success', async () => {
+    vi.mocked(api.listTestRuns).mockResolvedValue([
+      makeHarnessRun({
+        id: 'harness-archive-failed',
+        root_run_id: 'harness-archive-failed',
+        status: 'failed',
+        stage: 'evidence_incomplete',
+        evidence_archive_state: 'retryable_error',
+        evidence_archive_error: 'Expected evidence final.png is missing',
+        browser_review: completedJob,
+      }),
+    ]);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive={false}
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    const state = await screen.findByTestId('evidence-archive-state');
+    expect(state).toHaveTextContent(
+      '证据归档未完成：Expected evidence final.png is missing',
+    );
+    expect(state).toHaveClass('text-red-600');
   });
 
   it('shows a standby page before the task has started a test', async () => {

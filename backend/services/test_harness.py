@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -52,6 +53,18 @@ logger = logging.getLogger(__name__)
 
 _WORKSPACE_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _BROWSER_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+ARCHIVE_STAGING = "staging"
+ARCHIVE_ARCHIVING = "archiving"
+ARCHIVE_COMPLETE = "complete"
+ARCHIVE_RETRYABLE_ERROR = "retryable_error"
+ARCHIVE_INCOMPLETE = "incomplete"
+_ARCHIVE_RECOVERABLE_STATES = frozenset(
+    {ARCHIVE_STAGING, ARCHIVE_ARCHIVING, ARCHIVE_RETRYABLE_ERROR}
+)
+_EVIDENCE_NAME_RE = re.compile(
+    r"(?:initial\.png|final\.png|step-\d{2,3}\.png|report\.md|"
+    r"telemetry\.json|response\.json|actions\.jsonl)"
+)
 _FRONTEND_PATH_SUFFIXES = {
     ".astro",
     ".css",
@@ -500,7 +513,6 @@ class TestHarnessService:
                 )
             if workspace_run is None:
                 raise TestHarnessError("Workspace review record disappeared")
-            await self._sync_workspace_run(run_id, workspace_run)
             if workspace_run.browser_review_job_id:
                 from backend.services.browser_review_jobs import browser_review_job_manager
 
@@ -509,6 +521,7 @@ class TestHarnessService:
                 )
                 if job is not None:
                     await self.sync_browser_job(job)
+            await self._sync_workspace_run(run_id, workspace_run)
             if (
                 workspace_run.status in _WORKSPACE_TERMINAL
                 and workspace_run.cleanup_status != "pending"
@@ -533,23 +546,33 @@ class TestHarnessService:
             status = "stale" if workspace_run.stale else "completed"
         else:
             status = workspace_run.status
-        if status == "completed":
-            structured_verdict = None
-            if workspace_run.browser_review_job_id:
-                async with self.db_factory() as db:
-                    attempt = await db.scalar(
-                        select(TestHarnessAttempt).where(
-                            TestHarnessAttempt.run_id == run_id,
-                            TestHarnessAttempt.browser_review_job_id
-                            == workspace_run.browser_review_job_id,
-                        )
+        attempt = None
+        if workspace_run.browser_review_job_id:
+            async with self.db_factory() as db:
+                attempt = await db.scalar(
+                    select(TestHarnessAttempt).where(
+                        TestHarnessAttempt.run_id == run_id,
+                        TestHarnessAttempt.browser_review_job_id
+                        == workspace_run.browser_review_job_id,
                     )
-                if attempt is not None and isinstance(attempt.result_data, dict):
-                    structured_verdict = attempt.result_data.get("verdict")
-            verdict = normalize_verdict(
-                structured_verdict,
-                report=workspace_run.report,
+                )
+        evidence_error: str | None = None
+        if status == "completed" and (
+            attempt is None or attempt.archive_state != ARCHIVE_COMPLETE
+        ):
+            status = "failed"
+            verdict = "error"
+            evidence_error = (
+                (attempt.archive_error if attempt is not None else None)
+                or "Browser evidence archive did not reach complete"
             )
+        elif status == "completed":
+            structured_verdict = (
+                attempt.result_data.get("verdict")
+                if attempt is not None and isinstance(attempt.result_data, dict)
+                else None
+            )
+            verdict = normalize_verdict(structured_verdict, report=workspace_run.report)
         elif status == "stale":
             verdict = "stale"
         elif status == "cancelled":
@@ -560,8 +583,11 @@ class TestHarnessService:
             verdict = None
         event_type = "lifecycle"
         title = _workspace_stage_title(workspace_run.stage)
-        detail = workspace_run.error
-        if workspace_run.cleanup_status == "failed":
+        detail = evidence_error or workspace_run.error
+        if evidence_error:
+            event_type = "evidence"
+            title = "测试证据归档未完成"
+        elif workspace_run.cleanup_status == "failed":
             event_type = "cleanup"
             title = "隔离预览清理失败"
             detail = workspace_run.cleanup_error or workspace_run.error
@@ -585,13 +611,19 @@ class TestHarnessService:
                 "browser_review_job_id": workspace_run.browser_review_job_id,
                 "agent_task_id": workspace_run.agent_task_id,
                 "status": status,
-                "stage": workspace_run.stage,
+                "stage": (
+                    "evidence_incomplete" if evidence_error else workspace_run.stage
+                ),
                 "verdict": verdict,
                 "source_git_head": workspace_run.git_head,
                 "source_fingerprint": workspace_run.workspace_fingerprint,
                 "stale": workspace_run.stale,
                 "report": workspace_run.report,
-                "error": workspace_run.error,
+                "error": (
+                    f"Test evidence archive did not complete: {evidence_error}"
+                    if evidence_error
+                    else workspace_run.error
+                ),
                 "cleanup_status": workspace_run.cleanup_status,
                 "cleanup_error": workspace_run.cleanup_error,
                 "started_at": workspace_run.started_at,
@@ -743,23 +775,51 @@ class TestHarnessService:
 
             cleanup_error = await self._cleanup_git_target(run_id)
             report = job._read_report()
+            async with self.db_factory() as db:
+                terminal_attempt = await db.scalar(
+                    select(TestHarnessAttempt).where(
+                        TestHarnessAttempt.run_id == run_id,
+                        TestHarnessAttempt.browser_review_job_id == job.id,
+                    )
+                )
             if cleanup_error is not None:
                 status = "failed"
+                stage = "failed"
                 verdict = "error"
                 error = f"Sandbox cleanup could not be proven: {cleanup_error}"
                 cleanup_status = "failed"
+            elif (
+                terminal_attempt is None
+                or terminal_attempt.archive_state != ARCHIVE_COMPLETE
+            ):
+                status = "failed"
+                stage = "evidence_incomplete"
+                verdict = "error"
+                error = (
+                    "Test evidence archive did not complete"
+                    + (
+                        f": {terminal_attempt.archive_error}"
+                        if terminal_attempt is not None
+                        and terminal_attempt.archive_error
+                        else ""
+                    )
+                )
+                cleanup_status = "completed"
             elif job.status == "completed" and report:
                 status = "completed"
+                stage = "completed"
                 verdict = normalize_verdict(job.verdict, report=report)
                 error = None
                 cleanup_status = "completed"
             elif job.status == "cancelled":
                 status = "cancelled"
+                stage = "cancelled"
                 verdict = "cancelled"
                 error = job.error
                 cleanup_status = "completed"
             else:
                 status = "failed"
+                stage = "failed"
                 verdict = "error"
                 error = job.error or "Browser Agent did not return a report"
                 cleanup_status = "completed"
@@ -767,7 +827,7 @@ class TestHarnessService:
                 run_id,
                 values={
                     "status": status,
-                    "stage": status,
+                    "stage": stage,
                     "verdict": verdict,
                     "report": report,
                     "error": error,
@@ -853,6 +913,11 @@ class TestHarnessService:
                     )
                 )
                 if existing is None:
+                    staging_root = (
+                        str(job.options.output_dir)
+                        if job.options.output_dir is not None
+                        else None
+                    )
                     existing = TestHarnessAttempt(
                         id=attempt_id,
                         run_id=run_id,
@@ -865,7 +930,10 @@ class TestHarnessService:
                         codex_service_tier=job.codex_service_tier,
                         agent_task_id=job.task_id,
                         browser_review_job_id=job.id,
-                        artifact_root=str(job.options.output_dir),
+                        artifact_root=staging_root,
+                        artifact_staging_root=staging_root,
+                        archive_state=ARCHIVE_STAGING,
+                        archive_manifest={"version": 1, "expected": [], "archived": {}},
                         result_data=payload,
                     )
                     db.add(existing)
@@ -1099,6 +1167,11 @@ class TestHarnessService:
                     )
                 )
                 if attempt is None:
+                    staging_root = (
+                        str(job.options.output_dir)
+                        if job.options.output_dir is not None
+                        else None
+                    )
                     attempt = TestHarnessAttempt(
                         id=uuid.uuid4().hex,
                         run_id=run_id,
@@ -1108,13 +1181,23 @@ class TestHarnessService:
                         reasoning_effort=job.options.reasoning_effort,
                         codex_service_tier=job.codex_service_tier,
                         browser_review_job_id=job.id,
-                        artifact_root=str(job.options.output_dir),
+                        artifact_root=staging_root,
+                        artifact_staging_root=staging_root,
+                        archive_state=ARCHIVE_STAGING,
+                        archive_manifest={"version": 1, "expected": [], "archived": {}},
                     )
                     db.add(attempt)
                 attempt.status = job.status
                 attempt.stage = job.stage
                 attempt.agent_task_id = job.task_id
-                attempt.artifact_root = str(job.options.output_dir)
+                if attempt.archive_state != ARCHIVE_COMPLETE:
+                    staging_root = (
+                        str(job.options.output_dir)
+                        if job.options.output_dir is not None
+                        else attempt.artifact_staging_root
+                    )
+                    attempt.artifact_root = staging_root
+                    attempt.artifact_staging_root = staging_root
                 attempt.result_data = _json_copy(payload)
                 attempt.error = job.error
                 attempt.started_at = _parse_datetime(job.started_at)
@@ -1192,17 +1275,69 @@ class TestHarnessService:
                         },
                         source_key=f"trace:{job.id}:{source_id}",
                     )
-                obsolete_storage_keys = await self._sync_evidence(
-                    db,
-                    run,
-                    attempt.id,
-                    job,
-                )
-                if job.status in _BROWSER_TERMINAL and run.task_id is not None:
-                    attempt.artifact_root = self.artifact_store.run_prefix(
-                        task_id=run.task_id,
-                        run_id=run.id,
-                        attempt_id=attempt.id,
+                archive_error: str | None = None
+                try:
+                    obsolete_storage_keys = await self._sync_evidence(
+                        db,
+                        run,
+                        attempt,
+                        job,
+                        payload=payload,
+                    )
+                except (OSError, TestHarnessArtifactError) as exc:
+                    archive_error = _safe_error(exc)
+                    attempt.archive_state = ARCHIVE_RETRYABLE_ERROR
+                    attempt.archive_error = archive_error
+                    attempt.artifact_archive_prefix = None
+                    attempt.archived_at = None
+                    await self._append_event(
+                        db,
+                        run,
+                        event_type="evidence",
+                        title="测试证据归档未完成",
+                        detail=archive_error,
+                        stage=job.stage,
+                        data={"archive_state": attempt.archive_state},
+                        source_key=(
+                            f"evidence:{attempt.id}:{attempt.archive_state}:"
+                            f"{archive_error[:120]}"
+                        ),
+                    )
+                else:
+                    await self._append_event(
+                        db,
+                        run,
+                        event_type="evidence",
+                        title=(
+                            "测试证据已完整归档"
+                            if attempt.archive_state == ARCHIVE_COMPLETE
+                            else "正在收集测试证据"
+                        ),
+                        stage=job.stage,
+                        data={
+                            "archive_state": attempt.archive_state,
+                            "expected": len(
+                                _archive_manifest(attempt.archive_manifest)["expected"]
+                            ),
+                        },
+                        source_key=(
+                            f"evidence:{attempt.id}:{attempt.archive_state}:"
+                            f"{len(_archive_manifest(attempt.archive_manifest)['expected'])}"
+                        ),
+                    )
+                if job.status in _BROWSER_TERMINAL and (
+                    archive_error is not None
+                    or attempt.archive_state != ARCHIVE_COMPLETE
+                ):
+                    run.status = "failed"
+                    run.stage = "evidence_incomplete"
+                    run.verdict = "error"
+                    run.error = (
+                        "Test evidence archive did not complete"
+                        + (f": {archive_error}" if archive_error else "")
+                    )
+                    run.completed_at = (
+                        _parse_datetime(job.completed_at) or datetime.utcnow()
                     )
                 await self._sync_findings(db, run_id, job.findings)
                 await db.commit()
@@ -1217,24 +1352,143 @@ class TestHarnessService:
         self,
         db: Any,
         run: TestHarnessRun,
-        attempt_id: str,
+        attempt: TestHarnessAttempt,
         job: Any,
+        *,
+        payload: dict[str, Any],
     ) -> list[str]:
-        root_value = job.options.output_dir
-        if root_value is None or run.task_id is None:
+        if run.task_id is None:
+            raise TestHarnessArtifactError(
+                "Harness evidence has no owning Task identity"
+            )
+        manifest = _archive_manifest(attempt.archive_manifest)
+        expected = set(manifest["expected"])
+        payload_names = payload.get("artifacts")
+        if isinstance(payload_names, list):
+            expected.update(_valid_evidence_names(payload_names))
+        latest_screenshot = payload.get("latest_screenshot")
+        if isinstance(latest_screenshot, str):
+            expected.update(_valid_evidence_names([latest_screenshot]))
+        if isinstance(payload.get("report"), str) and payload["report"].strip():
+            expected.add("report.md")
+        manifest["expected"] = sorted(expected)
+        manifest["terminal_status"] = (
+            job.status if job.status in _BROWSER_TERMINAL else None
+        )
+        attempt.archive_manifest = _json_copy(manifest)
+
+        if attempt.archive_state == ARCHIVE_COMPLETE:
+            manifest["archived"] = await self._verify_archived_evidence(
+                db,
+                run=run,
+                attempt=attempt,
+                expected=manifest["expected"],
+            )
+            attempt.archive_manifest = _json_copy(manifest)
             return []
+
+        root_value = attempt.artifact_staging_root or job.options.output_dir
+        if root_value is None:
+            raise TestHarnessArtifactError(
+                "Browser Review staging directory was not recorded"
+            )
+        attempt.artifact_staging_root = str(root_value)
+        attempt.artifact_root = str(root_value)
+        attempt.archive_state = ARCHIVE_ARCHIVING
+        attempt.archive_error = None
+        if not self.artifact_store.is_managed_job_dir(root_value):
+            raise TestHarnessArtifactError(
+                "Browser Review staging directory is missing or unmanaged"
+            )
         try:
             root = Path(root_value).resolve(strict=True)
-        except OSError:
-            return []
-        return await self._archive_evidence_files(
+            names = self.artifact_store.list_job_artifacts(root)
+        except (OSError, TestHarnessArtifactError) as exc:
+            raise TestHarnessArtifactError(
+                "Browser Review staging directory is unavailable"
+            ) from exc
+        expected.update(names)
+        manifest["expected"] = sorted(expected)
+        attempt.archive_manifest = _json_copy(manifest)
+        obsolete = await self._archive_evidence_files(
             db,
             run=run,
-            attempt_id=attempt_id,
+            attempt_id=attempt.id,
             root=root,
-            names=job.artifact_names(),
+            names=names,
             browser_review_job_id=job.id,
         )
+        # Completion is an explicit commit protocol: all descriptors must be
+        # visible to the verification query before the staging pointer can be
+        # cleared. Do not rely on ORM autoflush timing here.
+        await db.flush()
+        archived = await self._verify_archived_evidence(
+            db,
+            run=run,
+            attempt=attempt,
+            expected=manifest["expected"],
+        )
+        manifest["archived"] = archived
+        attempt.archive_manifest = _json_copy(manifest)
+        if job.status in _BROWSER_TERMINAL:
+            prefix = self.artifact_store.run_prefix(
+                task_id=run.task_id,
+                run_id=run.id,
+                attempt_id=attempt.id,
+            )
+            attempt.archive_state = ARCHIVE_COMPLETE
+            attempt.artifact_archive_prefix = prefix
+            attempt.artifact_staging_root = None
+            attempt.artifact_root = prefix
+            attempt.archive_error = None
+            attempt.archived_at = datetime.utcnow()
+        else:
+            attempt.archive_state = ARCHIVE_STAGING
+            attempt.artifact_archive_prefix = None
+            attempt.archive_error = None
+            attempt.archived_at = None
+        return obsolete
+
+    async def _verify_archived_evidence(
+        self,
+        db: Any,
+        *,
+        run: TestHarnessRun,
+        attempt: TestHarnessAttempt,
+        expected: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        rows = list(
+            (
+                await db.execute(
+                    select(TestHarnessEvidence).where(
+                        TestHarnessEvidence.run_id == run.id,
+                        TestHarnessEvidence.attempt_id == attempt.id,
+                    )
+                )
+            ).scalars()
+        )
+        by_name = {row.name: row for row in rows}
+        missing = [name for name in expected if name not in by_name]
+        if missing:
+            raise TestHarnessArtifactError(
+                "Expected Test Harness evidence is missing: "
+                + ", ".join(missing)
+            )
+        archived: dict[str, dict[str, Any]] = {}
+        for name in expected:
+            evidence = by_name[name]
+            opened = self.artifact_store.open(
+                evidence.storage_path,
+                expected_sha256=evidence.sha256,
+                expected_size=evidence.byte_size,
+            )
+            opened.close()
+            archived[name] = {
+                "storage_path": evidence.storage_path,
+                "sha256": evidence.sha256,
+                "byte_size": evidence.byte_size,
+            }
+        return archived
 
     async def _archive_evidence_files(
         self,
@@ -1643,6 +1897,7 @@ class TestHarnessService:
 
                 workspace_payload = workspace_review_run_dict(workspace)
         browser_payload = attempts[-1].result_data if attempts else None
+        latest_attempt = attempts[-1] if attempts else None
         return {
             "id": run.id,
             "task_id": run.task_id,
@@ -1669,6 +1924,12 @@ class TestHarnessService:
             "error": run.error,
             "cleanup_status": run.cleanup_status,
             "cleanup_error": run.cleanup_error,
+            "evidence_archive_state": (
+                latest_attempt.archive_state if latest_attempt is not None else None
+            ),
+            "evidence_archive_error": (
+                latest_attempt.archive_error if latest_attempt is not None else None
+            ),
             "created_at": _iso(run.created_at),
             "started_at": _iso(run.started_at),
             "completed_at": _iso(run.completed_at),
@@ -1684,6 +1945,19 @@ class TestHarnessService:
                     "codex_service_tier": item.codex_service_tier,
                     "agent_task_id": item.agent_task_id,
                     "browser_review_job_id": item.browser_review_job_id,
+                    "archive_state": item.archive_state,
+                    "archive_error": item.archive_error,
+                    "archive_manifest": {
+                        "version": _archive_manifest(item.archive_manifest)["version"],
+                        "expected": _archive_manifest(item.archive_manifest)["expected"],
+                        "archived": sorted(
+                            _archive_manifest(item.archive_manifest)["archived"]
+                        ),
+                        "terminal_status": _archive_manifest(
+                            item.archive_manifest
+                        )["terminal_status"],
+                    },
+                    "archived_at": _iso(item.archived_at),
                     "error": item.error,
                     "created_at": _iso(item.created_at),
                     "started_at": _iso(item.started_at),
@@ -1906,6 +2180,17 @@ class TestHarnessService:
                         await db.execute(select(TestHarnessEvidence.storage_path))
                     ).scalars()
                 )
+                protected_staging_job_ids = set(
+                    (
+                        await db.execute(
+                            select(TestHarnessAttempt.browser_review_job_id).where(
+                                TestHarnessAttempt.archive_state
+                                != ARCHIVE_COMPLETE,
+                                TestHarnessAttempt.browser_review_job_id.is_not(None),
+                            )
+                        )
+                    ).scalars()
+                )
         for storage_key in removed_keys:
             self.artifact_store.remove(storage_key)
         self.artifact_store.cleanup_orphan_archives(referenced)
@@ -1914,14 +2199,16 @@ class TestHarnessService:
             from backend.services.browser_review_jobs import browser_review_job_manager
 
             jobs = await browser_review_job_manager.list()
-            active_job_ids = {
-                job.id for job in jobs if job.status not in _BROWSER_TERMINAL
-            }
+            # Every in-memory job may still be consumed by its owning pipeline
+            # after the Task itself becomes terminal. Incomplete durable
+            # attempts additionally retain staging across job-history pruning.
+            active_job_ids = {job.id for job in jobs}
+            active_job_ids.update(protected_staging_job_ids)
         except Exception:
             # Failure to prove which jobs are active must never turn into
             # deleting their staging evidence under quota pressure.
             clean_job_dirs = False
-            active_job_ids = set()
+            active_job_ids = set(protected_staging_job_ids)
         if clean_job_dirs:
             self.artifact_store.cleanup_job_dirs(active_job_ids=active_job_ids)
         return len(removed_keys)
@@ -1936,6 +2223,92 @@ class TestHarnessService:
             except Exception:
                 logger.exception("Test Harness evidence retention failed")
 
+    async def _reconcile_attempt_evidence(
+        self,
+        db: Any,
+        *,
+        run: TestHarnessRun,
+        attempt: TestHarnessAttempt,
+    ) -> list[str]:
+        """Finish or verify one interrupted archive without trusting its pointer."""
+
+        if run.task_id is None:
+            raise TestHarnessArtifactError(
+                "Interrupted Harness evidence has no owning Task"
+            )
+        manifest = _archive_manifest(attempt.archive_manifest)
+        expected = set(manifest["expected"])
+        payload = attempt.result_data if isinstance(attempt.result_data, dict) else {}
+        payload_names = payload.get("artifacts")
+        if isinstance(payload_names, list):
+            expected.update(_valid_evidence_names(payload_names))
+        latest_screenshot = payload.get("latest_screenshot")
+        if isinstance(latest_screenshot, str):
+            expected.update(_valid_evidence_names([latest_screenshot]))
+        if isinstance(payload.get("report"), str) and payload["report"].strip():
+            expected.add("report.md")
+
+        existing_rows = list(
+            (
+                await db.execute(
+                    select(TestHarnessEvidence).where(
+                        TestHarnessEvidence.run_id == run.id,
+                        TestHarnessEvidence.attempt_id == attempt.id,
+                    )
+                )
+            ).scalars()
+        )
+        expected.update(row.name for row in existing_rows)
+        manifest["expected"] = sorted(expected)
+        manifest["terminal_status"] = (
+            attempt.status if attempt.status in _BROWSER_TERMINAL else "failed"
+        )
+        attempt.archive_manifest = _json_copy(manifest)
+
+        source_root = attempt.artifact_staging_root or attempt.artifact_root
+        obsolete: list[str] = []
+        if source_root and self.artifact_store.is_managed_job_dir(source_root):
+            root = Path(source_root).resolve(strict=True)
+            names = self.artifact_store.list_job_artifacts(root)
+            expected.update(names)
+            manifest["expected"] = sorted(expected)
+            attempt.archive_manifest = _json_copy(manifest)
+            attempt.archive_state = ARCHIVE_ARCHIVING
+            obsolete = await self._archive_evidence_files(
+                db,
+                run=run,
+                attempt_id=attempt.id,
+                root=root,
+                names=names,
+                browser_review_job_id=attempt.browser_review_job_id,
+            )
+            await db.flush()
+        elif attempt.archive_state != ARCHIVE_COMPLETE and not existing_rows:
+            raise TestHarnessArtifactError(
+                "Interrupted Browser Review staging directory is unavailable"
+            )
+
+        archived = await self._verify_archived_evidence(
+            db,
+            run=run,
+            attempt=attempt,
+            expected=manifest["expected"],
+        )
+        manifest["archived"] = archived
+        prefix = self.artifact_store.run_prefix(
+            task_id=run.task_id,
+            run_id=run.id,
+            attempt_id=attempt.id,
+        )
+        attempt.archive_manifest = _json_copy(manifest)
+        attempt.archive_state = ARCHIVE_COMPLETE
+        attempt.artifact_archive_prefix = prefix
+        attempt.artifact_staging_root = None
+        attempt.artifact_root = prefix
+        attempt.archive_error = None
+        attempt.archived_at = attempt.archived_at or datetime.utcnow()
+        return obsolete
+
     async def recover_interrupted_runs(self) -> int:
         try:
             await self.sandbox_manager.recover_interrupted()
@@ -1948,44 +2321,57 @@ class TestHarnessService:
                     (
                         await db.execute(
                             select(TestHarnessAttempt).where(
-                                TestHarnessAttempt.artifact_root.is_not(None)
+                                TestHarnessAttempt.archive_state.in_(
+                                    _ARCHIVE_RECOVERABLE_STATES
+                                )
                             )
                         )
                     ).scalars()
                 )
                 reconciled = False
                 for attempt in attempts_to_reconcile:
-                    source_root = attempt.artifact_root
-                    if not source_root or not self.artifact_store.is_managed_job_dir(
-                        source_root
-                    ):
-                        continue
                     run_for_attempt = await db.get(TestHarnessRun, attempt.run_id)
                     if run_for_attempt is None or run_for_attempt.task_id is None:
                         continue
                     try:
-                        names = self.artifact_store.list_job_artifacts(source_root)
                         obsolete_storage_keys.extend(
-                            await self._archive_evidence_files(
+                            await self._reconcile_attempt_evidence(
                                 db,
                                 run=run_for_attempt,
-                                attempt_id=attempt.id,
-                                root=Path(source_root),
-                                names=names,
-                                browser_review_job_id=attempt.browser_review_job_id,
+                                attempt=attempt,
                             )
                         )
-                    except TestHarnessArtifactError:
+                    except (OSError, TestHarnessArtifactError) as exc:
                         logger.exception(
                             "Could not reconcile interrupted Harness evidence run=%s",
                             attempt.run_id,
                         )
+                        attempt.archive_state = ARCHIVE_INCOMPLETE
+                        attempt.archive_error = _safe_error(exc)
+                        attempt.artifact_archive_prefix = None
+                        attempt.archived_at = None
+                        await self._append_event(
+                            db,
+                            run_for_attempt,
+                            event_type="evidence",
+                            title="测试证据恢复失败",
+                            detail=attempt.archive_error,
+                            stage="evidence_incomplete",
+                            data={"archive_state": ARCHIVE_INCOMPLETE},
+                            source_key=(
+                                f"evidence:{attempt.id}:recovery-incomplete"
+                            ),
+                        )
+                        if run_for_attempt.status == "completed":
+                            run_for_attempt.status = "failed"
+                            run_for_attempt.stage = "evidence_incomplete"
+                            run_for_attempt.verdict = "error"
+                            run_for_attempt.error = (
+                                "Test evidence archive could not be recovered: "
+                                f"{attempt.archive_error}"
+                            )
+                        reconciled = True
                         continue
-                    attempt.artifact_root = self.artifact_store.run_prefix(
-                        task_id=run_for_attempt.task_id,
-                        run_id=run_for_attempt.id,
-                        attempt_id=attempt.id,
-                    )
                     reconciled = True
 
                 runs = list(
@@ -2126,6 +2512,32 @@ def _browser_stage_title(stage: str) -> str:
 def _safe_error(exc: BaseException) -> str:
     value = str(exc).strip() or exc.__class__.__name__
     return value[:4000]
+
+
+def _valid_evidence_names(values: list[Any]) -> set[str]:
+    return {
+        value
+        for value in values
+        if isinstance(value, str) and _EVIDENCE_NAME_RE.fullmatch(value)
+    }
+
+
+def _archive_manifest(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    expected = raw.get("expected")
+    archived = raw.get("archived")
+    return {
+        "version": 1,
+        "expected": sorted(
+            _valid_evidence_names(expected if isinstance(expected, list) else [])
+        ),
+        "archived": archived if isinstance(archived, dict) else {},
+        "terminal_status": (
+            raw.get("terminal_status")
+            if raw.get("terminal_status") in _BROWSER_TERMINAL
+            else None
+        ),
+    }
 
 
 def _parse_datetime(value: Any) -> datetime | None:

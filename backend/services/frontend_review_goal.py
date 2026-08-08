@@ -368,7 +368,7 @@ def build_frontend_review_goal_protocol(config: dict[str, Any]) -> str:
 每轮按证据驱动的顺序工作：
 1. 先检查仓库改动、相关路由和可运行的预览地址，建立“代码变化 → 页面/状态 → 验证动作”覆盖表。
 2. 使用 `ccm_workspace_review.test_current_changes` 测试当前分支和未提交修改；不要要求用户提供 URL。CCM 会启动可信隔离 Preview，并分配独立 Browser Agent。
-3. 使用 `check_current_changes_review` 等待运行完成；只有 completed、stale=false、存在报告并且 cleanup_status=completed 的结果才是当前版本的有效证据。
+3. 使用 `check_current_changes_review` 等待运行完成；只有 completed、stale=false、存在报告、cleanup_status=completed 且 evidence_archive_state=complete 的结果才是当前版本的有效证据。
 4. 如果发现需要修复的问题，修改代码并运行相关构建/测试；确认预览加载的是修改后的代码。
 5. 修改前端代码后必须再次调用 `test_current_changes` 创建新指纹的复查运行，不能仅凭代码或测试宣称修复成功。
 6. {profile_instruction}
@@ -420,6 +420,7 @@ async def collect_frontend_review_goal_evidence(
             f"id={run['id']}; target={run['target_kind']}; status={run['status']}; "
             f"stage={run['stage']}; verdict={run.get('verdict')}; "
             f"stale={run.get('stale')}; cleanup={run.get('cleanup_status')}; "
+            f"archive={run.get('evidence_archive_state')}; "
             f"screenshots={len(screenshots)}; "
             f"report={'yes' if bool((run.get('report') or '').strip()) else 'no'}; "
             f"findings={len(run.get('findings', []))}; high_findings={len(high_findings)}"
@@ -453,6 +454,12 @@ async def collect_frontend_review_goal_evidence(
         return "\n".join(lines), False, "最新测试结果已过期；请针对当前代码重新运行。"
     if latest.get("cleanup_status") != "completed":
         return "\n".join(lines), False, "最新测试尚未证明环境清理完成。"
+    if latest.get("evidence_archive_state") != "complete":
+        return (
+            "\n".join(lines),
+            False,
+            "最新测试的截图/报告尚未完成持久化归档；请恢复证据或重新执行测试。",
+        )
     screenshots = [
         item for item in latest.get("evidence", []) if item.get("kind") == "screenshot"
     ]

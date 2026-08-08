@@ -85,7 +85,7 @@ async def test_current_changes(
     parent Task. Use review_only unless the Task is already in an explicit
     fix-and-retest Goal. Poll the returned run with
     check_current_changes_review; do not claim success until it is completed,
-    not stale, and contains a report.
+    not stale, contains a report, and reports evidence_archive_state=complete.
     """
 
     if mode != "review_only":

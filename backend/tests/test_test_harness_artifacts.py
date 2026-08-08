@@ -104,6 +104,39 @@ def test_open_detects_tampering_without_reopening_an_unchecked_path(tmp_path):
         )
 
 
+def test_rearchive_repairs_tampered_content_addressed_destination(tmp_path):
+    store = _store(tmp_path)
+    source = tmp_path / "source.png"
+    source.write_bytes(PNG)
+    archived = store.archive(
+        source,
+        task_id=1,
+        run_id="a" * 32,
+        attempt_id="b" * 32,
+        name="final.png",
+    )
+    archived.path.write_bytes(PNG[:-1] + b"X")
+
+    repaired = store.archive(
+        source,
+        task_id=1,
+        run_id="a" * 32,
+        attempt_id="b" * 32,
+        name="final.png",
+    )
+
+    assert repaired.storage_key == archived.storage_key
+    opened = store.open(
+        repaired.storage_key,
+        expected_sha256=repaired.sha256,
+        expected_size=repaired.byte_size,
+    )
+    try:
+        assert b"".join(opened.chunks()) == PNG
+    finally:
+        opened.close()
+
+
 def test_file_and_job_quotas_fail_closed(tmp_path):
     store = _store(
         tmp_path,

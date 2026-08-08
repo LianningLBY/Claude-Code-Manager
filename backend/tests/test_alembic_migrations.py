@@ -50,7 +50,8 @@ BROWSER_PLAN_MERGE_REVISION = "9f2c6b4d8a10"
 SANDBOX_LEASE_REVISION = "c8f1a2d4e6b9"
 RESOLVED_TARGET_REVISION = "d9a2b4c6e8f1"
 CHILD_BINDING_REVISION = "e0b3c5d7f9a1"
-CURRENT_HEAD_REVISION = CHILD_BINDING_REVISION
+ARCHIVE_STATE_REVISION = "f1c4e6a8b0d2"
+CURRENT_HEAD_REVISION = ARCHIVE_STATE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -467,6 +468,16 @@ class TestFreshMigration:
             "state",
         }.issubset(child_binding_cols)
 
+        attempt_cols = _get_table_columns(engine, "test_harness_attempts")
+        assert {
+            "artifact_staging_root",
+            "artifact_archive_prefix",
+            "archive_state",
+            "archive_manifest",
+            "archive_error",
+            "archived_at",
+        }.issubset(attempt_cols)
+
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
         assert "task_retry_count" in log_cols
@@ -666,6 +677,86 @@ class TestFreshMigration:
                 text("SELECT version_num FROM alembic_version")
             ).scalar_one()
         assert revision == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    def test_archive_state_migration_preserves_legacy_pointer_and_roundtrips(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "archive-state-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CHILD_BINDING_REVISION)
+
+        run_id = "a" * 32
+        attempt_id = "b" * 32
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_runs ("
+                    "id, target_kind, target_spec, test_plan, runtime_config, "
+                    "request_fingerprint, root_run_id, attempt_number, status, "
+                    "stage, stale, cleanup_status, event_sequence, created_at"
+                    ") VALUES ("
+                    ":id, 'fixed_url', '{}', '{}', '{}', :fingerprint, :id, "
+                    "1, 'completed', 'completed', 0, 'completed', 0, :created_at"
+                    ")"
+                ),
+                {
+                    "id": run_id,
+                    "fingerprint": "c" * 64,
+                    "created_at": "2026-08-08 00:00:00",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_attempts ("
+                    "id, run_id, ordinal, status, stage, provider, model, "
+                    "reasoning_effort, codex_service_tier, artifact_root, "
+                    "result_data, created_at"
+                    ") VALUES ("
+                    ":id, :run_id, 1, 'completed', 'completed', 'codex', "
+                    "'gpt-5.6-sol', 'medium', 'default', :artifact_root, '{}', "
+                    ":created_at"
+                    ")"
+                ),
+                {
+                    "id": attempt_id,
+                    "run_id": run_id,
+                    "artifact_root": "/private/tmp/legacy-browser-job",
+                    "created_at": "2026-08-08 00:00:00",
+                },
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, ARCHIVE_STATE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT artifact_staging_root, artifact_archive_prefix, "
+                    "archive_state, archive_manifest, archive_error, archived_at "
+                    "FROM test_harness_attempts WHERE id = :id"
+                ),
+                {"id": attempt_id},
+            ).one()
+        assert row.artifact_staging_root == "/private/tmp/legacy-browser-job"
+        assert row.artifact_archive_prefix is None
+        assert row.archive_state == "staging"
+        manifest = row.archive_manifest
+        if isinstance(manifest, str):
+            manifest = json.loads(manifest)
+        assert manifest == {}
+        assert row.archive_error is None
+        assert row.archived_at is None
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, CHILD_BINDING_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        attempt_cols = _get_table_columns(engine, "test_harness_attempts")
+        assert "artifact_root" in attempt_cols
+        assert "archive_state" not in attempt_cols
+        assert "artifact_staging_root" not in attempt_cols
         engine.dispose()
 
 
@@ -1668,6 +1759,14 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(ARCHIVE_STATE_REVISION).down_revision
+            == CHILD_BINDING_REVISION
+        )
+        assert (
+            script.get_revision(CHILD_BINDING_REVISION).down_revision
+            == RESOLVED_TARGET_REVISION
+        )
         assert (
             script.get_revision(RESOLVED_TARGET_REVISION).down_revision
             == SANDBOX_LEASE_REVISION

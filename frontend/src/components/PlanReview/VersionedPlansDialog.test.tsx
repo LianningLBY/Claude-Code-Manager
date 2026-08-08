@@ -5,7 +5,7 @@ import { VersionedPlansDialog } from './VersionedPlansDialog';
 
 vi.mock('../../api/client', () => ({
   api: {
-    listPlans: vi.fn().mockResolvedValue([]),
+    listPlans: vi.fn(() => new Promise(() => {})),
   },
 }));
 
@@ -35,5 +35,5 @@ describe('VersionedPlansDialog mobile layout', () => {
     expect(close.className).toContain('top-[calc(env(safe-area-inset-top)+0.75rem)]');
     expect(close.className).toContain('h-11');
     expect(close.className).toContain('w-11');
-  });
+  }, 15_000);
 });

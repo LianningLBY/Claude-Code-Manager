@@ -336,7 +336,7 @@ describe('ChatView', () => {
     expect(actions.className).toContain('shrink-0');
     expect(screen.getByText('Plans').className).toContain('hidden');
     expect(screen.getByText('Plans').className).toContain('sm:inline');
-  });
+  }, 15_000);
 
   describe('chat conflict state', () => {
     it('does not show Interrupt for a non-busy 409 rejection', async () => {

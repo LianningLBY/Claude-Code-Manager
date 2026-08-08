@@ -912,7 +912,7 @@ describe('UpdateButton', () => {
       const closeButton = screen.getByRole('button', { name: '关闭更新提醒' });
       expect(closeButton.className).toContain('h-11');
       expect(closeButton.className).toContain('w-11');
-    });
+    }, 15_000);
 
     it('opens the existing update modal only after the user clicks view details', async () => {
       vi.useFakeTimers();

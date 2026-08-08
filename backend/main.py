@@ -111,12 +111,13 @@ instance_manager.task_message_enqueuer = dispatcher.enqueue_message
 # Keeping them present while the feature flag is dark lets startup recovery
 # finish or cancel work admitted by an earlier process without creating new
 # queued invocations.
+plan_capability_executor = PlanCapabilityExecutor(
+    wake_callback=dispatcher.wake,
+    stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+)
 register_capability(
     plan_capability_definition(
-        executor=PlanCapabilityExecutor(
-            wake_callback=dispatcher.wake,
-            stop_callback=dispatcher.stop_plan_run_lifecycle,
-        )
+        executor=plan_capability_executor,
     ),
     replace=True,
 )

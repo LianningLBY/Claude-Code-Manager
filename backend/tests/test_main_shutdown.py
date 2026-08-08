@@ -5,6 +5,15 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 
+def test_plan_capability_uses_capability_specific_cold_stop_callback():
+    import backend.main as main
+
+    assert (
+        main.plan_capability_executor._stop_callback
+        == main.dispatcher.stop_capability_plan_run_lifecycle
+    )
+
+
 @pytest.mark.asyncio
 async def test_execution_runtimes_start_in_dependency_order(monkeypatch):
     import backend.main as main

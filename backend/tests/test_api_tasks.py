@@ -3231,8 +3231,12 @@ async def test_delete_stopped_plan_cleans_pipeline_history(
 ):
     from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
     from backend.models.task import Task
+    from backend.services.plan_runtime_receipt import (
+        new_prepared_runtime_receipt,
+    )
 
     async with session_factory() as db:
+        finished_at = datetime.utcnow()
         plan = Task(
             title="Disposable Plan",
             description="Plan this",
@@ -3242,17 +3246,26 @@ async def test_delete_stopped_plan_cleans_pipeline_history(
         )
         db.add(plan)
         await db.flush()
-        run = PlanAgentRun(plan_task_id=plan.id, status="completed")
+        run = PlanAgentRun(
+            plan_task_id=plan.id,
+            status="completed",
+            finished_at=finished_at,
+        )
         db.add(run)
         await db.flush()
-        db.add(
-            PlanAgentStep(
-                run_id=run.id,
-                step_type="planner",
-                provider="claude",
-                status="completed",
-            )
+        step = PlanAgentStep(
+            run_id=run.id,
+            step_type="planner",
+            provider="claude",
+            status="completed",
+            finished_at=finished_at,
         )
+        db.add(step)
+        await db.flush()
+        receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+        receipt.status = "cleaned"
+        receipt.cleaned_at = finished_at
+        db.add(receipt)
         await db.commit()
         plan_id = plan.id
         run_id = run.id

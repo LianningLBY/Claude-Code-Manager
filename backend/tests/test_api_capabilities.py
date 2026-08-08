@@ -5,8 +5,10 @@ from unittest.mock import AsyncMock
 
 from fastapi import HTTPException
 import pytest
+from sqlalchemy import func, select
 
 from backend.config import settings
+from backend.models.capability import CapabilityInvocation
 from backend.models.code_review import CodeReviewResult, CodeReviewRun
 from backend.models.plan import Plan, PlanVersion
 from backend.models.plan_agent import PlanAgentRun
@@ -741,6 +743,76 @@ async def test_create_and_cancel_require_task_control(
     )
     assert response.status_code == 403
     denied.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_create_rechecks_task_control_inside_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import capabilities as api
+
+    task = await _task(session_factory)
+    revoked = AsyncMock(
+        side_effect=[None, HTTPException(403, "control was revoked")]
+    )
+    monkeypatch.setattr(api, "require_task_control", revoked)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/capability-invocations",
+        json=_body(idempotency_key="revoked-before-capability-commit"),
+    )
+
+    assert response.status_code == 403
+    assert revoked.await_count == 2
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(CapabilityInvocation.id))
+        ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cancel", "consume"])
+async def test_public_transition_rechecks_control_inside_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+    operation,
+):
+    from backend.api import capabilities as api
+
+    task = await _task(session_factory)
+    created = await client.post(
+        f"/api/tasks/{task.id}/capability-invocations",
+        json=_body(idempotency_key=f"revoke-before-{operation}"),
+    )
+    invocation = created.json()["invocation"]
+    if operation == "consume":
+        completed, _execution = await _complete_fake_output(
+            session_factory,
+            invocation_id=invocation["id"],
+        )
+        expected_version = completed.state_version
+        expected_status = "ready"
+    else:
+        expected_version = invocation["state_version"]
+        expected_status = "queued"
+
+    revoked = AsyncMock(
+        side_effect=[None, HTTPException(403, "control was revoked")]
+    )
+    monkeypatch.setattr(api, "require_task_control", revoked)
+    response = await client.post(
+        f"/api/capability-invocations/{invocation['id']}/{operation}",
+        json={"expected_state_version": expected_version},
+    )
+
+    assert response.status_code == 403
+    assert revoked.await_count == 2
+    async with session_factory() as db:
+        stored = await db.get(CapabilityInvocation, invocation["id"])
+        assert stored.status == expected_status
 
 
 @pytest.mark.asyncio

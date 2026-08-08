@@ -243,6 +243,7 @@ export interface SystemConfig {
   codex_service_tier_options?: CodexServiceTier[];
   codex_model_service_tiers: Record<string, CodexServiceTier[]>;
   versioned_plan_worker_protocol?: number;
+  plan_cascade_protocol?: number;
   /** Manager/Worker capability fences; absent on older deployments. */
   pr_review_snapshot_context_version?: number;
   pr_review_terminal_chat_version?: number;
@@ -584,7 +585,7 @@ export interface PlanRun {
   id: number;
   plan_id: number;
   run_type: string;
-  status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'running' | 'waiting_user' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
   current_stage: string;
   base_version_id: number | null;
   source_run_id: number | null;
@@ -636,6 +637,8 @@ export interface PlanResource {
   updated_at: string;
   display_state: string;
   legacy: boolean;
+  ownership: 'standard' | 'capability';
+  read_only: boolean;
   latest_run_status: string | null;
   latest_run_error: string | null;
   pipeline_config: PlanPipelineConfig;

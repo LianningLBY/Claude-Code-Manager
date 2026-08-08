@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
+import re
 from typing import Literal
 
 from sqlalchemy import func, select, update
@@ -58,6 +59,10 @@ AgentTerminalOutcome = Literal[
     "protocol_failed",
     "stale",
 ]
+
+_PLAN_REQUEST_FIELDS = frozenset({"prompt", "title"})
+_CODE_REVIEW_REQUEST_FIELDS = frozenset({"base_sha", "head_sha"})
+_FULL_GIT_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +288,57 @@ def _output_hash(content: str) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _validate_agent_capability_request(
+    action: CapabilityRequestAction,
+) -> tuple[dict, str]:
+    """Validate the capability-specific model contract before persistence.
+
+    Human and Delivery Controller invocations deliberately retain Capability
+    Core's generic JSON-object contract.  This boundary applies only to the
+    terminal protocol taught to an Auto Task, so malformed model requests
+    cannot consume budget and wait for an executor merely to reject them.
+    """
+
+    payload, input_hash = _validate_request(action.request)
+    fields = frozenset(payload)
+
+    if action.capability == "plan":
+        if "prompt" not in fields or not fields.issubset(_PLAN_REQUEST_FIELDS):
+            raise CapabilityValidationError(
+                "Plan request must contain exactly prompt and optional title"
+            )
+        prompt = payload["prompt"]
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise CapabilityValidationError(
+                "Plan request prompt must be a non-empty string"
+            )
+        if "title" in payload and not isinstance(payload["title"], str):
+            raise CapabilityValidationError(
+                "Plan request title must be a string"
+            )
+        return payload, input_hash
+
+    if action.capability == "code_review":
+        if fields != _CODE_REVIEW_REQUEST_FIELDS:
+            raise CapabilityValidationError(
+                "Code Review request must contain exactly base_sha and head_sha"
+        )
+        for field in ("base_sha", "head_sha"):
+            value = payload[field]
+            if (
+                not isinstance(value, str)
+                or _FULL_GIT_SHA_RE.fullmatch(value) is None
+            ):
+                raise CapabilityValidationError(
+                    f"Code Review {field} must be a full lowercase 40-character Git SHA"
+                )
+        return payload, input_hash
+
+    raise CapabilityValidationError(
+        f"Auto capability {action.capability!r} has no request contract"
+    )
+
+
 def _same_agent_identity(
     invocation: CapabilityInvocation,
     outbox: CapabilityResumeOutbox | None,
@@ -459,7 +515,7 @@ async def admit_agent_terminal_action_locked(
 
     output_hash = _output_hash(output.content)
     try:
-        request_payload, input_hash = _validate_request(action.request)
+        request_payload, input_hash = _validate_agent_capability_request(action)
     except CapabilityValidationError as exc:
         if task.status == "waiting_capability":
             raise CapabilityConflictError(

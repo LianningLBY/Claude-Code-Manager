@@ -112,7 +112,8 @@ def build_auto_capability_instructions(task: "Task") -> str | None:
         request_contracts.append(
             '- For "code_review", request must contain exactly string '
             '"base_sha" and "head_sha" using the full immutable Git commit '
-            'IDs to review; do not use branch names or abbreviated SHAs.'
+            'IDs to review; each ID must be a 40-character lowercase hexadecimal '
+            'SHA, never a branch name or abbreviated SHA.'
         )
     if not request_contracts:
         return protocol

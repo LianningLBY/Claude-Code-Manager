@@ -44,7 +44,7 @@ from backend.models.plan import (
     PlanLegacyTaskLink,
     PlanVersion,
 )
-from backend.models.plan_agent import PlanAgentRun
+from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.tests.worker_termination_helpers import (
@@ -488,6 +488,325 @@ async def test_recover_orphaned_plan_run_without_disturbing_reused_instance(
         assert owner.pid == 4321
         assert owner.current_task_id == task_id
         assert owner.current_plan_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_recover_cancelling_plan_run_without_exact_graph_preserves_owner(
+    db_factory,
+    monkeypatch,
+):
+    """Legacy pid-free state is not proof without graph + receipt identity."""
+    from backend.services import plan_agent_runner
+
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    dispatcher = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        owner = Instance(name="cancelled-plan-worker", status="running", pid=None)
+        plan = Plan(
+            title="Cancel after restart",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add_all([owner, plan])
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="capability",
+            status="cancelling",
+            generation=2,
+            cancellation_target_generation=1,
+            instance_id=owner.id,
+            pipeline_config={},
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=run.cancellation_target_generation,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        owner.current_plan_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        owner_id = owner.id
+        step_id = step.id
+
+    await dispatcher._recover_versioned_plan_runs()
+
+    async with db_factory() as db:
+        recovered = await db.get(PlanAgentRun, run_id)
+        recovered_plan = await db.get(Plan, recovered.plan_id)
+        recovered_owner = await db.get(Instance, owner_id)
+        recovered_step = await db.get(PlanAgentStep, step_id)
+        assert recovered.status == "cancelling"
+        assert recovered.instance_id == owner_id
+        assert recovered.last_execution_started_at is not None
+        assert recovered_plan.active_run_id == run_id
+        assert recovered_owner.status == "running"
+        assert recovered_owner.current_plan_run_id == run_id
+        assert recovered_step.status == "running"
+        assert recovered_step.error is None
+        assert recovered_step.finished_at is None
+
+    assert (
+        await dispatcher.stop_capability_plan_run_lifecycle(run_id, owner_id)
+        is False
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "inconsistency",
+    [
+        "live_registry",
+        "missing_owner",
+        "pid",
+        "plan_mismatch",
+        "reverse_mismatch",
+        "duplicate_reverse_owner",
+        "owner_status",
+    ],
+)
+async def test_recover_cancelling_plan_run_preserves_uncertain_owner_evidence(
+    db_factory,
+    monkeypatch,
+    inconsistency,
+):
+    """Any ambiguous runtime or ownership evidence remains fail-closed."""
+    from backend.services import plan_agent_runner
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        owner = Instance(name=f"uncertain-plan-{inconsistency}", status="running")
+        plan = Plan(
+            title=f"Uncertain cancellation: {inconsistency}",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add_all([owner, plan])
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="capability",
+            status="cancelling",
+            generation=3,
+            cancellation_target_generation=2,
+            instance_id=owner.id,
+            pipeline_config={},
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=run.cancellation_target_generation,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        owner.current_plan_run_id = run.id
+        if inconsistency == "missing_owner":
+            run.instance_id = owner.id + 100_000
+            owner.current_plan_run_id = None
+        elif inconsistency == "pid":
+            owner.pid = 4321
+        elif inconsistency == "plan_mismatch":
+            plan.active_run_id = None
+        elif inconsistency == "reverse_mismatch":
+            run.instance_id = owner.id + 100_000
+        elif inconsistency == "duplicate_reverse_owner":
+            db.add(
+                Instance(
+                    name="duplicate-plan-owner",
+                    status="running",
+                    current_plan_run_id=run.id,
+                )
+            )
+        elif inconsistency == "owner_status":
+            owner.status = "idle"
+        await db.commit()
+        run_id = run.id
+        step_id = step.id
+        retained_instance_id = run.instance_id
+        if inconsistency == "missing_owner":
+            expected_reverse_owner_count = 0
+        elif inconsistency == "duplicate_reverse_owner":
+            expected_reverse_owner_count = 2
+        else:
+            expected_reverse_owner_count = 1
+
+    monkeypatch.setattr(
+        plan_agent_runner,
+        "active_plan_run_ids",
+        lambda: {run_id} if inconsistency == "live_registry" else set(),
+    )
+
+    await dispatcher._recover_versioned_plan_runs()
+
+    async with db_factory() as db:
+        recovered = await db.get(PlanAgentRun, run_id)
+        recovered_step = await db.get(PlanAgentStep, step_id)
+        reverse_owner_ids = list(
+            (
+                await db.execute(
+                    select(Instance.id).where(
+                        Instance.current_plan_run_id == run_id
+                    )
+                )
+            ).scalars()
+        )
+        assert recovered.status == "cancelling"
+        assert recovered.instance_id == retained_instance_id
+        assert recovered.last_execution_started_at is not None
+        assert len(reverse_owner_ids) == expected_reverse_owner_count
+        assert recovered_step.status == "running"
+        assert recovered_step.error is None
+        assert recovered_step.finished_at is None
+
+
+@pytest.mark.asyncio
+async def test_cold_stop_plan_run_rejects_owner_free_malformed_capability_graph(
+    db_factory,
+    monkeypatch,
+):
+    """Even owner-free state needs an exact graph and cleaned receipts."""
+    from backend.services import plan_agent_runner
+
+    dispatcher = _make_dispatcher(db_factory)
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    async with db_factory() as db:
+        plan = Plan(
+            title="Owner-free cancellation",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="capability",
+            status="cancelling",
+            generation=1,
+            cancellation_target_generation=0,
+            instance_id=None,
+            pipeline_config={},
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=run.cancellation_target_generation,
+            step_type="reviewer",
+            provider="claude",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        plan_id = plan.id
+        step_id = step.id
+
+    await dispatcher._recover_versioned_plan_runs()
+
+    async with db_factory() as db:
+        recovered_step = await db.get(PlanAgentStep, step_id)
+        assert recovered_step.status == "running"
+        assert recovered_step.error is None
+        assert recovered_step.finished_at is None
+
+    assert await dispatcher.stop_plan_run_lifecycle(run_id, None) is False
+    assert (
+        await dispatcher.stop_capability_plan_run_lifecycle(run_id, None) is False
+    )
+
+    async with db_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        plan.active_run_id = None
+        await db.commit()
+    assert (
+        await dispatcher.stop_capability_plan_run_lifecycle(run_id, None) is False
+    )
+
+    async with db_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        plan.active_run_id = run_id
+        db.add(
+            Instance(
+                name="unexpected-reverse-owner",
+                status="running",
+                current_plan_run_id=run_id,
+            )
+        )
+        await db.commit()
+    assert (
+        await dispatcher.stop_capability_plan_run_lifecycle(run_id, None) is False
+    )
+
+    async with db_factory() as db:
+        owner = await db.scalar(
+            select(Instance).where(Instance.current_plan_run_id == run_id)
+        )
+        owner.current_plan_run_id = None
+        await db.commit()
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: {run_id})
+    assert (
+        await dispatcher.stop_capability_plan_run_lifecycle(run_id, None) is False
+    )
+
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    async with db_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        run.last_execution_started_at = datetime.utcnow()
+        await db.commit()
+    assert (
+        await dispatcher.stop_capability_plan_run_lifecycle(run_id, None) is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_plan_run_finds_lifecycle_by_exact_run_identity(db_factory):
+    """A stale/missing Instance key must not hide the exact live lifecycle."""
+    dispatcher = _make_dispatcher(db_factory)
+    started = asyncio.Event()
+
+    async def lifecycle_body():
+        started.set()
+        await asyncio.Event().wait()
+
+    lifecycle = asyncio.create_task(lifecycle_body())
+    setattr(lifecycle, "_ccm_plan_run_id", 711)
+    dispatcher._running_tasks[99] = lifecycle
+    await started.wait()
+
+    assert await dispatcher.stop_plan_run_lifecycle(711, None) is True
+    assert lifecycle.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_generic_plan_stop_without_lifecycle_never_queries_database(db_factory):
+    """Ordinary request-scoped Plan cancellation is a runtime-only callback."""
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher.db_factory = MagicMock(
+        side_effect=AssertionError("generic Plan stop must not open global DB")
+    )
+
+    assert await dispatcher.stop_plan_run_lifecycle(712, None) is False
+    dispatcher.db_factory.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -966,7 +1285,7 @@ async def test_initial_capability_admission_waits_for_live_background_epoch(
                 "terminal_action": "request_capability",
                 "capability": "plan",
                 "reason": "Need an exact implementation plan",
-                "request": {"focus": "background-safe rollout"},
+                "request": {"prompt": "Plan a background-safe rollout"},
             },
             separators=(",", ":"),
             sort_keys=True,
@@ -11557,7 +11876,7 @@ async def test_auto_terminal_admission_commits_before_late_termination_receipt(
                     "terminal_action": "request_capability",
                     "capability": "plan",
                     "reason": "Need a termination-safe plan",
-                    "request": {"focus": "writer-fence ordering"},
+                    "request": {"prompt": "Plan writer-fence ordering"},
                 },
                 separators=(",", ":"),
                 sort_keys=True,

@@ -48,6 +48,8 @@ _ACTIVE_TASK_STATUSES = frozenset(
     {"pending", "in_progress", "executing", "merging"}
 )
 _VALID_OPERATIONS = frozenset({"cancel", "stop_session", "supersede"})
+_MANAGER_ONLY_DELETE_OPERATION = "delete"
+WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION = 1
 _OPERATION_SOURCE_STATUSES = {
     "cancel": _ACTIVE_TASK_STATUSES | TERMINAL_TASK_STATUSES,
     "stop_session": frozenset({"pending", "in_progress", "executing"})
@@ -186,6 +188,64 @@ class ManagerTerminationOutcome:
     operation: str
     status: str
     result_payload: dict | None
+
+
+@dataclass(frozen=True)
+class ManagerTaskDeleteOutcome:
+    """A durable Worker delete whose Manager graph commit completed."""
+
+    operation_id: str
+    task_id: int
+    worker_id: int
+    plan_ids: tuple[int, ...]
+
+
+_DELETE_REQUEST_KEYS = frozenset(
+    {
+        "version",
+        "operation_id",
+        "task_id",
+        "operation",
+        "manager_worker_id",
+        "source",
+        "plan_ids",
+        "plan_cascade_protocol",
+    }
+)
+_DELETE_SOURCE_KEYS = frozenset(
+    {
+        "incarnation_id",
+        "status",
+        "retry_count",
+        "turn_generation",
+        "source_log_id",
+        "instance_id",
+        "started_at",
+        "completed_at",
+        "session_id",
+        "pty_background_generation",
+        "worker_turn_handoff_id",
+        "worker_turn_handoff_worker_id",
+        "worker_turn_handoff_retry_count",
+        "worker_turn_handoff_from_generation",
+        "worker_turn_handoff_source_log_id",
+        "worker_turn_handoff_acknowledged",
+    }
+)
+_DELETE_RESULT_KEYS = frozenset(
+    {
+        "version",
+        "operation_id",
+        "task_id",
+        "operation",
+        "request_digest",
+        "proof_kind",
+        "plan_cascade_protocol",
+        "deleted_plan_ids",
+        "remaining_target_plan_ids",
+        "task_exists",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -490,6 +550,231 @@ def _task_source_values(task: Task, *, manager_side: bool) -> dict:
             source_worker_turn_handoff_acknowledged=None,
         )
     return values
+
+
+def _delete_source_payload_from_task(task: Task) -> dict:
+    """Freeze every Task field that may distinguish the Manager mirror."""
+
+    return {
+        "incarnation_id": task.incarnation_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "source_log_id": task.turn_source_log_id,
+        "instance_id": task.instance_id,
+        "started_at": _wire_datetime(task.started_at),
+        "completed_at": _wire_datetime(task.completed_at),
+        "session_id": task.session_id,
+        "pty_background_generation": task.pty_background_generation,
+        "worker_turn_handoff_id": task.worker_turn_handoff_id,
+        "worker_turn_handoff_worker_id": task.worker_turn_handoff_worker_id,
+        "worker_turn_handoff_retry_count": task.worker_turn_handoff_retry_count,
+        "worker_turn_handoff_from_generation": (
+            task.worker_turn_handoff_from_generation
+        ),
+        "worker_turn_handoff_source_log_id": (
+            task.worker_turn_handoff_source_log_id
+        ),
+        "worker_turn_handoff_acknowledged": (
+            task.worker_turn_handoff_acknowledged
+        ),
+    }
+
+
+def _canonical_positive_ids(value: object) -> tuple[int, ...] | None:
+    if not isinstance(value, list):
+        return None
+    ids: list[int] = []
+    for item in value:
+        if type(item) is not int or item <= 0:
+            return None
+        ids.append(item)
+    if ids != sorted(set(ids)):
+        return None
+    return tuple(ids)
+
+
+def _manager_delete_request_payload(
+    task: Task,
+    *,
+    operation_id: str,
+    plan_ids: tuple[int, ...],
+) -> dict:
+    return {
+        "version": 1,
+        "operation_id": operation_id,
+        "task_id": task.id,
+        "operation": _MANAGER_ONLY_DELETE_OPERATION,
+        "manager_worker_id": task.worker_id,
+        "source": _delete_source_payload_from_task(task),
+        "plan_ids": list(plan_ids),
+        "plan_cascade_protocol": WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION,
+    }
+
+
+def _manager_delete_request_is_valid(
+    receipt: WorkerTaskTerminationReceipt,
+) -> bool:
+    payload = receipt.request_payload
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != _DELETE_REQUEST_KEYS
+        or payload.get("version") != 1
+        or payload.get("operation_id") != receipt.operation_id
+        or payload.get("task_id") != receipt.task_id
+        or payload.get("operation") != _MANAGER_ONLY_DELETE_OPERATION
+        or payload.get("manager_worker_id") != receipt.worker_id
+        or payload.get("plan_cascade_protocol")
+        != WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION
+        or _canonical_positive_ids(payload.get("plan_ids")) is None
+        or not isinstance(payload.get("source"), dict)
+        or set(payload["source"]) != _DELETE_SOURCE_KEYS
+        or not _valid_digest(receipt.request_digest)
+    ):
+        return False
+    try:
+        if canonical_json_digest(payload) != receipt.request_digest:
+            return False
+    except (TypeError, ValueError, UnicodeError):
+        return False
+    source = payload["source"]
+    frozen_source = {
+        "incarnation_id": receipt.source_task_incarnation_id,
+        "status": receipt.source_task_status,
+        "retry_count": receipt.source_task_retry_count,
+        "turn_generation": receipt.source_task_turn_generation,
+        "source_log_id": receipt.source_task_source_log_id,
+        "instance_id": receipt.source_task_instance_id,
+        "started_at": _wire_datetime(receipt.source_task_started_at),
+        "completed_at": _wire_datetime(receipt.source_task_completed_at),
+        "session_id": receipt.source_task_session_id,
+        "pty_background_generation": (
+            receipt.source_task_pty_background_generation
+        ),
+        "worker_turn_handoff_id": receipt.source_worker_turn_handoff_id,
+        "worker_turn_handoff_worker_id": (
+            receipt.source_worker_turn_handoff_worker_id
+        ),
+        "worker_turn_handoff_retry_count": (
+            receipt.source_worker_turn_handoff_retry_count
+        ),
+        "worker_turn_handoff_from_generation": (
+            receipt.source_worker_turn_handoff_from_generation
+        ),
+        "worker_turn_handoff_source_log_id": (
+            receipt.source_worker_turn_handoff_source_log_id
+        ),
+        "worker_turn_handoff_acknowledged": (
+            receipt.source_worker_turn_handoff_acknowledged
+        ),
+    }
+    return bool(source == frozen_source)
+
+
+def manager_delete_receipt_plan_ids(
+    receipt: WorkerTaskTerminationReceipt,
+) -> tuple[int, ...]:
+    """Return the digest-bound Plan identity or fail closed."""
+
+    if not _manager_delete_request_is_valid(receipt):
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion request identity is invalid"
+        )
+    plan_ids = _canonical_positive_ids(receipt.request_payload.get("plan_ids"))
+    if plan_ids is None:  # Kept explicit for type narrowing and corruption.
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion Plan identity is invalid"
+        )
+    return plan_ids
+
+
+def manager_delete_receipt_task_fence(
+    receipt: WorkerTaskTerminationReceipt,
+) -> tuple[
+    str,
+    int | None,
+    int,
+    int | None,
+    datetime | None,
+    datetime | None,
+    str | None,
+    int,
+]:
+    """Rebuild the exact TaskQueue delete fence from durable columns."""
+
+    if not _manager_delete_request_is_valid(receipt):
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion request identity is invalid"
+        )
+    return (
+        receipt.source_task_status,
+        receipt.worker_id,
+        receipt.source_task_retry_count,
+        receipt.source_task_instance_id,
+        receipt.source_task_started_at,
+        receipt.source_task_completed_at,
+        receipt.source_task_pty_background_generation,
+        receipt.source_task_turn_generation,
+    )
+
+
+def manager_delete_receipt_allows_finalize(
+    receipt: WorkerTaskTerminationReceipt | None,
+    task: Task,
+    *,
+    operation_id: str,
+    plan_ids: tuple[int, ...],
+) -> bool:
+    """Validate the exact active owner and its committed remote proof."""
+
+    if (
+        receipt is None
+        or receipt.operation_id != operation_id
+        or receipt.task_id != task.id
+        or receipt.active_task_id != task.id
+        or receipt.side != "manager"
+        or receipt.operation != _MANAGER_ONLY_DELETE_OPERATION
+        or receipt.status != "awaiting_ack"
+        or receipt.worker_id != task.worker_id
+        or not _receipt_source_matches_task(
+            receipt,
+            task,
+            include_manager_handoff=True,
+        )
+        or not _manager_delete_request_is_valid(receipt)
+        or receipt.result_payload is None
+        or not _valid_digest(receipt.result_digest)
+    ):
+        return False
+    try:
+        result_valid = bool(
+            set(receipt.result_payload) == _DELETE_RESULT_KEYS
+            and canonical_json_digest(receipt.result_payload)
+            == receipt.result_digest
+            and receipt.result_payload.get("version") == 1
+            and receipt.result_payload.get("operation_id") == operation_id
+            and receipt.result_payload.get("task_id") == task.id
+            and receipt.result_payload.get("operation")
+            == _MANAGER_ONLY_DELETE_OPERATION
+            and receipt.result_payload.get("request_digest")
+            == receipt.request_digest
+            and receipt.result_payload.get("proof_kind")
+            in {"delete_receipt", "delete_audit"}
+            and receipt.result_payload.get("plan_cascade_protocol")
+            == WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION
+            and receipt.result_payload.get("task_exists") is False
+            and receipt.result_payload.get("remaining_target_plan_ids") == []
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return False
+    return bool(
+        result_valid
+        and manager_delete_receipt_plan_ids(receipt) == plan_ids
+        and _canonical_positive_ids(
+            receipt.result_payload.get("deleted_plan_ids")
+        )
+        == plan_ids
+    )
 
 
 def _receipt_source_matches_task(
@@ -954,6 +1239,82 @@ async def create_or_resume_manager_receipt(
         raise WorkerTaskTerminationConflict(
             f"Task {task.id} termination was admitted concurrently"
         ) from exc
+    return receipt
+
+
+async def stage_manager_task_delete_receipt(
+    db: AsyncSession,
+    task: Task,
+    *,
+    plan_ids: tuple[int, ...],
+) -> WorkerTaskTerminationReceipt:
+    """Stage one Manager-only delete owner in the caller's locked transaction.
+
+    ``TaskQueue.delete`` calls this only after it has locked and validated the
+    complete Task/Capability/Plan graph.  The caller commits this row together
+    with that read/write fence and returns before any Worker request is made.
+    """
+
+    if (
+        type(task.worker_id) is not int
+        or task.worker_id <= 0
+        or task.shared_from_id is not None
+    ):
+        raise WorkerTaskTerminationConflict(
+            "Task is not an authoritative Worker mirror"
+        )
+    canonical_plan_ids = tuple(sorted(set(plan_ids)))
+    if canonical_plan_ids != plan_ids or any(
+        type(plan_id) is not int or plan_id <= 0
+        for plan_id in canonical_plan_ids
+    ):
+        raise WorkerTaskTerminationConflict(
+            "Task deletion Plan identity is not canonical"
+        )
+    if await active_worker_task_termination_receipt(
+        db,
+        task.id,
+        for_update=True,
+    ):
+        raise WorkerTaskTerminationConflict(
+            "Task already has an active Worker termination owner"
+        )
+
+    operation_id = secrets.token_hex(16)
+    request_payload = _manager_delete_request_payload(
+        task,
+        operation_id=operation_id,
+        plan_ids=canonical_plan_ids,
+    )
+    now = datetime.utcnow()
+    receipt = WorkerTaskTerminationReceipt(
+        operation_id=operation_id,
+        task_id=task.id,
+        active_task_id=task.id,
+        side="manager",
+        worker_id=task.worker_id,
+        operation=_MANAGER_ONLY_DELETE_OPERATION,
+        status="pending_remote",
+        state_version=1,
+        execution_token=None,
+        request_payload=request_payload,
+        request_digest=canonical_json_digest(request_payload),
+        result_payload=None,
+        result_digest=None,
+        attempt_count=0,
+        reconcile_count=0,
+        next_reconcile_at=now,
+        last_error=None,
+        accepted_at=None,
+        completed_at=None,
+        ack_intent_at=None,
+        acknowledged_at=None,
+        created_at=now,
+        updated_at=now,
+        **_task_source_values(task, manager_side=True),
+    )
+    db.add(receipt)
+    await db.flush()
     return receipt
 
 
@@ -3572,6 +3933,524 @@ async def settle_manager_receipt(
 
 
 ProxyRequest = Callable[..., Awaitable[object]]
+DeleteProtocolCheck = Callable[..., Awaitable[None]]
+
+
+async def _locked_manager_delete_rows(
+    db: AsyncSession,
+    operation_id: str,
+) -> tuple[Task, WorkerTaskTerminationReceipt]:
+    """Lock an exact delete aggregate in global Task -> receipt order."""
+
+    task_id = await db.scalar(
+        select(WorkerTaskTerminationReceipt.task_id).where(
+            WorkerTaskTerminationReceipt.operation_id == operation_id,
+            WorkerTaskTerminationReceipt.side == "manager",
+            WorkerTaskTerminationReceipt.operation
+            == _MANAGER_ONLY_DELETE_OPERATION,
+        )
+    )
+    await db.rollback()
+    if task_id is None:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion receipt not found"
+        )
+    task = (
+        await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if task is None:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task disappeared before deletion commit"
+        )
+    receipt = (
+        await db.execute(
+            select(WorkerTaskTerminationReceipt)
+            .where(
+                WorkerTaskTerminationReceipt.operation_id == operation_id,
+                WorkerTaskTerminationReceipt.task_id == task_id,
+                WorkerTaskTerminationReceipt.side == "manager",
+                WorkerTaskTerminationReceipt.operation
+                == _MANAGER_ONLY_DELETE_OPERATION,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if receipt is None:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion receipt disappeared"
+        )
+    return task, receipt
+
+
+async def mark_manager_task_delete_remote_possible(
+    db: AsyncSession,
+    operation_id: str,
+) -> WorkerTaskTerminationReceipt:
+    """Commit the ambiguity boundary before the first Worker DELETE byte."""
+
+    task, receipt = await _locked_manager_delete_rows(db, operation_id)
+    if (
+        receipt.status != "pending_remote"
+        or receipt.active_task_id != task.id
+        or receipt.worker_id != task.worker_id
+        or not _receipt_source_matches_task(
+            receipt,
+            task,
+            include_manager_handoff=True,
+        )
+        or not _manager_delete_request_is_valid(receipt)
+    ):
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            "Manager Task changed before the remote deletion boundary"
+        )
+    now = _timeline_now(receipt.created_at)
+    # ``conflict`` is the model's durable quarantine state.  For operation
+    # ``delete`` it specifically means remote_possible: recovery is restricted
+    # to the read-only cascade audit until that audit proves no mutation.
+    receipt.status = "conflict"
+    receipt.state_version += 1
+    receipt.attempt_count += 1
+    receipt.accepted_at = now
+    receipt.completed_at = None
+    receipt.next_reconcile_at = now
+    receipt.last_error = "Worker Task deletion crossed the remote boundary"
+    receipt.updated_at = now
+    await db.commit()
+    return receipt
+
+
+async def reject_manager_task_delete_preboundary(
+    db: AsyncSession,
+    operation_id: str,
+    detail: str,
+) -> WorkerTaskTerminationReceipt:
+    """Release a prepared owner when no Worker DELETE could have been sent."""
+
+    task, receipt = await _locked_manager_delete_rows(db, operation_id)
+    if (
+        receipt.status != "pending_remote"
+        or receipt.active_task_id != task.id
+        or receipt.worker_id != task.worker_id
+        or not _receipt_source_matches_task(
+            receipt,
+            task,
+            include_manager_handoff=True,
+        )
+        or not _manager_delete_request_is_valid(receipt)
+    ):
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion preflight owner changed"
+        )
+    now = _timeline_now(receipt.created_at)
+    result = {
+        "version": 1,
+        "operation_id": receipt.operation_id,
+        "task_id": receipt.task_id,
+        "operation": _MANAGER_ONLY_DELETE_OPERATION,
+        "request_digest": receipt.request_digest,
+        "rejected": True,
+        "error": detail[:_MAX_ERROR_LENGTH],
+    }
+    receipt.status = "rejected"
+    receipt.active_task_id = None
+    receipt.state_version += 1
+    receipt.result_payload = result
+    receipt.result_digest = canonical_json_digest(result)
+    receipt.accepted_at = now
+    receipt.completed_at = now
+    receipt.ack_intent_at = now
+    receipt.acknowledged_at = now
+    receipt.next_reconcile_at = None
+    receipt.last_error = detail[:_MAX_ERROR_LENGTH]
+    receipt.updated_at = now
+    await db.commit()
+    return receipt
+
+
+def _normalize_manager_task_delete_proof(
+    receipt: WorkerTaskTerminationReceipt,
+    remote: object,
+    *,
+    proof_kind: str,
+) -> dict | None:
+    expected_plan_ids = manager_delete_receipt_plan_ids(receipt)
+    if proof_kind == "delete_receipt":
+        if (
+            not isinstance(remote, dict)
+            or set(remote)
+            != {
+                "ok",
+                "plan_cascade_protocol",
+                "deleted_plan_ids",
+                "remaining_target_plan_ids",
+            }
+            or remote.get("ok") is not True
+            or remote.get("plan_cascade_protocol")
+            != WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION
+            or _canonical_positive_ids(remote.get("deleted_plan_ids"))
+            != expected_plan_ids
+            or remote.get("remaining_target_plan_ids") != []
+        ):
+            return None
+    elif proof_kind == "delete_audit":
+        if (
+            not isinstance(remote, dict)
+            or set(remote)
+            != {
+                "plan_cascade_protocol",
+                "task_exists",
+                "remaining_target_plan_ids",
+            }
+            or remote.get("plan_cascade_protocol")
+            != WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION
+            or remote.get("task_exists") is not False
+            or remote.get("remaining_target_plan_ids") != []
+        ):
+            return None
+    else:
+        raise ValueError("unknown Worker Task deletion proof kind")
+    return {
+        "version": 1,
+        "operation_id": receipt.operation_id,
+        "task_id": receipt.task_id,
+        "operation": _MANAGER_ONLY_DELETE_OPERATION,
+        "request_digest": receipt.request_digest,
+        "proof_kind": proof_kind,
+        "plan_cascade_protocol": WORKER_TASK_PLAN_DELETE_PROTOCOL_VERSION,
+        "deleted_plan_ids": list(expected_plan_ids),
+        "remaining_target_plan_ids": [],
+        "task_exists": False,
+    }
+
+
+async def record_manager_task_delete_proof(
+    db: AsyncSession,
+    operation_id: str,
+    remote: object,
+    *,
+    proof_kind: str,
+) -> WorkerTaskTerminationReceipt:
+    """Persist exact remote absence before deleting any Manager graph row."""
+
+    task, receipt = await _locked_manager_delete_rows(db, operation_id)
+    if (
+        receipt.status != "conflict"
+        or receipt.active_task_id != task.id
+        or receipt.worker_id != task.worker_id
+        or not _receipt_source_matches_task(
+            receipt,
+            task,
+            include_manager_handoff=True,
+        )
+        or not _manager_delete_request_is_valid(receipt)
+    ):
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion receipt is not proof-ready"
+        )
+    normalized = _normalize_manager_task_delete_proof(
+        receipt,
+        remote,
+        proof_kind=proof_kind,
+    )
+    if normalized is None:
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            "Worker did not prove the exact Task and Plan cascade deletion"
+        )
+    now = _timeline_now(receipt.accepted_at, receipt.created_at)
+    receipt.status = "awaiting_ack"
+    receipt.state_version += 1
+    receipt.result_payload = normalized
+    receipt.result_digest = canonical_json_digest(normalized)
+    receipt.accepted_at = receipt.accepted_at or now
+    receipt.completed_at = now
+    receipt.next_reconcile_at = now
+    receipt.last_error = None
+    receipt.updated_at = now
+    await db.commit()
+    return receipt
+
+
+async def _record_manager_task_delete_error(
+    db: AsyncSession,
+    operation_id: str,
+    detail: str,
+) -> None:
+    await db.rollback()
+    receipt = await db.get(
+        WorkerTaskTerminationReceipt,
+        operation_id,
+        populate_existing=True,
+    )
+    if (
+        receipt is None
+        or receipt.side != "manager"
+        or receipt.operation != _MANAGER_ONLY_DELETE_OPERATION
+        or receipt.status not in {"pending_remote", "conflict", "awaiting_ack"}
+        or receipt.active_task_id != receipt.task_id
+    ):
+        await db.rollback()
+        return
+    attempts = receipt.reconcile_count + 1
+    delay = min(
+        _MAX_RECONCILE_SECONDS,
+        _INITIAL_RECONCILE_SECONDS * (2 ** min(attempts - 1, 5)),
+    )
+    now = datetime.utcnow()
+    await db.execute(
+        update(WorkerTaskTerminationReceipt)
+        .where(
+            WorkerTaskTerminationReceipt.operation_id == operation_id,
+            WorkerTaskTerminationReceipt.side == "manager",
+            WorkerTaskTerminationReceipt.operation
+            == _MANAGER_ONLY_DELETE_OPERATION,
+            WorkerTaskTerminationReceipt.status == receipt.status,
+            WorkerTaskTerminationReceipt.state_version == receipt.state_version,
+            WorkerTaskTerminationReceipt.request_digest
+            == receipt.request_digest,
+            WorkerTaskTerminationReceipt.active_task_id == receipt.task_id,
+        )
+        .values(
+            reconcile_count=attempts,
+            next_reconcile_at=now + timedelta(seconds=delay),
+            last_error=detail[:_MAX_ERROR_LENGTH],
+            updated_at=now,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+
+
+async def finalize_manager_task_delete_receipt(
+    db: AsyncSession,
+    operation_id: str,
+) -> ManagerTaskDeleteOutcome:
+    """Consume awaiting_ack and atomically delete receipt + local graph."""
+
+    receipt = await db.get(
+        WorkerTaskTerminationReceipt,
+        operation_id,
+        populate_existing=True,
+    )
+    if (
+        receipt is None
+        or receipt.side != "manager"
+        or receipt.operation != _MANAGER_ONLY_DELETE_OPERATION
+        or receipt.status != "awaiting_ack"
+    ):
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion receipt is not locally finalizable"
+        )
+    task_id = receipt.task_id
+    worker_id = receipt.worker_id
+    if type(worker_id) is not int:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion lost its Worker route"
+        )
+    plan_ids = manager_delete_receipt_plan_ids(receipt)
+    expected_fence = manager_delete_receipt_task_fence(receipt)
+    await db.rollback()
+
+    from backend.services.task_queue import TaskQueue
+
+    deleted = await TaskQueue(db).delete(
+        task_id,
+        expected_fence=expected_fence,
+        remote_worker_deleted=True,
+        worker_delete_operation_id=operation_id,
+    )
+    if not deleted:
+        raise WorkerTaskTerminationPending(
+            "Manager Task/Plan graph is not ready for exact deletion finalization"
+        )
+    return ManagerTaskDeleteOutcome(
+        operation_id=operation_id,
+        task_id=task_id,
+        worker_id=worker_id,
+        plan_ids=plan_ids,
+    )
+
+
+async def _finish_delete_finalize_despite_cancellation(
+    awaitable: Awaitable[ManagerTaskDeleteOutcome],
+) -> ManagerTaskDeleteOutcome:
+    operation = asyncio.create_task(awaitable)
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+    result = operation.result()
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
+async def reconcile_manager_task_delete_receipt(
+    db: AsyncSession,
+    operation_id: str,
+    *,
+    proxy_request: ProxyRequest,
+    protocol_check: DeleteProtocolCheck,
+) -> ManagerTaskDeleteOutcome:
+    """Recover one remote-first delete without ever blindly replaying DELETE."""
+
+    receipt = await db.get(
+        WorkerTaskTerminationReceipt,
+        operation_id,
+        populate_existing=True,
+    )
+    if (
+        receipt is None
+        or receipt.side != "manager"
+        or receipt.operation != _MANAGER_ONLY_DELETE_OPERATION
+        or receipt.active_task_id != receipt.task_id
+        or not _manager_delete_request_is_valid(receipt)
+    ):
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion receipt is invalid"
+        )
+    if receipt.status == "awaiting_ack":
+        try:
+            return await _finish_delete_finalize_despite_cancellation(
+                finalize_manager_task_delete_receipt(db, operation_id)
+            )
+        except WorkerTaskTerminationPending as exc:
+            await _record_manager_task_delete_error(db, operation_id, str(exc))
+            raise
+    if receipt.status not in {"pending_remote", "conflict"}:
+        raise WorkerTaskTerminationConflict(
+            f"Manager Task deletion cannot recover from {receipt.status}"
+        )
+
+    route = type(
+        "TaskDeleteRoute",
+        (),
+        {"id": receipt.task_id, "worker_id": receipt.worker_id},
+    )()
+    delete_path = f"/api/tasks/{receipt.task_id}"
+    audit_path = f"{delete_path}/plan-delete-audit"
+    call_delete = receipt.status == "pending_remote"
+
+    if call_delete:
+        try:
+            await protocol_check(
+                route,
+                operation_id,
+                operation_lock_held=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await reject_manager_task_delete_preboundary(
+                db,
+                operation_id,
+                str(exc),
+            )
+            raise WorkerTaskTerminationPending(
+                "Worker cannot prove Task/Plan deletion protocol support; "
+                "the pre-boundary owner was released for a safe retry"
+            ) from exc
+        receipt = await mark_manager_task_delete_remote_possible(db, operation_id)
+        try:
+            remote = await proxy_request(
+                route,
+                "DELETE",
+                delete_path,
+                require_json=True,
+                allow_task_absent=True,
+                operation_lock_held=True,
+                quarantine_on_transport_uncertainty=True,
+            )
+        except asyncio.CancelledError:
+            await asyncio.shield(
+                _record_manager_task_delete_error(
+                    db,
+                    operation_id,
+                    "Manager Task deletion was cancelled after remote_possible",
+                )
+            )
+            raise
+        except Exception:
+            remote = None
+        normalized = _normalize_manager_task_delete_proof(
+            receipt,
+            remote,
+            proof_kind="delete_receipt",
+        )
+        if normalized is not None:
+            receipt = await record_manager_task_delete_proof(
+                db,
+                operation_id,
+                remote,
+                proof_kind="delete_receipt",
+            )
+            return await _finish_delete_finalize_despite_cancellation(
+                finalize_manager_task_delete_receipt(db, operation_id)
+            )
+
+    # A pre-existing remote_possible state, a lost ACK, or any non-exact
+    # DELETE response is reconciled only through this read-only postcondition.
+    try:
+        audit = await proxy_request(
+            route,
+            "GET",
+            audit_path,
+            require_json=True,
+            surface_endpoint_not_found=True,
+            operation_lock_held=True,
+        )
+    except asyncio.CancelledError:
+        await asyncio.shield(
+            _record_manager_task_delete_error(
+                db,
+                operation_id,
+                "Manager Task deletion audit was cancelled",
+            )
+        )
+        raise
+    except Exception as exc:
+        await _record_manager_task_delete_error(db, operation_id, str(exc))
+        raise WorkerTaskTerminationPending(
+            "Worker Task deletion outcome could not be audited"
+        ) from exc
+
+    receipt = await db.get(
+        WorkerTaskTerminationReceipt,
+        operation_id,
+        populate_existing=True,
+    )
+    if receipt is None:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion receipt disappeared during audit"
+        )
+    if (
+        _normalize_manager_task_delete_proof(
+            receipt,
+            audit,
+            proof_kind="delete_audit",
+        )
+        is not None
+    ):
+        await record_manager_task_delete_proof(
+            db,
+            operation_id,
+            audit,
+            proof_kind="delete_audit",
+        )
+        return await _finish_delete_finalize_despite_cancellation(
+            finalize_manager_task_delete_receipt(db, operation_id)
+        )
+    detail = "Worker returned an invalid or mismatched Task/Plan deletion audit"
+    await _record_manager_task_delete_error(db, operation_id, detail)
+    raise WorkerTaskTerminationPending(detail)
 
 
 def _manager_receipt_monotonic_progress(
@@ -3615,6 +4494,10 @@ async def reconcile_manager_receipt(
     receipt = await db.get(WorkerTaskTerminationReceipt, operation_id)
     if receipt is None or receipt.side != "manager":
         raise WorkerTaskTerminationConflict("Manager termination receipt not found")
+    if receipt.operation == _MANAGER_ONLY_DELETE_OPERATION:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task deletion requires the delete reconciler"
+        )
     if receipt.status == "settled":
         return ManagerTerminationOutcome(
             operation_id=operation_id,
@@ -3936,6 +4819,7 @@ class WorkerTaskTerminationCoordinator:
                             WorkerTaskTerminationReceipt.task_id,
                             WorkerTaskTerminationReceipt.side,
                             WorkerTaskTerminationReceipt.status,
+                            WorkerTaskTerminationReceipt.operation,
                         ).where(
                             WorkerTaskTerminationReceipt.active_task_id.is_not(None),
                             WorkerTaskTerminationReceipt.next_reconcile_at.is_not(
@@ -3951,8 +4835,16 @@ class WorkerTaskTerminationCoordinator:
                                 ),
                                 and_(
                                     WorkerTaskTerminationReceipt.side == "manager",
-                                    WorkerTaskTerminationReceipt.status.in_(
-                                        ("pending_remote", "awaiting_ack")
+                                    or_(
+                                        WorkerTaskTerminationReceipt.status.in_(
+                                            ("pending_remote", "awaiting_ack")
+                                        ),
+                                        and_(
+                                            WorkerTaskTerminationReceipt.operation
+                                            == _MANAGER_ONLY_DELETE_OPERATION,
+                                            WorkerTaskTerminationReceipt.status
+                                            == "conflict",
+                                        ),
                                     ),
                                 ),
                             ),
@@ -3960,7 +4852,7 @@ class WorkerTaskTerminationCoordinator:
                     )
                 ).all()
             )
-        for operation_id, task_id, side, status in rows:
+        for operation_id, task_id, side, status, operation in rows:
             from backend.services.worker_proxy import get_task_operation_lock
 
             async with get_task_operation_lock(task_id):
@@ -3985,6 +4877,33 @@ class WorkerTaskTerminationCoordinator:
                             )
                             await record_worker_reconcile_error(
                                 db, operation_id, exc
+                            )
+                elif (
+                    include_manager
+                    and side == "manager"
+                    and operation == _MANAGER_ONLY_DELETE_OPERATION
+                    and status in {"pending_remote", "conflict", "awaiting_ack"}
+                    and self.worker_proxy is not None
+                ):
+                    async with self.db_factory() as db:
+                        try:
+                            await reconcile_manager_task_delete_receipt(
+                                db,
+                                operation_id,
+                                proxy_request=self.worker_proxy.proxy_to_worker,
+                                protocol_check=(
+                                    self.worker_proxy
+                                    .require_task_plan_delete_protocol
+                                ),
+                            )
+                        except WorkerTaskTerminationPending:
+                            pass
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Manager Task deletion %s recovery failed",
+                                operation_id,
                             )
                 elif (
                     include_manager

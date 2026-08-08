@@ -51,6 +51,7 @@ def test_model_protocol_requires_both_rollout_switches(monkeypatch):
     assert 'For "code_review"' in instructions
     assert 'exactly string "base_sha" and "head_sha"' in instructions
     assert "full immutable Git commit IDs" in instructions
+    assert "40-character lowercase hexadecimal SHA" in instructions
 
 
 def test_model_protocol_only_describes_enabled_request_contracts(monkeypatch):

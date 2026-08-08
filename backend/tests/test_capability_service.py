@@ -95,6 +95,39 @@ async def test_same_idempotency_key_rejects_different_payload(db_session):
 
 
 @pytest.mark.asyncio
+async def test_agent_request_schema_does_not_narrow_human_or_controller_payloads(
+    db_session,
+):
+    human_task = await _task(db_session)
+    controller_task = await _task(db_session)
+    generic_payload = {
+        "request": "legacy caller-owned alias",
+        "caller_extension": {"preserve": True},
+    }
+
+    human, human_created = await service.create_human_invocation(
+        db_session,
+        task_id=human_task.id,
+        capability_key="plan",
+        request_payload=generic_payload,
+        idempotency_key="human-generic-contract",
+        requested_by_user_id=7,
+    )
+    controller, controller_created = await service.create_controller_invocation(
+        db_session,
+        task_id=controller_task.id,
+        capability_key="plan",
+        request_payload=generic_payload,
+        idempotency_key="controller-generic-contract",
+    )
+
+    assert human_created is True
+    assert controller_created is True
+    assert human.input_payload == generic_payload
+    assert controller.input_payload == generic_payload
+
+
+@pytest.mark.asyncio
 async def test_one_active_invocation_per_task_under_concurrency(
     db_session,
     db_factory,
@@ -170,6 +203,26 @@ async def test_remote_shared_and_migrating_tasks_fail_closed(
 
     with pytest.raises(service.CapabilityUnsupportedScopeError, match=error):
         await _create(db_session, task.id)
+
+
+@pytest.mark.asyncio
+async def test_human_creation_rejects_delivery_owned_task_in_service(db_session):
+    task = await _task(
+        db_session,
+        mode="delivery_loop",
+        delivery_run_id=91,
+        delivery_role="developer",
+    )
+
+    with pytest.raises(
+        service.CapabilityConflictError,
+        match="Delivery-owned Tasks",
+    ):
+        await _create(db_session, task.id)
+
+    assert await db_session.scalar(
+        select(func.count(CapabilityInvocation.id))
+    ) == 0
 
 
 @pytest.mark.asyncio

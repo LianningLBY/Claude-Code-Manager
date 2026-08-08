@@ -40,6 +40,23 @@ _worker_login_admission_lock = asyncio.Lock()
 # accounts column is one JSON value, so serialize its read/modify/write cycle
 # to prevent one successful login from overwriting another.
 _worker_account_store_lock = asyncio.Lock()
+# Lifecycle endpoints perform a durable compare-and-set before spawning their
+# background operation.  Keep same-process transitions for one Worker inside a
+# single transaction boundary.  Besides preventing duplicate coordinators,
+# this is required for SQLite's single-connection configurations where a
+# concurrent losing rollback could otherwise undo the winning request's
+# uncommitted CAS while it is still checking destroy blockers.
+
+
+class _WorkerLifecycleTransitionLock:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.users = 0
+
+
+_worker_lifecycle_transition_locks: dict[
+    tuple[asyncio.AbstractEventLoop, int], _WorkerLifecycleTransitionLock
+] = {}
 
 _LOGIN_METHODS = frozenset({"", "171mail", "mailcom", "onet", "gazeta"})
 _CODEX_LOGIN_METHODS = _LOGIN_METHODS | {"mailcatcher"}
@@ -462,6 +479,40 @@ async def _transition_worker_status(
     block_active_task_terminations: bool = False,
     destroy_recovery: bool = False,
 ) -> Worker:
+    loop = asyncio.get_running_loop()
+    lock_key = (loop, worker_id)
+    entry = _worker_lifecycle_transition_locks.setdefault(
+        lock_key, _WorkerLifecycleTransitionLock(),
+    )
+    entry.users += 1
+    try:
+        async with entry.lock:
+            return await _transition_worker_status_locked(
+                db,
+                worker_id,
+                allowed_statuses=allowed_statuses,
+                target_status=target_status,
+                block_active_task_terminations=block_active_task_terminations,
+                destroy_recovery=destroy_recovery,
+            )
+    finally:
+        entry.users -= 1
+        if (
+            entry.users == 0
+            and _worker_lifecycle_transition_locks.get(lock_key) is entry
+        ):
+            _worker_lifecycle_transition_locks.pop(lock_key, None)
+
+
+async def _transition_worker_status_locked(
+    db: AsyncSession,
+    worker_id: int,
+    *,
+    allowed_statuses: tuple[str, ...] | frozenset[str],
+    target_status: str,
+    block_active_task_terminations: bool = False,
+    destroy_recovery: bool = False,
+) -> Worker:
     """Atomically claim a Worker lifecycle transition.
 
     Routes perform authorization from a read first.  End that read transaction
@@ -535,6 +586,18 @@ async def _transition_worker_status(
             f"Worker 当前状态 {current_status}，不允许该操作",
         )
     if block_active_task_terminations:
+        # Plan/Run writers take this same Worker row as their admission fence.
+        # Once the CAS above owns ``destroying``, no new Worker Plan generation
+        # can commit. Historical terminal rows are audit, not runtime owners;
+        # only active/unarchived/native-runtime evidence blocks destruction.
+        plan_rows, run_rows = await _worker_plan_runtime_blockers(db, worker_id)
+        if plan_rows or run_rows:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                _worker_plan_ownership_block_detail(plan_rows, run_rows),
+            )
+
         # Global cross-process order is Task -> Worker -> receipt.  The Worker
         # status change remains uncommitted until every receipt has been
         # checked; a blocker rolls the lifecycle claim back atomically.
@@ -569,6 +632,231 @@ async def _transition_worker_status(
         raise HTTPException(404, "Worker not found")
     await db.refresh(worker)
     return worker
+
+
+async def _worker_plan_runtime_blockers(
+    db: AsyncSession,
+    worker_id: int,
+) -> tuple[
+    list[tuple[int, int | None, int | None]],
+    list[tuple[int, int | None, str, int | None]],
+]:
+    """Return active or unclean first-class Plan evidence for one Worker."""
+
+    from backend.main import dispatcher
+    from backend.models.instance import Instance
+    from backend.models.plan import Plan
+    from backend.models.plan_agent import (
+        PlanAgentRun,
+        PlanAgentWorkerDispatchReceipt,
+    )
+    from backend.services.plan_agent_runner import active_plan_run_ids
+    from backend.services.worker_plan_dispatch import (
+        WorkerPlanDispatchConflict,
+        snapshot_worker_dispatch_receipt,
+        worker_mirror_run_is_clean,
+    )
+
+    worker_runs = list(
+        (
+            await db.execute(
+                select(
+                    PlanAgentRun.id,
+                    PlanAgentRun.plan_id,
+                    PlanAgentRun.status,
+                    PlanAgentRun.instance_id,
+                )
+                .where(PlanAgentRun.worker_id == worker_id)
+                .order_by(PlanAgentRun.id)
+            )
+        ).all()
+    )
+    worker_run_ids = {int(row.id) for row in worker_runs}
+    unclean_run_ids: set[int] = set()
+    for run_id in sorted(worker_run_ids):
+        # A status string is not cleanup proof. Manager-side Worker Runs own
+        # remote Step mirrors, so validate their exact dispatch history and
+        # reject any contradictory local provider-runtime receipt.
+        if not await worker_mirror_run_is_clean(db, run_id=run_id):
+            unclean_run_ids.add(run_id)
+
+    # Dispatch ownership is frozen on the receipt.  Query it directly instead
+    # of reaching it only through the Run's current worker_id: a Run may have
+    # drifted, been detached, or been lost while the old Worker still owns an
+    # uncertain remote boundary.
+    dispatch_receipts = list(
+        (
+            await db.execute(
+                select(PlanAgentWorkerDispatchReceipt)
+                .where(PlanAgentWorkerDispatchReceipt.worker_id == worker_id)
+                .order_by(PlanAgentWorkerDispatchReceipt.id)
+            )
+        ).scalars()
+    )
+    dispatch_run_ids = {int(receipt.run_id) for receipt in dispatch_receipts}
+    dispatch_runs = (
+        {
+            int(row.id): row
+            for row in (
+                await db.execute(
+                    select(
+                        PlanAgentRun.id,
+                        PlanAgentRun.plan_id,
+                        PlanAgentRun.status,
+                        PlanAgentRun.instance_id,
+                        PlanAgentRun.worker_id,
+                        PlanAgentRun.generation,
+                    ).where(PlanAgentRun.id.in_(sorted(dispatch_run_ids)))
+                )
+            ).all()
+        }
+        if dispatch_run_ids
+        else {}
+    )
+    dispatch_plan_ids = {int(receipt.plan_id) for receipt in dispatch_receipts}
+    dispatch_plans = (
+        {
+            int(row.id): row
+            for row in (
+                await db.execute(
+                    select(
+                        Plan.id,
+                        Plan.target_task_id,
+                        Plan.worker_id,
+                    ).where(Plan.id.in_(sorted(dispatch_plan_ids)))
+                )
+            ).all()
+        }
+        if dispatch_plan_ids
+        else {}
+    )
+    detached_dispatch_blockers: list[
+        tuple[int, int | None, str, int | None]
+    ] = []
+    for receipt in dispatch_receipts:
+        # Complete receipt history for Runs still owned by this Worker was
+        # validated above, including historical settled generations.  This
+        # second pass exists to catch frozen receipts whose Run/Plan drifted
+        # away from the Worker and must remain fail-closed.
+        if receipt.run_id in worker_run_ids:
+            continue
+        run = dispatch_runs.get(int(receipt.run_id))
+        plan = dispatch_plans.get(int(receipt.plan_id))
+        try:
+            snapshot = snapshot_worker_dispatch_receipt(receipt)
+            valid_shape = True
+        except WorkerPlanDispatchConflict:
+            snapshot = None
+            valid_shape = False
+        exact_identity = bool(
+            run is not None
+            and plan is not None
+            and run.plan_id == receipt.plan_id
+            and run.worker_id == receipt.worker_id
+            and run.generation == receipt.run_generation
+            and plan.worker_id == receipt.worker_id
+            and plan.target_task_id == receipt.target_task_id
+        )
+        if (
+            valid_shape
+            and snapshot is not None
+            and snapshot.status == "settled"
+            and exact_identity
+        ):
+            continue
+        blocker_status = (
+            f"dispatch:{receipt.status}"
+            if valid_shape
+            else f"dispatch:malformed-{receipt.status}"
+        )
+        detached_dispatch_blockers.append(
+            (
+                int(receipt.run_id),
+                int(receipt.plan_id),
+                blocker_status,
+                run.instance_id if run is not None else None,
+            )
+        )
+    reverse_owner_run_ids = (
+        set(
+            (
+                await db.execute(
+                    select(Instance.current_plan_run_id).where(
+                        Instance.current_plan_run_id.in_(worker_run_ids)
+                    )
+                )
+            ).scalars()
+        )
+        if worker_run_ids
+        else set()
+    )
+    live_run_ids = set(active_plan_run_ids())
+    if dispatcher is not None:
+        for lifecycle in getattr(dispatcher, "_running_tasks", {}).values():
+            if lifecycle.done():
+                continue
+            for attribute in ("_ccm_plan_run_id", "_ccm_worker_plan_run_id"):
+                run_id = getattr(lifecycle, attribute, None)
+                if type(run_id) is int:
+                    live_run_ids.add(run_id)
+
+    terminal_statuses = {"completed", "failed", "cancelled"}
+    run_rows = [
+        tuple(row)
+        for row in worker_runs
+        if row.status not in terminal_statuses
+        or row.instance_id is not None
+        or row.id in unclean_run_ids
+        or row.id in reverse_owner_run_ids
+        or row.id in live_run_ids
+    ]
+    run_rows.extend(detached_dispatch_blockers)
+    run_rows.sort(key=lambda row: (row[0], row[2]))
+    plan_rows = [
+        tuple(row)
+        for row in (
+            await db.execute(
+                select(Plan.id, Plan.target_task_id, Plan.active_run_id)
+                .where(
+                    Plan.worker_id == worker_id,
+                    or_(
+                        Plan.archived_at.is_(None),
+                        Plan.active_run_id.is_not(None),
+                    ),
+                )
+                .order_by(Plan.id)
+            )
+        ).all()
+    ]
+    return plan_rows, run_rows
+
+
+def _worker_plan_ownership_block_detail(
+    plan_rows: list[tuple[int, int | None, int | None]],
+    run_rows: list[tuple[int, int | None, str, int | None]],
+) -> str:
+    parts: list[str] = []
+    if plan_rows:
+        parts.append(
+            "Plans "
+            + ", ".join(
+                f"{plan_id}(task={target_task_id}, active_run={active_run_id})"
+                for plan_id, target_task_id, active_run_id in plan_rows[:20]
+            )
+        )
+    if run_rows:
+        parts.append(
+            "Plan Runs "
+            + ", ".join(
+                f"{run_id}(plan={plan_id}, status={status}, instance={instance_id})"
+                for run_id, plan_id, status, instance_id in run_rows[:20]
+            )
+        )
+    return (
+        "Worker destroy is blocked by active first-class Plan runtime: "
+        + "; ".join(parts)
+        + ". Cancel active Runs and archive inactive Plans before retrying."
+    )
 
 
 @router.post("/{worker_id}/stop", response_model=WorkerResponse)
@@ -676,6 +964,21 @@ async def _migrate_back_then_destroy(
         )
         return
 
+    # Admission and background coordination are separate transactions. A Plan
+    # may have committed just after the HTTP transition's snapshot, so repeat
+    # the fail-closed ownership check before mutating or migrating any Task.
+    async with db_factory() as db:
+        plan_rows, run_rows = await _worker_plan_runtime_blockers(db, worker_id)
+    if plan_rows or run_rows:
+        detail = _worker_plan_ownership_block_detail(plan_rows, run_rows)
+        logger.error("destroy: worker %s blocked: %s", worker_id, detail)
+        await _mark_worker_destroy_blocked(
+            db_factory,
+            destroy_claim=destroy_claim,
+            detail=detail,
+        )
+        return
+
     # TaskMigrator 已接受 destroying 状态作为迁移源，无需临时改 ready
     async with db_factory() as db:
         result = await db.execute(select(Task).where(Task.worker_id == worker_id))
@@ -752,14 +1055,21 @@ async def _migrate_back_then_destroy(
                 )
             ).all()
         )
-    if remaining:
-        detail = (
-            "Worker 销毁已拒绝：仍有 Task 指向该 Worker（"
-            + ", ".join(
-                f"{task_id}:{status}" for task_id, status in remaining[:20]
+        plan_rows, run_rows = await _worker_plan_runtime_blockers(db, worker_id)
+    if remaining or plan_rows or run_rows:
+        blockers: list[str] = []
+        if remaining:
+            blockers.append(
+                "Tasks "
+                + ", ".join(
+                    f"{task_id}:{status}" for task_id, status in remaining[:20]
+                )
             )
-            + "）"
-        )
+        if plan_rows or run_rows:
+            blockers.append(
+                _worker_plan_ownership_block_detail(plan_rows, run_rows)
+            )
+        detail = "Worker 销毁已拒绝：仍有持久所有权指向该 Worker（" + "; ".join(blockers) + "）"
         logger.error("destroy: worker %s blocked: %s", worker_id, detail)
         await _mark_worker_destroy_blocked(
             db_factory,

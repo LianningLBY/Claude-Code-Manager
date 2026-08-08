@@ -77,6 +77,8 @@ function plan(current: PlanVersion, prior: PlanVersion): PlanResource {
     updated_at: '2026-08-02T09:00:00Z',
     display_state: 'awaiting_review',
     legacy: false,
+    ownership: 'standard',
+    read_only: false,
     latest_run_status: 'completed',
     latest_run_error: null,
     pipeline_config: {
@@ -388,7 +390,57 @@ describe('PlanDetail', () => {
       .toBeInTheDocument();
   });
 
-  it('immediately resumes the draft state and shows submitted input history', async () => {
+  it('keeps cancelling in the active status projection without offering another cancel', async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({});
+    const cancellingRun = {
+      id: 16,
+      plan_id: 4,
+      run_type: 'capability',
+      status: 'cancelling',
+      current_stage: 'planner',
+      base_version_id: null,
+      source_run_id: null,
+      result_version_id: null,
+      request_text: 'Design the migration',
+      round: 1,
+      generation: 2,
+      instance_id: 2,
+      worker_id: null,
+      open_input_request_id: null,
+      interaction_count: 0,
+      max_interactions: 5,
+      execution_seconds: 8,
+      last_execution_started_at: '2026-08-03T08:00:00Z',
+      review_verdict: null,
+      review_feedback: null,
+      review_exhausted: false,
+      error: 'Cancellation requested',
+      created_at: '2026-08-03T08:00:00Z',
+      updated_at: '2026-08-03T08:00:08Z',
+      finished_at: null,
+      steps: [],
+      input_requests: [],
+    } satisfies PlanRun;
+    const resource = plan(current, prior);
+    resource.current_version_id = null;
+    resource.current_version = null;
+    resource.active_run_id = cancellingRun.id;
+    resource.active_run = cancellingRun;
+    resource.display_state = 'cancelling';
+    resource.ownership = 'capability';
+    resource.read_only = true;
+    resource.latest_run_status = 'cancelling';
+    vi.mocked(api.listPlanVersions).mockResolvedValue([]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([cancellingRun]);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Cancelling v1 generation');
+    expect(screen.queryByRole('button', { name: 'Cancel planning' })).not.toBeInTheDocument();
+  });
+
+  it('keeps Capability input writable while all ordinary Plan controls stay read-only', async () => {
     const prior = version({ id: 11, version_number: 1 });
     const current = version({});
     const openRequest = {
@@ -418,7 +470,7 @@ describe('PlanDetail', () => {
     const waitingRun = {
       id: 21,
       plan_id: 4,
-      run_type: 'initial',
+      run_type: 'capability',
       status: 'waiting_user',
       current_stage: 'planner',
       base_version_id: null,
@@ -464,6 +516,8 @@ describe('PlanDetail', () => {
     resource.active_run = waitingRun;
     resource.open_input_request = openRequest;
     resource.display_state = 'waiting_user';
+    resource.ownership = 'capability';
+    resource.read_only = true;
     resource.latest_run_status = 'waiting_user';
     vi.mocked(api.listPlanVersions).mockResolvedValue([]);
     vi.mocked(api.listPlanResourceRuns)
@@ -472,12 +526,105 @@ describe('PlanDetail', () => {
     vi.mocked(api.answerPlanInput).mockResolvedValue(answeredRequest);
 
     render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+    expect(await screen.findByTestId('capability-plan-read-only')).toHaveTextContent(
+      'You can inspect it and answer an open input request here',
+    );
+    expect(screen.getByRole('button', { name: 'Submit answers' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Cancel planning' })).not.toBeInTheDocument();
     await userEvent.type((await screen.findAllByRole('textbox'))[0], 'Sunday 02:00 UTC');
     await userEvent.click(screen.getByRole('button', { name: 'Submit answers' }));
 
     expect(await screen.findByRole('status')).toHaveTextContent('v1 generation queued');
     expect(screen.getByText('v1 input history (1)')).toBeInTheDocument();
     expect(screen.getByText('Sunday 02:00 UTC')).toBeVisible();
+  });
+
+  it('renders a completed Capability Plan as navigation and audit only', async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({});
+    const resource = plan(current, prior);
+    resource.target_task_id = 8;
+    resource.ownership = 'capability';
+    resource.read_only = true;
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([]);
+    const navigate = vi.fn();
+
+    render(
+      <PlanDetail
+        plan={resource}
+        onRefresh={vi.fn()}
+        onNavigateTask={navigate}
+        onToggleVersion={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByTestId('capability-plan-read-only')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Current proposal' })).toBeInTheDocument();
+    const openTask = screen.getByRole('button', { name: 'Open related Task #8' });
+    await userEvent.click(openTask);
+    expect(navigate).toHaveBeenCalledWith(8);
+
+    for (const name of [
+      'Approve & attach v2',
+      'Approve v2 only',
+      'Reject v2',
+      'Attach to next message',
+      'Cancel planning',
+      'Archive',
+    ]) {
+      expect(screen.queryByRole('button', { name })).not.toBeInTheDocument();
+    }
+    expect(screen.queryByPlaceholderText('Revise from v2…')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Create execution Task/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Refresh contexts/ })).not.toBeInTheDocument();
+  });
+
+  it('does not offer retry for a failed Capability-owned Plan', async () => {
+    const prior = version({ id: 11, version_number: 1 });
+    const current = version({});
+    const failedRun = {
+      id: 24,
+      plan_id: 4,
+      run_type: 'capability',
+      status: 'failed',
+      current_stage: 'failed',
+      base_version_id: current.id,
+      source_run_id: null,
+      result_version_id: null,
+      request_text: 'Design the migration',
+      round: 1,
+      generation: 2,
+      instance_id: null,
+      worker_id: null,
+      open_input_request_id: null,
+      interaction_count: 0,
+      max_interactions: 5,
+      execution_seconds: 8,
+      last_execution_started_at: null,
+      review_verdict: null,
+      review_feedback: null,
+      review_exhausted: false,
+      error: 'Planner failed',
+      created_at: '2026-08-03T08:00:00Z',
+      updated_at: '2026-08-03T08:00:08Z',
+      finished_at: '2026-08-03T08:00:08Z',
+      steps: [],
+      input_requests: [],
+    } satisfies PlanRun;
+    const resource = plan(current, prior);
+    resource.ownership = 'capability';
+    resource.read_only = true;
+    resource.display_state = 'failed';
+    resource.latest_run_status = 'failed';
+    resource.latest_run_error = 'Planner failed';
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([failedRun]);
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
+
+    expect(await screen.findByText(/Capability Core controls retry/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Retry planning' })).not.toBeInTheDocument();
   });
 
   it('hides stale warnings after the selected Version has already been applied', async () => {

@@ -32,6 +32,7 @@ from backend.schemas.task import (
     WorkerRoutingConfigSnapshot,
 )
 from backend.services.task_queue import (
+    TaskDeletePreflight,
     TaskQueue,
     TaskWaitingCapabilityConflict,
     is_task_status_deletable,
@@ -95,7 +96,9 @@ from backend.services.worker_task_termination import (
     persist_worker_preflight_rejection,
     receipt_not_found_payload,
     reconcile_manager_receipt,
+    reconcile_manager_task_delete_receipt,
     serialize_receipt,
+    stage_manager_task_delete_receipt,
     stage_worker_receipt,
     task_not_found_payload,
     worker_task_termination_authority_predicate,
@@ -130,6 +133,7 @@ _WORKER_SKILL_EDITABLE_STATUSES = WORKER_ROUTING_SAFE_STATUSES | {"pending"}
 _PR_REVIEW_CHAT_TERMINAL_STATUSES = frozenset(
     {"approved", "merged", "commented", "error"}
 )
+_PLAN_CASCADE_PROTOCOL_VERSION = 1
 
 
 def _require_not_waiting_capability(task: Task, *, action: str) -> None:
@@ -3019,6 +3023,33 @@ async def _retry_local_task_safely(
         return retried
 
 
+@router.get("/{task_id}/plan-delete-audit", include_in_schema=False)
+async def audit_worker_task_plan_delete(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Prove whether an exact Worker Task still owns first-class Plans."""
+
+    require_internal_service(request)
+    from backend.models.plan import Plan
+
+    plan_ids = list(
+        (
+            await db.execute(
+                select(Plan.id)
+                .where(Plan.target_task_id == task_id)
+                .order_by(Plan.id)
+            )
+        ).scalars()
+    )
+    return {
+        "plan_cascade_protocol": _PLAN_CASCADE_PROTOCOL_VERSION,
+        "task_exists": await db.get(Task, task_id) is not None,
+        "remaining_target_plan_ids": plan_ids,
+    }
+
+
 @router.delete("/{task_id}")
 async def delete_task(
     task_id: int,
@@ -3087,89 +3118,102 @@ async def delete_task(
                     409,
                     "Task moved back to this Manager; refresh before deleting",
                 )
-            if await active_worker_task_termination_receipt(db, task_id):
+            active_delete = await active_worker_task_termination_receipt(
+                db,
+                task_id,
+            )
+            operation_id: str
+            if active_delete is not None:
+                if not (
+                    active_delete.side == "manager"
+                    and active_delete.operation == "delete"
+                    and active_delete.worker_id == worker_task.worker_id
+                    and active_delete.active_task_id == task_id
+                    and active_delete.status
+                    in {"pending_remote", "conflict", "awaiting_ack"}
+                ):
+                    raise HTTPException(
+                        409,
+                        "Task has a different active Worker termination receipt",
+                    )
+                operation_id = active_delete.operation_id
+                await db.rollback()
+            else:
+                if not is_task_status_deletable(
+                    mode=worker_task.mode,
+                    status=worker_task.status,
+                ):
+                    raise HTTPException(
+                        400,
+                        "Cannot delete task (not in deletable state)",
+                    )
+                delete_fence = task_delete_fence(worker_task)
+                staged_operation_id: str | None = None
+
+                async def stage_durable_delete(
+                    preflight: TaskDeletePreflight,
+                ) -> bool:
+                    nonlocal staged_operation_id
+                    locked_task = await db.get(
+                        Task,
+                        task_id,
+                        populate_existing=True,
+                    )
+                    if locked_task is None:
+                        return False
+                    receipt = await stage_manager_task_delete_receipt(
+                        db,
+                        locked_task,
+                        plan_ids=preflight.plan_ids,
+                    )
+                    staged_operation_id = receipt.operation_id
+                    return True
+
+                prepared = await queue.delete(
+                    task_id,
+                    expected_fence=delete_fence,
+                    prepare_remote_worker_delete=stage_durable_delete,
+                )
+                if not prepared or staged_operation_id is None:
+                    raise HTTPException(
+                        409,
+                        "Worker Task deletion preflight could not freeze the "
+                        "exact local Task/Plan graph; no remote mutation was "
+                        "attempted",
+                    )
+                operation_id = staged_operation_id
+
+            try:
+                outcome = await _finish_task_operation(
+                    reconcile_manager_task_delete_receipt(
+                        db,
+                        operation_id,
+                        proxy_request=_proxy,
+                        protocol_check=(
+                            worker_proxy.require_task_plan_delete_protocol
+                        ),
+                    )
+                )
+            except WorkerTaskTerminationPending as exc:
+                raise HTTPException(
+                    503,
+                    "Worker Task deletion is durably quarantined and will "
+                    f"continue by read-only reconciliation: {exc}",
+                ) from exc
+            except DurableWorkerTerminationConflict as exc:
                 raise HTTPException(
                     409,
-                    "Task has an active Worker termination receipt",
-                )
-            if not is_task_status_deletable(
-                mode=worker_task.mode,
-                status=worker_task.status,
-            ):
-                raise HTTPException(
-                    400,
-                    "Cannot delete task (not in deletable state)",
-                )
+                    f"Worker Task deletion identity conflict: {exc}",
+                ) from exc
+            worker_proxy.relay.unsubscribe_task(outcome.worker_id, task_id)
+        return {
+            "ok": True,
+            "plan_cascade_protocol": _PLAN_CASCADE_PROTOCOL_VERSION,
+            "deleted_plan_ids": list(outcome.plan_ids),
+            "remaining_target_plan_ids": [],
+        }
 
-            worker_id = worker_task.worker_id
-            delete_fence = task_delete_fence(worker_task)
-            remote_result = await _proxy(
-                worker_task,
-                "DELETE",
-                f"/api/tasks/{task_id}",
-                require_json=True,
-                allow_task_absent=True,
-                operation_lock_held=True,
-            )
-            if (
-                not isinstance(remote_result, dict)
-                or remote_result.get("ok") is not True
-            ):
-                await db.rollback()
-                raise HTTPException(
-                    502,
-                    "Worker did not explicitly confirm task deletion; "
-                    "Manager mirror was preserved",
-                )
-
-            # Drop the pre-proxy read snapshot. TaskQueue.delete starts with an
-            # exact current-write CAS over the original Worker generation, so
-            # a concurrent relay/retry cannot make us erase a newer mirror.
-            await db.rollback()
-            ok = await queue.delete(
-                task_id,
-                expected_fence=delete_fence,
-                remote_worker_deleted=True,
-            )
-            if not ok:
-                # Relay/status updates can legitimately land after the Worker
-                # has committed deletion. Remote mutation/forwarding and task
-                # migration are still fenced by the two locks above, so a
-                # current mirror on the same Worker is only stale state, not a
-                # rebuilt remote generation. Lock and delete that exact current
-                # row to make the cross-CCM delete converge.
-                await db.rollback()
-                current_worker_task = (
-                    await db.execute(
-                        select(Task).where(Task.id == task_id).with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if current_worker_task is None:
-                    ok = True
-                elif current_worker_task.worker_id != worker_id:
-                    await db.rollback()
-                    worker_proxy.relay.unsubscribe_task(worker_id, task_id)
-                    raise HTTPException(
-                        409,
-                        "Worker deleted the old task, but the Manager mirror "
-                        "moved to another execution location and was preserved",
-                    )
-                else:
-                    current_fence = task_delete_fence(current_worker_task)
-                    ok = await queue.delete(
-                        task_id,
-                        expected_fence=current_fence,
-                        remote_worker_deleted=True,
-                    )
-                if not ok:
-                    raise HTTPException(
-                        409,
-                        "Worker deleted the task, but local runtime ownership "
-                        "could not be safely reconciled; the mirror was preserved",
-                    )
-            worker_proxy.relay.unsubscribe_task(worker_id, task_id)
-        return {"ok": True}
-
+    deleted_local_plan_ids: list[int] = []
     lifecycle_ids = set(
         (
             await db.execute(
@@ -3199,7 +3243,17 @@ async def delete_task(
             await stack.enter_async_context(
                 instance_manager._instance_lifecycle_lock(instance_id)
             )
-        ok = await queue.delete(task_id)
+
+        async def capture_delete_preflight(
+            preflight: TaskDeletePreflight,
+        ) -> bool:
+            deleted_local_plan_ids.extend(preflight.plan_ids)
+            return True
+
+        ok = await queue.delete(
+            task_id,
+            before_delete=capture_delete_preflight,
+        )
     if not ok:
         db.expire_all()
         current = await db.get(Task, task_id)
@@ -3208,7 +3262,12 @@ async def delete_task(
         raise HTTPException(
             400, "Cannot delete task (not found or not in deletable state)"
         )
-    return {"ok": True}
+    return {
+        "ok": True,
+        "plan_cascade_protocol": _PLAN_CASCADE_PROTOCOL_VERSION,
+        "deleted_plan_ids": deleted_local_plan_ids,
+        "remaining_target_plan_ids": [],
+    }
 
 
 async def _worker_task_or_none(db: AsyncSession, task_id: int) -> Task | None:

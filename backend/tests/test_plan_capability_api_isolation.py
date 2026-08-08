@@ -133,7 +133,7 @@ async def _seed_waiting_capability_plan(session_factory) -> dict[str, int]:
         run.open_input_request_id = input_request.id
         execution.handle_kind = "plan_agent_run"
         execution.handle_id = str(run.id)
-        execution.handle_generation = run.generation
+        execution.handle_generation = 0
         await db.commit()
         return {
             "plan_id": plan.id,
@@ -213,6 +213,13 @@ async def test_capability_owned_plan_blocks_generic_writes_but_keeps_reads_and_i
         response = await client.get(url)
         assert response.status_code == 200, response.text
 
+    resource = (await client.get(f"/api/plans/{plan_id}")).json()
+    assert resource["ownership"] == "capability"
+    assert resource["read_only"] is True
+    assert resource["display_state"] == "waiting_user"
+    assert resource["active_run"]["run_type"] == "capability"
+    assert resource["open_input_request"]["id"] == ids["input_request_id"]
+
     answered = await client.post(
         f"/api/plan-runs/{run_id}/input-requests/"
         f"{ids['input_request_id']}/answer",
@@ -240,6 +247,106 @@ async def test_capability_owned_plan_blocks_generic_writes_but_keeps_reads_and_i
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 1
         assert await db.scalar(select(func.count(PlanApplication.id))) == 0
         assert await db.scalar(select(func.count(Task.id))) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("already_answered", [False, True])
+async def test_capability_owned_plan_rejects_ordinary_active_run_input_answer(
+    already_answered,
+    client,
+    session_factory,
+):
+    """Historical Capability ownership cannot be bypassed by an ordinary Run."""
+
+    ids = await _seed_waiting_capability_plan(session_factory)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = await db.get(Plan, ids["plan_id"])
+        capability_run = await db.get(PlanAgentRun, ids["run_id"])
+        capability_input = await db.get(PlanInputRequest, ids["input_request_id"])
+        capability_run.status = "completed"
+        capability_run.current_stage = "complete"
+        capability_run.open_input_request_id = None
+        capability_run.finished_at = datetime.utcnow()
+        capability_input.status = "cancelled"
+        capability_input.cancelled_at = datetime.utcnow()
+
+        ordinary_run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="user_revision",
+            request_text="Malformed ordinary continuation",
+            pipeline_config=pipeline,
+            status="waiting_user",
+            current_stage="planner",
+            generation=7,
+            max_interactions=3,
+        )
+        db.add(ordinary_run)
+        await db.flush()
+        ordinary_input = PlanInputRequest(
+            plan_id=plan.id,
+            run_id=ordinary_run.id,
+            source_step_id=2,
+            requested_by="planner",
+            questions=[
+                {
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should be used?",
+                    "response_type": "text",
+                    "options": [],
+                    "required": True,
+                }
+            ],
+            status="answered" if already_answered else "open",
+            answers=(
+                [{"question_id": "scope", "value": "existing"}]
+                if already_answered
+                else None
+            ),
+            idempotency_key=f"ordinary-input-{ordinary_run.id}",
+            answer_idempotency_key=(
+                "ordinary-answer" if already_answered else None
+            ),
+            opened_at=datetime.utcnow(),
+            answered_at=datetime.utcnow() if already_answered else None,
+        )
+        db.add(ordinary_input)
+        await db.flush()
+        ordinary_run.open_input_request_id = ordinary_input.id
+        plan.active_run_id = ordinary_run.id
+        await db.commit()
+        ordinary_run_id = ordinary_run.id
+        ordinary_input_id = ordinary_input.id
+
+    response = await client.post(
+        f"/api/plan-runs/{ordinary_run_id}/input-requests/"
+        f"{ordinary_input_id}/answer",
+        json={
+            "expected_run_generation": 7,
+            "idempotency_key": "ordinary-answer",
+            "answers": [{"question_id": "scope", "value": "repository"}],
+        },
+    )
+
+    _assert_read_only(response)
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, ordinary_run_id)
+        input_request = await db.get(PlanInputRequest, ordinary_input_id)
+        assert run.status == "waiting_user"
+        assert run.generation == 7
+        assert run.open_input_request_id == ordinary_input_id
+        assert input_request.status == (
+            "answered" if already_answered else "open"
+        )
+        assert input_request.answers == (
+            [{"question_id": "scope", "value": "existing"}]
+            if already_answered
+            else None
+        )
+        assert input_request.answer_idempotency_key == (
+            "ordinary-answer" if already_answered else None
+        )
 
 
 @pytest.mark.asyncio
@@ -293,6 +400,10 @@ async def test_capability_ownership_scans_deep_historical_runs(
         json={"title": "Must not change", "expected_lock_version": 0},
     )
     _assert_read_only(response)
+    resource = await client.get(f"/api/plans/{plan_id}")
+    assert resource.status_code == 200, resource.text
+    assert resource.json()["ownership"] == "capability"
+    assert resource.json()["read_only"] is True
     async with session_factory() as db:
         plan = await db.get(Plan, plan_id)
         assert plan.title == f"Historical marker {marker}"
@@ -304,6 +415,35 @@ async def test_capability_ownership_scans_deep_historical_runs(
             )
             == 251
         )
+
+
+@pytest.mark.asyncio
+async def test_capability_cancelling_state_matches_detail_and_collection_projection(
+    client,
+    session_factory,
+):
+    ids = await _seed_waiting_capability_plan(session_factory)
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, ids["run_id"])
+        run.cancellation_target_generation = run.generation
+        run.generation += 1
+        run.status = "cancelling"
+        run.open_input_request_id = None
+        await db.commit()
+
+    detail = await client.get(f"/api/plans/{ids['plan_id']}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["display_state"] == "cancelling"
+    assert detail.json()["active_run"]["status"] == "cancelling"
+    assert detail.json()["read_only"] is True
+
+    collection = await client.get(
+        "/api/plans",
+        params={"display_state": "cancelling"},
+    )
+    assert collection.status_code == 200, collection.text
+    assert [row["id"] for row in collection.json()] == [ids["plan_id"]]
+    assert collection.json()[0]["display_state"] == "cancelling"
 
 
 @pytest.mark.asyncio

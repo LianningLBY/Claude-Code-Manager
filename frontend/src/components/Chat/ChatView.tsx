@@ -734,10 +734,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }, 15_000);
     return () => window.clearTimeout(timer);
   }, [onTaskUpdated, stillRunning]);
-  const planAttentionCount = versionedPlans.filter((plan) =>
-    ['waiting_user', 'awaiting_review', 'planner', 'reviewer', 'queued', 'running'].includes(plan.display_state)
-    || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
-  ).length;
+  const planAttentionCount = versionedPlans.filter((plan) => (
+    plan.display_state === 'waiting_user'
+    || (!plan.read_only && (
+      ['awaiting_review', 'planner', 'reviewer', 'queued', 'running', 'cancelling'].includes(plan.display_state)
+      || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
+    ))
+  )).length;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const historyCursorRef = useRef<{

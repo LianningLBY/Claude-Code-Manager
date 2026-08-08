@@ -111,6 +111,7 @@ ValidateCapabilityOutputCallback = Callable[
     [AsyncSession, Task, CapabilityInvocation, CapabilityExecution],
     Awaitable[ValidatedCapabilityOutput[_CompletionValue]],
 ]
+LockedTaskAuthorizationCallback = Callable[[AsyncSession, Task], Awaitable[None]]
 
 
 def capability_task_lock(task_id: int) -> asyncio.Lock:
@@ -204,6 +205,15 @@ def _ensure_local_task(task: Task) -> None:
     if task.status == "migrating":
         raise CapabilityUnsupportedScopeError(
             "Capabilities cannot be created while a task is migrating"
+        )
+
+
+def _ensure_public_human_task(task: Task) -> None:
+    """Reject a human lifecycle mutation that crossed Delivery admission."""
+
+    if task.mode == "delivery_loop" or task.delivery_run_id is not None:
+        raise CapabilityConflictError(
+            "Delivery-owned Tasks cannot use the public advisory Capability lifecycle"
         )
 
 
@@ -323,6 +333,7 @@ async def _create_invocation(
     resume_policy: Literal["attach_only", "controller"],
     requested_by_user_id: int | None,
     request_source_log_id: int | None = None,
+    authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
 ) -> tuple[CapabilityInvocation, bool]:
     capability_key = capability_key.strip()
     idempotency_key = idempotency_key.strip()
@@ -351,13 +362,18 @@ async def _create_invocation(
             raise CapabilityConflictError(
                 "Idempotency key was already used for a different request"
             )
-        return existing, False
+        if authorize_locked_task is None:
+            return existing, False
 
-    if not settings.capability_core_enabled and source != "delivery_controller":
+    if (
+        existing is None
+        and not settings.capability_core_enabled
+        and source != "delivery_controller"
+    ):
         raise CapabilityDisabledError("Capability Core is disabled")
 
-    definition = resolve_capability(capability_key)
-    if definition is None:
+    definition = resolve_capability(capability_key) if existing is None else None
+    if existing is None and definition is None:
         raise CapabilityUnavailableError(
             f"Capability {capability_key!r} is not registered"
         )
@@ -374,6 +390,10 @@ async def _create_invocation(
                 require_termination_clear=True,
             )
             _ensure_local_task(task)
+            if authorize_locked_task is not None:
+                await authorize_locked_task(db, task)
+            if source == "human_request":
+                _ensure_public_human_task(task)
 
             existing = await _find_idempotent(
                 db,
@@ -394,6 +414,15 @@ async def _create_invocation(
                     )
                 await db.commit()
                 return existing, False
+
+            if not settings.capability_core_enabled and source != "delivery_controller":
+                raise CapabilityDisabledError("Capability Core is disabled")
+            if definition is None:
+                definition = resolve_capability(capability_key)
+            if definition is None:
+                raise CapabilityUnavailableError(
+                    f"Capability {capability_key!r} is not registered"
+                )
 
             if not settings.capability_core_enabled:
                 if source != "delivery_controller":
@@ -486,6 +515,9 @@ async def _create_invocation(
             raise CapabilityConflictError(
                 "A concurrent capability request won admission"
             ) from exc
+        except BaseException:
+            await _rollback_safely(db)
+            raise
 
     await broadcast_capability_event(
         "capability_invocation_created",
@@ -503,6 +535,7 @@ async def create_human_invocation(
     request_payload: dict,
     idempotency_key: str,
     requested_by_user_id: int | None,
+    authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
 ) -> tuple[CapabilityInvocation, bool]:
     """Create the only public contract: advisory + attach-only."""
 
@@ -516,6 +549,7 @@ async def create_human_invocation(
         purpose="advisory",
         resume_policy="attach_only",
         requested_by_user_id=requested_by_user_id,
+        authorize_locked_task=authorize_locked_task,
     )
 
 
@@ -1379,11 +1413,17 @@ async def consume_ready_invocation(
     invocation_id: int,
     expected_state_version: int,
     allow_workflow_owned: bool = False,
+    authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
 ) -> CapabilityInvocation:
     task_id = await _invocation_task_id(db, invocation_id)
+    await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            if authorize_locked_task is not None:
+                await authorize_locked_task(db, task)
+            if not allow_workflow_owned:
+                _ensure_public_human_task(task)
             if not allow_workflow_owned and (
                 invocation.source != "human_request"
                 or invocation.resume_policy != "attach_only"
@@ -1409,6 +1449,9 @@ async def consume_ready_invocation(
         except CapabilityError:
             await db.rollback()
             raise
+        except BaseException:
+            await _rollback_safely(db)
+            raise
 
 
 async def cancel_invocation(
@@ -1417,13 +1460,19 @@ async def cancel_invocation(
     invocation_id: int,
     expected_state_version: int,
     allow_workflow_owned: bool = False,
+    authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
 ) -> CapabilityInvocation:
     """Request cancellation; queued/ready work terminates synchronously."""
 
     task_id = await _invocation_task_id(db, invocation_id)
+    await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            _, invocation, executions = await _lock_aggregate(db, invocation_id)
+            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            if authorize_locked_task is not None:
+                await authorize_locked_task(db, task)
+            if not allow_workflow_owned:
+                _ensure_public_human_task(task)
             if not allow_workflow_owned and (
                 invocation.source != "human_request"
                 or invocation.resume_policy != "attach_only"
@@ -1471,6 +1520,9 @@ async def cancel_invocation(
             return invocation
         except CapabilityError:
             await db.rollback()
+            raise
+        except BaseException:
+            await _rollback_safely(db)
             raise
 
 

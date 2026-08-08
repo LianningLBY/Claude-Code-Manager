@@ -52,9 +52,11 @@ from backend.services.plan_input_safety import contains_high_confidence_secret
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
 from backend.services.plan_service import (
     ACTIVE_RUN_STATUSES,
+    PLAN_RUN_HANDLE_GENERATION,
     fence_capability_run_cancellation,
     finalize_capability_run_cancellation,
     plan_operation_lock,
+    release_capability_run_owner_after_cleanup,
     stage_plan_with_run,
 )
 from backend.services.plan_tasks import (
@@ -67,6 +69,11 @@ from backend.services.plan_tasks import (
 PLAN_CAPABILITY_KEY = "plan"
 PLAN_EXECUTOR_KIND = "plan_agent"
 PLAN_RUN_HANDLE_KIND = "plan_agent_run"
+# The handle generation identifies the staged adapter handle, not a mutable
+# provider turn.  Every first-class Plan Run is staged at generation zero;
+# subsequent PlanAgentRun generations are independent dispatcher owner fences.
+# Keeping this value immutable avoids an Execution -> Run / Run -> Execution
+# lock inversion between Capability cancellation and Plan dispatch.
 PLAN_VERSION_OUTPUT_KIND = "plan_version"
 
 WakeCallback = Callable[[], Awaitable[None] | None]
@@ -254,6 +261,7 @@ async def _load_exact_run(
         or run.plan_id != plan.id
         or run.run_type != "capability"
         or run.capability_execution_id != execution.id
+        or execution.handle_generation != PLAN_RUN_HANDLE_GENERATION
     ):
         raise CapabilityConflictError(
             "PlanAgentRun handle does not belong to this capability execution"
@@ -263,6 +271,43 @@ async def _load_exact_run(
             "Plan capabilities do not support remote Worker runs"
         )
     return run, plan
+
+
+async def _terminal_run_has_complete_absence_proof(
+    db: AsyncSession,
+    *,
+    run: PlanAgentRun,
+    plan: Plan,
+) -> bool:
+    """Prove a concurrently terminal Run needs no destructive cancellation.
+
+    A provider lifecycle publishes ``completed``/``failed`` only after it has
+    released both owner directions.  Cancellation may win the Capability CAS
+    immediately before that terminal Plan transaction wins.  In that race the
+    upper cancellation may converge, but it must neither rewrite the terminal
+    Plan nor signal a provider from incomplete evidence.
+    """
+
+    if (
+        run.status not in {"completed", "failed"}
+        or run.plan_id != plan.id
+        or plan.active_run_id is not None
+        or run.instance_id is not None
+        or run.last_execution_started_at is not None
+        or run.id in active_plan_run_ids()
+    ):
+        return False
+    reverse_owner = await db.scalar(
+        select(Instance.id)
+        .where(Instance.current_plan_run_id == run.id)
+        .with_for_update()
+        .limit(1)
+    )
+    if reverse_owner is not None:
+        return False
+    from backend.services.plan_runtime_receipt import runtime_run_is_clean
+
+    return await runtime_run_is_clean(db, run_id=run.id)
 
 
 def plan_version_output_hash(version: PlanVersion) -> str:
@@ -346,6 +391,7 @@ async def _validate_completed_plan_output(
         or run.worker_id is not None
         or run.run_type != "capability"
         or run.capability_execution_id != execution.id
+        or execution.handle_generation != PLAN_RUN_HANDLE_GENERATION
         or run.status != "completed"
         or run.current_stage != "complete"
         or run.result_version_id != version.id
@@ -398,7 +444,10 @@ async def _validate_completed_plan_output(
         and planner.step_type == "planner"
         and planner.status == "completed"
         and planner.round == run.round
-        and planner.generation == run.generation
+        # Planner and reviewer are separate dispatcher claims.  The exact
+        # draft Step may precede the final reviewer by more than one
+        # generation when a cleaned reviewer claim is recovered and retried.
+        and planner.generation >= 1
         and planner.plan_version_id == version.id
     )
     reviewer_valid = (
@@ -409,6 +458,8 @@ async def _validate_completed_plan_output(
         and reviewer.status == "completed"
         and reviewer.round == run.round
         and reviewer.generation == run.generation
+        and planner is not None
+        and planner.generation < reviewer.generation
     )
     if not planner_valid or not reviewer_valid:
         raise PlanCapabilityResultInvalid(
@@ -548,7 +599,7 @@ class PlanCapabilityExecutor:
                     expected_execution_version=execution.state_version,
                     handle_kind=PLAN_RUN_HANDLE_KIND,
                     handle_id=str(run.id),
-                    handle_generation=run.generation,
+                    handle_generation=PLAN_RUN_HANDLE_GENERATION,
                 )
             except (
                 CapabilityConflictError,
@@ -729,7 +780,7 @@ class PlanCapabilityExecutor:
             return StagedCapabilityHandle(
                 handle_kind=PLAN_RUN_HANDLE_KIND,
                 handle_id=str(run.id),
-                handle_generation=run.generation,
+                handle_generation=PLAN_RUN_HANDLE_GENERATION,
                 value=(plan, run),
             )
 
@@ -947,6 +998,41 @@ class PlanCapabilityExecutor:
                 run, _plan = await _load_exact_run(db, invocation, execution)
             return _observation(invocation, execution, run=run)
 
+        # Validate every persisted handle component before the Capability Core
+        # cancellation CAS.  Otherwise a corrupted immutable generation could
+        # move Invocation/Execution to ``cancelling`` and only then fail Plan
+        # ownership validation, leaving an unrecoverable half-transition.
+        has_handle_evidence = any(
+            value is not None
+            for value in (
+                execution.handle_kind,
+                execution.handle_id,
+                execution.handle_generation,
+            )
+        )
+        if has_handle_evidence:
+            await _load_exact_run(db, invocation, execution)
+        elif invocation.status != "queued":
+            raise CapabilityConflictError(
+                "Started Plan capability lost its durable handle"
+            )
+
+        # Recovery may leave the atomically staged handle on queued Core rows.
+        # Claim that same immutable handle before requesting cancellation so
+        # Capability Core cannot synchronously publish cancelled while the
+        # staged Plan still occupies its active-run slot.
+        if invocation.status == "queued" and has_handle_evidence:
+            invocation, execution = await claim_execution(
+                db,
+                invocation_id=invocation.id,
+                expected_invocation_version=invocation.state_version,
+                expected_execution_version=execution.state_version,
+                handle_kind=PLAN_RUN_HANDLE_KIND,
+                handle_id=execution.handle_id,
+                handle_generation=PLAN_RUN_HANDLE_GENERATION,
+            )
+            await _load_exact_run(db, invocation, execution)
+
         if invocation.status != "cancelling":
             invocation = await cancel_invocation(
                 db,
@@ -966,6 +1052,7 @@ class PlanCapabilityExecutor:
         run_id = run.id
         plan_id = plan.id
         execution_id = execution.id
+        terminal_plan_outcome = False
 
         # Fence the Plan generation before touching its process. The durable
         # ``cancelling`` state retains the Instance id for safe retries but is
@@ -1011,7 +1098,19 @@ class PlanCapabilityExecutor:
                     raise PlanCapabilityCancellationUnconfirmed(
                         str(exc.detail)
                     ) from exc
-            elif run.status not in {"completed", "failed", "cancelled"}:
+            elif run.status in {"completed", "failed"}:
+                terminal_plan_outcome = True
+                if not await _terminal_run_has_complete_absence_proof(
+                    db,
+                    run=run,
+                    plan=plan,
+                ):
+                    await db.rollback()
+                    raise PlanCapabilityCancellationUnconfirmed(
+                        "Terminal Plan Run runtime evidence is incomplete"
+                    )
+                await db.commit()
+            elif run.status != "cancelled":
                 await db.rollback()
                 raise PlanCapabilityCancellationUnconfirmed(
                     f"Plan Run stopped in unknown status {run.status!r}"
@@ -1020,7 +1119,10 @@ class PlanCapabilityExecutor:
                 await db.commit()
 
         selected_stopper = stop_callback or self._stop_callback
-        if runtime_may_be_active or owned_instance_id is not None:
+        if (
+            not terminal_plan_outcome
+            and (runtime_may_be_active or owned_instance_id is not None)
+        ):
             if selected_stopper is None:
                 raise PlanCapabilityCancellationUnconfirmed(
                     "An active Plan Run requires an injected dispatcher stop callback"
@@ -1033,66 +1135,47 @@ class PlanCapabilityExecutor:
 
         # Sweep any provider process retained outside the dispatcher lifecycle,
         # then prove both the runtime registry and every Instance reverse owner.
-        await cancel_plan_run_runtime(run_id)
-        if run_id in active_plan_run_ids():
-            raise PlanCapabilityCancellationUnconfirmed(
-                f"Plan Run #{run_id} runtime cleanup is not confirmed"
-            )
+        if not terminal_plan_outcome:
+            await cancel_plan_run_runtime(run_id)
+            if run_id in active_plan_run_ids():
+                raise PlanCapabilityCancellationUnconfirmed(
+                    f"Plan Run #{run_id} runtime cleanup is not confirmed"
+                )
 
-        await db.commit()
-        async with plan_operation_lock(plan_id):
-            run = await db.get(
-                PlanAgentRun,
-                run_id,
-                with_for_update=True,
-                populate_existing=True,
-            )
-            plan = await db.get(
-                Plan,
-                plan_id,
-                with_for_update=True,
-                populate_existing=True,
-            )
-            if run is None or plan is None or run.plan_id != plan.id:
-                await db.rollback()
-                raise PlanCapabilityCancellationUnconfirmed(
-                    "Plan Run disappeared before cancellation finalized"
-                )
-            try:
-                run = await finalize_capability_run_cancellation(
-                    db,
-                    plan=plan,
-                    run=run,
-                )
-            except HTTPException as exc:
-                raise PlanCapabilityCancellationUnconfirmed(
-                    str(exc.detail)
-                ) from exc
-
-        owners = list(
-            (
-                await db.execute(
-                    select(Instance)
-                    .where(Instance.current_plan_run_id == run_id)
-                    .order_by(Instance.id)
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalars()
-        )
-        for owner in owners:
-            if owner.current_task_id is not None or owner.pid is not None:
-                owner_id = owner.id
-                await db.rollback()
-                raise PlanCapabilityCancellationUnconfirmed(
-                    f"Plan Run #{run_id} still owns live Instance #{owner_id}"
-                )
-            owner.current_plan_run_id = None
-            owner.status = "idle"
-        if owners:
             await db.commit()
-        else:
-            await db.rollback()
+            async with plan_operation_lock(plan_id):
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if run is None or plan is None or run.plan_id != plan.id:
+                    await db.rollback()
+                    raise PlanCapabilityCancellationUnconfirmed(
+                        "Plan Run disappeared before cancellation finalized"
+                    )
+                try:
+                    run = await release_capability_run_owner_after_cleanup(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                    run = await finalize_capability_run_cancellation(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                except HTTPException as exc:
+                    raise PlanCapabilityCancellationUnconfirmed(
+                        str(exc.detail)
+                    ) from exc
 
         remaining_owner = await db.scalar(
             select(Instance.id)
@@ -1109,6 +1192,7 @@ class PlanCapabilityExecutor:
             or run is None
             or run.status not in {"completed", "failed", "cancelled"}
             or run.instance_id is not None
+            or run.last_execution_started_at is not None
             or run_id in active_plan_run_ids()
         ):
             await db.rollback()
@@ -1120,6 +1204,15 @@ class PlanCapabilityExecutor:
             await db.rollback()
             raise PlanCapabilityCancellationUnconfirmed(
                 "Plan disappeared while cancellation was being confirmed"
+            )
+        if terminal_plan_outcome and not await _terminal_run_has_complete_absence_proof(
+            db,
+            run=run,
+            plan=plan,
+        ):
+            await db.rollback()
+            raise PlanCapabilityCancellationUnconfirmed(
+                "Terminal Plan Run runtime evidence changed before publication"
             )
 
         # Re-read after Plan cancellation commits so the capability CAS uses

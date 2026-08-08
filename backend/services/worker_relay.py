@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 
 import httpx
 import websockets
+from fastapi import HTTPException
 from sqlalchemy import exists, func, or_, select, update
 
 from backend.models.log_entry import LogEntry
@@ -3633,8 +3634,11 @@ class WorkerRelay:
         if self._legacy_carrier_recovery_active(worker.id, task_id):
             return
 
-        # 1) user_message 跳过：chat 代理已在转发前存 Manager DB 并广播，防双写
-        if event_type == "user_message":
+        # Manager-side chat/application bookkeeping is the canonical owner of
+        # both events.  In particular, Worker-local Plan/Version ids are not
+        # valid in the Manager database and must never reach its subscribers;
+        # the proxy broadcasts the canonical event after its mirror commits.
+        if event_type in {"user_message", "plan_version_applied"}:
             return
 
         event_retry_count: int | None = None
@@ -3716,27 +3720,24 @@ class WorkerRelay:
             ):
                 return
             from backend.services.plan_events import broadcast_plan_event
-            from backend.models.plan import (
-                PlanApplicationReceipt,
-            )
             from backend.services.plan_service import (
+                fence_worker_plan_application_receipt,
                 preserve_uncertain_plan_application,
                 release_unstarted_plan_application,
                 resolve_uncertain_plan_application,
             )
 
             async with self.db_factory() as db:
-                receipt = (
-                    await db.execute(
-                        select(PlanApplicationReceipt)
-                        .where(
-                            PlanApplicationReceipt.receipt_key == receipt_key,
-                            PlanApplicationReceipt.worker_id == worker.id,
-                            PlanApplicationReceipt.target_task_id == task_id,
-                        )
-                        .with_for_update()
+                try:
+                    receipt = await fence_worker_plan_application_receipt(
+                        db,
+                        receipt_key=receipt_key,
+                        target_task_id=task_id,
+                        expected_worker_id=worker.id,
                     )
-                ).scalar_one_or_none()
+                except HTTPException:
+                    await db.rollback()
+                    return
                 if receipt is None:
                     await db.rollback()
                     return

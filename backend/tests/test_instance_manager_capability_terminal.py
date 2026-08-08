@@ -77,7 +77,7 @@ def _terminal_action(*, reason: str) -> str:
             "terminal_action": "request_capability",
             "capability": "plan",
             "reason": reason,
-            "request": {"focus": reason},
+            "request": {"prompt": reason},
         },
         separators=(",", ":"),
         sort_keys=True,

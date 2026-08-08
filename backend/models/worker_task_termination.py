@@ -25,6 +25,11 @@ WORKER_TASK_TERMINATION_OPERATIONS = (
     "cancel",
     "stop_session",
     "supersede",
+    # Manager-only durable owner for remote-first Task+Plan deletion.  No
+    # Worker termination receipt is created for this operation: the Worker
+    # exposes a separate idempotent DELETE plus read-only cascade audit, while
+    # this row quarantines the Manager mirror until local graph finalization.
+    "delete",
 )
 WORKER_TASK_TERMINATION_SOURCE_STATUSES = (
     "pending",
@@ -37,6 +42,7 @@ WORKER_TASK_TERMINATION_SOURCE_STATUSES = (
     "failed",
     "cancelled",
     "conflict",
+    "superseded",
 )
 
 MANAGER_TASK_TERMINATION_STATUSES = (
@@ -117,6 +123,10 @@ class WorkerTaskTerminationReceipt(Base):
         CheckConstraint(
             f"operation IN ({_sql_values(WORKER_TASK_TERMINATION_OPERATIONS)})",
             name="ck_worker_task_term_operation",
+        ),
+        CheckConstraint(
+            "operation <> 'delete' OR side = 'manager'",
+            name="ck_worker_task_term_delete_manager_only",
         ),
         CheckConstraint(
             f"status IN ({_sql_values(WORKER_TASK_TERMINATION_STATUSES_ALL)})",

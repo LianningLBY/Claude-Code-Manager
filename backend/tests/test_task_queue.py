@@ -22,8 +22,16 @@ from backend.models.capability import (
 )
 from backend.models.code_review import CodeReviewResult, CodeReviewRun
 from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
-from backend.models.plan import Plan
-from backend.models.plan_agent import PlanAgentRun
+from backend.models.plan import (
+    Plan,
+    PlanApplication,
+    PlanApplicationAttempt,
+    PlanVersion,
+)
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentWorkerDispatchReceipt,
+)
 from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.task import Task
@@ -33,6 +41,7 @@ from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services.delivery_service import DeliveryCreateSpec, create_delivery_run
 from backend.services.task_sharing import lock_task_share_authority
 from backend.services.task_queue import (
+    TaskDeletePreflight,
     TaskQueue,
     TaskWaitingCapabilityConflict,
     _effective_key_expr,
@@ -1194,6 +1203,168 @@ async def test_remote_worker_delete_rejects_changed_background_mirror(queue):
 
 
 @pytest.mark.asyncio
+async def test_remote_delete_callback_runs_after_plan_preflight_before_local_delete(
+    queue,
+):
+    task = await queue.create(
+        title="remote plan graph",
+        description="d",
+        worker_id=91,
+    )
+    task.status = "completed"
+    plan = Plan(
+        title="Remote durable plan",
+        initial_request="Plan the task",
+        target_task_id=task.id,
+        worker_id=91,
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.commit()
+    row_ids = (task.id, plan.id)
+    local_delete_seen = False
+    callback_called = False
+    original_execute = queue.db.execute
+
+    async def track_local_delete(statement, *args, **kwargs):
+        nonlocal local_delete_seen
+        if getattr(statement, "is_delete", False):
+            local_delete_seen = True
+        return await original_execute(statement, *args, **kwargs)
+
+    async def reject_remote_delete(preflight: TaskDeletePreflight) -> bool:
+        nonlocal callback_called
+        callback_called = True
+        assert local_delete_seen is False
+        assert preflight.task_id == row_ids[0]
+        assert preflight.plan_ids == (row_ids[1],)
+        return False
+
+    with patch.object(
+        queue.db,
+        "execute",
+        new=AsyncMock(side_effect=track_local_delete),
+    ):
+        assert await queue.delete(
+            row_ids[0],
+            expected_fence=task_delete_fence(task),
+            remote_worker_deleted=True,
+            remote_delete_confirm=reject_remote_delete,
+        ) is False
+
+    assert callback_called is True
+    queue.db.expire_all()
+    assert await queue.db.get(Task, row_ids[0]) is not None
+    assert await queue.db.get(Plan, row_ids[1]) is not None
+
+
+@pytest.mark.asyncio
+async def test_local_delete_preflight_includes_plan_added_after_stale_read(queue):
+    task = await queue.create(title="local Plan receipt", description="d")
+    task.status = "completed"
+    await queue.db.commit()
+    stale_plan_ids = tuple(
+        (
+            await queue.db.execute(
+                select(Plan.id)
+                .where(Plan.target_task_id == task.id)
+                .order_by(Plan.id)
+            )
+        ).scalars()
+    )
+    assert stale_plan_ids == ()
+
+    # Simulate a Plan admitted after an API-layer observation but before
+    # TaskQueue acquires the Task writer fence. The callback receipt must use
+    # the graph discovered under that fence, never the stale outer read.
+    plans = [
+        Plan(
+            title=f"Local durable Plan {index}",
+            initial_request="Plan the task",
+            target_task_id=task.id,
+            pipeline_config={},
+        )
+        for index in (2, 1)
+    ]
+    queue.db.add_all(plans)
+    await queue.db.commit()
+    task_id = task.id
+    expected_plan_ids = tuple(sorted(plan.id for plan in plans))
+    observed: list[TaskDeletePreflight] = []
+
+    async def capture_preflight(preflight: TaskDeletePreflight) -> bool:
+        observed.append(preflight)
+        return True
+
+    assert await queue.delete(
+        task_id,
+        before_delete=capture_preflight,
+    ) is True
+
+    assert observed == [
+        TaskDeletePreflight(task_id=task_id, plan_ids=expected_plan_ids)
+    ]
+    for plan_id in expected_plan_ids:
+        assert await queue.db.get(Plan, plan_id) is None
+
+
+@pytest.mark.asyncio
+async def test_remote_delete_callback_rejects_active_worker_plan_dispatch(queue):
+    task = await queue.create(
+        title="active remote Plan dispatch",
+        description="d",
+        worker_id=91,
+    )
+    task.status = "completed"
+    plan = Plan(
+        title="Remote active dispatch",
+        initial_request="Plan the task",
+        target_task_id=task.id,
+        worker_id=91,
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.flush()
+    run = PlanAgentRun(
+        plan_id=plan.id,
+        worker_id=91,
+        run_type="initial",
+        status="failed",
+        current_stage="failed",
+        generation=2,
+        finished_at=datetime.utcnow(),
+    )
+    queue.db.add(run)
+    await queue.db.flush()
+    receipt = PlanAgentWorkerDispatchReceipt(
+        plan_id=plan.id,
+        run_id=run.id,
+        target_task_id=task.id,
+        worker_id=91,
+        run_generation=run.generation,
+        protocol=1,
+        status="prepared",
+    )
+    queue.db.add(receipt)
+    await queue.db.commit()
+    await queue.db.refresh(task)
+    row_ids = (task.id, receipt.id)
+    remote_delete = AsyncMock(return_value=True)
+
+    assert await queue.delete(
+        row_ids[0],
+        expected_fence=task_delete_fence(task),
+        remote_worker_deleted=True,
+        remote_delete_confirm=remote_delete,
+    ) is False
+
+    remote_delete.assert_not_awaited()
+    queue.db.expire_all()
+    assert await queue.db.get(Task, row_ids[0]) is not None
+    assert await queue.db.get(PlanAgentWorkerDispatchReceipt, row_ids[1]) is not None
+
+
+@pytest.mark.asyncio
 async def test_delete_running_task_rejected(queue):
     """Should NOT be able to delete in_progress tasks."""
     task = await queue.create(title="t", description="d", target_repo="/tmp")
@@ -1328,6 +1499,41 @@ async def test_delete_task_rejects_active_capability_resume_outbox(queue):
     assert await queue.db.get(Task, task_id) is not None
     assert await queue.db.get(CapabilityInvocation, invocation_id) is not None
     assert await queue.db.get(CapabilityResumeOutbox, outbox_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_rejects_launched_capability_resume_outbox(queue):
+    task = await queue.create(title="launched resume outbox", description="d")
+    task.status = "completed"
+    invocation = _capability_invocation_for_delete(task.id, status="failed")
+    queue.db.add(invocation)
+    await queue.db.flush()
+    outbox = _capability_outbox_for_delete(task, invocation, status="pending")
+    outbox.status = "launched"
+    outbox.state_version = 4
+    outbox.active_task_id = None
+    outbox.active_invocation_id = None
+    outbox.invocation_terminal_status = invocation.status
+    outbox.invocation_error_code = invocation.error_code
+    outbox.invocation_error_message = invocation.error_message
+    outbox.resume_payload = {"schema_version": 1}
+    outbox.resume_payload_hash = "e" * 64
+    outbox.resume_source_log_id = 104
+    outbox.claimed_turn_generation = task.turn_generation + 1
+    outbox.resume_actual_transport = "claude_exec"
+    outbox.attempt_count = 1
+    outbox.ready_at = outbox.created_at
+    outbox.claimed_at = outbox.created_at
+    outbox.launched_at = outbox.created_at
+    queue.db.add(outbox)
+    await queue.db.commit()
+    row_ids = (task.id, invocation.id, outbox.id)
+
+    assert await queue.delete(row_ids[0]) is False
+    queue.db.expire_all()
+    assert await queue.db.get(Task, row_ids[0]) is not None
+    assert await queue.db.get(CapabilityInvocation, row_ids[1]) is not None
+    assert await queue.db.get(CapabilityResumeOutbox, row_ids[2]) is not None
 
 
 @pytest.mark.asyncio
@@ -1601,7 +1807,7 @@ async def test_delete_task_preserves_code_review_reverse_linked_by_capability_id
 
 
 @pytest.mark.asyncio
-async def test_delete_task_preserves_first_class_plan_aggregate(queue):
+async def test_delete_task_cascades_terminal_first_class_plan_aggregate(queue):
     task = await queue.create(title="plan target", description="d")
     task.status = "completed"
     plan = Plan(
@@ -1611,17 +1817,127 @@ async def test_delete_task_preserves_first_class_plan_aggregate(queue):
         pipeline_config={},
     )
     queue.db.add(plan)
+    await queue.db.flush()
+    run = PlanAgentRun(
+        plan_id=plan.id,
+        run_type="initial",
+        status="completed",
+        current_stage="complete",
+        finished_at=datetime.utcnow(),
+    )
+    queue.db.add(run)
+    await queue.db.flush()
+    version = PlanVersion(
+        plan_id=plan.id,
+        version_number=1,
+        produced_by_run_id=run.id,
+        content="terminal plan",
+    )
+    queue.db.add(version)
+    await queue.db.flush()
+    run.result_version_id = version.id
+    plan.current_version_id = version.id
     await queue.db.commit()
     task_id = task.id
     plan_id = plan.id
+    run_id = run.id
+    version_id = version.id
 
-    assert await queue.delete(task_id) is False
-    assert await queue.db.get(Task, task_id) is not None
-    assert await queue.db.get(Plan, plan_id) is not None
+    assert await queue.delete(task_id) is True
+    assert await queue.db.get(Task, task_id) is None
+    assert await queue.db.get(Plan, plan_id) is None
+    assert await queue.db.get(PlanAgentRun, run_id) is None
+    assert await queue.db.get(PlanVersion, version_id) is None
 
 
 @pytest.mark.asyncio
-async def test_delete_task_preserves_capability_plan_run_without_target_link(queue):
+async def test_delete_execution_task_preserves_external_plan_audit(queue):
+    execution_task = await queue.create(
+        title="materialized Plan execution",
+        description="delete only this Task",
+    )
+    execution_task.status = "completed"
+    plan = Plan(
+        title="external standalone Plan",
+        initial_request="retain the audit",
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.flush()
+    version = PlanVersion(
+        plan_id=plan.id,
+        version_number=1,
+        content="approved implementation",
+    )
+    queue.db.add(version)
+    await queue.db.flush()
+    application = PlanApplication(
+        plan_id=plan.id,
+        plan_version_id=version.id,
+        application_type="execution_task",
+        execution_task_id=execution_task.id,
+    )
+    attempt = PlanApplicationAttempt(
+        plan_id=plan.id,
+        plan_version_id=version.id,
+        application_receipt_key="execution-task-history",
+        application_type="execution_task",
+        execution_task_id=execution_task.id,
+        application_created_at=datetime.utcnow(),
+        released_at=datetime.utcnow(),
+    )
+    queue.db.add_all([application, attempt])
+    await queue.db.commit()
+    row_ids = (
+        execution_task.id,
+        plan.id,
+        version.id,
+        application.id,
+        attempt.id,
+    )
+
+    assert await queue.delete(row_ids[0]) is True
+    assert await queue.db.get(Task, row_ids[0]) is None
+    assert await queue.db.get(Plan, row_ids[1]) is not None
+    assert await queue.db.get(PlanVersion, row_ids[2]) is not None
+    preserved_application = await queue.db.get(PlanApplication, row_ids[3])
+    preserved_attempt = await queue.db.get(PlanApplicationAttempt, row_ids[4])
+    assert preserved_application.execution_task_id == row_ids[0]
+    assert preserved_attempt.execution_task_id == row_ids[0]
+
+
+@pytest.mark.asyncio
+async def test_delete_task_rejects_active_first_class_plan_aggregate(queue):
+    task = await queue.create(title="active plan target", description="d")
+    task.status = "completed"
+    plan = Plan(
+        title="Active durable plan",
+        initial_request="Plan the task",
+        target_task_id=task.id,
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.flush()
+    run = PlanAgentRun(
+        plan_id=plan.id,
+        run_type="initial",
+        status="planning",
+        current_stage="planner",
+    )
+    queue.db.add(run)
+    await queue.db.flush()
+    plan.active_run_id = run.id
+    await queue.db.commit()
+    row_ids = (task.id, plan.id, run.id)
+
+    assert await queue.delete(row_ids[0]) is False
+    assert await queue.db.get(Task, row_ids[0]) is not None
+    assert await queue.db.get(Plan, row_ids[1]) is not None
+    assert await queue.db.get(PlanAgentRun, row_ids[2]) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_cascades_terminal_capability_plan_aggregate(queue):
     task = await queue.create(title="plan capability target", description="d")
     task.status = "completed"
     invocation = _capability_invocation_for_delete(task.id, status="failed")
@@ -1642,21 +1958,89 @@ async def test_delete_task_preserves_capability_plan_run_without_target_link(que
     )
     queue.db.add(execution)
     await queue.db.flush()
+    plan = Plan(
+        title="Capability durable plan",
+        initial_request="Plan the task",
+        target_task_id=task.id,
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.flush()
     run = PlanAgentRun(
+        plan_id=plan.id,
         capability_execution_id=execution.id,
         run_type="capability",
         status="failed",
         current_stage="planner",
+        finished_at=datetime.utcnow(),
     )
     queue.db.add(run)
+    await queue.db.flush()
+    execution.handle_kind = "plan_agent_run"
+    execution.handle_id = str(run.id)
+    execution.handle_generation = 0
+    outbox = _capability_outbox_for_delete(
+        task,
+        invocation,
+        status="cancelled",
+    )
+    outbox.invocation_terminal_status = invocation.status
+    outbox.invocation_error_code = invocation.error_code
+    outbox.invocation_error_message = invocation.error_message
+    queue.db.add(outbox)
     await queue.db.commit()
-    row_ids = (task.id, invocation.id, execution.id, run.id)
+    row_ids = (
+        task.id,
+        invocation.id,
+        execution.id,
+        outbox.id,
+        plan.id,
+        run.id,
+    )
 
-    assert await queue.delete(row_ids[0]) is False
+    assert await queue.delete(row_ids[0]) is True
+    assert await queue.db.get(Task, row_ids[0]) is None
+    assert await queue.db.get(CapabilityInvocation, row_ids[1]) is None
+    assert await queue.db.get(CapabilityExecution, row_ids[2]) is None
+    assert await queue.db.get(CapabilityResumeOutbox, row_ids[3]) is None
+    assert await queue.db.get(Plan, row_ids[4]) is None
+    assert await queue.db.get(PlanAgentRun, row_ids[5]) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_task_rolls_back_plan_graph_when_final_task_cas_loses(queue):
+    task = await queue.create(title="plan CAS owner", description="keep graph")
+    task.status = "completed"
+    plan = Plan(
+        title="CAS durable plan",
+        initial_request="Plan the task",
+        target_task_id=task.id,
+        pipeline_config={},
+    )
+    queue.db.add(plan)
+    await queue.db.commit()
+    row_ids = (task.id, plan.id)
+    original_execute = queue.db.execute
+
+    async def lose_final_task_delete(statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if (
+            getattr(statement, "is_delete", False)
+            and getattr(table, "name", None) == "tasks"
+        ):
+            return MagicMock(rowcount=0)
+        return await original_execute(statement, *args, **kwargs)
+
+    with patch.object(
+        queue.db,
+        "execute",
+        new=AsyncMock(side_effect=lose_final_task_delete),
+    ):
+        assert await queue.delete(row_ids[0]) is False
+
+    queue.db.expire_all()
     assert await queue.db.get(Task, row_ids[0]) is not None
-    assert await queue.db.get(CapabilityInvocation, row_ids[1]) is not None
-    assert await queue.db.get(CapabilityExecution, row_ids[2]) is not None
-    assert await queue.db.get(PlanAgentRun, row_ids[3]) is not None
+    assert await queue.db.get(Plan, row_ids[1]) is not None
 
 
 @pytest.mark.asyncio

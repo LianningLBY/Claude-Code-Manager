@@ -6,12 +6,13 @@ from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import httpx
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import backend.main as main_module
 import backend.api.tasks as tasks_api_module
@@ -30,7 +31,10 @@ from backend.models.plan import (
     PlanLegacyTaskLink,
     PlanVersion,
 )
-from backend.models.plan_agent import PlanAgentRun
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentWorkerDispatchReceipt,
+)
 from backend.models.task import Task
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
@@ -39,6 +43,7 @@ from backend.schemas.task import TaskCreate
 from backend.services.worker_proxy import (
     WorkerEndpointNotFoundError,
     WorkerProxy,
+    WorkerTaskMutationOutcomeUncertainError,
 )
 from backend.services.worker_relay import WorkerRelay
 from backend.services.worker_routing_config import (
@@ -2863,13 +2868,26 @@ async def test_reserved_terminal_generation_drops_old_turn_then_adopts_next(
     ]
 
 
-async def test_relay_skips_user_message_and_unsubscribed(relay, broadcaster, session_factory):
+async def test_relay_skips_manager_canonical_events_and_unsubscribed(
+    relay, broadcaster, session_factory
+):
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id)
     relay._tasks[w.id] = {t.id}
 
     await relay._handle({"channel": f"task:{t.id}",
                          "data": {"event_type": "user_message", "content": "x"}}, w)
+    await relay._handle(
+        {
+            "channel": f"task:{t.id}",
+            "data": {
+                "event": "plan_version_applied",
+                "plan_id": 901,
+                "version_id": 902,
+            },
+        },
+        w,
+    )
     await relay._handle({"channel": "task:99999",
                          "data": {"event_type": "message", "content": "x"}}, w)
 
@@ -5540,7 +5558,7 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
         updated_at = run.updated_at.isoformat()
 
     proxy = AsyncMock()
-    proxy.run_versioned_plan_until_pause.return_value = {
+    remote_payload = {
         "protocol": 3,
         "run": {
             "id": run_id,
@@ -5572,7 +5590,22 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
         },
         "versions": [],
     }
+
+    async def run_remote(_plan, _run, *, on_remote_possible):
+        await on_remote_possible("a" * 64)
+        return remote_payload
+
+    proxy.run_versioned_plan_until_pause.side_effect = run_remote
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    original_get = AsyncSession.get
+    locked_rows = []
+
+    async def recording_get(self, entity, ident, *args, **kwargs):
+        if kwargs.get("with_for_update"):
+            locked_rows.append((entity, ident))
+        return await original_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "get", recording_get)
     dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
     dispatcher.db_factory = db_factory
     dispatcher.broadcaster = broadcaster
@@ -5581,6 +5614,15 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
     await dispatcher._dispatch_worker_plan_runs()
     lifecycle = dispatcher._running_tasks[f"worker-plan-{run_id}"]
     await lifecycle
+
+    assert locked_rows == [
+        (PlanAgentRun, run_id),
+        (Plan, plan_id),
+        (PlanAgentWorkerDispatchReceipt, 1),
+        (PlanAgentRun, run_id),
+        (Plan, plan_id),
+        (PlanAgentWorkerDispatchReceipt, 1),
+    ]
 
     async with session_factory() as db:
         current_plan = await db.get(Plan, plan_id)
@@ -6253,6 +6295,11 @@ class _ProxyResponse:
     def json(self):
         return self._body
 
+    def raise_for_status(self):
+        if not 200 <= self.status_code < 300:
+            raise RuntimeError(f"upstream HTTP {self.status_code}")
+        return self
+
 
 class _InvalidJSONProxyResponse(_ProxyResponse):
     def json(self):
@@ -6261,6 +6308,18 @@ class _InvalidJSONProxyResponse(_ProxyResponse):
 
 def _install_proxy_transport(monkeypatch, outcome):
     requests = []
+    outcomes = list(outcome) if isinstance(outcome, list) else None
+
+    def next_outcome():
+        if outcomes is not None:
+            if not outcomes:
+                raise AssertionError("unexpected extra Worker HTTP request")
+            current = outcomes.pop(0)
+        else:
+            current = outcome
+        if isinstance(current, BaseException):
+            raise current
+        return current
 
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -6272,11 +6331,13 @@ def _install_proxy_transport(monkeypatch, outcome):
         async def __aexit__(self, *args):
             return False
 
+        async def get(self, url, **kwargs):
+            requests.append(("GET", url, kwargs))
+            return next_outcome()
+
         async def request(self, method, url, **kwargs):
             requests.append((method, url, kwargs))
-            if isinstance(outcome, BaseException):
-                raise outcome
-            return outcome
+            return next_outcome()
 
     monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", FakeAsyncClient)
     return requests
@@ -10012,7 +10073,8 @@ async def test_worker_chat_applies_exact_mirrored_plan_version(
 
     proxy.proxy_to_worker.side_effect = route_chat
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
-    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    broadcaster = FakeBroadcaster()
+    monkeypatch.setattr(main_module, "broadcaster", broadcaster)
     request = SimpleNamespace(
         state=SimpleNamespace(
             user_id=None,
@@ -10033,6 +10095,21 @@ async def test_worker_chat_applies_exact_mirrored_plan_version(
         )
 
     assert result["applied_plan_version_ids"] == [local_version_id]
+    applied_events = [
+        (channel, data)
+        for channel, data in broadcaster.sent
+        if data.get("event") == "plan_version_applied"
+    ]
+    assert [channel for channel, _data in applied_events] == [
+        "plans",
+        f"plan:{plan.id}",
+        f"task:{task.id}",
+    ]
+    assert all(
+        data["plan_id"] == plan.id
+        and data["version_id"] == local_version_id
+        for _channel, data in applied_events
+    )
     async with session_factory() as db:
         application = (
             await db.execute(
@@ -10170,6 +10247,366 @@ async def test_worker_chat_ack_survives_later_plan_confirmation_rollback(
         converged = await db.get(Task, task.id)
     assert converged.turn_generation == task.turn_generation + 1
     assert converged.worker_turn_handoff_id is None
+
+
+async def test_worker_plan_application_rechecks_target_writer_after_ack(
+    session_factory,
+    monkeypatch,
+):
+    """A remote ACK must not recreate Plan audit after target deletion wins."""
+
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+    import backend.services.plan_service as plan_service_module
+
+    worker, task, version_id = await _approved_worker_plan_version(
+        session_factory
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.materialize_plan_version.return_value = 912
+    proxy.relay = AsyncMock()
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [912],
+        }
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    target_fence = AsyncMock(
+        side_effect=HTTPException(
+            409,
+            "Plan target disappeared before Manager audit commit",
+        )
+    )
+    monkeypatch.setattr(
+        plan_service_module,
+        "fence_plan_target_task",
+        target_fence,
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        with pytest.raises(HTTPException, match="target disappeared"):
+            await _send_worker_chat(
+                current,
+                ChatMessage(
+                    message="Implement once",
+                    plan_version_ids=[version_id],
+                ),
+                db,
+                request,
+            )
+
+    target_fence.assert_awaited_once_with(
+        ANY,
+        target_task_id=task.id,
+        expected_worker_id=worker.id,
+    )
+    async with session_factory() as db:
+        assert await db.scalar(select(PlanApplication.id)) is None
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.target_task_id == task.id
+            )
+        )
+        assert receipt is not None
+        assert receipt.status == "prepared"
+
+
+async def test_worker_plan_receipt_lock_order_starts_with_fresh_task_fence(
+    session_factory,
+    monkeypatch,
+):
+    """Worker delivery writers share Task -> Application -> Receipt order."""
+
+    from backend.models.plan import PlanApplicationAttempt
+    from backend.services import plan_service
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    receipt_key = "worker-plan-lock-order"
+    async with session_factory() as db:
+        log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+        )
+        db.add(log)
+        await db.flush()
+        db.add(PlanApplicationReceipt(
+            receipt_key=receipt_key,
+            target_task_id=task.id,
+            worker_id=worker.id,
+            manager_user_log_id=log.id,
+            plan_version_ids=[version_id],
+            status="committed",
+            delivery_status="queued",
+        ))
+        await db.commit()
+
+    events: list[str] = []
+    original_end = plan_service._end_plan_routing_read
+    original_fence = plan_service.fence_plan_target_task
+    original_execute = AsyncSession.execute
+
+    async def recording_end(db):
+        events.append("fresh_transaction")
+        return await original_end(db)
+
+    async def recording_fence(db, *, target_task_id, expected_worker_id):
+        events.append("task")
+        return await original_fence(
+            db,
+            target_task_id=target_task_id,
+            expected_worker_id=expected_worker_id,
+        )
+
+    async def recording_execute(self, statement, *args, **kwargs):
+        if getattr(statement, "is_select", False):
+            descriptions = getattr(statement, "column_descriptions", ())
+            entity = descriptions[0].get("entity") if descriptions else None
+            if entity is PlanApplication:
+                events.append("application")
+            elif entity is PlanApplicationAttempt:
+                events.append("attempt")
+            elif entity is PlanApplicationReceipt:
+                events.append("receipt")
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(plan_service, "_end_plan_routing_read", recording_end)
+    monkeypatch.setattr(plan_service, "fence_plan_target_task", recording_fence)
+    monkeypatch.setattr(AsyncSession, "execute", recording_execute)
+
+    async with session_factory() as db:
+        locked = await plan_service.fence_worker_plan_application_receipt(
+            db,
+            receipt_key=receipt_key,
+            target_task_id=task.id,
+            expected_worker_id=worker.id,
+        )
+        await db.rollback()
+
+    assert locked is not None
+    assert events == [
+        "fresh_transaction",
+        "task",
+        "application",
+        "attempt",
+        "receipt",
+    ]
+
+
+async def test_worker_uncertain_relay_cannot_revive_application_after_task_delete(
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    """A second Manager process deleting the Task wins before relay audit."""
+
+    from backend.services import plan_service
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    receipt_key = "worker-uncertain-after-delete"
+    async with session_factory() as db:
+        version = await db.get(PlanVersion, version_id)
+        log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+        )
+        db.add(log)
+        await db.flush()
+        db.add(PlanApplicationReceipt(
+            receipt_key=receipt_key,
+            target_task_id=task.id,
+            worker_id=worker.id,
+            manager_user_log_id=log.id,
+            plan_version_ids=[version_id],
+            status="committed",
+            response={"ok": True, "queued": True},
+            delivery_status="queued",
+        ))
+        await db.commit()
+        plan_id = version.plan_id
+        log_id = log.id
+
+    fence_entered = asyncio.Event()
+    release_fence = asyncio.Event()
+    original_fence = plan_service.fence_plan_target_task
+
+    async def fence_after_delete(db, *, target_task_id, expected_worker_id):
+        fence_entered.set()
+        await release_fence.wait()
+        return await original_fence(
+            db,
+            target_task_id=target_task_id,
+            expected_worker_id=expected_worker_id,
+        )
+
+    monkeypatch.setattr(plan_service, "fence_plan_target_task", fence_after_delete)
+    relay = WorkerRelay(session_factory, broadcaster)
+    relay._tasks[worker.id] = {task.id}
+    relay_event = asyncio.create_task(relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "plan_application_delivery_uncertain",
+                "task_id": task.id,
+                "receipt_key": receipt_key,
+                "delivery_status": "uncertain",
+                "error": "late Worker evidence",
+            },
+        },
+        worker,
+    ))
+    await asyncio.wait_for(fence_entered.wait(), timeout=5)
+
+    # This represents another Manager process completing its already-fenced
+    # aggregate delete before the relay transaction can acquire the Task row.
+    async with session_factory() as db:
+        await db.execute(
+            delete(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        await db.execute(delete(PlanVersion).where(PlanVersion.id == version_id))
+        await db.execute(delete(Plan).where(Plan.id == plan_id))
+        await db.execute(delete(LogEntry).where(LogEntry.id == log_id))
+        await db.execute(delete(Task).where(Task.id == task.id))
+        await db.commit()
+    release_fence.set()
+    await asyncio.wait_for(relay_event, timeout=5)
+
+    async with session_factory() as db:
+        assert await db.get(Task, task.id) is None
+        assert await db.scalar(select(PlanApplication.id)) is None
+        assert await db.scalar(
+            select(PlanApplicationReceipt.id).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        ) is None
+    assert not any(
+        data.get("receipt_key") == receipt_key
+        for _channel, data in broadcaster.sent
+    )
+
+
+async def test_worker_uncertain_relay_rejects_target_reassigned_before_fence(
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    """A stale source Worker event cannot mutate the moved Task's Plan audit."""
+
+    from backend.services import plan_service
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    destination = await _mk_worker(
+        session_factory,
+        name="worker-plan-destination",
+        private_ip="10.0.0.88",
+    )
+    receipt_key = "worker-uncertain-after-move"
+    async with session_factory() as db:
+        log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+        )
+        db.add(log)
+        await db.flush()
+        db.add(PlanApplicationReceipt(
+            receipt_key=receipt_key,
+            target_task_id=task.id,
+            worker_id=worker.id,
+            manager_user_log_id=log.id,
+            plan_version_ids=[version_id],
+            status="committed",
+            response={"ok": True, "queued": True},
+            delivery_status="queued",
+        ))
+        await db.commit()
+
+    fence_entered = asyncio.Event()
+    release_fence = asyncio.Event()
+    original_fence = plan_service.fence_plan_target_task
+
+    async def fence_after_move(db, *, target_task_id, expected_worker_id):
+        fence_entered.set()
+        await release_fence.wait()
+        return await original_fence(
+            db,
+            target_task_id=target_task_id,
+            expected_worker_id=expected_worker_id,
+        )
+
+    monkeypatch.setattr(plan_service, "fence_plan_target_task", fence_after_move)
+    relay = WorkerRelay(session_factory, broadcaster)
+    relay._tasks[worker.id] = {task.id}
+    relay_event = asyncio.create_task(relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "plan_application_delivery_uncertain",
+                "task_id": task.id,
+                "receipt_key": receipt_key,
+                "delivery_status": "uncertain",
+                "error": "stale source Worker evidence",
+            },
+        },
+        worker,
+    ))
+    await asyncio.wait_for(fence_entered.wait(), timeout=5)
+    async with session_factory() as db:
+        moved = await db.execute(
+            update(Task)
+            .where(Task.id == task.id, Task.worker_id == worker.id)
+            .values(worker_id=destination.id)
+        )
+        assert moved.rowcount == 1
+        await db.commit()
+    release_fence.set()
+    await asyncio.wait_for(relay_event, timeout=5)
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        assert current.worker_id == destination.id
+        assert receipt.delivery_status == "queued"
+        assert await db.scalar(select(PlanApplication.id)) is None
+    assert not any(
+        data.get("receipt_key") == receipt_key
+        for _channel, data in broadcaster.sent
+    )
 
 
 async def test_worker_delivery_failure_releases_manager_plan_application(
@@ -10561,6 +10998,7 @@ async def test_worker_uncertain_http_reconciliation_consumes_manager_version(
     from types import SimpleNamespace
 
     from backend.api.chat import ChatMessage, _send_worker_chat
+    from backend.services import plan_service
 
     worker, task, version_id = await _approved_worker_plan_version(session_factory)
     proxy = AsyncMock()
@@ -10595,6 +11033,18 @@ async def test_worker_uncertain_http_reconciliation_consumes_manager_version(
             "applied_plan_version_ids": [912],
         },
     }
+    target_fences: list[tuple[int | None, int | None]] = []
+    original_fence = plan_service.fence_plan_target_task
+
+    async def recording_fence(db, *, target_task_id, expected_worker_id):
+        target_fences.append((target_task_id, expected_worker_id))
+        return await original_fence(
+            db,
+            target_task_id=target_task_id,
+            expected_worker_id=expected_worker_id,
+        )
+
+    monkeypatch.setattr(plan_service, "fence_plan_target_task", recording_fence)
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
     monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
     request = SimpleNamespace(
@@ -10618,6 +11068,7 @@ async def test_worker_uncertain_http_reconciliation_consumes_manager_version(
                 request,
             )
     assert exc_info.value.status_code == 409
+    assert target_fences == [(task.id, worker.id)]
 
     async with session_factory() as db:
         application = await db.scalar(
@@ -10921,7 +11372,12 @@ async def test_delete_worker_task_remote_first_then_cleans_exact_manager_mirror(
         await db.commit()
 
     proxy = AsyncMock()
-    proxy.proxy_to_worker.return_value = {"ok": True}
+    proxy.proxy_to_worker.return_value = {
+        "ok": True,
+        "plan_cascade_protocol": 1,
+        "deleted_plan_ids": [],
+        "remaining_target_plan_ids": [],
+    }
     proxy.relay = Mock()
     proxy.task_operation_lock = Mock(return_value=asyncio.Lock())
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
@@ -10938,6 +11394,7 @@ async def test_delete_worker_task_remote_first_then_cleans_exact_manager_mirror(
         "require_json": True,
         "allow_task_absent": True,
         "operation_lock_held": True,
+        "quarantine_on_transport_uncertainty": True,
     }
     proxy.relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
     async with session_factory() as db:
@@ -10957,6 +11414,160 @@ async def test_delete_worker_task_remote_first_then_cleans_exact_manager_mirror(
         assert not (await db.execute(select(MonitorCheck))).scalars().all()
 
 
+async def test_delete_worker_task_requires_exact_plan_cascade_receipt(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Manager Plan mirror",
+            initial_request="Plan before deleting",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.commit()
+        plan_id = plan.id
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.return_value = {
+        "ok": True,
+        "plan_cascade_protocol": 1,
+        "deleted_plan_ids": [plan_id],
+        "remaining_target_plan_ids": [],
+    }
+    proxy.relay = Mock()
+    proxy.task_operation_lock = Mock(return_value=asyncio.Lock())
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "task_migrator", None)
+
+    response = await client.delete(f"/api/tasks/{task.id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "plan_cascade_protocol": 1,
+        "deleted_plan_ids": [plan_id],
+        "remaining_target_plan_ids": [],
+    }
+    async with session_factory() as db:
+        assert await db.get(Task, task.id) is None
+        assert await db.get(Plan, plan_id) is None
+
+
+async def test_delete_worker_task_old_worker_cannot_strand_manager_plan(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Preserve without cascade proof",
+            initial_request="Do not strand me",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.commit()
+        plan_id = plan.id
+
+    requests = _install_proxy_transport(
+        monkeypatch,
+        _ProxyResponse(200, {"plan_cascade_protocol": 0}),
+    )
+    relay = Mock()
+    relay.subscribe_task = AsyncMock()
+    proxy = WorkerProxy(session_factory, relay)
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "task_migrator", None)
+
+    response = await client.delete(f"/api/tasks/{task.id}")
+
+    assert response.status_code == 503
+    assert [request[0] for request in requests] == ["GET"]
+    assert requests[0][1].endswith("/api/system/config")
+    relay.unsubscribe_task.assert_not_called()
+    async with session_factory() as db:
+        assert await db.get(Task, task.id) is not None
+        assert await db.get(Plan, plan_id) is not None
+        receipt = await db.scalar(
+            select(worker_termination_module.WorkerTaskTerminationReceipt)
+            .where(
+                worker_termination_module.WorkerTaskTerminationReceipt.task_id
+                == task.id,
+                worker_termination_module.WorkerTaskTerminationReceipt.operation
+                == "delete",
+            )
+        )
+        assert receipt.status == "rejected"
+        assert receipt.active_task_id is None
+
+
+async def test_delete_worker_task_lost_ack_converges_by_read_only_plan_audit(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    async with session_factory() as db:
+        plan = Plan(
+            title="Audit after lost ACK",
+            initial_request="Delete exactly once",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.commit()
+        plan_id = plan.id
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = [
+        WorkerTaskMutationOutcomeUncertainError(
+            "DELETE response was lost",
+            status_code=502,
+        ),
+        {
+            "plan_cascade_protocol": 1,
+            "task_exists": False,
+            "remaining_target_plan_ids": [],
+        },
+    ]
+    proxy.relay = Mock()
+    proxy.task_operation_lock = Mock(return_value=asyncio.Lock())
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "task_migrator", None)
+
+    response = await client.delete(f"/api/tasks/{task.id}")
+
+    assert response.status_code == 200, response.text
+    assert proxy.proxy_to_worker.await_count == 2
+    proxy.relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
+    async with session_factory() as db:
+        assert await db.get(Task, task.id) is None
+        assert await db.get(Plan, plan_id) is None
+
+
 async def test_delete_worker_task_retry_converges_when_remote_is_already_absent(
     client,
     session_factory,
@@ -10970,7 +11581,18 @@ async def test_delete_worker_task_retry_converges_when_remote_is_already_absent(
     )
     requests = _install_proxy_transport(
         monkeypatch,
-        _ProxyResponse(404, {"detail": "Task not found"}),
+        [
+            _ProxyResponse(200, {"plan_cascade_protocol": 1}),
+            _ProxyResponse(404, {"detail": "Task not found"}),
+            _ProxyResponse(
+                200,
+                {
+                    "plan_cascade_protocol": 1,
+                    "task_exists": False,
+                    "remaining_target_plan_ids": [],
+                },
+            ),
+        ],
     )
     relay = Mock()
     relay.subscribe_task = AsyncMock()
@@ -10981,7 +11603,12 @@ async def test_delete_worker_task_retry_converges_when_remote_is_already_absent(
     response = await client.delete(f"/api/tasks/{task.id}")
 
     assert response.status_code == 200, response.text
-    assert requests[0][0] == "DELETE"
+    assert [request[0] for request in requests] == ["GET", "DELETE", "GET"]
+    assert requests[0][1].endswith("/api/system/config")
+    assert requests[1][1].endswith(f"/api/tasks/{task.id}")
+    assert requests[2][1].endswith(
+        f"/api/tasks/{task.id}/plan-delete-audit"
+    )
     relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
     async with session_factory() as db:
         assert await db.get(Task, task.id) is None
@@ -10998,9 +11625,13 @@ async def test_delete_worker_task_does_not_treat_unrelated_404_as_confirmation(
         worker_id=worker.id,
         status="completed",
     )
-    _install_proxy_transport(
+    requests = _install_proxy_transport(
         monkeypatch,
-        _ProxyResponse(404, {"detail": "Route not found"}),
+        [
+            _ProxyResponse(200, {"plan_cascade_protocol": 1}),
+            _ProxyResponse(404, {"detail": "Route not found"}),
+            _ProxyResponse(404, {"detail": "Route not found"}),
+        ],
     )
     relay = Mock()
     relay.subscribe_task = AsyncMock()
@@ -11010,7 +11641,8 @@ async def test_delete_worker_task_does_not_treat_unrelated_404_as_confirmation(
 
     response = await client.delete(f"/api/tasks/{task.id}")
 
-    assert response.status_code == 502
+    assert response.status_code == 503
+    assert [request[0] for request in requests] == ["GET", "DELETE", "GET"]
     relay.unsubscribe_task.assert_not_called()
     async with session_factory() as db:
         assert await db.get(Task, task.id) is not None
@@ -11047,10 +11679,10 @@ async def test_delete_worker_task_preserves_manager_mirror_without_confirmation(
         await db.commit()
 
     proxy = AsyncMock()
-    if isinstance(remote_outcome, BaseException):
-        proxy.proxy_to_worker.side_effect = remote_outcome
-    else:
-        proxy.proxy_to_worker.return_value = remote_outcome
+    proxy.proxy_to_worker.side_effect = [
+        remote_outcome,
+        WorkerEndpointNotFoundError("plan-delete-audit"),
+    ]
     proxy.relay = Mock()
     proxy.task_operation_lock = Mock(return_value=asyncio.Lock())
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
@@ -11058,7 +11690,14 @@ async def test_delete_worker_task_preserves_manager_mirror_without_confirmation(
 
     response = await client.delete(f"/api/tasks/{task.id}")
 
-    assert response.status_code == 502
+    assert response.status_code == 503
+    assert proxy.proxy_to_worker.await_count == 2
+    assert [
+        call.args[1:3] for call in proxy.proxy_to_worker.await_args_list
+    ] == [
+        ("DELETE", f"/api/tasks/{task.id}"),
+        ("GET", f"/api/tasks/{task.id}/plan-delete-audit"),
+    ]
     proxy.relay.unsubscribe_task.assert_not_called()
     async with session_factory() as db:
         assert await db.get(Task, task.id) is not None
@@ -11069,7 +11708,7 @@ async def test_delete_worker_task_preserves_manager_mirror_without_confirmation(
         ).scalars().one().content == "retain me"
 
 
-async def test_delete_worker_task_converges_after_stale_relay_generation_update(
+async def test_delete_worker_task_rejects_delayed_relay_generation_update(
     client,
     session_factory,
     monkeypatch,
@@ -11081,9 +11720,13 @@ async def test_delete_worker_task_converges_after_stale_relay_generation_update(
         status="completed",
     )
 
-    async def remote_delete_then_relay_new_generation(*_args, **_kwargs):
+    release_relay = asyncio.Event()
+    relay_task = None
+
+    async def delayed_relay_generation():
+        await release_relay.wait()
         async with session_factory() as db:
-            await db.execute(
+            changed = await db.execute(
                 update(Task)
                 .where(Task.id == task.id)
                 .values(
@@ -11092,10 +11735,20 @@ async def test_delete_worker_task_converges_after_stale_relay_generation_update(
                 )
             )
             await db.commit()
-        return {"ok": True}
+            return changed.rowcount
+
+    async def remote_delete_then_queue_relay(*_args, **_kwargs):
+        nonlocal relay_task
+        relay_task = asyncio.create_task(delayed_relay_generation())
+        return {
+            "ok": True,
+            "plan_cascade_protocol": 1,
+            "deleted_plan_ids": [],
+            "remaining_target_plan_ids": [],
+        }
 
     proxy = AsyncMock()
-    proxy.proxy_to_worker.side_effect = remote_delete_then_relay_new_generation
+    proxy.proxy_to_worker.side_effect = remote_delete_then_queue_relay
     proxy.relay = Mock()
     proxy.task_operation_lock = Mock(return_value=asyncio.Lock())
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
@@ -11105,11 +11758,13 @@ async def test_delete_worker_task_converges_after_stale_relay_generation_update(
 
     assert response.status_code == 200, response.text
     proxy.relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
+    release_relay.set()
+    assert await relay_task == 0
     async with session_factory() as db:
         assert await db.get(Task, task.id) is None
 
 
-async def test_delete_worker_task_preserves_mirror_moved_to_another_worker(
+async def test_delete_worker_task_rejects_delayed_worker_move(
     client,
     session_factory,
     monkeypatch,
@@ -11125,18 +11780,32 @@ async def test_delete_worker_task_preserves_mirror_moved_to_another_worker(
         status="completed",
     )
 
-    async def remote_delete_then_move_mirror(*_args, **_kwargs):
+    release_move = asyncio.Event()
+    move_task = None
+
+    async def delayed_worker_move():
+        await release_move.wait()
         async with session_factory() as db:
-            await db.execute(
+            changed = await db.execute(
                 update(Task)
                 .where(Task.id == task.id)
                 .values(worker_id=destination.id)
             )
             await db.commit()
-        return {"ok": True}
+            return changed.rowcount
+
+    async def remote_delete_then_queue_move(*_args, **_kwargs):
+        nonlocal move_task
+        move_task = asyncio.create_task(delayed_worker_move())
+        return {
+            "ok": True,
+            "plan_cascade_protocol": 1,
+            "deleted_plan_ids": [],
+            "remaining_target_plan_ids": [],
+        }
 
     proxy = AsyncMock()
-    proxy.proxy_to_worker.side_effect = remote_delete_then_move_mirror
+    proxy.proxy_to_worker.side_effect = remote_delete_then_queue_move
     proxy.relay = Mock()
     proxy.task_operation_lock = Mock(return_value=asyncio.Lock())
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
@@ -11144,12 +11813,13 @@ async def test_delete_worker_task_preserves_mirror_moved_to_another_worker(
 
     response = await client.delete(f"/api/tasks/{task.id}")
 
-    assert response.status_code == 409, response.text
+    assert response.status_code == 200, response.text
     proxy.relay.unsubscribe_task.assert_called_once_with(source.id, task.id)
+    release_move.set()
+    assert await move_task == 0
     async with session_factory() as db:
         preserved = await db.get(Task, task.id)
-        assert preserved is not None
-        assert preserved.worker_id == destination.id
+        assert preserved is None
 
 
 async def test_monitor_delete_translates_remote_id(client, session_factory, monkeypatch):

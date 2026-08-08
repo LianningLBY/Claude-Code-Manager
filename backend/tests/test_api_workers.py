@@ -5,9 +5,11 @@ import copy
 import logging
 import shlex
 import socket
+from datetime import datetime
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from sqlalchemy import text
 
 import backend.main as main_module
 from backend.config import settings
@@ -17,6 +19,14 @@ from backend.api.workers import (
     _remove_persisted_worker_account,
 )
 from backend.models.worker import Worker
+from backend.models.plan import Plan
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentStep,
+    PlanAgentWorkerDispatchReceipt,
+)
+from backend.schemas.plan import default_plan_pipeline_config
+from backend.services.plan_runtime_receipt import new_prepared_runtime_receipt
 from backend.services.worker_provisioner import (
     BootstrapError,
     WorkerProvisioner,
@@ -210,6 +220,439 @@ async def test_real_destroying_restart_recovery_can_retry_destroy(
     async with session_factory() as db:
         current = await db.get(Worker, worker_id)
     assert current.status == "destroying"
+
+
+async def _insert_worker_plan_graph(
+    session_factory,
+    *,
+    worker_id: int,
+    run_status: str = "completed",
+    archived: bool,
+    active: bool = False,
+    dirty_runtime: bool = False,
+    clean_runtime: bool = False,
+    dirty_worker_dispatch: bool = False,
+    worker_mirror_runtime: bool = False,
+    historical_dispatch_reason: str | None = None,
+) -> tuple[int, int]:
+    async with session_factory() as db:
+        run_generation = (
+            1
+            if historical_dispatch_reason is not None or run_status == "cancelling"
+            else 0
+        )
+        plan = Plan(
+            title="Worker lifecycle Plan",
+            initial_request="Keep exact Worker ownership",
+            worker_id=worker_id,
+            priority=0,
+            archived_at=datetime.utcnow() if archived else None,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker_id,
+            run_type="initial",
+            status=run_status,
+            current_stage="complete" if run_status == "completed" else "planner",
+            generation=run_generation,
+            cancellation_target_generation=(0 if run_status == "cancelling" else None),
+            pipeline_config=plan.pipeline_config,
+            finished_at=(
+                datetime.utcnow()
+                if run_status in {"completed", "failed", "cancelled"}
+                else None
+            ),
+        )
+        db.add(run)
+        await db.flush()
+        if active:
+            plan.active_run_id = run.id
+        if dirty_runtime or clean_runtime:
+            step = PlanAgentStep(
+                run_id=run.id,
+                plan_id=plan.id,
+                step_type="planner",
+                round=1,
+                generation=run.generation,
+                provider="claude",
+                status="failed",
+            )
+            db.add(step)
+            await db.flush()
+            receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+            if dirty_runtime:
+                receipt.status = "cleanup_failed"
+                receipt.cleanup_error = "still owns a process"
+            else:
+                receipt.status = "cleaned"
+                receipt.cleaned_at = datetime.utcnow()
+            db.add(receipt)
+        if worker_mirror_runtime:
+            step = PlanAgentStep(
+                run_id=run.id,
+                plan_id=plan.id,
+                worker_id=worker_id,
+                worker_step_id=901,
+                step_type="planner",
+                round=1,
+                generation=run.generation,
+                provider="claude",
+                status=run_status,
+                finished_at=datetime.utcnow(),
+            )
+            db.add(step)
+            db.add(
+                PlanAgentWorkerDispatchReceipt(
+                    plan_id=plan.id,
+                    run_id=run.id,
+                    target_task_id=plan.target_task_id,
+                    worker_id=worker_id,
+                    run_generation=run.generation,
+                    protocol=1,
+                    status="settled",
+                    payload_digest="b" * 64,
+                    remote_status=run_status,
+                    settlement_reason="remote_pause",
+                    settled_at=datetime.utcnow(),
+                )
+            )
+        if historical_dispatch_reason is not None:
+            db.add(
+                PlanAgentWorkerDispatchReceipt(
+                    plan_id=plan.id,
+                    run_id=run.id,
+                    target_task_id=plan.target_task_id,
+                    worker_id=worker_id,
+                    run_generation=run.generation - 1,
+                    protocol=1,
+                    status="settled",
+                    payload_digest=(
+                        "c" * 64
+                        if historical_dispatch_reason == "remote_absent"
+                        else None
+                    ),
+                    settlement_reason=historical_dispatch_reason,
+                    settled_at=datetime.utcnow(),
+                )
+            )
+        if dirty_worker_dispatch:
+            db.add(PlanAgentWorkerDispatchReceipt(
+                plan_id=plan.id,
+                run_id=run.id,
+                target_task_id=plan.target_task_id,
+                worker_id=worker_id,
+                run_generation=run.generation,
+                protocol=1,
+                status="remote_possible",
+                payload_digest="a" * 64,
+            ))
+        await db.commit()
+        return plan.id, run.id
+
+
+async def test_destroy_requires_inactive_worker_plan_to_be_archived(
+    client,
+    session_factory,
+    fake_provisioner,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-history",
+    )
+    await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=False,
+    )
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert "archive inactive Plans" in response.json()["detail"]
+    async with session_factory() as db:
+        worker = await db.get(Worker, worker_id)
+    assert worker.status == "ready"
+    fake_provisioner.destroy_worker.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "run_status",
+    ["queued", "running", "waiting_user", "cancelling"],
+)
+async def test_destroy_rejects_active_worker_plan_runtime(
+    client,
+    session_factory,
+    fake_provisioner,
+    run_status,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id=f"i-plan-{run_status}",
+    )
+    await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        run_status=run_status,
+        archived=True,
+        active=True,
+    )
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert run_status in response.json()["detail"]
+    async with session_factory() as db:
+        worker = await db.get(Worker, worker_id)
+    assert worker.status == "ready"
+
+
+async def test_destroy_rejects_dirty_terminal_worker_plan_runtime(
+    client,
+    session_factory,
+    fake_provisioner,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-dirty-terminal",
+    )
+    await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        dirty_runtime=True,
+    )
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]
+    async with session_factory() as db:
+        worker = await db.get(Worker, worker_id)
+    assert worker.status == "ready"
+
+
+async def test_destroy_rejects_uncertain_worker_plan_dispatch_receipt(
+    client,
+    session_factory,
+    fake_provisioner,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-remote-possible",
+    )
+    await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        dirty_worker_dispatch=True,
+    )
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]
+    async with session_factory() as db:
+        worker = await db.get(Worker, worker_id)
+    assert worker.status == "ready"
+
+
+@pytest.mark.parametrize("drift", ["rebound", "detached", "missing"])
+async def test_destroy_finds_dispatch_receipt_by_frozen_worker_identity(
+    client,
+    session_factory,
+    fake_provisioner,
+    drift,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id=f"i-plan-dispatch-{drift}",
+    )
+    replacement_worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id=f"i-plan-dispatch-replacement-{drift}",
+    )
+    plan_id, run_id = await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        dirty_worker_dispatch=True,
+    )
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        run = await db.get(PlanAgentRun, run_id)
+        assert plan is not None and run is not None
+        if drift == "rebound":
+            plan.worker_id = replacement_worker_id
+            run.worker_id = replacement_worker_id
+        elif drift == "detached":
+            plan.worker_id = None
+            run.worker_id = None
+        else:
+            plan.worker_id = None
+            await db.delete(run)
+        await db.commit()
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert "dispatch:remote_possible" in response.json()["detail"]
+    async with session_factory() as db:
+        worker = await db.get(Worker, worker_id)
+    assert worker is not None and worker.status == "ready"
+    fake_provisioner.destroy_worker.assert_not_awaited()
+
+
+async def test_destroy_rejects_forged_cleaned_worker_plan_runtime(
+    client,
+    session_factory,
+    fake_provisioner,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-forged-cleaned",
+    )
+    _plan_id, run_id = await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        clean_runtime=True,
+    )
+    async with session_factory() as db:
+        await db.execute(text("PRAGMA ignore_check_constraints = ON"))
+        await db.execute(
+            text(
+                "UPDATE plan_agent_runtime_receipts SET cleaned_at = NULL "
+                "WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+        await db.commit()
+        await db.execute(text("PRAGMA ignore_check_constraints = OFF"))
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]
+    fake_provisioner.destroy_worker.assert_not_awaited()
+
+
+async def test_destroy_rejects_cleaned_runtime_with_wrong_generation(
+    client,
+    session_factory,
+    fake_provisioner,
+):
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-cleaned-wrong-generation",
+    )
+    _plan_id, run_id = await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        clean_runtime=True,
+    )
+    async with session_factory() as db:
+        await db.execute(
+            text(
+                "UPDATE plan_agent_runtime_receipts "
+                "SET run_generation = run_generation + 1 WHERE run_id = :run_id"
+            ),
+            {"run_id": run_id},
+        )
+        await db.commit()
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 409
+    assert "completed" in response.json()["detail"]
+    fake_provisioner.destroy_worker.assert_not_awaited()
+
+
+async def test_destroy_allows_archived_clean_terminal_worker_plan_history(
+    client,
+    session_factory,
+    fake_provisioner,
+    monkeypatch,
+):
+    import backend.api.workers as workers_api
+
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-archived",
+    )
+    await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        worker_mirror_runtime=True,
+    )
+    coordinator = AsyncMock()
+    scheduled = []
+
+    def capture_spawn(coro):
+        scheduled.append(coro)
+        return Mock()
+
+    monkeypatch.setattr(workers_api, "_migrate_back_then_destroy", coordinator)
+    monkeypatch.setattr(workers_api, "_spawn", capture_spawn)
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "destroying"
+    assert len(scheduled) == 1
+    await scheduled[0]
+    coordinator.assert_awaited_once()
+
+
+async def test_destroy_allows_remote_absent_history_before_clean_worker_outcome(
+    client,
+    session_factory,
+    fake_provisioner,
+    monkeypatch,
+):
+    import backend.api.workers as workers_api
+
+    worker_id = await _insert_worker(
+        session_factory,
+        status="ready",
+        cloud_instance_id="i-plan-remote-absent-history",
+    )
+    await _insert_worker_plan_graph(
+        session_factory,
+        worker_id=worker_id,
+        archived=True,
+        worker_mirror_runtime=True,
+        historical_dispatch_reason="remote_absent",
+    )
+    coordinator = AsyncMock()
+    scheduled = []
+
+    def capture_spawn(coro):
+        scheduled.append(coro)
+        return Mock()
+
+    monkeypatch.setattr(workers_api, "_migrate_back_then_destroy", coordinator)
+    monkeypatch.setattr(workers_api, "_spawn", capture_spawn)
+
+    response = await client.post(f"/api/workers/{worker_id}/destroy")
+
+    assert response.status_code == 200, response.text
+    assert len(scheduled) == 1
+    await scheduled[0]
+    coordinator.assert_awaited_once()
 
 
 async def test_create_worker_disabled_returns_503(client, monkeypatch):

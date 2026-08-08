@@ -90,6 +90,13 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
         "versioned_plan_worker_protocol": 3,
+        # Worker Task deletion returns/serves an exact Task+Plan cascade proof.
+        # Managers with first-class Plan mirrors fail closed on older Workers.
+        "plan_cascade_protocol": 1,
+        "worker_plan_reconciliation_protocol": 1,
+        # Exact cancellation is authenticated by the permanent Worker import
+        # receipt; an absent Run creates a tombstone before returning success.
+        "worker_plan_exact_cancel_protocol": 1,
         # A Manager may resume a pre-Plan-v2 approved carrier already present
         # on a Worker only after exact semantic readback.  This protocol never
         # authorizes generic mode=plan Task creation.

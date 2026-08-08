@@ -29,7 +29,11 @@ from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.models.plan import Plan
-from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentStep,
+    PlanAgentWorkerDispatchReceipt,
+)
 from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
@@ -368,6 +372,8 @@ TASK_QUEUE_ABORT_TIMEOUT = 15.0
 AUX_LIFECYCLE_CANCEL_TIMEOUT = 10.0
 DISPATCHER_BACKGROUND_STOP_TIMEOUT = 10.0
 SHUTDOWN_LIFECYCLE_CANCEL_TIMEOUT = 15.0
+PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL = 5.0
+PLAN_RUNTIME_RECOVERY_BACKOFF_MAX = 60.0
 MONITOR_TURN_TIMEOUT = 600.0
 MONITOR_MAX_CONSECUTIVE_FAILURES = 3
 MONITOR_FAILURE_BACKOFF_BASE = 5.0
@@ -1036,6 +1042,20 @@ class GlobalDispatcher:
         # Alternate local admission when both queues have work so neither
         # ordinary Tasks nor first-class PlanRuns can starve the other.
         self._prefer_plan_runs = True
+        # Cold Plan runtime cleanup can be temporarily unprovable while an old
+        # shared Codex app-server still exists. Retry only from the single
+        # dispatch producer, before it can claim/register another Plan
+        # lifecycle, so recovery never observes that commit-to-registration
+        # window as an orphan. The deadline prevents the 2s task poll from
+        # turning into a high-frequency database/runtime audit.
+        self._plan_runtime_recovery_not_before: float | None = None
+        self._plan_runtime_recovery_backoff = (
+            PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL
+        )
+        # A lifecycle can become orphaned while an older cold scan is awaiting
+        # I/O. The generation stops that older clean result from erasing the
+        # newer retry request.
+        self._plan_runtime_recovery_signal_generation = 0
 
         # Pool: initialized lazily on start() if pool_enabled
         self.pool: "ClaudePool | None" = None
@@ -1110,24 +1130,47 @@ class GlobalDispatcher:
         lifecycle = (
             self._running_tasks.get(instance_id) if instance_id is not None else None
         )
-        if lifecycle is None and instance_id is None:
+        if lifecycle is not None and getattr(
+            lifecycle,
+            "_ccm_worker_plan_cancellation_recovery",
+            False,
+        ):
+            lifecycle = None
+        if lifecycle is None:
             lifecycle = next(
                 (
                     task
                     for task in self._running_tasks.values()
                     if not task.done()
-                    and getattr(task, "_ccm_worker_plan_run_id", None) == run_id
+                    and not getattr(
+                        task,
+                        "_ccm_worker_plan_cancellation_recovery",
+                        False,
+                    )
+                    and (
+                        getattr(task, "_ccm_plan_run_id", None) == run_id
+                        or getattr(task, "_ccm_worker_plan_run_id", None) == run_id
+                    )
                 ),
                 None,
             )
         if (
             lifecycle is None
             or lifecycle.done()
+            or getattr(
+                lifecycle,
+                "_ccm_worker_plan_cancellation_recovery",
+                False,
+            )
             or (
                 getattr(lifecycle, "_ccm_plan_run_id", None) != run_id
                 and getattr(lifecycle, "_ccm_worker_plan_run_id", None) != run_id
             )
         ):
+            # This generic runtime API is also called by the ordinary Plan
+            # route, whose request-scoped database may differ from the global
+            # dispatcher's factory in tests and embedded apps. Durable cold-
+            # restart proof therefore belongs to the Capability-only adapter.
             return False
         lifecycle.cancel()
         try:
@@ -1144,6 +1187,193 @@ class GlobalDispatcher:
                 f"Plan Run {run_id} runtime cleanup could not be confirmed"
             )
         return True
+
+    async def stop_capability_plan_run_lifecycle(
+        self,
+        run_id: int,
+        instance_id: int | None,
+    ) -> bool:
+        """Stop a Capability PlanRun or prove its cold-start runtime absent.
+
+        Unlike the generic Plan API callback, this method is injected only
+        into the process-global Capability executor and may therefore use the
+        dispatcher's matching database factory for durable absence proof.
+        """
+
+        from backend.models.capability import (
+            CapabilityExecution,
+            CapabilityInvocation,
+        )
+        from backend.services.plan_agent_runner import active_plan_run_ids
+        from backend.services.plan_capability import PLAN_RUN_HANDLE_GENERATION
+        from backend.services.plan_runtime_receipt import (
+            reconcile_runtime_generation,
+        )
+
+        target_generation: int | None = None
+        plan_id: int | None = None
+        async with self.db_factory() as db:
+            run = await db.get(
+                PlanAgentRun,
+                run_id,
+                populate_existing=True,
+            )
+            plan = (
+                await db.get(Plan, run.plan_id, populate_existing=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            execution = (
+                await db.get(
+                    CapabilityExecution,
+                    run.capability_execution_id,
+                    populate_existing=True,
+                )
+                if run is not None and run.capability_execution_id is not None
+                else None
+            )
+            invocation = (
+                await db.get(
+                    CapabilityInvocation,
+                    execution.invocation_id,
+                    populate_existing=True,
+                )
+                if execution is not None
+                else None
+            )
+            if (
+                run is None
+                or run.status != "cancelling"
+                or run.run_type != "capability"
+                or run.capability_execution_id is None
+                or run.cancellation_target_generation is None
+                or run.generation != run.cancellation_target_generation + 1
+                or plan is None
+                or plan.active_run_id != run.id
+                or execution is None
+                or invocation is None
+                or run.capability_execution_id != execution.id
+                or run.plan_id != plan.id
+                or plan.target_task_id != invocation.task_id
+                or invocation.capability_key != "plan"
+                or invocation.executor_kind != "plan_agent"
+                or invocation.status != "cancelling"
+                or invocation.active_task_id != invocation.task_id
+                or execution.invocation_id != invocation.id
+                or execution.executor_kind != "plan_agent"
+                or execution.status != "cancelling"
+                or execution.active_invocation_id != invocation.id
+                or execution.handle_kind != "plan_agent_run"
+                or execution.handle_id != str(run.id)
+                or execution.handle_generation != PLAN_RUN_HANDLE_GENERATION
+                or (
+                    instance_id is not None
+                    and run.instance_id not in {None, instance_id}
+                )
+            ):
+                return False
+            target_generation = run.cancellation_target_generation
+            plan_id = plan.id
+
+        await self.stop_plan_run_lifecycle(run_id, instance_id)
+        if run_id in active_plan_run_ids():
+            return False
+
+        if not await reconcile_runtime_generation(
+            self.db_factory,
+            self.instance_manager,
+            run_id=run_id,
+            generation=target_generation,
+            allow_transport_kill=False,
+        ):
+            return False
+
+        from backend.services.plan_service import (
+            plan_operation_lock,
+            release_capability_run_owner_after_cleanup,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                execution = (
+                    await db.get(
+                        CapabilityExecution,
+                        run.capability_execution_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if run is not None and run.capability_execution_id is not None
+                    else None
+                )
+                invocation = (
+                    await db.get(
+                        CapabilityInvocation,
+                        execution.invocation_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if execution is not None
+                    else None
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or execution is None
+                    or invocation is None
+                    or run.status != "cancelling"
+                    or run.run_type != "capability"
+                    or run.capability_execution_id != execution.id
+                    or run.cancellation_target_generation != target_generation
+                    or run.generation != target_generation + 1
+                    or run.plan_id != plan.id
+                    or plan.active_run_id != run.id
+                    or plan.target_task_id != invocation.task_id
+                    or invocation.capability_key != "plan"
+                    or invocation.executor_kind != "plan_agent"
+                    or invocation.status != "cancelling"
+                    or invocation.active_task_id != invocation.task_id
+                    or execution.invocation_id != invocation.id
+                    or execution.executor_kind != "plan_agent"
+                    or execution.status != "cancelling"
+                    or execution.active_invocation_id != invocation.id
+                    or execution.handle_kind != "plan_agent_run"
+                    or execution.handle_id != str(run.id)
+                    or execution.handle_generation != PLAN_RUN_HANDLE_GENERATION
+                ):
+                    await db.rollback()
+                    return False
+                try:
+                    run = await release_capability_run_owner_after_cleanup(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                except HTTPException:
+                    await db.rollback()
+                    return False
+                reverse_owner = await db.scalar(
+                    select(Instance.id)
+                    .where(Instance.current_plan_run_id == run_id)
+                    .limit(1)
+                )
+                return bool(
+                    run.status == "cancelling"
+                    and run.instance_id is None
+                    and run.last_execution_started_at is None
+                    and reverse_owner is None
+                )
 
     async def start(self):
         if self._shutting_down:
@@ -1186,7 +1416,20 @@ class GlobalDispatcher:
             # its pre-spawn phase so no child can appear after reconciliation's
             # manager-owned snapshot without being represented in that snapshot.
             async with self._chat_launch_admission_lock:
-                await self._recover_versioned_plan_runs()
+                recovery_signal_generation = (
+                    self._plan_runtime_recovery_signal_generation
+                )
+                plan_runtime_retry_needed = (
+                    await self._recover_versioned_plan_runs()
+                )
+                if (
+                    plan_runtime_retry_needed
+                    or recovery_signal_generation
+                    == self._plan_runtime_recovery_signal_generation
+                ):
+                    self._record_plan_runtime_recovery_result(
+                        retry_needed=plan_runtime_retry_needed,
+                    )
                 await self._cleanup_stale_state()
             await self._recover_codex_monitor_cleanups()
             await self._recover_monitor_sessions()
@@ -1214,109 +1457,868 @@ class GlobalDispatcher:
             raise
         logger.info("GlobalDispatcher started")
 
-    async def _recover_versioned_plan_runs(self) -> None:
-        """Reconcile durable PlanRun states before generic Instance cleanup."""
+    def _record_plan_runtime_recovery_result(self, *, retry_needed: bool) -> None:
+        """Update the bounded retry schedule after one serialized cold scan."""
+
+        if not retry_needed:
+            self._plan_runtime_recovery_not_before = None
+            self._plan_runtime_recovery_backoff = (
+                PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL
+            )
+            return
+        delay = self._plan_runtime_recovery_backoff
+        self._plan_runtime_recovery_not_before = time.monotonic() + delay
+        self._plan_runtime_recovery_backoff = min(
+            PLAN_RUNTIME_RECOVERY_BACKOFF_MAX,
+            max(PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL, delay * 2),
+        )
+
+    def _request_plan_runtime_recovery(self) -> None:
+        """Advertise a newly orphaned unclean generation to the producer."""
+
+        self._plan_runtime_recovery_signal_generation += 1
+        if self._plan_runtime_recovery_not_before is None:
+            self._record_plan_runtime_recovery_result(retry_needed=True)
+        self.wake()
+
+    async def _recover_due_versioned_plan_runs(self) -> None:
+        """Retry an orphan Plan runtime only from the dispatch producer.
+
+        This method must remain inline in ``_dispatch_loop`` before Plan
+        claims. A detached recovery task could scan after ``_claim_plan_run``
+        commits but before its lifecycle is registered in ``_running_tasks``.
+        """
+
+        deadline = self._plan_runtime_recovery_not_before
+        if deadline is None or time.monotonic() < deadline:
+            return
+        # Maintenance must either observe this reconciliation completed or
+        # close admission before it begins. Recheck every flag after acquiring
+        # the same lock used by pause and fresh Task/Plan claims.
+        async with self._dispatch_claim_lock:
+            deadline = self._plan_runtime_recovery_not_before
+            if (
+                deadline is None
+                or time.monotonic() < deadline
+                or self._dispatch_paused
+                or self._shutting_down
+                or not self._running
+            ):
+                return
+            recovery_signal_generation = (
+                self._plan_runtime_recovery_signal_generation
+            )
+            try:
+                retry_needed = await self._recover_versioned_plan_runs()
+            except Exception:
+                self._record_plan_runtime_recovery_result(retry_needed=True)
+                raise
+            if (
+                retry_needed
+                or recovery_signal_generation
+                == self._plan_runtime_recovery_signal_generation
+            ):
+                self._record_plan_runtime_recovery_result(
+                    retry_needed=retry_needed,
+                )
+            if not retry_needed:
+                # A recovered running Run is now queued. Let this same
+                # serialized loop claim it without the normal poll delay.
+                self.wake()
+
+    async def _recover_versioned_plan_runs(self) -> bool:
+        """Reconcile orphan local PlanRuns and report whether to retry.
+
+        ``True`` means at least one non-live local generation remains unclean
+        or has an incomplete cancellation/owner graph. Live in-memory runs and
+        ordinary clean queued/waiting runs do not enable the backoff scanner.
+        """
 
         from backend.services.plan_agent_runner import active_plan_run_ids
+        from backend.services.plan_runtime_receipt import (
+            reconcile_runtime_generation,
+            reconcile_runtime_run,
+        )
 
-        live_run_ids = active_plan_run_ids()
+        live_run_ids = active_plan_run_ids() | {
+            int(run_id)
+            for lifecycle in self._running_tasks.values()
+            if not lifecycle.done()
+            and (run_id := getattr(lifecycle, "_ccm_plan_run_id", None))
+            is not None
+        }
         async with self.db_factory() as db:
             runs = list(
                 (
                     await db.execute(
-                        select(PlanAgentRun).where(
+                        select(
+                            PlanAgentRun.id,
+                            PlanAgentRun.status,
+                            PlanAgentRun.generation,
+                            PlanAgentRun.cancellation_target_generation,
+                        ).where(
                             PlanAgentRun.plan_id.isnot(None),
+                            PlanAgentRun.worker_id.is_(None),
                             PlanAgentRun.status.in_(
-                                ["queued", "running", "waiting_user"]
+                                ["queued", "running", "waiting_user", "cancelling"]
                             ),
                         )
                     )
-                ).scalars()
+                ).all()
             )
-            for run in runs:
-                plan = await db.get(Plan, run.plan_id)
-                if plan is None or plan.active_run_id != run.id:
-                    if run.status != "waiting_user" or plan is None:
-                        run.status = "failed"
-                        run.current_stage = "failed"
-                        run.error = "Plan Run lost its aggregate owner during recovery"
-                        run.finished_at = datetime.utcnow()
-                    run.instance_id = None
-                    continue
-                if run.status == "running" and run.id not in live_run_ids:
-                    if run.last_execution_started_at is not None:
-                        run.execution_seconds = float(run.execution_seconds or 0) + max(
-                            0.0,
-                            (
-                                datetime.utcnow() - run.last_execution_started_at
-                            ).total_seconds(),
-                        )
-                        run.last_execution_started_at = None
-                    if run.instance_id is not None:
-                        owner = await db.get(Instance, run.instance_id)
-                        if (
-                            owner is not None
-                            and owner.current_plan_run_id == run.id
-                            and owner.current_task_id is None
-                            and owner.pid is None
-                        ):
-                            owner.status = "idle"
-                            owner.current_plan_run_id = None
-                    running_steps = list(
-                        (
-                            await db.execute(
-                                select(PlanAgentStep).where(
-                                    PlanAgentStep.run_id == run.id,
-                                    PlanAgentStep.status == "running",
-                                )
-                            )
-                        ).scalars()
-                    )
-                    for step in running_steps:
-                        step.status = "cancelled"
-                        step.error = "Interrupted by CCM restart"
-                        step.finished_at = datetime.utcnow()
-                    run.status = "queued"
-                    run.instance_id = None
-                    run.generation += 1
-                    run.updated_at = datetime.utcnow()
-                elif (
-                    run.status in {"queued", "waiting_user"}
-                    and run.instance_id is not None
-                ):
-                    owner = await db.get(Instance, run.instance_id)
-                    if (
-                        owner is not None
-                        and owner.current_plan_run_id == run.id
-                        and owner.current_task_id is None
-                        and owner.pid is None
-                    ):
-                        owner.status = "idle"
-                        owner.current_plan_run_id = None
-                    run.instance_id = None
-                    run.last_execution_started_at = None
 
-            owners = list(
+        retry_needed = False
+        for run_id, status, generation, cancellation_generation in runs:
+            if run_id in live_run_ids:
+                continue
+            if status == "running":
+                clean = await reconcile_runtime_generation(
+                    self.db_factory,
+                    self.instance_manager,
+                    run_id=run_id,
+                    generation=generation,
+                    allow_transport_kill=True,
+                )
+                if clean:
+                    recovered = await self._recover_clean_running_plan_run(
+                        run_id=run_id,
+                        generation=generation,
+                    )
+                    retry_needed = retry_needed or not recovered
+                else:
+                    retry_needed = True
+            elif status == "cancelling":
+                if cancellation_generation is None:
+                    retry_needed = True
+                    continue
+                if await self._is_exact_capability_plan_cancellation(
+                    run_id=run_id,
+                    target_generation=cancellation_generation,
+                ):
+                    clean = await reconcile_runtime_generation(
+                        self.db_factory,
+                        self.instance_manager,
+                        run_id=run_id,
+                        generation=cancellation_generation,
+                        allow_transport_kill=True,
+                    )
+                    if clean:
+                        recovered = await self.stop_capability_plan_run_lifecycle(
+                            run_id,
+                            None,
+                        )
+                        retry_needed = retry_needed or not recovered
+                    else:
+                        retry_needed = True
+                elif await self._is_exact_standard_plan_cancellation(
+                    run_id=run_id,
+                    target_generation=cancellation_generation,
+                ):
+                    clean = await reconcile_runtime_generation(
+                        self.db_factory,
+                        self.instance_manager,
+                        run_id=run_id,
+                        generation=cancellation_generation,
+                        allow_transport_kill=True,
+                    )
+                    if clean:
+                        recovered = (
+                            await self._recover_clean_standard_plan_cancellation(
+                                run_id=run_id,
+                                target_generation=cancellation_generation,
+                            )
+                        )
+                        retry_needed = retry_needed or not recovered
+                    else:
+                        retry_needed = True
+                else:
+                    retry_needed = True
+            else:
+                clean = await reconcile_runtime_run(
+                    self.db_factory,
+                    self.instance_manager,
+                    run_id=run_id,
+                    allow_transport_kill=True,
+                )
+                if clean:
+                    recovered = await self._recover_clean_inactive_plan_run(
+                        run_id=run_id
+                    )
+                    retry_needed = retry_needed or not recovered
+                else:
+                    retry_needed = True
+        worker_retry_needed = await self._recover_worker_plan_runs()
+        return retry_needed or worker_retry_needed
+
+    async def _recover_worker_plan_runs(self) -> bool:
+        """Recover orphan Manager claims without replaying Worker imports."""
+
+        from backend.main import worker_proxy
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            snapshot_worker_dispatch_receipt,
+        )
+
+        def live_worker_lifecycles(run_id: int) -> list[asyncio.Task]:
+            return [
+                lifecycle
+                for lifecycle in self._running_tasks.values()
+                if not lifecycle.done()
+                and getattr(
+                    lifecycle,
+                    "_ccm_worker_plan_run_id",
+                    None,
+                )
+                == run_id
+            ]
+
+        live_run_ids = {
+            int(run_id)
+            for lifecycle in self._running_tasks.values()
+            if not lifecycle.done()
+            and (
+                run_id := getattr(
+                    lifecycle,
+                    "_ccm_worker_plan_run_id",
+                    None,
+                )
+            )
+            is not None
+        }
+        retry_needed = False
+        async with self.db_factory() as db:
+            cancelling_rows = list(
                 (
                     await db.execute(
-                        select(Instance).where(Instance.current_plan_run_id.isnot(None))
+                        select(
+                            PlanAgentRun.id,
+                            PlanAgentRun.plan_id,
+                            PlanAgentRun.worker_id,
+                            PlanAgentRun.cancellation_target_generation,
+                        ).where(
+                            PlanAgentRun.status == "cancelling",
+                            PlanAgentRun.worker_id.isnot(None),
+                            PlanAgentRun.plan_id.isnot(None),
+                            PlanAgentRun.cancellation_target_generation.isnot(None),
+                        )
+                    )
+                ).all()
+        )
+        for run_id, plan_id, worker_id, target_generation in cancelling_rows:
+            live_lifecycles = live_worker_lifecycles(run_id)
+            if live_lifecycles:
+                if any(
+                    getattr(
+                        lifecycle,
+                        "_ccm_worker_plan_cancellation_recovery",
+                        False,
+                    )
+                    for lifecycle in live_lifecycles
+                ):
+                    # An exact recovery RPC already owns this run. Do not
+                    # cancel it just because the periodic sweep overlaps.
+                    retry_needed = True
+                    continue
+                try:
+                    await self.stop_plan_run_lifecycle(run_id, None)
+                except Exception as exc:
+                    logger.warning(
+                        "Worker Plan Run %s old lifecycle reap remains "
+                        "pending before exact cancellation recovery: %s",
+                        run_id,
+                        exc,
+                    )
+                    retry_needed = True
+                    continue
+                if live_worker_lifecycles(run_id):
+                    retry_needed = True
+                    continue
+                live_run_ids.discard(run_id)
+            async with self.db_factory() as db:
+                plan = await db.get(Plan, plan_id, populate_existing=True)
+                receipts = list(
+                    (
+                        await db.execute(
+                            select(PlanAgentWorkerDispatchReceipt)
+                            .where(PlanAgentWorkerDispatchReceipt.run_id == run_id)
+                            .order_by(
+                                PlanAgentWorkerDispatchReceipt.run_generation,
+                                PlanAgentWorkerDispatchReceipt.id,
+                            )
+                        )
+                    ).scalars()
+                )
+                try:
+                    snapshots = [
+                        snapshot_worker_dispatch_receipt(receipt)
+                        for receipt in receipts
+                    ]
+                except WorkerPlanDispatchConflict:
+                    retry_needed = True
+                    continue
+                digests = {
+                    snapshot.payload_digest
+                    for snapshot in snapshots
+                    if snapshot.payload_digest is not None
+                }
+                if (
+                    plan is None
+                    or plan.worker_id != worker_id
+                    or plan.active_run_id != run_id
+                    or digests == set()
+                    or len(digests) != 1
+                    or any(
+                        snapshot.plan_id != plan_id
+                        or snapshot.worker_id != worker_id
+                        or snapshot.target_task_id != plan.target_task_id
+                        or snapshot.run_generation > target_generation
+                        for snapshot in snapshots
+                    )
+                ):
+                    retry_needed = True
+                    continue
+                if plan.target_task_id is not None:
+                    target = await db.get(
+                        Task,
+                        plan.target_task_id,
+                        populate_existing=True,
+                    )
+                    if target is None or target.worker_id != worker_id:
+                        retry_needed = True
+                        continue
+                payload_digest = next(iter(digests))
+            if worker_proxy is None:
+                retry_needed = True
+                continue
+            key = f"worker-plan-{run_id}"
+            existing = self._running_tasks.get(key)
+            if existing is not None and not existing.done():
+                continue
+            lifecycle = asyncio.create_task(
+                self._run_worker_plan_cancellation_recovery_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    target_generation=target_generation,
+                    payload_digest=payload_digest,
+                )
+            )
+            setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
+            setattr(
+                lifecycle,
+                "_ccm_worker_plan_cancellation_recovery",
+                True,
+            )
+            self._running_tasks[key] = lifecycle
+            lifecycle.add_done_callback(
+                lambda finished, k=key: self._remove_running_task_if_same(
+                    k,
+                    finished,
+                )
+            )
+
+        async with self.db_factory() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(
+                            PlanAgentRun.id,
+                            PlanAgentRun.plan_id,
+                            PlanAgentRun.worker_id,
+                            PlanAgentRun.generation,
+                        ).where(
+                            PlanAgentRun.status == "running",
+                            PlanAgentRun.worker_id.isnot(None),
+                            PlanAgentRun.plan_id.isnot(None),
+                        )
+                    )
+                ).all()
+            )
+
+        for run_id, plan_id, worker_id, generation in rows:
+            if run_id in live_run_ids:
+                continue
+            async with self.db_factory() as db:
+                receipt = (
+                    await db.execute(
+                        select(PlanAgentWorkerDispatchReceipt).where(
+                            PlanAgentWorkerDispatchReceipt.run_id == run_id,
+                            PlanAgentWorkerDispatchReceipt.run_generation
+                            == generation,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if receipt is None:
+                    # A pre-receipt deployment cannot prove whether its old
+                    # HTTP request crossed the Worker boundary. Preserve it.
+                    retry_needed = True
+                    continue
+                try:
+                    snapshot = snapshot_worker_dispatch_receipt(receipt)
+                except WorkerPlanDispatchConflict:
+                    retry_needed = True
+                    continue
+                if snapshot.target_task_id is not None:
+                    target = await db.get(
+                        Task,
+                        snapshot.target_task_id,
+                        populate_existing=True,
+                    )
+                    if target is None or target.worker_id != snapshot.worker_id:
+                        retry_needed = True
+                        continue
+
+            if snapshot.status == "prepared":
+                recovered = await self._settle_prepared_worker_plan_run(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=snapshot.id,
+                )
+                retry_needed = retry_needed or not recovered
+                continue
+            if snapshot.status != "remote_possible" or snapshot.payload_digest is None:
+                retry_needed = True
+                continue
+            if worker_proxy is None:
+                retry_needed = True
+                continue
+            key = f"worker-plan-{run_id}"
+            existing = self._running_tasks.get(key)
+            if existing is not None and not existing.done():
+                continue
+            # Registration happens synchronously with this single recovery
+            # producer. The task itself performs only exact audit/poll calls.
+            lifecycle = asyncio.create_task(
+                self._run_worker_plan_reconciliation_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=snapshot.id,
+                    payload_digest=snapshot.payload_digest,
+                )
+            )
+            setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
+            self._running_tasks[key] = lifecycle
+            lifecycle.add_done_callback(
+                lambda finished, k=key: self._remove_running_task_if_same(
+                    k,
+                    finished,
+                )
+            )
+        return retry_needed
+
+    async def _settle_prepared_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+    ) -> bool:
+        """Requeue G as G+1 only while the receipt proves no import call."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return False
+                try:
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                except (HTTPException, WorkerPlanDispatchConflict):
+                    await db.rollback()
+                    return False
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.worker_id != worker_id
+                    or run.generation != generation
+                    or plan.active_run_id != run.id
+                    or receipt.status != "prepared"
+                ):
+                    await db.rollback()
+                    return False
+                try:
+                    settle_worker_dispatch_receipt(
+                        receipt=receipt,
+                        plan=plan,
+                        run=run,
+                        generation=generation,
+                        reason="not_launched",
+                        remote_status=None,
+                    )
+                except WorkerPlanDispatchConflict:
+                    await db.rollback()
+                    return False
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                run.last_execution_started_at = None
+                run.status = "queued"
+                run.generation = generation + 1
+                run.updated_at = now
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                return True
+
+    async def _is_exact_capability_plan_cancellation(
+        self,
+        *,
+        run_id: int,
+        target_generation: int,
+    ) -> bool:
+        """Authorize destructive recovery only for one exact Capability graph."""
+
+        from backend.models.capability import (
+            CapabilityExecution,
+            CapabilityInvocation,
+        )
+        from backend.services.plan_capability import PLAN_RUN_HANDLE_GENERATION
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+            plan = (
+                await db.get(Plan, run.plan_id, populate_existing=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            execution = (
+                await db.get(
+                    CapabilityExecution,
+                    run.capability_execution_id,
+                    populate_existing=True,
+                )
+                if run is not None and run.capability_execution_id is not None
+                else None
+            )
+            invocation = (
+                await db.get(
+                    CapabilityInvocation,
+                    execution.invocation_id,
+                    populate_existing=True,
+                )
+                if execution is not None
+                else None
+            )
+            return bool(
+                run is not None
+                and plan is not None
+                and execution is not None
+                and invocation is not None
+                and run.status == "cancelling"
+                and run.run_type == "capability"
+                and run.capability_execution_id == execution.id
+                and run.cancellation_target_generation == target_generation
+                and run.generation == target_generation + 1
+                and run.plan_id == plan.id
+                and plan.active_run_id == run.id
+                and plan.target_task_id == invocation.task_id
+                and invocation.capability_key == "plan"
+                and invocation.executor_kind == "plan_agent"
+                and invocation.status == "cancelling"
+                and invocation.active_task_id == invocation.task_id
+                and execution.invocation_id == invocation.id
+                and execution.executor_kind == "plan_agent"
+                and execution.status == "cancelling"
+                and execution.active_invocation_id == invocation.id
+                and execution.handle_kind == "plan_agent_run"
+                and execution.handle_id == str(run.id)
+                and execution.handle_generation == PLAN_RUN_HANDLE_GENERATION
+            )
+
+    async def _is_exact_standard_plan_cancellation(
+        self,
+        *,
+        run_id: int,
+        target_generation: int,
+    ) -> bool:
+        """Recognize only a local non-Capability cancellation fence."""
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+            plan = (
+                await db.get(Plan, run.plan_id, populate_existing=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            if (
+                run is None
+                or plan is None
+                or run.status != "cancelling"
+                or run.run_type == "capability"
+                or run.capability_execution_id is not None
+                or run.worker_id is not None
+                or run.cancellation_target_generation != target_generation
+                or run.generation != target_generation + 1
+                or run.plan_id != plan.id
+                or plan.active_run_id != run.id
+            ):
+                return False
+            capability_owner = await db.scalar(
+                select(PlanAgentRun.id)
+                .where(
+                    PlanAgentRun.plan_id == plan.id,
+                    or_(
+                        PlanAgentRun.run_type == "capability",
+                        PlanAgentRun.capability_execution_id.is_not(None),
+                    ),
+                )
+                .limit(1)
+            )
+            return capability_owner is None
+
+    async def _recover_clean_standard_plan_cancellation(
+        self,
+        *,
+        run_id: int,
+        target_generation: int,
+    ) -> bool:
+        """Release and terminalize one exact ordinary cancellation fence."""
+
+        from backend.services.plan_service import (
+            finalize_run_cancellation,
+            plan_operation_lock,
+            release_run_owner_after_cleanup,
+        )
+
+        async with self.db_factory() as lookup:
+            run = await lookup.get(PlanAgentRun, run_id)
+            plan_id = run.plan_id if run is not None else None
+        if plan_id is None:
+            return False
+        async with plan_operation_lock(plan_id):
+            if not await self._is_exact_standard_plan_cancellation(
+                run_id=run_id,
+                target_generation=target_generation,
+            ):
+                return False
+            async with self.db_factory() as db:
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if run is None or plan is None:
+                    await db.rollback()
+                    return False
+                try:
+                    run = await release_run_owner_after_cleanup(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                    plan = await db.get(
+                        Plan,
+                        plan_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    run = await finalize_run_cancellation(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                except HTTPException:
+                    await db.rollback()
+                    return False
+                return run.status == "cancelled"
+
+    async def _recover_clean_running_plan_run(
+        self,
+        *,
+        run_id: int,
+        generation: int,
+    ) -> bool:
+        """Requeue G only after every G provider attempt is durably clean."""
+
+        from backend.services.plan_runtime_receipt import runtime_generation_is_clean
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+            plan = (
+                await db.get(Plan, run.plan_id, with_for_update=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            if (
+                run is None
+                or plan is None
+                or run.status != "running"
+                or run.generation != generation
+                or plan.active_run_id != run.id
+                or not await runtime_generation_is_clean(
+                    db,
+                    run_id=run.id,
+                    generation=generation,
+                )
+            ):
+                await db.rollback()
+                return False
+            reverse_owners = list(
+                (
+                    await db.execute(
+                        select(Instance)
+                        .where(Instance.current_plan_run_id == run.id)
+                        .order_by(Instance.id)
+                        .with_for_update()
                     )
                 ).scalars()
             )
-            for owner in owners:
-                owned = await db.get(PlanAgentRun, owner.current_plan_run_id)
-                if (
-                    (
-                        owned is None
-                        or owned.instance_id != owner.id
-                        or owned.status != "running"
+            if len(reverse_owners) > 1:
+                await db.rollback()
+                return False
+            owner = reverse_owners[0] if reverse_owners else None
+            if owner is not None and (
+                (run.instance_id is not None and run.instance_id != owner.id)
+                or owner.current_task_id is not None
+                or owner.pid is not None
+                or owner.status not in {"running", "idle"}
+            ):
+                await db.rollback()
+                return False
+            if owner is None and run.instance_id is not None:
+                await db.get(Instance, run.instance_id, with_for_update=True)
+
+            now = datetime.utcnow()
+            if run.last_execution_started_at is not None:
+                run.execution_seconds = float(run.execution_seconds or 0) + max(
+                    0.0,
+                    (now - run.last_execution_started_at).total_seconds(),
+                )
+                run.last_execution_started_at = None
+            run.instance_id = None
+            run.status = "queued"
+            run.generation = generation + 1
+            run.updated_at = now
+            plan.lock_version += 1
+            plan.updated_at = now
+            for step in list(
+                (
+                    await db.execute(
+                        select(PlanAgentStep).where(
+                            PlanAgentStep.run_id == run.id,
+                            PlanAgentStep.generation == generation,
+                            PlanAgentStep.status == "running",
+                        )
                     )
-                    and owner.current_task_id is None
-                    and owner.pid is None
-                ):
-                    owner.status = "idle"
-                    owner.current_plan_run_id = None
+                ).scalars()
+            ):
+                step.status = "cancelled"
+                step.error = "Interrupted by CCM restart"
+                step.finished_at = now
+            if owner is not None:
+                owner.current_plan_run_id = None
+                owner.status = "idle"
             await db.commit()
+            return True
+
+    async def _recover_clean_inactive_plan_run(self, *, run_id: int) -> bool:
+        """Repair a one-way queued/waiting owner only with all-run proof."""
+
+        from backend.services.plan_runtime_receipt import runtime_run_is_clean
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+            plan = (
+                await db.get(Plan, run.plan_id, with_for_update=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            if (
+                run is None
+                or plan is None
+                or run.status not in {"queued", "waiting_user"}
+                or plan.active_run_id != run.id
+                or not await runtime_run_is_clean(db, run_id=run.id)
+            ):
+                await db.rollback()
+                return False
+            reverse_owners = list(
+                (
+                    await db.execute(
+                        select(Instance)
+                        .where(Instance.current_plan_run_id == run.id)
+                        .order_by(Instance.id)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if len(reverse_owners) > 1:
+                await db.rollback()
+                return False
+            owner = reverse_owners[0] if reverse_owners else None
+            if owner is not None and (
+                (run.instance_id is not None and run.instance_id != owner.id)
+                or owner.current_task_id is not None
+                or owner.pid is not None
+                or owner.status not in {"running", "idle"}
+            ):
+                await db.rollback()
+                return False
+            if owner is None and run.instance_id is not None:
+                await db.get(Instance, run.instance_id, with_for_update=True)
+            if run.last_execution_started_at is not None:
+                now = datetime.utcnow()
+                run.execution_seconds = float(run.execution_seconds or 0) + max(
+                    0.0,
+                    (now - run.last_execution_started_at).total_seconds(),
+                )
+                run.last_execution_started_at = None
+            run.instance_id = None
+            if owner is not None:
+                owner.current_plan_run_id = None
+                owner.status = "idle"
+            await db.commit()
+            return True
 
     def wake(self) -> None:
         """Wake the task dispatcher after a pending task is committed."""
@@ -3888,21 +4890,43 @@ class GlobalDispatcher:
         instance_id: int,
         run_id: int,
         generation: int,
-    ) -> None:
-        """Release only the exact PlanRun generation left after its coroutine."""
+    ) -> bool:
+        """Release an exact PlanRun owner; return whether cold retry is needed."""
+
+        from backend.services.plan_runtime_receipt import runtime_generation_is_clean
 
         async with self.db_factory() as db:
             run = await db.get(PlanAgentRun, run_id, with_for_update=True)
             owner = await db.get(Instance, instance_id, with_for_update=True)
             if (
-                owner is None
+                run is None
+                or owner is None
                 or owner.current_plan_run_id != run_id
                 or owner.current_task_id is not None
                 or owner.pid is not None
+                or run.instance_id not in {None, instance_id}
             ):
                 await db.rollback()
-                return
-            if run is not None and run.generation == generation:
+                return False
+            cancellation_generation = bool(
+                run.status == "cancelling"
+                and run.cancellation_target_generation == generation
+                and run.generation == generation + 1
+            )
+            if not cancellation_generation and run.generation != generation:
+                await db.rollback()
+                return False
+            if not await runtime_generation_is_clean(
+                db,
+                run_id=run_id,
+                generation=generation,
+            ):
+                # PID is intentionally NULL for Plan claims and is not absence
+                # proof. Preserve both directions until the exact provider
+                # generation has a durable cleaned receipt.
+                await db.rollback()
+                return True
+            if run.generation == generation or cancellation_generation:
                 if run.last_execution_started_at is not None:
                     run.execution_seconds = float(run.execution_seconds or 0) + max(
                         0.0,
@@ -3912,7 +4936,7 @@ class GlobalDispatcher:
                     )
                     run.last_execution_started_at = None
                 run.instance_id = None
-                if run.status == "running":
+                if run.status == "running" and not cancellation_generation:
                     # A path that neither advanced nor recorded failure is not
                     # safe to replay silently; preserve an explicit terminal.
                     run.status = "failed"
@@ -3925,9 +4949,26 @@ class GlobalDispatcher:
                             plan.active_run_id = None
                             plan.lock_version += 1
                             plan.updated_at = datetime.utcnow()
+                elif cancellation_generation:
+                    running_steps = list(
+                        (
+                            await db.execute(
+                                select(PlanAgentStep).where(
+                                    PlanAgentStep.run_id == run.id,
+                                    PlanAgentStep.generation == generation,
+                                    PlanAgentStep.status == "running",
+                                )
+                            )
+                        ).scalars()
+                    )
+                    for step in running_steps:
+                        step.status = "cancelled"
+                        step.error = "Cancelled by user"
+                        step.finished_at = datetime.utcnow()
             owner.status = "idle"
             owner.current_plan_run_id = None
             await db.commit()
+            return False
 
     async def _run_plan_run_lifecycle(
         self,
@@ -3986,13 +5027,23 @@ class GlobalDispatcher:
             await runner.fail_versioned_run(run_id, generation, str(exc))
         finally:
             try:
-                await _settle_despite_cancellation(
+                cleanup, _delayed_cancellation = await _settle_despite_cancellation(
                     self._cleanup_plan_run_owner(
                         instance_id=instance_id,
                         run_id=run_id,
                         generation=generation,
                     )
                 )
+                retry_needed = cleanup.result()
+                if (
+                    retry_needed
+                    and self._running
+                    and not self._shutting_down
+                ):
+                    # The lifecycle is about to disappear from the live set.
+                    # Make its durable unclean generation visible to the
+                    # serialized cold scanner without starting another task.
+                    self._request_plan_runtime_recovery()
             finally:
                 if self._running_tasks.get(instance_id) is lifecycle:
                     self._running_tasks.pop(instance_id, None)
@@ -4008,6 +5059,11 @@ class GlobalDispatcher:
                     except asyncio.TimeoutError:
                         pass
                     continue
+                # Keep orphan Plan cleanup and local Plan claim/lifecycle
+                # registration in this one producer. Do not move this into a
+                # detached timer task: the claim commit is intentionally
+                # followed immediately by in-memory lifecycle registration.
+                await self._recover_due_versioned_plan_runs()
                 # Top up idle workers before looking for capacity
                 await self._ensure_min_idle_instances()
 
@@ -4596,7 +5652,15 @@ class GlobalDispatcher:
 
         from backend.main import worker_proxy
         from backend.models.worker import Worker
-        from backend.services.plan_service import plan_operation_lock
+        from backend.services.plan_service import (
+            fence_plan_target_task,
+            fence_plan_worker,
+            plan_operation_lock,
+        )
+        from backend.services.worker_plan_dispatch import (
+            load_worker_dispatch_receipt,
+            new_prepared_worker_dispatch_receipt,
+        )
 
         if worker_proxy is None:
             return
@@ -4644,6 +5708,16 @@ class GlobalDispatcher:
                     worker = await db.get(Worker, current.worker_id)
                     if worker is None or worker.status != "ready":
                         continue
+                    try:
+                        await fence_plan_target_task(
+                            db,
+                            target_task_id=plan.target_task_id,
+                            expected_worker_id=worker.id,
+                        )
+                        await fence_plan_worker(db, worker_id=worker.id)
+                    except HTTPException:
+                        # Worker destruction won the Task -> Worker fence.
+                        continue
                     running_tasks = int(
                         await db.scalar(
                             select(func.count(Task.id)).where(
@@ -4666,6 +5740,25 @@ class GlobalDispatcher:
                         continue
                     generation = current.generation
                     worker_id = current.worker_id
+                    receipt = await load_worker_dispatch_receipt(
+                        db,
+                        run_id=run_id,
+                        generation=generation,
+                        for_update=True,
+                    )
+                    if receipt is None:
+                        receipt = new_prepared_worker_dispatch_receipt(
+                            plan=plan,
+                            run=current,
+                        )
+                        db.add(receipt)
+                        await db.flush()
+                    elif receipt.status != "prepared":
+                        # remote_possible is owned exclusively by read-only
+                        # recovery; settled at this same generation is corrupt.
+                        await db.rollback()
+                        continue
+                    now = datetime.utcnow()
                     claimed = await db.execute(
                         update(PlanAgentRun)
                         .where(
@@ -4675,18 +5768,24 @@ class GlobalDispatcher:
                             PlanAgentRun.status == "queued",
                             PlanAgentRun.generation == generation,
                         )
-                        .values(status="running", updated_at=datetime.utcnow())
+                        .values(
+                            status="running",
+                            last_execution_started_at=now,
+                            updated_at=now,
+                        )
                     )
                     if claimed.rowcount != 1:
                         await db.rollback()
                         continue
                     await db.commit()
+                    receipt_id = receipt.id
             lifecycle = asyncio.create_task(
                 self._run_worker_plan_lifecycle(
                     plan_id=plan_id,
                     run_id=run_id,
                     worker_id=worker_id,
                     generation=generation,
+                    receipt_id=receipt_id,
                 )
             )
             setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
@@ -4704,6 +5803,12 @@ class GlobalDispatcher:
 
     @staticmethod
     def _worker_plan_failure_is_permanent(exc: Exception) -> bool:
+        from backend.services.worker_proxy import (
+            WorkerPlanReconciliationUnsupported,
+        )
+
+        if isinstance(exc, WorkerPlanReconciliationUnsupported):
+            return True
         if isinstance(exc, HTTPException):
             return exc.status_code < 500 and exc.status_code != 429
         if isinstance(exc, httpx.HTTPStatusError):
@@ -4728,12 +5833,33 @@ class GlobalDispatcher:
         run_id: int,
         worker_id: int,
         generation: int,
+        receipt_id: int,
     ) -> None:
         from backend.main import worker_proxy
         from backend.services.plan_service import (
             apply_worker_plan_outcome,
             plan_operation_lock,
         )
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            mark_worker_dispatch_remote_possible,
+        )
+
+        async def publish_remote_possible(payload_digest: str) -> None:
+            operation, delayed_cancellation = await _settle_despite_cancellation(
+                mark_worker_dispatch_remote_possible(
+                    self.db_factory,
+                    receipt_id=receipt_id,
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    payload_digest=payload_digest,
+                )
+            )
+            operation.result()
+            if delayed_cancellation is not None:
+                raise delayed_cancellation
 
         try:
             async with self.db_factory() as db:
@@ -4741,13 +5867,28 @@ class GlobalDispatcher:
                 run = await db.get(PlanAgentRun, run_id)
                 if plan is None or run is None:
                     return
-            payload = await worker_proxy.run_versioned_plan_until_pause(plan, run)
+            payload = await worker_proxy.run_versioned_plan_until_pause(
+                plan,
+                run,
+                on_remote_possible=publish_remote_possible,
+            )
             async with plan_operation_lock(plan_id):
                 async with self.db_factory() as db:
-                    current_plan = await db.get(Plan, plan_id, with_for_update=True)
+                    frozen_receipt = await db.get(
+                        PlanAgentWorkerDispatchReceipt,
+                        receipt_id,
+                        populate_existing=True,
+                    )
+                    if frozen_receipt is None:
+                        return
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
                     current_run = await db.get(
                         PlanAgentRun, run_id, with_for_update=True
                     )
+                    current_plan = await db.get(Plan, plan_id, with_for_update=True)
                     if current_plan is None or current_run is None:
                         return
                     imported = await apply_worker_plan_outcome(
@@ -4757,6 +5898,7 @@ class GlobalDispatcher:
                         worker_id=worker_id,
                         expected_generation=generation,
                         payload=payload,
+                        worker_dispatch_receipt_id=receipt_id,
                     )
                     status = imported.status
                     stage = imported.current_stage
@@ -4769,43 +5911,282 @@ class GlobalDispatcher:
                 round_number=round_number,
             )
         except asyncio.CancelledError:
+            cleanup, _delayed_cancellation = await _settle_despite_cancellation(
+                self._settle_cancelled_worker_plan_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=receipt_id,
+                )
+            )
+            needs_recovery = cleanup.result()
+            if needs_recovery and self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
             raise
         except Exception as exc:
-            permanent = self._worker_plan_failure_is_permanent(exc)
-            logger.exception(
-                "Worker Plan Run %s %s",
-                run_id,
-                "failed" if permanent else "was deferred",
+            deferred_remote = await self._handle_worker_plan_failure(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+                exc=exc,
+            )
+            if deferred_remote and self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+
+    async def _settle_cancelled_worker_plan_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+    ) -> bool:
+        """Return True when shutdown left a maybe-imported remote generation."""
+
+        async with self.db_factory() as db:
+            receipt = await db.get(
+                PlanAgentWorkerDispatchReceipt,
+                receipt_id,
+                populate_existing=True,
+            )
+            if receipt is None or receipt.status == "settled":
+                return False
+            if receipt.status == "remote_possible":
+                return True
+            if receipt.status != "prepared":
+                return True
+        return not await self._settle_prepared_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            worker_id=worker_id,
+            generation=generation,
+            receipt_id=receipt_id,
+        )
+
+    async def _handle_worker_plan_failure(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        exc: Exception,
+    ) -> bool:
+        """Defer uncertain remote errors; only pre-boundary failures requeue."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        permanent = self._worker_plan_failure_is_permanent(exc)
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return True
+                try:
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                except (HTTPException, WorkerPlanDispatchConflict):
+                    await db.rollback()
+                    return True
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                ):
+                    await db.rollback()
+                    return False
+                if receipt.status == "remote_possible":
+                    receipt.last_error = str(exc)[:4000]
+                    receipt.updated_at = datetime.utcnow()
+                    await db.commit()
+                    logger.warning(
+                        "Worker Plan Run %s has an uncertain remote outcome; "
+                        "read-only reconciliation was scheduled: %s",
+                        run_id,
+                        exc,
+                    )
+                    return True
+                if receipt.status != "prepared":
+                    await db.rollback()
+                    return True
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                    run.last_execution_started_at = None
+                if permanent:
+                    try:
+                        settle_worker_dispatch_receipt(
+                            receipt=receipt,
+                            plan=plan,
+                            run=run,
+                            generation=generation,
+                            reason="preflight_failed",
+                            remote_status=None,
+                            last_error=str(exc),
+                        )
+                    except WorkerPlanDispatchConflict:
+                        await db.rollback()
+                        return True
+                    run.status = "failed"
+                    run.current_stage = "failed"
+                    run.error = str(exc)[:4000]
+                    run.finished_at = now
+                    plan.active_run_id = None
+                else:
+                    run.status = "queued"
+                run.updated_at = now
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                status = run.status
+                stage = run.current_stage
+                round_number = run.round
+        logger.exception(
+            "Worker Plan Run %s %s before remote import",
+            run_id,
+            "failed" if permanent else "was deferred",
+            exc_info=exc,
+        )
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status=status,
+            stage=stage,
+            round_number=round_number,
+        )
+        return False
+
+    async def _run_worker_plan_reconciliation_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        payload_digest: str,
+    ) -> None:
+        """Audit and follow one exact maybe-imported Worker Run."""
+
+        from backend.main import worker_proxy
+        from backend.services.plan_service import (
+            apply_worker_plan_outcome,
+            plan_operation_lock,
+        )
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            record_worker_dispatch_error,
+        )
+        from backend.services.worker_proxy import (
+            WorkerPlanRemoteAbsent,
+            WorkerPlanRemoteCancelled,
+            WorkerPlanRemoteIdentityConflict,
+        )
+
+        try:
+            async with self.db_factory() as db:
+                run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+                plan = (
+                    await db.get(Plan, plan_id, populate_existing=True)
+                    if run is not None
+                    else None
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                ):
+                    return
+            payload = await worker_proxy.reconcile_versioned_plan_until_pause(
+                plan,
+                run,
+                payload_digest=payload_digest,
             )
             async with plan_operation_lock(plan_id):
                 async with self.db_factory() as db:
-                    run = await db.get(PlanAgentRun, run_id, with_for_update=True)
-                    plan = await db.get(Plan, plan_id, with_for_update=True)
-                    if (
-                        run is None
-                        or plan is None
-                        or run.status != "running"
-                        or run.generation != generation
-                        or run.worker_id != worker_id
-                        or plan.active_run_id != run.id
-                    ):
+                    frozen_receipt = await db.get(
+                        PlanAgentWorkerDispatchReceipt,
+                        receipt_id,
+                        populate_existing=True,
+                    )
+                    if frozen_receipt is None:
                         return
-                    now = datetime.utcnow()
-                    if permanent:
-                        run.status = "failed"
-                        run.current_stage = "failed"
-                        run.error = str(exc)[:4000]
-                        run.finished_at = now
-                        plan.active_run_id = None
-                    else:
-                        run.status = "queued"
-                    run.updated_at = now
-                    plan.lock_version += 1
-                    plan.updated_at = now
-                    await db.commit()
-                    status = run.status
-                    stage = run.current_stage
-                    round_number = run.round
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                    current_run = await db.get(
+                        PlanAgentRun,
+                        run_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    current_plan = await db.get(
+                        Plan,
+                        plan_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if current_plan is None or current_run is None:
+                        return
+                    imported = await apply_worker_plan_outcome(
+                        db,
+                        plan=current_plan,
+                        run=current_run,
+                        worker_id=worker_id,
+                        expected_generation=generation,
+                        payload=payload,
+                        worker_dispatch_receipt_id=receipt_id,
+                    )
+                    status = imported.status
+                    stage = imported.current_stage
+                    round_number = imported.round
             await self._broadcast_worker_plan_run(
                 plan_id=plan_id,
                 run_id=run_id,
@@ -4813,6 +6194,409 @@ class GlobalDispatcher:
                 stage=stage,
                 round_number=round_number,
             )
+        except WorkerPlanRemoteAbsent:
+            await self._settle_absent_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+            )
+        except WorkerPlanRemoteCancelled:
+            await self._settle_cancelled_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+                payload_digest=payload_digest,
+            )
+        except WorkerPlanRemoteIdentityConflict as exc:
+            await self._fail_conflicting_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+                error=str(exc),
+            )
+        except asyncio.CancelledError:
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+            raise
+        except Exception as exc:
+            await record_worker_dispatch_error(
+                self.db_factory,
+                receipt_id=receipt_id,
+                error=str(exc),
+            )
+            logger.warning(
+                "Worker Plan Run %s reconciliation remains uncertain: %s",
+                run_id,
+                exc,
+            )
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+
+    async def _run_worker_plan_cancellation_recovery_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        target_generation: int,
+        payload_digest: str,
+    ) -> None:
+        """Replay an exact RPC for one durable Worker cancellation intent."""
+
+        from backend.main import worker_proxy
+        from backend.services.plan_service import (
+            fence_plan_target_task,
+            plan_operation_lock,
+        )
+        from backend.services.worker_plan_dispatch import (
+            apply_worker_terminal_after_cancellation_race,
+            finalize_worker_mirror_cancellation,
+        )
+
+        try:
+            if worker_proxy is None:
+                raise RuntimeError("Worker Plan runtime is unavailable")
+            remote = await worker_proxy.cancel_versioned_plan_run(
+                worker_id,
+                run_id,
+                plan_id=plan_id,
+                payload_digest=payload_digest,
+            )
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    run = await db.get(
+                        PlanAgentRun,
+                        run_id,
+                        populate_existing=True,
+                    )
+                    plan = await db.get(Plan, plan_id, populate_existing=True)
+                    if (
+                        run is None
+                        or plan is None
+                        or run.status != "cancelling"
+                        or run.worker_id != worker_id
+                        or run.cancellation_target_generation != target_generation
+                        or run.generation != target_generation + 1
+                        or plan.active_run_id != run.id
+                    ):
+                        return
+                    await fence_plan_target_task(
+                        db,
+                        target_task_id=plan.target_task_id,
+                        expected_worker_id=worker_id,
+                    )
+                    if remote["state"] == "terminal":
+                        run = await apply_worker_terminal_after_cancellation_race(
+                            db,
+                            plan_id=plan_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                            target_generation=target_generation,
+                            payload_digest=payload_digest,
+                            payload={
+                                "protocol": 3,
+                                "base_worker_version_id": remote.get(
+                                    "base_worker_version_id"
+                                ),
+                                "run": remote.get("run"),
+                                "versions": remote.get("versions"),
+                            },
+                        )
+                    else:
+                        run = await finalize_worker_mirror_cancellation(
+                            db,
+                            plan_id=plan_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                            target_generation=target_generation,
+                            payload_digest=payload_digest,
+                            remote_state=remote["state"],
+                        )
+                    stage = run.current_stage
+                    round_number = run.round
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status=run.status,
+                stage=stage,
+                round_number=round_number,
+            )
+        except asyncio.CancelledError:
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Worker Plan Run %s exact cancellation recovery remains "
+                "pending: %s",
+                run_id,
+                exc,
+            )
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+
+    async def _settle_cancelled_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        payload_digest: str,
+    ) -> None:
+        """Terminalize a running mirror after audit found exact tombstone."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            fence_worker_dispatch_target,
+            fence_worker_mirror_cancellation,
+            finalize_worker_mirror_cancellation,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return
+                try:
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                    await fence_worker_mirror_cancellation(
+                        db,
+                        plan_id=plan_id,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        generation=generation,
+                        payload_digest=payload_digest,
+                    )
+                    run = await finalize_worker_mirror_cancellation(
+                        db,
+                        plan_id=plan_id,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        target_generation=generation,
+                        payload_digest=payload_digest,
+                        remote_state="cancelled",
+                    )
+                except (HTTPException, WorkerPlanDispatchConflict):
+                    await db.rollback()
+                    return
+                plan = await db.get(Plan, plan_id, populate_existing=True)
+                if plan is None:
+                    return
+                stage = run.current_stage
+                round_number = run.round
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status="cancelled",
+            stage=stage,
+            round_number=round_number,
+        )
+
+    async def _settle_absent_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+    ) -> None:
+        """Requeue only after exact Worker audit returned ``absent``."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return
+                await fence_worker_dispatch_target(
+                    db,
+                    receipt=frozen_receipt,
+                )
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                    or receipt.status != "remote_possible"
+                ):
+                    await db.rollback()
+                    return
+                settle_worker_dispatch_receipt(
+                    receipt=receipt,
+                    plan=plan,
+                    run=run,
+                    generation=generation,
+                    reason="remote_absent",
+                    remote_status=None,
+                )
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                run.last_execution_started_at = None
+                run.status = "queued"
+                run.generation = generation + 1
+                run.updated_at = now
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                stage = run.current_stage
+                round_number = run.round
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status="queued",
+            stage=stage,
+            round_number=round_number,
+        )
+
+    async def _fail_conflicting_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        error: str,
+    ) -> None:
+        """Terminalize only an audit-proven immutable identity collision."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return
+                await fence_worker_dispatch_target(
+                    db,
+                    receipt=frozen_receipt,
+                )
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                    or receipt.status != "remote_possible"
+                ):
+                    await db.rollback()
+                    return
+                settle_worker_dispatch_receipt(
+                    receipt=receipt,
+                    plan=plan,
+                    run=run,
+                    generation=generation,
+                    reason="identity_conflict",
+                    remote_status="conflict",
+                    last_error=error,
+                )
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                run.last_execution_started_at = None
+                run.status = "failed"
+                run.current_stage = "failed"
+                run.error = error[:4000]
+                run.finished_at = now
+                run.updated_at = now
+                plan.active_run_id = None
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                stage = run.current_stage
+                round_number = run.round
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status="failed",
+            stage=stage,
+            round_number=round_number,
+        )
 
     async def _broadcast_worker_plan_run(
         self,

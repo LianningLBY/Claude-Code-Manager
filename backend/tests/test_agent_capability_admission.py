@@ -38,8 +38,8 @@ from backend.services.terminal_arbitration import bind_turn_source
 
 POLICY = {
     "version": 1,
-    "max_invocations": 1,
-    "capabilities": {"plan": 1},
+    "max_invocations": 2,
+    "capabilities": {"plan": 1, "code_review": 1},
 }
 
 
@@ -48,27 +48,39 @@ def agent_capability_runtime(monkeypatch):
     monkeypatch.setattr(settings, "capability_core_enabled", True)
     monkeypatch.setattr(settings, "auto_capability_enabled", True)
     unregister_capability("plan")
-    register_capability(
-        CapabilityDefinition(
-            capability_key="plan",
-            executor_kind="fake_plan",
-            executor_config={"route": "test"},
-            policy_snapshot={"local_only": True},
-            max_attempts=2,
+    unregister_capability("code_review")
+    for capability in ("plan", "code_review"):
+        register_capability(
+            CapabilityDefinition(
+                capability_key=capability,
+                executor_kind=f"fake_{capability}",
+                executor_config={"route": "test"},
+                policy_snapshot={"local_only": True},
+                max_attempts=2,
+            )
         )
-    )
     yield
     unregister_capability("plan")
+    unregister_capability("code_review")
 
 
-def _terminal_action(*, request: dict | None = None, reason: str = "Need a plan") -> str:
+def _terminal_action(
+    *,
+    capability: str = "plan",
+    request: object | None = None,
+    reason: str = "Need a plan",
+) -> str:
     payload = json.dumps(
         {
             "schema_version": 1,
             "terminal_action": "request_capability",
-            "capability": "plan",
+            "capability": capability,
             "reason": reason,
-            "request": request or {"focus": "safe rollout"},
+            "request": (
+                {"prompt": "Produce a safe rollout plan"}
+                if request is None
+                else request
+            ),
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -288,6 +300,104 @@ async def test_malformed_terminal_marker_fails_closed_without_invocation(db_sess
     stored = await db_session.get(Task, task.id, populate_existing=True)
     assert stored.status == "failed"
     assert "invalid_json" in stored.error_message
+    assert await db_session.scalar(
+        select(func.count(CapabilityInvocation.id))
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_payload",
+    [
+        {},
+        {"title": "Missing prompt"},
+        {"request": "legacy Plan request alias"},
+        {"prompt": "Plan this", "unknown": True},
+        {"prompt": 42},
+        {"prompt": "Plan this", "title": 42},
+        {"prompt": ""},
+        {"prompt": "  \n\t"},
+    ],
+    ids=(
+        "empty-object",
+        "missing-prompt",
+        "legacy-request-alias",
+        "unknown-field",
+        "wrong-prompt-type",
+        "wrong-title-type",
+        "empty-prompt",
+        "blank-prompt",
+    ),
+)
+async def test_plan_request_schema_is_rejected_at_terminal_admission(
+    db_session,
+    request_payload,
+):
+    task, expected, _output = await _claude_turn(
+        db_session,
+        content=_terminal_action(request=request_payload),
+    )
+
+    admitted = await admit_agent_terminal_action(db_session, expected=expected)
+
+    assert admitted.outcome == "protocol_failed"
+    assert admitted.error_code == "invalid_capability_request"
+    stored = await db_session.get(Task, task.id, populate_existing=True)
+    assert stored.status == "failed"
+    assert await db_session.scalar(
+        select(func.count(CapabilityInvocation.id))
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "request_payload",
+    [
+        {},
+        {"base_sha": "a" * 40},
+        {"head_sha": "b" * 40},
+        {"base_sha": "a" * 40, "head_sha": "b" * 40, "path": "src"},
+        {"base_sha": 1, "head_sha": "b" * 40},
+        {"base_sha": "a" * 40, "head_sha": None},
+        {"base_sha": "a" * 39, "head_sha": "b" * 40},
+        {"base_sha": "a" * 40, "head_sha": "b" * 41},
+        {"base_sha": "g" * 40, "head_sha": "b" * 40},
+        {"base_sha": "A" * 40, "head_sha": "b" * 40},
+        {"base_sha": " " * 40, "head_sha": "b" * 40},
+    ],
+    ids=(
+        "empty-object",
+        "missing-head",
+        "missing-base",
+        "unknown-field",
+        "wrong-base-type",
+        "wrong-head-type",
+        "abbreviated-base",
+        "oversized-head",
+        "non-hex-base",
+        "uppercase-base",
+        "blank-base",
+    ),
+)
+async def test_code_review_request_schema_is_rejected_at_terminal_admission(
+    db_session,
+    request_payload,
+):
+    task, expected, _output = await _claude_turn(
+        db_session,
+        content=_terminal_action(
+            capability="code_review",
+            request=request_payload,
+            reason="Need an immutable commit-range review",
+        ),
+    )
+
+    admitted = await admit_agent_terminal_action(db_session, expected=expected)
+
+    assert admitted.outcome == "protocol_failed"
+    assert admitted.error_code == "invalid_capability_request"
+    stored = await db_session.get(Task, task.id, populate_existing=True)
+    assert stored.status == "failed"
     assert await db_session.scalar(
         select(func.count(CapabilityInvocation.id))
     ) == 0

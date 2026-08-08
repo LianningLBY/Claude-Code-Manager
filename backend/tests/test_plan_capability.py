@@ -1,8 +1,9 @@
 """Plan Capability adapter transaction and lifecycle tests."""
 
 import asyncio
+import json
 from datetime import datetime
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
@@ -26,7 +27,14 @@ from backend.services.plan_capability import (
     PlanCapabilityExecutor,
     plan_capability_definition,
 )
-from backend.services.plan_service import answer_input_request, plan_operation_lock
+from backend.services.dispatcher import GlobalDispatcher
+from backend.services.plan_agent_runner import PlanAgentRunner
+from backend.services.plan_runtime_receipt import new_prepared_runtime_receipt
+from backend.services.plan_service import (
+    answer_input_request,
+    plan_operation_lock,
+    plan_resource,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -110,6 +118,65 @@ async def _handled_run(
     return execution, run, plan
 
 
+def _dispatcher(db_factory) -> GlobalDispatcher:
+    manager = MagicMock()
+    manager.processes = {}
+    manager._tasks = {}
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    return GlobalDispatcher(
+        db_factory=db_factory,
+        instance_manager=manager,
+        broadcaster=broadcaster,
+    )
+
+
+async def _claim_capability_run(
+    db_factory,
+    dispatcher: GlobalDispatcher,
+    *,
+    run_id: int,
+    instance_id: int,
+) -> tuple[int, int]:
+    async with db_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        instance = await db.get(Instance, instance_id)
+        assert run is not None and run.status == "queued"
+        assert instance is not None and instance.status == "idle"
+        claimed = await dispatcher._claim_plan_run(db, instance=instance)
+    assert claimed is not None and claimed[0] == run_id
+    return claimed
+
+
+def _clean_stage_stub(db_factory, outputs: dict[str, dict]):
+    async def fake_stage(**kwargs):
+        output = outputs[kwargs["step_type"]]
+        async with db_factory() as db:
+            step = PlanAgentStep(
+                run_id=kwargs["run_id"],
+                plan_id=kwargs["plan_id"],
+                step_type=kwargs["step_type"],
+                round=kwargs["round_number"],
+                generation=kwargs["generation"],
+                provider="codex",
+                model="test-model",
+                route_slot="primary",
+                status="completed",
+                output=json.dumps(output),
+                finished_at=datetime.utcnow(),
+            )
+            db.add(step)
+            await db.flush()
+            receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+            receipt.status = "cleaned"
+            receipt.cleaned_at = datetime.utcnow()
+            db.add(receipt)
+            await db.commit()
+        return output, json.dumps(output), object(), "primary", "test-account"
+
+    return fake_stage
+
+
 @pytest.mark.asyncio
 async def test_plan_and_handle_creation_roll_back_together(db_session, monkeypatch):
     _task, invocation = await _create_invocation(db_session)
@@ -150,6 +217,23 @@ async def test_ensure_started_replays_exact_durable_handle(db_session):
     execution, run, _plan = await _handled_run(db_session, invocation.id)
     assert run.run_type == "capability"
     assert run.capability_execution_id == execution.id
+
+
+@pytest.mark.asyncio
+async def test_started_capability_projects_explicit_read_only_plan_resource(db_session):
+    _task, invocation = await _create_invocation(db_session)
+    await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation.id,
+    )
+    _execution_row, _run, plan = await _handled_run(db_session, invocation.id)
+
+    resource = await plan_resource(db_session, plan, include_audit=True)
+
+    assert resource.ownership == "capability"
+    assert resource.read_only is True
+    assert resource.active_run is not None
+    assert resource.active_run.run_type == "capability"
 
 
 @pytest.mark.asyncio
@@ -238,10 +322,14 @@ async def _complete_run(
     _execution_row, run, plan = await _handled_run(db_session, invocation_id)
     version_id = None
     if with_result:
+        # A normal reviewed pipeline uses two distinct dispatcher claims:
+        # planner G and reviewer G+1.  Keep this compact fixture aligned with
+        # that production fence; a dedicated test below drives both claims.
+        run.generation = max(run.generation, 2)
         planner_step = PlanAgentStep(
             run_id=run.id,
             plan_id=plan.id,
-            generation=run.generation,
+            generation=run.generation - 1,
             step_type="planner",
             round=run.round,
             provider="codex",
@@ -309,6 +397,558 @@ async def test_only_exact_approved_version_completes_capability(db_session):
     assert ready.output_hash is not None and len(ready.output_hash) == 64
     execution = await db_session.get(CapabilityExecution, ready.execution_id)
     assert execution.output_kind == "plan_version"
+    _execution_row, _run, plan = await _handled_run(db_session, invocation.id)
+    resource = await plan_resource(db_session, plan, include_audit=True)
+    assert resource.ownership == "capability"
+    assert resource.read_only is True
+    assert resource.display_state == "awaiting_review"
+    assert resource.active_run is None
+
+
+@pytest.mark.asyncio
+async def test_real_planner_and_reviewer_claims_complete_exact_capability(
+    db_session,
+    db_factory,
+):
+    """Planner G1 and reviewer G2 remain an exact, valid result chain."""
+
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    executor = PlanCapabilityExecutor()
+    started = await executor.ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    assert started.run_id is not None
+    instance = Instance(name="two-stage-capability-slot", status="idle")
+    db_session.add(instance)
+    await db_session.commit()
+    instance_id = instance.id
+    dispatcher = _dispatcher(db_factory)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=dispatcher.instance_manager,
+    )
+    runner._run_stage = _clean_stage_stub(
+        db_factory,
+        {
+            "planner": {
+                "action": "propose",
+                "plan": "# Exact two-claim implementation plan",
+            },
+            "reviewer": {
+                "action": "approve",
+                "feedback": "Exact and testable",
+            },
+        },
+    )
+
+    first_claim = await _claim_capability_run(
+        db_factory,
+        dispatcher,
+        run_id=started.run_id,
+        instance_id=instance_id,
+    )
+    assert first_claim[1] == 1
+    assert await runner.advance_versioned(started.run_id, cwd="/tmp") == "queued"
+    second_claim = await _claim_capability_run(
+        db_factory,
+        dispatcher,
+        run_id=started.run_id,
+        instance_id=instance_id,
+    )
+    assert second_claim[1] == 2
+    assert await runner.advance_versioned(started.run_id, cwd="/tmp") == "completed"
+
+    db_session.expire_all()
+    ready = await executor.observe(db_session, invocation_id=invocation_id)
+    assert ready.status == "ready"
+    execution, run, _plan = await _handled_run(db_session, invocation_id)
+    assert execution.handle_generation == 0
+    assert run.generation == 2
+    steps = list(
+        (
+            await db_session.execute(
+                select(PlanAgentStep)
+                .where(PlanAgentStep.run_id == run.id)
+                .order_by(PlanAgentStep.id)
+            )
+        ).scalars()
+    )
+    assert [(step.step_type, step.generation) for step in steps] == [
+        ("planner", 1),
+        ("reviewer", 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capability_cancel_between_planner_and_reviewer_claims(
+    db_session,
+    db_factory,
+):
+    """A queued reviewer retains G1 as the exact cancellation target."""
+
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    started = await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    assert started.run_id is not None
+    owner = Instance(name="between-stage-capability-slot", status="idle")
+    db_session.add(owner)
+    await db_session.commit()
+    dispatcher = _dispatcher(db_factory)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=dispatcher.instance_manager,
+    )
+    runner._run_stage = _clean_stage_stub(
+        db_factory,
+        {
+            "planner": {
+                "action": "propose",
+                "plan": "# Awaiting exact reviewer claim",
+            },
+        },
+    )
+    await _claim_capability_run(
+        db_factory,
+        dispatcher,
+        run_id=started.run_id,
+        instance_id=owner.id,
+    )
+    assert await runner.advance_versioned(started.run_id, cwd="/tmp") == "queued"
+
+    db_session.expire_all()
+    cancelled = await PlanCapabilityExecutor(
+        stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+    ).cancel(db_session, invocation_id=invocation_id)
+
+    assert cancelled.status == "cancelled"
+    execution, run, plan = await _handled_run(db_session, invocation_id)
+    assert execution.handle_generation == 0
+    assert run.status == "cancelled"
+    assert run.generation == 2
+    assert run.cancellation_target_generation == 1
+    assert plan.active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_and_cancel_race_has_no_cross_aggregate_deadlock(
+    db_session,
+    db_factory,
+):
+    """Run claim never writes Execution, so concurrent cancellation converges."""
+
+    _task, invocation = await _create_invocation(db_session)
+    started = await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation.id,
+    )
+    assert started.run_id is not None
+    owner = Instance(name="claim-cancel-race-slot", status="idle")
+    db_session.add(owner)
+    await db_session.commit()
+    owner_id = owner.id
+    dispatcher = _dispatcher(db_factory)
+
+    async def claim():
+        async with db_factory() as db:
+            instance = await db.get(Instance, owner_id)
+            assert instance is not None
+            return await dispatcher._claim_plan_run(db, instance=instance)
+
+    async def cancel():
+        async with db_factory() as db:
+            return await PlanCapabilityExecutor(
+                stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+            ).cancel(db, invocation_id=invocation.id)
+
+    claimed, cancelled = await asyncio.wait_for(
+        asyncio.gather(claim(), cancel()),
+        timeout=5,
+    )
+    assert claimed is None or claimed[0] == started.run_id
+    assert cancelled.status == "cancelled"
+    async with db_factory() as db:
+        execution = await db.get(CapabilityExecution, started.execution_id)
+        run = await db.get(PlanAgentRun, started.run_id)
+        owner = await db.get(Instance, owner_id)
+        assert execution is not None and execution.handle_generation == 0
+        assert run is not None and run.status == "cancelled"
+        assert run.cancellation_target_generation in {0, 1}
+        assert run.instance_id is None
+        assert owner is not None and owner.current_plan_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_wrong_immutable_plan_handle_generation_fails_closed(
+    db_session,
+    db_factory,
+):
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    started = await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    execution = await db_session.get(CapabilityExecution, started.execution_id)
+    execution.handle_generation = 9
+    await db_session.commit()
+
+    with pytest.raises(
+        capability_service.CapabilityConflictError,
+        match="does not belong",
+    ):
+        await PlanCapabilityExecutor(
+            stop_callback=_dispatcher(
+                db_factory
+            ).stop_capability_plan_run_lifecycle,
+        ).cancel(db_session, invocation_id=invocation_id)
+
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    stored_execution = await db_session.get(
+        CapabilityExecution,
+        started.execution_id,
+        populate_existing=True,
+    )
+    run = await db_session.get(
+        PlanAgentRun,
+        started.run_id,
+        populate_existing=True,
+    )
+    assert stored_invocation.status == "running"
+    assert stored_execution.status == "running"
+    assert run.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_cancel_claims_queued_recovery_handle_before_terminalizing_core(
+    db_session,
+):
+    """A queued durable handle cannot leave its staged Plan orphaned."""
+
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    started = await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    execution, run, plan = await _handled_run(db_session, invocation_id)
+    run_id = run.id
+    plan_id = plan.id
+    execution_id = execution.id
+    invocation.status = "queued"
+    invocation.state_version += 1
+    execution.status = "queued"
+    execution.state_version += 1
+    execution.lease_token = None
+    execution.lease_expires_at = None
+    execution.heartbeat_at = None
+    execution.started_at = None
+    await db_session.commit()
+
+    cancelled = await PlanCapabilityExecutor().cancel(
+        db_session,
+        invocation_id=invocation_id,
+    )
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.run_status == "cancelled"
+    stored_execution = await db_session.get(
+        CapabilityExecution,
+        execution_id,
+        populate_existing=True,
+    )
+    stored_run = await db_session.get(
+        PlanAgentRun,
+        run_id,
+        populate_existing=True,
+    )
+    stored_plan = await db_session.get(Plan, plan_id, populate_existing=True)
+    assert stored_execution.status == "cancelled"
+    assert stored_execution.handle_generation == 0
+    assert stored_run.status == "cancelled"
+    assert stored_run.cancellation_target_generation == 0
+    assert stored_plan.active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_plan_cancel_crash_is_recovered_from_exact_cleaned_generation(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    """Run cancelled / Execution cancelling is a durable idempotent window."""
+
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    started = await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    dispatcher = _dispatcher(db_factory)
+    original_mark_cancelled = adapter_module.mark_execution_cancelled
+    monkeypatch.setattr(
+        adapter_module,
+        "mark_execution_cancelled",
+        AsyncMock(side_effect=RuntimeError("crash after Plan terminal commit")),
+    )
+
+    with pytest.raises(RuntimeError, match="crash after Plan terminal"):
+        await PlanCapabilityExecutor(
+            stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+        ).cancel(db_session, invocation_id=invocation_id)
+
+    db_session.expire_all()
+    execution = await db_session.get(CapabilityExecution, started.execution_id)
+    run = await db_session.get(PlanAgentRun, started.run_id)
+    plan = await db_session.get(Plan, started.plan_id)
+    assert execution.status == "cancelling"
+    assert run.status == "cancelled"
+    assert run.cancellation_target_generation == 0
+    assert plan.active_run_id is None
+
+    # A new process/session observes the same durable window and finishes the
+    # Capability side without replaying or re-stopping provider work.
+    monkeypatch.setattr(
+        adapter_module,
+        "mark_execution_cancelled",
+        original_mark_cancelled,
+    )
+    async with db_factory() as restarted_db:
+        recovered = await PlanCapabilityExecutor(
+            stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+        ).observe(restarted_db, invocation_id=invocation_id)
+    assert recovered.status == "cancelled"
+    assert recovered.run_status == "cancelled"
+    async with db_factory() as db:
+        execution = await db.get(CapabilityExecution, started.execution_id)
+        run = await db.get(PlanAgentRun, started.run_id)
+        assert execution.status == "cancelled"
+        assert run.status == "cancelled"
+        assert run.cancellation_target_generation == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["completed", "failed"])
+async def test_cancel_converges_when_plan_terminal_wins_after_core_fence(
+    db_session,
+    monkeypatch,
+    terminal_status,
+):
+    """A clean Plan terminal is preserved when it races Core cancellation."""
+
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    started = await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    execution, run, plan = await _handled_run(db_session, invocation_id)
+    run_id = run.id
+    plan_id = plan.id
+    execution_id = execution.id
+    generation = run.generation
+    step = PlanAgentStep(
+        run_id=run_id,
+        plan_id=plan_id,
+        generation=generation,
+        step_type="planner",
+        provider="codex",
+        status="completed",
+        finished_at=datetime.utcnow(),
+    )
+    db_session.add(step)
+    await db_session.flush()
+    receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+    receipt.status = "cleaned"
+    receipt.cleaned_at = datetime.utcnow()
+    db_session.add(receipt)
+    await db_session.commit()
+
+    original_cancel_invocation = adapter_module.cancel_invocation
+
+    async def cancel_then_publish_terminal(db, **kwargs):
+        result = await original_cancel_invocation(db, **kwargs)
+        raced_run = await db.get(
+            PlanAgentRun,
+            run_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        raced_plan = await db.get(
+            Plan,
+            plan_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        assert raced_run is not None and raced_plan is not None
+        raced_run.status = terminal_status
+        raced_run.current_stage = (
+            "complete" if terminal_status == "completed" else "failed"
+        )
+        raced_run.error = None if terminal_status == "completed" else "provider failed"
+        raced_run.finished_at = datetime.utcnow()
+        raced_plan.active_run_id = None
+        await db.commit()
+        return result
+
+    monkeypatch.setattr(
+        adapter_module,
+        "cancel_invocation",
+        cancel_then_publish_terminal,
+    )
+    monkeypatch.setattr(adapter_module, "active_plan_run_ids", lambda: set())
+    runtime_stopper = AsyncMock()
+    monkeypatch.setattr(
+        adapter_module,
+        "cancel_plan_run_runtime",
+        runtime_stopper,
+    )
+    dispatcher_stopper = AsyncMock(return_value=True)
+
+    cancelled = await PlanCapabilityExecutor(
+        stop_callback=dispatcher_stopper,
+    ).cancel(db_session, invocation_id=invocation_id)
+
+    assert cancelled.status == "cancelled"
+    assert cancelled.run_status == terminal_status
+    dispatcher_stopper.assert_not_awaited()
+    runtime_stopper.assert_not_awaited()
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    stored_execution = await db_session.get(
+        CapabilityExecution,
+        execution_id,
+        populate_existing=True,
+    )
+    stored_run = await db_session.get(
+        PlanAgentRun,
+        run_id,
+        populate_existing=True,
+    )
+    stored_plan = await db_session.get(Plan, plan_id, populate_existing=True)
+    assert stored_invocation.status == "cancelled"
+    assert stored_execution.status == "cancelled"
+    assert stored_run.status == terminal_status
+    assert stored_run.generation == generation
+    assert stored_run.cancellation_target_generation is None
+    assert stored_plan.active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_terminal_race_with_unclean_runtime_stays_cancelling(
+    db_session,
+    monkeypatch,
+):
+    """A terminal label alone cannot erase an unclean provider receipt."""
+
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    execution, run, plan = await _handled_run(db_session, invocation_id)
+    run_id = run.id
+    plan_id = plan.id
+    execution_id = execution.id
+    step = PlanAgentStep(
+        run_id=run_id,
+        plan_id=plan_id,
+        generation=run.generation,
+        step_type="planner",
+        provider="codex",
+        status="completed",
+        finished_at=datetime.utcnow(),
+    )
+    db_session.add(step)
+    await db_session.flush()
+    receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+    receipt.status = "launching"
+    receipt.codex_home = "/tmp/ccm-test-codex-home"
+    receipt.codex_thread_id = "thread-unclean-runtime"
+    db_session.add(receipt)
+    await db_session.commit()
+
+    original_cancel_invocation = adapter_module.cancel_invocation
+
+    async def cancel_then_publish_terminal(db, **kwargs):
+        result = await original_cancel_invocation(db, **kwargs)
+        raced_run = await db.get(
+            PlanAgentRun,
+            run_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        raced_plan = await db.get(
+            Plan,
+            plan_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        assert raced_run is not None and raced_plan is not None
+        raced_run.status = "completed"
+        raced_run.current_stage = "complete"
+        raced_run.finished_at = datetime.utcnow()
+        raced_plan.active_run_id = None
+        await db.commit()
+        return result
+
+    monkeypatch.setattr(
+        adapter_module,
+        "cancel_invocation",
+        cancel_then_publish_terminal,
+    )
+    monkeypatch.setattr(adapter_module, "active_plan_run_ids", lambda: set())
+    runtime_stopper = AsyncMock()
+    monkeypatch.setattr(
+        adapter_module,
+        "cancel_plan_run_runtime",
+        runtime_stopper,
+    )
+    dispatcher_stopper = AsyncMock(return_value=True)
+
+    with pytest.raises(
+        PlanCapabilityCancellationUnconfirmed,
+        match="runtime evidence is incomplete",
+    ):
+        await PlanCapabilityExecutor(
+            stop_callback=dispatcher_stopper,
+        ).cancel(db_session, invocation_id=invocation_id)
+
+    dispatcher_stopper.assert_not_awaited()
+    runtime_stopper.assert_not_awaited()
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    stored_execution = await db_session.get(
+        CapabilityExecution,
+        execution_id,
+        populate_existing=True,
+    )
+    stored_run = await db_session.get(
+        PlanAgentRun,
+        run_id,
+        populate_existing=True,
+    )
+    stored_plan = await db_session.get(Plan, plan_id, populate_existing=True)
+    assert stored_invocation.status == "cancelling"
+    assert stored_execution.status == "cancelling"
+    assert stored_run.status == "completed"
+    assert stored_run.cancellation_target_generation is None
+    assert stored_plan.active_run_id is None
 
 
 @pytest.mark.asyncio
@@ -345,7 +985,14 @@ async def test_unapproved_or_inexact_completed_run_fails_closed(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tamper",
-    ["planner_type", "reviewer_run", "produced_step", "reviewed_step"],
+    [
+        "planner_type",
+        "reviewer_run",
+        "produced_step",
+        "reviewed_step",
+        "planner_generation",
+        "reviewer_generation",
+    ],
 )
 async def test_wrong_planner_or_reviewer_step_identity_fails_closed(
     db_session,
@@ -367,8 +1014,12 @@ async def test_wrong_planner_or_reviewer_step_identity_fails_closed(
         reviewer.run_id = run.id + 999
     elif tamper == "produced_step":
         version.produced_by_step_id = reviewer.id
-    else:
+    elif tamper == "reviewed_step":
         version.reviewed_by_step_id = planner.id
+    elif tamper == "planner_generation":
+        planner.generation = run.generation
+    else:
+        reviewer.generation = planner.generation
     await db_session.commit()
 
     failed = await executor.observe(db_session, invocation_id=invocation.id)
@@ -444,6 +1095,102 @@ async def test_cancel_stop_false_retains_durable_cancelling_fence(db_session):
     ).cancel(db_session, invocation_id=invocation_id)
     assert cancelled.status == "cancelled"
     accepted_stopper.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cold_restart_recovery_converges_cancelling_capability(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    """A restarted dispatcher and executor finish the durable cancel fence."""
+    from backend.services import plan_agent_runner
+
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    await PlanCapabilityExecutor().ensure_started(
+        db_session,
+        invocation_id=invocation_id,
+    )
+    execution, run, plan = await _handled_run(db_session, invocation_id)
+    owner = Instance(
+        name="cold-restart-plan-owner",
+        status="running",
+        current_plan_run_id=run.id,
+    )
+    db_session.add(owner)
+    await db_session.flush()
+    run.status = "running"
+    run.instance_id = owner.id
+    run.last_execution_started_at = datetime.utcnow()
+    step = PlanAgentStep(
+        run_id=run.id,
+        plan_id=plan.id,
+        generation=run.generation,
+        step_type="planner",
+        provider="codex",
+        status="running",
+    )
+    db_session.add(step)
+    await db_session.flush()
+    from backend.services.plan_runtime_receipt import (
+        new_prepared_runtime_receipt,
+    )
+
+    receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+    receipt.status = "cleaned"
+    receipt.cleaned_at = datetime.utcnow()
+    db_session.add(receipt)
+    await db_session.commit()
+    run_id = run.id
+    plan_id = plan.id
+    execution_id = execution.id
+    owner_id = owner.id
+    step_id = step.id
+
+    with pytest.raises(
+        PlanCapabilityCancellationUnconfirmed,
+        match="stop was not confirmed",
+    ):
+        await PlanCapabilityExecutor(
+            stop_callback=AsyncMock(return_value=False)
+        ).cancel(db_session, invocation_id=invocation_id)
+
+    dispatcher = GlobalDispatcher(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+        broadcaster=MagicMock(),
+    )
+    await dispatcher._recover_versioned_plan_runs()
+
+    # Model a new process/session rather than relying on the first session's
+    # SQLAlchemy identity map after recovery committed through db_factory.
+    db_session.expire_all()
+    recovered = await PlanCapabilityExecutor(
+        stop_callback=dispatcher.stop_capability_plan_run_lifecycle
+    ).recover(db_session, invocation_id=invocation_id)
+
+    assert recovered.status == "cancelled"
+    assert recovered.run_status == "cancelled"
+    async with db_factory() as db:
+        stored_invocation = await db.get(CapabilityInvocation, invocation_id)
+        stored_execution = await db.get(CapabilityExecution, execution_id)
+        stored_run = await db.get(PlanAgentRun, run_id)
+        stored_plan = await db.get(Plan, plan_id)
+        stored_owner = await db.get(Instance, owner_id)
+        stored_step = await db.get(PlanAgentStep, step_id)
+        assert stored_invocation.status == "cancelled"
+        assert stored_execution.status == "cancelled"
+        assert stored_run.status == "cancelled"
+        assert stored_run.instance_id is None
+        assert stored_run.last_execution_started_at is None
+        assert stored_plan.active_run_id is None
+        assert stored_owner.status == "idle"
+        assert stored_owner.current_plan_run_id is None
+        assert stored_step.status == "cancelled"
+        assert stored_step.error == "Cancelled by user"
+        assert stored_step.finished_at is not None
 
 
 @pytest.mark.asyncio
@@ -530,3 +1277,85 @@ async def test_capability_cancel_fence_rejects_waiting_input_answer(db_session):
                 answered_by=7,
             )
     assert getattr(raised.value, "status_code", None) == 409
+
+
+@pytest.mark.asyncio
+async def test_wrong_plan_handle_generation_cannot_consume_input_request(db_session):
+    _task, invocation = await _create_invocation(db_session)
+    invocation_id = invocation.id
+    executor = PlanCapabilityExecutor()
+    await executor.ensure_started(db_session, invocation_id=invocation_id)
+    execution, run, plan = await _handled_run(db_session, invocation_id)
+    execution_id = execution.id
+    run_id = run.id
+    plan_id = plan.id
+    input_request = PlanInputRequest(
+        plan_id=plan_id,
+        run_id=run_id,
+        source_step_id=1,
+        requested_by="planner",
+        questions=[],
+        status="open",
+        idempotency_key=f"wrong-generation-input-{run_id}",
+        opened_at=datetime.utcnow(),
+    )
+    db_session.add(input_request)
+    await db_session.flush()
+    request_id = input_request.id
+    run.status = "waiting_user"
+    run.open_input_request_id = request_id
+    await db_session.commit()
+    waiting = await executor.observe(db_session, invocation_id=invocation_id)
+    assert waiting.status == "waiting_user"
+
+    execution = await db_session.get(
+        CapabilityExecution,
+        execution.id,
+        populate_existing=True,
+    )
+    execution.handle_generation = 7
+    await db_session.commit()
+
+    async with plan_operation_lock(plan_id):
+        with pytest.raises(Exception) as raised:
+            await answer_input_request(
+                db_session,
+                plan=plan,
+                run=run,
+                input_request=input_request,
+                expected_generation=run.generation,
+                idempotency_key="wrong-handle-generation-answer",
+                answers=[],
+                response_text=None,
+                attachments=None,
+                answered_by=7,
+            )
+    assert getattr(raised.value, "status_code", None) == 409
+    await db_session.rollback()
+    stored_request = await db_session.get(
+        PlanInputRequest,
+        request_id,
+        populate_existing=True,
+    )
+    stored_run = await db_session.get(
+        PlanAgentRun,
+        run_id,
+        populate_existing=True,
+    )
+    stored_invocation = await db_session.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    stored_execution = await db_session.get(
+        CapabilityExecution,
+        execution_id,
+        populate_existing=True,
+    )
+    assert stored_request.status == "open"
+    assert stored_request.answers is None
+    assert stored_request.answered_at is None
+    assert stored_run.status == "waiting_user"
+    assert stored_run.open_input_request_id == request_id
+    assert stored_invocation.status == "waiting_user"
+    assert stored_execution.status == "waiting_user"

@@ -2010,14 +2010,32 @@ async def _send_shared_chat(
 async def _preserve_remote_uncertain_plan_receipt(
     db: AsyncSession,
     *,
-    receipt,
+    receipt_key: str,
+    target_task_id: int,
+    expected_worker_id: int,
     remote_receipt: dict,
     request: Request | None,
 ) -> None:
     """Mirror a Worker's ambiguous launch as a consumed, visible Version."""
 
     from backend.services.plan_events import broadcast_plan_event
-    from backend.services.plan_service import preserve_uncertain_plan_application
+    from backend.services.plan_service import (
+        fence_worker_plan_application_receipt,
+        preserve_uncertain_plan_application,
+    )
+
+    receipt = await fence_worker_plan_application_receipt(
+        db,
+        receipt_key=receipt_key,
+        target_task_id=target_task_id,
+        expected_worker_id=expected_worker_id,
+    )
+    if receipt is None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Worker Plan receipt changed before uncertain delivery was preserved",
+        )
 
     error = str(
         remote_receipt.get("delivery_error")
@@ -2038,8 +2056,8 @@ async def _preserve_remote_uncertain_plan_receipt(
         await broadcast_plan_event(
             event="plan_application_delivery_uncertain",
             plan_id=plan_id,
-            target_task_id=receipt.target_task_id,
-            receipt_key=receipt.receipt_key,
+            target_task_id=target_task_id,
+            receipt_key=receipt_key,
             delivery_status="uncertain",
         )
 
@@ -2228,8 +2246,15 @@ async def _send_worker_chat(
                         "A previous Worker Plan application is bound to a "
                         "different message or attachment set",
                     )
+                prepared_receipt_key = prepared.receipt_key
+                prepared_log_id = prior_log.id
+                # Remote receipt lookup is read-only and may take an arbitrary
+                # amount of time. End the discovery snapshot first; every
+                # branch that mutates Manager audit state reacquires the exact
+                # Task writer fence in a new transaction below.
+                await db.commit()
                 remote_receipt = await worker_proxy.get_plan_application_receipt(
-                    worker, prepared.receipt_key
+                    worker, prepared_receipt_key
                 )
                 remote_delivery_status = (
                     remote_receipt.get("delivery_status")
@@ -2238,12 +2263,25 @@ async def _send_worker_chat(
                 )
                 if remote_delivery_status in {"failed", "cancelled"}:
                     from backend.services.plan_service import (
+                        fence_worker_plan_application_receipt,
                         release_unstarted_plan_application,
                     )
 
+                    locked_receipt = await fence_worker_plan_application_receipt(
+                        db,
+                        receipt_key=prepared_receipt_key,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
+                    )
+                    if locked_receipt is None:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Prepared Worker Plan receipt changed during reconciliation",
+                        )
                     await release_unstarted_plan_application(
                         db,
-                        receipt_key=prepared.receipt_key,
+                        receipt_key=prepared_receipt_key,
                         delivery_status=remote_delivery_status,
                         error=str(remote_receipt.get("delivery_error") or "")[:2000],
                         expected_worker_id=worker.id,
@@ -2256,7 +2294,9 @@ async def _send_worker_chat(
                 if remote_delivery_status == "uncertain":
                     await _preserve_remote_uncertain_plan_receipt(
                         db,
-                        receipt=prepared,
+                        receipt_key=prepared_receipt_key,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
                         remote_receipt=remote_receipt,
                         request=request,
                     )
@@ -2271,11 +2311,66 @@ async def _send_worker_chat(
                     and isinstance(remote_receipt.get("response"), dict)
                 ):
                     remote_result = dict(remote_receipt["response"])
+                    from backend.services.plan_service import (
+                        fence_plan_target_task,
+                    )
+
+                    await fence_plan_target_task(
+                        db,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
+                    )
+                    prior_log = await db.get(
+                        LogEntry,
+                        prepared_log_id,
+                        populate_existing=True,
+                    )
+                    if prior_log is None:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Prepared Plan application lost its user log",
+                        )
+                    for plan, version in approved_versions:
+                        db.add(PlanApplication(
+                            plan_id=plan.id,
+                            plan_version_id=version.id,
+                            application_type="chat_message",
+                            target_task_id=current.id,
+                            target_session_id=(
+                                remote_result.get("session_id") or current.session_id
+                            ),
+                            user_log_id=prior_log.id,
+                            applied_by=(
+                                get_current_user_id(request) if request else None
+                            ),
+                            application_receipt_key=prepared_receipt_key,
+                        ))
+                    metadata = _raw_log_metadata(prior_log)
+                    metadata["applied_plans"] = versioned_plan_snapshots(
+                        approved_versions
+                    )
+                    prior_log.raw_json = json.dumps(metadata)
+                    try:
+                        # Task -> Application -> Receipt is the shared deletion
+                        # order. If receipt reconciliation lost its CAS, this
+                        # flush is rolled back together with every audit row.
+                        await db.flush()
+                    except IntegrityError as exc:
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "A selected Plan Version was applied concurrently",
+                        ) from exc
                     receipt_committed = await db.execute(
                         sa_update(PlanApplicationReceipt)
                         .where(
                             PlanApplicationReceipt.receipt_key
-                            == prepared.receipt_key,
+                            == prepared_receipt_key,
+                            PlanApplicationReceipt.target_task_id == current.id,
+                            PlanApplicationReceipt.worker_id == worker.id,
+                            PlanApplicationReceipt.manager_user_log_id
+                            == prepared_log_id,
                             PlanApplicationReceipt.status == "prepared",
                             PlanApplicationReceipt.delivery_status == "pending",
                         )
@@ -2296,20 +2391,6 @@ async def _send_worker_chat(
                             409,
                             "Worker Plan delivery changed during reconciliation",
                         )
-                    for plan, version in approved_versions:
-                        db.add(PlanApplication(
-                            plan_id=plan.id,
-                            plan_version_id=version.id,
-                            application_type="chat_message",
-                            target_task_id=current.id,
-                            target_session_id=remote_result.get("session_id") or current.session_id,
-                            user_log_id=prior_log.id,
-                            applied_by=get_current_user_id(request) if request else None,
-                            application_receipt_key=prepared.receipt_key,
-                        ))
-                    metadata = _raw_log_metadata(prior_log)
-                    metadata["applied_plans"] = versioned_plan_snapshots(approved_versions)
-                    prior_log.raw_json = json.dumps(metadata)
                     await db.commit()
                     from backend.services.plan_events import broadcast_plan_event
 
@@ -2647,7 +2728,9 @@ async def _send_worker_chat(
                 ):
                     await _preserve_remote_uncertain_plan_receipt(
                         db,
-                        receipt=manager_receipt,
+                        receipt_key=application_receipt_key,
+                        target_task_id=current.id,
+                        expected_worker_id=worker.id,
                         remote_receipt=remote_receipt,
                         request=request,
                     )
@@ -2690,16 +2773,32 @@ async def _send_worker_chat(
         # validation or local DB failure cannot roll the ACK back and strand a
         # relay-proven G+1 behind an eternally unacknowledged handoff marker.
         await db.commit()
+
         if callable(recovery_scheduler):
             scheduled = recovery_scheduler(worker, acknowledged)
             if inspect.isawaitable(scheduled):
                 await scheduled
+        requested_plan_ids = list(body.plan_task_ids or [])
+        if approved_versions or requested_plan_ids:
+            # The ACK commit intentionally ends the original admission
+            # transaction.  Reacquire a cross-process Task writer fence after
+            # all external recovery scheduling and immediately before creating
+            # first-class PlanApplication rows or updating legacy mirrors.
+            # Otherwise another Manager process could delete the Task in the
+            # ACK -> audit window and this transaction would recreate
+            # references to a missing target.
+            from backend.services.plan_service import fence_plan_target_task
+
+            await fence_plan_target_task(
+                db,
+                target_task_id=current.id,
+                expected_worker_id=worker.id,
+            )
         applied_plan_ids = (
             result.get("applied_plan_task_ids")
             if isinstance(result, dict)
             else None
         )
-        requested_plan_ids = list(body.plan_task_ids or [])
         if applied_plan_ids is None:
             normalized_applied_ids: list[int] = []
         elif isinstance(applied_plan_ids, list) and all(
@@ -2779,29 +2878,6 @@ async def _send_worker_chat(
             from backend.models.plan import PlanApplication
             from backend.services.plan_service import versioned_plan_snapshots
 
-            if manager_receipt is not None:
-                receipt_committed = await db.execute(
-                    sa_update(PlanApplicationReceipt)
-                    .where(
-                        PlanApplicationReceipt.receipt_key
-                        == manager_receipt.receipt_key,
-                        PlanApplicationReceipt.status == "prepared",
-                        PlanApplicationReceipt.delivery_status == "pending",
-                    )
-                    .values(
-                        status="committed",
-                        delivery_status="queued",
-                        response=(result if isinstance(result, dict) else None),
-                        updated_at=datetime.utcnow(),
-                    )
-                )
-                if receipt_committed.rowcount != 1:
-                    await db.rollback()
-                    raise HTTPException(
-                        409,
-                        "Worker Plan delivery changed before Manager commit",
-                    )
-
             for plan, version in approved_versions:
                 db.add(
                     PlanApplication(
@@ -2834,19 +2910,33 @@ async def _send_worker_chat(
                     409,
                     "A selected Plan Version was applied concurrently",
                 ) from exc
-        await db.commit()
-
-        if approved_versions:
-            from backend.services.plan_events import broadcast_plan_event
-
-            for plan, version in approved_versions:
-                await broadcast_plan_event(
-                    event="plan_version_applied",
-                    plan_id=plan.id,
-                    target_task_id=current.id,
-                    version_id=version.id,
-                    user_log_id=manager_user_log.id,
+            if manager_receipt is not None:
+                receipt_committed = await db.execute(
+                    sa_update(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.receipt_key
+                        == application_receipt_key,
+                        PlanApplicationReceipt.target_task_id == current.id,
+                        PlanApplicationReceipt.worker_id == worker.id,
+                        PlanApplicationReceipt.manager_user_log_id
+                        == manager_user_log.id,
+                        PlanApplicationReceipt.status == "prepared",
+                        PlanApplicationReceipt.delivery_status == "pending",
+                    )
+                    .values(
+                        status="committed",
+                        delivery_status="queued",
+                        response=(result if isinstance(result, dict) else None),
+                        updated_at=datetime.utcnow(),
+                    )
                 )
+                if receipt_committed.rowcount != 1:
+                    await db.rollback()
+                    raise HTTPException(
+                        409,
+                        "Worker Plan delivery changed before Manager commit",
+                    )
+        await db.commit()
 
         if approved_versions:
             from backend.services.plan_events import broadcast_plan_event

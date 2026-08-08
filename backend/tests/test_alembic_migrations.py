@@ -41,6 +41,7 @@ import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
+import backend.models.plan_agent  # noqa: F401
 import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
@@ -62,7 +63,11 @@ DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
 AUTO_CAPABILITY_TURN_REVISION = "c3a7e9f1b2d4"
 TERMINAL_ARBITRATION_REVISION = "4b8d2f6a1c90"
 CAPABILITY_RESUME_OUTBOX_REVISION = "7c1e4a9d2f60"
-CURRENT_HEAD_REVISION = CAPABILITY_RESUME_OUTBOX_REVISION
+PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
+WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
+WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
+WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
+CURRENT_HEAD_REVISION = WORKER_PLAN_IMPORT_RECEIPT_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -102,6 +107,40 @@ def _load_terminal_arbitration_migration(module_suffix: str = "test"):
     )
     spec = importlib.util.spec_from_file_location(
         f"terminal_arbitration_migration_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_worker_task_delete_receipt_migration(module_suffix: str = "test"):
+    migration_path = (
+        PROJECT_ROOT
+        / "alembic"
+        / "versions"
+        / "b7f3d1a8c920_add_worker_task_delete_receipts.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"worker_task_delete_receipt_migration_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_worker_plan_import_receipt_migration(module_suffix: str = "test"):
+    migration_path = (
+        PROJECT_ROOT
+        / "alembic"
+        / "versions"
+        / "d3c8a7f1e620_add_worker_plan_import_receipts.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"worker_plan_import_receipt_migration_{module_suffix}",
         migration_path,
     )
     assert spec is not None and spec.loader is not None
@@ -3126,6 +3165,1491 @@ class TestCodeReviewMigration:
         _run_alembic(cfg, command.downgrade, CAPABILITY_CORE_REVISION)
 
 
+class TestPlanRuntimeReceiptMigration:
+    @staticmethod
+    def _assert_receipt_schema(engine) -> None:
+        inspector = inspect(engine)
+        assert "plan_agent_runtime_receipts" in inspector.get_table_names()
+        run_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("plan_agent_runs")
+        }
+        receipt_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("plan_agent_runtime_receipts")
+        }
+        assert "cancellation_target_generation" in run_columns
+        assert {
+            "run_id",
+            "step_id",
+            "run_generation",
+            "attempt_index",
+            "runtime_token",
+            "prepared_boot_id",
+            "prepared_start_ticks",
+            "prepared_uid",
+            "process_start_ticks",
+        }.issubset(receipt_columns)
+        assert isinstance(
+            receipt_columns["prepared_start_ticks"]["type"], BigInteger
+        )
+        assert isinstance(
+            receipt_columns["process_start_ticks"]["type"], BigInteger
+        )
+        assert isinstance(
+            Base.metadata.tables["plan_agent_runtime_receipts"]
+            .c.process_start_ticks.type,
+            BigInteger,
+        )
+        assert receipt_columns["runtime_token"]["type"].length == 32
+
+    @staticmethod
+    def _insert_run_and_step(
+        conn,
+        *,
+        run_status="waiting_user",
+        step_status="completed",
+        worker_id: int | None = None,
+    ):
+        plan_id = None
+        if worker_id is not None:
+            plan_id = conn.execute(
+                text(
+                    "INSERT INTO plans "
+                    "(title, initial_request, worker_id, priority, "
+                    "pipeline_config, lock_version, created_at, updated_at) "
+                    "VALUES ('legacy Worker mirror', 'plan', :worker_id, 0, "
+                    "'{}', 0, '2026-08-08 00:00:00', "
+                    "'2026-08-08 00:00:01') RETURNING id"
+                ),
+                {"worker_id": worker_id},
+            ).scalar_one()
+        run_id = conn.execute(
+            text(
+                "INSERT INTO plan_agent_runs "
+                "(plan_id, run_type, current_stage, generation, interaction_count, "
+                "max_interactions, execution_seconds, status, round, worker_id, "
+                "review_exhausted, created_at, updated_at, finished_at) VALUES "
+                "(:plan_id, 'initial', 'planner', 4, 0, 3, 0, :run_status, 1, "
+                ":worker_id, 0, '2026-08-08 00:00:00', "
+                "'2026-08-08 00:00:01', CASE WHEN :run_status IN "
+                "('completed', 'failed', 'cancelled') THEN "
+                "'2026-08-08 00:00:01' ELSE NULL END) RETURNING id"
+            ),
+            {
+                "plan_id": plan_id,
+                "run_status": run_status,
+                "worker_id": worker_id,
+            },
+        ).scalar_one()
+        step_id = conn.execute(
+            text(
+                "INSERT INTO plan_agent_steps "
+                "(run_id, plan_id, worker_id, worker_step_id, generation, step_type, "
+                "round, provider, status, "
+                "streamed_output_chars, started_at, finished_at) VALUES "
+                "(:run_id, :plan_id, :worker_id, :worker_step_id, 4, 'planner', 1, "
+                "'claude', :step_status, 0, "
+                "'2026-08-08 00:00:00', "
+                "CASE WHEN :step_status = 'running' THEN NULL "
+                "ELSE '2026-08-08 00:00:01' END) RETURNING id"
+            ),
+            {
+                "run_id": run_id,
+                "plan_id": plan_id,
+                "worker_id": worker_id,
+                "worker_step_id": 501 if worker_id is not None else None,
+                "step_status": step_status,
+            },
+        ).scalar_one()
+        return run_id, step_id
+
+    def test_revision_backfills_terminal_steps_downgrades_and_reupgrades(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "plan-runtime-receipt-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CAPABILITY_RESUME_OUTBOX_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_runtime_receipts" not in _get_all_tables(engine)
+        assert "cancellation_target_generation" not in _get_table_columns(
+            engine, "plan_agent_runs"
+        )
+        with engine.begin() as conn:
+            _run_id, step_id = self._insert_run_and_step(conn)
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_receipt_schema(engine)
+        large_start_ticks = 5_000_000_123
+        with engine.begin() as conn:
+            backfill = conn.execute(
+                text(
+                    "SELECT status, length(runtime_token), prepared_start_ticks, "
+                    "cleaned_at FROM plan_agent_runtime_receipts WHERE step_id = :step_id"
+                ),
+                {"step_id": step_id},
+            ).one()
+            assert backfill == (
+                "cleaned",
+                32,
+                0,
+                "2026-08-08 00:00:01.000000",
+            )
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        "INSERT INTO plan_agent_runtime_receipts "
+                        "(run_id, step_id, run_generation, attempt_index, provider, "
+                        "runtime_token, prepared_boot_id, prepared_start_ticks, "
+                        "prepared_uid, status, created_at, updated_at) VALUES "
+                        "(11, 12, 7, 1, 'claude', :token, :boot_id, :ticks, 1000, "
+                        "'cleaned', '2026-08-08 00:00:00', "
+                        "'2026-08-08 00:00:00')"
+                    ),
+                    {
+                        "token": "a" * 32,
+                        "boot_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        "ticks": large_start_ticks,
+                    },
+                )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, CAPABILITY_RESUME_OUTBOX_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_runtime_receipts" not in _get_all_tables(engine)
+        assert "cancellation_target_generation" not in _get_table_columns(
+            engine, "plan_agent_runs"
+        )
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == CAPABILITY_RESUME_OUTBOX_REVISION
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        self._assert_receipt_schema(engine)
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == PLAN_RUNTIME_RECEIPT_REVISION
+            assert conn.execute(
+                text("SELECT COUNT(*) FROM plan_agent_runtime_receipts")
+            ).scalar_one() == 1
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        "receipt_status",
+        ["prepared", "admitting", "launching", "cleanup_failed", "cleaned"],
+    )
+    def test_downgrade_refuses_nonclean_or_malformed_receipt(
+        self,
+        tmp_path,
+        receipt_status,
+    ):
+        db_path = str(tmp_path / f"plan-runtime-{receipt_status}-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            run_id, step_id = self._insert_run_and_step(
+                conn,
+                run_status="running",
+                step_status="running",
+            )
+            conn.execute(text("PRAGMA ignore_check_constraints = ON"))
+            conn.execute(
+                text(
+                    "INSERT INTO plan_agent_runtime_receipts "
+                    "(run_id, step_id, run_generation, attempt_index, provider, "
+                    "runtime_token, prepared_boot_id, prepared_start_ticks, "
+                    "prepared_uid, status, process_id, process_group_id, "
+                    "process_start_ticks, process_uid, boot_id, cleanup_error, "
+                    "created_at, updated_at, cleaned_at) VALUES "
+                    "(:run_id, :step_id, 4, 1, 'claude', :token, :boot_id, 1, 1000, "
+                    ":status, :process_id, :process_group_id, :process_ticks, "
+                    ":process_uid, :process_boot_id, :cleanup_error, "
+                    "'2026-08-08 00:00:00', '2026-08-08 00:00:01', :cleaned_at)"
+                ),
+                {
+                    "run_id": run_id,
+                    "step_id": step_id,
+                    "token": "a" * 32,
+                    "boot_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                    "status": receipt_status,
+                    "process_id": 42 if receipt_status == "launching" else None,
+                    "process_group_id": 42 if receipt_status == "launching" else None,
+                    "process_ticks": 2 if receipt_status == "launching" else None,
+                    "process_uid": 1000 if receipt_status == "launching" else None,
+                    "process_boot_id": (
+                        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                        if receipt_status == "launching"
+                        else None
+                    ),
+                    "cleanup_error": (
+                        "cleanup uncertain"
+                        if receipt_status == "cleanup_failed"
+                        else None
+                    ),
+                    # The cleaned case is deliberately malformed.
+                    "cleaned_at": None,
+                },
+            )
+            conn.execute(text("PRAGMA ignore_check_constraints = OFF"))
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="non-clean, malformed, or actively cancelling",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                CAPABILITY_RESUME_OUTBOX_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_runtime_receipts" in _get_all_tables(engine)
+        engine.dispose()
+
+    def test_upgrade_rejects_active_legacy_step_without_identity(self, tmp_path):
+        db_path = str(tmp_path / "plan-runtime-active-legacy-upgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CAPABILITY_RESUME_OUTBOX_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            self._insert_run_and_step(
+                conn,
+                run_status="running",
+                step_status="running",
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="active or malformed legacy Plan Steps",
+        ):
+            _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+
+    def test_terminal_worker_mirror_gets_dispatch_not_manager_runtime_proof(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "plan-runtime-worker-mirror-upgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CAPABILITY_RESUME_OUTBOX_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            _run_id, step_id = self._insert_run_and_step(
+                conn,
+                run_status="completed",
+                step_status="completed",
+                worker_id=7,
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM plan_agent_runtime_receipts "
+                    "WHERE step_id = :step_id"
+                ),
+                {"step_id": step_id},
+            ).scalar_one() == 0
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            legacy = conn.execute(
+                text(
+                    "SELECT status, payload_digest, remote_status, "
+                    "settlement_reason, run_generation, settled_at "
+                    "FROM plan_agent_worker_dispatch_receipts"
+                )
+            ).one()
+            assert legacy == (
+                "settled",
+                None,
+                "completed",
+                "legacy_terminal",
+                4,
+                "2026-08-08 00:00:01.000000",
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, CAPABILITY_RESUME_OUTBOX_REVISION)
+
+    def test_upgrade_rejects_active_worker_mirror_without_dispatch_identity(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "plan-runtime-active-worker-mirror.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CAPABILITY_RESUME_OUTBOX_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            self._insert_run_and_step(
+                conn,
+                run_status="running",
+                step_status="running",
+                worker_id=7,
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="active or malformed legacy Worker Plan Runs",
+        ):
+            _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+
+    def test_downgrade_refuses_active_cancellation_generation(self, tmp_path):
+        db_path = str(tmp_path / "plan-runtime-active-cancel-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO plan_agent_runs "
+                    "(run_type, current_stage, generation, "
+                    "cancellation_target_generation, interaction_count, "
+                    "max_interactions, execution_seconds, status, round, "
+                    "review_exhausted, created_at, updated_at) VALUES "
+                    "('initial', 'planner', 5, 4, 0, 3, 0, 'cancelling', 1, 0, "
+                    "'2026-08-08 00:00:00', '2026-08-08 00:00:01')"
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="actively cancelling durable Plan runtime evidence",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                CAPABILITY_RESUME_OUTBOX_REVISION,
+            )
+
+
+class TestWorkerPlanDispatchReceiptMigration:
+    @pytest.mark.parametrize(
+        ("status", "payload_digest"),
+        [
+            ("prepared", None),
+            ("remote_possible", "d" * 64),
+        ],
+    )
+    def test_downgrade_refuses_unsettled_boundary_evidence(
+        self,
+        tmp_path,
+        status,
+        payload_digest,
+    ):
+        db_path = str(tmp_path / f"worker-plan-{status}-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO plan_agent_worker_dispatch_receipts "
+                    "(plan_id, run_id, worker_id, run_generation, protocol, "
+                    "status, payload_digest, created_at, updated_at) VALUES "
+                    "(1, 2, 3, 4, 1, :status, :payload_digest, "
+                    "'2026-08-08 00:00:00', '2026-08-08 00:00:00')"
+                ),
+                {"status": status, "payload_digest": payload_digest},
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="non-settled or malformed durable Worker Plan dispatch",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                PLAN_RUNTIME_RECEIPT_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            "plan_agent_worker_dispatch_receipts" in _get_all_tables(engine)
+        )
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORKER_PLAN_DISPATCH_RECEIPT_REVISION
+        engine.dispose()
+
+    def test_revision_enforces_boundary_state_and_roundtrips(self, tmp_path):
+        db_path = str(tmp_path / "worker-plan-dispatch-receipt.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            "plan_agent_worker_dispatch_receipts"
+            not in _get_all_tables(engine)
+        )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert "plan_agent_worker_dispatch_receipts" in inspector.get_table_names()
+        columns = {
+            item["name"]
+            for item in inspector.get_columns(
+                "plan_agent_worker_dispatch_receipts"
+            )
+        }
+        assert {
+            "plan_id",
+            "run_id",
+            "target_task_id",
+            "worker_id",
+            "run_generation",
+            "protocol",
+            "status",
+            "payload_digest",
+            "settlement_reason",
+            "settled_at",
+        }.issubset(columns)
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO plan_agent_worker_dispatch_receipts "
+                "(plan_id, run_id, worker_id, run_generation, protocol, status, "
+                "created_at, updated_at) VALUES "
+                "(1, 2, 3, 4, 1, 'prepared', "
+                "'2026-08-08 00:00:00', '2026-08-08 00:00:00')"
+            ))
+            conn.execute(text(
+                "INSERT INTO plan_agent_worker_dispatch_receipts "
+                "(plan_id, run_id, worker_id, run_generation, protocol, status, "
+                "payload_digest, created_at, updated_at) VALUES "
+                "(1, 2, 3, 5, 1, 'remote_possible', :digest, "
+                "'2026-08-08 00:00:00', '2026-08-08 00:00:00')"
+            ), {"digest": "a" * 64})
+            conn.execute(text(
+                "INSERT INTO plan_agent_worker_dispatch_receipts "
+                "(plan_id, run_id, worker_id, run_generation, protocol, status, "
+                "settlement_reason, created_at, updated_at, settled_at) VALUES "
+                "(1, 2, 3, 6, 1, 'settled', 'not_launched', "
+                "'2026-08-08 00:00:00', '2026-08-08 00:00:00', "
+                "'2026-08-08 00:00:01')"
+            ))
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO plan_agent_worker_dispatch_receipts "
+                    "(plan_id, run_id, worker_id, run_generation, protocol, "
+                    "status, payload_digest, created_at, updated_at) VALUES "
+                    "(1, 2, 3, 7, 1, 'prepared', :digest, "
+                    "'2026-08-08 00:00:00', '2026-08-08 00:00:00')"
+                ), {"digest": "b" * 64})
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO plan_agent_worker_dispatch_receipts "
+                    "(plan_id, run_id, worker_id, run_generation, protocol, "
+                    "status, payload_digest, created_at, updated_at) VALUES "
+                    "(1, 2, 3, 8, 1, 'remote_possible', :digest, "
+                    "'2026-08-08 00:00:00', '2026-08-08 00:00:00')"
+                ), {"digest": "A" * 64})
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO plan_agent_worker_dispatch_receipts "
+                    "(plan_id, run_id, worker_id, run_generation, protocol, "
+                    "status, payload_digest, remote_status, settlement_reason, "
+                    "created_at, updated_at, settled_at) VALUES "
+                    "(1, 2, 3, 9, 1, 'settled', :digest, 'completed', "
+                    "'remote_pause', '2026-08-08 00:00:00', "
+                    "'2026-08-08 00:00:00', '2026-08-08 00:00:01')"
+                ), {"digest": "z" * 64})
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="non-settled or malformed durable Worker Plan dispatch",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                PLAN_RUNTIME_RECEIPT_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            "plan_agent_worker_dispatch_receipts" in _get_all_tables(engine)
+        )
+        with engine.begin() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORKER_PLAN_DISPATCH_RECEIPT_REVISION
+            conn.execute(text(
+                "DELETE FROM plan_agent_worker_dispatch_receipts "
+                "WHERE status != 'settled'"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, PLAN_RUNTIME_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            "plan_agent_worker_dispatch_receipts"
+            not in _get_all_tables(engine)
+        )
+        engine.dispose()
+
+
+class TestWorkerTaskDeleteReceiptMigration:
+    @staticmethod
+    def _insert_task(connection, *, title: str) -> int:
+        connection.execute(
+            text(
+                "INSERT INTO tasks "
+                "(title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, created_at) "
+                "VALUES (:title, 'd', 'completed', 0, 'main', 'pending', "
+                "0, 2, 'auto', '2026-08-08 00:00:00')"
+            ),
+            {"title": title},
+        )
+        return connection.execute(
+            text("SELECT id FROM tasks WHERE title = :title"),
+            {"title": title},
+        ).scalar_one()
+
+    @staticmethod
+    def _insert_manager_receipt(
+        connection,
+        *,
+        task_id: int,
+        operation: str,
+        source_task_status: str,
+    ) -> None:
+        connection.execute(
+            text(
+                "INSERT INTO worker_task_termination_receipts "
+                "(operation_id, task_id, active_task_id, side, worker_id, "
+                "operation, status, source_task_status, "
+                "source_task_retry_count, source_task_turn_generation, "
+                "request_payload, request_digest, created_at, updated_at) "
+                "VALUES (:operation_id, :task_id, :task_id, 'manager', 1, "
+                ":operation, 'pending_remote', :source_task_status, 0, 0, "
+                "'{}', :digest, '2026-08-08 00:00:00', "
+                "'2026-08-08 00:00:00')"
+            ),
+            {
+                "operation_id": "d" * 32,
+                "task_id": task_id,
+                "operation": operation,
+                "source_task_status": source_task_status,
+                "digest": "e" * 64,
+            },
+        )
+
+    def test_revision_roundtrips_and_enforces_manager_only_delete(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "worker-task-delete-receipt-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+        )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        old_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspect(engine).get_check_constraints(
+                "worker_task_termination_receipts"
+            )
+        }
+        assert "delete" not in old_checks["ck_worker_task_term_operation"]
+        assert (
+            "superseded"
+            not in old_checks["ck_worker_task_term_source_status"]
+        )
+        assert "ck_worker_task_term_delete_manager_only" not in old_checks
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_TASK_DELETE_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        new_checks = {
+            item["name"]: item["sqltext"]
+            for item in inspect(engine).get_check_constraints(
+                "worker_task_termination_receipts"
+            )
+        }
+        assert "delete" in new_checks["ck_worker_task_term_operation"]
+        assert (
+            "superseded"
+            in new_checks["ck_worker_task_term_source_status"]
+        )
+        assert "ck_worker_task_term_delete_manager_only" in new_checks
+        with engine.begin() as connection:
+            task_id = self._insert_task(
+                connection,
+                title="worker-side delete constraint",
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "INSERT INTO worker_task_termination_receipts "
+                        "(operation_id, task_id, active_task_id, side, "
+                        "operation, status, source_task_status, "
+                        "source_task_retry_count, "
+                        "source_task_turn_generation, request_payload, "
+                        "request_digest, accepted_at, created_at, updated_at) "
+                        "VALUES (:operation_id, :task_id, :task_id, 'worker', "
+                        "'delete', 'accepted', 'completed', 0, 0, '{}', "
+                        ":digest, '2026-08-08 00:00:00', "
+                        "'2026-08-08 00:00:00', '2026-08-08 00:00:00')"
+                    ),
+                    {
+                        "operation_id": "f" * 32,
+                        "task_id": task_id,
+                        "digest": "a" * 64,
+                    },
+                )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+        )
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_TASK_DELETE_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORKER_TASK_DELETE_RECEIPT_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("operation", "source_task_status"),
+        [
+            ("delete", "completed"),
+            ("supersede", "superseded"),
+        ],
+    )
+    def test_downgrade_refuses_rows_old_constraints_cannot_represent(
+        self,
+        tmp_path,
+        operation,
+        source_task_status,
+    ):
+        db_path = str(
+            tmp_path
+            / f"worker-task-delete-{operation}-{source_task_status}.db"
+        )
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_TASK_DELETE_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as connection:
+            task_id = self._insert_task(
+                connection,
+                title=f"downgrade guard {operation} {source_task_status}",
+            )
+            self._insert_manager_receipt(
+                connection,
+                task_id=task_id,
+                operation=operation,
+                source_task_status=source_task_status,
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="delete operations or superseded source status",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as connection:
+            assert connection.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == WORKER_TASK_DELETE_RECEIPT_REVISION
+            connection.execute(
+                text("DELETE FROM worker_task_termination_receipts")
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            WORKER_PLAN_DISPATCH_RECEIPT_REVISION,
+        )
+
+
+class TestWorkerPlanImportReceiptMigration:
+    @staticmethod
+    def _insert_imported_graph(
+        connection,
+        *,
+        plan_origin="manager_v1",
+        include_receipt_protocol=False,
+    ):
+        plan_id = connection.execute(
+            text(
+                "INSERT INTO plans "
+                "(title, initial_request, worker_id, relay_origin, priority, "
+                "pipeline_config, lock_version, created_at, updated_at) VALUES "
+                "('imported', 'plan', NULL, :plan_origin, 0, '{}', 0, "
+                "'2026-08-08 00:00:00', '2026-08-08 00:00:01') RETURNING id"
+            ),
+            {"plan_origin": plan_origin},
+        ).scalar_one()
+        protocol_column = (
+            ", import_receipt_protocol" if include_receipt_protocol else ""
+        )
+        protocol_value = ", 1" if include_receipt_protocol else ""
+        run_id = connection.execute(
+            text(
+                "INSERT INTO plan_agent_runs "
+                "(plan_id, run_type, current_stage, generation, "
+                "interaction_count, max_interactions, execution_seconds, "
+                "status, round, worker_id, relay_origin, "
+                "import_payload_digest, review_exhausted, created_at, "
+                f"updated_at, finished_at{protocol_column}) VALUES "
+                "(:plan_id, 'initial', 'completed', 0, 0, 3, 0, "
+                "'completed', 1, NULL, 'manager_v1', :digest, 0, "
+                "'2026-08-08 00:00:00', '2026-08-08 00:00:01', "
+                f"'2026-08-08 00:00:01'{protocol_value}) RETURNING id"
+            ),
+            {"plan_id": plan_id, "digest": "a" * 64},
+        ).scalar_one()
+        return plan_id, run_id
+
+    def test_backfill_constraints_and_clean_roundtrip(self, tmp_path):
+        db_path = str(tmp_path / "worker-plan-import-receipt-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_TASK_DELETE_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            plan_id, run_id = self._insert_imported_graph(conn)
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, WORKER_PLAN_IMPORT_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert "plan_agent_worker_import_receipts" in inspector.get_table_names()
+        assert {
+            "run_id",
+            "plan_id",
+            "protocol",
+            "relay_origin",
+            "payload_digest",
+            "outcome",
+            "created_at",
+        } == {
+            column["name"]
+            for column in inspector.get_columns(
+                "plan_agent_worker_import_receipts"
+            )
+        }
+        with engine.connect() as conn:
+            assert conn.execute(
+                text(
+                    "SELECT run_id, plan_id, protocol, relay_origin, "
+                    "payload_digest, outcome FROM "
+                    "plan_agent_worker_import_receipts"
+                )
+            ).one() == (
+                run_id,
+                plan_id,
+                1,
+                "manager_v1",
+                "a" * 64,
+                "imported",
+            )
+            assert conn.execute(
+                text(
+                    "SELECT import_receipt_protocol FROM plan_agent_runs "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": run_id},
+            ).scalar_one() == 1
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO plan_agent_worker_import_receipts "
+                        "(run_id, plan_id, protocol, relay_origin, "
+                        "payload_digest, outcome, created_at) VALUES "
+                        "(999, 999, 1, 'manager_v1', :digest, 'imported', "
+                        "'2026-08-08 00:00:00')"
+                    ),
+                    {"digest": "A" * 64},
+                )
+        for bad_run_id, bad_plan_id in ((0, 999), (998, 0), (-997, 999)):
+            with pytest.raises(IntegrityError):
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "INSERT INTO plan_agent_worker_import_receipts "
+                            "(run_id, plan_id, protocol, relay_origin, "
+                            "payload_digest, outcome, created_at) VALUES "
+                            "(:run_id, :plan_id, 1, 'manager_v1', :digest, "
+                            "'imported', '2026-08-08 00:00:00')"
+                        ),
+                        {
+                            "run_id": bad_run_id,
+                            "plan_id": bad_plan_id,
+                            "digest": "a" * 64,
+                        },
+                    )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, WORKER_TASK_DELETE_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_worker_import_receipts" not in _get_all_tables(engine)
+        engine.dispose()
+        _run_alembic(cfg, command.upgrade, WORKER_PLAN_IMPORT_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT COUNT(*) FROM plan_agent_worker_import_receipts")
+            ).scalar_one() == 1
+        engine.dispose()
+
+    def test_run_gate_rejects_old_importer_without_receipt_protocol(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "worker-plan-import-old-writer-gate.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_PLAN_IMPORT_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+
+        # The legacy importer still writes relay_origin/import digest but does
+        # not know the receipt protocol marker.  SQL CHECK must evaluate to
+        # FALSE (not UNKNOWN, which databases accept) for that exact shape.
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                self._insert_imported_graph(conn)
+
+        with engine.begin() as conn:
+            plan_id = conn.execute(
+                text(
+                    "INSERT INTO plans "
+                    "(title, initial_request, worker_id, relay_origin, "
+                    "priority, pipeline_config, lock_version, created_at, "
+                    "updated_at) VALUES ('local', 'plan', NULL, NULL, 0, "
+                    "'{}', 0, '2026-08-08 00:00:00', "
+                    "'2026-08-08 00:00:01') RETURNING id"
+                )
+            ).scalar_one()
+            with pytest.raises(IntegrityError):
+                conn.execute(
+                    text(
+                        "INSERT INTO plan_agent_runs "
+                        "(plan_id, run_type, current_stage, generation, "
+                        "interaction_count, max_interactions, execution_seconds, "
+                        "status, round, relay_origin, import_receipt_protocol, "
+                        "review_exhausted, created_at, updated_at) VALUES "
+                        "(:plan_id, 'initial', 'planner', 0, 0, 3, 0, "
+                        "'queued', 1, NULL, 1, 0, "
+                        "'2026-08-08 00:00:00', '2026-08-08 00:00:01')"
+                    ),
+                    {"plan_id": plan_id},
+                )
+            ordinary_run_id = conn.execute(
+                text(
+                    "INSERT INTO plan_agent_runs "
+                    "(plan_id, run_type, current_stage, generation, "
+                    "interaction_count, max_interactions, execution_seconds, "
+                    "status, round, relay_origin, review_exhausted, "
+                    "created_at, updated_at) VALUES "
+                    "(:plan_id, 'initial', 'planner', 0, 0, 3, 0, "
+                    "'queued', 1, NULL, 0, '2026-08-08 00:00:00', "
+                    "'2026-08-08 00:00:01') RETURNING id"
+                ),
+                {"plan_id": plan_id},
+            ).scalar_one()
+            assert conn.execute(
+                text(
+                    "SELECT import_receipt_protocol FROM plan_agent_runs "
+                    "WHERE id = :run_id"
+                ),
+                {"run_id": ordinary_run_id},
+            ).scalar_one_or_none() is None
+        engine.dispose()
+
+    @pytest.mark.parametrize("downgrade", (False, True))
+    def test_sqlite_preflight_fence_blocks_a_second_writer(
+        self,
+        tmp_path,
+        downgrade,
+    ):
+        db_path = str(
+            tmp_path / f"worker-plan-import-sqlite-fence-{downgrade}.db"
+        )
+        cfg = _alembic_cfg(db_path)
+        target = (
+            WORKER_PLAN_IMPORT_RECEIPT_REVISION
+            if downgrade
+            else WORKER_TASK_DELETE_RECEIPT_REVISION
+        )
+        _run_alembic(cfg, command.upgrade, target)
+        module = _load_worker_plan_import_receipt_migration(
+            f"sqlite_fence_{downgrade}"
+        )
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        engine = create_engine(
+            f"sqlite:///{db_path}",
+            connect_args={"timeout": 0},
+        )
+        first = engine.connect()
+        transaction = first.begin()
+        context = MigrationContext.configure(connection=first)
+        try:
+            with patch.object(module, "op", Operations(context)):
+                module._acquire_transactional_fence(downgrade=downgrade)
+                with engine.connect() as second:
+                    second.exec_driver_sql("PRAGMA busy_timeout = 0")
+                    with pytest.raises(OperationalError, match="locked"):
+                        second.execute(
+                            text(
+                                "UPDATE alembic_version "
+                                "SET version_num = version_num"
+                            )
+                        )
+        finally:
+            transaction.rollback()
+            first.close()
+            engine.dispose()
+
+    @pytest.mark.parametrize("direction", ("upgrade", "downgrade"))
+    def test_mysql_offline_sql_is_refused_before_output(self, direction):
+        module = _load_worker_plan_import_receipt_migration(
+            f"mysql_offline_{direction}"
+        )
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(context)),
+            pytest.raises(RuntimeError, match="refuses MySQL offline SQL"),
+        ):
+            getattr(module, direction)()
+        assert output.getvalue() == ""
+
+    def test_postgresql_offline_fences_before_preflight_and_ddl(self):
+        module = _load_worker_plan_import_receipt_migration("postgresql_fence")
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        for direction in ("upgrade", "downgrade"):
+            output = io.StringIO()
+            context = MigrationContext.configure(
+                dialect_name="postgresql",
+                opts={"as_sql": True, "output_buffer": output},
+            )
+            with patch.object(module, "op", Operations(context)):
+                getattr(module, direction)()
+            ddl = output.getvalue().lower()
+            lock = "lock table plan_agent_runs, plans"
+            if direction == "downgrade":
+                lock += ", plan_agent_worker_import_receipts"
+            lock += " in access exclusive mode"
+            guard = f"do $ccm_worker_plan_import_{direction}$"
+            mutation = "alter table" if direction == "upgrade" else "drop index"
+            assert ddl.index(lock) < ddl.index(guard) < ddl.index(mutation)
+
+    def test_receipt_table_uses_innodb_on_mysql(self):
+        module = _load_worker_plan_import_receipt_migration("mysql_innodb")
+
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module._create_receipt_table()
+        assert "engine=innodb" in output.getvalue().lower()
+
+    @pytest.mark.parametrize(
+        ("version", "is_mariadb", "engines", "error"),
+        [
+            ((8, 0, 15), False, (), "8.0.16"),
+            ((8, 0, 36), True, (), "8.0.16"),
+            (
+                (8, 0, 36),
+                False,
+                (("plans", "InnoDB"), ("plan_agent_runs", "MyISAM")),
+                "InnoDB tables",
+            ),
+        ],
+    )
+    def test_mysql_runtime_requirements_fail_closed(
+        self,
+        version,
+        is_mariadb,
+        engines,
+        error,
+    ):
+        module = _load_worker_plan_import_receipt_migration(
+            f"mysql_requirements_{error}_{is_mariadb}"
+        )
+        dialect = SimpleNamespace(
+            name="mysql",
+            is_mariadb=is_mariadb,
+            server_version_info=version,
+        )
+        bind = SimpleNamespace(
+            dialect=dialect,
+            execute=MagicMock(return_value=engines),
+        )
+        fake_op = SimpleNamespace(
+            get_bind=lambda: bind,
+            get_context=lambda: SimpleNamespace(as_sql=False),
+        )
+        with (
+            patch.object(module, "op", fake_op),
+            pytest.raises(RuntimeError, match=error),
+        ):
+            module._require_supported_mysql()
+
+    def test_mysql_runtime_requirements_accept_supported_innodb(self):
+        module = _load_worker_plan_import_receipt_migration(
+            "mysql_requirements_supported"
+        )
+        dialect = SimpleNamespace(
+            name="mysql",
+            is_mariadb=False,
+            server_version_info=(8, 0, 36),
+        )
+        bind = SimpleNamespace(
+            dialect=dialect,
+            execute=MagicMock(
+                return_value=(
+                    ("plans", "InnoDB"),
+                    ("plan_agent_runs", "InnoDB"),
+                )
+            ),
+        )
+        fake_op = SimpleNamespace(
+            get_bind=lambda: bind,
+            get_context=lambda: SimpleNamespace(as_sql=False),
+        )
+        with patch.object(module, "op", fake_op):
+            module._require_supported_mysql()
+
+    def test_mysql_upgrade_replays_legacy_phase_and_table_suffix(self):
+        module = _load_worker_plan_import_receipt_migration(
+            "mysql_upgrade_state_machine"
+        )
+        events: list[str] = []
+
+        class _Result:
+            def scalar_one(self):
+                return 0
+
+        bind = SimpleNamespace(
+            execute=lambda statement, *args, **kwargs: (
+                events.append("run_backfill") or _Result()
+            )
+        )
+
+        def alter(table_name, actions):
+            assert table_name == "plan_agent_runs"
+            events.append(
+                "phase_alter"
+                if actions[0].startswith("ADD COLUMN")
+                else "canonical_alter"
+            )
+
+        with (
+            patch.object(
+                module,
+                "_mysql_run_state",
+                side_effect=("legacy", "phase", "canonical"),
+            ),
+            patch.object(
+                module,
+                "_mysql_receipt_state",
+                side_effect=("absent", "absent", "canonical"),
+            ),
+            patch.object(
+                module,
+                "_assert_valid_import_identities",
+                side_effect=lambda: events.append("preflight"),
+            ),
+            patch.object(module, "_mysql_alter", side_effect=alter),
+            patch.object(
+                module,
+                "_create_receipt_table",
+                side_effect=lambda: events.append("create_receipt"),
+            ),
+            patch.object(
+                module,
+                "_backfill_receipts",
+                side_effect=lambda: events.append("receipt_backfill"),
+            ),
+            patch.object(
+                module,
+                "_assert_live_runs_have_receipts",
+                side_effect=lambda: events.append("validate_receipts"),
+            ),
+            patch.object(
+                module,
+                "_ensure_mysql_receipt_index",
+                side_effect=lambda: events.append("ensure_index"),
+            ),
+            patch.object(
+                module,
+                "op",
+                SimpleNamespace(get_bind=lambda: bind),
+            ),
+        ):
+            module._upgrade_mysql()
+
+        assert events == [
+            "preflight",
+            "phase_alter",
+            "preflight",
+            "run_backfill",
+            "canonical_alter",
+            "preflight",
+            "create_receipt",
+            "receipt_backfill",
+            "validate_receipts",
+            "ensure_index",
+        ]
+
+    def test_mysql_upgrade_replays_canonical_gate_without_realtering_run(self):
+        module = _load_worker_plan_import_receipt_migration(
+            "mysql_upgrade_canonical_replay"
+        )
+        with (
+            patch.object(module, "_mysql_run_state", return_value="canonical"),
+            patch.object(
+                module,
+                "_mysql_receipt_state",
+                side_effect=("absent", "absent", "canonical"),
+            ),
+            patch.object(module, "_assert_valid_import_identities"),
+            patch.object(module, "_mysql_alter") as alter,
+            patch.object(module, "_create_receipt_table") as create_receipt,
+            patch.object(module, "_backfill_receipts") as backfill,
+            patch.object(module, "_assert_live_runs_have_receipts"),
+            patch.object(module, "_ensure_mysql_receipt_index"),
+        ):
+            module._upgrade_mysql()
+        alter.assert_not_called()
+        create_receipt.assert_called_once_with()
+        backfill.assert_called_once_with()
+
+    def test_mysql_downgrade_installs_both_writer_gates_before_drop(self):
+        module = _load_worker_plan_import_receipt_migration(
+            "mysql_downgrade_gate_order"
+        )
+        events: list[str] = []
+
+        class _Result:
+            def scalar_one(self):
+                return 0
+
+        bind = SimpleNamespace(execute=lambda *args, **kwargs: _Result())
+
+        def alter(table_name, actions):
+            if table_name == "plan_agent_runs" and actions[0].startswith(
+                "ADD CONSTRAINT"
+            ):
+                events.append("run_gate")
+            elif table_name == "plan_agent_worker_import_receipts":
+                events.append("receipt_gate")
+            else:
+                events.append("run_downgrade")
+
+        fake_op = SimpleNamespace(
+            get_bind=lambda: bind,
+            drop_table=lambda table_name: events.append(f"drop:{table_name}"),
+        )
+        with (
+            patch.object(
+                module,
+                "_mysql_run_state",
+                side_effect=("canonical", "canonical_gated", "legacy"),
+            ),
+            patch.object(
+                module,
+                "_mysql_receipt_state",
+                side_effect=("canonical", "canonical_gated", "absent"),
+            ),
+            patch.object(module, "_mysql_alter", side_effect=alter),
+            patch.object(module, "op", fake_op),
+        ):
+            module._downgrade_mysql()
+        assert events == [
+            "receipt_gate",
+            "run_gate",
+            "drop:plan_agent_worker_import_receipts",
+            "run_downgrade",
+        ]
+
+    def test_mysql_downgrade_refuses_history_before_any_ddl(self):
+        module = _load_worker_plan_import_receipt_migration(
+            "mysql_downgrade_history"
+        )
+
+        class _Result:
+            def scalar_one(self):
+                return 1
+
+        bind = SimpleNamespace(execute=lambda *args, **kwargs: _Result())
+        with (
+            patch.object(module, "_mysql_run_state", return_value="canonical"),
+            patch.object(module, "_mysql_receipt_state", return_value="canonical"),
+            patch.object(module, "_mysql_alter") as alter,
+            patch.object(
+                module,
+                "op",
+                SimpleNamespace(get_bind=lambda: bind),
+            ),
+            pytest.raises(RuntimeError, match="while receipt or imported Run"),
+        ):
+            module._downgrade_mysql()
+        alter.assert_not_called()
+
+    def test_mysql_downgrade_replays_after_receipt_drop(self):
+        module = _load_worker_plan_import_receipt_migration(
+            "mysql_downgrade_after_drop"
+        )
+        with (
+            patch.object(
+                module,
+                "_mysql_run_state",
+                side_effect=("canonical_gated", "legacy"),
+            ),
+            patch.object(module, "_mysql_receipt_state", return_value="absent"),
+            patch.object(module, "_mysql_alter") as alter,
+        ):
+            module._downgrade_mysql()
+        alter.assert_called_once()
+        table_name, actions = alter.call_args.args
+        assert table_name == "plan_agent_runs"
+        assert actions[-1] == "DROP COLUMN import_receipt_protocol"
+
+    def test_upgrade_rejects_null_plan_relay_origin(self, tmp_path):
+        db_path = str(tmp_path / "worker-plan-import-null-origin.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_TASK_DELETE_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            self._insert_imported_graph(conn, plan_origin=None)
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="malformed immutable identity"):
+            _run_alembic(
+                cfg,
+                command.upgrade,
+                WORKER_PLAN_IMPORT_RECEIPT_REVISION,
+            )
+
+    @pytest.mark.parametrize("identity", ["run", "plan"])
+    def test_upgrade_rejects_nonpositive_import_identity(
+        self,
+        tmp_path,
+        identity,
+    ):
+        db_path = str(tmp_path / f"worker-plan-import-{identity}-identity.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_TASK_DELETE_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            plan_id, run_id = self._insert_imported_graph(conn)
+            if identity == "run":
+                conn.execute(
+                    text(
+                        "UPDATE plan_agent_runs SET id = :invalid_id "
+                        "WHERE id = :run_id"
+                    ),
+                    {"invalid_id": -run_id, "run_id": run_id},
+                )
+            else:
+                conn.execute(
+                    text(
+                        "UPDATE plans SET id = :invalid_id WHERE id = :plan_id"
+                    ),
+                    {"invalid_id": -plan_id, "plan_id": plan_id},
+                )
+                conn.execute(
+                    text(
+                        "UPDATE plan_agent_runs SET plan_id = :invalid_id "
+                        "WHERE id = :run_id"
+                    ),
+                    {
+                        "invalid_id": -plan_id,
+                        "run_id": run_id,
+                    },
+                )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="malformed immutable identity"):
+            _run_alembic(
+                cfg,
+                command.upgrade,
+                WORKER_PLAN_IMPORT_RECEIPT_REVISION,
+            )
+
+    def test_downgrade_rejects_imported_run_with_null_plan_identity(self, tmp_path):
+        db_path = str(tmp_path / "worker-plan-import-null-plan-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_PLAN_IMPORT_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            plan_id, run_id = self._insert_imported_graph(
+                conn,
+                include_receipt_protocol=True,
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO plan_agent_worker_import_receipts "
+                    "(run_id, plan_id, protocol, relay_origin, "
+                    "payload_digest, outcome, created_at) VALUES "
+                    "(:run_id, :plan_id, 1, 'manager_v1', :digest, "
+                    "'imported', '2026-08-08 00:00:00')"
+                ),
+                {
+                    "run_id": run_id,
+                    "plan_id": plan_id,
+                    "digest": "a" * 64,
+                },
+            )
+            conn.execute(
+                text("UPDATE plan_agent_runs SET plan_id = NULL WHERE id = :run_id"),
+                {"run_id": run_id},
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="Cannot downgrade"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                WORKER_TASK_DELETE_RECEIPT_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_worker_import_receipts" in _get_all_tables(engine)
+        engine.dispose()
+
+    @pytest.mark.parametrize("outcome", ["cancelled_before_import", "imported"])
+    def test_downgrade_refuses_tombstone_or_historical_graph(
+        self,
+        tmp_path,
+        outcome,
+    ):
+        db_path = str(tmp_path / f"worker-plan-import-{outcome}-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_PLAN_IMPORT_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            if outcome == "imported":
+                plan_id, run_id = self._insert_imported_graph(
+                    conn,
+                    include_receipt_protocol=True,
+                )
+                conn.execute(
+                    text(
+                        "INSERT INTO plan_agent_worker_import_receipts "
+                        "(run_id, plan_id, protocol, relay_origin, "
+                        "payload_digest, outcome, created_at) VALUES "
+                        "(:run_id, :plan_id, 1, 'manager_v1', :digest, "
+                        "'imported', '2026-08-08 00:00:00')"
+                    ),
+                    {
+                        "run_id": run_id,
+                        "plan_id": plan_id,
+                        "digest": "a" * 64,
+                    },
+                )
+                conn.execute(
+                    text("DELETE FROM plan_agent_runs WHERE id = :run_id"),
+                    {"run_id": run_id},
+                )
+                conn.execute(
+                    text("DELETE FROM plans WHERE id = :plan_id"),
+                    {"plan_id": plan_id},
+                )
+            else:
+                conn.execute(
+                    text(
+                        "INSERT INTO plan_agent_worker_import_receipts "
+                        "(run_id, plan_id, protocol, relay_origin, "
+                        "payload_digest, outcome, created_at) VALUES "
+                        "(777, 776, 1, 'manager_v1', :digest, "
+                        "'cancelled_before_import', "
+                        "'2026-08-08 00:00:00')"
+                    ),
+                    {"digest": "b" * 64},
+                )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="Cannot downgrade"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                WORKER_TASK_DELETE_RECEIPT_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "plan_agent_worker_import_receipts" in _get_all_tables(engine)
+        engine.dispose()
+
+
 class TestFreshMigration:
     """A fresh database (no tables) can be fully created via Alembic upgrade."""
 
@@ -3138,7 +4662,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plan_agent_runtime_receipts", "plan_agent_worker_dispatch_receipts", "plan_agent_worker_import_receipts", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -3164,6 +4688,22 @@ class TestFreshMigration:
 
         plan_run_cols = _get_table_columns(engine, "plan_agent_runs")
         assert "capability_execution_id" in plan_run_cols
+        assert "cancellation_target_generation" in plan_run_cols
+
+        receipt_columns = {
+            item["name"]: item
+            for item in inspect(engine).get_columns(
+                "plan_agent_runtime_receipts"
+            )
+        }
+        assert isinstance(
+            receipt_columns["process_start_ticks"]["type"], BigInteger
+        )
+        assert isinstance(
+            Base.metadata.tables["plan_agent_runtime_receipts"]
+            .c.process_start_ticks.type,
+            BigInteger,
+        )
 
         delivery_run_cols = set(_get_table_columns(engine, "delivery_runs"))
         assert {
@@ -4353,6 +5893,28 @@ class TestSchemaConsistency:
             assert "turn_scope = 'source'" in ddl
             assert "'codex_app_server'" in ddl
 
+    def test_worker_plan_dispatch_digest_constraint_is_portable(self):
+        table = Base.metadata.tables[
+            "plan_agent_worker_dispatch_receipts"
+        ]
+        for dialect in (
+            sqlite.dialect(),
+            postgresql.dialect(),
+            mysql.dialect(),
+        ):
+            ddl = str(CreateTable(table).compile(dialect=dialect))
+            assert "ck_plan_worker_dispatch_state_shape" in ddl
+            assert "length(payload_digest) = 64" in ddl
+            assert ddl.count("replace(") >= 16
+            assert "'f', '') = ''" in ddl
+
+    def test_worker_plan_import_receipt_metadata_uses_innodb_on_mysql(self):
+        table = Base.metadata.tables[
+            "plan_agent_worker_import_receipts"
+        ]
+        mysql_ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
+        assert "ENGINE=InnoDB" in mysql_ddl
+
     def test_worker_termination_constraints_compile_on_all_dialects(self):
         table = Base.metadata.tables["worker_task_termination_receipts"]
         for dialect in (
@@ -4432,17 +5994,26 @@ class TestSchemaConsistency:
         module = _load_terminal_arbitration_migration(
             "worker_termination_orm_expression_match"
         )
+        delete_module = _load_worker_task_delete_receipt_migration(
+            "worker_termination_orm_expression_match"
+        )
         orm_check_sql = {
             constraint.name: constraint.sqltext
             for constraint in table.constraints
             if isinstance(constraint, CheckConstraint)
         }
-        assert set(orm_check_sql) == set(
-            module._WORKER_TASK_TERMINATION_CHECKS
+        effective_checks = dict(module._WORKER_TASK_TERMINATION_CHECKS)
+        effective_checks[delete_module._OPERATION_CONSTRAINT] = (
+            delete_module._NEW_OPERATIONS
         )
-        for name, expected_sql in (
-            module._WORKER_TASK_TERMINATION_CHECKS.items()
-        ):
+        effective_checks[delete_module._SOURCE_STATUS_CONSTRAINT] = (
+            delete_module._NEW_SOURCE_STATUSES
+        )
+        effective_checks[delete_module._DELETE_SIDE_CONSTRAINT] = (
+            delete_module._DELETE_MANAGER_ONLY
+        )
+        assert set(orm_check_sql) == set(effective_checks)
+        for name, expected_sql in effective_checks.items():
             assert module._boolean_check_shape(
                 orm_check_sql[name]
             ) == module._boolean_check_shape(expected_sql)
@@ -4923,6 +6494,22 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert (
+            script.get_revision(WORKER_PLAN_IMPORT_RECEIPT_REVISION).down_revision
+            == WORKER_TASK_DELETE_RECEIPT_REVISION
+        )
+        assert (
+            script.get_revision(WORKER_TASK_DELETE_RECEIPT_REVISION).down_revision
+            == WORKER_PLAN_DISPATCH_RECEIPT_REVISION
+        )
+        assert (
+            script.get_revision(WORKER_PLAN_DISPATCH_RECEIPT_REVISION).down_revision
+            == PLAN_RUNTIME_RECEIPT_REVISION
+        )
+        assert (
+            script.get_revision(PLAN_RUNTIME_RECEIPT_REVISION).down_revision
+            == CAPABILITY_RESUME_OUTBOX_REVISION
+        )
         assert (
             script.get_revision(CAPABILITY_RESUME_OUTBOX_REVISION).down_revision
             == TERMINAL_ARBITRATION_REVISION

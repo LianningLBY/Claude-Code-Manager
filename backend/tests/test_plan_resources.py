@@ -5,13 +5,15 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from sqlalchemy import event, func, select
+from fastapi import HTTPException
+from sqlalchemy import event, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.global_settings import GlobalSettings
+from backend.models.project import Project
 from backend.models.plan import (
     Plan,
     PlanApplication,
@@ -22,8 +24,10 @@ from backend.models.plan import (
 )
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
+from backend.models.worker import Worker
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_agent_runner import PlanAgentRunner
+from backend.services.plan_runtime_receipt import new_prepared_runtime_receipt
 from backend.services.plan_service import (
     apply_worker_plan_outcome,
     materialize_execution_task,
@@ -91,6 +95,432 @@ async def _finish_current_run_with_version(
         run.finished_at = datetime.utcnow()
         await db.commit()
         return version.id
+
+
+@pytest.mark.asyncio
+async def test_attached_plan_freezes_target_last_cwd(client, session_factory):
+    target = await _target(client, session_factory)
+    async with session_factory() as db:
+        current = await db.get(Task, target.id)
+        current.target_repo = "/workspace/project"
+        current.last_cwd = "/workspace/project/.worktrees/exact-turn"
+        await db.commit()
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Plan against the active checkout", "target_task_id": target.id},
+    )
+
+    assert created.status_code == 201, created.text
+    assert created.json()["target_repo"] == "/workspace/project/.worktrees/exact-turn"
+    async with session_factory() as db:
+        plan = await db.get(Plan, created.json()["id"])
+        assert plan.target_repo == "/workspace/project/.worktrees/exact-turn"
+
+
+@pytest.mark.asyncio
+async def test_related_plan_revision_rebinds_to_current_target_checkout(
+    client,
+    session_factory,
+):
+    target = await _target(client, session_factory)
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Refresh the exact checkout", "target_task_id": target.id},
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    next_checkout = "/workspace/project/.worktrees/revision-turn"
+    async with session_factory() as db:
+        current = await db.get(Task, target.id)
+        current.last_cwd = next_checkout
+        current.target_branch = "revision-branch"
+        await db.commit()
+
+    revised = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={
+            "run_type": "user_revision",
+            "request": "Use the Task's current checkout",
+            "base_version_id": version_id,
+            "expected_current_version_id": version_id,
+        },
+    )
+
+    assert revised.status_code == 201, revised.text
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        assert plan.target_repo == next_checkout
+        assert plan.target_branch == "revision-branch"
+
+
+@pytest.mark.asyncio
+async def test_related_plan_fork_binds_to_current_target_checkout(
+    client,
+    session_factory,
+):
+    target = await _target(client, session_factory)
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Fork the current checkout", "target_task_id": target.id},
+    )
+    assert created.status_code == 201, created.text
+    source_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=source_id,
+    )
+    next_checkout = "/workspace/project/.worktrees/fork-turn"
+    async with session_factory() as db:
+        current = await db.get(Task, target.id)
+        current.last_cwd = next_checkout
+        current.target_branch = "fork-branch"
+        await db.commit()
+
+    forked = await client.post(
+        f"/api/plans/{source_id}/fork",
+        json={"base_version_id": version_id},
+    )
+
+    assert forked.status_code == 201, forked.text
+    assert forked.json()["target_repo"] == next_checkout
+    assert forked.json()["target_branch"] == "fork-branch"
+
+
+@pytest.mark.asyncio
+async def test_create_plan_rechecks_task_control_in_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import plan_resources as api
+
+    target = await _target(client, session_factory)
+    revoked = AsyncMock(
+        side_effect=[None, HTTPException(403, "control was revoked")]
+    )
+    monkeypatch.setattr(api, "require_task_control", revoked)
+
+    response = await client.post(
+        "/api/plans",
+        json={
+            "input": "Do not create from a revoked Task snapshot",
+            "target_task_id": target.id,
+        },
+    )
+
+    assert response.status_code == 403
+    assert revoked.await_count == 2
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Plan.id))) == 0
+        assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_create_project_plan_rechecks_access_in_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import plan_resources as api
+
+    async with session_factory() as db:
+        project = Project(
+            name="revoked-plan-project",
+            local_path="/tmp/revoked-plan-project",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+
+    monkeypatch.setattr(settings, "auth_token", "plan-acl-test-token")
+    revoked = AsyncMock(
+        side_effect=[None, HTTPException(403, "project access was revoked")]
+    )
+    monkeypatch.setattr(api, "require_project_access", revoked)
+    response = await client.post(
+        "/api/plans",
+        headers={"Authorization": "Bearer plan-acl-test-token"},
+        json={
+            "input": "Do not create from revoked Project access",
+            "project_id": project_id,
+        },
+    )
+
+    assert response.status_code == 403
+    assert revoked.await_count == 2
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Plan.id))) == 0
+        assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_create_worker_plan_rechecks_access_in_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import plan_resources as api
+
+    async with session_factory() as db:
+        worker = Worker(name="revoked-plan-worker", status="ready")
+        db.add(worker)
+        await db.commit()
+        worker_id = worker.id
+
+    monkeypatch.setattr(settings, "auth_token", "plan-acl-test-token")
+    revoked = AsyncMock(
+        side_effect=[None, HTTPException(403, "Worker access was revoked")]
+    )
+    monkeypatch.setattr(api, "require_worker_target_access", revoked)
+    response = await client.post(
+        "/api/plans",
+        headers={"Authorization": "Bearer plan-acl-test-token"},
+        json={
+            "input": "Do not create from revoked Worker access",
+            "target_repo": "/workspace/revoked-plan-worker",
+            "worker_id": worker_id,
+        },
+    )
+
+    assert response.status_code == 403
+    assert revoked.await_count == 2
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Plan.id))) == 0
+        assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_acl_dependency_refresh_never_adds_cross_worker_writer_locks():
+    """Refreshing cached ACL inputs must not create an A/B Worker lock cycle."""
+
+    from backend.api.plan_resources import _refresh_plan_acl_dependencies
+
+    db = MagicMock()
+    db.get = AsyncMock(
+        side_effect=[
+            Worker(id=22, name="current-worker", status="ready"),
+            Project(
+                id=33,
+                name="migrated-project",
+                local_path="/workspace/project",
+                worker_id=11,
+            ),
+            Worker(id=11, name="project-worker", status="ready"),
+        ]
+    )
+    db.execute = AsyncMock()
+
+    await _refresh_plan_acl_dependencies(
+        db,
+        worker_id=22,
+        project_id=33,
+    )
+
+    db.execute.assert_not_awaited()
+    assert db.get.await_args_list == [
+        ((Worker, 22), {"populate_existing": True}),
+        ((Project, 33), {"populate_existing": True}),
+        ((Worker, 11), {"populate_existing": True}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_create_run_rechecks_plan_control_in_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import plan_resources as api
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Create a protected revision", "target_repo": "/tmp"},
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    async with session_factory() as db:
+        before_plan = await db.get(Plan, plan_id)
+        before_lock_version = before_plan.lock_version
+        before_run_count = await db.scalar(
+            select(func.count(PlanAgentRun.id)).where(
+                PlanAgentRun.plan_id == plan_id
+            )
+        )
+
+    access = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(api, "_has_plan_access", access)
+    response = await client.post(
+        f"/api/plans/{plan_id}/runs",
+        json={
+            "run_type": "user_revision",
+            "request": "This write must lose authorization",
+            "base_version_id": version_id,
+            "expected_current_version_id": version_id,
+        },
+    )
+
+    assert response.status_code == 403
+    assert access.await_count == 2
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        assert plan.active_run_id is None
+        assert plan.lock_version == before_lock_version
+        assert (
+            await db.scalar(
+                select(func.count(PlanAgentRun.id)).where(
+                    PlanAgentRun.plan_id == plan_id
+                )
+            )
+            == before_run_count
+        )
+
+
+@pytest.mark.asyncio
+async def test_fork_rechecks_source_plan_control_in_final_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import plan_resources as api
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Create a protected fork", "target_repo": "/tmp"},
+    )
+    assert created.status_code == 201, created.text
+    source_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=source_id,
+    )
+    async with session_factory() as db:
+        before_plan_count = await db.scalar(select(func.count(Plan.id)))
+        before_run_count = await db.scalar(select(func.count(PlanAgentRun.id)))
+
+    access = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(api, "_has_plan_access", access)
+    response = await client.post(
+        f"/api/plans/{source_id}/fork",
+        json={"base_version_id": version_id},
+    )
+
+    assert response.status_code == 403
+    assert access.await_count == 2
+    async with session_factory() as db:
+        source = await db.get(Plan, source_id)
+        assert source.active_run_id is None
+        assert await db.scalar(select(func.count(Plan.id))) == before_plan_count
+        assert (
+            await db.scalar(select(func.count(PlanAgentRun.id)))
+            == before_run_count
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_lifecycle_fences_new_plan_admission(client, session_factory):
+    async with session_factory() as db:
+        worker = Worker(
+            name="destroying-plan-worker",
+            status="destroying",
+            cloud_instance_id="i-destroying-plan",
+        )
+        db.add(worker)
+        await db.commit()
+        worker_id = worker.id
+
+    created = await client.post(
+        "/api/plans",
+        json={
+            "input": "Must not outlive the Worker",
+            "target_repo": "/workspace/remote",
+            "worker_id": worker_id,
+        },
+    )
+
+    assert created.status_code == 409
+    assert "lifecycle" in created.json()["detail"]
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Plan.id))) == 0
+        assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_lifecycle_fences_new_run_and_restore(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        worker = Worker(name="plan-worker", status="ready")
+        db.add(worker)
+        await db.flush()
+        plan = Plan(
+            title="Archived Worker Plan",
+            initial_request="Keep historical output",
+            target_repo="/workspace/remote",
+            worker_id=worker.id,
+            priority=0,
+            archived_at=datetime.utcnow(),
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+        )
+        db.add(plan)
+        runnable_plan = Plan(
+            title="Runnable Worker Plan",
+            initial_request="Attempt another generation",
+            target_repo="/workspace/remote",
+            worker_id=worker.id,
+            priority=0,
+            pipeline_config=default_plan_pipeline_config().model_dump(mode="json"),
+        )
+        db.add(runnable_plan)
+        await db.commit()
+        plan_id = plan.id
+        runnable_plan_id = runnable_plan.id
+        worker.status = "destroying"
+        await db.commit()
+
+    restored = await client.patch(
+        f"/api/plans/{plan_id}",
+        json={"archived": False, "expected_lock_version": 0},
+    )
+    forked = await client.post(
+        f"/api/plans/{plan_id}/fork",
+        json={"base_version_id": 1},
+    )
+    new_run = await client.post(
+        f"/api/plans/{runnable_plan_id}/runs",
+        json={
+            "run_type": "user_revision",
+            "request": "Do not cross Worker destruction",
+        },
+    )
+
+    assert restored.status_code == 409
+    assert "lifecycle" in restored.json()["detail"]
+    # The archive fence is checked before a fork can turn historical Worker
+    # data into another executable Plan generation.
+    assert forked.status_code == 409
+    assert "Archived Plan" in forked.json()["detail"]
+    assert new_run.status_code == 409
+    assert "lifecycle" in new_run.json()["detail"]
+    async with session_factory() as db:
+        assert (
+            await db.scalar(
+                select(func.count(PlanAgentRun.id)).where(
+                    PlanAgentRun.plan_id == runnable_plan_id
+                )
+            )
+            == 0
+        )
 
 
 @pytest.mark.asyncio
@@ -583,15 +1013,428 @@ async def test_approve_and_create_execution_is_atomic_and_history_stays_linked(
     }
     assert version_states == {1: "applied", 2: "awaiting_review"}
 
+    deleted_execution = await client.delete(f"/api/tasks/{execution_task_id}")
+    assert deleted_execution.status_code == 200, deleted_execution.text
+
     async with session_factory() as db:
-        execution_task = await db.get(Task, execution_task_id)
-        await db.delete(execution_task)
-        await db.commit()
+        assert await db.get(Task, execution_task_id) is None
+        assert await db.scalar(
+            select(PlanApplication.id).where(
+                PlanApplication.plan_version_id == version_id,
+                PlanApplication.execution_task_id == execution_task_id,
+            )
+        ) is not None
 
     missing_target = await client.get(f"/api/plans/{plan_id}")
     assert missing_target.status_code == 200, missing_target.text
     missing_application = missing_target.json()["applications"][0]
     assert missing_application["execution_task_available"] is False
+
+
+@pytest.mark.asyncio
+async def test_execution_materialization_rechecks_control_after_snapshot_reset(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.api import plan_resources as api
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Recheck authorization before apply", "target_repo": "/tmp"},
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    access = AsyncMock(side_effect=[True, False])
+    monkeypatch.setattr(api, "_has_plan_access", access)
+
+    response = await client.post(
+        f"/api/plan-versions/{version_id}/create-execution-task",
+        json={
+            "expected_current_version_id": version_id,
+            "approve_if_pending": True,
+        },
+    )
+
+    assert response.status_code == 403
+    assert access.await_count == 2
+    async with session_factory() as db:
+        version = await db.get(PlanVersion, version_id)
+        assert version is not None and version.human_decision == "pending"
+        assert await db.scalar(select(func.count(PlanApplication.id))) == 0
+        assert await db.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_execution_materialization_rolls_back_inline_approval_on_failure(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Keep approval atomic with Task creation", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    async with session_factory() as db:
+        initial_plan = await db.get(Plan, plan_id)
+        assert initial_plan is not None
+        initial_lock_version = initial_plan.lock_version
+        initial_task_count = int(await db.scalar(select(func.count(Task.id))) or 0)
+
+    with patch(
+        "backend.services.plan_service.stage_task_record",
+        new=AsyncMock(side_effect=RuntimeError("injected Task staging failure")),
+    ):
+        async with session_factory() as db:
+            with pytest.raises(RuntimeError, match="injected Task staging failure"):
+                await materialize_execution_task(
+                    db,
+                    plan_id=plan_id,
+                    version_id=version_id,
+                    expected_current_version_id=version_id,
+                    confirm_stale=False,
+                    approve_if_pending=True,
+                    actor_id=42,
+                )
+
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        version = await db.get(PlanVersion, version_id)
+        assert plan is not None and version is not None
+        assert plan.lock_version == initial_lock_version
+        assert version.human_decision == "pending"
+        assert version.decided_at is None
+        assert await db.scalar(
+            select(func.count(PlanApplication.id)).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        ) == 0
+        assert int(await db.scalar(select(func.count(Task.id))) or 0) == initial_task_count
+
+
+@pytest.mark.asyncio
+async def test_execution_materialization_rejects_active_refresh_run(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Do not execute while refreshing", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        assert plan is not None
+        refresh = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="refresh",
+            base_version_id=version_id,
+            request_text="Refresh current context",
+            status="queued",
+            current_stage="planner",
+            pipeline_config=plan.pipeline_config,
+        )
+        db.add(refresh)
+        await db.flush()
+        plan.active_run_id = refresh.id
+        plan.lock_version += 1
+        await db.commit()
+
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as exc_info:
+            await materialize_execution_task(
+                db,
+                plan_id=plan_id,
+                version_id=version_id,
+                expected_current_version_id=version_id,
+                confirm_stale=False,
+                approve_if_pending=True,
+                actor_id=42,
+            )
+    assert exc_info.value.status_code == 409
+    assert exc_info.value.detail["code"] == "plan_active_run"
+
+    async with session_factory() as db:
+        version = await db.get(PlanVersion, version_id)
+        assert version is not None and version.human_decision == "pending"
+        assert await db.scalar(select(func.count(PlanApplication.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_execution_materialization_loses_cleanly_to_concurrent_plan_writer(
+    tmp_path,
+):
+    """A WAL snapshot race is a deterministic Plan CAS conflict, never BUSY."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.services.plan_staleness import version_staleness as real_staleness
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'execution-materialization.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            plan = Plan(
+                title="Execution materialization WAL fence",
+                initial_request="Create one exact Task",
+                target_repo="/tmp",
+                target_branch="main",
+                pipeline_config=pipeline,
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                run_type="initial",
+                status="completed",
+                current_stage="complete",
+                pipeline_config=pipeline,
+                finished_at=datetime.utcnow(),
+            )
+            setup.add(run)
+            await setup.flush()
+            version = PlanVersion(
+                plan_id=plan.id,
+                version_number=1,
+                produced_by_run_id=run.id,
+                content="# Exact candidate",
+                repo_revision={"available": False, "reason": "not_git"},
+                reviewer_repo_revision={"available": False, "reason": "not_git"},
+                review_verdict="approve",
+                reviewed_at=datetime.utcnow(),
+            )
+            setup.add(version)
+            await setup.flush()
+            plan.current_version_id = version.id
+            run.result_version_id = version.id
+            await setup.commit()
+            plan_id = plan.id
+            version_id = version.id
+
+        staleness_entered = asyncio.Event()
+        release_staleness = asyncio.Event()
+
+        async def blocked_staleness(db, current_plan, current_version):
+            result = await real_staleness(db, current_plan, current_version)
+            staleness_entered.set()
+            await release_staleness.wait()
+            return result
+
+        async def materialize():
+            async with sessions() as materializer:
+                with patch(
+                    "backend.services.plan_staleness.version_staleness",
+                    new=blocked_staleness,
+                ):
+                    return await materialize_execution_task(
+                        materializer,
+                        plan_id=plan_id,
+                        version_id=version_id,
+                        expected_current_version_id=version_id,
+                        confirm_stale=True,
+                        approve_if_pending=True,
+                        actor_id=42,
+                    )
+
+        pending = asyncio.create_task(materialize())
+        await asyncio.wait_for(staleness_entered.wait(), timeout=2)
+        async with sessions() as writer:
+            changed = await writer.execute(
+                update(Plan)
+                .where(Plan.id == plan_id)
+                .values(
+                    archived_at=datetime.utcnow(),
+                    lock_version=Plan.lock_version + 1,
+                )
+            )
+            assert changed.rowcount == 1
+            await writer.commit()
+        release_staleness.set()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await pending
+        assert exc_info.value.status_code == 409
+        assert (
+            exc_info.value.detail["code"]
+            == "plan_changed_during_execution_materialization"
+        )
+
+        async with sessions() as verify:
+            persisted_version = await verify.get(PlanVersion, version_id)
+            assert persisted_version is not None
+            assert persisted_version.human_decision == "pending"
+            assert await verify.scalar(select(func.count(PlanApplication.id))) == 0
+            assert await verify.scalar(select(func.count(Task.id))) == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_execution_materialization_reauthorizes_concurrent_exact_winner(
+    tmp_path,
+):
+    """A CAS-losing replay must not disclose a winner after ACL revocation."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.services.plan_staleness import version_staleness as real_staleness
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'execution-winner-acl.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            plan = Plan(
+                title="Concurrent exact winner ACL",
+                initial_request="Create one protected Task",
+                target_repo="/tmp",
+                target_branch="main",
+                pipeline_config=pipeline,
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                run_type="initial",
+                status="completed",
+                current_stage="complete",
+                pipeline_config=pipeline,
+                finished_at=datetime.utcnow(),
+            )
+            setup.add(run)
+            await setup.flush()
+            version = PlanVersion(
+                plan_id=plan.id,
+                version_number=1,
+                produced_by_run_id=run.id,
+                content="# Protected exact winner",
+                repo_revision={"available": False, "reason": "not_git"},
+                reviewer_repo_revision={"available": False, "reason": "not_git"},
+                review_verdict="approve",
+                reviewed_at=datetime.utcnow(),
+            )
+            setup.add(version)
+            await setup.flush()
+            plan.current_version_id = version.id
+            run.result_version_id = version.id
+            await setup.commit()
+            plan_id = plan.id
+            version_id = version.id
+
+        staleness_entered = asyncio.Event()
+        release_staleness = asyncio.Event()
+        revoked = AsyncMock(side_effect=HTTPException(403, "Plan access was revoked"))
+
+        async def blocked_staleness(db, current_plan, current_version):
+            result = await real_staleness(db, current_plan, current_version)
+            staleness_entered.set()
+            await release_staleness.wait()
+            return result
+
+        async def losing_replay():
+            async with sessions() as materializer:
+                with patch(
+                    "backend.services.plan_staleness.version_staleness",
+                    new=blocked_staleness,
+                ):
+                    return await materialize_execution_task(
+                        materializer,
+                        plan_id=plan_id,
+                        version_id=version_id,
+                        expected_current_version_id=version_id,
+                        confirm_stale=True,
+                        approve_if_pending=True,
+                        actor_id=42,
+                        authorize_locked_plan=revoked,
+                    )
+
+        pending = asyncio.create_task(losing_replay())
+        await asyncio.wait_for(staleness_entered.wait(), timeout=2)
+        async with sessions() as writer:
+            execution = Task(
+                title="Protected execution winner",
+                description="Implement the exact Plan Version",
+                status="pending",
+                target_repo="/tmp",
+                target_branch="main",
+            )
+            writer.add(execution)
+            await writer.flush()
+            winner_version = await writer.get(PlanVersion, version_id)
+            winner_version.human_decision = "approved"
+            winner_version.decided_at = datetime.utcnow()
+            winner_version.decided_by = 7
+            writer.add(
+                PlanApplication(
+                    plan_id=plan_id,
+                    plan_version_id=version_id,
+                    application_type="execution_task",
+                    execution_task_id=execution.id,
+                    applied_by=7,
+                )
+            )
+            changed = await writer.execute(
+                update(Plan)
+                .where(Plan.id == plan_id)
+                .values(lock_version=Plan.lock_version + 1)
+            )
+            assert changed.rowcount == 1
+            await writer.commit()
+
+        release_staleness.set()
+        with pytest.raises(HTTPException) as exc_info:
+            await pending
+        assert exc_info.value.status_code == 403
+        revoked.assert_awaited_once()
+
+        async with sessions() as verify:
+            assert await verify.scalar(select(func.count(PlanApplication.id))) == 1
+            assert await verify.scalar(select(func.count(Task.id))) == 1
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -692,6 +1535,86 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
         assert first.task.effort_level == settings.default_effort
         assert first.task.codex_service_tier == "default"
         assert first.task.timeout_hours == 3.5
+        assert (
+            await db.scalar(
+                select(func.count(PlanApplication.id)).where(
+                    PlanApplication.plan_version_id == version_id
+                )
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_execution_task_replay_survives_later_plan_state_changes(
+    client,
+    session_factory,
+):
+    """Exact-Version idempotency outlives archive, Refresh, and supersession."""
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Keep the immutable execution result", "target_repo": "/tmp"},
+    )
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+
+    async with session_factory() as db:
+        first = await materialize_execution_task(
+            db,
+            plan_id=plan_id,
+            version_id=version_id,
+            expected_current_version_id=version_id,
+            confirm_stale=False,
+            approve_if_pending=True,
+            actor_id=42,
+        )
+        plan = await db.get(Plan, plan_id, populate_existing=True)
+        version = await db.get(PlanVersion, version_id, populate_existing=True)
+        assert plan is not None and version is not None
+        refresh = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="refresh",
+            base_version_id=version.id,
+            request_text="Refresh after the execution Task was created",
+            status="queued",
+            current_stage="planner",
+            pipeline_config=plan.pipeline_config,
+        )
+        db.add(refresh)
+        await db.flush()
+        successor = PlanVersion(
+            plan_id=plan.id,
+            version_number=version.version_number + 1,
+            parent_version_id=version.id,
+            content="# Later historical Version",
+            review_verdict="approve",
+        )
+        db.add(successor)
+        await db.flush()
+        version.superseded_by_version_id = successor.id
+        plan.current_version_id = successor.id
+        plan.active_run_id = refresh.id
+        plan.archived_at = datetime.utcnow()
+        plan.lock_version += 1
+        await db.commit()
+
+        replay = await materialize_execution_task(
+            db,
+            plan_id=plan_id,
+            version_id=version_id,
+            expected_current_version_id=version_id,
+            confirm_stale=False,
+            approve_if_pending=False,
+            actor_id=42,
+        )
+
+        assert replay.created is False
+        assert replay.task.id == first.task.id
+        assert replay.application.id == first.application.id
         assert (
             await db.scalar(
                 select(func.count(PlanApplication.id)).where(
@@ -880,6 +1803,9 @@ async def test_plan_admission_loses_cleanly_to_concurrent_wal_receipt(
                         context_log_id=None,
                         context_snapshot=None,
                         repo_revision=None,
+                        project_id=observed_plan.project_id,
+                        target_repo=observed_plan.target_repo,
+                        target_branch=observed_plan.target_branch,
                         worker_id=None,
                     )
 
@@ -1125,6 +2051,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         plan_id = plan.id
         run_id = run.id
         base_version_id = base.id
+        initial_lock_version = plan.lock_version
 
     payload = {
         "protocol": 3,
@@ -1251,6 +2178,7 @@ async def test_worker_outcome_maps_exact_audit_and_preserves_manager_context(
         assert run.status == "waiting_user"
         # Manager and Worker generations are independent protocol-v3 fences.
         assert run.generation == 2
+        assert plan.lock_version == initial_lock_version + 1
         assert plan.current_version_id == base_version_id
         assert version.id == base_version_id
         assert run.result_version_id is None
@@ -1936,6 +2864,11 @@ async def test_interaction_round_limit_fails_without_limiting_question_count(
             status="completed",
         )
         db.add(step)
+        await db.flush()
+        receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+        receipt.status = "cleaned"
+        receipt.cleaned_at = datetime.utcnow()
+        db.add(receipt)
         await db.commit()
         await db.refresh(step)
         step_id = step.id
@@ -2047,21 +2980,25 @@ async def test_versioned_run_pauses_twice_and_resumes_same_pipeline(
         prompts.append(kwargs["prompt"])
         output = outputs.pop(0)
         async with session_factory() as db:
-            db.add(
-                PlanAgentStep(
-                    run_id=kwargs["run_id"],
-                    plan_id=kwargs["plan_id"],
-                    step_type=kwargs["step_type"],
-                    round=kwargs["round_number"],
-                    generation=kwargs["generation"],
-                    provider="claude",
-                    model="test-model",
-                    route_slot="primary",
-                    status="completed",
-                    output=json.dumps(output),
-                    finished_at=datetime.utcnow(),
-                )
+            step = PlanAgentStep(
+                run_id=kwargs["run_id"],
+                plan_id=kwargs["plan_id"],
+                step_type=kwargs["step_type"],
+                round=kwargs["round_number"],
+                generation=kwargs["generation"],
+                provider="claude",
+                model="test-model",
+                route_slot="primary",
+                status="completed",
+                output=json.dumps(output),
+                finished_at=datetime.utcnow(),
             )
+            db.add(step)
+            await db.flush()
+            receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+            receipt.status = "cleaned"
+            receipt.cleaned_at = datetime.utcnow()
+            db.add(receipt)
             await db.commit()
         return output, json.dumps(output), object(), "primary", "test-account"
 

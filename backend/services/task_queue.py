@@ -1,5 +1,7 @@
 import errno
 import os
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import Float, and_, delete as sa_delete, func, or_, select, update
@@ -202,6 +204,14 @@ TaskDeleteFence = tuple[
     str | None,
     int,
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDeletePreflight:
+    """Exact target-owned Plan identity locked for one Task deletion."""
+
+    task_id: int
+    plan_ids: tuple[int, ...]
 
 
 def task_generation_fence(task: Task) -> TaskGenerationFence:
@@ -536,7 +546,45 @@ class TaskQueue:
         *,
         expected_fence: TaskDeleteFence | None = None,
         remote_worker_deleted: bool = False,
+        before_delete: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        remote_delete_confirm: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        prepare_remote_worker_delete: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        worker_delete_operation_id: str | None = None,
     ) -> bool:
+        callbacks = tuple(
+            callback
+            for callback in (
+                before_delete,
+                remote_delete_confirm,
+                prepare_remote_worker_delete,
+            )
+            if callback is not None
+        )
+        if len(callbacks) > 1:
+            raise ValueError(
+                "Task delete callbacks are mutually exclusive"
+            )
+        if remote_delete_confirm is not None and not remote_worker_deleted:
+            raise ValueError(
+                "remote_delete_confirm requires remote_worker_deleted=True"
+            )
+        if prepare_remote_worker_delete is not None and remote_worker_deleted:
+            raise ValueError(
+                "prepare_remote_worker_delete precedes remote_worker_deleted"
+            )
+        if worker_delete_operation_id is not None and (
+            not remote_worker_deleted
+            or any(callback is not None for callback in callbacks)
+        ):
+            raise ValueError(
+                "worker_delete_operation_id requires callback-free remote finalization"
+            )
         task = await self.get(task_id)
         if not task:
             return False
@@ -550,6 +598,7 @@ class TaskQueue:
             observed_background_generation,
             observed_turn_generation,
         ) = expected_fence or task_delete_fence(task)
+        worker_delete_preparing = prepare_remote_worker_delete is not None
         if observed_status == "waiting_capability":
             return False
         if (
@@ -560,7 +609,10 @@ class TaskQueue:
             )
         ):
             return False
-        if not remote_worker_deleted and task.pty_background_generation:
+        if (
+            not (remote_worker_deleted or worker_delete_preparing)
+            and task.pty_background_generation
+        ):
             # The foreground status is terminal, but the persistent Claude
             # session still owns detached output for this Task.
             return False
@@ -568,9 +620,21 @@ class TaskQueue:
         # its Manager mirror would lose the only management handle while the
         # remote task/process can still exist.  The API opts in only after a
         # 2xx Worker response with an explicit deletion acknowledgement.
-        if (observed_worker_id is not None) != remote_worker_deleted:
+        if (observed_worker_id is not None) != (
+            remote_worker_deleted or worker_delete_preparing
+        ):
             return False
-        if await active_worker_task_termination_receipt(self.db, task_id):
+        active_delete_owner = await active_worker_task_termination_receipt(
+            self.db,
+            task_id,
+        )
+        if active_delete_owner is not None and (
+            worker_delete_operation_id is None
+            or active_delete_owner.operation_id != worker_delete_operation_id
+        ):
+            await self.db.rollback()
+            return False
+        if worker_delete_operation_id is not None and active_delete_owner is None:
             await self.db.rollback()
             return False
 
@@ -621,7 +685,9 @@ class TaskQueue:
                 else Task.pty_background_generation
                 == observed_background_generation
             ),
-            no_active_worker_task_termination_predicate(),
+            no_active_worker_task_termination_predicate(
+                allow_operation_id=worker_delete_operation_id,
+            ),
         ]
         # Establish the global lifecycle DB lock order at Task first. A no-op
         # exact UPDATE is both a generation CAS and a current-write lock on
@@ -636,6 +702,28 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
+        locked_worker_delete_receipt = None
+        if worker_delete_operation_id is not None:
+            locked_worker_delete_receipt = (
+                await self.db.execute(
+                    select(WorkerTaskTerminationReceipt)
+                    .where(
+                        WorkerTaskTerminationReceipt.operation_id
+                        == worker_delete_operation_id,
+                        WorkerTaskTerminationReceipt.task_id == task_id,
+                        WorkerTaskTerminationReceipt.active_task_id == task_id,
+                        WorkerTaskTerminationReceipt.side == "manager",
+                        WorkerTaskTerminationReceipt.operation == "delete",
+                        WorkerTaskTerminationReceipt.status == "awaiting_ack",
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if locked_worker_delete_receipt is None:
+                await self.db.rollback()
+                return False
+
         # Capability lifecycle uses the same global Task -> Invocation ->
         # Execution lock order. Active work owns an external adapter handle or
         # an unconsumed result, so deletion must fail closed. Terminal history
@@ -644,7 +732,7 @@ class TaskQueue:
         from backend.models.capability import (
             ACTIVE_EXECUTION_STATUSES,
             ACTIVE_INVOCATION_STATUSES,
-            ACTIVE_RESUME_OUTBOX_STATUSES,
+            TERMINAL_RESUME_OUTBOX_STATUSES,
             CapabilityExecution,
             CapabilityInvocation,
             CapabilityResumeOutbox,
@@ -716,35 +804,176 @@ class TaskQueue:
             ).scalars()
         )
         if any(
-            outbox.status in ACTIVE_RESUME_OUTBOX_STATUSES
+            outbox.status not in TERMINAL_RESUME_OUTBOX_STATUSES
             for outbox in capability_outboxes
         ):
             await self.db.rollback()
             return False
 
-        # First-class Plans likewise retain a complete version/run/history
-        # aggregate around their target Task.  ``Task.plan_target_task_id``
-        # only covers the legacy Task-shaped planner and cannot protect the
-        # newer ``plans.target_task_id`` link.  Keep the target until callers
-        # explicitly remove its Plan aggregate.
-        from backend.models.plan import Plan
-
-        linked_plan_id = await self.db.scalar(
-            select(Plan.id)
-            .where(Plan.target_task_id == task_id)
-            .order_by(Plan.id)
-            .with_for_update()
-            .limit(1)
-        )
-        if linked_plan_id is not None:
-            await self.db.rollback()
-            return False
-
-        from backend.models.plan_agent import PlanAgentRun
-
         capability_execution_ids = {
             execution.id for execution in capability_executions
         }
+
+        # The Plan graph helper locks both legacy Task-shaped and first-class
+        # Runs in one stable primary-key order before it locks any Plan. Runs
+        # that also belong to the first-class graph are validated/deleted by
+        # that graph; only pure legacy rows are handled locally below.
+        from backend.models.plan_agent import (
+            PlanAgentRun,
+            PlanAgentRuntimeReceipt,
+            PlanAgentStep,
+        )
+        from backend.services.plan_runtime_receipt import runtime_run_is_clean
+
+        # First-class Plan completion/recovery takes Run -> Plan locks after
+        # Capability Core.  Validate and lock the complete target-owned graph
+        # in that same order while the exact Task generation remains fenced.
+        # The helper never commits or rolls back; the final Task DELETE below
+        # is therefore the single commit point for both aggregates.
+        from backend.services.plan_deletion import (
+            PlanDeletionConflict,
+            lock_target_plan_delete_graph,
+        )
+
+        try:
+            target_plan_graph = await lock_target_plan_delete_graph(
+                self.db,
+                task_id,
+                capability_invocation_ids=capability_invocation_ids,
+                capability_execution_ids=capability_execution_ids,
+                capability_outbox_ids={
+                    outbox.id for outbox in capability_outboxes
+                },
+            )
+        except PlanDeletionConflict:
+            await self.db.rollback()
+            return False
+
+        # These rows were included in the helper's Run lock tier. Refresh the
+        # exact legacy subset without introducing a Plan -> Run lock inversion.
+        legacy_plan_runs = list(
+            (
+                await self.db.execute(
+                    select(PlanAgentRun)
+                    .where(PlanAgentRun.plan_task_id == task_id)
+                    .order_by(PlanAgentRun.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars()
+        )
+
+        target_plan_run_ids = (
+            set(target_plan_graph.run_ids)
+            if target_plan_graph is not None
+            else set()
+        )
+        legacy_only_plan_runs = [
+            run for run in legacy_plan_runs if run.id not in target_plan_run_ids
+        ]
+        legacy_only_plan_run_ids = {
+            run.id for run in legacy_only_plan_runs
+        }
+        # A migrated/first-class Run must be owned by the closed target graph;
+        # otherwise deleting only its legacy Task pointer would strand the
+        # Plan aggregate. Pure legacy Runs have no first-class Plan identity.
+        if any(run.plan_id is not None for run in legacy_only_plan_runs):
+            await self.db.rollback()
+            return False
+        if any(
+            run.status not in {"completed", "failed", "cancelled"}
+            or run.instance_id is not None
+            or run.last_execution_started_at is not None
+            or run.open_input_request_id is not None
+            or run.capability_execution_id is not None
+            for run in legacy_only_plan_runs
+        ):
+            await self.db.rollback()
+            return False
+
+        legacy_plan_steps = []
+        if legacy_only_plan_run_ids:
+            legacy_plan_steps = list(
+                (
+                    await self.db.execute(
+                        select(PlanAgentStep)
+                        .where(
+                            PlanAgentStep.run_id.in_(legacy_only_plan_run_ids)
+                        )
+                        .order_by(PlanAgentStep.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalars()
+            )
+        legacy_plan_step_ids = {step.id for step in legacy_plan_steps}
+        if any(
+            step.status not in {"completed", "failed", "cancelled"}
+            or step.plan_id is not None
+            or step.plan_version_id is not None
+            or step.input_request_id is not None
+            for step in legacy_plan_steps
+        ):
+            await self.db.rollback()
+            return False
+        legacy_plan_steps_by_id = {
+            step.id: step for step in legacy_plan_steps
+        }
+        legacy_plan_runs_by_id = {
+            run.id: run for run in legacy_only_plan_runs
+        }
+        for run in legacy_only_plan_runs:
+            if (
+                run.source_run_id is not None
+                and run.source_run_id not in legacy_only_plan_run_ids
+            ) or (
+                run.draft_step_id is not None
+                and (
+                    run.draft_step_id not in legacy_plan_step_ids
+                    or legacy_plan_steps_by_id[run.draft_step_id].run_id
+                    != run.id
+                )
+            ) or run.base_version_id is not None or run.result_version_id is not None:
+                await self.db.rollback()
+                return False
+
+        legacy_runtime_receipts = []
+        if legacy_only_plan_run_ids:
+            receipt_predicates = [
+                PlanAgentRuntimeReceipt.run_id.in_(legacy_only_plan_run_ids)
+            ]
+            if legacy_plan_step_ids:
+                receipt_predicates.append(
+                    PlanAgentRuntimeReceipt.step_id.in_(legacy_plan_step_ids)
+                )
+            legacy_runtime_receipts = list(
+                (
+                    await self.db.execute(
+                        select(PlanAgentRuntimeReceipt)
+                        .where(or_(*receipt_predicates))
+                        .order_by(PlanAgentRuntimeReceipt.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalars()
+            )
+        for receipt in legacy_runtime_receipts:
+            step = legacy_plan_steps_by_id.get(receipt.step_id)
+            run = legacy_plan_runs_by_id.get(receipt.run_id)
+            if (
+                run is None
+                or step is None
+                or step.run_id != run.id
+                or receipt.status != "cleaned"
+                or receipt.cleaned_at is None
+                or receipt.run_generation != step.generation
+            ):
+                await self.db.rollback()
+                return False
+        for run in legacy_only_plan_runs:
+            if not await runtime_run_is_clean(self.db, run_id=run.id):
+                await self.db.rollback()
+                return False
 
         # Prove both adapter tables have no reverse ownership of this Task's
         # Core aggregate.  Do not trust their denormalized developer_task_id:
@@ -798,22 +1027,6 @@ class TaskQueue:
         if linked_code_review_result_id is not None:
             await self.db.rollback()
             return False
-
-        if capability_execution_ids:
-            linked_plan_run_id = await self.db.scalar(
-                select(PlanAgentRun.id)
-                .where(
-                    PlanAgentRun.capability_execution_id.in_(
-                        capability_execution_ids
-                    )
-                )
-                .order_by(PlanAgentRun.id)
-                .with_for_update()
-                .limit(1)
-            )
-            if linked_plan_run_id is not None:
-                await self.db.rollback()
-                return False
 
         # A failed task may be the only durable identity for an unmanaged
         # process retained by startup recovery. Never delete that evidence
@@ -882,9 +1095,9 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
-        # Plan history is a first-class child of its target Task. Refuse to
-        # create dangling history; users can explicitly delete those Plans
-        # before deleting the target.
+        # Legacy Task-shaped child Plans are separate Task generations, not
+        # the first-class ``plans.target_task_id`` graph handled above. Keep
+        # their explicit parent reference fail-closed.
         related_plan_id = await self.db.scalar(
             select(Task.id)
             .where(Task.plan_target_task_id == task_id)
@@ -909,7 +1122,7 @@ class TaskQueue:
         )
         monitor_ids = {session.id for session in monitor_rows}
         if (
-            not remote_worker_deleted
+            not (remote_worker_deleted or worker_delete_preparing)
             and any(session.status == "running" for session in monitor_rows)
         ):
             await self.db.rollback()
@@ -997,12 +1210,73 @@ class TaskQueue:
                 await self.db.rollback()
                 return False
 
+        # Expose only the Plan ids from the graph locked above; API callers
+        # must not reconstruct a deletion receipt with a lock-free query. A
+        # Manager mirror also retains this Task writer fence across its
+        # authoritative Worker DELETE. Invoke either callback after every
+        # Capability/Plan/runtime preflight and before the first local DELETE.
+        delete_preflight = TaskDeletePreflight(
+            task_id=task_id,
+            plan_ids=(
+                target_plan_graph.plan_ids
+                if target_plan_graph is not None
+                else ()
+            ),
+        )
+        if worker_delete_operation_id is not None:
+            from backend.services.worker_task_termination import (
+                manager_delete_receipt_allows_finalize,
+            )
+
+            if not manager_delete_receipt_allows_finalize(
+                locked_worker_delete_receipt,
+                task,
+                operation_id=worker_delete_operation_id,
+                plan_ids=delete_preflight.plan_ids,
+            ):
+                await self.db.rollback()
+                return False
+
+        delete_confirm = (
+            remote_delete_confirm
+            or before_delete
+            or prepare_remote_worker_delete
+        )
+        if delete_confirm is not None:
+            try:
+                delete_confirmed = await delete_confirm(delete_preflight)
+            except BaseException:
+                await self.db.rollback()
+                raise
+            if not delete_confirmed:
+                await self.db.rollback()
+                return False
+        if prepare_remote_worker_delete is not None:
+            # The callback staged the active pending_remote receipt in this
+            # transaction after every local fail-closed check. Commit that
+            # durable owner with the exact locked Task/Plan identity, then
+            # return before the first local DELETE or remote mutation.
+            await self.db.commit()
+            return True
+
         # Neither task_shares nor team_task_shares can be left to database
         # cascades: SQLite may not enforce the former FK, while the latter has
         # no Task FK.  Keeping this inside the fenced delete transaction also
         # prevents future Task-id reuse from inheriting stale access.
         await purge_task_access_grants(self.db, task_id)
         await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
+        if target_plan_graph is not None:
+            from backend.services.plan_deletion import delete_target_plan_graph
+
+            try:
+                await delete_target_plan_graph(self.db, target_plan_graph)
+            except PlanDeletionConflict:
+                await self.db.rollback()
+                # The complete graph was already locked and validated before
+                # a possible remote delete. A row-count mismatch here is an
+                # internal invariant/transaction failure, not a safe business
+                # rejection after the authoritative Worker may be gone.
+                raise
         if capability_outboxes:
             # SQLite deployments commonly run without FK enforcement.  Remove
             # terminal outbox history explicitly and before its Execution /
@@ -1028,26 +1302,24 @@ class TaskQueue:
                     CapabilityInvocation.task_id == task_id
                 )
             )
-        from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
-
-        plan_run_ids = list(
-            (
-                await self.db.execute(
-                    select(PlanAgentRun.id).where(
-                        PlanAgentRun.plan_task_id == task_id
+        if legacy_runtime_receipts:
+            await self.db.execute(
+                sa_delete(PlanAgentRuntimeReceipt).where(
+                    PlanAgentRuntimeReceipt.id.in_(
+                        [receipt.id for receipt in legacy_runtime_receipts]
                     )
                 )
-            ).scalars().all()
-        )
-        if plan_run_ids:
+            )
+        if legacy_plan_step_ids:
             await self.db.execute(
                 sa_delete(PlanAgentStep).where(
-                    PlanAgentStep.run_id.in_(plan_run_ids)
+                    PlanAgentStep.id.in_(legacy_plan_step_ids)
                 )
             )
+        if legacy_only_plan_run_ids:
             await self.db.execute(
                 sa_delete(PlanAgentRun).where(
-                    PlanAgentRun.id.in_(plan_run_ids)
+                    PlanAgentRun.id.in_(legacy_only_plan_run_ids)
                 )
             )
         if monitor_ids:
@@ -1059,6 +1331,24 @@ class TaskQueue:
             await self.db.execute(
                 sa_delete(MonitorSession).where(MonitorSession.task_id == task_id)
             )
+
+        if worker_delete_operation_id is not None:
+            consumed_delete_owner = await self.db.execute(
+                sa_delete(WorkerTaskTerminationReceipt).where(
+                    WorkerTaskTerminationReceipt.operation_id
+                    == worker_delete_operation_id,
+                    WorkerTaskTerminationReceipt.task_id == task_id,
+                    WorkerTaskTerminationReceipt.active_task_id == task_id,
+                    WorkerTaskTerminationReceipt.side == "manager",
+                    WorkerTaskTerminationReceipt.operation == "delete",
+                    WorkerTaskTerminationReceipt.status == "awaiting_ack",
+                )
+            )
+            if consumed_delete_owner.rowcount != 1:
+                await self.db.rollback()
+                raise WorkerTaskTerminationConflict(
+                    "Durable Worker Task deletion owner changed before commit"
+                )
 
         # SQLite deployments do not globally enable FK enforcement, while
         # PostgreSQL/MySQL cascade this history.  Remove inactive tombstones

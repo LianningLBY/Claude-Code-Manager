@@ -88,6 +88,10 @@ async def create_capability_invocation(
         task,
         action="given ad-hoc capability invocations",
     )
+
+    async def authorize_locked_task(locked_db: AsyncSession, locked_task: Task):
+        await require_task_control(request, locked_task, locked_db)
+
     try:
         invocation, created = await create_human_invocation(
             db,
@@ -96,6 +100,7 @@ async def create_capability_invocation(
             request_payload=body.request,
             idempotency_key=body.idempotency_key,
             requested_by_user_id=get_current_user_id(request),
+            authorize_locked_task=authorize_locked_task,
         )
     except CapabilityError as exc:
         raise _http_error(exc) from exc
@@ -191,11 +196,16 @@ async def consume_capability_invocation(
         task,
         action="had capability results consumed outside its Delivery Run",
     )
+
+    async def authorize_locked_task(locked_db: AsyncSession, locked_task: Task):
+        await require_task_control(request, locked_task, locked_db)
+
     try:
         invocation = await consume_ready_invocation(
             db,
             invocation_id=invocation_id,
             expected_state_version=body.expected_state_version,
+            authorize_locked_task=authorize_locked_task,
         )
     except CapabilityError as exc:
         raise _http_error(exc) from exc
@@ -226,11 +236,16 @@ async def cancel_capability_invocation(
         task,
         action="had capabilities cancelled outside its Delivery Run",
     )
+
+    async def authorize_locked_task(locked_db: AsyncSession, locked_task: Task):
+        await require_task_control(request, locked_task, locked_db)
+
     try:
         invocation = await cancel_invocation(
             db,
             invocation_id=invocation_id,
             expected_state_version=body.expected_state_version,
+            authorize_locked_task=authorize_locked_task,
         )
     except CapabilityError as exc:
         raise _http_error(exc) from exc

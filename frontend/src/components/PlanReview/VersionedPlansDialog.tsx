@@ -10,7 +10,7 @@ import { usePlanEvents } from './usePlanEvents';
 
 type Filter = 'all' | 'input' | 'review' | 'running' | 'approved';
 interface Props { open: boolean; taskId: number; refreshGeneration?: number; selectedVersionIds: number[]; onToggleVersion: (versionId: number) => void; onAttachVersion: (versionId: number) => void; onPlansChange: (plans: PlanResource[]) => void; onClose: () => void; }
-const RUNNING = new Set(['planner', 'reviewer', 'queued', 'running']);
+const RUNNING = new Set(['planner', 'reviewer', 'queued', 'running', 'cancelling']);
 const filterPlan = (plan: PlanResource, filter: Filter) => filter === 'all' || (filter === 'input' ? plan.display_state === 'waiting_user' : filter === 'review' ? plan.display_state === 'awaiting_review' : filter === 'running' ? RUNNING.has(plan.display_state) : ['approved', 'applied'].includes(plan.display_state));
 const uploadPayload = (results: UploadResult[]) => results.length ? { file_paths: results.map((item) => item.path), image_paths: results.filter((item) => item.is_image).map((item) => item.path), attachments: results.map((item) => ({ url: item.url, name: item.filename || item.url.split('/').pop() || 'file', is_image: item.is_image })) } : {};
 

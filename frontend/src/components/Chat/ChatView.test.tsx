@@ -313,6 +313,31 @@ describe('ChatView', () => {
     }
   });
 
+  it('keeps mobile header badges and compact actions on one row', async () => {
+    render(
+      <ChatView
+        task={makeTask({ provider: 'codex', project_id: 7 })}
+        projects={[{ id: 7, name: 'A long mobile project name' } as Project]}
+        onBack={onBack}
+      />,
+    );
+
+    await screen.findByTestId('codex-main-mcp-status');
+
+    const header = screen.getByTestId('chat-header-primary');
+    expect(header.className).toContain('items-center');
+    expect(header.className).not.toContain('flex-col');
+
+    const badges = screen.getByTestId('chat-task-badges');
+    expect(badges.className).toContain('flex-nowrap');
+    expect(badges.className).toContain('overflow-hidden');
+
+    const actions = screen.getByTestId('chat-header-actions');
+    expect(actions.className).toContain('shrink-0');
+    expect(screen.getByText('Plans').className).toContain('hidden');
+    expect(screen.getByText('Plans').className).toContain('sm:inline');
+  }, 15_000);
+
   describe('chat conflict state', () => {
     it('does not show Interrupt for a non-busy 409 rejection', async () => {
       const rejection = Object.assign(

@@ -698,6 +698,86 @@ async def test_cancel_task(client):
 
 
 @pytest.mark.asyncio
+async def test_cancel_owner_cascades_to_durable_browser_child(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import (
+        TestHarnessChildBinding,
+        TestHarnessRun,
+    )
+
+    create_resp = await client.post(
+        "/api/tasks",
+        json={"title": "Owner with browser run", "description": "d"},
+    )
+    task_id = create_resp.json()["id"]
+    run_id = "a" * 32
+    async with session_factory() as db:
+        child = Task(
+            title="Isolated Browser Agent",
+            description="black-box review",
+            status="pending_activation",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+            archived=True,
+            metadata_={
+                "isolated_browser_agent": True,
+                "test_harness_run_id": run_id,
+                "test_harness_parent_task_id": task_id,
+                "browser_review_job_id": "browser-cascade-job",
+            },
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=task_id,
+                agent_task_id=child.id,
+                browser_review_job_id="browser-cascade-job",
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Review the page"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="b" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="waiting_for_agent",
+            )
+        )
+        db.add(
+            TestHarnessChildBinding(
+                id="c" * 32,
+                harness_run_id=run_id,
+                owner_task_id=task_id,
+                child_task_id=child.id,
+                browser_review_job_id="browser-cascade-job",
+                state="reserved",
+            )
+        )
+        await db.commit()
+        child_id = child.id
+
+    response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    async with session_factory() as db:
+        owner = await db.get(Task, task_id)
+        child = await db.get(Task, child_id)
+        run = await db.get(TestHarnessRun, run_id)
+        binding = await db.get(TestHarnessChildBinding, "c" * 32)
+        assert owner.status == "cancelled"
+        assert child.status == "cancelled"
+        assert run.status == "cancelled"
+        assert binding.state == "stopped"
+
+
+@pytest.mark.asyncio
 async def test_retry_task(client):
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",

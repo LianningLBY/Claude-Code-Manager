@@ -745,6 +745,20 @@ async def _runtime_lifespan(app: FastAPI):
             instance_manager.set_pty_mode(row.use_pty_mode)
     await _reset_stale_discussion_agents()
     await _cleanup_stale_sub_agents()
+    # Browser Agent Tasks are ordinary executable Tasks underneath, but their
+    # launch authority comes from a durable Harness binding. Reap interrupted
+    # bindings before any review projection is failed and, critically, before
+    # Dispatcher can claim pending work.
+    from backend.services.test_harness_children import test_harness_child_service
+
+    recovered_browser_children = (
+        await test_harness_child_service.recover_interrupted()
+    )
+    if recovered_browser_children:
+        logger.warning(
+            "Recovered %d interrupted Browser Agent child Task(s)",
+            recovered_browser_children,
+        )
     from backend.services.workspace_review import workspace_review_manager
     interrupted_workspace_reviews = (
         await workspace_review_manager.recover_interrupted_runs()

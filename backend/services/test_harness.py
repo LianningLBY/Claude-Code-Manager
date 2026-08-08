@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -164,6 +165,7 @@ class TestHarnessService:
         retention_interval: float | None = None,
         target_manager: Any | None = None,
         sandbox_manager: Any | None = None,
+        child_service: Any | None = None,
     ) -> None:
         self.db_factory = db_factory
         self.poll_interval = poll_interval
@@ -181,6 +183,13 @@ class TestHarnessService:
 
             sandbox_manager = test_harness_sandbox_manager
         self.sandbox_manager = sandbox_manager
+        if child_service is None:
+            from backend.services.test_harness_children import (
+                TestHarnessChildService,
+            )
+
+            child_service = TestHarnessChildService(db_factory=db_factory)
+        self.child_service = child_service
         self._pipelines: dict[str, asyncio.Task[None]] = {}
         self._retention_task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
@@ -610,26 +619,28 @@ class TestHarnessService:
                 f"{resolve_internal_api_base(None)}/api/tasks/{task_id}/stop-session",
                 headers=headers,
             )
-            if response.status_code not in {200, 404, 409}:
+            if response.status_code not in {200, 404}:
                 raise TestHarnessError(
-                    f"Browser Agent stop returned HTTP {response.status_code}"
+                    "Browser Agent stop was not confirmed: "
+                    f"HTTP {response.status_code} {response.text[:500]}"
                 )
 
     async def _stop_git_target_children(self, job: Any | None) -> None:
         if job is None:
             return
+        harness_run_id = getattr(job, "harness_run_id", None)
+        stopped_binding = False
+        if isinstance(harness_run_id, str) and harness_run_id:
+            stopped_binding = await self.child_service.stop_for_harness_run(
+                harness_run_id,
+                reason="Git target Harness pipeline stopped",
+            )
         task_id = getattr(job, "task_id", None)
-        if isinstance(task_id, int) and task_id > 0:
-            try:
-                await self._stop_agent_task(task_id)
-            except Exception:
-                logger.exception("Could not stop sandbox Browser Agent Task %s", task_id)
-        try:
-            from backend.services.browser_review_jobs import browser_review_job_manager
+        if not stopped_binding and isinstance(task_id, int) and task_id > 0:
+            await self._stop_agent_task(task_id)
+        from backend.services.browser_review_jobs import browser_review_job_manager
 
-            await browser_review_job_manager.cancel(job.id)
-        except Exception:
-            logger.exception("Could not cancel sandbox Browser job %s", job.id)
+        await browser_review_job_manager.cancel(job.id)
 
     async def _cleanup_git_target(self, run_id: str) -> str | None:
         try:
@@ -960,6 +971,7 @@ class TestHarnessService:
             max_actions=int(runtime["max_actions"]),
         )
         job = None
+        child_binding_id: str | None = None
         try:
             if inline:
                 job = await browser_review_job_manager.prepare_task_tool(
@@ -976,43 +988,47 @@ class TestHarnessService:
                     codex_service_tier=str(runtime["codex_service_tier"]),
                     harness_run_id=run_id,
                 )
-                from backend.services.task_queue import TaskQueue
                 from backend.services.workspace_review import _browser_agent_prompt
 
-                async with self.db_factory() as db:
-                    child = await TaskQueue(db).create(
-                        title=f"Frontend Test Harness: Task {task.id}"[:200],
-                        description=_browser_agent_prompt(
+                child, binding = await self.child_service.reserve_child(
+                    owner_task_id=task.id,
+                    browser_review_job_id=job.id,
+                    harness_run_id=run_id,
+                    child_values={
+                        "title": f"Frontend Test Harness: Task {task.id}"[:200],
+                        "description": _browser_agent_prompt(
                             job.id,
                             job.options,
                             profile=str(runtime.get("profile") or "standard"),
                             test_plan=run.test_plan,
                             target_context=_git_browser_target_context(run),
                         ),
-                        status="pending",
-                        priority=0,
-                        max_retries=0,
-                        mode="auto",
-                        provider=str(runtime["provider"]),
-                        model=str(runtime["model"]),
-                        codex_service_tier=str(runtime["codex_service_tier"]),
-                        effort_level=str(runtime["reasoning_effort"]),
-                        timeout_hours=1.0,
-                        enabled_skills={"browser-review": job.id},
-                        metadata_={
-                            "browser_review_job_id": job.id,
-                            "test_harness_run_id": run_id,
-                            "test_harness_parent_task_id": task.id,
-                            "isolated_browser_agent": True,
-                        },
-                        created_by=created_by,
-                        archived=True,
-                    )
+                        "priority": 0,
+                        "max_retries": 0,
+                        "mode": "auto",
+                        "provider": str(runtime["provider"]),
+                        "model": str(runtime["model"]),
+                        "codex_service_tier": str(runtime["codex_service_tier"]),
+                        "effort_level": str(runtime["reasoning_effort"]),
+                        "timeout_hours": 1.0,
+                        "enabled_skills": {"browser-review": job.id},
+                        "created_by": created_by,
+                        "archived": True,
+                    },
+                )
+                child_binding_id = binding.id
                 await browser_review_job_manager.attach_task(
                     job.id,
                     child.id,
                     owner_task_id=task.id,
                 )
+            await self.attach_browser_job(
+                run_id=run_id,
+                job=job,
+                watch_terminal=watch_terminal,
+            )
+            if child_binding_id is not None:
+                await self.child_service.activate(child_binding_id)
                 try:
                     from backend.main import dispatcher
 
@@ -1020,15 +1036,21 @@ class TestHarnessService:
                         dispatcher.wake()
                 except Exception:
                     logger.exception("Could not wake dispatcher for harness browser agent")
-            await self.attach_browser_job(
-                run_id=run_id,
-                job=job,
-                watch_terminal=watch_terminal,
-            )
             return job
         except BaseException as exc:
             if job is not None:
                 await browser_review_job_manager.fail_start(job.id, exc)
+            if child_binding_id is not None:
+                try:
+                    await self.child_service.stop_binding(
+                        child_binding_id,
+                        reason=f"Browser Agent attach failed: {_safe_error(exc)}",
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Could not roll back Browser child binding %s",
+                        child_binding_id,
+                    )
             if fail_run_on_error:
                 await self._fail_start(run_id, exc)
             raise
@@ -1461,17 +1483,19 @@ class TestHarnessService:
 
             await workspace_review_manager.cancel(run.workspace_review_run_id)
         else:
-            if run.agent_task_id is not None:
-                try:
-                    if stop_agent_task is not None:
-                        await stop_agent_task(run.agent_task_id)
-                    else:
-                        await self._stop_agent_task(run.agent_task_id)
-                except Exception:
-                    logger.exception(
-                        "Could not stop Harness Browser Agent Task %s",
-                        run.agent_task_id,
-                    )
+            stopped_binding = await self.child_service.stop_for_harness_run(
+                run_id,
+                reason="Harness run was cancelled",
+            )
+            if (
+                not stopped_binding
+                and run.agent_task_id is not None
+                and run.agent_task_id != run.task_id
+            ):
+                if stop_agent_task is not None:
+                    await stop_agent_task(run.agent_task_id)
+                else:
+                    await self._stop_agent_task(run.agent_task_id)
             if run.browser_review_job_id:
                 from backend.services.browser_review_jobs import browser_review_job_manager
 
@@ -1484,6 +1508,43 @@ class TestHarnessService:
         if current is not None and current.status not in HARNESS_TERMINAL_STATUSES:
             await self._mark_cancelled(run_id)
         return await self.get_run_model(run_id)
+
+    async def cancel_for_task(self, task_id: int, *, reason: str) -> int:
+        """Cascade an explicit owner stop/delete to all active Harness runs."""
+
+        async with self._lock:
+            return await self._cancel_for_task_unlocked(task_id, reason=reason)
+
+    @asynccontextmanager
+    async def owner_stop_fence(self, task_id: int, *, reason: str):
+        """Prevent a new run from racing an explicit owner terminalization."""
+
+        async with self._lock:
+            await self._cancel_for_task_unlocked(task_id, reason=reason)
+            yield
+
+    async def _cancel_for_task_unlocked(self, task_id: int, *, reason: str) -> int:
+        """Cancel owner runs while the global run-admission lock is held."""
+
+        async with self.db_factory() as db:
+            run_ids = list(
+                (
+                    await db.execute(
+                        select(TestHarnessRun.id)
+                        .where(
+                            TestHarnessRun.task_id == task_id,
+                            TestHarnessRun.status.not_in(HARNESS_TERMINAL_STATUSES),
+                        )
+                        .order_by(TestHarnessRun.created_at.desc())
+                    )
+                ).scalars()
+            )
+        for run_id in run_ids:
+            await self.cancel(run_id)
+        # A legacy/incomplete row may own a durable child before its Harness
+        # status was persisted. Stop any remaining binding as a second fence.
+        await self.child_service.stop_for_owner(task_id, reason=reason)
+        return len(run_ids)
 
     async def get_run_model(self, run_id: str) -> TestHarnessRun | None:
         async with self.db_factory() as db:

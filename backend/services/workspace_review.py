@@ -29,7 +29,6 @@ from urllib.parse import urlsplit
 import httpx
 from sqlalchemy import select
 
-from backend.config import settings
 from backend.database import async_session
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
@@ -37,7 +36,7 @@ from backend.models.task import Task
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.process_safety import require_safe_process_group_id
-from backend.services.task_queue import TaskQueue
+from backend.services.test_harness_children import TestHarnessChildService
 from backend.services.test_harness_runtime import resolve_harness_runtime
 
 
@@ -1021,8 +1020,15 @@ be a number from 0 to 1 (for example 0.9), or omitted; never use high/medium/low
 class WorkspaceReviewManager:
     """Durable pipeline joining Task worktrees, previews, and browser agents."""
 
-    def __init__(self, preview_manager: WorkspacePreviewManager | None = None) -> None:
+    def __init__(
+        self,
+        preview_manager: WorkspacePreviewManager | None = None,
+        child_service: TestHarnessChildService | None = None,
+    ) -> None:
         self.preview_manager = preview_manager or WorkspacePreviewManager()
+        self.child_service = child_service or TestHarnessChildService(
+            db_factory=async_session
+        )
         self._pipelines: dict[str, asyncio.Task[None]] = {}
         self._lock = asyncio.Lock()
 
@@ -1153,6 +1159,7 @@ class WorkspaceReviewManager:
     ) -> None:
         handle: PreviewHandle | None = None
         job_id: str | None = None
+        child_binding_id: str | None = None
         try:
             await self._update(
                 run_id,
@@ -1217,41 +1224,40 @@ class WorkspaceReviewManager:
                 harness_run_id=run.harness_run_id,
             )
             job_id = job.id
-            async with async_session() as db:
-                child = await TaskQueue(db).create(
-                    title=f"Workspace Browser Review: Task {parent.id}"[:200],
-                    description=_browser_agent_prompt(
+            child, binding = await self.child_service.reserve_child(
+                owner_task_id=parent.id,
+                browser_review_job_id=job.id,
+                harness_run_id=run.harness_run_id,
+                workspace_review_run_id=run_id,
+                child_values={
+                    "title": f"Workspace Browser Review: Task {parent.id}"[:200],
+                    "description": _browser_agent_prompt(
                         job.id,
                         job.options,
                         profile=run.profile,
                         test_plan=test_plan,
                     ),
-                    status="pending",
-                    priority=0,
-                    max_retries=0,
-                    mode="auto",
-                    target_repo=str(handle.temp_dir),
-                    provider=provider,
-                    model=model,
-                    codex_service_tier=tier,
-                    effort_level=effort,
-                    timeout_hours=1.0,
-                    enabled_skills={"browser-review": job.id},
-                    metadata_={
-                        "browser_review_job_id": job.id,
-                        "workspace_review_run_id": run_id,
-                        "workspace_review_parent_task_id": parent.id,
-                        "test_harness_run_id": run.harness_run_id,
-                        "isolated_browser_agent": True,
-                    },
-                    created_by=created_by,
-                    archived=True,
-                )
+                    "priority": 0,
+                    "max_retries": 0,
+                    "mode": "auto",
+                    "target_repo": str(handle.temp_dir),
+                    "provider": provider,
+                    "model": model,
+                    "codex_service_tier": tier,
+                    "effort_level": effort,
+                    "timeout_hours": 1.0,
+                    "enabled_skills": {"browser-review": job.id},
+                    "created_by": created_by,
+                    "archived": True,
+                },
+            )
+            child_binding_id = binding.id
             await browser_review_job_manager.attach_task(
                 job.id,
                 child.id,
                 owner_task_id=parent.id,
             )
+            await self.child_service.activate(binding.id)
             await self._update(
                 run_id,
                 agent_task_id=child.id,
@@ -1306,6 +1312,19 @@ class WorkspaceReviewManager:
                     report=report,
                 )
         except asyncio.CancelledError:
+            if child_binding_id:
+                await asyncio.shield(
+                    self.child_service.stop_binding(
+                        child_binding_id,
+                        reason="Workspace review pipeline was cancelled",
+                    )
+                )
+            elif job_id:
+                from backend.services.browser_review_jobs import (
+                    browser_review_job_manager,
+                )
+
+                await asyncio.shield(browser_review_job_manager.cancel(job_id))
             await self._update(
                 run_id,
                 status="cancelled",
@@ -1315,6 +1334,17 @@ class WorkspaceReviewManager:
             raise
         except Exception as exc:
             logger.exception("Workspace review pipeline failed run=%s", run_id)
+            if child_binding_id:
+                try:
+                    await self.child_service.stop_binding(
+                        child_binding_id,
+                        reason=f"Workspace review pipeline failed: {exc}",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Could not stop workspace Browser child binding %s",
+                        child_binding_id,
+                    )
             await self._update(
                 run_id,
                 status="failed",
@@ -1443,25 +1473,12 @@ class WorkspaceReviewManager:
                 return run
             run.status = "cancelling"
             run.stage = "cancelling"
-            agent_task_id = run.agent_task_id
             await db.commit()
         pipeline = self._pipelines.get(run_id)
-        if agent_task_id is not None:
-            try:
-                from backend.services.internal_api_endpoint import resolve_internal_api_base
-
-                headers = (
-                    {"Authorization": f"Bearer {settings.auth_token}"}
-                    if settings.auth_token
-                    else {}
-                )
-                async with httpx.AsyncClient(timeout=30) as client:
-                    await client.post(
-                        f"{resolve_internal_api_base(None)}/api/tasks/{agent_task_id}/stop-session",
-                        headers=headers,
-                    )
-            except Exception:
-                logger.exception("Could not stop workspace Browser Agent Task %s", agent_task_id)
+        await self.child_service.stop_for_workspace_run(
+            run_id,
+            reason="Workspace review was cancelled",
+        )
         if pipeline is not None and not pipeline.done():
             pipeline.cancel()
             await asyncio.gather(pipeline, return_exceptions=True)

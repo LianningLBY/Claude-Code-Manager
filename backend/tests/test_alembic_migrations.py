@@ -49,7 +49,8 @@ PLAN_MAIN_MERGE_REVISION = "e5b8d1c4a7f2"
 BROWSER_PLAN_MERGE_REVISION = "9f2c6b4d8a10"
 SANDBOX_LEASE_REVISION = "c8f1a2d4e6b9"
 RESOLVED_TARGET_REVISION = "d9a2b4c6e8f1"
-CURRENT_HEAD_REVISION = RESOLVED_TARGET_REVISION
+CHILD_BINDING_REVISION = "e0b3c5d7f9a1"
+CURRENT_HEAD_REVISION = CHILD_BINDING_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -440,7 +441,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "workspace_review_runs", "test_harness_runs", "test_harness_attempts", "test_harness_events", "test_harness_evidence", "test_harness_findings", "test_harness_sandbox_leases"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "workspace_review_runs", "test_harness_runs", "test_harness_attempts", "test_harness_events", "test_harness_evidence", "test_harness_findings", "test_harness_sandbox_leases", "test_harness_child_bindings"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -453,6 +454,18 @@ class TestFreshMigration:
         assert "plan_context_snapshot" in task_cols
         assert "plan_applied_log_id" in task_cols
         assert "attention_tag" in task_cols
+
+        child_binding_cols = _get_table_columns(
+            engine, "test_harness_child_bindings"
+        )
+        assert {
+            "harness_run_id",
+            "workspace_review_run_id",
+            "owner_task_id",
+            "child_task_id",
+            "browser_review_job_id",
+            "state",
+        }.issubset(child_binding_cols)
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols

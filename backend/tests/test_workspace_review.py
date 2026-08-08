@@ -319,13 +319,30 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
 
     created_child: dict = {}
 
-    class FakeTaskQueue:
-        def __init__(self, _db):
-            pass
+    class FakeChildService:
+        async def reserve_child(
+            self,
+            *,
+            owner_task_id,
+            browser_review_job_id,
+            child_values,
+            harness_run_id=None,
+            workspace_review_run_id=None,
+        ):
+            assert owner_task_id == parent_id
+            assert browser_review_job_id == "browser-job-1"
+            created_child.update(child_values)
+            created_child["metadata_"] = {
+                "browser_review_job_id": browser_review_job_id,
+                "workspace_review_run_id": workspace_review_run_id,
+                "workspace_review_parent_task_id": owner_task_id,
+                "test_harness_run_id": harness_run_id,
+                "isolated_browser_agent": True,
+            }
+            return SimpleNamespace(id=918), SimpleNamespace(id="binding-1")
 
-        async def create(self, **kwargs):
-            created_child.update(kwargs)
-            return SimpleNamespace(id=918)
+        async def activate(self, binding_id):
+            assert binding_id == "binding-1"
 
     browser_job = SimpleNamespace(
         id="browser-job-1",
@@ -362,9 +379,11 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
         "browser_review_job_manager",
         FakeBrowserManager(),
     )
-    monkeypatch.setattr(workspace_review_module, "TaskQueue", FakeTaskQueue)
     preview_manager = FakePreviewManager()
-    manager = WorkspaceReviewManager(preview_manager=preview_manager)
+    manager = WorkspaceReviewManager(
+        preview_manager=preview_manager,
+        child_service=FakeChildService(),
+    )
     manager._publish_parent_report = AsyncMock()
 
     run = await manager.start(

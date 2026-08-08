@@ -45,6 +45,7 @@ from backend.models.user_group import UserGroup, UserGroupMember  # noqa: F401
 from backend.models.workspace_review import WorkspaceReviewRun  # noqa: F401
 from backend.models.test_harness import (  # noqa: F401
     TestHarnessAttempt,
+    TestHarnessChildBinding,
     TestHarnessEvent,
     TestHarnessEvidence,
     TestHarnessFinding,

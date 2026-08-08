@@ -12,6 +12,7 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.test_harness import (
     TestHarnessAttempt as AttemptModel,
+    TestHarnessChildBinding as ChildBindingModel,
     TestHarnessEvidence as EvidenceModel,
     TestHarnessRun as RunModel,
 )
@@ -34,6 +35,11 @@ from backend.services.test_harness_sandbox import (
     SandboxSourceSnapshot,
 )
 from backend.services.test_harness_targets import PreparedGitTarget
+from backend.services.test_harness_children import (
+    CHILD_READY,
+    CHILD_STOPPED,
+    TestHarnessChildService as ChildService,
+)
 from backend.services import test_harness as harness_module
 
 
@@ -148,6 +154,209 @@ def _completed_job(tmp_path, *, title: str, severity: str = "high") -> BrowserRe
         started_at=now,
         completed_at=now,
     )
+
+
+def _child_stopper(db_factory):
+    async def stop(task_id: int) -> None:
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            if task is not None and task.status not in {
+                "completed",
+                "failed",
+                "cancelled",
+                "conflict",
+            }:
+                task.status = "cancelled"
+                task.completed_at = datetime.utcnow()
+                await db.commit()
+
+    return stop
+
+
+@pytest.mark.asyncio
+async def test_isolated_browser_attach_opens_launch_gate_only_after_job_binding(
+    monkeypatch,
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    child_service = ChildService(
+        db_factory=db_factory,
+        task_stopper=_child_stopper(db_factory),
+    )
+    service = HarnessService(
+        db_factory=db_factory,
+        child_service=child_service,
+        artifact_store=ArtifactStore(tmp_path / "archive", retention_days=1),
+    )
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Verify the public page",
+        ),
+    )
+    observed_status_at_attach: list[str] = []
+
+    class BrowserManager:
+        def __init__(self):
+            self.job: BrowserReviewJob | None = None
+
+        async def prepare_agent(self, options, **kwargs):
+            self.job = BrowserReviewJob(
+                id="job-durable-attach",
+                options=options,
+                capture_only=False,
+                provider=kwargs["provider"],
+                codex_service_tier=kwargs["codex_service_tier"],
+                harness_run_id=kwargs["harness_run_id"],
+                created_at=datetime.utcnow().isoformat(),
+            )
+            return self.job
+
+        async def attach_task(self, job_id, child_id, *, owner_task_id=None):
+            assert self.job is not None and job_id == self.job.id
+            async with db_factory() as db:
+                child = await db.get(Task, child_id)
+                observed_status_at_attach.append(child.status)
+            self.job.task_id = child_id
+            self.job.owner_task_id = owner_task_id
+            self.job.stage = "waiting_for_agent"
+            return self.job
+
+        async def fail_start(self, _job_id, exc):
+            assert self.job is not None
+            self.job.status = "failed"
+            self.job.error = str(exc)
+
+        async def mark_cancelling(self, _job_id):
+            return self.job
+
+        async def cancel(self, _job_id):
+            assert self.job is not None
+            self.job.status = "cancelled"
+            return self.job
+
+    manager = BrowserManager()
+    from backend.services import browser_review_jobs
+
+    monkeypatch.setattr(browser_review_jobs, "browser_review_job_manager", manager)
+
+    job = await service._start_browser_for_url(
+        run=run,
+        url="https://example.com",
+        network_policy="external_public",
+        inline=False,
+        watch_terminal=False,
+        fail_run_on_error=True,
+    )
+
+    assert observed_status_at_attach == ["pending_activation"]
+    async with db_factory() as db:
+        child = await db.get(Task, job.task_id)
+        binding = await db.scalar(
+            select(ChildBindingModel).where(
+                ChildBindingModel.harness_run_id == run.id
+            )
+        )
+        assert child.status == "pending"
+        assert binding is not None
+        assert binding.state == CHILD_READY
+        assert binding.child_task_id == child.id
+
+    await service.cancel(run.id)
+    async with db_factory() as db:
+        binding = await db.scalar(
+            select(ChildBindingModel).where(
+                ChildBindingModel.harness_run_id == run.id
+            )
+        )
+        child = await db.get(Task, binding.child_task_id)
+        assert binding.state == CHILD_STOPPED
+        assert child.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_isolated_browser_attach_failure_rolls_back_reserved_child(
+    monkeypatch,
+    db_factory,
+    tmp_path,
+):
+    task_id = await _task(db_factory)
+    child_service = ChildService(
+        db_factory=db_factory,
+        task_stopper=_child_stopper(db_factory),
+    )
+    service = HarnessService(
+        db_factory=db_factory,
+        child_service=child_service,
+        artifact_store=ArtifactStore(tmp_path / "archive", retention_days=1),
+    )
+    run = await service.start_task_run(
+        task_id=task_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="Verify attach rollback",
+        ),
+    )
+
+    class BrowserManager:
+        def __init__(self):
+            self.job: BrowserReviewJob | None = None
+
+        async def prepare_agent(self, options, **kwargs):
+            self.job = BrowserReviewJob(
+                id="job-attach-failure",
+                options=options,
+                capture_only=False,
+                provider=kwargs["provider"],
+                codex_service_tier=kwargs["codex_service_tier"],
+                harness_run_id=kwargs["harness_run_id"],
+                created_at=datetime.utcnow().isoformat(),
+            )
+            return self.job
+
+        async def attach_task(self, *_args, **_kwargs):
+            raise RuntimeError("watcher attach failed")
+
+        async def fail_start(self, _job_id, exc):
+            assert self.job is not None
+            self.job.status = "failed"
+            self.job.error = str(exc)
+
+        async def mark_cancelling(self, _job_id):
+            return self.job
+
+        async def cancel(self, _job_id):
+            return self.job
+
+    manager = BrowserManager()
+    from backend.services import browser_review_jobs
+
+    monkeypatch.setattr(browser_review_jobs, "browser_review_job_manager", manager)
+
+    with pytest.raises(RuntimeError, match="watcher attach failed"):
+        await service._start_browser_for_url(
+            run=run,
+            url="https://example.com",
+            network_policy="external_public",
+            inline=False,
+            watch_terminal=False,
+            fail_run_on_error=True,
+        )
+
+    async with db_factory() as db:
+        binding = await db.scalar(
+            select(ChildBindingModel).where(
+                ChildBindingModel.harness_run_id == run.id
+            )
+        )
+        assert binding is not None
+        child = await db.get(Task, binding.child_task_id)
+        assert binding.state == CHILD_STOPPED
+        assert child.status == "cancelled"
 
 
 @pytest.mark.asyncio

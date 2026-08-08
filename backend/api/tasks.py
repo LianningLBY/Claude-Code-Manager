@@ -2816,36 +2816,46 @@ async def delete_task(
             worker_proxy.relay.unsubscribe_task(worker_id, task_id)
         return {"ok": True}
 
-    lifecycle_ids = set(
-        (
-            await db.execute(
-                select(Instance.id).where(Instance.current_task_id == task_id)
-            )
+    if not is_task_status_deletable(mode=task.mode, status=task.status):
+        raise HTTPException(
+            400, "Cannot delete task (not found or not in deletable state)"
         )
-        .scalars()
-        .all()
-    )
-    if task is not None and task.instance_id is not None:
-        task_side_instance = await db.get(Instance, task.instance_id)
-        if task_side_instance is not None and task_side_instance.current_task_id in (
-            None,
-            task_id,
-        ):
-            lifecycle_ids.add(task.instance_id)
-    # Do not wait on a lifecycle lock while retaining a read transaction:
-    # launch holds that lock while committing Task/Instance metadata.
-    await db.rollback()
+    from backend.services.test_harness import test_harness_service
 
-    # Serialize deletion with the complete launch/spawn/persist window. A
-    # terminal Task can otherwise disappear just before a child is registered;
-    # the launch would eventually abort, but shutdown in that gap would have no
-    # durable Task evidence.
-    async with AsyncExitStack() as stack:
-        for instance_id in sorted(lifecycle_ids):
-            await stack.enter_async_context(
-                instance_manager._instance_lifecycle_lock(instance_id)
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task was deleted",
+    ):
+        lifecycle_ids = set(
+            (
+                await db.execute(
+                    select(Instance.id).where(Instance.current_task_id == task_id)
+                )
             )
-        ok = await queue.delete(task_id)
+            .scalars()
+            .all()
+        )
+        if task is not None and task.instance_id is not None:
+            task_side_instance = await db.get(Instance, task.instance_id)
+            if task_side_instance is not None and task_side_instance.current_task_id in (
+                None,
+                task_id,
+            ):
+                lifecycle_ids.add(task.instance_id)
+        # Do not wait on a lifecycle lock while retaining a read transaction:
+        # launch holds that lock while committing Task/Instance metadata.
+        await db.rollback()
+
+        # Serialize deletion with the complete launch/spawn/persist window. A
+        # terminal Task can otherwise disappear just before a child is registered;
+        # the launch would eventually abort, but shutdown in that gap would have no
+        # durable Task evidence.
+        async with AsyncExitStack() as stack:
+            for instance_id in sorted(lifecycle_ids):
+                await stack.enter_async_context(
+                    instance_manager._instance_lifecycle_lock(instance_id)
+                )
+            ok = await queue.delete(task_id)
     if not ok:
         raise HTTPException(
             400, "Cannot delete task (not found or not in deletable state)"
@@ -3074,12 +3084,17 @@ async def _stop_task_session_local_impl(
     """Keep message admission closed until the stopped generation is final."""
 
     from backend.main import dispatcher
+    from backend.services.test_harness import test_harness_service
 
-    async with dispatcher.task_queue_cancellation_lease(task_id):
-        return await _stop_task_session_local_under_cancellation_lease(
-            task_id,
-            db,
-        )
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task session was stopped",
+    ):
+        async with dispatcher.task_queue_cancellation_lease(task_id):
+            return await _stop_task_session_local_under_cancellation_lease(
+                task_id,
+                db,
+            )
 
 
 async def _stop_task_session_local_under_cancellation_lease(
@@ -3600,9 +3615,14 @@ async def _cancel_local_task_impl(
     """Keep message admission closed until cancellation is authoritative."""
 
     from backend.main import dispatcher
+    from backend.services.test_harness import test_harness_service
 
-    async with dispatcher.task_queue_cancellation_lease(task_id):
-        return await _cancel_local_task_under_cancellation_lease(task_id, db)
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task was cancelled",
+    ):
+        async with dispatcher.task_queue_cancellation_lease(task_id):
+            return await _cancel_local_task_under_cancellation_lease(task_id, db)
 
 
 async def _cancel_local_task_under_cancellation_lease(
@@ -3675,6 +3695,7 @@ async def _cancel_local_task_under_cancellation_lease(
         )
     ).scalar_one_or_none()
     active_statuses = (
+        "pending_activation",
         "pending",
         "in_progress",
         "executing",

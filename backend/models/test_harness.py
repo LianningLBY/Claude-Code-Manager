@@ -6,6 +6,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     Integer,
@@ -191,4 +192,43 @@ class TestHarnessSandboxLease(Base):
     cleanup_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class TestHarnessChildBinding(Base):
+    """Durable ownership and launch gate for one isolated Browser Agent Task."""
+
+    __tablename__ = "test_harness_child_bindings"
+    __table_args__ = (
+        CheckConstraint(
+            "harness_run_id IS NOT NULL OR workspace_review_run_id IS NOT NULL",
+            name="ck_test_harness_child_binding_owner",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    harness_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, unique=True, index=True
+    )
+    workspace_review_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, unique=True, index=True
+    )
+    owner_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    child_task_id: Mapped[int] = mapped_column(
+        Integer, nullable=False, unique=True, index=True
+    )
+    browser_review_job_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, unique=True, index=True
+    )
+    state: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="reserved", index=True
+    )
+    claimed_retry_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claimed_instance_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

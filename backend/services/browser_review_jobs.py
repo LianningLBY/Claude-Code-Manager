@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import json
+import logging
 import re
 import stat
 import uuid
@@ -30,6 +31,9 @@ from backend.services.test_harness_artifacts import (
     TestHarnessArtifactStore,
     test_harness_artifact_store,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 _ARTIFACT_NAME_RE = re.compile(
@@ -606,6 +610,24 @@ class BrowserReviewJobManager:
                             or f"Browser Review Task ended with status {status}"
                         )
                     job.completed_at = _now()
+                    try:
+                        from backend.services.test_harness_children import (
+                            test_harness_child_service,
+                        )
+
+                        await test_harness_child_service.mark_terminal_by_child(
+                            job.task_id,
+                            task_status=status,
+                            error=job.error,
+                        )
+                    except Exception:
+                        # The Task itself is already terminal. Startup recovery
+                        # will reconcile the durable binding if this auxiliary
+                        # projection cannot be committed right now.
+                        logger.exception(
+                            "Could not finalize Browser child binding for Task %s",
+                            job.task_id,
+                        )
                     return
                 await asyncio.sleep(self._poll_interval)
         except asyncio.CancelledError:

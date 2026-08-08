@@ -894,10 +894,25 @@ describe('UpdateButton', () => {
       expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
       const notice = screen.getByTestId('update-available-notice');
       expect(notice.className).toContain('pointer-events-none');
+      expect(notice.className).toContain('top-[calc(env(safe-area-inset-top)+0.75rem)]');
       expect(screen.getByText('发现可用更新')).toBeInTheDocument();
       expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
       expect(findModalOverlay()).toBeNull();
     });
+
+    it('keeps mobile notice actions large enough to tap', async () => {
+      vi.useFakeTimers();
+      render(<UpdateButton />);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1_000);
+      });
+
+      expect(screen.getByRole('button', { name: '查看详情' }).className).toContain('min-h-11');
+      const closeButton = screen.getByRole('button', { name: '关闭更新提醒' });
+      expect(closeButton.className).toContain('h-11');
+      expect(closeButton.className).toContain('w-11');
+    }, 15_000);
 
     it('opens the existing update modal only after the user clicks view details', async () => {
       vi.useFakeTimers();

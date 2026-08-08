@@ -2265,49 +2265,60 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       {/* Header — two rows */}
       <div className="px-3 sm:px-4 py-1.5 pt-[max(0.375rem,env(safe-area-inset-top))] border-b border-gray-800 bg-gray-900">
         {/* Row 1: back + task info + action buttons */}
-        <div className="flex items-center gap-2 sm:gap-3">
-          <button onClick={onBack} className="text-gray-400 hover:text-foreground shrink-0">
-            <ArrowLeft size={20} />
-          </button>
-          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-            <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
-            {task.mode === 'plan' ? (
-              <PlanPipelineBadge task={task} />
-            ) : (
-              <>
-                <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-                  {providerLabel}
+        <div
+          data-testid="chat-header-primary"
+          className="flex items-center gap-2 sm:gap-3"
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+            <button onClick={onBack} className="shrink-0 text-gray-400 hover:text-foreground">
+              <ArrowLeft size={20} />
+            </button>
+            <div
+              data-testid="chat-task-badges"
+              className="flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-hidden"
+            >
+              <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
+              {task.mode === 'plan' ? (
+                <PlanPipelineBadge task={task} />
+              ) : (
+                <>
+                  <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                    {providerLabel}
+                  </span>
+                  <FastModeBadge task={task} />
+                </>
+              )}
+              {backgroundActive && (
+                <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
+                  后台运行中
                 </span>
-                <FastModeBadge task={task} />
-              </>
-            )}
-            {backgroundActive && (
-              <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
-                后台运行中
-              </span>
-            )}
-            {!deliveryReadOnly && task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
-              <span
-                data-testid="codex-main-mcp-status"
-                className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
-                  codexMainMcpEnabled
-                    ? 'bg-teal-600/25 text-teal-300'
-                    : 'bg-gray-700 text-gray-400'
-                }`}
-                title={
-                  codexMainMcpEnabled
-                    ? 'Codex 主任务 MCP 已启用'
-                    : 'Codex 主任务 MCP 已关闭'
-                }
-              >
-                MCP {codexMainMcpEnabled ? '已启用' : '已关闭'}
-              </span>
-            )}
-            {projectName && (
-              <span className="text-xs bg-emerald-600/30 text-emerald-300 px-1.5 rounded font-medium whitespace-nowrap truncate">{projectName}</span>
-            )}
+              )}
+              {!deliveryReadOnly && task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
+                <span
+                  data-testid="codex-main-mcp-status"
+                  className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
+                    codexMainMcpEnabled
+                      ? 'bg-teal-600/25 text-teal-300'
+                      : 'bg-gray-700 text-gray-400'
+                  }`}
+                  title={
+                    codexMainMcpEnabled
+                      ? 'Codex 主任务 MCP 已启用'
+                      : 'Codex 主任务 MCP 已关闭'
+                  }
+                >
+                  MCP <span className="hidden sm:inline">{codexMainMcpEnabled ? '已启用' : '已关闭'}</span>
+                </span>
+              )}
+              {projectName && (
+                <span className="min-w-0 flex-1 truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300">{projectName}</span>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div
+            data-testid="chat-header-actions"
+            className="flex shrink-0 items-center gap-0.5 sm:gap-1"
+          >
             <SubAgentIndicator
               taskId={task.id}
               count={monitorCount}
@@ -2317,7 +2328,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             {!deliveryReadOnly && task.session_id && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
-                className={`flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
+                className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs font-medium transition-colors sm:px-2 ${
                   plansOpen
                     ? 'bg-indigo-500/15 text-indigo-300'
                     : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'
@@ -2326,7 +2337,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 aria-label="Plans"
               >
                 <ListTodo size={16} />
-                <span>Plans</span>
+                <span className="hidden sm:inline">Plans</span>
                 {planAttentionCount > 0 && (
                   <span className="min-w-4 rounded-full bg-indigo-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
                     {planAttentionCount}
@@ -2394,7 +2405,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   finally { setInterrupting(false); }
                 }}
                 disabled={interrupting}
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded hover:bg-red-500/10 disabled:opacity-50"
+                className="flex items-center gap-1 px-1.5 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded hover:bg-red-500/10 disabled:opacity-50 sm:px-2.5"
                 title="Interrupt session"
               >
                 <StopCircle size={14} />

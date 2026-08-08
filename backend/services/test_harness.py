@@ -29,6 +29,7 @@ from backend.models.test_harness import (
 )
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.test_harness_contracts import (
+    DEFAULT_BROWSER_CHANNEL,
     HARNESS_TERMINAL_STATUSES,
     TestHarnessContractError,
     TestHarnessSpec,
@@ -2114,7 +2115,10 @@ class TestHarnessService:
             goal=str(source.test_plan.get("objective") or "Repeat frontend test"),
             profile=runtime.get("profile", "standard"),
             allow_actions=bool(runtime.get("allow_actions", True)),
-            browser_channel=runtime.get("browser_channel", "chrome"),
+            browser_channel=runtime.get(
+                "browser_channel",
+                DEFAULT_BROWSER_CHANNEL,
+            ),
             viewport_width=int(runtime.get("viewport_width", 1440)),
             viewport_height=int(runtime.get("viewport_height", 900)),
             max_steps=int(runtime.get("max_steps", 20)),

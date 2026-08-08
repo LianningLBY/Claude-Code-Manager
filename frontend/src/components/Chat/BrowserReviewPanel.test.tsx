@@ -499,7 +499,8 @@ describe('BrowserReviewPanel', () => {
     });
     fireEvent.change(screen.getByLabelText('测试深度'), { target: { value: 'exhaustive' } });
     fireEvent.change(screen.getByLabelText('视口'), { target: { value: '390x844' } });
-    fireEvent.change(screen.getByLabelText('浏览器'), { target: { value: 'chromium' } });
+    expect(screen.getByLabelText('浏览器')).toHaveValue('chromium');
+    expect(screen.getByRole('option', { name: '系统 Chrome' })).toBeInTheDocument();
     fireEvent.click(screen.getByRole('checkbox', { name: /允许安全的点击和输入/ }));
     fireEvent.click(screen.getByRole('button', { name: '开始网站测试' }));
 

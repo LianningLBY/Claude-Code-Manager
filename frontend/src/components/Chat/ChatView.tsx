@@ -18,6 +18,7 @@ import type {
   UploadResult,
   WorkspaceReviewCapabilities,
 } from '../../api/client';
+import { DEFAULT_BROWSER_CHANNEL } from '../../config/browserReview';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
 import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw } from '../icons';
@@ -2115,7 +2116,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           goal: text,
           profile: 'standard',
           allow_actions: true,
-          browser_channel: 'chrome',
+          browser_channel: DEFAULT_BROWSER_CHANNEL,
           viewport_width: 1440,
           viewport_height: 900,
         });

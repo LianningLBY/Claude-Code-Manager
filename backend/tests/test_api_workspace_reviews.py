@@ -155,7 +155,6 @@ async def test_workspace_review_api_confirms_preview_then_starts_one_shot(
             "goal": "Verify the settings flow without modifying code",
             "mode": "review_only",
             "profile": "standard",
-            "browser_channel": "chrome",
         },
     )
     assert started.status_code == 202, started.text
@@ -163,6 +162,7 @@ async def test_workspace_review_api_confirms_preview_then_starts_one_shot(
     assert started.json()["mode"] == "review_only"
     assert captured["task_id"] == task_id
     assert captured["spec"].goal == "Verify the settings flow without modifying code"
+    assert captured["spec"].browser_channel == "chromium"
 
 
 @pytest.mark.asyncio

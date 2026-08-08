@@ -46,6 +46,7 @@ from backend.services.test_harness import (
 )
 from backend.services.test_harness_contracts import (
     BrowserReviewFindingInput,
+    DEFAULT_BROWSER_CHANNEL,
     TestHarnessContractError,
     TestHarnessSpec,
 )
@@ -70,7 +71,7 @@ class BrowserReviewCreate(BaseModel):
     reasoning_effort: str = Field(default="medium", min_length=1, max_length=20)
     codex_service_tier: Literal["default", "priority"] = "default"
     allow_actions: bool = False
-    browser_channel: Literal["chrome", "chromium"] = "chrome"
+    browser_channel: Literal["chrome", "chromium"] = DEFAULT_BROWSER_CHANNEL
     viewport_width: int = Field(default=1440, ge=320, le=3840)
     viewport_height: int = Field(default=900, ge=480, le=2160)
     max_steps: int = Field(default=20, ge=1, le=50)
@@ -106,7 +107,7 @@ class TaskBrowserReviewStart(BaseModel):
     url: str = Field(min_length=1, max_length=2048)
     goal: str = Field(default=DEFAULT_REVIEW_GOAL, min_length=1, max_length=4000)
     allow_actions: bool = False
-    browser_channel: Literal["chrome", "chromium"] = "chrome"
+    browser_channel: Literal["chrome", "chromium"] = DEFAULT_BROWSER_CHANNEL
     viewport_width: int = Field(default=1440, ge=320, le=3840)
     viewport_height: int = Field(default=900, ge=480, le=2160)
     max_steps: int = Field(default=20, ge=1, le=50)
@@ -357,7 +358,7 @@ async def get_browser_review_config() -> dict[str, Any]:
         },
         "codex_service_tiers": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
-        "browser_channels": ["chrome", "chromium"],
+        "browser_channels": [DEFAULT_BROWSER_CHANNEL, "chrome"],
         "max_concurrent_jobs": 1,
         "execution": "ccm_task_account_pool",
     }

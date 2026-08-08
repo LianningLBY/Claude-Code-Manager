@@ -33,6 +33,7 @@ from backend.services.test_harness import (
     test_harness_service,
 )
 from backend.services.test_harness_contracts import (
+    DEFAULT_BROWSER_CHANNEL,
     TestHarnessContractError,
     TestHarnessSpec,
 )
@@ -50,7 +51,7 @@ class WorkspaceReviewStart(BaseModel):
     mode: Literal["review_only", "fix_loop"] = "review_only"
     profile: Literal["quick", "standard", "exhaustive"] = "standard"
     allow_actions: bool = True
-    browser_channel: Literal["chrome", "chromium"] = "chrome"
+    browser_channel: Literal["chrome", "chromium"] = DEFAULT_BROWSER_CHANNEL
     viewport_width: int = Field(default=1440, ge=320, le=3840)
     viewport_height: int = Field(default=900, ge=320, le=2160)
     provider: Literal["claude", "codex"] | None = None

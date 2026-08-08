@@ -102,6 +102,7 @@ async def test_task_test_run_api_persists_lists_and_cancels_fixed_url(
         assert payload["target_kind"] == "fixed_url"
         assert payload["runtime"]["provider"] == "claude"
         assert payload["runtime"]["context_policy"] == "isolated_black_box_v1"
+        assert payload["runtime"]["browser_channel"] == "chromium"
         assert payload["stage"] == "waiting_for_browser"
         start_browser.assert_awaited_once_with(run_id=run_id, inline=False)
 
@@ -137,6 +138,7 @@ async def test_task_test_run_api_persists_lists_and_cancels_fixed_url(
         repeated_payload = repeated.json()
         assert repeated_payload["id"] != run_id
         assert repeated_payload["parent_run_id"] == run_id
+        assert repeated_payload["runtime"]["browser_channel"] == "chromium"
         assert repeated_payload["browser_review_job_id"] == "b" * 32
         assert start_browser.await_count == 2
         assert start_browser.await_args.kwargs == {

@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 HarnessTargetKind = Literal["current_workspace", "fixed_url", "pull_request", "git_ref"]
 HarnessProfile = Literal["quick", "standard", "exhaustive"]
+DEFAULT_BROWSER_CHANNEL = "chromium"
 
 HARNESS_TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "stale"}
@@ -80,7 +81,7 @@ class TestHarnessSpec:
     goal: str
     profile: HarnessProfile = "standard"
     allow_actions: bool = True
-    browser_channel: str = "chrome"
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL
     viewport_width: int = 1440
     viewport_height: int = 900
     max_steps: int | None = None

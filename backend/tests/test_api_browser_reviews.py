@@ -87,6 +87,7 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
         config = await client.get("/api/browser-reviews/config")
         assert config.status_code == 200
         assert config.json()["execution"] == "ccm_task_account_pool"
+        assert config.json()["browser_channels"][0] == "chromium"
         assert {"claude", "codex"}.intersection(config.json()["providers"])
 
         created = await client.post(
@@ -96,12 +97,12 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
                 "provider": "codex",
                 "model": settings.default_codex_model,
                 "reasoning_effort": "medium",
-                "browser_channel": "chromium",
             },
         )
         assert created.status_code == 202, created.text
         job_id = created.json()["id"]
         assert created.json()["task_id"] == 91
+        assert created.json()["browser_channel"] == "chromium"
         assert created_task["provider"] == "codex"
         assert created_task["enabled_skills"] == {"browser-review": job_id}
         assert "finish_review" in created_task["description"]
@@ -284,7 +285,6 @@ async def test_ordinary_task_can_start_and_list_isolated_browser_review(
             json={
                 "url": "https://example.com",
                 "goal": "Check the task UI",
-                "browser_channel": "chromium",
                 "viewport_width": 390,
                 "viewport_height": 844,
                 "max_actions": 0,
@@ -296,6 +296,7 @@ async def test_ordinary_task_can_start_and_list_isolated_browser_review(
         assert payload["inline_tool"] is False
         assert payload["provider"] == "claude"
         assert payload["model"] == "claude-opus-4-6"
+        assert payload["browser_channel"] == "chromium"
         assert payload["viewport_width"] == 390
         assert payload["viewport_height"] == 844
         assert payload["max_actions"] == 0

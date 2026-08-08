@@ -27,6 +27,7 @@ from backend.services.test_harness import (
     test_harness_service,
 )
 from backend.services.test_harness_contracts import (
+    DEFAULT_BROWSER_CHANNEL,
     TestHarnessContractError,
     TestHarnessSpec,
 )
@@ -52,7 +53,7 @@ class TestHarnessRunStart(BaseModel):
     goal: str = Field(min_length=1, max_length=20_000)
     profile: Literal["quick", "standard", "exhaustive"] = "standard"
     allow_actions: bool = True
-    browser_channel: Literal["chrome", "chromium"] = "chrome"
+    browser_channel: Literal["chrome", "chromium"] = DEFAULT_BROWSER_CHANNEL
     viewport_width: int = Field(default=1440, ge=320, le=3840)
     viewport_height: int = Field(default=900, ge=320, le=2160)
     max_steps: int | None = Field(default=None, ge=1, le=50)

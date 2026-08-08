@@ -302,7 +302,7 @@ Harness 生命周期和浏览器工具调用，不暴露隐藏推理。Web 页�
 Task 的浏览器链路诊断；其中完整模型审查才需要 `OPENAI_API_KEY`：
 
 ```bash
-# 安装 Playwright 自带的 Chromium（也可用 --browser-channel chrome 复用系统 Chrome）
+# 默认使用 Playwright 自带的 Chromium（也可用 --browser-channel chrome 复用系统 Chrome）
 uv run playwright install chromium
 
 # 先只验证浏览器、截图和遥测，不调用模型

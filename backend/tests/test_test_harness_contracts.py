@@ -24,6 +24,7 @@ def test_harness_spec_normalizes_profile_budgets_and_pr_target():
     assert spec.goal == "Verify the changed settings flow"
     assert spec.max_steps == 40
     assert spec.max_actions == 80
+    assert spec.browser_channel == "chromium"
     assert spec.target == {"remote": "origin", "pr_number": 99}
 
 

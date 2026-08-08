@@ -1252,7 +1252,7 @@ describe('ChatView', () => {
           goal: '验证设置页保存和窄屏布局',
           profile: 'standard',
           allow_actions: true,
-          browser_channel: 'chrome',
+          browser_channel: 'chromium',
           viewport_width: 1440,
           viewport_height: 900,
         },

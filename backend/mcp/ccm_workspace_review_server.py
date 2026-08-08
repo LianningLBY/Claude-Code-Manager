@@ -9,6 +9,8 @@ from typing import Any
 import httpx
 from mcp.server.fastmcp import FastMCP
 
+from backend.services.test_harness_contracts import DEFAULT_BROWSER_CHANNEL
+
 
 _TASK_ID = 0
 _API_BASE = "http://localhost:8000"
@@ -68,7 +70,7 @@ async def test_current_changes(
     mode: str = "review_only",
     profile: str = "standard",
     allow_actions: bool = True,
-    browser_channel: str = "chrome",
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
     viewport_width: int = 1440,
     viewport_height: int = 900,
     provider: str | None = None,
@@ -143,7 +145,7 @@ async def test_git_target(
     fetch: bool = False,
     profile: str = "standard",
     allow_actions: bool = True,
-    browser_channel: str = "chrome",
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
     viewport_width: int = 1440,
     viewport_height: int = 900,
     provider: str | None = None,

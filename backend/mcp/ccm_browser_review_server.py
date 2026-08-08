@@ -27,7 +27,10 @@ from backend.services.browser_review import (
     execute_computer_actions,
     validate_target_url,
 )
-from backend.services.test_harness_contracts import BrowserReviewFindingInput
+from backend.services.test_harness_contracts import (
+    DEFAULT_BROWSER_CHANNEL,
+    BrowserReviewFindingInput,
+)
 
 
 _JOB_ID = ""
@@ -358,7 +361,7 @@ async def start_review(
     url: str,
     goal: str = DEFAULT_REVIEW_GOAL,
     allow_actions: bool = False,
-    browser_channel: str = "chrome",
+    browser_channel: str = DEFAULT_BROWSER_CHANNEL,
     viewport_width: int = 1440,
     viewport_height: int = 900,
     max_steps: int = 20,

@@ -14,6 +14,7 @@ import type {
   TestHarnessTargetKind,
   WorkspaceReviewRun,
 } from '../../api/client';
+import { DEFAULT_BROWSER_CHANNEL } from '../../config/browserReview';
 import {
   Activity,
   AlertCircle,
@@ -204,7 +205,7 @@ export function BrowserReviewPanel({
   const [configuredGoal, setConfiguredGoal] = useState(DEFAULT_REVIEW_GOAL);
   const [configuredProfile, setConfiguredProfile] = useState<'quick' | 'standard' | 'exhaustive'>('standard');
   const [configuredViewport, setConfiguredViewport] = useState('1440x900');
-  const [configuredBrowserChannel, setConfiguredBrowserChannel] = useState<'chrome' | 'chromium'>('chrome');
+  const [configuredBrowserChannel, setConfiguredBrowserChannel] = useState<'chrome' | 'chromium'>(DEFAULT_BROWSER_CHANNEL);
   const [configuredAllowActions, setConfiguredAllowActions] = useState(false);
   const [runtimeConfig, setRuntimeConfig] = useState<TestHarnessRuntimeConfig | null>(null);
   const [capabilities, setCapabilities] = useState<TestHarnessCapabilities | null>(null);
@@ -1184,8 +1185,8 @@ export function BrowserReviewPanel({
                   onChange={(event) => setConfiguredBrowserChannel(event.target.value as 'chrome' | 'chromium')}
                   className="w-full rounded-lg border border-gray-600/60 bg-gray-900 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500"
                 >
-                  <option value="chrome">系统 Chrome</option>
                   <option value="chromium">Playwright Chromium</option>
+                  <option value="chrome">系统 Chrome</option>
                 </select>
               </div>
             </div>

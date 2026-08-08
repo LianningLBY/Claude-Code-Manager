@@ -37,6 +37,7 @@ from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.test_harness_children import TestHarnessChildService
+from backend.services.test_harness_contracts import DEFAULT_BROWSER_CHANNEL
 from backend.services.test_harness_runtime import resolve_harness_runtime
 
 
@@ -1040,7 +1041,7 @@ class WorkspaceReviewManager:
         mode: str = "review_only",
         profile: str = "standard",
         allow_actions: bool = True,
-        browser_channel: str = "chrome",
+        browser_channel: str = DEFAULT_BROWSER_CHANNEL,
         viewport_width: int = 1440,
         viewport_height: int = 900,
         max_steps: int | None = None,

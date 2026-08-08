@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     effort_options: str = "low,medium,high,xhigh,max"  # comma-separated
     host: str = "0.0.0.0"
     port: int = 8000
+    # Optional fixed Manager-local origin for MCP servers/hooks. When empty,
+    # the live ASGI listening address is learned from incoming requests.
+    internal_api_base_url: str = ""
     # Public base URL of this deployment (e.g. https://ccm.example.com),
     # used to display the GitHub webhook URL on the PR Monitor page.
     public_base_url: str = ""

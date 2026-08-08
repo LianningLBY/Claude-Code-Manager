@@ -161,6 +161,7 @@ def test_main_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_skills",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -195,6 +196,7 @@ def test_monitor_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_monitor_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -229,7 +231,7 @@ def test_monitor_agent_mcp_spec_carries_exact_turn_generation(monkeypatch):
         turn_generation=9,
     )[0]
 
-    assert spec.args[2:8] == (
+    assert spec.args[3:9] == (
         "--monitor-session-id",
         "7",
         "--task-id",
@@ -251,6 +253,7 @@ def test_sub_agent_mcp_server_spec_snapshot(monkeypatch):
             name="ccm_sub_agent",
             command="/srv/ccm/.venv/bin/python3",
             args=(
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -319,6 +322,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_mcp_config(42),
             "ccm_skills",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_skills_server",
                 "--task-id",
@@ -331,6 +335,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_monitor_agent_mcp_config(7),
             "ccm_monitor_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_monitor_agent_server",
                 "--monitor-session-id",
@@ -345,6 +350,7 @@ def test_spec_enabled_tools_match_registered_server_tools(
             lambda: cleanup_sub_agent_mcp_config(9),
             "ccm_sub_agent",
             [
+                "-P",
                 "-m",
                 "backend.mcp.ccm_sub_agent_server",
                 "--sub-agent-session-id",
@@ -408,6 +414,13 @@ def test_observed_asgi_port_overrides_cli_stale_settings(monkeypatch):
     spec = build_mcp_server_specs(42)[0]
 
     assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8803")
+
+
+def test_internal_api_base_rejects_non_origin_values():
+    with pytest.raises(ValueError, match=r"HTTP\(S\) origin"):
+        internal_api_endpoint.resolve_internal_api_base(
+            "https://manager.example/internal"
+        )
 
 
 def test_task_ssh_spec_exposes_only_tools_for_granted_capabilities(monkeypatch):

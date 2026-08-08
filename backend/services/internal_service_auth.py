@@ -27,7 +27,6 @@ _TOKEN_TTL_SECONDS = 24 * 60 * 60
 _CLOCK_SKEW_SECONDS = 30
 _MAX_TOKEN_LENGTH = 4096
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
-_RUN_SEGMENT = r"[A-Za-z0-9_-]{1,160}"
 
 
 class InternalServiceTokenError(ValueError):
@@ -47,7 +46,6 @@ class InternalServiceClaims:
     task_id: int | None = None
     monitor_session_id: int | None = None
     sub_agent_session_id: int | None = None
-    job_id: str | None = None
     owner_kind: str | None = None
     owner_id: str | None = None
 
@@ -126,7 +124,6 @@ def issue_internal_service_token(
     task_id: int | None = None,
     monitor_session_id: int | None = None,
     sub_agent_session_id: int | None = None,
-    job_id: str | None = None,
     owner_kind: str,
     owner_id: str | int,
     ttl_seconds: int = _TOKEN_TTL_SECONDS,
@@ -148,7 +145,6 @@ def issue_internal_service_token(
         sub_agent_session_id,
         "sub-agent session id",
     )
-    job_id = _safe_segment(job_id, "browser job id")
     if (
         isinstance(ttl_seconds, bool)
         or not isinstance(ttl_seconds, int)
@@ -166,7 +162,6 @@ def issue_internal_service_token(
         str(task_id or ""),
         str(monitor_session_id or ""),
         str(sub_agent_session_id or ""),
-        job_id or "",
         str(ttl_seconds),
         hashlib.sha256(secret).hexdigest(),
     )
@@ -195,7 +190,6 @@ def issue_internal_service_token(
         ("task_id", task_id),
         ("monitor_session_id", monitor_session_id),
         ("sub_agent_session_id", sub_agent_session_id),
-        ("job_id", job_id),
     ):
         if value is not None:
             payload[key] = value
@@ -300,7 +294,6 @@ def _decode_claims(token: str) -> InternalServiceClaims:
             payload.get("sub_agent_session_id"),
             "sub-agent session id",
         ),
-        job_id=_safe_segment(payload.get("job_id"), "browser job id"),
         owner_kind=_safe_segment(payload.get("owner_kind"), "owner kind"),
         owner_id=_safe_segment(payload.get("owner_id"), "owner id"),
     )
@@ -346,29 +339,6 @@ def _route_allowed(claims: InternalServiceClaims, method: str, path: str) -> boo
             rf"{re.escape(task_path)}/(monitor-sessions|sub-agent-sessions)/[1-9][0-9]*",
             path,
         )
-
-    if claims.audience in {"ccm_frontend_review", "ccm_workspace_review"} and task_id is not None:
-        base = rf"/api/tasks/{task_id}/test-runs"
-        if method == "POST" and path == f"{base}/internal/start":
-            return True
-        if claims.audience == "ccm_workspace_review" and method == "GET" and path == f"{base}/capabilities":
-            return True
-        if method == "GET" and _fullmatch(rf"{base}/{_RUN_SEGMENT}/internal/status", path):
-            return True
-        if method == "POST" and _fullmatch(rf"{base}/{_RUN_SEGMENT}/internal/stop", path):
-            return True
-        return (
-            claims.audience == "ccm_workspace_review"
-            and method == "GET"
-            and _fullmatch(rf"{base}/{_RUN_SEGMENT}/compare/{_RUN_SEGMENT}", path)
-        )
-
-    if claims.audience == "ccm_browser_review" and claims.job_id is not None:
-        base = f"/api/browser-reviews/{claims.job_id}/internal"
-        return (method, path) in {
-            ("GET", f"{base}/context"),
-            ("POST", f"{base}/events"),
-        }
 
     if (
         claims.audience == "ccm_monitor_agent"

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from sqlalchemy import select
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -803,6 +803,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Code Manager", version="0.1.0", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def remember_internal_api_endpoint(request: Request, call_next):
+    # Use scope["server"], never the untrusted Host header. This captures
+    # Uvicorn CLI-only --host/--port overrides before a request can create and
+    # dispatch a Task whose MCP subprocess needs to call back into Manager.
+    from backend.services.internal_api_endpoint import observe_asgi_server
+
+    observe_asgi_server(request.scope.get("server"))
+    return await call_next(request)
+
 
 app.add_middleware(TokenAuthMiddleware)
 app.add_middleware(

@@ -109,7 +109,6 @@ def _ccm_server_spec(
     task_id: int | None = None,
     monitor_session_id: int | None = None,
     sub_agent_session_id: int | None = None,
-    job_id: str | None = None,
     credential_owner_kind: str,
     credential_owner_id: str | int,
 ) -> McpServerSpec:
@@ -120,6 +119,10 @@ def _ccm_server_spec(
 
     resolved_api_base = _api_base(api_base)
     args = [
+        # Claude Code does not consistently honor ``cwd`` for stdio MCP
+        # entries. Safe-path mode plus an explicit PYTHONPATH pins imports to
+        # the running Manager checkout instead of the Task repository.
+        "-P",
         "-m",
         module,
         *context_args,
@@ -131,7 +134,6 @@ def _ccm_server_spec(
         task_id=task_id,
         monitor_session_id=monitor_session_id,
         sub_agent_session_id=sub_agent_session_id,
-        job_id=job_id,
         owner_kind=credential_owner_kind,
         owner_id=credential_owner_id,
     )

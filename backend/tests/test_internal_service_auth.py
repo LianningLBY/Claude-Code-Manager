@@ -90,24 +90,6 @@ def test_skills_credential_cannot_use_the_general_task_update_route():
             "/api/tasks/42/sub-agent-sessions",
         ),
         (
-            "ccm_frontend_review",
-            {"task_id": 42},
-            "GET",
-            "/api/tasks/42/test-runs/run-1/internal/status",
-        ),
-        (
-            "ccm_workspace_review",
-            {"task_id": 42},
-            "GET",
-            "/api/tasks/42/test-runs/run-1/compare/run-2",
-        ),
-        (
-            "ccm_browser_review",
-            {"job_id": "job-1"},
-            "POST",
-            "/api/browser-reviews/job-1/internal/events",
-        ),
-        (
             "ccm_monitor_agent",
             {"task_id": 42, "monitor_session_id": 8},
             "POST",

@@ -1755,8 +1755,6 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
         config = json.loads(config_path.read_text())
         assert set(config["mcpServers"]) == {
             "ccm_skills",
-            "ccm_frontend_review",
-            "ccm_workspace_review",
             "ccm_ssh",
         }
         assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
@@ -1985,11 +1983,7 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
 
     assert pid == 45_678
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
-    assert [spec.name for spec in specs] == [
-        "ccm_frontend_review",
-        "ccm_workspace_review",
-        "ccm_ssh",
-    ]
+    assert [spec.name for spec in specs] == ["ccm_ssh"]
     ssh_spec = next(spec for spec in specs if spec.name == "ccm_ssh")
     assert ssh_spec.required is True
     assert ssh_spec.enabled_tools == (

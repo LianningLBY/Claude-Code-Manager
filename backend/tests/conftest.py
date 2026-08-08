@@ -12,7 +12,9 @@ from pathlib import Path
 # bootstrap, an incompletely mocked test can write Instance/Task lifecycle
 # state into the developer's real ``claude_manager.db``.
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-_GLOBAL_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="ccm-pytest-global-"))
+_GLOBAL_TEST_DB_DIR = Path(
+    tempfile.mkdtemp(prefix="ccm-pytest-global-")
+).resolve()
 atexit.register(shutil.rmtree, _GLOBAL_TEST_DB_DIR, ignore_errors=True)
 _GLOBAL_TEST_PROJECT_DIR = _GLOBAL_TEST_DB_DIR / "project"
 _GLOBAL_TEST_PROJECT_DIR.mkdir(mode=0o700)

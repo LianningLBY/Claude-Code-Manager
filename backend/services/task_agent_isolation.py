@@ -8,13 +8,10 @@ from pathlib import Path
 from typing import Iterable
 
 from backend.services.mcp_config import (
-    CCM_BROWSER_REVIEW_TOOLS,
-    CCM_FRONTEND_REVIEW_TOOLS,
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
     CCM_SSH_TOOLS,
     CCM_SUB_AGENT_TOOLS,
-    CCM_WORKSPACE_REVIEW_TOOLS,
 )
 from backend.services.task_runtime_secrets import (
     runtime_secret_root,
@@ -90,9 +87,6 @@ def _permission_path(path: str) -> str:
 def _mcp_allow_rules() -> list[str]:
     servers = {
         "ccm_skills": CCM_SKILLS_TOOLS,
-        "ccm_frontend_review": CCM_FRONTEND_REVIEW_TOOLS,
-        "ccm_workspace_review": CCM_WORKSPACE_REVIEW_TOOLS,
-        "ccm_browser_review": CCM_BROWSER_REVIEW_TOOLS,
         "ccm_ssh": CCM_SSH_TOOLS,
         "ccm_monitor_agent": CCM_MONITOR_AGENT_TOOLS,
         "ccm_sub_agent": CCM_SUB_AGENT_TOOLS,

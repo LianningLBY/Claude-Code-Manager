@@ -2037,15 +2037,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         {/* Row 1: back + task info + action buttons */}
         <div
           data-testid="chat-header-primary"
-          className="flex flex-col gap-1 sm:flex-row sm:items-center sm:gap-3"
+          className="flex items-center gap-2 sm:gap-3"
         >
-          <div className="flex w-full min-w-0 items-start gap-2 sm:w-auto sm:flex-1 sm:items-center sm:gap-3">
-            <button onClick={onBack} className="mt-0.5 shrink-0 text-gray-400 hover:text-foreground sm:mt-0">
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+            <button onClick={onBack} className="shrink-0 text-gray-400 hover:text-foreground">
               <ArrowLeft size={20} />
             </button>
             <div
               data-testid="chat-task-badges"
-              className="flex min-w-0 flex-1 flex-wrap items-center gap-x-1.5 gap-y-1 sm:flex-nowrap"
+              className="flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-hidden"
             >
               <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
               {task.mode === 'plan' ? (
@@ -2077,17 +2077,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       : 'Codex 主任务 MCP 已关闭'
                   }
                 >
-                  MCP {codexMainMcpEnabled ? '已启用' : '已关闭'}
+                  MCP <span className="hidden sm:inline">{codexMainMcpEnabled ? '已启用' : '已关闭'}</span>
                 </span>
               )}
               {projectName && (
-                <span className="max-w-full truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300">{projectName}</span>
+                <span className="min-w-0 flex-1 truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300">{projectName}</span>
               )}
             </div>
           </div>
           <div
             data-testid="chat-header-actions"
-            className="flex shrink-0 items-center gap-1 self-end sm:self-auto"
+            className="flex shrink-0 items-center gap-0.5 sm:gap-1"
           >
             <SubAgentIndicator
               taskId={task.id}
@@ -2098,7 +2098,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             {task.session_id && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
-                className={`flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
+                className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs font-medium transition-colors sm:px-2 ${
                   plansOpen
                     ? 'bg-indigo-500/15 text-indigo-300'
                     : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'
@@ -2107,7 +2107,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 aria-label="Plans"
               >
                 <ListTodo size={16} />
-                <span>Plans</span>
+                <span className="hidden sm:inline">Plans</span>
                 {planAttentionCount > 0 && (
                   <span className="min-w-4 rounded-full bg-indigo-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
                     {planAttentionCount}
@@ -2173,7 +2173,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   finally { setInterrupting(false); }
                 }}
                 disabled={interrupting}
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded hover:bg-red-500/10 disabled:opacity-50"
+                className="flex items-center gap-1 px-1.5 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded hover:bg-red-500/10 disabled:opacity-50 sm:px-2.5"
                 title="Interrupt session"
               >
                 <StopCircle size={14} />

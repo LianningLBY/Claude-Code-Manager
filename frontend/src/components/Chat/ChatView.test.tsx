@@ -313,7 +313,7 @@ describe('ChatView', () => {
     }
   });
 
-  it('stacks mobile header actions below wrapping task badges', async () => {
+  it('keeps mobile header badges and compact actions on one row', async () => {
     render(
       <ChatView
         task={makeTask({ provider: 'codex', project_id: 7 })}
@@ -325,16 +325,17 @@ describe('ChatView', () => {
     await screen.findByTestId('codex-main-mcp-status');
 
     const header = screen.getByTestId('chat-header-primary');
-    expect(header.className).toContain('flex-col');
-    expect(header.className).toContain('sm:flex-row');
+    expect(header.className).toContain('items-center');
+    expect(header.className).not.toContain('flex-col');
 
     const badges = screen.getByTestId('chat-task-badges');
-    expect(badges.className).toContain('flex-wrap');
-    expect(badges.className).toContain('sm:flex-nowrap');
+    expect(badges.className).toContain('flex-nowrap');
+    expect(badges.className).toContain('overflow-hidden');
 
     const actions = screen.getByTestId('chat-header-actions');
-    expect(actions.className).toContain('self-end');
-    expect(actions.className).toContain('sm:self-auto');
+    expect(actions.className).toContain('shrink-0');
+    expect(screen.getByText('Plans').className).toContain('hidden');
+    expect(screen.getByText('Plans').className).toContain('sm:inline');
   });
 
   describe('chat conflict state', () => {

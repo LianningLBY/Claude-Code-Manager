@@ -29,18 +29,10 @@ def upgrade() -> None:
             nullable=False,
         ))
 
-    # Managed profiles created before this policy existed were all eligible
-    # for Task grants. Preserve that behavior during upgrade; newly created
-    # profiles default to Files-only in the API and model.
-    profiles = sa.table(
-        "ssh_profiles",
-        sa.column("task_access_enabled", sa.Boolean()),
-        sa.column("task_capabilities", sa.JSON()),
-    )
-    op.execute(profiles.update().values(
-        task_access_enabled=True,
-        task_capabilities=["exec", "read", "write"],
-    ))
+    # Existing Profiles may point at arbitrary administrator-selected paths.
+    # Keep them Files-only: Task eligibility requires re-authorizing the key
+    # through CCM's stable managed storage root, which a running sandbox always
+    # denies even when a Profile is created after its launch snapshot.
 
 
 def downgrade() -> None:

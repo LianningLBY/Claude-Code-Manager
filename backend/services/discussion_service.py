@@ -6,6 +6,8 @@ import os
 import re
 import signal
 import tempfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select, update
@@ -19,8 +21,27 @@ from backend.models.discussion import (
     DiscussionMessage,
 )
 from backend.models.project import Project
+from backend.services.claude_auth_projection import (
+    ClaudeAuthProjectionError,
+    apply_claude_auth_projection,
+    environment_has_direct_claude_auth,
+    prepare_claude_auth_projection,
+    remove_claude_auth_projection,
+)
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
+from backend.services.task_agent_isolation import (
+    CLAUDE_READ_ONLY_BUILTIN_TOOLS,
+    TaskAgentIsolationError,
+    generate_claude_read_only_isolation_settings,
+    scrub_task_model_environment,
+    validate_claude_task_isolation_settings,
+)
+from backend.services.task_runtime_secrets import remove_private_scope
+from backend.services.task_ssh_access import (
+    TaskSSHAccessError,
+    task_ssh_protected_paths,
+)
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -34,6 +55,21 @@ _CONSUMER_SHUTDOWN_TIMEOUT = sum(_PROCESS_SIGNAL_TIMEOUTS) + 5.0
 
 class DiscussionProcessCleanupError(RuntimeError):
     """A discussion child could not be proven terminal within the deadline."""
+
+
+class DiscussionSecurityError(RuntimeError):
+    """A Discussion Agent could not prove its provider isolation boundary."""
+
+
+@dataclass(frozen=True)
+class _DiscussionClaudeSecurityContext:
+    discussion_id: int
+    namespace: str
+    identifier: int
+    model: str
+    resume_session_id: str | None
+    repository_cwd: str | None
+    binding: str
 
 
 async def _settle_despite_cancellation(awaitable):
@@ -52,9 +88,16 @@ async def _settle_despite_cancellation(awaitable):
 
 
 class DiscussionService:
-    def __init__(self, db_factory, broadcaster: WebSocketBroadcaster):
+    def __init__(
+        self,
+        db_factory,
+        broadcaster: WebSocketBroadcaster,
+        *,
+        claude_pool_provider=None,
+    ):
         self.db_factory = db_factory
         self.broadcaster = broadcaster
+        self._claude_pool_provider = claude_pool_provider
         self.parser = StreamParser()
         self._processes: dict[int, asyncio.subprocess.Process] = {}
         self._consumers: dict[int, asyncio.Task] = {}
@@ -63,6 +106,7 @@ class DiscussionService:
             asyncio.Task, asyncio.subprocess.Process
         ] = {}
         self._facilitator_tasks: set[asyncio.Task] = set()
+        self._facilitator_discussions: dict[asyncio.Task, int] = {}
         self._facilitator_locks: dict[int, asyncio.Lock] = {}
         self._round_count: dict[int, int] = {}
 
@@ -73,6 +117,15 @@ class DiscussionService:
 
     def _get_agent_lock(self, agent_id: int) -> asyncio.Lock:
         return self._agent_locks.setdefault(agent_id, asyncio.Lock())
+
+    @staticmethod
+    def _runtime_binding(kind: str, record) -> str:
+        created_at = getattr(record, "created_at", None)
+        if isinstance(created_at, datetime):
+            created_identity = created_at.isoformat()
+        else:
+            created_identity = str(created_at or "legacy")
+        return f"{kind}:{getattr(record, 'id', 0)}:{created_identity}"
 
     async def _claim_agent_start_locked(
         self,
@@ -123,10 +176,115 @@ class DiscussionService:
             return project.local_path
         return None
 
+    async def _prepare_claude_security_context(
+        self,
+        context: _DiscussionClaudeSecurityContext,
+    ) -> tuple[list[str], dict[str, str], str]:
+        """Build one exact read-only Claude route immediately before spawn."""
+
+        try:
+            async with self.db_factory() as db:
+                from backend.models.user import User
+
+                discussion = await db.get(Discussion, context.discussion_id)
+                creator = (
+                    await db.get(User, discussion.creator_user_id)
+                    if discussion is not None
+                    and discussion.creator_user_id is not None
+                    else None
+                )
+                if (
+                    discussion is None
+                    or discussion.creator_user_id is None
+                    or creator is None
+                    or not creator.is_active
+                    or creator.role not in {"admin", "super_admin"}
+                ):
+                    raise DiscussionSecurityError(
+                        "Discussion Agent workloads are restricted to active admins"
+                    )
+                protected_paths = await task_ssh_protected_paths(
+                    db,
+                    working_directory=context.repository_cwd,
+                )
+            env = scrub_task_model_environment(os.environ, provider="claude")
+            source_home = env.get("CLAUDE_CONFIG_DIR") or str(
+                os.path.expanduser("~/.claude")
+            )
+            if not environment_has_direct_claude_auth(env):
+                pool = (
+                    self._claude_pool_provider()
+                    if self._claude_pool_provider is not None
+                    else None
+                )
+                if pool is not None:
+                    refreshed = await pool.ensure_oauth_access_token(
+                        source_home,
+                        minimum_remaining_seconds=300.0,
+                    )
+                    if not refreshed:
+                        raise DiscussionSecurityError(
+                            "Discussion Claude account is not an active native "
+                            "pool account"
+                        )
+            projection = prepare_claude_auth_projection(
+                source_home,
+                namespace=context.namespace,
+                identifier=context.identifier,
+                binding=context.binding,
+                environment=env,
+            )
+            apply_claude_auth_projection(env, projection)
+            isolation_path = generate_claude_read_only_isolation_settings(
+                context.namespace,
+                context.identifier,
+                protected_paths,
+            )
+            await asyncio.to_thread(
+                validate_claude_task_isolation_settings,
+                isolation_path,
+                claude_binary=settings.claude_binary,
+                tools=CLAUDE_READ_ONLY_BUILTIN_TOOLS,
+                include_mcp_tools=False,
+            )
+        except (
+            ClaudeAuthProjectionError,
+            TaskAgentIsolationError,
+            TaskSSHAccessError,
+            OSError,
+            ValueError,
+        ) as exc:
+            raise DiscussionSecurityError(
+                "Discussion Agent security admission failed"
+            ) from exc
+
+        command = self._build_cmd(
+            context.model,
+            resume_session_id=context.resume_session_id,
+            isolation_settings_path=str(isolation_path),
+            repository_cwd=context.repository_cwd,
+        )
+        # The repository is named explicitly in the system prompt; using a
+        # neutral cwd prevents automatic CLAUDE.md/project-memory discovery.
+        return command, env, os.path.abspath(os.sep)
+
     # ------------------------------------------------------------------
     # Public: user sends group message
     # ------------------------------------------------------------------
     async def send_broadcast(
+        self,
+        db: AsyncSession,
+        discussion_id: int,
+        user_message: str,
+    ) -> list[DiscussionAgent]:
+        async with self._get_lock(discussion_id):
+            return await self._send_broadcast_locked(
+                db,
+                discussion_id,
+                user_message,
+            )
+
+    async def _send_broadcast_locked(
         self,
         db: AsyncSession,
         discussion_id: int,
@@ -209,41 +367,54 @@ class DiscussionService:
         agent = await db.get(DiscussionAgent, agent_id)
         if not agent:
             raise ValueError(f"Agent {agent_id} not found")
-        if agent.status == "running":
-            raise ValueError(f"Agent {agent_id} is already running")
+        discussion_id = agent.discussion_id
+        async with self._get_lock(discussion_id):
+            agent = await db.get(
+                DiscussionAgent,
+                agent_id,
+                populate_existing=True,
+            )
+            if not agent:
+                raise ValueError(f"Agent {agent_id} not found")
+            if agent.status == "running":
+                raise ValueError(f"Agent {agent_id} is already running")
 
-        disc = await db.get(Discussion, agent.discussion_id)
-        if not disc:
-            raise ValueError(f"Discussion {agent.discussion_id} not found")
+            disc = await db.get(
+                Discussion,
+                discussion_id,
+                populate_existing=True,
+            )
+            if not disc:
+                raise ValueError(f"Discussion {discussion_id} not found")
 
-        user_evt = DiscussionEvent(
-            discussion_id=agent.discussion_id,
-            agent_id=agent_id,
-            event_type="user_message",
-            role="user",
-            content=message,
-            timestamp=datetime.now(timezone.utc),
-        )
-        db.add(user_evt)
+            user_evt = DiscussionEvent(
+                discussion_id=discussion_id,
+                agent_id=agent_id,
+                event_type="user_message",
+                role="user",
+                content=message,
+                timestamp=datetime.now(timezone.utc),
+            )
+            db.add(user_evt)
 
-        async with self._get_agent_lock(agent_id):
-            agent = await self._claim_agent_start_locked(db, agent_id)
-            self._launch_agent_resume(agent, disc, message)
+            async with self._get_agent_lock(agent_id):
+                agent = await self._claim_agent_start_locked(db, agent_id)
+                self._launch_agent_resume(agent, disc, message)
 
-        await self.broadcaster.broadcast(
-            f"discussion:{agent.discussion_id}:agent:{agent_id}",
-            {
-                "event_type": "user_message",
-                "role": "user",
-                "content": message,
+            await self.broadcaster.broadcast(
+                f"discussion:{discussion_id}:agent:{agent_id}",
+                {
+                    "event_type": "user_message",
+                    "role": "user",
+                    "content": message,
+                    "agent_id": agent_id,
+                },
+            )
+            await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
+                "event_type": "agent_status",
                 "agent_id": agent_id,
-            },
-        )
-        await self.broadcaster.broadcast(f"discussion:{agent.discussion_id}", {
-            "event_type": "agent_status",
-            "agent_id": agent_id,
-            "status": "running",
-        })
+                "status": "running",
+            })
 
     # ------------------------------------------------------------------
     # Public: trigger an idle agent
@@ -256,17 +427,30 @@ class DiscussionService:
         agent = await db.get(DiscussionAgent, agent_id)
         if not agent:
             raise ValueError(f"Agent {agent_id} not found")
-        if agent.status == "running":
-            raise ValueError(f"Agent {agent_id} is already running")
+        discussion_id = agent.discussion_id
+        async with self._get_lock(discussion_id):
+            agent = await db.get(
+                DiscussionAgent,
+                agent_id,
+                populate_existing=True,
+            )
+            if not agent:
+                raise ValueError(f"Agent {agent_id} not found")
+            if agent.status == "running":
+                raise ValueError(f"Agent {agent_id} is already running")
 
-        disc = await db.get(Discussion, agent.discussion_id)
-        if not disc:
-            raise ValueError(f"Discussion not found")
+            disc = await db.get(
+                Discussion,
+                discussion_id,
+                populate_existing=True,
+            )
+            if not disc:
+                raise ValueError("Discussion not found")
 
-        history = await self._get_history(db, agent.discussion_id)
-        history_file = self._write_history_file(agent.discussion_id, history)
+            history = await self._get_history(db, discussion_id)
+            history_file = self._write_history_file(discussion_id, history)
 
-        prompt = f"""\
+            prompt = f"""\
 {agent.system_prompt}
 
 The discussion has continued since your last response.
@@ -274,35 +458,191 @@ Updated discussion history is at: {history_file}
 Read it, then provide your updated analysis from your perspective as "{agent.role_name}".
 Write in Chinese."""
 
-        try:
-            async with self._get_agent_lock(agent_id):
-                agent = await self._claim_agent_start_locked(db, agent_id)
-                self._launch_agent_with_prompt(
-                    agent,
-                    disc,
-                    prompt,
-                    history_file,
-                )
-        except BaseException:
             try:
-                os.unlink(history_file)
-            except OSError:
-                pass
-            raise
+                async with self._get_agent_lock(agent_id):
+                    agent = await self._claim_agent_start_locked(db, agent_id)
+                    self._launch_agent_with_prompt(
+                        agent,
+                        disc,
+                        prompt,
+                        history_file,
+                    )
+            except BaseException:
+                try:
+                    os.unlink(history_file)
+                except OSError:
+                    pass
+                raise
 
-        await self.broadcaster.broadcast(f"discussion:{agent.discussion_id}", {
-            "event_type": "agent_status",
-            "agent_id": agent_id,
-            "status": "running",
-        })
+            await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
+                "event_type": "agent_status",
+                "agent_id": agent_id,
+                "status": "running",
+            })
 
     # ------------------------------------------------------------------
     # Public: stop a running agent
     # ------------------------------------------------------------------
     async def stop_agent(self, agent_id: int) -> None:
+        async with self._get_agent_lock(agent_id):
+            await self._stop_agent_locked(agent_id)
+
+    async def _stop_agent_locked(self, agent_id: int) -> None:
+        """Cancel and reap one exact consumer while its admission lock is held."""
+
+        consumer = self._consumers.get(agent_id)
+        current = asyncio.current_task()
+        if consumer is not None and consumer is not current and not consumer.done():
+            consumer.cancel()
+            done, pending = await asyncio.wait(
+                {consumer},
+                timeout=_CONSUMER_SHUTDOWN_TIMEOUT,
+            )
+            if pending:
+                raise DiscussionProcessCleanupError(
+                    f"Discussion Agent {agent_id} consumer ignored cancellation"
+                )
+            await asyncio.gather(*done, return_exceptions=True)
         process = self._processes.get(agent_id)
-        if process and self._process_tree_alive(process):
-            await self._terminate_process(process)
+        if process is not None:
+            tree_alive = self._process_tree_alive(process)
+            if tree_alive:
+                await self._terminate_process(process)
+                tree_alive = self._process_tree_alive(process)
+            if not tree_alive and self._processes.get(agent_id) is process:
+                self._processes.pop(agent_id, None)
+        retained = self._consumers.get(agent_id)
+        if retained is not None and not retained.done():
+            raise DiscussionProcessCleanupError(
+                f"Discussion Agent {agent_id} consumer remains active"
+            )
+        if retained is not None and retained.done():
+            self._consumers.pop(agent_id, None)
+
+    async def stop_facilitator(self, discussion_id: int) -> None:
+        """Cancel and reap every facilitator turn owned by one Discussion."""
+
+        owners = [
+            owner
+            for owner, owned_discussion_id in self._facilitator_discussions.items()
+            if owned_discussion_id == discussion_id
+        ]
+        for owner in owners:
+            owner.cancel()
+        if owners:
+            done, pending = await asyncio.wait(
+                owners,
+                timeout=_CONSUMER_SHUTDOWN_TIMEOUT,
+            )
+            if done:
+                await asyncio.gather(*done, return_exceptions=True)
+            if pending:
+                raise DiscussionProcessCleanupError(
+                    "Discussion facilitator ignored cancellation"
+                )
+
+    async def cleanup_runtime(
+        self,
+        discussion_id: int,
+        agent_ids: list[int],
+    ) -> None:
+        """Remove exact auth/session/settings projections after terminal proof."""
+
+        if any(
+            owned_discussion_id == discussion_id
+            for owned_discussion_id in self._facilitator_discussions.values()
+        ):
+            raise DiscussionProcessCleanupError(
+                "Discussion facilitator is still running during cleanup"
+            )
+        if any(
+            agent_id in self._processes
+            and self._process_tree_alive(self._processes[agent_id])
+            for agent_id in agent_ids
+        ):
+            raise DiscussionProcessCleanupError(
+                "Discussion Agent is still running during cleanup"
+            )
+        if any(
+            agent_id in self._consumers
+            and not self._consumers[agent_id].done()
+            for agent_id in agent_ids
+        ):
+            raise DiscussionProcessCleanupError(
+                "Discussion Agent consumer is still running during cleanup"
+            )
+
+        def remove() -> None:
+            remove_claude_auth_projection(
+                namespace="discussion-facilitator",
+                identifier=discussion_id,
+            )
+            remove_private_scope("discussion-facilitator", discussion_id)
+            for agent_id in agent_ids:
+                remove_claude_auth_projection(
+                    namespace="discussion-agent",
+                    identifier=agent_id,
+                )
+                remove_private_scope("discussion-agent", agent_id)
+
+        await asyncio.to_thread(remove)
+
+    @asynccontextmanager
+    async def deletion_barrier(
+        self,
+        discussion_id: int,
+        db: AsyncSession,
+    ):
+        """Quiesce a Discussion and fence every concurrent launch until commit.
+
+        Launch admission is ordered Discussion -> Agent.  Deletion takes the
+        same locks, waits for exact facilitator/consumer finalization, and keeps
+        them held while the API removes the database graph.  A queued launch
+        can only resume after deletion commits, at which point its fresh DB
+        lookup observes that the Discussion no longer exists.
+        """
+
+        discussion_lock = self._get_lock(discussion_id)
+        async with discussion_lock:
+            result = await db.execute(
+                select(DiscussionAgent.id).where(
+                    DiscussionAgent.discussion_id == discussion_id
+                )
+            )
+            agent_ids = sorted(set(result.scalars().all()))
+
+            acquired: list[asyncio.Lock] = []
+            try:
+                for agent_id in agent_ids:
+                    lock = self._get_agent_lock(agent_id)
+                    await lock.acquire()
+                    acquired.append(lock)
+
+                async def quiesce_runtime() -> None:
+                    await self.stop_facilitator(discussion_id)
+                    for agent_id in agent_ids:
+                        await self._stop_agent_locked(agent_id)
+                    await self.cleanup_runtime(discussion_id, agent_ids)
+
+                # HTTP request cancellation must not tear down this safety
+                # barrier halfway through process reaping.  Finish the bounded
+                # quiesce while every launch lock remains held, then deliver
+                # the cancellation without entering the graph-deletion body.
+                quiesce, cancellation = await _settle_despite_cancellation(
+                    quiesce_runtime()
+                )
+                try:
+                    quiesce.result()
+                except BaseException:
+                    if cancellation is not None:
+                        raise cancellation
+                    raise
+                if cancellation is not None:
+                    raise cancellation
+                yield agent_ids
+            finally:
+                for lock in reversed(acquired):
+                    lock.release()
 
     async def shutdown(self) -> None:
         """Stop every discussion consumer and prove its child has exited."""
@@ -529,6 +869,14 @@ Write in Chinese."""
     # Public: add one more agent via facilitator
     # ------------------------------------------------------------------
     async def add_agent(
+        self,
+        db: AsyncSession,
+        discussion_id: int,
+    ) -> DiscussionAgent:
+        async with self._get_lock(discussion_id):
+            return await self._add_agent_locked(db, discussion_id)
+
+    async def _add_agent_locked(
         self,
         db: AsyncSession,
         discussion_id: int,
@@ -782,19 +1130,6 @@ Write in Chinese."""
         self, disc: Discussion, prompt: str, cwd: str | None = None
     ) -> list[str]:
         """Run facilitator subprocess, stream events, capture session_id. Returns collected text."""
-        env = self._build_env()
-        cmd = [
-            settings.claude_binary,
-            "--dangerously-skip-permissions",
-            "--output-format", "stream-json",
-            "--verbose",
-            "--model", disc.facilitator_model,
-            "--max-turns", "5",
-        ]
-        if disc.facilitator_session_id:
-            cmd.extend(["--resume", disc.facilitator_session_id])
-        cmd.extend(["-p", prompt])
-
         discussion_id = disc.id
         collected_text: list[str] = []
         captured_session_id: str | None = None
@@ -802,6 +1137,7 @@ Write in Chinese."""
         if owner is None:
             raise RuntimeError("Facilitator process has no owning task")
         self._facilitator_tasks.add(owner)
+        self._facilitator_discussions[owner] = discussion_id
         process: asyncio.subprocess.Process | None = None
         stderr_task: asyncio.Task[bytes] | None = None
         stderr_data = b""
@@ -810,6 +1146,18 @@ Write in Chinese."""
         cleanup_error: BaseException | None = None
 
         try:
+            cmd, env, process_cwd = await self._prepare_claude_security_context(
+                _DiscussionClaudeSecurityContext(
+                    discussion_id=discussion_id,
+                    namespace="discussion-facilitator",
+                    identifier=discussion_id,
+                    model=disc.facilitator_model,
+                    resume_session_id=disc.facilitator_session_id,
+                    repository_cwd=cwd,
+                    binding=self._runtime_binding("discussion", disc),
+                )
+            )
+            cmd.extend(["--max-turns", "5", "-p", prompt])
             await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
                 "event_type": "facilitator_status",
                 "status": "running",
@@ -820,7 +1168,7 @@ Write in Chinese."""
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     env=env,
-                    cwd=cwd,
+                    cwd=process_cwd,
                     limit=10 * 1024 * 1024,
                     start_new_session=(os.name == "posix"),
                 )
@@ -977,6 +1325,7 @@ Write in Chinese."""
                 except asyncio.CancelledError:
                     pass
             self._facilitator_tasks.discard(owner)
+            self._facilitator_discussions.pop(owner, None)
 
         if captured_session_id:
             async with self.db_factory() as db:
@@ -1109,14 +1458,28 @@ Guidelines:
         message: str,
         cwd: str | None = None,
     ) -> None:
-        cmd = self._build_cmd(disc.agent_model, resume_session_id=agent.session_id)
+        cmd: list[str] = []
         cmd.extend(["-p", message])
-
-        env = self._build_env()
+        env: dict[str, str] = {}
         cwd = cwd or agent.last_cwd
 
         task = asyncio.get_event_loop().create_task(
-            self._run_and_consume(agent.id, agent.discussion_id, cmd, env, cwd)
+            self._run_and_consume(
+                agent.id,
+                agent.discussion_id,
+                cmd,
+                env,
+                cwd,
+                security_context=_DiscussionClaudeSecurityContext(
+                    discussion_id=agent.discussion_id,
+                    namespace="discussion-agent",
+                    identifier=agent.id,
+                    model=disc.agent_model,
+                    resume_session_id=agent.session_id,
+                    repository_cwd=cwd,
+                    binding=self._runtime_binding("discussion-agent", agent),
+                ),
+            )
         )
         self._consumers[agent.id] = task
 
@@ -1128,38 +1491,63 @@ Guidelines:
         history_file: str | None = None,
         cwd: str | None = None,
     ) -> None:
-        cmd = self._build_cmd(disc.agent_model, resume_session_id=agent.session_id)
+        cmd: list[str] = []
         cmd.extend(["-p", prompt])
-
-        env = self._build_env()
+        env: dict[str, str] = {}
+        repository_cwd = cwd or agent.last_cwd
 
         task = asyncio.get_event_loop().create_task(
             self._run_and_consume(
                 agent.id, agent.discussion_id, cmd, env,
-                cwd=cwd or agent.last_cwd,
+                cwd=repository_cwd,
                 cleanup_file=history_file,
+                security_context=_DiscussionClaudeSecurityContext(
+                    discussion_id=agent.discussion_id,
+                    namespace="discussion-agent",
+                    identifier=agent.id,
+                    model=disc.agent_model,
+                    resume_session_id=agent.session_id,
+                    repository_cwd=repository_cwd,
+                    binding=self._runtime_binding("discussion-agent", agent),
+                ),
             )
         )
         self._consumers[agent.id] = task
 
-    def _build_cmd(self, model: str, resume_session_id: str | None = None) -> list[str]:
+    def _build_cmd(
+        self,
+        model: str,
+        resume_session_id: str | None = None,
+        *,
+        isolation_settings_path: str,
+        repository_cwd: str | None,
+    ) -> list[str]:
+        tools = ",".join(CLAUDE_READ_ONLY_BUILTIN_TOOLS)
         cmd = [
             settings.claude_binary,
-            "--dangerously-skip-permissions",
+            "--permission-mode", "plan",
+            "--settings", isolation_settings_path,
+            "--setting-sources", "",
+            "--strict-mcp-config",
+            "--mcp-config", '{"mcpServers":{}}',
+            "--disable-slash-commands",
+            "--no-chrome",
+            "--tools", tools,
+            "--allowedTools", tools,
+            "--exclude-dynamic-system-prompt-sections",
             "--output-format", "stream-json",
             "--verbose",
             "--model", model,
         ]
+        if repository_cwd:
+            cmd.extend([
+                "--append-system-prompt",
+                "Repository root for optional read-only inspection: "
+                f"{repository_cwd}",
+            ])
         if resume_session_id:
             cmd.extend(["--resume", resume_session_id])
         return cmd
-
-    def _build_env(self) -> dict:
-        return {
-            k: v
-            for k, v in os.environ.items()
-            if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")
-        }
 
     # ------------------------------------------------------------------
     # Internal: run subprocess and consume stream
@@ -1207,12 +1595,18 @@ Guidelines:
         env: dict,
         cwd: str | None = None,
         cleanup_file: str | None = None,
+        security_context: _DiscussionClaudeSecurityContext | None = None,
     ) -> None:
         process: asyncio.subprocess.Process | None = None
         stderr_task: asyncio.Task[bytes] | None = None
         cancelled: asyncio.CancelledError | None = None
         cleanup_error: BaseException | None = None
         try:
+            if security_context is not None:
+                base_cmd, env, cwd = await self._prepare_claude_security_context(
+                    security_context
+                )
+                cmd = [*base_cmd, *cmd]
             spawn, spawn_cancellation = await _settle_despite_cancellation(
                 asyncio.create_subprocess_exec(
                     *cmd,

@@ -42,6 +42,9 @@ from backend.services.worker_proxy import (
 from backend.services import worker_task_termination as termination
 
 
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+
 def _active_receipt(
     task: Task,
     *,

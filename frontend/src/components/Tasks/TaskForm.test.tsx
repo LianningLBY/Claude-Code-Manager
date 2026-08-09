@@ -1114,7 +1114,7 @@ describe('TaskForm SSH grants', () => {
 
   it('clears Manager-local SSH grants when switching to a Worker project', async () => {
     vi.mocked(api.listProjects).mockResolvedValueOnce([
-      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [] },
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
       { id: 2, name: 'worker-project', worker_id: 9, git_url: '', has_remote: false, local_path: '/workspace/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [] },
     ] as Awaited<ReturnType<typeof api.listProjects>>);
     const user = userEvent.setup();

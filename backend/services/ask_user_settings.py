@@ -17,10 +17,11 @@ import shlex
 import tempfile
 from pathlib import Path
 
+from backend.services.trusted_runtime import RUNNING_PYTHON
+
 logger = logging.getLogger(__name__)
 
 _CCM_ROOT = Path(__file__).resolve().parent.parent.parent
-_VENV_PYTHON = _CCM_ROOT / ".venv" / "bin" / "python3"
 _HOOK_SCRIPT = _CCM_ROOT / "backend" / "hooks" / "ask_user_hook.py"
 _SSH_GUARD_SCRIPT = _CCM_ROOT / "backend" / "hooks" / "task_ssh_guard_hook.py"
 _MATCHER = "AskUserQuestion"
@@ -29,23 +30,22 @@ _SSH_GUARD_MATCHER = "Bash|Read|Write|Edit|MultiEdit|Glob|Grep"
 _SSH_GUARD_MARKER = "task_ssh_guard_hook.py"
 
 
-def _hook_command() -> str:
+def _hook_command(*, script_path: str | Path | None = None) -> str:
     from backend.config import settings
 
     host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
     api_base = f"http://{host}:{settings.port}"
-    python = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else "python3"
     timeout = int(getattr(settings, "ask_user_timeout", 1800)) + 60
 
     parts = [
-        python, str(_HOOK_SCRIPT),
+        RUNNING_PYTHON, str(script_path or _HOOK_SCRIPT),
         "--api-base", api_base,
         "--timeout", str(timeout),
     ]
     return " ".join(shlex.quote(p) for p in parts)
 
 
-def ask_user_hook_entry() -> dict:
+def ask_user_hook_entry(*, script_path: str | Path | None = None) -> dict:
     """Return CCM's secret-free AskUser hook entry for exact settings."""
 
     from backend.config import settings
@@ -54,7 +54,7 @@ def ask_user_hook_entry() -> dict:
         "matcher": _MATCHER,
         "hooks": [{
             "type": "command",
-            "command": _hook_command(),
+            "command": _hook_command(script_path=script_path),
             "timeout": int(getattr(settings, "ask_user_timeout", 1800)) + 60,
         }],
     }
@@ -82,22 +82,32 @@ def _is_our_ssh_guard_entry(entry: dict) -> bool:
     return False
 
 
-def _ssh_guard_command(protected_paths: tuple[str, ...]) -> str:
-    python = str(_VENV_PYTHON) if _VENV_PYTHON.exists() else "python3"
-    parts = [python, str(_SSH_GUARD_SCRIPT)]
+def _ssh_guard_command(
+    protected_paths: tuple[str, ...],
+    *,
+    script_path: str | Path | None = None,
+) -> str:
+    parts = [RUNNING_PYTHON, str(script_path or _SSH_GUARD_SCRIPT)]
     for path in protected_paths:
         parts.extend(["--protected-path", path])
     return " ".join(shlex.quote(part) for part in parts)
 
 
-def task_ssh_guard_hook_entry(protected_paths: tuple[str, ...]) -> dict:
+def task_ssh_guard_hook_entry(
+    protected_paths: tuple[str, ...],
+    *,
+    script_path: str | Path | None = None,
+) -> dict:
     """Return the advisory SSH guard used inside the OS-enforced sandbox."""
 
     return {
         "matcher": _SSH_GUARD_MATCHER,
         "hooks": [{
             "type": "command",
-            "command": _ssh_guard_command(protected_paths),
+            "command": _ssh_guard_command(
+                protected_paths,
+                script_path=script_path,
+            ),
             "timeout": 5,
         }],
     }

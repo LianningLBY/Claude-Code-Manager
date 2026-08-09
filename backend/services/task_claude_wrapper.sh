@@ -19,4 +19,5 @@ exec "$claude_binary" \
   --disable-slash-commands \
   --no-chrome \
   --tools "$tool_allowlist" \
+  --allowedTools "$tool_allowlist" \
   "$@"

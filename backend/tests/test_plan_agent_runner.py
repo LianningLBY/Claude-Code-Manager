@@ -36,13 +36,19 @@ def test_claude_plan_command_is_read_only():
         model="claude-opus-4-6",
         effort="high",
         schema=PLANNER_SCHEMA,
+        isolation_settings_path="/private/runtime/plan-security.json",
     )
 
     assert command[0] == settings.claude_binary
     assert command[command.index("--permission-mode") + 1] == "plan"
     assert "--no-session-persistence" in command
     assert "--safe-mode" in command
-    assert command[command.index("--tools") + 1] == "Read,Grep,Glob"
+    assert command[command.index("--tools") + 1] == "Glob,Grep,Read"
+    assert command[command.index("--allowedTools") + 1] == "Glob,Grep,Read"
+    assert command[command.index("--settings") + 1] == (
+        "/private/runtime/plan-security.json"
+    )
+    assert command[command.index("--setting-sources") + 1] == ""
     assert "Bash" in command[command.index("--disallowed-tools") + 1]
     assert "--dangerously-skip-permissions" not in command
 

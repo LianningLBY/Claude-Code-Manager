@@ -2,15 +2,23 @@ import asyncio
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from sqlalchemy import select, update
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import (
     get_current_user_id,
     require_admin,
-    require_ssh_auth_configured,
+    require_managed_ssh_auth_configured,
 )
 from backend.config import settings
 from backend.database import get_db
@@ -33,6 +41,7 @@ from backend.services.ssh_key_store import (
 from backend.services.ssh_profiles import (
     CONNECTION_IDENTITY_FIELDS,
     test_profile,
+    update_profile_revision_cas,
     validated_profile_material,
 )
 
@@ -41,7 +50,7 @@ router = APIRouter(
     prefix="/api/ssh-profiles",
     tags=["ssh-profiles"],
     dependencies=[
-        Depends(require_ssh_auth_configured),
+        Depends(require_managed_ssh_auth_configured),
         Depends(require_admin),
     ],
 )
@@ -62,6 +71,8 @@ def _validate_task_policy(enabled: bool, capabilities: list[str]) -> None:
 
 
 def _profile_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
     if isinstance(exc, (SSHKeyPreflightError, SSHManagedKeyStoreError)):
         return HTTPException(400, {"code": exc.code, "message": exc.detail})
     return HTTPException(400, str(exc))
@@ -69,6 +80,19 @@ def _profile_error(exc: Exception) -> HTTPException:
 
 def _key_store() -> SSHManagedKeyStore:
     return SSHManagedKeyStore(settings.ssh_key_storage_dir)
+
+
+def _require_task_managed_key(
+    store: SSHManagedKeyStore,
+    *,
+    key_path: str,
+) -> None:
+    if not store.is_task_managed_path(key_path):
+        raise HTTPException(
+            422,
+            "New SSH private-key paths must use CCM managed storage; upload "
+            "the key instead of registering an arbitrary host path",
+        )
 
 
 async def _discard_unreferenced_managed_key(
@@ -111,7 +135,15 @@ async def list_ssh_profiles(
             SSHProfile.task_access_enabled.is_(True),
         )
     result = await db.execute(stmt.order_by(SSHProfile.name.asc()))
-    return list(result.scalars().all())
+    profiles = list(result.scalars().all())
+    if task_eligible_only:
+        store = _key_store()
+        profiles = [
+            profile
+            for profile in profiles
+            if store.is_task_managed_path(profile.key_path)
+        ]
+    return profiles
 
 
 @router.post("/probe-host-key", response_model=SSHHostKeyProbeResponse)
@@ -173,13 +205,14 @@ async def create_ssh_profile(
     claimed_key_path: str | None = None
     committed = False
     try:
-        key_path = body.key_path
-        if body.key_upload_token:
-            claimed_key_path = store.claim_upload(body.key_upload_token)
-            key_path = claimed_key_path
+        claimed_key_path = store.claim_upload(body.key_upload_token)
         material = validated_profile_material(
-            key_path=key_path or "",
+            key_path=claimed_key_path,
             host_key_value=body.host_key_value,
+        )
+        _require_task_managed_key(
+            store,
+            key_path=material["key_path"],
         )
     except Exception as exc:
         if claimed_key_path:
@@ -207,11 +240,10 @@ async def create_ssh_profile(
     finally:
         if claimed_key_path and not committed:
             store.discard_managed_key(claimed_key_path)
-    if body.key_upload_token:
-        try:
-            store.finalize_upload(body.key_upload_token)
-        except Exception:
-            logger.exception("Failed to finalize a committed managed SSH key upload")
+    try:
+        store.finalize_upload(body.key_upload_token)
+    except Exception:
+        logger.exception("Failed to finalize a committed managed SSH key upload")
     await db.refresh(profile)
     return profile
 
@@ -231,15 +263,10 @@ async def update_ssh_profile(
 ):
     profile = await _live_profile(db, profile_id)
     values = body.model_dump(exclude_unset=True)
-    expected_revision = values.pop("revision")
+    expected_revision = values.pop("expected_revision")
     if profile.revision != expected_revision:
-        raise HTTPException(
-            409,
-            "SSH profile changed; refresh it before saving",
-        )
+        raise HTTPException(409, "SSH profile changed; refresh and retry")
     upload_token = values.pop("key_upload_token", None)
-    if values.get("key_path") is None:
-        values.pop("key_path", None)
     next_task_access_enabled = values.get(
         "task_access_enabled",
         profile.task_access_enabled,
@@ -270,6 +297,31 @@ async def update_ssh_profile(
         except Exception as exc:
             raise _profile_error(exc) from exc
         values["key_path"] = claimed_key_path
+    # Existing external-path Profiles are grandfathered for Files compatibility
+    # because every Task launch snapshots and denies their current path. They
+    # may keep that exact path, but any key rotation must enter the stable
+    # managed root so a newly named Manager credential cannot appear outside a
+    # running sandbox's deny set.
+    if "key_path" in values:
+        try:
+            _require_task_managed_key(
+                store,
+                key_path=values["key_path"],
+            )
+        except BaseException:
+            if claimed_key_path:
+                store.discard_managed_key(claimed_key_path)
+            raise
+    if next_task_access_enabled:
+        try:
+            _require_task_managed_key(
+                store,
+                key_path=values.get("key_path", profile.key_path),
+            )
+        except BaseException:
+            if claimed_key_path:
+                store.discard_managed_key(claimed_key_path)
+            raise
     # An explicitly re-entered key or host key is a re-authorization request,
     # even when its path/value string is unchanged. The file at a stable path
     # may have been rotated outside CCM and must receive a new revision.
@@ -278,11 +330,13 @@ async def update_ssh_profile(
         for field in CONNECTION_IDENTITY_FIELDS - {"key_path", "host_key_value"}
     )
     policy_changed = (
-        values.get("enabled", profile.enabled) != profile.enabled
-        or next_task_access_enabled != profile.task_access_enabled
+        next_task_access_enabled != profile.task_access_enabled
         or next_task_capabilities != profile.task_capabilities
         or values.get("allowed_roots", profile.allowed_roots)
         != profile.allowed_roots
+    )
+    enabled_changed = (
+        "enabled" in values and values["enabled"] != profile.enabled
     )
     if identity_changed:
         try:
@@ -297,37 +351,26 @@ async def update_ssh_profile(
                 store.discard_managed_key(claimed_key_path)
             raise _profile_error(exc) from exc
         values.update(material)
-        values.update({
-            "last_tested_at": None,
-            "last_test_ok": None,
-            "last_error_code": None,
-            "last_error_detail": None,
-        })
-    next_revision = expected_revision
-    if identity_changed or policy_changed:
-        # Grants snapshot this authorization revision. The compare-and-swap
-        # below ensures concurrent security changes cannot both publish N+1.
-        next_revision += 1
-    try:
-        changed = await db.execute(
-            update(SSHProfile)
-            .where(
-                SSHProfile.id == profile_id,
-                SSHProfile.deleted_at.is_(None),
-                SSHProfile.revision == expected_revision,
-            )
-            .values(
-                **values,
-                revision=next_revision,
-                updated_at=datetime.utcnow(),
-            )
-            .execution_options(synchronize_session=False)
+        values.update(
+            last_tested_at=None,
+            last_test_ok=None,
+            last_error_code=None,
+            last_error_detail=None,
         )
-        if changed.rowcount != 1:
+    revision_changed = identity_changed or policy_changed or enabled_changed
+    try:
+        updated = await update_profile_revision_cas(
+            db,
+            profile_id=profile_id,
+            expected_revision=expected_revision,
+            values=values,
+            increment_revision=revision_changed,
+        )
+        if not updated:
             await db.rollback()
             raise HTTPException(
                 409,
-                "SSH profile changed; refresh it before saving",
+                "SSH profile changed; refresh and retry",
             )
         await db.commit()
         committed = True
@@ -342,10 +385,11 @@ async def update_ssh_profile(
             store.finalize_upload(upload_token)
         except Exception:
             logger.exception("Failed to finalize a committed managed SSH key upload")
-    await db.refresh(profile)
-    if old_key_path != profile.key_path:
+    db.expire_all()
+    refreshed = await _live_profile(db, profile_id)
+    if old_key_path != refreshed.key_path:
         await _discard_unreferenced_managed_key(db, store, old_key_path)
-    return profile
+    return refreshed
 
 
 @router.post("/{profile_id}/test", response_model=SSHProfileTestResponse)
@@ -353,68 +397,79 @@ async def test_ssh_profile(
     profile_id: int, db: AsyncSession = Depends(get_db),
 ):
     profile = await _live_profile(db, profile_id)
+    expected_revision = profile.revision
+    tested_at = datetime.utcnow()
     try:
         result = await test_profile(profile)
     except Exception as exc:
         result_error = _profile_error(exc)
-        profile.last_tested_at = datetime.utcnow()
-        profile.last_test_ok = False
         detail = result_error.detail
-        profile.last_error_code = (
+        error_code = (
             detail.get("code") if isinstance(detail, dict) else "connection_failed"
         )
-        profile.last_error_detail = (
+        error_detail = (
             detail.get("message") if isinstance(detail, dict) else str(detail)
         )[:500]
-        await db.commit()
-        return SSHProfileTestResponse(
+        response = SSHProfileTestResponse(
             ok=False,
-            error_code=profile.last_error_code,
-            detail=profile.last_error_detail,
+            error_code=error_code,
+            detail=error_detail,
         )
-    await db.commit()
-    return SSHProfileTestResponse(
-        ok=result.ok,
-        error_code=result.error_code,
-        detail=result.detail,
+        values = {
+            "last_tested_at": tested_at,
+            "last_test_ok": False,
+            "last_error_code": error_code,
+            "last_error_detail": error_detail,
+        }
+    else:
+        response = SSHProfileTestResponse(
+            ok=result.ok,
+            error_code=result.error_code,
+            detail=result.detail,
+        )
+        values = {
+            "last_tested_at": tested_at,
+            "last_test_ok": result.ok,
+            "last_error_code": result.error_code,
+            "last_error_detail": (result.detail or "")[:500] or None,
+        }
+    updated = await update_profile_revision_cas(
+        db,
+        profile_id=profile_id,
+        expected_revision=expected_revision,
+        values=values,
+        increment_revision=False,
     )
+    if not updated:
+        await db.rollback()
+        raise HTTPException(409, "SSH profile changed; refresh and retry")
+    await db.commit()
+    return response
 
 
 @router.delete("/{profile_id}")
 async def delete_ssh_profile(
     profile_id: int,
-    revision: int = Query(ge=1),
+    expected_revision: int = Query(ge=1),
     db: AsyncSession = Depends(get_db),
 ):
     profile = await _live_profile(db, profile_id)
-    if profile.revision != revision:
-        raise HTTPException(
-            409,
-            "SSH profile changed; refresh it before deleting",
-        )
+    if profile.revision != expected_revision:
+        raise HTTPException(409, "SSH profile changed; refresh and retry")
     key_path = profile.key_path
-    deleted_at = datetime.utcnow()
-    changed = await db.execute(
-        update(SSHProfile)
-        .where(
-            SSHProfile.id == profile_id,
-            SSHProfile.deleted_at.is_(None),
-            SSHProfile.revision == revision,
-        )
-        .values(
-            enabled=False,
-            revision=revision + 1,
-            deleted_at=deleted_at,
-            updated_at=deleted_at,
-        )
-        .execution_options(synchronize_session=False)
+    deleted = await update_profile_revision_cas(
+        db,
+        profile_id=profile_id,
+        expected_revision=expected_revision,
+        values={
+            "enabled": False,
+            "deleted_at": datetime.utcnow(),
+        },
+        increment_revision=True,
     )
-    if changed.rowcount != 1:
+    if not deleted:
         await db.rollback()
-        raise HTTPException(
-            409,
-            "SSH profile changed; refresh it before deleting",
-        )
+        raise HTTPException(409, "SSH profile changed; refresh and retry")
     await db.commit()
     await _discard_unreferenced_managed_key(db, _key_store(), key_path)
     return {"ok": True}

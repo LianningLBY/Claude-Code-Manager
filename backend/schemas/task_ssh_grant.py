@@ -5,6 +5,7 @@ from pydantic import BaseModel, Field, field_validator
 
 
 SSHCapability = Literal["exec", "read", "write"]
+TASK_SSH_MAX_EXEC_OUTPUT_BYTES = 64 * 1024
 
 
 class TaskSSHGrantInput(BaseModel):
@@ -47,12 +48,13 @@ class TaskSSHGrantResponse(BaseModel):
 
 
 class TaskSSHExecuteRequest(BaseModel):
+    effect_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     command: str = Field(min_length=1, max_length=32768)
     timeout_seconds: int = Field(default=60, ge=1, le=300)
     max_output_bytes: int = Field(
-        default=1024 * 1024,
+        default=TASK_SSH_MAX_EXEC_OUTPUT_BYTES,
         ge=1024,
-        le=1024 * 1024,
+        le=TASK_SSH_MAX_EXEC_OUTPUT_BYTES,
     )
 
     @field_validator("command")
@@ -64,6 +66,8 @@ class TaskSSHExecuteRequest(BaseModel):
 
 
 class TaskSSHExecuteResponse(BaseModel):
+    effect_id: str
+    replayed: bool = False
     exit_code: int
     stdout: str
     stderr: str
@@ -87,6 +91,7 @@ class TaskSSHReadRequest(TaskSSHPathRequest):
 
 
 class TaskSSHWriteRequest(TaskSSHPathRequest):
+    effect_id: str = Field(pattern=r"^[0-9a-f]{32}$")
     content: str = Field(max_length=1024 * 1024)
     overwrite: bool = False
 
@@ -105,5 +110,7 @@ class TaskSSHReadResponse(BaseModel):
 
 
 class TaskSSHWriteResponse(BaseModel):
+    effect_id: str
+    replayed: bool = False
     path: str
     bytes_written: int

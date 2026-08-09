@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from backend.models.ssh_profile import SSHProfile
 from backend.services.ssh_executor import (
     SSHExecutor,
@@ -18,6 +21,32 @@ CONNECTION_IDENTITY_FIELDS = {
     "key_path",
     "host_key_value",
 }
+
+
+async def update_profile_revision_cas(
+    db: AsyncSession,
+    *,
+    profile_id: int,
+    expected_revision: int,
+    values: dict,
+    increment_revision: bool,
+) -> bool:
+    """Stage one exact-revision Profile mutation in the current transaction."""
+
+    persisted = dict(values)
+    persisted["updated_at"] = datetime.utcnow()
+    if increment_revision:
+        persisted["revision"] = SSHProfile.revision + 1
+    result = await db.execute(
+        update(SSHProfile)
+        .where(
+            SSHProfile.id == profile_id,
+            SSHProfile.revision == expected_revision,
+            SSHProfile.deleted_at.is_(None),
+        )
+        .values(**persisted)
+    )
+    return result.rowcount == 1
 
 
 def validated_profile_material(
@@ -51,9 +80,4 @@ def executor_for_profile(profile: SSHProfile) -> SSHExecutor:
 
 
 async def test_profile(profile: SSHProfile, *, timeout: int = 10):
-    result = await executor_for_profile(profile).probe(timeout=timeout)
-    profile.last_tested_at = datetime.utcnow()
-    profile.last_test_ok = result.ok
-    profile.last_error_code = result.error_code
-    profile.last_error_detail = (result.detail or "")[:500] or None
-    return result
+    return await executor_for_profile(profile).probe(timeout=timeout)

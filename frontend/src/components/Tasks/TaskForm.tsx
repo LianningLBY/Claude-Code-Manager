@@ -576,13 +576,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       }));
 
       if (mode === 'delivery_loop') {
-        if (
-          uploadedPaths.length > 0
-          || selectedSecretIds.length > 0
-          || selectedSSHGrants.length > 0
-        ) {
+        if (uploadedPaths.length > 0 || selectedSecretIds.length > 0) {
           throw new Error(
-            'Delivery Loop V1 does not accept Task attachments, secrets, or SSH grants. '
+            'Delivery Loop V1 does not accept Task attachments or Task secrets. '
             + 'Put durable requirements in the prompt or repository.',
           );
         }

@@ -27,6 +27,9 @@ from backend.models.worker import Worker
 from backend.services.worker_provisioner import WorkerProvisioner
 
 
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+
 async def _insert_worker(session_factory, **fields) -> Worker:
     fields.setdefault("status", "ready")
     fields.setdefault("private_ip", "10.0.0.9")

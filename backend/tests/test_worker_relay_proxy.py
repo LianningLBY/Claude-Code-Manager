@@ -20,6 +20,7 @@ import backend.services.task_events as task_events_module
 import backend.services.worker_proxy as worker_proxy_module
 import backend.services.worker_relay as worker_relay_module
 import backend.services.worker_task_termination as worker_termination_module
+from backend.config import settings
 from backend.models.log_entry import LogEntry
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
@@ -68,6 +69,59 @@ def broadcaster():
 def relay(db_factory, broadcaster):
     r = WorkerRelay(db_factory=db_factory, broadcaster=broadcaster)
     return r
+
+
+def test_worker_proxy_network_boundaries_require_manager_auth(monkeypatch):
+    worker = SimpleNamespace(
+        auth_token="worker-token",
+        private_ip="10.0.0.8",
+        ssh_user="ubuntu",
+        ssh_key_path="/unused/key",
+        cloud_instance_id="i-auth-gate",
+    )
+    monkeypatch.setattr(settings, "auth_token", "")
+
+    with pytest.raises(HTTPException) as headers_error:
+        WorkerProxy._headers(worker)
+    with pytest.raises(HTTPException) as ssh_error:
+        WorkerProxy._ssh(worker)
+
+    assert headers_error.value.status_code == 503
+    assert ssh_error.value.status_code == 503
+    assert "AUTH_TOKEN" in headers_error.value.detail
+
+
+def test_worker_proxy_rejects_missing_worker_credential(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "manager-token")
+    worker = SimpleNamespace(auth_token="   ")
+
+    with pytest.raises(HTTPException) as exc_info:
+        WorkerProxy._headers(worker)
+
+    assert exc_info.value.status_code == 503
+    assert "Worker authentication" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_worker_relay_refuses_network_without_manager_auth(
+    relay,
+    monkeypatch,
+):
+    worker = SimpleNamespace(
+        id=81,
+        private_ip="10.0.0.81",
+        ccm_port=8002,
+        auth_token="worker-token",
+    )
+    connect = AsyncMock()
+    monkeypatch.setattr(settings, "auth_token", "")
+    monkeypatch.setattr(worker_relay_module.websockets, "connect", connect)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await relay.ensure_connection(worker)
+
+    assert exc_info.value.status_code == 503
+    connect.assert_not_awaited()
 
 
 async def test_concurrent_worker_connection_admission_creates_one_transport(
@@ -288,6 +342,10 @@ async def test_worker_relay_start_requires_completed_clean_shutdown(relay):
 
 
 async def _mk_worker(session_factory, **fields) -> Worker:
+    # A ready Worker is meaningful only behind an authenticated Manager
+    # control plane. Individual fail-closed tests explicitly clear this after
+    # constructing their durable fixture.
+    settings.auth_token = "manager-worker-test-token"
     fields.setdefault("name", "w1")
     fields.setdefault("status", "ready")
     fields.setdefault("private_ip", "10.0.0.9")
@@ -948,6 +1006,7 @@ def test_worker_proxy_ssh_is_scoped_to_cloud_instance(monkeypatch):
         ssh_user="ubuntu",
         ssh_key_path="/tmp/worker-key",
         cloud_instance_id="i-worker-proxy",
+        auth_token="worker-token",
     )
 
     proxy._ssh(worker)
@@ -5280,6 +5339,40 @@ async def test_dispatch_worker_tasks_forwards(db_factory, session_factory, broad
     assert resulting.status == "executing"
 
 
+async def test_dispatch_worker_tasks_without_auth_keeps_pending_and_never_posts(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(settings, "auth_token", "")
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.turn_generation == task.turn_generation
+        assert current.started_at == task.started_at
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
 async def test_dispatch_worker_tasks_fail_closes_unproven_plan_before_post(
     db_factory,
     session_factory,
@@ -5636,6 +5729,71 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
         and event.get("status") == "failed"
         for channel, event in broadcaster.sent
     )
+
+
+async def test_dispatch_worker_plan_without_auth_keeps_queued_without_receipt(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Unauthenticated Worker Plan",
+            initial_request="Plan it",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan it",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(settings, "auth_token", "   ")
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+
+    async with session_factory() as db:
+        current = await db.get(PlanAgentRun, run_id)
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentWorkerDispatchReceipt).where(
+                        PlanAgentWorkerDispatchReceipt.run_id == run_id
+                    )
+                )
+            ).scalars()
+        )
+        assert current.status == "queued"
+        assert current.last_execution_started_at is None
+        assert receipts == []
+    proxy.run_versioned_plan_until_pause.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
 
 
 async def test_dispatch_worker_claim_rejects_same_worker_pending_retry_aba(

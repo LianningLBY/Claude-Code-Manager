@@ -1,19 +1,26 @@
 from __future__ import annotations
 
+import json
 import os
+import secrets
+import stat
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
+from backend.models.global_settings import GlobalSettings
+from backend.models.project import Project
 from backend.models.ssh_profile import SSHProfile
 from backend.models.task import Task
 from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.schemas.task_ssh_grant import TaskSSHGrantInput
 from backend.services.skill_context import is_worker_managed_task_metadata
+from backend.services.ssh_key_store import SSHManagedKeyStore, SSHManagedKeyStoreError
 
 
 class TaskSSHAccessError(ValueError):
@@ -23,19 +30,36 @@ class TaskSSHAccessError(ValueError):
         self.detail = detail
 
 
-def _require_managed_ssh_auth() -> None:
-    if not settings.auth_token:
-        raise TaskSSHAccessError(
-            503,
-            "Managed SSH requires AUTH_TOKEN authentication to be configured",
-        )
-
-
 @dataclass(frozen=True)
 class PreparedTaskSSHGrant:
     profile_id: int
     profile_revision: int
     capabilities: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class TaskSSHRuntimePolicy:
+    """Launch-time SSH policy derived from every durable grant row.
+
+    ``broker_only`` deliberately does not mean "has a currently valid grant".
+    Once a Task has any durable grant row, a stale/disabled/shared Profile must
+    not silently restore ambient Git credentials or direct networking. Valid
+    capabilities control only which broker MCP tools can be exposed.
+    """
+
+    broker_only: bool
+    capabilities: frozenset[str]
+
+
+def _profile_uses_task_managed_key(profile: SSHProfile) -> bool:
+    """Fail closed unless a Task-capable Profile key is in the managed root."""
+
+    try:
+        return SSHManagedKeyStore(
+            settings.ssh_key_storage_dir,
+        ).is_task_managed_path(profile.key_path)
+    except (OSError, TypeError, ValueError, SSHManagedKeyStoreError):
+        return False
 
 
 def task_ssh_policy_context(capabilities: Iterable[str]) -> str:
@@ -81,35 +105,107 @@ def _protected_path_variants(value: str | Path) -> set[str]:
     return variants
 
 
-async def task_ssh_protected_paths(
-    db: AsyncSession,
+def _configured_pool_home_roots(
+    config_path: str | Path,
     *,
-    extra_paths: Iterable[str | Path] = (),
-) -> tuple[str, ...]:
-    """Return local credential paths that Task tools must never read.
+    home_field: str,
+) -> set[str]:
+    """Return every durable pool home, failing closed on malformed inventory.
 
-    Include every Profile key, rather than only keys granted to the current
-    Task: an ungranted key is exactly the credential an ambient shell must not
-    discover.  The parent ``~/.ssh`` and CCM-managed storage roots also cover
-    history/config files and keys that have not yet been imported as Profiles.
+    Disabled and retired accounts still contain provider credentials/session
+    evidence, so their custom homes remain Manager-secret roots.  Read the
+    entire authoritative config on every isolation snapshot: a bad record must
+    never make later records disappear from the deny set or let a recovered
+    Task fall back to ambient host reads.
     """
 
+    config = Path(
+        os.path.abspath(
+            os.path.expandvars(os.path.expanduser(os.fspath(config_path)))
+        )
+    )
+    values = _protected_path_variants(config.parent)
+    try:
+        info = config.lstat()
+    except FileNotFoundError:
+        return values
+    except OSError as exc:
+        raise TaskSSHAccessError(
+            503,
+            "Provider account inventory is unavailable for Task isolation",
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise TaskSSHAccessError(
+            503,
+            "Provider account inventory is unsafe for Task isolation",
+        )
+    try:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        accounts = payload.get("accounts") if isinstance(payload, dict) else None
+        if not isinstance(accounts, list):
+            raise ValueError("accounts must be a list")
+        raw_homes: list[str] = []
+        for account in accounts:
+            if not isinstance(account, dict):
+                raise ValueError("account must be an object")
+            raw_home = account.get(home_field)
+            if not isinstance(raw_home, str) or not raw_home.strip():
+                raise ValueError(f"account {home_field} must be a path")
+            expanded = os.path.expandvars(os.path.expanduser(raw_home.strip()))
+            if not os.path.isabs(expanded):
+                raise ValueError(f"account {home_field} must be absolute")
+            raw_homes.append(expanded)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise TaskSSHAccessError(
+            503,
+            "Provider account inventory is invalid for Task isolation",
+        ) from exc
+    for home in raw_homes:
+        values.update(_protected_path_variants(home))
+    return values
+
+
+def task_git_non_overridable_paths(
+    *extra_paths: str | Path,
+) -> tuple[str, ...]:
+    """Return Manager-secret boundaries an exact Git allow may never reopen."""
+
+    home = Path.home()
     values: set[str] = set()
-    values.update(_protected_path_variants(Path.home() / ".ssh"))
-    values.update(_protected_path_variants(Path.home() / ".claude"))
-    values.update(_protected_path_variants(Path.home() / ".codex"))
-    values.update(_protected_path_variants(Path.home() / ".claude-pool"))
-    values.update(_protected_path_variants(Path.home() / ".codex-pool"))
-    values.update(_protected_path_variants(Path.home() / ".ccm"))
-    values.update(_protected_path_variants(settings.pool_config_path))
-    values.update(_protected_path_variants(settings.codex_pool_config_path))
-    values.update(_protected_path_variants(settings.ssh_key_storage_dir))
-    values.update(_protected_path_variants(settings.cloudrouter_accounts_dir))
-    values.update(_protected_path_variants(settings.task_runtime_secret_dir))
+    from backend.services.trusted_runtime import (
+        trusted_runtime_protected_roots,
+    )
+
+    for value in (
+        home / ".claude",
+        home / ".codex",
+        home / ".claude-pool",
+        home / ".codex-pool",
+        home / ".ccm",
+        settings.ssh_key_storage_dir,
+        settings.cloudrouter_accounts_dir,
+        settings.task_runtime_secret_dir,
+        Path(__file__).resolve().parent.parent.parent / ".env",
+        *trusted_runtime_protected_roots(),
+        *extra_paths,
+    ):
+        values.update(_protected_path_variants(value))
+    values.update(_configured_pool_home_roots(
+        settings.pool_config_path,
+        home_field="config_dir",
+    ))
+    values.update(_configured_pool_home_roots(
+        settings.codex_pool_config_path,
+        home_field="codex_home",
+    ))
     if settings.worker_ssh_key_path:
         values.update(_protected_path_variants(settings.worker_ssh_key_path))
-    manager_env = Path(__file__).resolve().parent.parent.parent / ".env"
-    values.update(_protected_path_variants(manager_env))
+    for backup_path in (
+        settings.backup_temp_dir,
+        settings.backup_destination_path,
+    ):
+        if backup_path:
+            values.update(_protected_path_variants(backup_path))
     try:
         from sqlalchemy.engine import make_url
 
@@ -128,15 +224,133 @@ async def task_ssh_protected_paths(
                     _protected_path_variants(f"{sqlite_path}{suffix}")
                 )
     except (TypeError, ValueError):
-        # A malformed database URL will fail application startup separately.
-        # Do not let path discovery broaden a Task permission profile.
+        # Startup reports malformed database configuration separately. Keep
+        # the allow-list narrow rather than guessing a path here.
         pass
+    return tuple(sorted(values))
+
+
+def manager_secret_protected_paths(
+    *extra_paths: str | Path,
+) -> tuple[str, ...]:
+    """Provider-neutral alias for every stable Manager secret boundary."""
+
+    return task_git_non_overridable_paths(*extra_paths)
+
+
+async def task_ssh_protected_paths(
+    db: AsyncSession,
+    *,
+    task: Task | None = None,
+    working_directory: str | Path | None = None,
+    extra_paths: Iterable[str | Path] = (),
+    include_direct_git_credentials: bool = False,
+    allowed_credential_paths: Iterable[str | Path] = (),
+) -> tuple[str, ...]:
+    """Return local credential paths that Task tools must never read.
+
+    Include every Profile key, rather than only keys granted to the current
+    Task: an ungranted key is exactly the credential an ambient shell must not
+    discover.  The parent ``~/.ssh`` and CCM-managed storage roots also cover
+    history/config files and keys that have not yet been imported as Profiles.
+    """
+
+    values: set[str] = set(task_git_non_overridable_paths(*extra_paths))
+    home = Path.home()
+    allowed_variants: set[str] = set()
+    for allowed_path in allowed_credential_paths:
+        allowed_variants.update(_protected_path_variants(allowed_path))
     key_paths = (await db.execute(select(SSHProfile.key_path))).scalars()
     for key_path in key_paths:
         if key_path:
-            values.update(_protected_path_variants(key_path))
-    for extra_path in extra_paths:
-        values.update(_protected_path_variants(extra_path))
+            key_variants = _protected_path_variants(key_path)
+            # Ordinary Tasks retain an explicitly selected Project/global Git
+            # credential even when the same external file is also registered
+            # as a Profile. This exemption is exact only: stable Manager roots
+            # (notably SSH_KEY_STORAGE_DIR) remain denied below/above it.
+            if key_variants and key_variants.issubset(allowed_variants):
+                continue
+            values.update(key_variants)
+
+    # Every Task denies stable ambient credential roots. Ordinary Tasks may
+    # re-allow only their exact, explicitly selected Git key/askpass file in
+    # the provider permission profile; parent roots stay denied so keys or
+    # helpers created after this snapshot cannot become visible.
+    values.update(_protected_path_variants(home / ".ssh"))
+    values.update(_protected_path_variants(home / ".git-credentials"))
+    values.update(_protected_path_variants(home / ".gitconfig"))
+    values.update(_protected_path_variants(home / ".netrc"))
+    default_config_home = home / ".config"
+    default_data_home = home / ".local" / "share"
+    for root in (default_config_home, default_data_home):
+        values.update(_protected_path_variants(root / "git"))
+        values.update(_protected_path_variants(root / "gh"))
+    for env_name in ("XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+        configured_root = os.environ.get(env_name)
+        if configured_root:
+            values.update(
+                _protected_path_variants(Path(configured_root) / "git")
+            )
+            values.update(
+                _protected_path_variants(Path(configured_root) / "gh")
+            )
+    for env_name in (
+        "GIT_CONFIG_GLOBAL",
+        "GH_CONFIG_DIR",
+        "NETRC",
+        "GIT_ASKPASS",
+        "SSH_ASKPASS",
+        "GIT_SSH",
+    ):
+        configured_path = os.environ.get(env_name)
+        if configured_path and configured_path != os.devnull:
+            values.update(_protected_path_variants(configured_path))
+    values.update(
+        _protected_path_variants(
+            Path(tempfile.gettempdir()) / "claude-manager-askpass"
+        )
+    )
+    if settings.git_ssh_key_path:
+        values.update(_protected_path_variants(settings.git_ssh_key_path))
+
+    global_settings = await db.get(GlobalSettings, 1)
+    if global_settings and global_settings.git_ssh_key_path:
+        values.update(
+            _protected_path_variants(global_settings.git_ssh_key_path)
+        )
+
+    repository_paths: list[str | Path] = []
+    if working_directory:
+        repository_paths.append(working_directory)
+    if task is not None and task.project_id is not None:
+        project = await db.get(Project, task.project_id)
+        if project is not None:
+            if project.git_ssh_key_path:
+                values.update(
+                    _protected_path_variants(project.git_ssh_key_path)
+                )
+            if project.local_path:
+                repository_paths.append(project.local_path)
+    for repository_path in repository_paths:
+        root = Path(
+            os.path.expandvars(
+                os.path.expanduser(os.fspath(repository_path))
+            )
+        )
+        if not root.is_absolute():
+            root = Path.cwd() / root
+        # projects._apply_git_config writes the HTTPS token here and points
+        # the local credential.helper at it. Protect both the configured
+        # checkout and the exact runtime worktree/cwd candidate.
+        values.update(
+            _protected_path_variants(root / ".git" / "credentials")
+        )
+
+    # Exact provider allowRead rules, not path omission, preserve the selected
+    # ordinary Git credential beneath a denied parent. Removing only the exact
+    # duplicate here avoids contradictory same-path deny/read entries; every
+    # parent/root and all sibling credentials remain denied.
+    values.difference_update(allowed_variants)
     return tuple(sorted(values))
 
 
@@ -260,7 +474,11 @@ async def prepare_task_ssh_grants(
     ]
     if not parsed:
         return []
-    _require_managed_ssh_auth()
+    if not settings.auth_token:
+        raise TaskSSHAccessError(
+            503,
+            "Managed SSH requires AUTH_TOKEN to be configured",
+        )
     if project_id is not None:
         # Serialize Task creation-with-grants against both team and outbound
         # Project sharing. Existing Task grant replacement instead locks the
@@ -312,6 +530,12 @@ async def prepare_task_ssh_grants(
             raise TaskSSHAccessError(
                 409,
                 f"SSH profile {value.profile_id} is available only in Files",
+            )
+        if not _profile_uses_task_managed_key(profile):
+            raise TaskSSHAccessError(
+                409,
+                f"SSH profile {value.profile_id} must rotate its private key "
+                "into CCM managed storage before Tasks may use it",
             )
         disallowed = set(value.capabilities) - set(profile.task_capabilities or [])
         if disallowed:
@@ -368,6 +592,8 @@ def _invalid_reason(
         return "profile_disabled"
     if not profile.task_access_enabled:
         return "profile_task_access_disabled"
+    if not _profile_uses_task_managed_key(profile):
+        return "profile_key_not_managed"
     if not set(grant.capabilities or []).issubset(
         set(profile.task_capabilities or [])
     ):
@@ -431,6 +657,7 @@ async def replace_task_ssh_grants(
     *,
     created_by: int | None,
 ) -> list[dict]:
+    requested_inputs = list(inputs)
     task_id = task.id
     # Project sharing takes Project -> Task locks. Preserve that global order
     # here so a grant replacement cannot deadlock against a concurrent share.
@@ -444,11 +671,22 @@ async def replace_task_ssh_grants(
         )
         if locked_project_id is None:
             raise TaskSSHAccessError(404, "Project not found")
-    locked_task = (
-        await db.execute(
-            select(Task).where(Task.id == task_id).with_for_update()
+    # ``FOR UPDATE`` is ignored by SQLite.  This exact-row no-op UPDATE is a
+    # portable writer fence shared with Monitor/Sub-Agent admission and Task
+    # lifecycle writers: whichever transaction wins is visible to the loser
+    # after it waits.  It also prevents delete/import of the same integer id
+    # from crossing this replacement transaction.
+    fenced = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task_id,
+            Task.incarnation_id == task.incarnation_id,
         )
-    ).scalar_one_or_none()
+        .values(status=Task.status)
+    )
+    if fenced.rowcount != 1:
+        raise TaskSSHAccessError(404, "Task not found")
+    locked_task = await db.get(Task, task_id, populate_existing=True)
     if locked_task is None:
         raise TaskSSHAccessError(404, "Task not found")
     if locked_task.project_id != task.project_id:
@@ -456,15 +694,67 @@ async def replace_task_ssh_grants(
             409,
             "Task Project changed while SSH grants were being updated; retry",
         )
+    if requested_inputs:
+        if locked_task.status in {
+            "in_progress",
+            "executing",
+            "merging",
+            "migrating",
+            "waiting_capability",
+        } or locked_task.instance_id is not None:
+            raise TaskSSHAccessError(
+                409,
+                "Managed SSH grants cannot be added while the Task has an "
+                "active execution generation",
+            )
+
+        from backend.models.instance import Instance
+
+        reverse_owner_id = await db.scalar(
+            select(Instance.id)
+            .where(Instance.current_task_id == task_id)
+            .limit(1)
+        )
+        if reverse_owner_id is not None:
+            raise TaskSSHAccessError(
+                409,
+                "Managed SSH grants cannot be added while an Instance still "
+                "owns the Task",
+            )
+
+        from backend.models.sub_agent import SubAgentSession
+
+        running_child_id = await db.scalar(
+            select(SubAgentSession.id)
+            .where(
+                SubAgentSession.task_id == task_id,
+                SubAgentSession.status == "running",
+            )
+            .limit(1)
+        )
+        if running_child_id is not None:
+            raise TaskSSHAccessError(
+                409,
+                "Managed SSH grants cannot be added while a Monitor or "
+                "Sub-Agent is running",
+            )
+
     prepared = await prepare_task_ssh_grants(
         db,
-        inputs,
+        requested_inputs,
         worker_id=locked_task.worker_id,
         shared_from_id=locked_task.shared_from_id,
         metadata=locked_task.metadata_,
         task_id=locked_task.id,
         project_id=locked_task.project_id,
     )
+    if prepared and locked_task.incarnation_id is None:
+        # Delivery's incarnation migration deliberately leaves upgraded Task
+        # rows nullable. Managed SSH credentials, however, are bound to the
+        # exact incarnation and must remain invalid after Task-id reuse or a
+        # Manager restart. Upgrade the legacy row while its Task lock is held
+        # and commit the identity together with the grants.
+        locked_task.incarnation_id = secrets.token_hex(16)
     await db.execute(
         delete(TaskSSHGrant).where(TaskSSHGrant.task_id == task_id)
     )
@@ -488,7 +778,11 @@ async def resolve_task_ssh_profile(
     profile_id: int,
     required_capability: str,
 ) -> SSHProfile:
-    _require_managed_ssh_auth()
+    if not settings.auth_token:
+        raise TaskSSHAccessError(
+            503,
+            "Managed SSH requires AUTH_TOKEN to be configured",
+        )
     task = await db.get(Task, task_id)
     if task is None:
         raise TaskSSHAccessError(404, "Task not found")
@@ -546,33 +840,40 @@ async def valid_task_ssh_capabilities(
     db: AsyncSession,
     task: Task,
 ) -> set[str]:
+    return set((await task_ssh_runtime_policy(db, task)).capabilities)
+
+
+async def task_ssh_runtime_policy(
+    db: AsyncSession,
+    task: Task,
+) -> TaskSSHRuntimePolicy:
+    """Return the fail-closed launch policy for one Task snapshot."""
+
+    rows = (await db.execute(
+        select(TaskSSHGrant, SSHProfile)
+        .join(SSHProfile, SSHProfile.id == TaskSSHGrant.ssh_profile_id)
+        .where(TaskSSHGrant.task_id == task.id)
+    )).all()
+    broker_only = bool(rows)
+    # AUTH_TOKEN is also the root from which route-scoped broker credentials
+    # are derived. Legacy open mode cannot authenticate that broker, so never
+    # materialize a Manager-held private-key capability into an agent turn.
     if not settings.auth_token:
-        return set()
+        return TaskSSHRuntimePolicy(broker_only, frozenset())
     if task_ssh_scope_invalid_reason(
         worker_id=task.worker_id,
         shared_from_id=task.shared_from_id,
         metadata=task.metadata_,
     ) is not None:
-        return set()
+        return TaskSSHRuntimePolicy(broker_only, frozenset())
     sharing_reason = await task_ssh_sharing_invalid_reason(
         db,
         task_id=task.id,
         project_id=task.project_id,
     )
     if sharing_reason is not None:
-        return set()
-    rows = (await db.execute(
-        select(TaskSSHGrant, SSHProfile)
-        .join(SSHProfile, SSHProfile.id == TaskSSHGrant.ssh_profile_id)
-        .where(
-            TaskSSHGrant.task_id == task.id,
-            TaskSSHGrant.profile_revision == SSHProfile.revision,
-            SSHProfile.enabled.is_(True),
-            SSHProfile.task_access_enabled.is_(True),
-            SSHProfile.deleted_at.is_(None),
-        )
-    )).all()
-    return {
+        return TaskSSHRuntimePolicy(broker_only, frozenset())
+    capabilities = {
         capability
         for grant, profile in rows
         if _invalid_reason(
@@ -584,6 +885,7 @@ async def valid_task_ssh_capabilities(
         for capability in (grant.capabilities or [])
         if capability in {"exec", "read", "write"}
     }
+    return TaskSSHRuntimePolicy(broker_only, frozenset(capabilities))
 
 
 async def task_has_valid_ssh_grants(

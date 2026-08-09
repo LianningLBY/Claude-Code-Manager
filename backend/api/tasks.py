@@ -52,6 +52,10 @@ from backend.services.pr_review_runtime import (
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
+from backend.services.skill_tool_rpc import (
+    SKILL_TOOL_RPC_NAMES,
+    execute_skill_tool_rpc,
+)
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
     _finish_despite_cancellation as _finish_task_operation,
@@ -110,9 +114,11 @@ from backend.services.auto_capability_policy import (
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
+    internal_task_incarnation_id,
     is_admin,
     require_admin,
     require_internal_service,
+    require_internal_task_incarnation,
     require_project_access,
     require_task_access,
     require_task_control,
@@ -126,6 +132,23 @@ _WORKER_ROUTING_CONFIG_FIELDS = frozenset({"provider", "model", "codex_service_t
 _WORKER_SKILL_CONFIG_FIELDS = frozenset(
     {"enabled_skills", "selected_user_skills", "metadata_"}
 )
+
+
+class InternalSkillToolCall(BaseModel):
+    """Strict payload accepted only from the frozen task Skills MCP wrapper."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal[
+        "ccm_command_help",
+        "ccm_read_skill",
+        "ccm_read_user_skill",
+        "ccm_create_skill",
+        "ccm_distill",
+        "ccm_enable_skill",
+        "ccm_disable_skill",
+    ]
+    arguments: dict = Field(default_factory=dict)
 _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
     {"worker_id", "project_id", "target_repo"}
 )
@@ -757,6 +780,11 @@ async def create_task(
         # Task id.  Letting an ordinary JWT caller choose it makes identifier
         # reuse and cross-node identity collisions externally controllable.
         require_internal_service(request)
+    elif body.source_incarnation_id is not None:
+        raise HTTPException(
+            422,
+            "source_incarnation_id requires internal explicit-id forwarding",
+        )
     if body.mode == "plan":
         raise HTTPException(
             410,
@@ -771,6 +799,9 @@ async def create_task(
     if body.secret_ids:
         require_admin(request)
     if body.ssh_grants:
+        from backend.api.deps import require_managed_ssh_auth_configured
+
+        require_managed_ssh_auth_configured()
         require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
@@ -1413,6 +1444,7 @@ async def get_task(
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_internal_task_incarnation(request, task_id, db)
     await require_task_access(request, task, db)
     return task
 
@@ -2508,6 +2540,10 @@ async def _update_worker_task_with_skill_configuration(
             updated = await queue.update_task(
                 task_id,
                 operation_lock_held=True,
+                expected_incarnation_id=internal_task_incarnation_id(
+                    request,
+                    task_id,
+                ),
                 **updates,
             )
         except (
@@ -2548,6 +2584,10 @@ async def _update_worker_task_with_handoff_fence(
             updated = await queue.update_task(
                 task_id,
                 operation_lock_held=True,
+                expected_incarnation_id=internal_task_incarnation_id(
+                    request,
+                    task_id,
+                ),
                 **updates,
             )
         except (
@@ -2809,7 +2849,14 @@ async def update_task(
             )
         )
     try:
-        task = await queue.update_task(task_id, **updates)
+        task = await queue.update_task(
+            task_id,
+            expected_incarnation_id=internal_task_incarnation_id(
+                request,
+                task_id,
+            ),
+            **updates,
+        )
     except (
         DurableWorkerTerminationConflict,
         TaskWaitingCapabilityConflict,
@@ -2833,12 +2880,58 @@ async def update_task_enabled_skills_internal(
     """Apply only the skill toggle exposed to the scoped skills MCP."""
 
     require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
     return await update_task(
         task_id,
         TaskUpdate(enabled_skills=body.enabled_skills),
         request,
         queue,
     )
+
+
+@router.post("/{task_id}/internal/skill-tools")
+async def execute_task_skill_tool_internal(
+    task_id: int,
+    body: InternalSkillToolCall,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Execute the privileged half of one frozen Skills MCP tool call."""
+
+    require_internal_service(request)
+    task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
+    # Keep the runtime allow-list duplicated at the typed HTTP boundary so a
+    # future schema edit cannot silently broaden the Manager effect surface.
+    if body.tool not in SKILL_TOOL_RPC_NAMES:
+        raise HTTPException(400, "Unsupported CCM skill tool")
+    if task is None:
+        task = await queue.get(task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    outcome = await execute_skill_tool_rpc(
+        task,
+        body.tool,
+        body.arguments,
+        queue.db,
+    )
+    if outcome.enabled_skills is not None:
+        await update_task(
+            task_id,
+            TaskUpdate(enabled_skills=outcome.enabled_skills),
+            request,
+            queue,
+        )
+    return {"result": outcome.result}
 
 
 async def _settle_task_launch_barrier(

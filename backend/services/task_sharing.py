@@ -89,13 +89,15 @@ async def share_task(
         raise ValueError(f"Task {task_id} not found")
     if not await lock_task_share_authority(db, task):
         raise ValueError(f"Task {task_id} changed while sharing")
-    blocked = _writable_share_block_reason(task)
-    if blocked is not None:
-        raise ValueError(blocked)
     from backend.services.task_ssh_access import task_has_any_ssh_grants
 
     if await task_has_any_ssh_grants(db, task_id):
-        raise ValueError("Remove this Task's SSH grants before sharing it")
+        raise ValueError(
+            "Remove this Task's SSH grants before sharing it"
+        )
+    blocked = _writable_share_block_reason(task)
+    if blocked is not None:
+        raise ValueError(blocked)
 
     identity = await _get_my_identity(db)
     if not identity:

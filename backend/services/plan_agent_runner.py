@@ -936,6 +936,7 @@ def _build_command(
     model: str,
     effort: str | None,
     schema: dict,
+    isolation_settings_path: str,
 ) -> list[str]:
     if provider != "claude":
         raise ValueError(
@@ -956,8 +957,15 @@ def _build_command(
         "--strict-mcp-config",
         "--mcp-config",
         '{"mcpServers":{}}',
+        "--settings",
+        isolation_settings_path,
+        "--setting-sources",
+        "",
+        "--no-chrome",
         "--tools",
-        "Read,Grep,Glob",
+        "Glob,Grep,Read",
+        "--allowedTools",
+        "Glob,Grep,Read",
         "--disallowed-tools",
         "Bash,Edit,Write,NotebookEdit,Agent,Task,Monitor,WebFetch,WebSearch",
         "--json-schema",
@@ -1372,6 +1380,7 @@ class PlanAgentRunner:
         delta_idle_timeout: float | None = None,
         json_whitespace_limit: int | None = None,
         runtime_receipt=None,
+        protected_paths: tuple[str, ...] = (),
     ) -> tuple[bytes, bytes, int]:
         registry = self.instance_manager._ensure_codex_app_server_registry()
         process = None
@@ -1425,6 +1434,8 @@ class PlanAgentRunner:
                     skill_context="",
                     codex_service_tier="default",
                     sandbox_mode="read-only",
+                    task_ssh_protected_paths=protected_paths,
+                    task_ssh_disable_network=True,
                     disable_autonomous_features=True,
                     output_schema=schema,
                     on_thread_started=(
@@ -1758,11 +1769,11 @@ class PlanAgentRunner:
         step_type: str | None,
         runtime_receipt: RuntimeReceiptSnapshot | None,
     ) -> tuple[dict, str]:
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if key.upper() not in {"CLAUDECODE", "CLAUDE_CODE"}
-        }
+        from backend.services.task_agent_isolation import (
+            scrub_task_model_environment,
+        )
+
+        env = scrub_task_model_environment(os.environ, provider=provider)
         async with self._runtime_admission(
             provider=provider,
             home=home,
@@ -1783,6 +1794,21 @@ class PlanAgentRunner:
                     env.pop(key, None)
             if runtime_receipt is not None:
                 env.update(runtime_token_environment(runtime_receipt))
+
+            from backend.services.task_ssh_access import (
+                task_ssh_protected_paths,
+            )
+
+            async with self.db_factory() as isolation_db:
+                parent_task = await isolation_db.get(Task, task_id)
+                protected_paths = await task_ssh_protected_paths(
+                    isolation_db,
+                    task=parent_task,
+                    working_directory=cwd,
+                    extra_paths=(
+                        () if not admitted_home else (admitted_home,)
+                    ),
+                )
 
             if provider == "codex":
                 if not settings.codex_app_server_enabled:
@@ -1815,6 +1841,7 @@ class PlanAgentRunner:
                             settings.plan_structured_output_whitespace_limit
                         ),
                         runtime_receipt=runtime_receipt,
+                        protected_paths=protected_paths,
                     )
                 except CodexAppServerBusyError as exc:
                     raise PlanRouteUnavailable(
@@ -1860,11 +1887,31 @@ class PlanAgentRunner:
                     ) from exc
                 return structured, content
 
+            from backend.services.task_agent_isolation import (
+                CLAUDE_READ_ONLY_BUILTIN_TOOLS,
+                generate_claude_read_only_isolation_settings,
+                validate_claude_task_isolation_settings,
+            )
+
+            isolation_identifier = step_id or task_id
+            isolation_path = generate_claude_read_only_isolation_settings(
+                "plan",
+                isolation_identifier,
+                protected_paths,
+            )
+            await asyncio.to_thread(
+                validate_claude_task_isolation_settings,
+                isolation_path,
+                claude_binary=settings.claude_binary,
+                tools=CLAUDE_READ_ONLY_BUILTIN_TOOLS,
+                include_mcp_tools=False,
+            )
             command = _build_command(
                 provider=provider,
                 model=model,
                 effort=effort,
                 schema=schema,
+                isolation_settings_path=str(isolation_path),
             )
             process = None
             token = None

@@ -44,6 +44,9 @@ from backend.services.ssh_executor import SSHExecutor, SSHKeyMaterial
 from backend.services.ssh_executor import SSHKeyPreflightError
 
 
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+
 # === Fixtures ===
 
 
@@ -102,6 +105,75 @@ class FakeCloud:
 
 
 # === API tests ===
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("GET", "/api/workers", None),
+        ("POST", "/api/workers", {"name": "blocked"}),
+        ("GET", "/api/workers/1", None),
+        ("GET", "/api/workers/1/logs", None),
+        ("POST", "/api/workers/1/stop", None),
+        ("POST", "/api/workers/1/start", None),
+        ("POST", "/api/workers/1/destroy", None),
+        ("POST", "/api/workers/1/retry", None),
+        ("GET", "/api/workers/1/pool", None),
+        ("POST", "/api/workers/1/pool/add", {}),
+        ("GET", "/api/workers/1/pool/add/user%40example.com", None),
+        ("POST", "/api/workers/1/pool/login-attempts/a/otp", {}),
+        ("DELETE", "/api/workers/1/pool/login-attempts/a", None),
+        ("DELETE", "/api/workers/1/pool/codex-1", None),
+        ("GET", "/api/workers/1/pool/usage", None),
+        ("GET", "/api/workers/1/settings/runtime", None),
+        ("PUT", "/api/workers/1/settings/runtime", {}),
+        ("PATCH", "/api/workers/1/rename", {"name": "blocked"}),
+        ("PUT", "/api/workers/1/assign", {"owner_user_id": None}),
+    ],
+)
+async def test_worker_control_plane_routes_fail_closed_without_auth_token(
+    client,
+    session_factory,
+    fake_provisioner,
+    monkeypatch,
+    method,
+    path,
+    payload,
+):
+    monkeypatch.setattr(settings, "auth_token", "")
+
+    response = await client.request(method, path, json=payload)
+
+    assert response.status_code == 503, response.text
+    assert response.json() == {
+        "detail": "Worker control plane requires AUTH_TOKEN to be configured"
+    }
+    async with session_factory() as db:
+        assert (await db.execute(text("SELECT COUNT(*) FROM workers"))).scalar() == 0
+    fake_provisioner.create_worker.assert_not_called()
+    fake_provisioner.cloud.assert_not_called()
+
+
+async def test_worker_background_paths_fail_closed_without_auth_token(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_token", "")
+    db_factory = Mock(side_effect=AssertionError("must not open Worker DB"))
+    cloud = AsyncMock()
+    relay = AsyncMock()
+    provisioner = WorkerProvisioner(db_factory, cloud=cloud, relay=relay)
+    monkeypatch.setattr(main_module, "async_session", db_factory)
+    monkeypatch.setattr(main_module, "worker_relay", relay)
+
+    await main_module._recover_stale_worker_lifecycles()
+    await main_module._recover_worker_relays()
+    await provisioner.health_check_loop(interval=0)
+    with pytest.raises(RuntimeError, match="AUTH_TOKEN"):
+        await provisioner.create_worker(1)
+
+    db_factory.assert_not_called()
+    relay.assert_not_awaited()
+    cloud.assert_not_awaited()
 
 
 async def test_list_workers_empty(client):
@@ -1885,6 +1957,7 @@ async def test_provisioner_system_init_installs_codex_and_login_runtime(
     assert '@openai/codex@$CODEX_CLI_VERSION' in script
     assert '"codex-cli $CODEX_CLI_VERSION"' in script
     assert "xvfb xauth xdotool" in script
+    assert "bubblewrap socat" in script
     assert "149.0.7827.53-1" in script
     assert "google-chrome-stable_current" not in script
 

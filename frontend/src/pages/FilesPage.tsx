@@ -4,7 +4,7 @@ import {
   AlertCircle, Loader2, Plus, Trash2, Server, HardDrive, Download, Upload,
   GitBranch, RefreshCw,
 } from '../components/icons';
-import { api, getToken } from '../api/client';
+import { api, getToken, isApiRequestError } from '../api/client';
 import type {
   Project,
   SSHProfile as ManagedSSHProfile,
@@ -199,7 +199,6 @@ interface ManagedProfileDraft {
   host: string;
   port: number;
   username: string;
-  keyPath: string;
   keyUploadToken: string;
   keyUploadFilename: string;
   keyUploadFingerprint: string;
@@ -221,7 +220,6 @@ function emptyManagedDraft(): ManagedProfileDraft {
     host: '',
     port: 22,
     username: '',
-    keyPath: '',
     keyUploadToken: '',
     keyUploadFilename: '',
     keyUploadFingerprint: '',
@@ -283,7 +281,6 @@ function ManagedSSHPanel({
       host: profile.host,
       port: profile.port,
       username: profile.username,
-      keyPath: '',
       keyUploadToken: '',
       keyUploadFilename: '',
       keyUploadFingerprint: '',
@@ -305,11 +302,10 @@ function ManagedSSHPanel({
       host: profile.host,
       port: profile.port,
       username: profile.username,
-      keyPath: profile.key_path,
     });
-    setMessage(profile.password && !profile.key_path
-      ? 'Legacy passwords are not copied. Upload a PEM/private key to migrate this connection.'
-      : 'Verify the host fingerprint, review Task access, and save to finish migration.');
+    setMessage(
+      'Legacy credentials are not copied. Upload a PEM/private key, verify the host fingerprint, and save to finish migration.',
+    );
   };
 
   const uploadPrivateKey = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -330,7 +326,6 @@ function ManagedSSHPanel({
       }
       setEditing((current) => current ? {
         ...current,
-        keyPath: '',
         keyUploadToken: uploaded.upload_token,
         keyUploadFilename: uploaded.filename,
         keyUploadFingerprint: uploaded.public_key_fingerprint,
@@ -380,8 +375,8 @@ function ManagedSSHPanel({
       setMessage('Name, host, and username are required.');
       return;
     }
-    if (editing.id === null && ((!editing.keyPath.trim() && !editing.keyUploadToken) || !editing.hostKeyValue)) {
-      setMessage('Upload a private key or enter its Manager path, then verify the host fingerprint.');
+    if (editing.id === null && (!editing.keyUploadToken || !editing.hostKeyValue)) {
+      setMessage('Upload a private key, then verify the host fingerprint.');
       return;
     }
     if (editing.hostKeyValue && !editing.hostKeyConfirmed) {
@@ -415,22 +410,20 @@ function ManagedSSHPanel({
       if (editing.id === null) {
         const input: SSHProfileInput = {
           ...common,
-          ...(editing.keyUploadToken
-            ? { key_upload_token: editing.keyUploadToken }
-            : { key_path: editing.keyPath.trim() }),
+          key_upload_token: editing.keyUploadToken,
           host_key_value: editing.hostKeyValue,
         };
         saved = await api.createSSHProfile(input);
       } else {
         if (editing.revision === null) {
-          throw new Error('SSH profile revision is missing; refresh and try again.');
+          throw new Error('SSH profile revision is unavailable; refresh and retry.');
         }
         saved = await api.updateSSHProfile(editing.id, {
-          revision: editing.revision,
+          expected_revision: editing.revision,
           ...common,
           ...(editing.keyUploadToken
             ? { key_upload_token: editing.keyUploadToken }
-            : editing.keyPath.trim() ? { key_path: editing.keyPath.trim() } : {}),
+            : {}),
           ...(editing.hostKeyValue ? { host_key_value: editing.hostKeyValue } : {}),
         });
       }
@@ -439,7 +432,14 @@ function ManagedSSHPanel({
       await onRefresh(saved.id);
       if (migratedLegacyId) onLegacyMigrated(migratedLegacyId);
     } catch (error) {
-      setMessage((error as Error).message);
+      if (isApiRequestError(error) && error.status === 409) {
+        abandonUploadedKey(editing);
+        setEditing(null);
+        await onRefresh();
+        setMessage('SSH profile changed elsewhere. Refreshed; reopen it and retry.');
+      } else {
+        setMessage((error as Error).message);
+      }
     } finally {
       setBusy(false);
     }
@@ -471,7 +471,12 @@ function ManagedSSHPanel({
       }
       await onRefresh();
     } catch (error) {
-      setMessage((error as Error).message);
+      if (isApiRequestError(error) && error.status === 409) {
+        await onRefresh();
+        setMessage('SSH profile changed elsewhere. Refreshed; retry the delete.');
+      } else {
+        setMessage((error as Error).message);
+      }
     } finally {
       setBusy(false);
     }
@@ -526,7 +531,7 @@ function ManagedSSHPanel({
             <div className="mt-2 flex gap-2 text-xs">
               <button disabled={busy} onClick={() => testManagedProfile(profile)} className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50">test</button>
               {isAdmin && <button disabled={busy} onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">edit</button>}
-              {isAdmin && <button aria-label={`Delete ${profile.name}`} disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>}
+              {isAdmin && <button disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>}
             </div>
           </div>
         ))}
@@ -582,13 +587,11 @@ function ManagedSSHPanel({
                   <button disabled={busy} onClick={removeUploadedKey} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50">remove</button>
                 </div>
               ) : (
-                <input
-                  aria-label="Private key path on Manager"
-                  value={editing.keyPath}
-                  onChange={(e) => setEditing({ ...editing, keyPath: e.target.value })}
-                  placeholder={editing.id === null ? '/absolute/path/to/id_ed25519' : 'Leave blank to keep the current key'}
-                  className="mt-1 w-full rounded bg-gray-700 px-2 py-1.5 text-gray-200"
-                />
+                <div className="mt-1 rounded border border-gray-700 bg-gray-900/40 px-2 py-1.5 text-gray-400">
+                  {editing.id === null
+                    ? 'Upload is required for every new or migrated connection.'
+                    : `Current key (${profiles.find((profile) => profile.id === editing.id)?.key_path_hint || 'stored on Manager'}) will be kept. Upload only to rotate it.`}
+                </div>
               )}
               <div className="mt-1 text-[10px] text-gray-500">Uploaded keys are validated and stored only on the CCM server with mode 0600.</div>
             </div>

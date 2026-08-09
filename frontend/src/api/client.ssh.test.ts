@@ -83,4 +83,33 @@ describe('Task SSH grant API', () => {
     expect(options.body).toBeInstanceOf(FormData);
     expect((options.body as FormData).get('file')).toBe(file);
   });
+
+  it('sends the observed profile revision for update and delete CAS', async () => {
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: () => null },
+      json: async () => ({ ok: true }),
+    });
+
+    await api.updateSSHProfile(41, {
+      expected_revision: 7,
+      enabled: false,
+    });
+    await api.deleteSSHProfile(41, 8);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'https://ccm.example.com/api/ssh-profiles/41',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({ expected_revision: 7, enabled: false }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      'https://ccm.example.com/api/ssh-profiles/41?expected_revision=8',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
 });

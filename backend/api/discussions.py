@@ -6,6 +6,7 @@ from backend.database import get_db
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
+    require_admin,
     require_project_access,
 )
 from backend.models.discussion import (
@@ -28,11 +29,13 @@ _discussion_service = None
 def _get_service():
     global _discussion_service
     if _discussion_service is None:
-        from backend.main import broadcaster
+        from backend.main import broadcaster, dispatcher
         from backend.database import async_session
         from backend.services.discussion_service import DiscussionService
         _discussion_service = DiscussionService(
-            db_factory=async_session, broadcaster=broadcaster,
+            db_factory=async_session,
+            broadcaster=broadcaster,
+            claude_pool_provider=lambda: dispatcher.pool,
         )
     return _discussion_service
 
@@ -104,6 +107,7 @@ async def list_discussions(request: Request, db: AsyncSession = Depends(get_db))
 async def create_discussion(
     data: DiscussionCreate, request: Request, db: AsyncSession = Depends(get_db)
 ):
+    require_admin(request)
     if not await _can_create_discussion(request, db):
         raise HTTPException(403, "You need a Worker or Project access to create Discussions")
     if data.project_id is not None:
@@ -166,6 +170,7 @@ async def send_broadcast_message(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    require_admin(request)
     disc = await db.get(Discussion, discussion_id)
     if not disc:
         raise HTTPException(status_code=404, detail="Discussion not found")
@@ -193,6 +198,7 @@ async def send_agent_chat(
     data: DiscussionSendMessage,
     db: AsyncSession = Depends(get_db),
 ):
+    require_admin(request)
     disc = await db.get(Discussion, discussion_id)
     if disc:
         await _require_discussion_owner(request, disc)
@@ -215,6 +221,7 @@ async def trigger_agent(
     agent_id: int,
     db: AsyncSession = Depends(get_db),
 ):
+    require_admin(request)
     disc = await db.get(Discussion, discussion_id)
     if disc:
         await _require_discussion_owner(request, disc)
@@ -234,6 +241,7 @@ async def resume_all_agents(
     discussion_id: int, request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    require_admin(request)
     disc = await db.get(Discussion, discussion_id)
     if disc:
         await _require_discussion_owner(request, disc)
@@ -268,6 +276,7 @@ async def add_agent(
     discussion_id: int, request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    require_admin(request)
     disc = await db.get(Discussion, discussion_id)
     if disc:
         await _require_discussion_owner(request, disc)
@@ -339,30 +348,43 @@ async def delete_discussion(
         raise HTTPException(status_code=404, detail="Discussion not found")
     await _require_discussion_owner(request, disc)
 
-    # Stop running agents
     service = _get_service()
-    agents_result = await db.execute(
-        select(DiscussionAgent).where(DiscussionAgent.discussion_id == discussion_id)
-    )
-    for agent in agents_result.scalars().all():
-        if agent.status == "running":
-            await service.stop_agent(agent.id)
-        await db.delete(agent)
+    async with service.deletion_barrier(discussion_id, db):
+        # Re-read the complete graph while launch admission remains fenced.
+        agents_result = await db.execute(
+            select(DiscussionAgent).where(
+                DiscussionAgent.discussion_id == discussion_id
+            )
+        )
+        for agent in agents_result.scalars().all():
+            await db.delete(agent)
 
-    events_result = await db.execute(
-        select(DiscussionEvent).where(DiscussionEvent.discussion_id == discussion_id)
-    )
-    for e in events_result.scalars().all():
-        await db.delete(e)
+        events_result = await db.execute(
+            select(DiscussionEvent).where(
+                DiscussionEvent.discussion_id == discussion_id
+            )
+        )
+        for event in events_result.scalars().all():
+            await db.delete(event)
 
-    msgs_result = await db.execute(
-        select(DiscussionMessage).where(DiscussionMessage.discussion_id == discussion_id)
-    )
-    for m in msgs_result.scalars().all():
-        await db.delete(m)
+        msgs_result = await db.execute(
+            select(DiscussionMessage).where(
+                DiscussionMessage.discussion_id == discussion_id
+            )
+        )
+        for message in msgs_result.scalars().all():
+            await db.delete(message)
 
-    await db.delete(disc)
-    await db.commit()
+        current = await db.get(
+            Discussion,
+            discussion_id,
+            populate_existing=True,
+        )
+        if current is None:
+            await db.rollback()
+            raise HTTPException(status_code=404, detail="Discussion not found")
+        await db.delete(current)
+        await db.commit()
     return {"ok": True}
 
 

@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from backend.config import settings
 from backend.database import Base
 from backend.models.task import Task
 from backend.models.monitor_session import MonitorSession, MonitorCheck
@@ -28,9 +29,48 @@ from backend.services.dispatcher import (
     GlobalDispatcher,
     _MonitorTurnHandle,
 )
+from backend.services.task_agent_isolation import TaskAgentIsolationError
 from backend.tests.worker_termination_helpers import (
     persist_active_worker_receipt,
 )
+
+
+TASK_INCARNATION = "a" * 32
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor", "sub-agent"])
+async def test_claude_aux_launch_has_zero_model_side_effect_without_auth_token(
+    dispatcher,
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    monkeypatch.setattr(settings, "auth_token", "")
+    dispatcher._launch_registered_aux_process = AsyncMock()
+
+    with pytest.raises(TaskAgentIsolationError, match="AUTH_TOKEN"):
+        if kind == "monitor":
+            await dispatcher._launch_monitor_agent(
+                prompt="must not run",
+                cwd=str(tmp_path),
+                model=None,
+                task_id=1,
+                monitor_session_id=2,
+                turn_generation=1,
+                mcp_config_path=tmp_path / "monitor.json",
+            )
+        else:
+            await dispatcher._launch_sub_agent(
+                prompt="must not run",
+                cwd=str(tmp_path),
+                model=None,
+                task_id=1,
+                session_id=2,
+                mcp_config_path=tmp_path / "sub-agent.json",
+            )
+
+    dispatcher._launch_registered_aux_process.assert_not_awaited()
 
 
 @pytest.fixture
@@ -224,6 +264,7 @@ async def _seed_codex_sub_agent(
     async with dispatcher.db_factory() as db:
         task = Task(
             id=task_id,
+            incarnation_id=TASK_INCARNATION,
             title="codex parent",
             description="d",
             status="completed",
@@ -341,7 +382,11 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
 
     from backend.services.mcp_config import build_sub_agent_mcp_server_specs
 
-    specs = build_sub_agent_mcp_server_specs(41, 7)
+    specs = build_sub_agent_mcp_server_specs(
+        41,
+        7,
+        task_incarnation_id=TASK_INCARNATION,
+    )
     launched = await dispatcher._launch_codex_sub_agent(
         prompt="review",
         cwd="/tmp",
@@ -349,6 +394,7 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
         effort_level="high",
         session_id=41,
         task_id=7,
+        task_incarnation_id=TASK_INCARNATION,
         task_metadata={},
         mcp_specs=specs,
     )
@@ -359,7 +405,8 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     assert "ephemeral" not in kwargs
     assert kwargs["mcp_specs"] == specs
     assert kwargs["mcp_specs"][0].required is True
-    assert kwargs["disable_project_config"] is False
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_user_mcp"] is True
     assert kwargs["sandbox_mode"] == "workspace-write"
     assert kwargs["disable_autonomous_features"] is True
     assert kwargs["task_ssh_protected_paths"]
@@ -423,6 +470,7 @@ async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
         effort_level="high",
         session_id=61,
         task_id=7,
+        task_incarnation_id=TASK_INCARNATION,
         task_metadata={},
         mcp_specs=(),
     )
@@ -432,6 +480,7 @@ async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
         registry.start_turn.await_args.kwargs["disable_project_config"]
         is True
     )
+    assert registry.start_turn.await_args.kwargs["disable_user_mcp"] is True
 
 
 @pytest.mark.asyncio
@@ -475,6 +524,7 @@ async def test_codex_sub_agent_final_gate_rejects_pending_task_routing(
             effort_level="high",
             session_id=71,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
             expected_task_routing=(
@@ -520,6 +570,7 @@ async def test_codex_sub_agent_final_gate_rejects_stopped_generation(
             effort_level="high",
             session_id=72,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
             expected_task_routing=(
@@ -562,6 +613,7 @@ async def test_codex_sub_agent_final_gate_yields_to_active_receipt(dispatcher):
             effort_level="high",
             session_id=75,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
             expected_task_routing=(
@@ -621,6 +673,7 @@ async def test_codex_sub_agent_commit_failure_aborts_exact_started_turn(
             effort_level="high",
             session_id=73,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
         )
@@ -691,6 +744,7 @@ async def test_codex_sub_agent_commit_cancellation_waits_for_exact_abort(
             effort_level="high",
             session_id=74,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
         )
@@ -747,7 +801,12 @@ async def test_codex_sub_agent_rejects_home_owned_by_exec_generation(
             session_id=51,
             task_id=7,
             task_metadata={},
-            mcp_specs=build_sub_agent_mcp_server_specs(51, 7),
+            task_incarnation_id=TASK_INCARNATION,
+            mcp_specs=build_sub_agent_mcp_server_specs(
+                51,
+                7,
+                task_incarnation_id=TASK_INCARNATION,
+            ),
         )
 
     registry.start_turn.assert_not_awaited()
@@ -782,8 +841,13 @@ async def test_codex_sub_agent_rejects_active_ephemeral_exec(
                 effort_level="high",
                 session_id=52,
                 task_id=7,
+                task_incarnation_id=TASK_INCARNATION,
                 task_metadata={},
-                mcp_specs=build_sub_agent_mcp_server_specs(52, 7),
+                mcp_specs=build_sub_agent_mcp_server_specs(
+                    52,
+                    7,
+                    task_incarnation_id=TASK_INCARNATION,
+                ),
             )
 
     registry.start_turn.assert_not_awaited()
@@ -1398,11 +1462,14 @@ async def test_failed_group_proof_retains_aux_process_evidence(dispatcher):
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
 @pytest.mark.parametrize("map_kind", ["monitor", "sub-agent"])
 async def test_aux_spawn_cancellation_settles_registers_and_reaps(
-    dispatcher, tmp_path, map_kind
+    dispatcher, tmp_path, map_kind, monkeypatch
 ):
     """Cancellation inside spawn cannot lose the exact child group handle."""
     pid_file = tmp_path / f"{map_kind}-child.pid"
-    log_path = tmp_path / f"{map_kind}.log"
+    monkeypatch.setattr(
+        "backend.config.settings.task_runtime_secret_dir",
+        str(tmp_path / "runtime-secrets"),
+    )
     process_map = {}
     log_map = {}
     captured = {}
@@ -1445,7 +1512,7 @@ time.sleep(30)
                     cmd=cmd,
                     cwd=str(tmp_path),
                     env=dict(os.environ),
-                    log_path=log_path,
+                    log_namespace=map_kind,
                     session_id=81,
                     process_map=process_map,
                     log_map=log_map,
@@ -1797,6 +1864,7 @@ async def test_codex_monitor_reuses_thread_with_read_only_generation_specs(
         assert kwargs["sandbox_mode"] == "read-only"
         assert kwargs["disable_autonomous_features"] is True
         assert kwargs["disable_project_config"] is True
+        assert kwargs["disable_user_mcp"] is True
         assert kwargs["task_ssh_protected_paths"]
         # Monitor must never inherit the parent Task's ccm_skills server or
         # skill context. Its only model-visible capability is the exact

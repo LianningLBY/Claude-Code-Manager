@@ -24,6 +24,7 @@ from backend.services.instance_manager import (
     InstanceManager,
     LaunchSupersededError,
     LiveAttachmentInjectionUnsupportedError,
+    SharedProjectAgentLaunchDisabledError,
     _OutputConsumerRecord,
 )
 from backend.services.claude_pool import ClaudePool
@@ -48,6 +49,7 @@ from backend.services.mcp_config import (
     build_task_ssh_mcp_server_specs,
     render_codex_exec_config_args,
 )
+from backend.services.task_agent_isolation import TaskAgentIsolationError
 from backend.config import Settings, settings
 from backend.database import Base
 from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
@@ -75,15 +77,6 @@ def _no_pty_no_skills(monkeypatch):
              new=AsyncMock(return_value=""),
          ):
         yield
-
-
-@pytest.fixture
-def managed_ssh_auth(monkeypatch):
-    monkeypatch.setattr(
-        settings,
-        "auth_token",
-        "ccm-managed-ssh-instance-test-token",
-    )
 
 
 def test_codex_main_mcp_capability_defaults_on():
@@ -138,7 +131,7 @@ def test_claude_terminal_result_suppresses_only_exact_assistant_duplicate():
     )["content"] == " Finished safely. "
 
 
-def test_claude_hot_runtime_fingerprint_covers_mcp_and_ask_user_token(
+def test_claude_hot_runtime_fingerprint_covers_mcp_and_full_git_environment(
     tmp_path,
 ):
     settings_path = tmp_path / "settings.json"
@@ -149,25 +142,59 @@ def test_claude_hot_runtime_fingerprint_covers_mcp_and_ask_user_token(
     baseline = InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
     )
     assert baseline == InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+        git_env={
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "CCM_ASK_USER_TOKEN": "token-a",
+        },
     )
 
     mcp_path.write_text('{"mcpServers":{"ccm_ssh":{}}}')
     assert baseline != InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
     )
     mcp_path.write_text('{"mcpServers":{}}')
     assert baseline != InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-b"},
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-b",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
+    )
+    assert baseline != InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-b",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
+    )
+    assert baseline != InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-b",
+        },
     )
 
 
@@ -671,6 +698,74 @@ async def test_launch_preflight_failure_does_not_publish_launch_admission(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_ordinary_task_launch_remains_compatible_without_auth_token(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+):
+    monkeypatch.setattr(settings, "auth_token", "")
+    monkeypatch.setattr(settings, "use_pty_mode", False)
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    instance_id, task_id = await _create_project_agent_launch_task(
+        db_factory,
+        tmp_path,
+        provider=provider,
+    )
+    manager = InstanceManager(db_factory, MagicMock())
+    manager._persist_actual_turn_transport = AsyncMock(return_value=True)
+    process = _make_mock_process(pid=19_170)
+    manager._spawn_managed_direct_process = AsyncMock(return_value=process)
+    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+
+    async def launch_codex(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        return 19_171
+
+    manager._launch_codex_app_server = AsyncMock(side_effect=launch_codex)
+    with (
+        patch(
+            "backend.services.container_manager.is_shared_project",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "backend.services.task_agent_isolation."
+            "validate_claude_task_isolation_settings",
+            lambda *_args, **_kwargs: None,
+        ),
+    ):
+        pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="ordinary open-mode Task",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider=provider,
+            config_dir=(
+                str(tmp_path / "codex-open-mode-home")
+                if provider == "codex"
+                else None
+            ),
+        )
+
+    assert pid == (19_171 if provider == "codex" else process.pid)
+    if provider == "codex":
+        kwargs = manager._launch_codex_app_server.await_args.kwargs
+        assert kwargs["task_ssh_disable_network"] is True
+        specs = manager._launch_codex_app_server.await_args.kwargs["mcp_specs"]
+        assert [spec.name for spec in specs] == ["ccm_skills"]
+        assert "CCM_INTERNAL_SERVICE_TOKEN" not in specs[0].env
+    else:
+        cmd = manager._spawn_managed_direct_process.await_args.args[2]
+        config_path = Path(cmd[cmd.index("--mcp-config") + 1])
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert "CCM_INTERNAL_SERVICE_TOKEN" not in config["mcpServers"][
+            "ccm_skills"
+        ].get("env", {})
+
+
+@pytest.mark.asyncio
 async def test_direct_launch_callback_runs_immediately_before_spawn(
     db_factory,
 ):
@@ -713,90 +808,269 @@ async def test_direct_launch_callback_runs_immediately_before_spawn(
     assert events == ["command", "callback", "spawn"]
 
 
-@pytest.mark.asyncio
-async def test_container_launch_callback_runs_immediately_before_exec(
-    db_factory, tmp_path,
-):
+async def _create_project_agent_launch_task(
+    db_factory,
+    tmp_path,
+    *,
+    provider: str,
+) -> tuple[int, int]:
     async with db_factory() as db:
         project = Project(
-            name="container-launch-boundary-project",
+            name=f"shared-launch-boundary-{provider}",
             local_path=str(tmp_path),
             status="ready",
         )
-        instance = Instance(name="container-launch-boundary")
+        instance = Instance(name=f"shared-launch-boundary-{provider}")
         db.add_all([project, instance])
         await db.flush()
         task = Task(
-            title="container launch boundary",
+            title=f"shared launch boundary {provider}",
             status="executing",
-            provider="claude",
+            provider=provider,
             project_id=project.id,
             instance_id=instance.id,
+            incarnation_id="a" * 32,
         )
         db.add(task)
         await db.flush()
         instance.current_task_id = task.id
         await db.commit()
-        instance_id = instance.id
-        task_id = task.id
+        return instance.id, task.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "route"),
+    [
+        ("claude", "direct"),
+        ("claude", "pty"),
+        ("codex", "direct"),
+        ("codex", "app-server"),
+    ],
+)
+async def test_shared_project_agent_launch_rejects_every_provider_route(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+    route,
+):
+    instance_id, task_id = await _create_project_agent_launch_task(
+        db_factory,
+        tmp_path,
+        provider=provider,
+    )
+    monkeypatch.setattr(settings, "use_pty_mode", route == "pty")
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        route == "app-server",
+    )
 
     from backend.services.container_manager import ContainerManager
 
     im = InstanceManager(db_factory, MagicMock())
-    process = _make_mock_process(pid=1915)
-    events = []
-    container_manager = MagicMock()
-
-    async def ensure_container(*_args, **_kwargs):
-        events.append("container-preflight")
-        return "ccm-project-boundary"
-
-    async def exec_command(*_args, **_kwargs):
-        assert events[-1] == "callback"
-        assert im._instance_lifecycle_lock(instance_id).locked()
-        events.append("container-exec")
-        return process
-
-    container_manager.ensure_container = ensure_container
-    container_manager.create_pty_wrapper.return_value = (None, None)
-    container_manager.exec_command = exec_command
-    im._container_mgr = container_manager
-    im._build_command = MagicMock(return_value=["agent"])
-    im._persist_and_track_launch = AsyncMock(return_value=process.pid)
-
-    async def on_launch_admitted():
-        assert events.count("container-preflight") == 2
-        assert im._instance_lifecycle_lock(instance_id).locked()
-        events.append("callback")
+    im._build_command = MagicMock()
+    im._launch_pty = AsyncMock()
+    im._launch_codex_app_server = AsyncMock()
+    im._spawn_managed_direct_process = AsyncMock()
+    im._persist_actual_turn_transport = AsyncMock()
+    im._container_mgr = MagicMock()
+    on_launch_admitted = AsyncMock()
+    shared_check = AsyncMock(return_value=True)
 
     with (
         patch(
             "backend.services.container_manager.is_shared_project",
-            new=AsyncMock(return_value=True),
+            new=shared_check,
         ),
         patch.object(
             ContainerManager,
             "is_docker_available",
-            return_value=True,
+            side_effect=RuntimeError("Docker probe must not run"),
+        ) as docker_probe,
+        patch(
+            "backend.services.ask_user_settings.ensure_ask_user_hook"
+        ),
+    ):
+        with pytest.raises(
+            SharedProjectAgentLaunchDisabledError,
+            match="is shared",
+        ):
+            await im.launch(
+                instance_id,
+                "prompt",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider=provider,
+                config_dir=(
+                    str(tmp_path / "codex-home")
+                    if provider == "codex"
+                    else None
+                ),
+                on_launch_admitted=on_launch_admitted,
+            )
+
+    project_id = shared_check.await_args.args[0]
+    shared_check.assert_awaited_once_with(project_id, db_factory)
+    assert isinstance(project_id, int)
+    docker_probe.assert_not_called()
+    im._container_mgr.ensure_container.assert_not_called()
+    im._container_mgr.exec_command.assert_not_called()
+    im._build_command.assert_not_called()
+    im._launch_pty.assert_not_awaited()
+    im._launch_codex_app_server.assert_not_awaited()
+    im._spawn_managed_direct_process.assert_not_awaited()
+    im._persist_actual_turn_transport.assert_not_awaited()
+    on_launch_admitted.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_shared_project_detection_error_fails_closed_before_launch(
+    db_factory,
+    tmp_path,
+    provider,
+):
+    instance_id, task_id = await _create_project_agent_launch_task(
+        db_factory,
+        tmp_path,
+        provider=provider,
+    )
+
+    im = InstanceManager(db_factory, MagicMock())
+    im._build_command = MagicMock()
+    im._launch_pty = AsyncMock()
+    im._launch_codex_app_server = AsyncMock()
+    im._spawn_managed_direct_process = AsyncMock()
+    im._persist_actual_turn_transport = AsyncMock()
+
+    with patch(
+        "backend.services.container_manager.is_shared_project",
+        new=AsyncMock(side_effect=OSError("sharing DB unavailable")),
+    ):
+        with pytest.raises(
+            SharedProjectAgentLaunchDisabledError,
+            match="Could not verify sharing state",
+        ):
+            await im.launch(
+                instance_id,
+                "prompt",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider=provider,
+                config_dir=(
+                    str(tmp_path / "codex-home")
+                    if provider == "codex"
+                    else None
+                ),
+            )
+
+    im._build_command.assert_not_called()
+    im._launch_pty.assert_not_awaited()
+    im._launch_codex_app_server.assert_not_awaited()
+    im._spawn_managed_direct_process.assert_not_awaited()
+    im._persist_actual_turn_transport.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "route"),
+    [
+        ("claude", "direct"),
+        ("claude", "pty"),
+        ("codex", "direct"),
+        ("codex", "app-server"),
+    ],
+)
+async def test_project_becoming_shared_at_provider_boundary_blocks_effect(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+    route,
+):
+    instance_id, task_id = await _create_project_agent_launch_task(
+        db_factory,
+        tmp_path,
+        provider=provider,
+    )
+    monkeypatch.setattr(settings, "use_pty_mode", route == "pty")
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        route == "app-server",
+    )
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "backend.services.task_ssh_access.task_ssh_protected_paths",
+        AsyncMock(return_value=()),
+    )
+    monkeypatch.setattr(
+        "backend.services.task_ssh_access._protected_path_variants",
+        lambda *_args, **_kwargs: (),
+    )
+
+    im = InstanceManager(db_factory, MagicMock())
+    im._build_command = MagicMock(return_value=["agent"])
+    im._spawn_managed_direct_process = AsyncMock()
+    im._persist_actual_turn_transport = AsyncMock()
+    on_launch_admitted = AsyncMock()
+
+    async def launch_pty(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        raise AssertionError("shared Claude PTY effect was reached")
+
+    async def launch_codex_app_server(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        raise AssertionError("shared Codex app-server effect was reached")
+
+    im._launch_pty = AsyncMock(side_effect=launch_pty)
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=launch_codex_app_server
+    )
+    shared_check = AsyncMock(side_effect=[False, True])
+
+    with (
+        patch(
+            "backend.services.container_manager.is_shared_project",
+            new=shared_check,
         ),
         patch(
             "backend.services.ask_user_settings.ensure_ask_user_hook"
         ),
     ):
-        assert await im.launch(
-            instance_id,
-            "prompt",
-            task_id=task_id,
-            cwd=str(tmp_path),
-            on_launch_admitted=on_launch_admitted,
-        ) == process.pid
+        with pytest.raises(
+            SharedProjectAgentLaunchDisabledError,
+            match="is shared",
+        ):
+            await im.launch(
+                instance_id,
+                "prompt",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider=provider,
+                config_dir=(
+                    str(tmp_path / f"codex-home-{route}")
+                    if provider == "codex"
+                    else None
+                ),
+                on_launch_admitted=on_launch_admitted,
+            )
 
-    assert events == [
-        "container-preflight",
-        "container-preflight",
-        "callback",
-        "container-exec",
-    ]
+    assert shared_check.await_count == 2
+    im._persist_actual_turn_transport.assert_not_awaited()
+    im._spawn_managed_direct_process.assert_not_awaited()
+    on_launch_admitted.assert_not_awaited()
+    if route == "pty":
+        im._launch_pty.assert_awaited_once()
+    elif route == "app-server":
+        im._launch_codex_app_server.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1450,7 +1724,14 @@ def test_build_command_codex_renders_required_mcp_as_exact_argv_tokens(
     resume_session_id, expected_tail,
 ):
     im = InstanceManager(MagicMock(), MagicMock())
-    specs = build_mcp_server_specs(73, {"monitor": True})
+    specs = build_mcp_server_specs(
+        73,
+        {"monitor": True},
+        task_incarnation_id="a" * 32,
+        task_retry_count=0,
+        task_turn_generation=0,
+        task_status="executing",
+    )
 
     cmd = im._build_command(
         provider="codex",
@@ -1648,12 +1929,18 @@ def _make_mock_process(pid=12345, returncode=0):
 
 
 def _managed_ssh_profile(name: str = "launch-ssh") -> SSHProfile:
+    managed_root = Path(settings.ssh_key_storage_dir) / "managed"
+    managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    managed_root.chmod(0o700)
+    key_path = managed_root / f"{name}.pem"
+    key_path.write_text("test-only-private-key", encoding="utf-8")
+    key_path.chmod(0o600)
     return SSHProfile(
         name=name,
         host="ssh.launch.internal",
         port=22,
         username="deploy",
-        key_path="/private/test/id_ed25519",
+        key_path=str(key_path),
         public_key_fingerprint="SHA256:client",
         host_key_type="ssh-ed25519",
         host_key_value="ssh-ed25519 AAAAhost",
@@ -1663,6 +1950,8 @@ def _managed_ssh_profile(name: str = "launch-ssh") -> SSHProfile:
         task_access_enabled=True,
         task_capabilities=["exec", "read", "write"],
     )
+
+
 
 async def _make_actual_transport_scope(db_factory, *, provider: str):
     """Create the normal pre-spawn Task owner and its exact bound source."""
@@ -1700,19 +1989,6 @@ async def _make_actual_transport_scope(db_factory, *, provider: str):
         task.turn_source_log_id = source.id
         await db.commit()
         return instance.id, task.id, source.id
-
-
-def _allow_direct_codex_transport_unit_scope(monkeypatch) -> None:
-    """Keep transport-arbitration tests independent of Task credential policy."""
-
-    monkeypatch.setattr(
-        "backend.services.task_ssh_access.task_ssh_protected_paths",
-        AsyncMock(return_value=()),
-    )
-    monkeypatch.setattr(
-        "backend.services.task_ssh_access._protected_path_variants",
-        lambda _value: (),
-    )
 
 
 async def _bind_preflight_chat_source(
@@ -1821,6 +2097,11 @@ async def test_launch_persists_final_actual_transport_before_provider_boundary(
         "codex_app_server_enabled",
         app_server_enabled,
     )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider=provider,
@@ -1870,7 +2151,7 @@ async def test_launch_persists_final_actual_transport_before_provider_boundary(
 
 
 @pytest.mark.asyncio
-async def test_codex_task_credential_isolation_blocks_pre_turn_exec_fallback(
+async def test_codex_task_pre_turn_failure_never_falls_back_to_exec(
     db_factory,
     monkeypatch,
     tmp_path,
@@ -1881,20 +2162,18 @@ async def test_codex_task_credential_isolation_blocks_pre_turn_exec_fallback(
         provider="codex",
     )
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    process = _make_mock_process(pid=61_100)
     manager._launch_codex_app_server = AsyncMock(
         side_effect=RuntimeError("protocol unavailable before turn/start")
     )
-    manager._spawn_managed_direct_process = AsyncMock(return_value=process)
-    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+    manager._spawn_managed_direct_process = AsyncMock()
 
     with pytest.raises(
         CodexRequiredMcpError,
-        match="Task credential isolation could not be guaranteed",
+        match="required ccm_ssh could be guaranteed",
     ):
         await manager.launch(
             instance_id=instance_id,
-            prompt="safe fallback",
+            prompt="must fail closed",
             task_id=task_id,
             task_turn_generation=7,
             cwd=str(tmp_path),
@@ -1916,7 +2195,6 @@ async def test_cancellation_after_transport_commit_never_crosses_provider_bounda
     tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider="codex",
@@ -1976,7 +2254,6 @@ async def test_sqlite_cancel_commit_wins_before_transport_writer_fence(
     """SQLite must not rely on its ignored SELECT .. FOR UPDATE clause."""
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'transport-cancel-race.db'}",
         connect_args={"timeout": 2},
@@ -2043,7 +2320,6 @@ async def test_actual_transport_accepts_only_a_valid_bound_source_alias(
     pass_bound_alias_id,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider="codex",
@@ -2096,7 +2372,6 @@ async def test_actual_transport_rejects_corrupt_positive_alias_when_caller_uses_
     alias_corruption,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider="codex",
@@ -2169,7 +2444,6 @@ async def test_actual_transport_rejects_stale_source_before_process_start(
     corruption,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider="codex",
@@ -2266,7 +2540,6 @@ async def test_actual_transport_rejects_explicit_peer_instance_owner(
     tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider="codex",
@@ -2305,7 +2578,6 @@ async def test_actual_transport_rejects_source_bound_to_another_instance(
     tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
         provider="codex",
@@ -2349,7 +2621,6 @@ async def test_actual_transport_blocks_fresh_launch_even_on_the_same_route(
         db_factory,
         provider="codex",
     )
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     codex_home = str(tmp_path / "codex-home")
 
     async def make_exec_manager(pid):
@@ -2464,7 +2735,6 @@ async def test_successful_mode_predecessor_mints_one_real_sequential_launch(
         provider="codex",
     )
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     first = _make_mock_process(pid=61_310, returncode=0)
     second = _make_mock_process(pid=61_311, returncode=0)
@@ -2581,7 +2851,6 @@ async def test_stale_sequential_turn_mint_cannot_launch_after_token_consumed(
         await db.commit()
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     predecessor = _make_mock_process(pid=61_320, returncode=0)
     successor = _make_mock_process(pid=61_321, returncode=0)
@@ -2852,7 +3121,6 @@ async def test_failed_mode_predecessor_cannot_mint_sequential_authority(
         provider="codex",
     )
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     failed = _make_mock_process(pid=61_312, returncode=1)
     manager._spawn_managed_direct_process = AsyncMock(return_value=failed)
@@ -2889,7 +3157,6 @@ async def test_preboundary_launch_error_revokes_mode_continuation_token(
         provider="codex",
     )
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     first = _make_mock_process(pid=61_315, returncode=0)
     forbidden = _make_mock_process(pid=61_316, returncode=0)
@@ -2955,7 +3222,6 @@ async def test_admitted_chat_transient_retry_never_spawns_a_second_provider_turn
         await db.commit()
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
-    _allow_direct_codex_transport_unit_scope(monkeypatch)
     monkeypatch.setattr(
         claude_pool_module,
         "transient_retry_delay",
@@ -3518,9 +3784,15 @@ async def test_launch_with_effort_level(db_factory):
 @pytest.mark.asyncio
 async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     db_factory,
+    monkeypatch,
     tmp_path,
-    managed_ssh_auth,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     async with db_factory() as db:
         inst = Instance(name="claude-task-ssh")
         profile = _managed_ssh_profile("claude-launch-ssh")
@@ -3569,7 +3841,9 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
             "ccm_skills",
             "ccm_ssh",
         }
-        assert "backend.mcp.ccm_ssh_server" in config["mcpServers"]["ccm_ssh"]["args"]
+        ssh_args = config["mcpServers"]["ccm_ssh"]["args"]
+        assert ssh_args[0] == "-I"
+        assert Path(ssh_args[1]).name.startswith("ccm-ssh-server-")
     finally:
         config_path.unlink(missing_ok=True)
     env = exec_mock.await_args.kwargs["env"]
@@ -3582,7 +3856,7 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     assert settings_data["sandbox"]["failIfUnavailable"] is True
     assert settings_data["sandbox"]["network"]["allowedDomains"] == []
     assert any(
-        "task_ssh_guard_hook.py" in hook.get("command", "")
+        "task-ssh-guard-hook-" in hook.get("command", "")
         for entry in settings_data["hooks"]["PreToolUse"]
         for hook in entry.get("hooks", [])
     )
@@ -3595,9 +3869,15 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
 @pytest.mark.asyncio
 async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
     db_factory,
+    monkeypatch,
     tmp_path,
-    managed_ssh_auth,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     async with db_factory() as db:
         inst = Instance(name="claude-pty-task-ssh")
         profile = _managed_ssh_profile("claude-pty-launch-ssh")
@@ -3631,12 +3911,44 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
         cwd=str(tmp_path),
         provider="claude",
         config_dir=str(tmp_path / "claude-pty-ssh-home"),
+        git_env={
+            "GIT_AUTHOR_NAME": "Task Author",
+            "GIT_AUTHOR_EMAIL": "author@example.com",
+            "GIT_COMMITTER_NAME": "Task Committer",
+            "GIT_COMMITTER_EMAIL": "committer@example.com",
+            "GIT_SSH_COMMAND": "ssh -i /manager/project-key",
+            "GIT_ASKPASS": "/manager/askpass-with-token",
+            "GIT_CONFIG_GLOBAL": "/manager/gitconfig",
+            "GH_TOKEN": "manager-gh-token",
+            "GITHUB_TOKEN": "manager-github-token",
+        },
     )
 
     assert pid == 54_321
     kwargs = im._launch_pty.await_args.kwargs
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert {
+        key: kwargs["git_env"][key]
+        for key in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        )
+    } == {
+        "GIT_AUTHOR_NAME": "Task Author",
+        "GIT_AUTHOR_EMAIL": "author@example.com",
+        "GIT_COMMITTER_NAME": "Task Committer",
+        "GIT_COMMITTER_EMAIL": "committer@example.com",
+    }
+    assert not {
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    } & kwargs["git_env"].keys()
+    assert kwargs["git_env"]["GIT_CONFIG_GLOBAL"] == os.devnull
     assert kwargs["claude_isolation_settings_path"].name == (
         "claude-security.json"
     )
@@ -3645,11 +3957,120 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
 
 
 @pytest.mark.asyncio
+async def test_claude_pty_scrubs_ambient_credentials_and_restores_exact_git_env(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services.task_agent_isolation import (
+        CLAUDE_SUBPROCESS_ENV_SCRUB,
+    )
+
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    async with db_factory() as db:
+        instance = Instance(name="claude-pty-ambient-env")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="Claude PTY ambient env boundary",
+            status="executing",
+            provider="claude",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    observed = {}
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class FakePTYBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={
+                    "GH_TOKEN": "override-gh-secret",
+                    "SAFE_VALUE": "kept",
+                },
+                claude_binary="/opt/claude-real",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            config = self.build_config()
+            observed["binary"] = config.claude_binary
+            # Mirror claude_pty._env: start from the parent, remove its nested
+            # Claude coordinates, then apply CCM's exact overrides.
+            runtime_env = {
+                key: value
+                for key, value in os.environ.items()
+                if "CLAUDE" not in key.upper()
+                and "CLAUDECODE" not in key.upper()
+                and "AI_AGENT" not in key.upper()
+            }
+            runtime_env.update(config.env_overrides)
+            observed["env"] = runtime_env
+            observed["dangerous"] = config.dangerously_skip_permissions
+            im.processes[kwargs["instance_id"]] = MagicMock(
+                pid=52_002,
+                returncode=None,
+            )
+            return "claude-pty-ambient-env-session"
+
+    im._pty_backend = FakePTYBackend()
+    im._pty_enabled = True
+    ambient = {
+        "AUTH_TOKEN": "deployment-secret",
+        "CCM_INTERNAL_SERVICE_TOKEN": "internal-secret",
+        "GH_TOKEN": "ambient-gh-secret",
+        "GITHUB_TOKEN": "ambient-github-secret",
+        "GIT_ASKPASS": "/ambient/askpass",
+        "GIT_SSH_COMMAND": "ssh -i /ambient/key",
+        "SSH_AUTH_SOCK": "/ambient/agent.sock",
+        "ANTHROPIC_API_KEY": "provider-parent-secret",
+    }
+    with patch.dict(os.environ, ambient, clear=False):
+        await im.launch(
+            instance_id=instance_id,
+            prompt="edit project",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            git_env={
+                "GIT_ASKPASS": "/project/askpass",
+                "GIT_SSH_COMMAND": "ssh -i /project/key",
+            },
+        )
+
+    env = observed["env"]
+    assert Path(observed["binary"]).name == "task_claude_wrapper.sh"
+    assert observed["dangerous"] is False
+    assert env["SAFE_VALUE"] == "kept"
+    assert env["AUTH_TOKEN"] == ""
+    assert env["CCM_INTERNAL_SERVICE_TOKEN"] == ""
+    assert env["GH_TOKEN"] == ""
+    assert env["GITHUB_TOKEN"] == ""
+    assert env["SSH_AUTH_SOCK"] == ""
+    assert env["GIT_ASKPASS"] == "/project/askpass"
+    assert env["GIT_SSH_COMMAND"] == "ssh -i /project/key"
+    assert env["ANTHROPIC_API_KEY"] == "provider-parent-secret"
+    assert env[CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
+
+
+@pytest.mark.asyncio
 async def test_claude_task_ssh_refuses_launch_when_isolation_preflight_fails(
     db_factory,
+    monkeypatch,
     tmp_path,
-    managed_ssh_auth,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     async with db_factory() as db:
         inst = Instance(name="claude-task-ssh-no-guard")
         profile = _managed_ssh_profile("claude-task-ssh-no-guard-profile")
@@ -3704,8 +4125,8 @@ async def test_codex_ssh_requires_isolated_app_server_when_main_mcp_is_disabled(
     db_factory,
     monkeypatch,
     tmp_path,
-    managed_ssh_auth,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
@@ -3758,8 +4179,8 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
     db_factory,
     monkeypatch,
     tmp_path,
-    managed_ssh_auth,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
@@ -3795,6 +4216,17 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
         cwd=str(tmp_path),
         provider="codex",
         config_dir=str(tmp_path / "codex-app-server-ssh-home"),
+        git_env={
+            "GIT_AUTHOR_NAME": "Task Author",
+            "GIT_AUTHOR_EMAIL": "author@example.com",
+            "GIT_COMMITTER_NAME": "Task Committer",
+            "GIT_COMMITTER_EMAIL": "committer@example.com",
+            "GIT_SSH_COMMAND": "ssh -i /manager/project-key",
+            "GIT_ASKPASS": "/manager/askpass-with-token",
+            "GIT_CONFIG_GLOBAL": "/manager/gitconfig",
+            "GH_TOKEN": "manager-gh-token",
+            "GITHUB_TOKEN": "manager-github-token",
+        },
     )
 
     assert pid == 45_678
@@ -3809,15 +4241,35 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
     )
     kwargs = im._launch_codex_app_server.await_args.kwargs
     assert kwargs["sandbox_mode"] == "workspace-write"
-    assert kwargs["task_ssh_disable_network"] is True
     assert kwargs["disable_project_config"] is True
     assert kwargs["disable_user_mcp"] is True
-    assert kwargs["isolate_mcp_inventory"] is True
     assert kwargs["disable_autonomous_features"] is True
-    assert "/private/test/id_ed25519" in kwargs["task_ssh_protected_paths"]
+    assert kwargs["task_ssh_disable_network"] is True
+    assert profile.key_path in kwargs["task_ssh_protected_paths"]
     assert any(path.endswith("/.ssh") for path in kwargs["task_ssh_protected_paths"])
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert {
+        key: kwargs["git_env"][key]
+        for key in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        )
+    } == {
+        "GIT_AUTHOR_NAME": "Task Author",
+        "GIT_AUTHOR_EMAIL": "author@example.com",
+        "GIT_COMMITTER_NAME": "Task Committer",
+        "GIT_COMMITTER_EMAIL": "committer@example.com",
+    }
+    assert not {
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    } & kwargs["git_env"].keys()
+    assert kwargs["git_env"]["GIT_CONFIG_GLOBAL"] == os.devnull
     assert "ccm_ssh.list_connections" in kwargs["skill_context"]
     assert "known_hosts" in kwargs["skill_context"]
 
@@ -3827,8 +4279,8 @@ async def test_codex_task_ssh_isolation_failure_never_falls_back_to_exec(
     db_factory,
     monkeypatch,
     tmp_path,
-    managed_ssh_auth,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
@@ -4144,11 +4596,7 @@ async def test_codex_delivery_uses_network_isolated_app_server_without_credentia
 
     assert pid == 54_321
     kwargs = manager._launch_codex_app_server.await_args.kwargs
-    assert kwargs["git_env"] == {
-        "SSH_AUTH_SOCK": "",
-        "SSH_AGENT_PID": "",
-        "SSH_ASKPASS": "",
-    }
+    assert kwargs["git_env"] is None
     assert kwargs["mcp_specs"] == ()
     assert kwargs["skill_context"] == ""
     assert kwargs["disable_project_config"] is True
@@ -4157,6 +4605,100 @@ async def test_codex_delivery_uses_network_isolated_app_server_without_credentia
     assert kwargs["sandbox_mode"] == "workspace-write"
     assert kwargs["network_isolated"] is True
     assert kwargs["tools_disabled"] is False
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_delivery_rejects_any_durable_ssh_grant_before_transport(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+    )
+    async with db_factory() as db:
+        profile = _managed_ssh_profile("delivery-must-not-use-ssh")
+        db.add(profile)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task_id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._launch_codex_app_server = AsyncMock(return_value=54_321)
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(LaunchSupersededError, match="durable SSH grant"):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must reject conflicting authority",
+                task_id=task_id,
+                cwd=workspace,
+                model="gpt-5.6-sol",
+                provider="codex",
+                config_dir=str(tmp_path / "delivery-codex-home"),
+                effort_level="high",
+                codex_service_tier="default",
+            )
+
+    manager._launch_codex_app_server.assert_not_awaited()
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incarnation", (None, "invalid-incarnation"))
+async def test_task_launch_rejects_missing_or_invalid_incarnation_before_spawn(
+    db_factory,
+    tmp_path,
+    incarnation,
+):
+    async with db_factory() as db:
+        instance = Instance(name="invalid-incarnation-launch")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="invalid incarnation",
+            status="executing",
+            provider="codex",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(incarnation_id=incarnation)
+        )
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(TaskAgentIsolationError, match="incarnation"):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must fail before transport",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+            )
+
     exec_mock.assert_not_awaited()
 
 
@@ -5730,7 +6272,14 @@ async def test_launch_codex_app_server_uses_passed_task_scoped_specs(
         config_dir="/tmp/codex-mcp",
         enable_workflows=False,
         enabled_skills={"monitor": True},
-        mcp_specs=build_mcp_server_specs(73, {"monitor": True}),
+        mcp_specs=build_mcp_server_specs(
+            73,
+            {"monitor": True},
+            task_incarnation_id="a" * 32,
+            task_retry_count=0,
+            task_turn_generation=0,
+            task_status="executing",
+        ),
     )
 
     assert pid == 7655
@@ -5769,7 +6318,13 @@ async def test_codex_app_server_uses_passed_sub_agent_controller_specs(
         config_dir="/tmp/codex-sub-agent",
         enable_workflows=False,
         enabled_skills={"sub-agent": True},
-        mcp_specs=build_sub_agent_controller_mcp_server_specs(74),
+        mcp_specs=build_sub_agent_controller_mcp_server_specs(
+            74,
+            task_incarnation_id="a" * 32,
+            task_retry_count=0,
+            task_turn_generation=0,
+            task_status="executing",
+        ),
     )
 
     specs = registry.start_turn.await_args.kwargs["mcp_specs"]
@@ -13250,7 +13805,6 @@ class _FakeDB:
     async def get(self, model, pk):
         inst = MagicMock()
         inst.current_task_id = None
-        inst.incarnation_id = "0" * 32
         return inst
 
 
@@ -13314,14 +13868,6 @@ async def test_pty_launch_callback_runs_immediately_before_backend_launch():
     events = []
 
     class FakeBackend:
-        @staticmethod
-        def build_config(**_kwargs):
-            return types.SimpleNamespace(
-                env_overrides={},
-                claude_binary="claude",
-                dangerously_skip_permissions=True,
-            )
-
         async def launch_for_ccm(self, **kwargs):
             assert events == ["callback"]
             assert im._instance_lifecycle_lock(instance_id).locked()

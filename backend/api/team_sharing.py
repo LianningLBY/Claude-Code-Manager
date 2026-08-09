@@ -116,12 +116,13 @@ async def share_project(project_id: int, body: ShareBody, request: Request, db: 
     await _lock_project_share_authority(project_id, db)
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to share this project")
-    # Grant replacement uses the same Project -> Task lock order. A no-op
-    # UPDATE is intentional because SQLite ignores SELECT ... FOR UPDATE.
+    # Lock current Tasks in a stable order. Grant replacement takes the same
+    # Task lock, closing the share-vs-grant race on databases with row locks.
     await db.execute(
-        update(Task)
+        select(Task.id)
         .where(Task.project_id == project_id)
-        .values(id=Task.id)
+        .order_by(Task.id)
+        .with_for_update()
     )
     from backend.services.task_ssh_access import project_has_task_ssh_grants
 

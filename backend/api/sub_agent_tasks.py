@@ -15,7 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.api.deps import (
+    internal_task_incarnation_id,
     require_internal_service,
+    require_internal_task_incarnation,
     require_task_access,
     require_task_control,
 )
@@ -173,8 +175,21 @@ async def create_sub_agent_session(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_control(request, task, db)
+    expected_incarnation_id = task.incarnation_id
     if task.worker_id is not None:
+        if internal_task_incarnation_id(request, task_id) is not None:
+            raise HTTPException(
+                409,
+                "Scoped Sub-Agent tools must execute on the Task's owning Worker",
+            )
         from backend.main import worker_proxy
         if worker_proxy is None:
             raise HTTPException(503, "Worker 功能未启用")
@@ -185,6 +200,7 @@ async def create_sub_agent_session(
             "POST",
             f"/api/tasks/{task_id}/sub-agent-sessions",
             body=body.model_dump(),
+            require_task_incarnation_fence=True,
         )
     await db.rollback()
 
@@ -193,10 +209,12 @@ async def create_sub_agent_session(
             # The keyed lock makes SQLite cap admission deterministic in one
             # CCM process; this Task write barrier additionally serializes
             # cancellation and other backend processes.
+            await require_internal_task_incarnation(request, task_id, db)
             guarded = await db.execute(
                 update(Task)
                 .where(
                     Task.id == task_id,
+                    Task.incarnation_id == expected_incarnation_id,
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
                     task_retry_not_superseded_predicate(),
@@ -206,15 +224,27 @@ async def create_sub_agent_session(
             )
             if not guarded.rowcount:
                 await db.rollback()
-                task = await db.get(Task, task_id)
+                await require_internal_task_incarnation(request, task_id, db)
+                task = await db.scalar(
+                    select(Task).where(
+                        Task.id == task_id,
+                        Task.incarnation_id == expected_incarnation_id,
+                    )
+                )
                 if task is None:
-                    raise HTTPException(404, "Task not found")
+                    raise HTTPException(409, "Task incarnation changed")
                 if await active_worker_task_termination_receipt(db, task_id):
                     raise HTTPException(
                         409,
                         "Task has an active Worker termination receipt",
                     )
                 if task.worker_id is not None:
+                    if internal_task_incarnation_id(request, task_id) is not None:
+                        raise HTTPException(
+                            409,
+                            "Scoped Sub-Agent tools must execute on the Task's "
+                            "owning Worker",
+                        )
                     from backend.main import worker_proxy
                     if worker_proxy is None:
                         raise HTTPException(503, "Worker 功能未启用")
@@ -225,15 +255,21 @@ async def create_sub_agent_session(
                         "POST",
                         f"/api/tasks/{task_id}/sub-agent-sessions",
                         body=body.model_dump(),
+                        require_task_incarnation_fence=True,
                     )
                 raise HTTPException(
                     400,
                     "Cannot create sub-agent for inactive task",
                 )
             db.expire_all()
-            task = await db.get(Task, task_id)
+            task = await db.scalar(
+                select(Task).where(
+                    Task.id == task_id,
+                    Task.incarnation_id == expected_incarnation_id,
+                )
+            )
             if task is None:
-                raise HTTPException(404, "Task not found")
+                raise HTTPException(409, "Task incarnation changed")
             provider = (task.provider or "claude").lower()
             if provider not in {"claude", "codex"}:
                 raise HTTPException(
@@ -316,6 +352,13 @@ async def list_sub_agent_sessions(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_access(request, task, db)
     stmt = (
         select(SubAgentSession)
@@ -340,6 +383,13 @@ async def get_sub_agent_session(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_access(request, task, db)
     sa = await db.get(SubAgentSession, session_id)
     if not sa or sa.task_id != task_id:
@@ -355,10 +405,16 @@ async def delete_sub_agent_session(
     db: AsyncSession = Depends(get_db),
 ):
     """Stop/cancel a running sub-agent."""
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     sa = await db.get(SubAgentSession, session_id)
     if not sa or sa.task_id != task_id:
         raise HTTPException(404, "Sub-agent session not found")
-    task = await db.get(Task, task_id)
+    task = scoped_task or await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, db)
@@ -405,6 +461,12 @@ async def sub_agent_report_progress(
 ):
     """Sub-agent reports progress via MCP tool."""
     require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     advanced = await db.execute(
         update(SubAgentSession)
         .where(
@@ -487,6 +549,12 @@ async def sub_agent_submit_result(
 ):
     """Sub-agent submits final result and marks completed."""
     require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     from backend.main import dispatcher
 
     queue_admission_fence = await dispatcher.snapshot_queue_admission(task_id)
@@ -575,6 +643,7 @@ async def get_sub_agent_context(
 ):
     """Get task context for a sub-agent."""
     require_internal_service(request)
+    await require_internal_task_incarnation(request, task_id, db)
     sa = await db.get(SubAgentSession, session_id)
     if not sa or sa.task_id != task_id:
         raise HTTPException(404, "Sub-agent session not found")

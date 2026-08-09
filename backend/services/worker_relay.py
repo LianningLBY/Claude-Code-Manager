@@ -29,6 +29,7 @@ import websockets
 from fastapi import HTTPException
 from sqlalchemy import exists, func, or_, select, update
 
+from backend.config import settings
 from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.task import Task
@@ -1594,7 +1595,28 @@ class WorkerRelay:
     def _api(worker: Worker, path: str) -> str:
         return f"http://{worker.private_ip}:{worker.ccm_port}{path}"
 
-    def _headers(self, worker: Worker) -> dict:
+    @staticmethod
+    def _require_authenticated_control_plane(worker: Worker) -> None:
+        if (
+            not isinstance(settings.auth_token, str)
+            or not settings.auth_token.strip()
+        ):
+            raise HTTPException(
+                503,
+                "AUTH_TOKEN must be configured before Worker relay operations",
+            )
+        if (
+            not isinstance(worker.auth_token, str)
+            or not worker.auth_token.strip()
+        ):
+            raise HTTPException(
+                503,
+                "Worker relay authentication credential is unavailable",
+            )
+
+    @classmethod
+    def _headers(cls, worker: Worker) -> dict:
+        cls._require_authenticated_control_plane(worker)
         return {"Authorization": f"Bearer {worker.auth_token}"}
 
     def _connection_lock(self, worker_id: int) -> asyncio.Lock:

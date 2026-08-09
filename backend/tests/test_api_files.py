@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from fastapi import FastAPI
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
@@ -11,7 +12,7 @@ from httpx import ASGITransport, AsyncClient
 import backend.api.files as files_module
 
 
-def _managed_files_app(profile):
+def _managed_files_app(profile, *, auth_configured: bool = True):
     class FakeSession:
         async def get(self, model, profile_id):
             assert model is files_module.SSHProfile
@@ -23,11 +24,64 @@ def _managed_files_app(profile):
     app = FastAPI()
     app.include_router(files_module.router)
     app.dependency_overrides[files_module.require_admin] = lambda: None
-    app.dependency_overrides[
-        files_module.require_ssh_auth_configured
-    ] = lambda: None
+    if auth_configured:
+        app.dependency_overrides[
+            files_module.require_managed_ssh_auth_configured
+        ] = lambda: None
     app.dependency_overrides[files_module.get_db] = override_db
     return app
+
+
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("/api/files/ssh/7/list", {"path": "/srv"}),
+        ("/api/files/ssh/7/read", {"path": "/srv/report.txt"}),
+        ("/api/files/ssh/7/download", {"path": "/srv/report.txt"}),
+        (
+            "/api/files/ssh/list",
+            {
+                "host": "legacy.internal",
+                "username": "operator",
+                "path": "/srv",
+            },
+        ),
+        (
+            "/api/files/ssh/read",
+            {
+                "host": "legacy.internal",
+                "username": "operator",
+                "path": "/srv/report.txt",
+            },
+        ),
+        (
+            "/api/files/ssh/download",
+            {
+                "host": "legacy.internal",
+                "username": "operator",
+                "path": "/srv/report.txt",
+            },
+        ),
+    ],
+)
+async def test_managed_ssh_files_fail_closed_without_auth_token(
+    monkeypatch,
+    path,
+    payload,
+):
+    monkeypatch.setattr(files_module.settings, "auth_token", "")
+    profile = SimpleNamespace(id=7, enabled=True, deleted_at=None)
+    transport = ASGITransport(
+        app=_managed_files_app(profile, auth_configured=False)
+    )
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(path, json=payload)
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Managed SSH requires AUTH_TOKEN to be configured"
+    )
 
 
 async def test_managed_ssh_files_use_profile_id_without_browser_credentials(
@@ -244,9 +298,6 @@ async def test_ssh_download_removes_temporary_file_after_response(
     app = FastAPI()
     app.include_router(files_module.router)
     app.dependency_overrides[files_module.require_admin] = lambda: None
-    app.dependency_overrides[
-        files_module.require_ssh_auth_configured
-    ] = lambda: None
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(

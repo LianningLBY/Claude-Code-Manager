@@ -2287,7 +2287,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     {providerLabel}
                   </span>
                   <FastModeBadge task={task} />
-                  <TaskSSHAccessBadge task={task} />
+                  {!deliveryReadOnly && <TaskSSHAccessBadge task={task} />}
                 </>
               )}
               {backgroundActive && (

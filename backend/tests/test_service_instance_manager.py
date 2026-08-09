@@ -1843,7 +1843,9 @@ async def test_codex_safe_pre_turn_fallback_records_only_exec_transport(
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     process = _make_mock_process(pid=61_100)
     manager._launch_codex_app_server = AsyncMock(
-        side_effect=RuntimeError("protocol unavailable before turn/start")
+        side_effect=CodexRequiredMcpPreTurnError(
+            "required MCP was not admitted before turn/start"
+        )
     )
     manager._spawn_managed_direct_process = AsyncMock(return_value=process)
     manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
@@ -13084,7 +13086,9 @@ class _FakeDB:
 
     async def scalar(self, stmt):
         self.executed.append(stmt)
-        return datetime.utcnow()
+        # The launch preflight uses scalar() to discover an optional immutable
+        # Browser child binding.  Ordinary PTY fixtures have no such binding.
+        return None
 
     async def get(self, model, pk):
         inst = MagicMock()

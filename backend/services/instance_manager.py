@@ -2332,6 +2332,7 @@ class InstanceManager:
             and task_id is not None
             and not pr_review_task
             and not codex_browser_mcp_required
+            and not delivery_task
         )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"

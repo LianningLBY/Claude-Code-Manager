@@ -2884,6 +2884,37 @@ async def _retry_local_task_safely(
     task_updates: dict | None = None,
     commit: bool = True,
 ) -> Task | None:
+    """Retry only after closing every Harness owner from the old generation."""
+
+    from backend.services.test_harness import test_harness_service
+
+    # The Harness service uses an independent session while cancelling Runs
+    # and durable Browser children.  Release this request's read snapshot
+    # before waiting for that writer, then keep the owner fence until the new
+    # Task generation is durable so no stale-generation Run can materialize in
+    # between cleanup and retry.
+    await db.rollback()
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task was retried",
+    ):
+        return await _retry_local_task_under_harness_owner_fence(
+            task_id,
+            queue,
+            db,
+            task_updates=task_updates,
+            commit=commit,
+        )
+
+
+async def _retry_local_task_under_harness_owner_fence(
+    task_id: int,
+    queue: TaskQueue,
+    db: AsyncSession,
+    *,
+    task_updates: dict | None = None,
+    commit: bool = True,
+) -> Task | None:
     """Retry without discarding evidence of a possibly-live orphan process.
 
     Startup recovery intentionally retains ``Task.instance_id`` plus the
@@ -6316,43 +6347,56 @@ async def retry_task(
             )
 
         if current.worker_id is not None:
-            await _ensure_worker_routing_ready(
-                current,
-                operation_lock_held=True,
-            )
-            observed = worker_task_generation(current)
-            if observed is None:
-                raise HTTPException(409, "Task Worker assignment changed")
-            await _sync_worker_skill_selection_before_execution(current)
             await db.rollback()
-            db.expire_all()
-            current = await db.get(Task, task_id)
-            if (
-                current is None
-                or worker_task_generation(
-                    current,
-                    expected_worker_id=observed.worker_id,
-                )
-                != observed
+            from backend.services.test_harness import test_harness_service
+
+            async with test_harness_service.owner_stop_fence(
+                task_id,
+                reason="Owner Task was retried",
             ):
-                raise HTTPException(
-                    409,
-                    "Task Worker generation changed while Skill selection was "
-                    "being synchronized",
+                db.expire_all()
+                current = await db.get(Task, task_id)
+                if current is None or current.worker_id is None:
+                    raise HTTPException(409, "Task Worker assignment changed")
+                await _ensure_worker_routing_ready(
+                    current,
+                    operation_lock_held=True,
                 )
-            result = await _proxy(
-                current,
-                "POST",
-                f"/api/tasks/{task_id}/retry",
-                body=body.model_dump(mode="json") if body is not None else None,
-                operation_lock_held=True,
-            )
-            return await _sync_task_from_worker_response(
-                db,
-                current,
-                result,
-                observed=observed,
-            )
+                observed = worker_task_generation(current)
+                if observed is None:
+                    raise HTTPException(409, "Task Worker assignment changed")
+                await _sync_worker_skill_selection_before_execution(current)
+                await db.rollback()
+                db.expire_all()
+                current = await db.get(Task, task_id)
+                if (
+                    current is None
+                    or worker_task_generation(
+                        current,
+                        expected_worker_id=observed.worker_id,
+                    )
+                    != observed
+                ):
+                    raise HTTPException(
+                        409,
+                        "Task Worker generation changed while Skill selection was "
+                        "being synchronized",
+                    )
+                result = await _proxy(
+                    current,
+                    "POST",
+                    f"/api/tasks/{task_id}/retry",
+                    body=(
+                        body.model_dump(mode="json") if body is not None else None
+                    ),
+                    operation_lock_held=True,
+                )
+                return await _sync_task_from_worker_response(
+                    db,
+                    current,
+                    result,
+                    observed=observed,
+                )
 
         _require_no_pending_worker_routing(current)
         retried = await _retry_local_task_safely(task_id, queue, db)

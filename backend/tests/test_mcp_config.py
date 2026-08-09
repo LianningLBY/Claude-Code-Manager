@@ -482,7 +482,8 @@ def test_observed_asgi_port_overrides_cli_stale_settings(monkeypatch):
     internal_api_endpoint.observe_asgi_server(("127.0.0.1", 8803))
     spec = build_mcp_server_specs(42)[0]
 
-    assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8803")
+    api_base_index = spec.args.index("--api-base")
+    assert spec.args[api_base_index + 1] == "http://127.0.0.1:8803"
 
 
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():

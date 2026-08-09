@@ -1472,6 +1472,74 @@ async def test_retry_task(client):
 
 
 @pytest.mark.asyncio
+async def test_retry_fences_and_cancels_concurrent_harness_owner(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A retry cannot strand a Run or child on the previous generation."""
+
+    from backend.models.task import Task
+    from backend.models.test_harness import TestHarnessRun
+    from backend.services.test_harness import test_harness_service
+    from backend.services.test_harness_contracts import TestHarnessSpec
+
+    async with session_factory() as db:
+        owner = Task(
+            title="Retry Harness owner",
+            description="race retry against run materialization",
+            status="failed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.commit()
+        task_id = owner.id
+
+    entered_create = asyncio.Event()
+    release_create = asyncio.Event()
+    original_create = test_harness_service._create_run
+
+    async def delayed_create(**kwargs):
+        entered_create.set()
+        await release_create.wait()
+        return await original_create(**kwargs)
+
+    monkeypatch.setattr(test_harness_service, "_create_run", delayed_create)
+    start_request = asyncio.create_task(
+        test_harness_service.start_task_run(
+            task_id=task_id,
+            spec=TestHarnessSpec(
+                target_kind="fixed_url",
+                target={"url": "https://example.com"},
+                goal="Exercise retry owner fencing",
+            ),
+        )
+    )
+    await asyncio.wait_for(entered_create.wait(), timeout=1)
+
+    retry_request = asyncio.create_task(client.post(f"/api/tasks/{task_id}/retry"))
+    await asyncio.sleep(0)
+    assert not retry_request.done()
+
+    release_create.set()
+    run = await asyncio.wait_for(start_request, timeout=1)
+    response = await asyncio.wait_for(retry_request, timeout=2)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pending"
+    assert response.json()["retry_count"] == 1
+    async with session_factory() as db:
+        owner = await db.get(Task, task_id)
+        persisted_run = await db.get(TestHarnessRun, run.id)
+        assert owner is not None
+        assert owner.status == "pending"
+        assert owner.retry_count == 1
+        assert persisted_run is not None
+        assert persisted_run.status == "cancelled"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("status", "plan_approved"),
     [("completed", True), ("cancelled", False)],

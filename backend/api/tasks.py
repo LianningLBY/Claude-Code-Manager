@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import uuid
 from contextlib import AsyncExitStack
@@ -22,7 +23,9 @@ from backend.schemas.task import (
     TaskActionRequest,
     PlanApprovalRequest,
     TaskCreate,
+    InternalTaskSkillsUpdate,
     TaskMigrationImport,
+    TaskMigrationImportResponse,
     TaskResponse,
     TaskRoutingExpectation,
     TaskTerminationRequest,
@@ -39,7 +42,9 @@ from backend.services.task_queue import (
     task_delete_fence,
 )
 from backend.services.task_creation import (
+    SOURCE_TASK_INCARNATION_METADATA_KEY,
     prepare_task_create_values,
+    purge_task_access_grants,
     stage_task_record,
     validate_task_service_tier_configuration,
 )
@@ -50,6 +55,10 @@ from backend.services.pr_review_runtime import (
 )
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
+)
+from backend.services.skill_tool_rpc import (
+    SKILL_TOOL_RPC_NAMES,
+    execute_skill_tool_rpc,
 )
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
@@ -109,9 +118,11 @@ from backend.services.auto_capability_policy import (
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
+    internal_task_incarnation_id,
     is_admin,
     require_admin,
     require_internal_service,
+    require_internal_task_incarnation,
     require_project_access,
     require_task_access,
     require_task_control,
@@ -125,6 +136,23 @@ _WORKER_ROUTING_CONFIG_FIELDS = frozenset({"provider", "model", "codex_service_t
 _WORKER_SKILL_CONFIG_FIELDS = frozenset(
     {"enabled_skills", "selected_user_skills", "metadata_"}
 )
+
+
+class InternalSkillToolCall(BaseModel):
+    """Strict payload accepted only from the frozen task Skills MCP wrapper."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal[
+        "ccm_command_help",
+        "ccm_read_skill",
+        "ccm_read_user_skill",
+        "ccm_create_skill",
+        "ccm_distill",
+        "ccm_enable_skill",
+        "ccm_disable_skill",
+    ]
+    arguments: dict = Field(default_factory=dict)
 _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
     {"worker_id", "project_id", "target_repo"}
 )
@@ -177,6 +205,60 @@ def _require_not_delivery_owned_task(task: Task, *, action: str) -> None:
             f"Delivery-owned Tasks cannot be manually {action}; use Delivery Run"
             f"{suffix} controls so the Plan/Code/Review/PR evidence stays fenced",
         )
+
+
+def _require_migration_import_eligible(
+    task: Task,
+    body: TaskMigrationImport,
+) -> str | None:
+    """Validate one exact destination row before a Worker import refresh."""
+
+    _require_not_delivery_owned_task(task, action="migration-imported")
+    if task.mode == "plan" or task.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            "Existing Plan carriers are immutable and cannot be "
+            "migration-imported",
+        )
+    if task.mode != body.mode:
+        raise HTTPException(
+            409,
+            "Migration import cannot change an existing Task mode",
+        )
+    if task.capability_policy is not None:
+        raise HTTPException(
+            409,
+            "Destination Task has an immutable local Auto capability policy "
+            "and cannot be migration-imported",
+        )
+    bound_source_incarnation = (task.metadata_ or {}).get(
+        SOURCE_TASK_INCARNATION_METADATA_KEY
+    )
+    if body.source_incarnation_id is None and (
+        not isinstance(task.incarnation_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", task.incarnation_id) is None
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task has no verifiable incarnation identity",
+        )
+    if bound_source_incarnation is not None and (
+        not isinstance(bound_source_incarnation, str)
+        or bound_source_incarnation != task.incarnation_id
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task has a corrupt source incarnation binding",
+        )
+    if (
+        bound_source_incarnation is not None
+        and body.source_incarnation_id != bound_source_incarnation
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task is bound to a different source incarnation",
+        )
+    return bound_source_incarnation
 
 
 def _require_no_pending_worker_turn_handoff(task: Task) -> None:
@@ -756,6 +838,11 @@ async def create_task(
         # Task id.  Letting an ordinary JWT caller choose it makes identifier
         # reuse and cross-node identity collisions externally controllable.
         require_internal_service(request)
+    elif body.source_incarnation_id is not None:
+        raise HTTPException(
+            422,
+            "source_incarnation_id requires internal explicit-id forwarding",
+        )
     if body.mode == "plan":
         raise HTTPException(
             410,
@@ -768,6 +855,11 @@ async def create_task(
             "clone_from_task_id or the migration-import protocol",
         )
     if body.secret_ids:
+        require_admin(request)
+    if body.ssh_grants:
+        from backend.api.deps import require_managed_ssh_auth_configured
+
+        require_managed_ssh_auth_configured()
         require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
@@ -862,6 +954,7 @@ async def create_task(
     file_paths = data.pop("file_paths", None)
     attachments = data.pop("attachments", None)
     secret_ids = data.pop("secret_ids", None)
+    ssh_grants = data.pop("ssh_grants", None) or []
     clone_from_task_id = data.pop("clone_from_task_id", None)
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
     if user_skill_snapshots is not None:
@@ -1061,8 +1154,34 @@ async def create_task(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
+    from backend.services.task_ssh_access import (
+        TaskSSHAccessError,
+        prepare_task_ssh_grants,
+        task_ssh_grant_rows,
+    )
+
+    try:
+        prepared_ssh_grants = await prepare_task_ssh_grants(
+            db,
+            ssh_grants,
+            worker_id=data.get("worker_id"),
+            shared_from_id=data.get("shared_from_id"),
+            metadata=data.get("metadata_"),
+            project_id=data.get("project_id"),
+        )
+    except TaskSSHAccessError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
     if supersedes is None:
-        task = await queue.create(**data)
+        task = await stage_task_record(db, **data)
+        if prepared_ssh_grants:
+            db.add_all(task_ssh_grant_rows(
+                task.id,
+                prepared_ssh_grants,
+                created_by=user_id,
+            ))
+        await db.commit()
+        await db.refresh(task)
     else:
         superseded_id = supersedes.id
         metadata = dict(data.get("metadata_") or {})
@@ -1095,6 +1214,12 @@ async def create_task(
                         "Only a Plan awaiting review can be superseded",
                     )
                 staged = await stage_task_record(db, **data)
+                if prepared_ssh_grants:
+                    db.add_all(task_ssh_grant_rows(
+                        staged.id,
+                        prepared_ssh_grants,
+                        created_by=user_id,
+                    ))
                 if not await mark_plan_superseded(
                     db,
                     current_supersedes,
@@ -1138,7 +1263,11 @@ async def create_task(
     return task
 
 
-@router.post("/migration-import", response_model=TaskResponse, status_code=201)
+@router.post(
+    "/migration-import",
+    response_model=TaskMigrationImportResponse,
+    status_code=201,
+)
 async def import_migrated_task(
     request: Request,
     body: TaskMigrationImport,
@@ -1169,33 +1298,22 @@ async def import_migrated_task(
 
     existing = await db.get(Task, body.id)
     if existing is not None:
-        _require_not_delivery_owned_task(existing, action="migration-imported")
-        if existing.mode == "plan" or existing.canonical_plan_id is not None:
-            raise HTTPException(
-                409,
-                "Existing Plan carriers are immutable and cannot be "
-                "migration-imported",
-            )
-        if existing.mode != body.mode:
-            raise HTTPException(
-                409,
-                "Migration import cannot change an existing Task mode",
-            )
-        # Migration import may refresh an inert Worker copy, but it must never
-        # repurpose a same-id local Auto Task that carries immutable capability
-        # authority.  The wire schema deliberately omits the policy, so merely
-        # excluding that field from the UPDATE would retain it on the imported
-        # Worker mirror and bypass the local-only scope boundary.
-        if existing.capability_policy is not None:
-            raise HTTPException(
-                409,
-                "Destination Task has an immutable local Auto capability "
-                "policy and cannot be migration-imported",
-            )
+        _require_migration_import_eligible(existing, body)
 
     data = body.model_dump()
+    # ``source_incarnation_id`` is a transport-only name.  New imports map it
+    # inside ``stage_task_record``; the UPDATE path must perform the same
+    # mapping explicitly because it writes Task columns directly.  An omitted
+    # source fence deliberately preserves the destination row's incarnation.
+    source_incarnation_id = data.pop("source_incarnation_id", None)
     source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
+    ssh_grants = data.pop("ssh_grants", None)
+    if ssh_grants:
+        raise HTTPException(
+            400,
+            "Managed SSH grants cannot be imported to a Worker",
+        )
     for transient_field in (
         "image_paths",
         "file_paths",
@@ -1212,6 +1330,18 @@ async def import_migrated_task(
     migration_metadata = {
         WORKER_MANAGED_TASK_METADATA_KEY: True,
     }
+    if existing is not None:
+        existing_binding = (existing.metadata_ or {}).get(
+            SOURCE_TASK_INCARNATION_METADATA_KEY
+        )
+        if existing_binding is not None:
+            migration_metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = (
+                existing_binding
+            )
+    if source_incarnation_id is not None:
+        migration_metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = (
+            source_incarnation_id
+        )
     if user_skill_snapshots is not None:
         migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
     data["metadata_"] = migration_metadata
@@ -1248,9 +1378,13 @@ async def import_migrated_task(
     if existing is None:
         # The first visible state is already inert.  In particular there is no
         # pending commit and no dispatcher.wake() between create and cancel.
-        return await queue.create(**data)
+        return await queue.create(
+            source_incarnation_id=source_incarnation_id,
+            **data,
+        )
 
     old_status = existing.status
+    observed_incarnation_id = existing.incarnation_id
     existing_generation = _task_generation_fence(body.id, existing)
     if old_status in ("in_progress", "executing", "migrating"):
         raise HTTPException(
@@ -1259,20 +1393,66 @@ async def import_migrated_task(
         )
 
     values = {key: value for key, value in data.items() if key != "id"}
+    if source_incarnation_id is not None:
+        values["incarnation_id"] = source_incarnation_id
     # End every validation read before competing with receipt admission.  The
     # no-op/write CAS below must be the first statement of a fresh transaction
     # so a receipt that committed through another SQLite WAL connection cannot
     # turn this into BUSY_SNAPSHOT or be overwritten by the stale import.
     await db.rollback()
     async with get_task_operation_lock(body.id):
+        fence_predicates = (
+            *existing_generation,
+            (
+                Task.incarnation_id.is_(None)
+                if observed_incarnation_id is None
+                else Task.incarnation_id == observed_incarnation_id
+            ),
+            Task.mode != "delivery_loop",
+            Task.delivery_run_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        writer_fence = await db.execute(
+            sa_update(Task)
+            .where(*fence_predicates)
+            .values(id=Task.id)
+            .execution_options(synchronize_session=False)
+        )
+        if writer_fence.rowcount != 1:
+            await db.rollback()
+            if await active_worker_task_termination_receipt(db, body.id):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Destination task has an active Worker termination receipt",
+                )
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task changed during migration import",
+            )
+        db.expire_all()
+        locked_existing = await db.get(
+            Task,
+            body.id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if locked_existing is None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task disappeared during migration import",
+            )
+        try:
+            _require_migration_import_eligible(locked_existing, body)
+        except HTTPException:
+            await db.rollback()
+            raise
+
         result = await db.execute(
             sa_update(Task)
-            .where(
-                *existing_generation,
-                Task.mode != "delivery_loop",
-                Task.delivery_run_id.is_(None),
-                no_active_worker_task_termination_predicate(),
-            )
+            .where(*fence_predicates)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -1289,6 +1469,7 @@ async def import_migrated_task(
                 409,
                 "Destination task changed during migration import",
             )
+        await purge_task_access_grants(db, body.id)
         db.expire_all()
         task = await db.get(Task, body.id)
         if task is None:
@@ -1298,6 +1479,7 @@ async def import_migrated_task(
                 "Destination task disappeared during migration import",
             )
         publication_generation = _task_generation_fence(body.id, task)
+        resulting_incarnation_id = task.incarnation_id
         await db.commit()
 
         if old_status != source_status:
@@ -1310,6 +1492,11 @@ async def import_migrated_task(
                 sa_update(Task)
                 .where(
                     *publication_generation,
+                    (
+                        Task.incarnation_id.is_(None)
+                        if resulting_incarnation_id is None
+                        else Task.incarnation_id == resulting_incarnation_id
+                    ),
                     no_active_worker_task_termination_predicate(),
                 )
                 .values(status=source_status)
@@ -1371,6 +1558,7 @@ async def get_task(
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_internal_task_incarnation(request, task_id, db)
     await require_task_access(request, task, db)
     return task
 
@@ -2466,6 +2654,10 @@ async def _update_worker_task_with_skill_configuration(
             updated = await queue.update_task(
                 task_id,
                 operation_lock_held=True,
+                expected_incarnation_id=internal_task_incarnation_id(
+                    request,
+                    task_id,
+                ),
                 **updates,
             )
         except (
@@ -2506,6 +2698,10 @@ async def _update_worker_task_with_handoff_fence(
             updated = await queue.update_task(
                 task_id,
                 operation_lock_held=True,
+                expected_incarnation_id=internal_task_incarnation_id(
+                    request,
+                    task_id,
+                ),
                 **updates,
             )
         except (
@@ -2767,7 +2963,14 @@ async def update_task(
             )
         )
     try:
-        task = await queue.update_task(task_id, **updates)
+        task = await queue.update_task(
+            task_id,
+            expected_incarnation_id=internal_task_incarnation_id(
+                request,
+                task_id,
+            ),
+            **updates,
+        )
     except (
         DurableWorkerTerminationConflict,
         TaskWaitingCapabilityConflict,
@@ -2776,6 +2979,73 @@ async def update_task(
     if not task:
         raise HTTPException(404, "Task not found")
     return task
+
+
+@router.put(
+    "/{task_id}/internal/enabled-skills",
+    response_model=TaskResponse,
+)
+async def update_task_enabled_skills_internal(
+    task_id: int,
+    body: InternalTaskSkillsUpdate,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Apply only the skill toggle exposed to the scoped skills MCP."""
+
+    require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
+    return await update_task(
+        task_id,
+        TaskUpdate(enabled_skills=body.enabled_skills),
+        request,
+        queue,
+    )
+
+
+@router.post("/{task_id}/internal/skill-tools")
+async def execute_task_skill_tool_internal(
+    task_id: int,
+    body: InternalSkillToolCall,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Execute the privileged half of one frozen Skills MCP tool call."""
+
+    require_internal_service(request)
+    task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
+    # Keep the runtime allow-list duplicated at the typed HTTP boundary so a
+    # future schema edit cannot silently broaden the Manager effect surface.
+    if body.tool not in SKILL_TOOL_RPC_NAMES:
+        raise HTTPException(400, "Unsupported CCM skill tool")
+    if task is None:
+        task = await queue.get(task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    outcome = await execute_skill_tool_rpc(
+        task,
+        body.tool,
+        body.arguments,
+        queue.db,
+    )
+    if outcome.enabled_skills is not None:
+        await update_task(
+            task_id,
+            TaskUpdate(enabled_skills=outcome.enabled_skills),
+            request,
+            queue,
+        )
+    return {"result": outcome.result}
 
 
 async def _settle_task_launch_barrier(

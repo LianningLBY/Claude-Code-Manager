@@ -5111,13 +5111,15 @@ async def test_goal_turn_passes_pool_config_dir(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
+@pytest.mark.parametrize("service_tier", ["default", "priority"])
+async def test_codex_goal_evaluator_uses_audited_app_server_route(
     db_factory,
+    service_tier,
 ):
-    """A hidden Fast evaluator must never enter the Standard exec path."""
+    """No hidden evaluator may enter the unaudited direct-exec path."""
 
     d = _make_dispatcher(db_factory)
-    codex_home = "/codex/fast-account"
+    codex_home = f"/codex/{service_tier}-account"
     d._resolve_resume_config_dir = AsyncMock(return_value=codex_home)
     registry = MagicMock(name="fast-goal-registry")
     d.instance_manager._ensure_codex_app_server_registry = MagicMock(
@@ -5133,7 +5135,7 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
 
     @asynccontextmanager
     async def forbidden_exec_guard(_home):
-        raise AssertionError("Fast goal evaluator entered codex exec")
+        raise AssertionError("Goal evaluator entered codex exec")
         yield  # pragma: no cover
 
     @asynccontextmanager
@@ -5157,11 +5159,11 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
     d.codex_pool = pool
 
     async with db_factory() as db:
-        inst = Instance(name="fast-goal-worker")
+        inst = Instance(name=f"{service_tier}-goal-worker")
         task = _make_goal_task(db)
         task.provider = "codex"
         task.model = "gpt-5.4"
-        task.codex_service_tier = "priority"
+        task.codex_service_tier = service_tier
         db.add_all([inst, task])
         await db.commit()
         await db.refresh(inst)
@@ -5173,6 +5175,8 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
     d.instance_manager.processes = {inst_id: process}
 
     from backend.services.goal_evaluator import GoalEvalResult
+
+    _, expected_evaluator_model, _ = d._goal_evaluator_runtime_config(task_obj)
 
     with patch(
         "backend.services.goal_evaluator.GoalEvaluator.evaluate",
@@ -5188,18 +5192,18 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
         )
 
     eval_kwargs = evaluate.await_args.kwargs
-    assert eval_kwargs["model"] == "gpt-5.4"
+    assert eval_kwargs["model"] == expected_evaluator_model
     assert eval_kwargs["codex_home"] == codex_home
-    assert eval_kwargs["codex_service_tier"] == "priority"
+    assert eval_kwargs["codex_service_tier"] == service_tier
     assert eval_kwargs["codex_app_server_registry"] is registry
     assert app_server_homes == [codex_home]
     assert runtime_admissions == [
-        ("codex", codex_home, "gpt-5.4", "priority"),
+        ("codex", codex_home, expected_evaluator_model, service_tier),
     ]
     pool.supports_model_for_home.assert_called_with(
         codex_home,
-        "gpt-5.4",
-        service_tier="priority",
+        expected_evaluator_model,
+        service_tier=service_tier,
     )
 
 

@@ -1085,7 +1085,52 @@ class ClaudePool:
         self._usage_cache = None
         return True
 
-    async def _refresh_oauth(self, account: "PoolAccount", cred_path: Path) -> dict | None:
+    async def ensure_oauth_access_token(
+        self,
+        config_dir: str | os.PathLike[str],
+        *,
+        minimum_remaining_seconds: float = 300.0,
+    ) -> bool:
+        """Refresh a managed native account before access-token-only projection.
+
+        Auxiliary untrusted workloads receive only ``accessToken`` and cannot
+        rotate a refresh token themselves.  Resolve the exact pool account and
+        refresh under the same per-account lock used by the pool before such a
+        workload snapshots its bounded access token.
+        """
+
+        if minimum_remaining_seconds < 0:
+            raise ValueError("minimum_remaining_seconds must be non-negative")
+        canonical = os.path.realpath(os.path.expanduser(os.fspath(config_dir)))
+        account = next(
+            (
+                candidate
+                for candidate in self._accounts
+                if os.path.realpath(candidate.config_dir) == canonical
+            ),
+            None,
+        )
+        if (
+            account is None
+            or not account.enabled
+            or account.retired
+            or _is_api_auth_kind(account.auth_kind)
+        ):
+            return False
+        creds = await self._refresh_oauth(
+            account,
+            Path(account.config_dir) / ".credentials.json",
+            minimum_remaining_seconds=minimum_remaining_seconds,
+        )
+        return creds is not None
+
+    async def _refresh_oauth(
+        self,
+        account: "PoolAccount",
+        cred_path: Path,
+        *,
+        minimum_remaining_seconds: float = 60.0,
+    ) -> dict | None:
         """accessToken 过期时用 refreshToken 换新（与 Claude CLI 自动刷新行为一致）。
 
         过期 ≠ 需要重新登录：CLI 平时跑着就会自己刷，闲置账号才会看到过期。
@@ -1105,7 +1150,10 @@ class ClaudePool:
             except (OSError, ValueError, KeyError):
                 return None
             # 等锁期间可能已被并发请求（或 CLI 进程自己）刷新过
-            if creds.get("expiresAt", 0) / 1000 > time.time() + 60:
+            if (
+                creds.get("expiresAt", 0) / 1000
+                > time.time() + minimum_remaining_seconds
+            ):
                 return creds
             refresh_token = creds.get("refreshToken")
             if not refresh_token:

@@ -23,10 +23,25 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.worker import Worker
 from backend.schemas.worker import WorkerCreate, WorkerLogsResponse, WorkerResponse
+from backend.services.worker_provisioner import worker_control_plane_enabled
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/workers", tags=["workers"])
+def _require_worker_control_plane_auth() -> None:
+    """Keep every Worker route closed in unauthenticated open mode."""
+
+    if not worker_control_plane_enabled():
+        raise HTTPException(
+            status_code=503,
+            detail="Worker control plane requires AUTH_TOKEN to be configured",
+        )
+
+
+router = APIRouter(
+    prefix="/api/workers",
+    tags=["workers"],
+    dependencies=[Depends(_require_worker_control_plane_auth)],
+)
 
 # 后台任务强引用：event loop 只持弱引用，长耗时 bootstrap 任务可能被 GC
 # 掐死在半路（asyncio 文档明确的坑）

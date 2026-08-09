@@ -4333,7 +4333,15 @@ async def reconcile_manager_task_delete_receipt(
     route = type(
         "TaskDeleteRoute",
         (),
-        {"id": receipt.task_id, "worker_id": receipt.worker_id},
+        {
+            "id": receipt.task_id,
+            "worker_id": receipt.worker_id,
+            # WorkerProxy re-reads the authoritative Manager mirror under the
+            # operation lock.  Preserve the receipt's exact incarnation here;
+            # an id/Worker-only recovery route would now fail closed before
+            # DELETE/audit, or worse become ambiguous after integer-id reuse.
+            "incarnation_id": receipt.source_task_incarnation_id,
+        },
     )()
     delete_path = f"/api/tasks/{receipt.task_id}"
     audit_path = f"{delete_path}/plan-delete-audit"

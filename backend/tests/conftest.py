@@ -12,7 +12,9 @@ from pathlib import Path
 # bootstrap, an incompletely mocked test can write Instance/Task lifecycle
 # state into the developer's real ``claude_manager.db``.
 TEST_DB_URL = "sqlite+aiosqlite:///:memory:"
-_GLOBAL_TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="ccm-pytest-global-"))
+_GLOBAL_TEST_DB_DIR = Path(
+    tempfile.mkdtemp(prefix="ccm-pytest-global-")
+).resolve()
 atexit.register(shutil.rmtree, _GLOBAL_TEST_DB_DIR, ignore_errors=True)
 _GLOBAL_TEST_PROJECT_DIR = _GLOBAL_TEST_DB_DIR / "project"
 _GLOBAL_TEST_PROJECT_DIR.mkdir(mode=0o700)
@@ -32,6 +34,10 @@ os.environ.update({
     ),
     "CLOUDROUTER_ACCOUNTS_DIR": str(
         _GLOBAL_TEST_DB_DIR / "cloudrouter-accounts"
+    ),
+    "SSH_KEY_STORAGE_DIR": str(_GLOBAL_TEST_DB_DIR / "ssh-key-store"),
+    "TASK_RUNTIME_SECRET_DIR": str(
+        _GLOBAL_TEST_DB_DIR / "task-runtime-secrets"
     ),
     "WORKSPACE_DIR": str(_GLOBAL_TEST_DB_DIR / "workspace"),
     "WORKER_ENABLED": "false",
@@ -80,6 +86,9 @@ import backend.models.worker_turn_handoff  # noqa: F401
 import backend.models.worker_task_termination  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
+import backend.models.ssh_profile  # noqa: F401
+import backend.models.task_ssh_grant  # noqa: F401
+import backend.models.task_ssh_effect  # noqa: F401
 import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
@@ -154,6 +163,18 @@ async def client(app):
     transport = ASGITransport(app=real_app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest_asyncio.fixture
+async def worker_control_plane_auth(client, monkeypatch):
+    """Run Worker-specific suites as an authenticated deployment."""
+
+    from backend.config import settings
+
+    token = "worker-control-plane-test-token"
+    monkeypatch.setattr(settings, "auth_token", token)
+    client.headers["Authorization"] = f"Bearer {token}"
+    yield
 
 
 @pytest_asyncio.fixture

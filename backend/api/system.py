@@ -125,6 +125,10 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         # Manager-side ACL must not proxy the managed Task namespace to an
         # older Worker that lacks the same cross-Task path fence.
         "task_artifact_scope_version": TASK_ARTIFACT_SCOPE_VERSION,
+        # Manager-side Task operation locks are not enough across processes.
+        # This proves Worker Task mutations validate the exact logical
+        # incarnation carried by the Manager proxy.
+        "worker_task_incarnation_proxy_version": 1,
     }
 
 

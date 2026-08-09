@@ -631,6 +631,7 @@ async def test_codex_task_distill_routes_to_codex_provider(
     assert kwargs["claude_pool"] is sentinel_claude_pool
     assert kwargs["codex_pool"] is sentinel_pool
     assert kwargs["codex_account_id"] == "codex-2"
+    assert kwargs["task_id"] == task_id
     assert kwargs["cloudrouter_store"] is sentinel_cloudrouter_store
     assert kwargs["custom_instruction"] == "focus on tests"
     assert "fix the bug" in kwargs["conversation"]

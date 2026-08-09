@@ -20,17 +20,59 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from backend.config import settings
 from backend.database import Base
+from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.team_share import TeamProjectShare
 from backend.models.monitor_session import MonitorSession, MonitorCheck
 from backend.services.dispatcher import (
     AuxiliaryLaunchSupersededError,
     GlobalDispatcher,
     _MonitorTurnHandle,
 )
+from backend.services.task_agent_isolation import TaskAgentIsolationError
 from backend.tests.worker_termination_helpers import (
     persist_active_worker_receipt,
 )
+
+
+TASK_INCARNATION = "a" * 32
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["monitor", "sub-agent"])
+async def test_claude_aux_launch_has_zero_model_side_effect_without_auth_token(
+    dispatcher,
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    monkeypatch.setattr(settings, "auth_token", "")
+    dispatcher._launch_registered_aux_process = AsyncMock()
+
+    with pytest.raises(TaskAgentIsolationError, match="AUTH_TOKEN"):
+        if kind == "monitor":
+            await dispatcher._launch_monitor_agent(
+                prompt="must not run",
+                cwd=str(tmp_path),
+                model=None,
+                task_id=1,
+                monitor_session_id=2,
+                turn_generation=1,
+                mcp_config_path=tmp_path / "monitor.json",
+            )
+        else:
+            await dispatcher._launch_sub_agent(
+                prompt="must not run",
+                cwd=str(tmp_path),
+                model=None,
+                task_id=1,
+                session_id=2,
+                mcp_config_path=tmp_path / "sub-agent.json",
+            )
+
+    dispatcher._launch_registered_aux_process.assert_not_awaited()
 
 
 @pytest.fixture
@@ -56,11 +98,13 @@ def dispatcher(db_factory, mock_broadcaster):
     d._monitor_active_turns = set()
     d._sub_agent_tasks = {}
     d._sub_agent_processes = {}
+    d._sub_agent_config_dirs = {}
     d._sub_agent_log_fhs = {}
     d._sub_agent_codex_processes = {}
     d._sub_agent_codex_homes = {}
     d._sub_agent_codex_threads = {}
     d.codex_pool = None
+    d.pool = None
     # This fixture deliberately bypasses GlobalDispatcher.__init__. Keep the
     # queue-admission members used by Monitor callback fencing in sync with the
     # production constructor.
@@ -86,11 +130,188 @@ def dispatcher(db_factory, mock_broadcaster):
     return d
 
 
+async def _seed_project_auxiliary(
+    db_factory,
+    *,
+    provider: str,
+    agent_type: str,
+    shared: bool,
+    status: str = "running",
+):
+    async with db_factory() as db:
+        project = Project(
+            name=f"{provider}-{agent_type}-share-gate",
+            status="ready",
+        )
+        db.add(project)
+        await db.flush()
+        task = Task(
+            title=f"{provider} auxiliary parent",
+            description="d",
+            status="in_progress",
+            project_id=project.id,
+            target_repo="/tmp",
+            provider=provider,
+            model=("gpt-5.6-sol" if provider == "codex" else None),
+            incarnation_id=("c" if provider == "codex" else "a") * 32,
+        )
+        db.add(task)
+        await db.flush()
+        session = MonitorSession(
+            task_id=task.id,
+            agent_type=agent_type,
+            source="ccm",
+            description="Project share auxiliary gate",
+            provider=provider,
+            status=status,
+            next_check_at=(
+                datetime.utcnow()
+                if agent_type == "monitor" and status == "running"
+                else None
+            ),
+            model=("gpt-5.6-sol" if provider == "codex" else None),
+        )
+        db.add(session)
+        await db.flush()
+        if shared:
+            db.add(TeamProjectShare(
+                project_id=project.id,
+                target_type="user",
+                target_id=701,
+                shared_by=701,
+            ))
+        await db.commit()
+        return project.id, task.id, session.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_shared_project_monitor_claim_terminalizes_without_provider_effect(
+    dispatcher,
+    provider,
+):
+    _project_id, _task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider=provider,
+        agent_type="monitor",
+        shared=True,
+    )
+    dispatcher._launch_scheduled_monitor_turn = AsyncMock()
+
+    assert await dispatcher._claim_due_monitor_turn(session_id) is None
+    dispatcher._launch_scheduled_monitor_turn.assert_not_awaited()
+    async with dispatcher.db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+    assert session.status == "failed"
+    assert session.active_turn_generation is None
+    assert session.next_check_at is None
+    assert "Project admission failed" in session.last_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_monitor_provider_effect_rechecks_project_share_after_claim(
+    dispatcher,
+    provider,
+):
+    project_id, task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider=provider,
+        agent_type="monitor",
+        shared=False,
+    )
+    snapshot = await dispatcher._claim_due_monitor_turn(session_id)
+    assert snapshot is not None
+    async with dispatcher.db_factory() as db:
+        db.add(TeamProjectShare(
+            project_id=project_id,
+            target_type="user",
+            target_id=702,
+            shared_by=702,
+        ))
+        await db.commit()
+
+    dispatcher._launch_codex_monitor_turn = AsyncMock()
+    dispatcher._launch_monitor_agent = AsyncMock()
+    from backend.services.project_share_admission import (
+        ProjectShareAdmissionError,
+    )
+
+    with pytest.raises(ProjectShareAdmissionError, match="is shared"):
+        await dispatcher._launch_scheduled_monitor_turn(session_id, snapshot)
+    dispatcher._launch_codex_monitor_turn.assert_not_awaited()
+    dispatcher._launch_monitor_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_shared_project_sub_agent_has_zero_provider_effect(
+    dispatcher,
+    provider,
+):
+    _project_id, _task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider=provider,
+        agent_type="sub_agent",
+        shared=True,
+    )
+    dispatcher._launch_sub_agent = AsyncMock()
+    dispatcher._launch_codex_sub_agent = AsyncMock()
+    dispatcher._finalize_aux_lifecycle_process = AsyncMock(return_value=None)
+    dispatcher._finalize_codex_sub_agent_turn = AsyncMock()
+
+    await dispatcher._sub_agent_session_lifecycle(session_id)
+
+    dispatcher._launch_sub_agent.assert_not_awaited()
+    dispatcher._launch_codex_sub_agent.assert_not_awaited()
+    async with dispatcher.db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+    assert session.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_auxiliary_runtime_map_vetoes_first_project_share(
+    dispatcher,
+):
+    project_id, task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider="claude",
+        agent_type="sub_agent",
+        shared=False,
+        status="failed",
+    )
+    async with dispatcher.db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+    dispatcher._sub_agent_processes[session_id] = _fake_proc(returncode=None)
+    manager = MagicMock()
+    manager.project_share_runtime_block_reason.return_value = None
+    from backend.services import task_sharing
+    from backend.services.project_share_admission import (
+        ProjectShareAdmissionError,
+    )
+
+    async with dispatcher.db_factory() as db:
+        with pytest.raises(
+            ProjectShareAdmissionError,
+            match="runtime is still attached",
+        ):
+            await task_sharing.share_project(
+                db,
+                project_id,
+                [],
+                instance_manager=manager,
+                dispatcher=dispatcher,
+            )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["monitor", "sub-agent"])
 async def test_api_account_aux_home_survives_cancelled_unreaped_spawn(
     dispatcher, tmp_path, kind,
 ):
+    task_id, _ = await _seed_task_and_monitor(dispatcher.db_factory)
     home = str(tmp_path / "api-account" / "claude")
     dispatcher.pool = MagicMock()
     dispatcher._pool_select = AsyncMock(return_value=home)
@@ -103,23 +324,30 @@ async def test_api_account_aux_home_survives_cancelled_unreaped_spawn(
         raise asyncio.CancelledError()
 
     dispatcher._launch_registered_aux_process = cancelled_spawn
-    with pytest.raises(asyncio.CancelledError):
-        if kind == "monitor":
-            await dispatcher._launch_monitor_agent(
-                prompt="monitor",
-                cwd=str(tmp_path),
-                model="claude-opus-4-8",
-                monitor_session_id=session_id,
-                mcp_config_path=tmp_path / "monitor.json",
-            )
-        else:
-            await dispatcher._launch_sub_agent(
-                prompt="child",
-                cwd=str(tmp_path),
-                model="claude-opus-4-8",
-                session_id=session_id,
-                mcp_config_path=tmp_path / "child.json",
-            )
+    with patch(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings"
+    ):
+        with pytest.raises(asyncio.CancelledError):
+            if kind == "monitor":
+                await dispatcher._launch_monitor_agent(
+                    prompt="monitor",
+                    cwd=str(tmp_path),
+                    model="claude-opus-4-8",
+                    task_id=task_id,
+                    monitor_session_id=session_id,
+                    turn_generation=1,
+                    mcp_config_path=tmp_path / "monitor.json",
+                )
+            else:
+                await dispatcher._launch_sub_agent(
+                    prompt="child",
+                    cwd=str(tmp_path),
+                    model="claude-opus-4-8",
+                    task_id=task_id,
+                    session_id=session_id,
+                    mcp_config_path=tmp_path / "child.json",
+                )
 
     home_map = (
         dispatcher._monitor_config_dirs
@@ -216,6 +444,7 @@ async def _seed_codex_sub_agent(
     async with dispatcher.db_factory() as db:
         task = Task(
             id=task_id,
+            incarnation_id=TASK_INCARNATION,
             title="codex parent",
             description="d",
             status="completed",
@@ -333,17 +562,32 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
 
     from backend.services.mcp_config import build_sub_agent_mcp_server_specs
 
-    specs = build_sub_agent_mcp_server_specs(41, 7)
-    launched = await dispatcher._launch_codex_sub_agent(
-        prompt="review",
-        cwd="/tmp",
-        model="gpt-5.6-sol",
-        effort_level="high",
-        session_id=41,
-        task_id=7,
-        task_metadata={},
-        mcp_specs=specs,
+    specs = build_sub_agent_mcp_server_specs(
+        41,
+        7,
+        task_incarnation_id=TASK_INCARNATION,
     )
+    git_fingerprint = (("/git/HEAD", "file", 1, 2, 3, 4, 5),)
+    git_boundary = MagicMock(
+        read_paths=("/git/objects", "/git/HEAD"),
+        identity_fingerprint=git_fingerprint,
+    )
+    with patch(
+        "backend.services.task_agent_isolation."
+        "discover_linked_worktree_git_read_boundary",
+        return_value=git_boundary,
+    ):
+        launched = await dispatcher._launch_codex_sub_agent(
+            prompt="review",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=41,
+            task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
+            task_metadata={},
+            mcp_specs=specs,
+        )
 
     assert launched is process
     kwargs = registry.start_turn.await_args.kwargs
@@ -351,7 +595,18 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     assert "ephemeral" not in kwargs
     assert kwargs["mcp_specs"] == specs
     assert kwargs["mcp_specs"][0].required is True
-    assert kwargs["disable_project_config"] is False
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_user_mcp"] is True
+    assert kwargs["sandbox_mode"] == "workspace-write"
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["task_ssh_protected_paths"]
+    assert kwargs["task_ssh_disable_network"] is False
+    assert kwargs["task_git_read_paths"] == (
+        "/git/objects",
+        "/git/HEAD",
+    )
+    assert kwargs["task_git_boundary_fingerprint"] == git_fingerprint
+    assert kwargs["task_private_tmpdir"].cleaned is True
     assert set(kwargs["mcp_specs"][0].enabled_tools) == {
         "get_context",
         "report_progress",
@@ -359,6 +614,54 @@ async def test_launch_codex_sub_agent_uses_required_thread_mcp(dispatcher):
     }
     assert dispatcher._sub_agent_codex_processes[41] is process
     assert dispatcher._sub_agent_codex_threads[41] == "thread-child"
+
+
+@pytest.mark.asyncio
+async def test_codex_sub_agent_inherits_parent_broker_only_network_fence(
+    dispatcher,
+):
+    await _seed_codex_sub_agent(
+        dispatcher,
+        task_id=7,
+        session_id=42,
+    )
+    process = _fake_proc(returncode=None)
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(
+        return_value=(process, "thread-broker-child")
+    )
+    dispatcher.instance_manager._ensure_codex_app_server_registry.return_value = (
+        registry
+    )
+
+    @asynccontextmanager
+    async def admit(home):
+        yield home or "/tmp/default-codex-home"
+
+    dispatcher.instance_manager.codex_home_app_server_guard = admit
+    broker_policy = MagicMock(broker_only=True)
+    with patch(
+        "backend.services.task_ssh_access.task_ssh_runtime_policy",
+        new=AsyncMock(return_value=broker_policy),
+    ):
+        await dispatcher._launch_codex_sub_agent(
+            prompt="use only the broker",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            session_id=42,
+            task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
+            task_metadata={},
+            mcp_specs=(),
+        )
+
+    kwargs = registry.start_turn.await_args.kwargs
+    assert kwargs["sandbox_mode"] == "workspace-write"
+    assert kwargs["task_ssh_disable_network"] is True
+    assert kwargs["task_git_read_paths"] == ()
+    assert kwargs["task_git_boundary_fingerprint"] == ()
+    assert kwargs["task_private_tmpdir"].cleaned is True
 
 
 @pytest.mark.asyncio
@@ -412,6 +715,7 @@ async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
         effort_level="high",
         session_id=61,
         task_id=7,
+        task_incarnation_id=TASK_INCARNATION,
         task_metadata={},
         mcp_specs=(),
     )
@@ -421,6 +725,7 @@ async def test_launch_api_codex_sub_agent_disables_project_config(dispatcher):
         registry.start_turn.await_args.kwargs["disable_project_config"]
         is True
     )
+    assert registry.start_turn.await_args.kwargs["disable_user_mcp"] is True
 
 
 @pytest.mark.asyncio
@@ -464,6 +769,7 @@ async def test_codex_sub_agent_final_gate_rejects_pending_task_routing(
             effort_level="high",
             session_id=71,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
             expected_task_routing=(
@@ -509,6 +815,7 @@ async def test_codex_sub_agent_final_gate_rejects_stopped_generation(
             effort_level="high",
             session_id=72,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
             expected_task_routing=(
@@ -551,6 +858,7 @@ async def test_codex_sub_agent_final_gate_yields_to_active_receipt(dispatcher):
             effort_level="high",
             session_id=75,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
             expected_task_routing=(
@@ -610,6 +918,7 @@ async def test_codex_sub_agent_commit_failure_aborts_exact_started_turn(
             effort_level="high",
             session_id=73,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
         )
@@ -680,6 +989,7 @@ async def test_codex_sub_agent_commit_cancellation_waits_for_exact_abort(
             effort_level="high",
             session_id=74,
             task_id=7,
+            task_incarnation_id=TASK_INCARNATION,
             task_metadata={},
             mcp_specs=(),
         )
@@ -736,7 +1046,12 @@ async def test_codex_sub_agent_rejects_home_owned_by_exec_generation(
             session_id=51,
             task_id=7,
             task_metadata={},
-            mcp_specs=build_sub_agent_mcp_server_specs(51, 7),
+            task_incarnation_id=TASK_INCARNATION,
+            mcp_specs=build_sub_agent_mcp_server_specs(
+                51,
+                7,
+                task_incarnation_id=TASK_INCARNATION,
+            ),
         )
 
     registry.start_turn.assert_not_awaited()
@@ -771,8 +1086,13 @@ async def test_codex_sub_agent_rejects_active_ephemeral_exec(
                 effort_level="high",
                 session_id=52,
                 task_id=7,
+                task_incarnation_id=TASK_INCARNATION,
                 task_metadata={},
-                mcp_specs=build_sub_agent_mcp_server_specs(52, 7),
+                mcp_specs=build_sub_agent_mcp_server_specs(
+                    52,
+                    7,
+                    task_incarnation_id=TASK_INCARNATION,
+                ),
             )
 
     registry.start_turn.assert_not_awaited()
@@ -888,16 +1208,22 @@ def test_build_monitor_agent_prompt_interval_guidance(dispatcher):
 async def test_launch_monitor_agent_raises_bash_max_timeout(dispatcher, tmp_path):
     """A one-check turn no longer scales shell timeout with interval."""
     dispatcher.pool = None
+    task_id, _ = await _seed_task_and_monitor(dispatcher.db_factory)
     captured = {}
 
     async def fake_exec(*cmd, **kwargs):
         captured["env"] = kwargs["env"]
         return _fake_proc()
 
-    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec), patch(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings"
+    ):
         await dispatcher._launch_monitor_agent(
             prompt="p", cwd="/tmp", model=None,
+            task_id=task_id,
             monitor_session_id=990001,
+            turn_generation=1,
             mcp_config_path=tmp_path / "mcp.json",
             interval_seconds=3600,
         )
@@ -912,6 +1238,7 @@ async def test_launch_monitor_agent_keeps_larger_env_timeout(
 ):
     """环境里已有更大的 BASH_MAX_TIMEOUT_MS 时只抬不降。"""
     dispatcher.pool = None
+    task_id, _ = await _seed_task_and_monitor(dispatcher.db_factory)
     monkeypatch.setenv("BASH_MAX_TIMEOUT_MS", "99999000")
     captured = {}
 
@@ -919,10 +1246,15 @@ async def test_launch_monitor_agent_keeps_larger_env_timeout(
         captured["env"] = kwargs["env"]
         return _fake_proc()
 
-    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec):
+    with patch("asyncio.create_subprocess_exec", side_effect=fake_exec), patch(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings"
+    ):
         await dispatcher._launch_monitor_agent(
             prompt="p", cwd="/tmp", model=None,
+            task_id=task_id,
             monitor_session_id=990002,
+            turn_generation=1,
             mcp_config_path=tmp_path / "mcp.json",
             interval_seconds=300,
         )
@@ -1375,11 +1707,14 @@ async def test_failed_group_proof_retains_aux_process_evidence(dispatcher):
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups only")
 @pytest.mark.parametrize("map_kind", ["monitor", "sub-agent"])
 async def test_aux_spawn_cancellation_settles_registers_and_reaps(
-    dispatcher, tmp_path, map_kind
+    dispatcher, tmp_path, map_kind, monkeypatch
 ):
     """Cancellation inside spawn cannot lose the exact child group handle."""
     pid_file = tmp_path / f"{map_kind}-child.pid"
-    log_path = tmp_path / f"{map_kind}.log"
+    monkeypatch.setattr(
+        "backend.config.settings.task_runtime_secret_dir",
+        str(tmp_path / "runtime-secrets"),
+    )
     process_map = {}
     log_map = {}
     captured = {}
@@ -1422,7 +1757,7 @@ time.sleep(30)
                     cmd=cmd,
                     cwd=str(tmp_path),
                     env=dict(os.environ),
-                    log_path=log_path,
+                    log_namespace=map_kind,
                     session_id=81,
                     process_map=process_map,
                     log_map=log_map,
@@ -1774,6 +2109,12 @@ async def test_codex_monitor_reuses_thread_with_read_only_generation_specs(
         assert kwargs["sandbox_mode"] == "read-only"
         assert kwargs["disable_autonomous_features"] is True
         assert kwargs["disable_project_config"] is True
+        assert kwargs["disable_user_mcp"] is True
+        assert kwargs["task_ssh_protected_paths"]
+        assert kwargs["task_ssh_disable_network"] is True
+        assert kwargs["task_git_read_paths"] == ()
+        assert kwargs["task_git_boundary_fingerprint"] == ()
+        assert kwargs["task_private_tmpdir"].cleaned is True
         # Monitor must never inherit the parent Task's ccm_skills server or
         # skill context. Its only model-visible capability is the exact
         # generation-fenced callback server.
@@ -1790,6 +2131,10 @@ async def test_codex_monitor_reuses_thread_with_read_only_generation_specs(
         args = monitor_spec.args
         generation_index = args.index("--turn-generation")
         assert args[generation_index + 1] == str(generation)
+    assert (
+        launch_kwargs[0]["task_private_tmpdir"]
+        is not launch_kwargs[1]["task_private_tmpdir"]
+    )
     registry.abort_unclaimed_turn.assert_not_awaited()
     registry.recycle_thread_runtime.assert_awaited_once_with(
         home,

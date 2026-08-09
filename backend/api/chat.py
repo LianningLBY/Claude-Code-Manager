@@ -3828,6 +3828,7 @@ async def distill_task(
                 codex_account_id=(task.metadata_ or {}).get(
                     "codex_account_id"
                 ),
+                task_id=task.id,
                 instance_manager=instance_manager,
                 cloudrouter_store=cloudrouter_store,
             )

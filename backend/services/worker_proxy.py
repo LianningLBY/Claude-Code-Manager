@@ -244,12 +244,35 @@ class WorkerProxy:
         return f"http://{worker.private_ip}:{worker.ccm_port}{path}"
 
     @staticmethod
-    def _headers(worker: Worker) -> dict:
+    def _require_authenticated_control_plane(worker: Worker) -> None:
+        """Refuse every Manager→Worker network effect in legacy open mode."""
+
+        if (
+            not isinstance(settings.auth_token, str)
+            or not settings.auth_token.strip()
+        ):
+            raise HTTPException(
+                503,
+                "AUTH_TOKEN must be configured before Worker operations",
+            )
+        if (
+            not isinstance(worker.auth_token, str)
+            or not worker.auth_token.strip()
+        ):
+            raise HTTPException(
+                503,
+                "Worker authentication credential is unavailable",
+            )
+
+    @classmethod
+    def _headers(cls, worker: Worker) -> dict:
+        cls._require_authenticated_control_plane(worker)
         return {"Authorization": f"Bearer {worker.auth_token}"}
 
-    @staticmethod
-    def _ssh(worker: Worker) -> SSHExecutor:
+    @classmethod
+    def _ssh(cls, worker: Worker) -> SSHExecutor:
         """Build every WorkerProxy SSH path with per-instance host trust."""
+        cls._require_authenticated_control_plane(worker)
         return SSHExecutor(
             host=worker.private_ip,
             user=worker.ssh_user,
@@ -1613,6 +1636,7 @@ class WorkerProxy:
                 f"Worker {worker.name if worker else task.worker_id} 不可用"
                 f"（{worker.status if worker else 'not found'}）"
             )
+        self._require_authenticated_control_plane(worker)
 
         await self.require_worker_fast_support(worker, task)
         # PR reviews use only the remote GitHub snapshot named in their prompt.
@@ -1656,12 +1680,14 @@ class WorkerProxy:
             )
         ]
 
-        # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件
+        # 先订阅 relay 再创建：worker Dispatcher 可能创建后立即执行，后订阅丢初始事件。
+        # The authentication gate above must precede this WebSocket effect.
         await self.relay.subscribe_task(worker, task.id)
         user_skill_snapshots = await self._user_skill_snapshots(task)
 
         payload = {
             "id": task.id,  # 关键：Manager 分配的全局 ID
+            "source_incarnation_id": task.incarnation_id,
             "title": task.title,
             "description": task.description or "",
             "project_id": worker_project_id,
@@ -1698,13 +1724,14 @@ class WorkerProxy:
             "attachments": attachment_records or None,
             "attention_tag": task.attention_tag,
         }
+        headers = self._headers(worker)
         post_started = False
         try:
             async with httpx.AsyncClient(timeout=30) as c:
                 post_started = True
                 r = await c.post(
                     self._api(worker, "/api/tasks"),
-                    headers=self._headers(worker),
+                    headers=headers,
                     json=payload,
                 )
                 # Once POST has started, even an HTTP error or malformed ACK
@@ -1964,6 +1991,7 @@ class WorkerProxy:
         operation_lock_held: bool = False,
         pr_review_terminal_chat: bool = False,
         quarantine_on_transport_uncertainty: bool = False,
+        require_task_incarnation_fence: bool = False,
     ):
         if pr_review_terminal_chat and not is_pr_review_task(task):
             raise ValueError(
@@ -1982,6 +2010,7 @@ class WorkerProxy:
                 quarantine_on_transport_uncertainty=(
                     quarantine_on_transport_uncertainty
                 ),
+                require_task_incarnation_fence=require_task_incarnation_fence,
             )
         async with self.task_operation_lock(task.id):
             return await self._proxy_to_worker_locked(
@@ -1996,6 +2025,7 @@ class WorkerProxy:
                 quarantine_on_transport_uncertainty=(
                     quarantine_on_transport_uncertainty
                 ),
+                require_task_incarnation_fence=require_task_incarnation_fence,
             )
 
     async def _proxy_to_worker_locked(
@@ -2010,7 +2040,28 @@ class WorkerProxy:
         surface_endpoint_not_found: bool,
         pr_review_terminal_chat: bool,
         quarantine_on_transport_uncertainty: bool,
+        require_task_incarnation_fence: bool,
     ):
+        if self.db_factory is not None:
+            if not task.incarnation_id:
+                raise HTTPException(
+                    409,
+                    "Manager Task has no stable incarnation identity",
+                )
+            async with self.db_factory() as db:
+                current = await db.scalar(
+                    select(Task).where(
+                        Task.id == task.id,
+                        Task.incarnation_id == task.incarnation_id,
+                        Task.worker_id == task.worker_id,
+                    )
+                )
+            if current is None:
+                raise HTTPException(
+                    409,
+                    "Manager Task incarnation or Worker assignment changed",
+                )
+            task = current
         # A durable Manager receipt owns every remote mutation until its exact
         # result is ACKed. The reconciliation loop itself traverses this common
         # proxy, so admit only that receipt's identity-bound GET/PUT/ACK paths;
@@ -2075,6 +2126,28 @@ class WorkerProxy:
                         "Task has an active Worker termination receipt",
                     )
         worker = await self.require_ready_worker(task.worker_id)
+        if require_task_incarnation_fence:
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.get(
+                        self._api(worker, "/api/system/config"),
+                        headers=self._headers(worker),
+                    )
+                    response.raise_for_status()
+                config = response.json()
+            except Exception as exc:
+                raise HTTPException(
+                    503,
+                    "Unable to confirm Worker Task-incarnation fencing",
+                ) from exc
+            if (
+                not isinstance(config, dict)
+                or config.get("worker_task_incarnation_proxy_version") != 1
+            ):
+                raise HTTPException(
+                    409,
+                    "Worker must be upgraded before Monitor/Sub-Agent mutation",
+                )
         return await self._proxy_to_authorized_worker_locked(
             worker,
             task,
@@ -2088,6 +2161,7 @@ class WorkerProxy:
             quarantine_on_transport_uncertainty=(
                 quarantine_on_transport_uncertainty
             ),
+            task_incarnation_fenced=require_task_incarnation_fence,
         )
 
     async def _proxy_to_claimed_destroying_worker(
@@ -2156,6 +2230,7 @@ class WorkerProxy:
             quarantine_on_transport_uncertainty=(
                 quarantine_on_transport_uncertainty
             ),
+            task_incarnation_fenced=False,
         )
 
     async def _proxy_to_authorized_worker_locked(
@@ -2171,9 +2246,15 @@ class WorkerProxy:
         surface_endpoint_not_found: bool,
         pr_review_terminal_chat: bool,
         quarantine_on_transport_uncertainty: bool,
+        task_incarnation_fenced: bool,
     ):
+        self._require_authenticated_control_plane(worker)
         await self.relay.subscribe_task(worker, task.id)
         headers = self._headers(worker)
+        if task_incarnation_fenced:
+            if not task.incarnation_id:
+                raise HTTPException(409, "Task has no stable incarnation identity")
+            headers["X-CCM-Task-Incarnation"] = task.incarnation_id
         if pr_review_terminal_chat:
             headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
                 PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
@@ -2240,6 +2321,11 @@ class WorkerProxy:
                 and missing.get("detail") == "Task not found"
             ):
                 return {"ok": True, "already_deleted": True}
+        if task_incarnation_fenced and r.status_code == 409:
+            raise HTTPException(
+                409,
+                "Worker Task incarnation or lifecycle changed",
+            )
         if not 200 <= r.status_code < 300:
             if quarantine_on_transport_uncertainty:
                 raise WorkerTaskMutationOutcomeUncertainError(

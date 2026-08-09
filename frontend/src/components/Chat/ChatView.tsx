@@ -25,6 +25,7 @@ import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/Task
 import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
 import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
 import { AttentionTag } from '../Tasks/AttentionTag';
+import { TaskSSHAccessBadge } from '../SSH/TaskSSHAccess';
 import { DeliveryRunPanel } from '../Tasks/DeliveryRunPanel';
 import { ExpandableText } from '../ExpandableText';
 import { copyToClipboard } from '../clipboard';
@@ -2286,6 +2287,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     {providerLabel}
                   </span>
                   <FastModeBadge task={task} />
+                  {!deliveryReadOnly && <TaskSSHAccessBadge task={task} />}
                 </>
               )}
               {backgroundActive && (

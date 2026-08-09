@@ -12,6 +12,7 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services.task_creation import (
     purge_task_access_grants,
@@ -455,6 +456,7 @@ class TaskQueue:
         task_id: int,
         *,
         operation_lock_held: bool = False,
+        expected_incarnation_id: str | None = None,
         **kwargs,
     ) -> Task | None:
         """Update one Task only while no durable termination owns it.
@@ -476,6 +478,7 @@ class TaskQueue:
                 return await self.update_task(
                     task_id,
                     operation_lock_held=True,
+                    expected_incarnation_id=expected_incarnation_id,
                     **kwargs,
                 )
 
@@ -510,6 +513,11 @@ class TaskQueue:
                 Task.id == task_id,
                 *(
                     ()
+                    if expected_incarnation_id is None
+                    else (Task.incarnation_id == expected_incarnation_id,)
+                ),
+                *(
+                    ()
                     if waiting_capability_safe
                     else (Task.status != "waiting_capability",)
                 ),
@@ -538,7 +546,14 @@ class TaskQueue:
             return None
         await self.db.commit()
         self.db.expire_all()
-        return await self.db.get(Task, task_id)
+        if expected_incarnation_id is None:
+            return await self.db.get(Task, task_id)
+        return await self.db.scalar(
+            select(Task).where(
+                Task.id == task_id,
+                Task.incarnation_id == expected_incarnation_id,
+            )
+        )
 
     async def delete(
         self,
@@ -588,6 +603,7 @@ class TaskQueue:
         task = await self.get(task_id)
         if not task:
             return False
+        observed_incarnation_id = task.incarnation_id
         (
             observed_status,
             observed_worker_id,
@@ -1322,6 +1338,13 @@ class TaskQueue:
                     PlanAgentRun.id.in_(legacy_only_plan_run_ids)
                 )
             )
+        # SQLite does not enable foreign-key cascades consistently across all
+        # supported deployment/test connection paths.  Keep SSH grants inside
+        # the same generation-fenced transaction so a deleted Task can never
+        # leave reusable authorization behind (or collide if its id is reused).
+        await self.db.execute(
+            sa_delete(TaskSSHGrant).where(TaskSSHGrant.task_id == task_id)
+        )
         if monitor_ids:
             await self.db.execute(
                 sa_delete(MonitorCheck).where(
@@ -1374,6 +1397,18 @@ class TaskQueue:
             await self.db.rollback()
             return False
         await self.db.commit()
+        from backend.services.internal_service_auth import (
+            revoke_internal_service_owner,
+        )
+
+        revoke_internal_service_owner("task-turn", task_id)
+        if observed_incarnation_id:
+            from backend.services.ask_user import ask_user_registry
+
+            ask_user_registry.discard_for_task(
+                task_id,
+                observed_incarnation_id,
+            )
         return True
 
     async def dequeue(

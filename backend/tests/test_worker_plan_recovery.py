@@ -33,6 +33,11 @@ from backend.services.worker_proxy import (
 )
 
 
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+_WORKER_CONTROL_PLANE_TOKEN = "worker-control-plane-test-token"
+
+
 @dataclass(frozen=True)
 class _Graph:
     worker_id: int
@@ -54,7 +59,11 @@ async def _seed_graph(
 ) -> _Graph:
     pipeline = default_plan_pipeline_config().model_dump(mode="json")
     async with db_factory() as db:
-        worker = Worker(name=f"worker-{receipt_status}", status="ready")
+        worker = Worker(
+            name=f"worker-{receipt_status}",
+            status="ready",
+            auth_token=_WORKER_CONTROL_PLANE_TOKEN,
+        )
         db.add(worker)
         await db.flush()
         target = None
@@ -741,6 +750,7 @@ async def test_proxy_reconciliation_is_read_only_for_terminal_remote(
         status="ready",
         private_ip="10.0.0.7",
         ccm_port=8000,
+        auth_token=_WORKER_CONTROL_PLANE_TOKEN,
     )
     plan = Plan(
         id=graph.plan_id,
@@ -823,6 +833,7 @@ async def test_proxy_reconciliation_rejects_malformed_audit_before_side_effect(
         status="ready",
         private_ip="10.0.0.7",
         ccm_port=8000,
+        auth_token=_WORKER_CONTROL_PLANE_TOKEN,
     )
     plan = Plan(
         id=graph.plan_id,
@@ -897,6 +908,7 @@ async def test_old_worker_without_audit_protocol_fails_closed(monkeypatch):
         status="ready",
         private_ip="10.0.0.3",
         ccm_port=8000,
+        auth_token=_WORKER_CONTROL_PLANE_TOKEN,
     )
 
     class Client:

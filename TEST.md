@@ -426,6 +426,7 @@ Codex 版本兼容基线（2026-07-24）：
 - 两版 app-server 均已用真实 `thread/start` 启动 CCM FastMCP server，`required`、`enabled_tools` 和 timeout 配置可正常完成 session 初始化。
 - 实测确认 app-server 对 server 名强制 `^[a-zA-Z0-9_-]+$`；renderer 在进 CLI 前做同样校验。
 - smoke test 前后隔离目录均未产生 `config.toml`；路径/中文/引号/反斜杠的无损序列化由不经过 shell 的单元测试覆盖。
+- Managed public proxy 有独立安全版本门槛：只接受同一 live app-server generation 的 `initialize.userAgent` 所证明的稳定版 `>=0.146.0`；`0.144.6`/`0.145.0`、不可解析版本或 process generation 不匹配都必须在 `thread/start` 前降级为 network-off。
 
 #### `test_codex_app_server.py` / `test_service_instance_manager.py` — Codex 主任务 MCP 按 thread 注入
 
@@ -447,6 +448,8 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | transport 启动失败/no-thread-id 只在 turn 前回退，且 exec argv 保留当前 task 的 required MCP |
 | `test_required_mcp_unknown_app_server_failure_does_not_launch_exec` | required MCP 下未知 adapter 异常继续 fail closed |
 | `test_launch_codex_does_not_fallback_when_replay_is_unsafe` | timeout、busy、required 非 pre-turn、owner mismatch 和已启动 turn 的持久化失败均禁止重放 |
+| `test_managed_network_runtime_version_gate` / `test_old_runtime_downgrades_managed_task_before_thread_start` | exact initialize version + process generation 门控 managed proxy；旧版/未知版仍以 network-off 执行，不发送 direct-network Task |
+| `test_ordinary_task_uses_exact_managed_public_network_profile` / `test_ordinary_task_managed_network_requires_exact_thread_proof` / profile-id 与 drift/recheck 用例 | 每 turn 随机 profile；精确网络配置、thread response、ambient MCP/config/skills/instruction sources 和最终 turn admission 漂移均 fail closed |
 | `test_codex_sub_agent_requires_app_server_and_never_uses_exec` | app-server 关闭时 Sub-Agent 明确失败，绝不降级到没有 live thread control 的 exec |
 | `test_codex_sub_agent_mcp_failure_does_not_launch_exec` | 即使是 pre-turn 错误，Sub-Agent 仍不得走 exec |
 | `test_codex_app_server_rejects_home_owned_by_exec_generation` | 同一 `CODEX_HOME` 有 exec generation 时 app-server 返回 busy |
@@ -1228,16 +1231,25 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 # Run/Controller/worktree/publisher/PR Monitor 的本地 Git、故障注入与状态机回归
 uv run pytest -q backend/tests/test_delivery_*.py
 
-# 真实 Codex 0.144.6 app-server 隔离探针（显式 opt-in）
+# 真实 Codex app-server 隔离探针（显式 opt-in，不发送模型请求）
 CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
   backend/tests/test_codex_app_server.py::test_real_codex_delivery_permission_profile_blocks_host_reads
+
+# 需让 PATH 中的 codex 指向可验证的稳定版 >=0.146.0
+CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
+  backend/tests/test_codex_app_server.py::test_real_codex_managed_public_network_extended_boundary
 ```
 
-真实探针只调用 `initialize` / `thread/start` / `command/exec`，不调用
-`turn/start`，因此不发送模型请求。它使用临时 `CODEX_HOME` 和 workspace，验证
-宿主文件不可读、GitHub/SSH 凭据环境变量不进入 shell、workspace 可写，
-且 linked-worktree `.git` pointer 不可覆盖。需要已安装项目锁定的
-`codex-cli 0.144.6`；缺少 CLI 时用例会跳过。
+两项真实探针都不调用 `turn/start`，因此不发送模型请求。Delivery 探针通过
+`initialize` / `thread/start` / `command/exec` 验证 network-off 的宿主文件、
+凭据环境和 linked-worktree 边界。Managed 探针要求 PATH 中是可由同一
+app-server `initialize.userAgent` 证明的稳定版 Codex `>=0.146.0`，并让
+`codex sandbox` 使用与生产相同的 permission profile 和
+`shell_environment_policy.inherit=none` + safe explicit set/TMP；它验证公网
+HTTPS 经 managed proxy 成功，同时 direct public TCP、host loopback/private
+destination、pathname/abstract AF_UNIX、UDP、SOCKS 和 deployment upstream
+proxy 全部失败；sandbox loopback bind/self-connect 仅在隔离 netns 内成立，
+不暴露给宿主。缺少 CLI、版本不足或非 Linux 时对应用例跳过。
 
 真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
 一次性 canary 仓库执行；V1 的成功终点必须是 `ready_to_merge`，不得自动

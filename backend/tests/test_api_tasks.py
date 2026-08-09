@@ -271,6 +271,32 @@ async def test_explicit_skill_save_clears_temporary_generation_marker(
 
 
 @pytest.mark.asyncio
+async def test_internal_skill_update_endpoint_accepts_only_enabled_skills(client):
+    created = await client.post("/api/tasks", json={
+        "title": "Scoped skill update",
+        "description": "d",
+        "provider": "claude",
+    })
+    task_id = created.json()["id"]
+
+    updated = await client.put(
+        f"/api/tasks/{task_id}/internal/enabled-skills",
+        json={"enabled_skills": {"monitor": True}},
+    )
+    rejected = await client.put(
+        f"/api/tasks/{task_id}/internal/enabled-skills",
+        json={
+            "enabled_skills": {},
+            "title": "must not be writable through the MCP credential",
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["enabled_skills"] == {"monitor": True}
+    assert rejected.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_local_codex_accepts_monitor_when_main_mcp_is_enabled(
     client,
     monkeypatch,
@@ -675,6 +701,183 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
 
 
 @pytest.mark.asyncio
+async def test_migration_import_maps_source_incarnation_on_existing_copy(
+    client,
+    session_factory,
+):
+    """Refreshing a Worker mirror preserves the Manager's exact identity."""
+    from backend.models.ssh_profile import SSHProfile
+    from backend.models.task import Task
+    from backend.models.task_share import TaskShare
+    from backend.models.task_ssh_grant import TaskSSHGrant
+    from backend.models.team_share import TeamTaskShare
+    from backend.services.task_creation import (
+        SOURCE_TASK_INCARNATION_METADATA_KEY,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            id=7004,
+            title="stale Worker mirror",
+            description="d",
+            status="cancelled",
+            incarnation_id="a" * 32,
+        )
+        profile = SSHProfile(
+            name="stale-migration-grant",
+            host="ssh.invalid",
+            username="worker",
+            key_path="/run/ccm/managed-key",
+            public_key_fingerprint="SHA256:public",
+            host_key_type="ssh-ed25519",
+            host_key_value="AAAA",
+            host_key_fingerprint="SHA256:host",
+        )
+        db.add_all([task, profile])
+        await db.flush()
+        db.add_all([
+            TaskShare(
+                task_id=task.id,
+                shared_to_open_id="legacy-reader",
+                shared_to_ccm_url="https://peer.invalid",
+                share_token="legacy-migration-share",
+            ),
+            TeamTaskShare(
+                task_id=task.id,
+                target_type="user",
+                target_id=41,
+                permission="chat",
+                shared_by=7,
+            ),
+            TaskSSHGrant(
+                task_id=task.id,
+                ssh_profile_id=profile.id,
+                profile_revision=1,
+                capabilities=["read"],
+            ),
+        ])
+        await db.commit()
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7004,
+        "title": "current Manager mirror",
+        "description": "d",
+        "source_status": "completed",
+        "source_incarnation_id": "b" * 32,
+    })
+
+    assert response.status_code == 201, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7004)
+    assert current is not None
+    assert current.incarnation_id == "b" * 32
+    assert (
+        current.metadata_[SOURCE_TASK_INCARNATION_METADATA_KEY]
+        == "b" * 32
+    )
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(TaskShare.id).where(TaskShare.task_id == 7004)
+        ) is None
+        assert await db.scalar(
+            select(TeamTaskShare.id).where(TeamTaskShare.task_id == 7004)
+        ) is None
+        assert await db.scalar(
+            select(TaskSSHGrant.id).where(TaskSSHGrant.task_id == 7004)
+        ) is None
+
+    exact_refresh = await client.post("/api/tasks/migration-import", json={
+        "id": 7004,
+        "title": "bound Manager refresh",
+        "description": "same logical Task",
+        "source_status": "completed",
+        "source_incarnation_id": "b" * 32,
+    })
+    assert exact_refresh.status_code == 201, exact_refresh.text
+
+    mismatched = await client.post("/api/tasks/migration-import", json={
+        "id": 7004,
+        "title": "stale different Manager",
+        "description": "must not rebind",
+        "source_status": "completed",
+        "source_incarnation_id": "e" * 32,
+    })
+    assert mismatched.status_code == 409, mismatched.text
+    omitted = await client.post("/api/tasks/migration-import", json={
+        "id": 7004,
+        "title": "legacy identity-less Manager",
+        "description": "must not overwrite a bound mirror",
+        "source_status": "completed",
+    })
+    assert omitted.status_code == 409, omitted.text
+
+
+@pytest.mark.asyncio
+async def test_migration_import_maps_source_incarnation_on_new_copy(
+    client,
+    session_factory,
+):
+    """A new Worker mirror shares the Manager's exact immutable identity."""
+    from backend.models.task import Task
+    from backend.services.task_creation import (
+        SOURCE_TASK_INCARNATION_METADATA_KEY,
+    )
+
+    source_incarnation = "d" * 32
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7006,
+        "title": "new Manager mirror",
+        "description": "d",
+        "source_status": "completed",
+        "source_incarnation_id": source_incarnation,
+    })
+
+    assert response.status_code == 201, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7006)
+    assert current is not None
+    assert current.incarnation_id == source_incarnation
+    assert (
+        current.metadata_[SOURCE_TASK_INCARNATION_METADATA_KEY]
+        == source_incarnation
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_import_without_source_preserves_existing_incarnation(
+    client,
+    session_factory,
+):
+    """Legacy imports cannot silently replace a destination identity fence."""
+    from backend.models.task import Task
+
+    existing_incarnation = "c" * 32
+    async with session_factory() as db:
+        task = Task(
+            id=7005,
+            title="legacy Worker mirror",
+            description="d",
+            status="cancelled",
+            incarnation_id=existing_incarnation,
+        )
+        db.add(task)
+        await db.commit()
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7005,
+        "title": "legacy Manager refresh",
+        "description": "d",
+        "source_status": "completed",
+    })
+
+    assert response.status_code == 201, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7005)
+    assert current is not None
+    assert current.incarnation_id == existing_incarnation
+
+
+@pytest.mark.asyncio
 async def test_migration_import_cannot_repurpose_existing_task_mode(
     client,
     session_factory,
@@ -851,6 +1054,135 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
     assert current.title == "Current generation"
     assert current.status == "cancelled"
     assert current.retry_count == 5
+
+
+@pytest.mark.asyncio
+async def test_migration_import_existing_row_cas_binds_observed_incarnation(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A stale legacy adoption cannot overwrite a concurrently bound mirror."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+    from backend.services.skill_context import WORKER_MANAGED_TASK_METADATA_KEY
+    from backend.services.task_creation import (
+        SOURCE_TASK_INCARNATION_METADATA_KEY,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            id=7015,
+            title="unbound legacy mirror",
+            description="d",
+            status="cancelled",
+            incarnation_id="a" * 32,
+        )
+        db.add(task)
+        await db.commit()
+
+    winning_incarnation = "a" * 32
+
+    @asynccontextmanager
+    async def bind_after_snapshot(task_id):
+        async with session_factory() as competing_db:
+            await competing_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(metadata_={
+                    WORKER_MANAGED_TASK_METADATA_KEY: True,
+                    SOURCE_TASK_INCARNATION_METADATA_KEY: winning_incarnation,
+                })
+            )
+            await competing_db.commit()
+        yield
+
+    monkeypatch.setattr(
+        task_api,
+        "get_task_operation_lock",
+        bind_after_snapshot,
+    )
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7015,
+        "title": "stale adoption",
+        "description": "must lose",
+        "source_status": "completed",
+        "source_incarnation_id": "c" * 32,
+    })
+
+    assert response.status_code == 409, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7015)
+    assert current is not None
+    assert current.title == "unbound legacy mirror"
+    assert current.incarnation_id == winning_incarnation
+    assert (
+        current.metadata_[SOURCE_TASK_INCARNATION_METADATA_KEY]
+        == winning_incarnation
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_import_revalidates_capability_authority_after_fence(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A late local capability policy cannot be overwritten by an import."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    policy = {
+        "version": 1,
+        "max_invocations": 1,
+        "capabilities": {"plan": 1},
+    }
+    async with session_factory() as db:
+        task = Task(
+            id=7016,
+            title="local Auto task",
+            description="d",
+            status="cancelled",
+            mode="auto",
+        )
+        db.add(task)
+        await db.commit()
+
+    @asynccontextmanager
+    async def add_capability_after_snapshot(task_id):
+        async with session_factory() as competing_db:
+            await competing_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(capability_policy=policy)
+            )
+            await competing_db.commit()
+        yield
+
+    monkeypatch.setattr(
+        task_api,
+        "get_task_operation_lock",
+        add_capability_after_snapshot,
+    )
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7016,
+        "title": "stale Worker import",
+        "description": "must not replace local authority",
+        "source_status": "completed",
+        "source_incarnation_id": "d" * 32,
+    })
+
+    assert response.status_code == 409, response.text
+    assert "capability policy" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7016)
+    assert current is not None
+    assert current.title == "local Auto task"
+    assert current.capability_policy == policy
 
 
 @pytest.mark.asyncio

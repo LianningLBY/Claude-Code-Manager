@@ -97,6 +97,7 @@ def _format_process_exit(returncode: int | None) -> str:
 # this exact profile, rather than an inherited :read-only profile, was selected
 # before any model turn is admitted.
 _TOOL_FREE_PERMISSION_PROFILE = "ccm_pr_review_no_access_v1"
+_NETWORK_ISOLATED_PERMISSION_PROFILE_PREFIX = "ccm_delivery_workspace_v1_"
 _TOOL_FREE_DISABLED_FEATURES = frozenset({
     "apps",
     "artifact",
@@ -133,6 +134,44 @@ _TOOL_FREE_DISABLED_FEATURES = frozenset({
     "tool_call_mcp_elicitation",
     "tool_suggest",
     "unified_exec",
+    "workspace_dependencies",
+})
+# Delivery turns still need the local shell and patch tools, but every native
+# route that can add remote capabilities, background work, or a second model
+# lineage must remain off.  In particular ``shell_snapshot`` is security
+# relevant here: Codex snapshots a login shell before applying the per-turn
+# environment policy, so replaying one could otherwise resurrect GH_TOKEN or
+# an SSH agent that the Delivery profile deliberately did not inherit.
+_NETWORK_ISOLATED_DISABLED_FEATURES = frozenset({
+    "apps",
+    "artifact",
+    "auth_elicitation",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "default_mode_request_user_input",
+    "deferred_executor",
+    "enable_fanout",
+    "enable_mcp_apps",
+    "goals",
+    "guardian_approval",
+    "hooks",
+    "image_generation",
+    "in_app_browser",
+    "memories",
+    "multi_agent",
+    "plugins",
+    "plugin_sharing",
+    "realtime_conversation",
+    "remote_compaction_v2",
+    "remote_plugin",
+    "request_permissions_tool",
+    "shell_snapshot",
+    "skill_mcp_dependency_install",
+    "standalone_web_search",
+    "tool_call_mcp_elicitation",
+    "tool_suggest",
     "workspace_dependencies",
 })
 _TOOL_FREE_PASSIVE_ITEM_TYPES = frozenset({
@@ -386,6 +425,57 @@ def _audit_tool_free_thread_response(response: Any) -> None:
         )
 
 
+def _audit_network_isolated_thread_response(
+    response: Any,
+    *,
+    cwd: str,
+    permission_profile_id: str,
+) -> None:
+    """Prove the Delivery thread kept its exact local sandbox boundary."""
+
+    if not isinstance(response, dict):
+        raise ValueError("thread response is not an object")
+    response_cwd = response.get("cwd")
+    if (
+        not isinstance(response_cwd, str)
+        or _canonical_path(response_cwd) != _canonical_path(cwd)
+    ):
+        raise ValueError("thread response changed the Delivery cwd")
+    permission_profile = response.get("activePermissionProfile")
+    if (
+        not isinstance(permission_profile, dict)
+        or permission_profile.get("id")
+        != permission_profile_id
+        or permission_profile.get("extends") is not None
+    ):
+        raise ValueError("Delivery permission profile was not selected")
+    sandbox = response.get("sandbox")
+    if (
+        not isinstance(sandbox, dict)
+        or sandbox.get("type") != "workspaceWrite"
+        or sandbox.get("networkAccess") is not False
+        or sandbox.get("excludeTmpdirEnvVar") is not True
+        or sandbox.get("excludeSlashTmp") is not True
+    ):
+        raise ValueError(
+            "Delivery workspace-write network isolation was not admitted"
+        )
+    writable_roots = sandbox.get("writableRoots")
+    if not isinstance(writable_roots, list):
+        raise ValueError("Delivery writable roots were not reported")
+    workspace = _canonical_path(cwd)
+    for value in writable_roots:
+        if not isinstance(value, str):
+            raise ValueError("Delivery writable root is malformed")
+        candidate = _canonical_path(value)
+        try:
+            candidate.relative_to(workspace)
+        except ValueError as exc:
+            raise ValueError(
+                "Delivery sandbox admitted a writable root outside the worktree"
+            ) from exc
+
+
 def _tool_free_disabled_skill_config(
     response: Any,
     *,
@@ -552,6 +642,7 @@ class CodexTurnProcess:
     ) -> None:
         self.pid = pid
         self.thread_id = thread_id
+        self.native_turn_id: str | None = None
         self.unsubscribe_on_terminal = False
         self.returncode: int | None = None
         self.termination_kind: str | None = None
@@ -672,6 +763,8 @@ class _TurnContext:
     active_mcp_item_ids: set[str] = field(default_factory=set)
     tool_policy_violation: str | None = None
     tool_policy_abort_task: asyncio.Task | None = None
+    terminal_protocol_violation: str | None = None
+    malformed_terminal_guard_task: asyncio.Task | None = None
 
 
 @dataclass
@@ -820,6 +913,18 @@ class CodexAppServer:
             and not policy_task.done()
         ):
             policy_task.cancel()
+        malformed_task = getattr(
+            context,
+            "malformed_terminal_guard_task",
+            None,
+        )
+        context.malformed_terminal_guard_task = None
+        if (
+            malformed_task is not None
+            and malformed_task is not current_task
+            and not malformed_task.done()
+        ):
+            malformed_task.cancel()
         goal_tasks = set(getattr(context, "goal_guard_tasks", set()))
         if hasattr(context, "goal_guard_tasks"):
             context.goal_guard_tasks.clear()
@@ -872,6 +977,7 @@ class CodexAppServer:
         ):
             self._contexts_by_turn.pop(old_turn_id, None)
         context.turn_id = turn_id
+        context.process.native_turn_id = turn_id
         if observed:
             context.observed_turn_id = turn_id
         self._contexts_by_turn[turn_id] = context
@@ -950,10 +1056,309 @@ class CodexAppServer:
 
         if method in {"turn/started", "turn/completed"}:
             turn = params.get("turn")
-            if isinstance(turn, dict) and turn.get("id"):
-                return str(turn["id"])
+            if isinstance(turn, dict):
+                turn_id = turn.get("id")
+                if (
+                    isinstance(turn_id, str)
+                    and turn_id
+                    and turn_id == turn_id.strip()
+                ):
+                    return turn_id
         turn_id = params.get("turnId")
         return str(turn_id) if turn_id else None
+
+    def _malformed_turn_terminal_reason(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+    ) -> str | None:
+        """Reject ambiguous native terminals before any deferral can retain them."""
+
+        if "turn" not in params:
+            return "turn/completed is missing its turn object"
+        turn = params.get("turn")
+        if not isinstance(turn, dict):
+            return "turn/completed turn must be an object"
+
+        turn_id = turn.get("id")
+        if (
+            not isinstance(turn_id, str)
+            or not turn_id.strip()
+            or turn_id != turn_id.strip()
+        ):
+            return (
+                "turn/completed turn.id must be a non-empty, "
+                "whitespace-normalized string"
+            )
+        if "turnId" in params:
+            root_turn_id = params["turnId"]
+            if (
+                not isinstance(root_turn_id, str)
+                or not root_turn_id
+                or root_turn_id != root_turn_id.strip()
+            ):
+                return (
+                    "turn/completed root turnId must be a non-empty, "
+                    "whitespace-normalized string when present"
+                )
+            if root_turn_id != turn_id:
+                return "turn/completed root turnId conflicts with turn.id"
+
+        status = turn.get("status")
+        if (
+            not isinstance(status, str)
+            or not status
+            or status != status.strip()
+        ):
+            return (
+                "turn/completed turn.status must be a non-empty, "
+                "whitespace-normalized string"
+            )
+        if "status" in params:
+            root_status = params["status"]
+            if (
+                not isinstance(root_status, str)
+                or not root_status
+                or root_status != root_status.strip()
+            ):
+                return (
+                    "turn/completed root status must be a non-empty, "
+                    "whitespace-normalized string when present"
+                )
+            if root_status != status:
+                return "turn/completed root status conflicts with turn.status"
+
+        success_values: list[Any] = []
+        if "success" in turn:
+            success_values.append(turn["success"])
+        # ``success`` is not part of the current native Turn schema, but
+        # reject a contradictory gateway spelling rather than silently
+        # blessing it as completed.
+        if "success" in params:
+            success_values.append(params["success"])
+        for success in success_values:
+            if type(success) is not bool:
+                return "turn/completed success must be a boolean when present"
+            if success is not (status == "completed"):
+                return (
+                    "turn/completed success conflicts with "
+                    f"turn.status {status!r}"
+                )
+        if len(success_values) > 1 and any(
+            success is not success_values[0]
+            for success in success_values[1:]
+        ):
+            return "turn/completed root success conflicts with turn.success"
+
+        if "error" in turn and "error" in params and params["error"] != turn["error"]:
+            return "turn/completed root error conflicts with turn.error"
+
+        if status == "completed":
+            error = turn.get("error")
+            if error not in (None, "", {}, []):
+                return (
+                    "turn/completed reports completed with a non-empty "
+                    "turn.error"
+                )
+            root_error = params.get("error")
+            if root_error not in (None, "", {}, []):
+                return (
+                    "turn/completed reports completed with a non-empty "
+                    "root error"
+                )
+
+        if self._turn_terminal_correlates_context(context, params):
+            return None
+        return (
+            "turn/completed turn.id is not correlated to the active "
+            f"adapter: {turn_id!r}"
+        )
+
+    def _turn_terminal_correlates_context(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+    ) -> bool:
+        """Require native identity or client-input proof, never thread alone."""
+
+        candidate_ids: list[Any] = []
+        turn = params.get("turn")
+        if isinstance(turn, dict) and "id" in turn:
+            candidate_ids.append(turn["id"])
+        if "turnId" in params:
+            candidate_ids.append(params["turnId"])
+        for turn_id in candidate_ids:
+            if (
+                isinstance(turn_id, str)
+                and turn_id
+                and turn_id == turn_id.strip()
+                and self._contexts_by_turn.get(turn_id) is context
+            ):
+                return True
+        return self._notification_matches_context_input(
+            context,
+            "turn/completed",
+            params,
+        )
+
+    def _fail_malformed_turn_terminal(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+        reason: str,
+        *,
+        use_context_identity: bool = False,
+    ) -> None:
+        """Fail closed on a corrupt native terminal without reusing an old id."""
+
+        if not self._context_is_current(context):
+            return
+        error = {
+            "message": f"Malformed Codex turn/completed notification: {reason}",
+            "code": "ccm_malformed_turn_terminal",
+        }
+        event: dict[str, Any] = {
+            "type": "turn.failed",
+            "status": "failed",
+            "success": False,
+            "terminal": True,
+            "error": error,
+        }
+        if use_context_identity:
+            if context.turn_id:
+                event["turn_id"] = context.turn_id
+        else:
+            turn = params.get("turn")
+            raw_turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if (
+                isinstance(raw_turn_id, str)
+                and raw_turn_id
+                and raw_turn_id == raw_turn_id.strip()
+            ):
+                event["turn_id"] = raw_turn_id
+        context.process.feed(event)
+
+        # A malformed completion must not survive as a retained Goal or a
+        # descendant-delayed success.  Detach also cancels any live guards.
+        context.pending_terminal_notification = None
+        context.pending_goal_terminal_notification = None
+        context.deferred_terminal_notification = None
+        context.goal_terminal_generation += 1
+
+        runtime = self._thread_runtime.get(context.thread_id)
+        if runtime is not None:
+            aliases = {
+                turn_id
+                for turn_id, candidate in self._contexts_by_turn.items()
+                if candidate is context
+            }
+            runtime.active_turn_ids.difference_update(aliases)
+            if not runtime.active_turn_ids:
+                runtime.status_type = "idle"
+
+        logger.error(
+            "Failing Codex adapter on malformed terminal thread=%s task=%s: %s",
+            context.thread_id,
+            context.task_id,
+            reason,
+        )
+        context.process.finish(1, str(error["message"]))
+        self._detach_turn_context(context)
+
+    async def _abort_uncorrelated_turn_terminal(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Stop the real current turn before failing its local adapter.
+
+        A terminal found only through ``threadId`` may belong to an older
+        native turn.  Until the exact current turn is interrupted (or the
+        whole transport is proven dead), its context and runtime identities
+        must remain live so no replacement can overlap it.
+        """
+
+        try:
+            try:
+                await self._interrupt_turn_context(context)
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                logger.exception(
+                    "Could not confirm exact Codex interrupt after an "
+                    "uncorrelated terminal thread=%s task=%s; shutting down "
+                    "the transport",
+                    context.thread_id,
+                    context.task_id,
+                )
+                try:
+                    # Do not mark the target as a user interrupt.  Protocol
+                    # ambiguity is a failed turn, and every peer adapter on
+                    # this now-untrusted transport must fail as well.
+                    await self.shutdown(
+                        reason=(
+                            "Codex app-server emitted an uncorrelated terminal: "
+                            f"{reason}"
+                        ),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    # shutdown() publishes its one-way intent before touching
+                    # the process.  Retain the context/runtime and live adapter
+                    # when termination cannot be proven; a future start will
+                    # fail closed on that shutdown intent.
+                    logger.exception(
+                        "Could not prove Codex transport shutdown after an "
+                        "uncorrelated terminal thread=%s task=%s",
+                        context.thread_id,
+                        context.task_id,
+                    )
+                    return
+                if self._context_is_current(context):
+                    # Test doubles and a reader-cancellation race may return
+                    # from shutdown without running normal EOF finalization.
+                    self._fail_malformed_turn_terminal(
+                        context,
+                        params,
+                        reason,
+                        use_context_identity=True,
+                    )
+                return
+
+            if self._context_is_current(context):
+                self._fail_malformed_turn_terminal(
+                    context,
+                    params,
+                    reason,
+                    use_context_identity=True,
+                )
+        finally:
+            if context.malformed_terminal_guard_task is asyncio.current_task():
+                context.malformed_terminal_guard_task = None
+
+    def _schedule_uncorrelated_turn_terminal_abort(
+        self,
+        context: _TurnContext,
+        params: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """Retain ownership while asynchronously isolating an unknown terminal."""
+
+        if not self._context_is_current(context):
+            return
+        existing = context.malformed_terminal_guard_task
+        if existing is not None and not existing.done():
+            return
+        context.terminal_protocol_violation = reason
+        context.malformed_terminal_guard_task = asyncio.create_task(
+            self._abort_uncorrelated_turn_terminal(
+                context,
+                dict(params),
+                reason,
+            )
+        )
 
     @staticmethod
     def _notification_user_message_client_ids(
@@ -1915,6 +2320,7 @@ class CodexAppServer:
             and goal_may_continue
             and context.tool_policy_violation is None
             and context.non_retry_error is None
+            and context.terminal_protocol_violation is None
             and not (context.tools_disabled or context.mcp_only)
         ):
             self._defer_terminal_turn_for_native_goal(context, params)
@@ -1934,7 +2340,28 @@ class CodexAppServer:
         terminal_turn_id = turn.get("id") or context.turn_id
         status = turn.get("status") or "completed"
         error = turn.get("error")
-        if context.tool_policy_violation is not None:
+        if context.terminal_protocol_violation is not None:
+            normalized_error = {
+                "message": (
+                    "Malformed Codex turn/completed notification: "
+                    f"{context.terminal_protocol_violation}"
+                ),
+                "code": "ccm_malformed_turn_terminal",
+            }
+            context.process.feed(
+                {
+                    "type": "turn.failed",
+                    "turn_id": terminal_turn_id,
+                    "status": "failed",
+                    "success": False,
+                    "terminal": True,
+                    "error": normalized_error,
+                }
+            )
+            status = "terminalProtocolViolation"
+            exit_code = 1
+            stderr = str(normalized_error["message"])
+        elif context.tool_policy_violation is not None:
             normalized_error = {
                 "message": context.tool_policy_violation,
                 "code": "ccm_tool_policy_violation",
@@ -1945,22 +2372,51 @@ class CodexAppServer:
             status = "toolPolicyViolation"
             exit_code = 1
             stderr = context.tool_policy_violation
+        elif context.non_retry_error is not None:
+            # A willRetry=false notification is authoritative even when Codex
+            # later closes the native turn as completed/interrupted.  Publish
+            # an explicit failed terminal so durable arbitration cannot infer
+            # success from the otherwise ambiguous turn.completed type.
+            normalized_error = dict(context.non_retry_error)
+            context.process.feed(
+                {
+                    "type": "turn.completed",
+                    "usage": context.usage or {},
+                    "turn_id": terminal_turn_id,
+                    "status": "failed",
+                    "success": False,
+                    "error": normalized_error,
+                }
+            )
+            status = "failed"
+            exit_code = 1
+            stderr = str(normalized_error["message"])
         elif status == "completed":
             context.process.feed(
                 {
                     "type": "turn.completed",
                     "usage": context.usage or {},
                     "turn_id": terminal_turn_id,
+                    "status": "completed",
+                    "success": True,
+                    "error": None,
                 }
             )
             exit_code = 0
             stderr = ""
         elif status == "interrupted":
+            normalized_error = self._normalize_turn_error(
+                error,
+                fallback="Codex turn was interrupted",
+            )
             context.process.feed(
                 {
                     "type": "turn.completed",
                     "usage": context.usage or {},
                     "turn_id": terminal_turn_id,
+                    "status": "interrupted",
+                    "success": False,
+                    "error": normalized_error,
                 }
             )
             exit_code = 130
@@ -1976,12 +2432,6 @@ class CodexAppServer:
             )
             exit_code = 1
             stderr = str(message)
-        if context.non_retry_error is not None and exit_code != 1:
-            # Match native `codex exec`: any ErrorNotification with
-            # willRetry=false makes the turn fail even if a later terminal
-            # notification reports completed/interrupted.
-            exit_code = 1
-            stderr = str(context.non_retry_error["message"])
         logger.info(
             "Codex latency task=%s thread=%s stage=completed elapsed_ms=%.1f status=%s",
             context.task_id,
@@ -2382,6 +2832,7 @@ class CodexAppServer:
         codex_service_tier: str = CODEX_SERVICE_TIER_DEFAULT,
         sandbox_mode: str = "danger-full-access",
         disable_autonomous_features: bool = False,
+        network_isolated: bool = False,
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         mcp_only: bool = False,
@@ -2468,6 +2919,26 @@ class CodexAppServer:
                     resume_session_id,
                 )
                 resume_session_id = None
+        if network_isolated:
+            if sandbox_mode != "workspace-write":
+                raise CodexRequiredMcpPreTurnError(
+                    "Network-isolated Codex execution requires workspace-write"
+                )
+            if mcp_specs or git_env:
+                raise CodexRequiredMcpPreTurnError(
+                    "Network-isolated Codex execution forbids MCP and Git "
+                    "credential environment injection"
+                )
+            if not disable_user_mcp or not disable_autonomous_features:
+                raise CodexRequiredMcpPreTurnError(
+                    "Network-isolated Codex execution requires user MCP and "
+                    "autonomous features to be disabled"
+                )
+        network_permission_profile = (
+            f"{_NETWORK_ISOLATED_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
+            if network_isolated
+            else None
+        )
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2519,6 +2990,76 @@ class CodexAppServer:
             _deep_merge_config(
                 thread_config,
                 codex_untrusted_project_config(cwd),
+            )
+        if network_isolated:
+            # Built-in web search, Apps and ambient MCP run outside the local
+            # shell sandbox. Disable those routes and every autonomous/remote
+            # capability while retaining the local coding tools. ``core`` is
+            # Codex's fixed PATH/HOME/etc allow-list; explicit excludes and a
+            # disabled shell snapshot keep Git/GitHub credentials out even if
+            # a future core list expands.
+            _deep_merge_config(
+                thread_config,
+                {
+                    "web_search": "disabled",
+                    "allow_login_shell": False,
+                    "features": {
+                        feature: False
+                        for feature in _NETWORK_ISOLATED_DISABLED_FEATURES
+                    },
+                    "tools": {
+                        "experimental_request_user_input": {
+                            "enabled": False,
+                        },
+                    },
+                    "orchestrator": {
+                        "skills": {"enabled": False},
+                        "mcp": {"enabled": False},
+                    },
+                    "skills": {
+                        "include_instructions": False,
+                        "bundled": {"enabled": False},
+                        "config": [],
+                    },
+                    # WorkspaceWrite alone only narrows writes; its legacy
+                    # profile can still read the entire host. This named
+                    # request-local profile defaults the filesystem to deny,
+                    # admits only Codex's minimal executable/runtime roots for
+                    # reading, and grants the exact managed worktree read/write.
+                    "default_permissions": (
+                        network_permission_profile
+                    ),
+                    "permissions": {
+                        network_permission_profile: {
+                            "filesystem": {
+                                ":root": "deny",
+                                ":minimal": "read",
+                                os.path.abspath(cwd): "write",
+                            },
+                            "network": {
+                                "enabled": False,
+                                "allow_local_binding": False,
+                            },
+                        },
+                    },
+                    "shell_environment_policy": {
+                        "inherit": "core",
+                        "ignore_default_excludes": False,
+                        "exclude": [
+                            "GIT_*",
+                            "GH_*",
+                            "GITHUB_*",
+                            "SSH_*",
+                        ],
+                        "set": {
+                            "GIT_TERMINAL_PROMPT": "0",
+                            "GCM_INTERACTIVE": "never",
+                            "GIT_CONFIG_GLOBAL": os.devnull,
+                            "GIT_CONFIG_NOSYSTEM": "1",
+                            "GH_PROMPT_DISABLED": "1",
+                        },
+                    },
+                },
             )
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -2640,6 +3181,43 @@ class CodexAppServer:
                     + str(exc)
                 ) from exc
             raise
+        if network_isolated:
+            try:
+                effective = await self._request(
+                    "config/read",
+                    {
+                        "cwd": os.path.abspath(cwd),
+                        "includeLayers": False,
+                    },
+                )
+                effective_config = (
+                    effective.get("config")
+                    if isinstance(effective, dict)
+                    else None
+                )
+                if not isinstance(effective_config, dict):
+                    raise ValueError("effective Codex configuration is malformed")
+                inherited_mcp = effective_config.get("mcp_servers", {})
+                if not isinstance(inherited_mcp, dict) or any(
+                    not isinstance(name, str) or not name
+                    for name in inherited_mcp
+                ):
+                    raise ValueError(
+                        "effective MCP server configuration is malformed"
+                    )
+                # Codex merges nested tables across config layers. An empty
+                # request-local table does not erase account-level servers,
+                # so explicitly disable every effective inherited name. The
+                # common no-MCP case remains the required literal ``{}``.
+                thread_config["mcp_servers"] = {
+                    name: {"enabled": False}
+                    for name in inherited_mcp
+                }
+            except Exception as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex network-isolated profile could not audit inherited "
+                    "MCP servers"
+                ) from exc
         if restricted_tools:
             try:
                 effective = await self._request(
@@ -2757,7 +3335,7 @@ class CodexAppServer:
             # layer above defines and selects the profile atomically.
             common["baseInstructions"] = ""
             common["developerInstructions"] = ""
-        else:
+        elif not network_isolated:
             common["sandbox"] = sandbox_mode
         if model and model != "default":
             common["model"] = model
@@ -2877,6 +3455,18 @@ class CodexAppServer:
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex tool-free profile was not proven by the "
+                    f"{thread_method} response"
+                ) from exc
+        if network_isolated:
+            try:
+                _audit_network_isolated_thread_response(
+                    response,
+                    cwd=cwd,
+                    permission_profile_id=str(network_permission_profile),
+                )
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex network-isolated profile was not proven by the "
                     f"{thread_method} response"
                 ) from exc
         self._known_threads.add(thread_id)
@@ -3035,20 +3625,6 @@ class CodexAppServer:
                 self._attach_descendant(context, child_id, active=None)
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
-        if on_turn_prepared is not None:
-            try:
-                # Publish the adapter before turn/start goes on the wire. This
-                # closes the last shutdown/maintenance window in which model
-                # work could exist without an exact in-memory owner.
-                await on_turn_prepared(turn_process, thread_id)
-            except BaseException:
-                self._detach_turn_context(context)
-                turn_process.finish(
-                    1,
-                    "Codex turn ownership preparation failed",
-                )
-                raise
-
         if (
             restricted_tools
             and (
@@ -3056,9 +3632,8 @@ class CodexAppServer:
                 or self._skills_revision != tool_free_skills_revision
             )
         ):
-            # The ownership hook above may await durable state. Recheck the
-            # inventory generation at the final boundary before model input
-            # goes on the wire.
+            # Recheck the inventory generation at the final pure-preflight
+            # boundary before publishing durable launch ownership.
             reason = (
                 "Codex tool-free skills inventory changed before turn/start"
             )
@@ -3109,7 +3684,7 @@ class CodexAppServer:
                 "type": "readOnly",
                 "networkAccess": False,
             }
-        elif sandbox_mode == "workspace-write":
+        elif sandbox_mode == "workspace-write" and not network_isolated:
             turn_params["sandboxPolicy"] = {
                 "type": "workspaceWrite",
                 "writableRoots": [os.path.abspath(cwd)],
@@ -3117,6 +3692,37 @@ class CodexAppServer:
                 "excludeTmpdirEnvVar": False,
                 "excludeSlashTmp": False,
             }
+        if on_turn_prepared is not None:
+            try:
+                # All fallible pure preflight is complete. Publish the exact
+                # adapter immediately before either Goal steering or
+                # turn/start can send model input.
+                await on_turn_prepared(turn_process, thread_id)
+            except BaseException:
+                self._detach_turn_context(context)
+                turn_process.finish(
+                    1,
+                    "Codex turn ownership preparation failed",
+                )
+                raise
+        if (
+            tools_disabled
+            and (
+                tool_free_skills_revision is None
+                or self._skills_revision != tool_free_skills_revision
+            )
+        ):
+            # This is not retryable preflight: the ownership callback has
+            # already crossed the durable ``launching`` boundary. It is a
+            # final TOCTOU safety invariant so a skills change during that
+            # awaited commit cannot widen a tool-free turn.
+            reason = (
+                "Codex tool-free skills inventory changed while publishing "
+                "launch ownership"
+            )
+            self._detach_turn_context(context)
+            turn_process.finish(1, reason)
+            raise CodexRequiredMcpPreTurnError(reason)
         if adopt_active_goal:
             self._mark_following_native_goal(context)
             adoption = asyncio.create_task(
@@ -3250,6 +3856,14 @@ class CodexAppServer:
                     + message
                 )
             raise CodexAppServerError(message)
+        if turn_process.returncode is not None:
+            # A response-first malformed terminal can close the adapter while
+            # the turn/start RPC response is still in flight. Do not resurrect
+            # that failed context by binding the later submission id.
+            self._detach_turn_context(context)
+            if turn_cancelled:
+                raise asyncio.CancelledError
+            return turn_process, str(thread_id)
         context.admitted_turn_id = str(turn_id)
         # An already-running steerable turn can emit notifications before this
         # response arrives. In that case its notification turn id is the real
@@ -4525,6 +5139,53 @@ class CodexAppServer:
                 method,
             )
             return
+        if method == "turn/completed":
+            terminal_context = context
+            if terminal_context is None and thread_id_str is not None:
+                terminal_context = self._contexts_by_thread.get(thread_id_str)
+                if (
+                    terminal_context is not None
+                    and terminal_context.client_user_message_id
+                    and notification_client_ids
+                    and terminal_context.client_user_message_id
+                    not in notification_client_ids
+                ):
+                    # Preserve the same contradictory-clientId rule used for
+                    # mapped aliases. A different input's terminal is not
+                    # evidence that this adapter failed.
+                    logger.error(
+                        "Ignoring Codex terminal with mismatched client input "
+                        "thread=%s turn=%s expected_client=%s "
+                        "actual_clients=%s",
+                        thread_id,
+                        turn_id,
+                        terminal_context.client_user_message_id,
+                        sorted(notification_client_ids),
+                    )
+                    return
+            if terminal_context is not None:
+                terminal_is_correlated = self._turn_terminal_correlates_context(
+                    terminal_context,
+                    params,
+                )
+                malformed_reason = self._malformed_turn_terminal_reason(
+                    terminal_context,
+                    params,
+                )
+                if malformed_reason is not None:
+                    if terminal_is_correlated:
+                        self._fail_malformed_turn_terminal(
+                            terminal_context,
+                            params,
+                            malformed_reason,
+                        )
+                    else:
+                        self._schedule_uncorrelated_turn_terminal_abort(
+                            terminal_context,
+                            params,
+                            malformed_reason,
+                        )
+                    return
         if (
             thread_id_str is not None
             and method in {"turn/started", "turn/completed"}

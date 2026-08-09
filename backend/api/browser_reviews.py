@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
@@ -386,18 +387,19 @@ async def create_browser_review(
         viewport_height=body.viewport_height,
     )
     job = None
-    harness_run = None
     try:
-        job = await manager.prepare_agent(
-            options,
-            provider=body.provider,
-            codex_service_tier=body.codex_service_tier,
-        )
+        options.validate()
         hostname = urlsplit(options.url).hostname or "frontend"
-        task = await TaskQueue(db).create(
-            title=f"Browser Review: {hostname}"[:200],
-            description=_task_prompt(job.id, job.options),
-            status="pending",
+        # The public standalone entry point owns a stable, non-runnable Task;
+        # the Harness service then stages a separate immutable Browser child
+        # and opens its queue gate only after job attachment.  Creating the
+        # executable Task first left a real dequeue window before isolation
+        # metadata/binding existed.
+        owner = await TaskQueue(db).create(
+            title=f"Browser Review Controller: {hostname}"[:200],
+            description="Durable owner for a standalone Browser Review run.",
+            status="completed",
+            completed_at=datetime.utcnow(),
             priority=0,
             max_retries=0,
             mode="auto",
@@ -406,12 +408,13 @@ async def create_browser_review(
             codex_service_tier=body.codex_service_tier,
             effort_level=body.reasoning_effort,
             timeout_hours=1.0,
-            enabled_skills={"browser-review": job.id},
-            metadata_={"browser_review_job_id": job.id},
+            enabled_skills={},
+            metadata_={"standalone_browser_review_owner": True},
             created_by=get_current_user_id(request),
+            archived=True,
         )
         harness_run = await test_harness_service.start_task_run(
-            task_id=task.id,
+            task_id=owner.id,
             owner_user_id=get_current_user_id(request),
             spec=TestHarnessSpec(
                 target_kind="fixed_url",
@@ -426,34 +429,10 @@ async def create_browser_review(
                 max_actions=options.max_actions,
             ),
         )
-        from backend.services.workspace_review import _browser_agent_prompt
-
-        task.description = _browser_agent_prompt(
-            job.id,
-            job.options,
-            profile="standard",
-            test_plan=harness_run.test_plan,
-        )
-        task.metadata_ = {
-            **(task.metadata_ or {}),
-            "test_harness_run_id": harness_run.id,
-            "isolated_browser_agent": True,
-        }
-        await db.commit()
-        await test_harness_service.attach_browser_job(
+        job = await test_harness_service.start_fixed_url_browser(
             run_id=harness_run.id,
-            job=job,
-            watch_terminal=True,
-            browser_manager=manager,
+            inline=False,
         )
-        await manager.attach_task(job.id, task.id)
-        try:
-            from backend.main import dispatcher
-
-            if dispatcher:
-                dispatcher.wake()
-        except Exception:
-            pass
     except (BrowserReviewBusyError, TestHarnessBusyError) as exc:
         if job is not None:
             await manager.fail_start(job.id, exc)
@@ -466,6 +445,7 @@ async def create_browser_review(
         if job is not None:
             await manager.fail_start(job.id, exc)
         raise
+    assert job is not None
     return job.as_dict()
 
 

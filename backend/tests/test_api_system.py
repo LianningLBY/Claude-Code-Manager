@@ -329,6 +329,26 @@ async def test_config_reflects_settings(client):
     assert data["model_options"] == ["haiku", "sonnet"]
 
 
+@pytest.mark.asyncio
+async def test_auto_capability_switch_is_independent_and_fail_closed(client):
+    from unittest.mock import patch
+    from backend.config import settings
+
+    response = await client.get("/api/system/config")
+    assert response.status_code == 200
+    assert response.json()["auto_capability_enabled"] is False
+
+    with patch.object(settings, "auto_capability_enabled", True), \
+         patch.object(settings, "capability_core_enabled", False):
+        response = await client.get("/api/system/config")
+    assert response.json()["auto_capability_enabled"] is False
+
+    with patch.object(settings, "auto_capability_enabled", True), \
+         patch.object(settings, "capability_core_enabled", True):
+        response = await client.get("/api/system/config")
+    assert response.json()["auto_capability_enabled"] is True
+
+
 # === Effort config tests ===
 
 

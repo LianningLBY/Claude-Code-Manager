@@ -36,6 +36,9 @@ from backend.services.browser_network import (
     PublicEgressProxy,
     resolve_public_endpoint,
 )
+from backend.services.test_harness_artifacts import (
+    TestHarnessArtifactStore as ArtifactStore,
+)
 
 
 @pytest.mark.asyncio
@@ -574,6 +577,8 @@ async def test_run_browser_review_completes_loop_and_writes_artifacts(
 ):
     page = _FakePage()
     progress_events = []
+    artifact_store = ArtifactStore(tmp_path / "evidence")
+    output_dir = artifact_store.create_job_dir("a" * 32)
 
     @asynccontextmanager
     async def fake_browser_page(_options, _origin, telemetry):
@@ -644,11 +649,12 @@ async def test_run_browser_review_completes_loop_and_writes_artifacts(
             BrowserReviewOptions(
                 url="http://127.0.0.1:5173",
                 network_policy="managed_preview",
-                output_dir=tmp_path,
+                output_dir=output_dir,
             action_delay_ms=0,
         ),
         api_key="test-key",
         progress_callback=progress_events.append,
+        artifact_store=artifact_store,
     )
 
     assert result.steps == 2
@@ -657,9 +663,9 @@ async def test_run_browser_review_completes_loop_and_writes_artifacts(
     assert result.screenshot_path.read_bytes() == b"fake-png"
     assert "Pass with issues" in result.report_path.read_text()
     assert "observed render error" in result.telemetry_path.read_text()
-    assert (tmp_path / "initial.png").exists()
-    assert (tmp_path / "step-01.png").exists()
-    assert (tmp_path / "step-02.png").exists()
+    assert (output_dir / "initial.png").exists()
+    assert (output_dir / "step-01.png").exists()
+    assert (output_dir / "step-02.png").exists()
     assert [event["stage"] for event in progress_events] == [
         "browser_ready",
         "model_thinking",

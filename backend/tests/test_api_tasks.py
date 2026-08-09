@@ -29,6 +29,307 @@ async def test_create_task(client):
 
 
 @pytest.mark.asyncio
+async def test_create_task_with_explicit_id_uses_internal_service_gate(client):
+    from fastapi import HTTPException
+
+    with patch(
+        "backend.api.tasks.require_internal_service",
+        side_effect=HTTPException(
+            403,
+            "Internal service authentication required",
+        ),
+    ) as require_internal:
+        rejected = await client.post("/api/tasks", json={
+            "id": 7001,
+            "title": "caller-chosen identity",
+            "description": "must be internal",
+        })
+
+    assert rejected.status_code == 403
+    require_internal.assert_called_once()
+
+    # Auth-disabled installations intentionally preserve their historical
+    # fully-open semantics through the real guard.
+    allowed = await client.post("/api/tasks", json={
+        "id": 7001,
+        "title": "manager-forwarded identity",
+        "description": "accepted without configured auth",
+    })
+    assert allowed.status_code == 201, allowed.text
+    assert allowed.json()["id"] == 7001
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_mode", ["plan", "canonical_link"])
+async def test_create_task_cannot_clone_a_legacy_plan_carrier(
+    client,
+    session_factory,
+    source_mode,
+):
+    from backend.models.plan import Plan, PlanLegacyTaskLink
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        source = Task(
+            title="legacy Plan source",
+            description="approved planning history",
+            status="completed",
+            mode="plan" if source_mode == "plan" else "auto",
+            session_id="legacy-plan-session",
+            last_cwd="/repo",
+        )
+        db.add(source)
+        await db.flush()
+        if source_mode == "canonical_link":
+            plan = Plan(
+                title="Canonical Plan",
+                initial_request="plan this",
+                pipeline_config={},
+            )
+            db.add(plan)
+            await db.flush()
+            db.add(
+                PlanLegacyTaskLink(
+                    legacy_task_id=source.id,
+                    plan_id=plan.id,
+                    plan_version_id=None,
+                )
+            )
+        await db.commit()
+        source_id = source.id
+
+    response = await client.post("/api/tasks", json={
+        "title": "bypass canonical execution",
+        "description": "must not inherit the Plan session",
+        "clone_from_task_id": source_id,
+    })
+
+    assert response.status_code == 409, response.text
+    assert "Plan Tasks cannot be used as clone sources" in response.text
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_unknown_mode_before_write(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    response = await client.post("/api/tasks", json={
+        "title": "Unknown mode",
+        "description": "must not silently become Auto",
+        "mode": "delivery",
+    })
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "mode"]
+    assert error["type"] == "literal_error"
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_mode", ["delivery", "AUTO", " auto ", None])
+async def test_update_task_rejects_invalid_mode_without_mutation(
+    client,
+    session_factory,
+    invalid_mode,
+):
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Keep Auto mode",
+        "description": "d",
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"mode": invalid_mode},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "mode"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_valid_mode_change_without_mutation(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    created = await client.post("/api/tasks", json={
+        "title": "Immutable lifecycle mode",
+        "description": "must remain Auto",
+    })
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"mode": "loop"},
+    )
+
+    assert response.status_code == 422
+    error = response.json()["detail"][0]
+    assert error["loc"] == ["body", "mode"]
+    assert "immutable" in error["msg"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_update_task_rejects_immutable_browser_child_binding(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import TestHarnessChildBinding
+
+    async with session_factory() as db:
+        owner = Task(
+            title="Browser owner",
+            description="Own the isolated child",
+            status="completed",
+        )
+        db.add(owner)
+        await db.flush()
+        child = Task(
+            title="Immutable Browser child",
+            description="Frozen launch profile",
+            status="pending_activation",
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            enabled_skills={"browser-review": "immutable-job"},
+            metadata_={"isolated_browser_agent": True},
+            archived=True,
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            TestHarnessChildBinding(
+                id="e" * 32,
+                harness_run_id="f" * 32,
+                owner_task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                child_task_id=child.id,
+                child_task_incarnation_id=child.incarnation_id,
+                browser_review_job_id="immutable-job",
+                state="reserved",
+            )
+        )
+        await db.commit()
+        child_id = child.id
+
+    response = await client.put(
+        f"/api/tasks/{child_id}",
+        json={"title": "Mutated Browser child"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Harness owner" in response.text
+    async with session_factory() as db:
+        child = await db.get(Task, child_id)
+        assert child.title == "Immutable Browser child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "suffix", "payload"),
+    [
+        ("DELETE", "", None),
+        ("POST", "/cancel", None),
+        ("POST", "/retry", None),
+        ("POST", "/stop-session", None),
+        ("POST", "/archive", None),
+        ("POST", "/chat", {"message": "escape owner lifecycle"}),
+        ("GET", "/fork-anchors", None),
+        ("POST", "/fork", {"anchor": {"type": "latest"}}),
+        ("GET", "/inject-capabilities", None),
+        ("POST", "/inject", {"message": "steer child"}),
+    ],
+)
+async def test_public_task_controls_reject_isolated_browser_marker(
+    client,
+    session_factory,
+    method,
+    suffix,
+    payload,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        child = Task(
+            title="Internal Browser child",
+            description="not a public Task lifecycle",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            session_id="browser-session-is-not-resumable",
+            last_cwd="/tmp/browser-child",
+            metadata_={"isolated_browser_agent": True},
+            archived=True,
+        )
+        db.add(child)
+        await db.commit()
+        child_id = child.id
+
+    response = await client.request(
+        method,
+        f"/api/tasks/{child_id}{suffix}",
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Harness owner" in response.text
+    async with session_factory() as db:
+        assert await db.get(Task, child_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_browser_child_cannot_be_shared_or_own_plan(client, session_factory):
+    from backend.models.task import Task
+    from backend.services import task_sharing
+
+    async with session_factory() as db:
+        child = Task(
+            title="Internal Browser child",
+            description="not shareable or plannable",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            session_id="browser-session-is-not-resumable",
+            metadata_={"isolated_browser_agent": True},
+            archived=True,
+        )
+        db.add(child)
+        await db.commit()
+        child_id = child.id
+
+    async with session_factory() as db:
+        with pytest.raises(ValueError, match="Browser Agent"):
+            await task_sharing.share_task(db, child_id, [])
+    related_plan = await client.post(
+        f"/api/tasks/{child_id}/plans",
+        json={"title": "forbidden", "input": "forbidden"},
+    )
+
+    assert related_plan.status_code == 409, related_plan.text
+    assert "Harness owner" in related_plan.text
+
+
+@pytest.mark.asyncio
 async def test_create_task_wakes_dispatcher_after_commit(client):
     """New work should not wait for the dispatcher's 2-second safety poll."""
     from backend.main import dispatcher
@@ -485,6 +786,7 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
             "session_id": "session-1",
             "last_cwd": "/workspace/repo",
             "retry_count": 2,
+            "turn_generation": 7,
             "source_status": "plan_review",
             "mode": "plan",
             "selected_user_skills": [81],
@@ -498,12 +800,14 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["status"] == "plan_review"
+    assert resp.json()["turn_generation"] == 7
     wake.assert_not_called()
     async with session_factory() as db:
         task = await db.get(Task, 7001)
     assert task.status == "plan_review"
     assert task.session_id == "session-1"
     assert task.retry_count == 2
+    assert task.turn_generation == 7
     assert task.selected_user_skills == [81]
     assert task.metadata_["ccm_user_skill_snapshots"] == [{
         "id": 81,
@@ -512,6 +816,74 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
         "content": "full body",
     }]
     assert task.metadata_["ccm_worker_managed_task"] is True
+
+
+@pytest.mark.asyncio
+async def test_migration_import_cannot_repurpose_existing_task_mode(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7010,
+            title="existing Auto task",
+            description="keep its authority",
+            status="cancelled",
+            mode="auto",
+        )
+        db.add(task)
+        await db.commit()
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7010,
+        "title": "forged Goal replacement",
+        "description": "must not replace",
+        "mode": "goal",
+        "goal_condition": "done",
+        "source_status": "cancelled",
+    })
+
+    assert response.status_code == 409, response.text
+    assert "cannot change an existing Task mode" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7010)
+    assert current.mode == "auto"
+    assert current.title == "existing Auto task"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_cannot_refresh_existing_plan_carrier(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7011,
+            title="existing Plan carrier",
+            description="immutable approval history",
+            status="cancelled",
+            mode="plan",
+        )
+        db.add(task)
+        await db.commit()
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7011,
+        "title": "replace Plan carrier",
+        "description": "must not replace",
+        "mode": "plan",
+        "source_status": "cancelled",
+    })
+
+    assert response.status_code == 409, response.text
+    assert "Plan carriers are immutable" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7011)
+    assert current.title == "existing Plan carrier"
 
 
 @pytest.mark.asyncio
@@ -590,19 +962,23 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
         db.add(task)
         await db.commit()
 
-    real_fence = task_api._task_generation_fence
-
-    def replace_generation_after_snapshot(task_id, observed):
-        predicates = real_fence(task_id, observed)
-        # Autoflush applies this same-status generation change immediately
-        # before the import's guarded UPDATE. The old retry_count already
-        # captured in ``predicates`` must make that UPDATE miss.
-        observed.retry_count += 1
-        return predicates
+    @asynccontextmanager
+    async def replace_generation_after_snapshot(task_id):
+        # Model a different Worker process committing after this request froze
+        # its exact scalar predicates and ended its read transaction.  The
+        # fresh-writer CAS must miss without SQLite BUSY_SNAPSHOT.
+        async with session_factory() as competing_db:
+            await competing_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(retry_count=5)
+            )
+            await competing_db.commit()
+        yield
 
     monkeypatch.setattr(
         task_api,
-        "_task_generation_fence",
+        "get_task_operation_lock",
         replace_generation_after_snapshot,
     )
 
@@ -618,7 +994,241 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
         current = await db.get(Task, 7003)
     assert current.title == "Current generation"
     assert current.status == "cancelled"
+    assert current.retry_count == 5
+
+
+@pytest.mark.asyncio
+async def test_migration_import_rejects_turn_generation_only_aba(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """An import snapshot cannot overwrite a newer logical turn."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7009,
+            title="Current logical turn",
+            description="d",
+            status="cancelled",
+            retry_count=4,
+            turn_generation=9,
+        )
+        db.add(task)
+        await db.commit()
+
+    @asynccontextmanager
+    async def replace_turn_after_snapshot(task_id):
+        async with session_factory() as competing_db:
+            await competing_db.execute(
+                update(Task)
+                .where(Task.id == task_id)
+                .values(turn_generation=10)
+            )
+            await competing_db.commit()
+        yield
+
+    monkeypatch.setattr(
+        task_api,
+        "get_task_operation_lock",
+        replace_turn_after_snapshot,
+    )
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7009,
+        "title": "Stale imported turn",
+        "description": "d",
+        "retry_count": 4,
+        "turn_generation": 9,
+    })
+
+    assert response.status_code == 409
+    async with session_factory() as db:
+        current = await db.get(Task, 7009)
+    assert current.title == "Current logical turn"
+    assert current.status == "cancelled"
     assert current.retry_count == 4
+    assert current.turn_generation == 10
+
+
+@pytest.mark.asyncio
+async def test_migration_import_yields_to_receipt_after_snapshot(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A Worker receipt committed after validation owns the inert copy."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            id=7012,
+            title="receipt-owned Worker copy",
+            description="d",
+            status="cancelled",
+        )
+        db.add(task)
+        await db.commit()
+
+    @asynccontextmanager
+    async def receipt_wins_after_snapshot(task_id):
+        await persist_active_worker_receipt(session_factory, task_id)
+        yield
+
+    monkeypatch.setattr(
+        task_api,
+        "get_task_operation_lock",
+        receipt_wins_after_snapshot,
+    )
+
+    response = await client.post("/api/tasks/migration-import", json={
+        "id": 7012,
+        "title": "stale Manager mirror",
+        "description": "must not overwrite the receipt generation",
+        "source_status": "completed",
+    })
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, 7012)
+    assert current is not None
+    assert current.title == "receipt-owned Worker copy"
+    assert current.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_commits_before_status_publication(
+    client,
+    session_factory,
+):
+    """A publication failure cannot roll back an already imported mirror."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            id=7013,
+            title="old Worker mirror",
+            description="d",
+            status="cancelled",
+        )
+        db.add(task)
+        await db.commit()
+
+    async def fail_after_verifying_commit(task_id, status):
+        assert task_id == 7013
+        assert status == "completed"
+        async with session_factory() as verify_db:
+            committed = await verify_db.get(Task, task_id)
+            assert committed is not None
+            assert committed.title == "durable imported mirror"
+            assert committed.status == "completed"
+        raise RuntimeError("publication failed after durable import")
+
+    with (
+        patch(
+            "backend.services.task_events.broadcast_status_change",
+            new=AsyncMock(side_effect=fail_after_verifying_commit),
+        ),
+        pytest.raises(RuntimeError, match="publication failed"),
+    ):
+        await client.post("/api/tasks/migration-import", json={
+            "id": 7013,
+            "title": "durable imported mirror",
+            "description": "d",
+            "source_status": "completed",
+        })
+
+    async with session_factory() as db:
+        current = await db.get(Task, 7013)
+    assert current is not None
+    assert current.title == "durable imported mirror"
+    assert current.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_migration_import_publication_yields_to_post_commit_receipt(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A receipt admitted after import commit suppresses its old status event."""
+
+    from backend.models.task import Task
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            id=7014,
+            title="old Worker mirror",
+            description="d",
+            status="cancelled",
+        )
+        db.add(task)
+        await db.commit()
+
+    publication_waiting = asyncio.Event()
+    release_publication = asyncio.Event()
+    original_execute = AsyncSession.execute
+    publication_paused = False
+
+    async def pause_publication_guard(self, statement, *args, **kwargs):
+        nonlocal publication_paused
+        values = getattr(statement, "_values", None)
+        value_keys = {
+            getattr(column, "key", None)
+            for column in values or ()
+        }
+        table = getattr(statement, "table", None)
+        if (
+            not publication_paused
+            and getattr(table, "name", None) == Task.__tablename__
+            and value_keys == {"status"}
+        ):
+            publication_paused = True
+            publication_waiting.set()
+            await release_publication.wait()
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", pause_publication_guard)
+    with patch(
+        "backend.services.task_events.broadcast_status_change",
+        new_callable=AsyncMock,
+    ) as publish:
+        request_task = asyncio.create_task(
+            client.post("/api/tasks/migration-import", json={
+                "id": 7014,
+                "title": "durable imported mirror",
+                "description": "d",
+                "source_status": "completed",
+            })
+        )
+        await asyncio.wait_for(publication_waiting.wait(), timeout=2)
+        async with session_factory() as db:
+            committed = await db.get(Task, 7014)
+            assert committed is not None
+            assert committed.title == "durable imported mirror"
+            assert committed.status == "completed"
+
+        await persist_active_worker_receipt(session_factory, 7014)
+        release_publication.set()
+        response = await asyncio.wait_for(request_task, timeout=2)
+
+    assert response.status_code == 201, response.text
+    assert response.json()["title"] == "durable imported mirror"
+    assert response.json()["status"] == "completed"
+    publish.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -674,6 +1284,77 @@ async def test_get_task(client):
 async def test_get_task_not_found(client):
     resp = await client.get("/api/tasks/9999")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_worker_termination_receipt_returns_exact_task_not_found(
+    client,
+):
+    operation_id = "a" * 32
+    task_id = 987654
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/termination-receipts/{operation_id}"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "version": 2,
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "status": "task_not_found",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_worker_termination_receipt_fails_closed_on_corrupt_storage(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.services.worker_task_termination import (
+        WorkerTaskTerminationReceipt,
+        canonical_json_digest,
+        stage_worker_receipt,
+    )
+
+    operation_id = "b" * 32
+    async with session_factory() as db:
+        task = Task(title="corrupt Worker receipt", status="pending")
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        payload = {
+            "version": 2,
+            "operation_id": operation_id,
+            "task_id": task_id,
+            "operation": "cancel",
+            "manager_worker_id": 17,
+            "expected_remote": {
+                "status": "pending",
+                "retry_count": 0,
+                "turn_generation": 0,
+            },
+            "manager_handoff": None,
+        }
+        await stage_worker_receipt(
+            db,
+            task_id=task_id,
+            operation_id=operation_id,
+            operation="cancel",
+            request_payload=payload,
+            request_digest=canonical_json_digest(payload),
+        )
+        receipt = await db.get(WorkerTaskTerminationReceipt, operation_id)
+        receipt.request_payload = {**payload, "unexpected": True}
+        await db.commit()
+
+    response = await client.get(
+        f"/api/tasks/{task_id}/termination-receipts/{operation_id}"
+    )
+
+    assert response.status_code == 409, response.text
+    assert "receipt" in response.json()["detail"].lower()
 
 
 @pytest.mark.asyncio
@@ -788,6 +1469,45 @@ async def test_retry_task(client):
     assert cancelled.status_code == 200
     resp = await client.post(f"/api/tasks/{task_id}/retry")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "plan_approved"),
+    [("completed", True), ("cancelled", False)],
+)
+async def test_manual_retry_rejects_terminal_plan_tasks(
+    client,
+    session_factory,
+    status,
+    plan_approved,
+):
+    """Plan decisions are immutable; revision owns another planning run."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        plan = Task(
+            title="Terminal Plan",
+            description="Plan this",
+            status=status,
+            mode="plan",
+            plan_approved=plan_approved,
+            plan_content="A reviewed proposal",
+        )
+        db.add(plan)
+        await db.commit()
+        task_id = plan.id
+
+    response = await client.post(f"/api/tasks/{task_id}/retry")
+
+    assert response.status_code == 409
+    assert "Plan Tasks cannot be retried" in response.json()["detail"]
+    async with session_factory() as db:
+        plan = await db.get(Task, task_id)
+    assert plan.status == status
+    assert plan.retry_count == 0
+    assert plan.plan_approved is plan_approved
 
 
 @pytest.mark.asyncio
@@ -1126,6 +1846,1402 @@ async def test_update_task(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "suffix", "payload"),
+    [
+        ("PUT", "", {"title": "must not change"}),
+        ("POST", "/retry", None),
+        ("DELETE", "", None),
+    ],
+)
+async def test_waiting_capability_rejects_ordinary_task_management(
+    client,
+    session_factory,
+    method,
+    suffix,
+    payload,
+):
+    """Only the durable resume protocol may advance a waiting Task."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="durable capability wait",
+            description="d",
+            status="waiting_capability",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    response = await client.request(
+        method,
+        f"/api/tasks/{task_id}{suffix}",
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "waiting" in response.json()["detail"].lower()
+    assert "capability" in response.json()["detail"].lower()
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "waiting_capability"
+        assert current.title == "durable capability wait"
+        assert current.retry_count == 0
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_keeps_independent_task_preferences_available(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="waiting preferences",
+            description="d",
+            status="waiting_capability",
+            has_unread=True,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    for suffix in ("star", "read", "unread", "archive"):
+        response = await client.post(f"/api/tasks/{task_id}/{suffix}")
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "waiting_capability"
+
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "waiting_capability"
+        assert current.starred is True
+        assert current.has_unread is True
+        assert current.archived is True
+
+
+async def _seed_waiting_capability_for_terminal_api(
+    db,
+    *,
+    capability_key: str = "plan",
+    executor_kind: str = "plan_agent",
+    invocation_status: str = "queued",
+    queued_runtime_evidence: bool = False,
+):
+    """Create one exact agent-request aggregate for Task terminal tests."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    digest = "d" * 64
+    task = Task(
+        title=f"waiting {capability_key}",
+        description="terminalize the exact capability wait",
+        status="waiting_capability",
+        mode="auto",
+        provider="claude",
+        retry_count=2,
+        turn_generation=7,
+        session_id="waiting-capability-session",
+    )
+    db.add(task)
+    await db.flush()
+    source_log_id = task.id * 10 + 1
+    output_log_id = task.id * 10 + 2
+    terminal_log_id = task.id * 10 + 3
+    result_ready = invocation_status in {"ready", "resuming"}
+    invocation = CapabilityInvocation(
+        task_id=task.id,
+        capability_key=capability_key,
+        source="agent_request",
+        purpose="advisory",
+        status=invocation_status,
+        state_version=1,
+        idempotency_key=f"waiting-api-{task.id}",
+        input_payload={"focus": "safe cancellation"},
+        input_hash=digest,
+        subject_kind="task_generation",
+        subject_ref={
+            "task_id": task.id,
+            "incarnation_id": task.incarnation_id,
+            "retry_count": task.retry_count,
+            "turn_generation": task.turn_generation,
+        },
+        subject_hash=digest,
+        executor_kind=executor_kind,
+        executor_config={},
+        executor_config_hash=digest,
+        policy_snapshot={"enabled": True},
+        policy_hash=digest,
+        resume_policy="resume_task",
+        max_attempts=1,
+        active_task_id=task.id,
+        request_task_incarnation_id=task.incarnation_id,
+        request_task_retry_count=task.retry_count,
+        request_task_instance_id=None,
+        request_task_started_at=None,
+        request_task_session_id=task.session_id,
+        request_task_turn_generation=task.turn_generation,
+        request_source_log_id=source_log_id,
+        request_output_log_id=output_log_id,
+        request_terminal_log_id=terminal_log_id,
+        request_reason="Need capability guidance",
+        request_protocol_version=1,
+        request_output_hash=digest,
+        result_kind=("plan_version" if result_ready else None),
+        result_id=(task.id if result_ready else None),
+        result_hash=(digest if result_ready else None),
+        ready_at=(datetime.utcnow() if result_ready else None),
+    )
+    db.add(invocation)
+    await db.flush()
+    running = invocation_status in {"running", "waiting_user", "cancelling"}
+    execution = CapabilityExecution(
+        invocation_id=invocation.id,
+        attempt=1,
+        status=("completed" if result_ready else invocation_status),
+        state_version=1,
+        active_invocation_id=(None if result_ready else invocation.id),
+        idempotency_key=f"waiting-api-execution-{task.id}",
+        executor_kind=executor_kind,
+        input_hash=digest,
+        handle_kind=(
+            f"{capability_key}_runtime"
+            if running or queued_runtime_evidence
+            else None
+        ),
+        handle_id=(
+            str(task.id) if running or queued_runtime_evidence else None
+        ),
+        handle_generation=(1 if running or queued_runtime_evidence else None),
+        lease_token=(digest if running else None),
+        heartbeat_at=(datetime.utcnow() if running else None),
+        started_at=(datetime.utcnow() if running else None),
+        output_kind=("plan_version" if result_ready else None),
+        output_id=(task.id if result_ready else None),
+        output_hash=(digest if result_ready else None),
+        completed_at=(datetime.utcnow() if result_ready else None),
+    )
+    db.add(execution)
+    await db.flush()
+    outbox = CapabilityResumeOutbox(
+        task_id=task.id,
+        invocation_id=invocation.id,
+        active_task_id=task.id,
+        active_invocation_id=invocation.id,
+        status="pending",
+        state_version=1,
+        request_task_incarnation_id=task.incarnation_id,
+        request_task_retry_count=task.retry_count,
+        from_turn_generation=task.turn_generation,
+        request_task_session_id=task.session_id,
+        request_source_log_id=source_log_id,
+        request_output_log_id=output_log_id,
+        request_terminal_log_id=terminal_log_id,
+    )
+    db.add(outbox)
+    await db.commit()
+    return task.id, invocation.id, execution.id, outbox.id
+
+
+async def _promote_waiting_capability_to_released_claimed_g_plus_one(
+    db,
+    *,
+    task_id: int,
+    invocation_id: int,
+    execution_id: int,
+    outbox_id: int,
+) -> None:
+    """Model the canonical claimed G+1 state after pre-provider release."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    from backend.services.terminal_arbitration import bind_turn_source
+
+    digest = "d" * 64
+    task = await db.get(Task, task_id, populate_existing=True)
+    invocation = await db.get(
+        CapabilityInvocation,
+        invocation_id,
+        populate_existing=True,
+    )
+    execution = await db.get(
+        CapabilityExecution,
+        execution_id,
+        populate_existing=True,
+    )
+    outbox = await db.get(
+        CapabilityResumeOutbox,
+        outbox_id,
+        populate_existing=True,
+    )
+    task.turn_generation = outbox.from_turn_generation + 1
+    task.instance_id = 77
+    source = await bind_turn_source(
+        db,
+        task,
+        None,
+        instance_id=77,
+        transport=None,
+    )
+    task.status = "waiting_capability"
+    task.instance_id = None
+
+    now = datetime.utcnow()
+    invocation.status = "resuming"
+    invocation.state_version += 1
+    invocation.result_kind = "plan_version"
+    invocation.result_id = task.id
+    invocation.result_hash = digest
+    invocation.ready_at = now
+    execution.status = "completed"
+    execution.state_version += 1
+    execution.active_invocation_id = None
+    execution.output_kind = "plan_version"
+    execution.output_id = task.id
+    execution.output_hash = digest
+    execution.completed_at = now
+    outbox.status = "claimed"
+    outbox.state_version += 1
+    outbox.invocation_terminal_status = "completed"
+    outbox.invocation_result_kind = "plan_version"
+    outbox.invocation_result_id = task.id
+    outbox.invocation_result_hash = digest
+    outbox.resume_payload = {
+        "schema_version": 1,
+        "status": "completed",
+        "result": {"kind": "plan_version", "id": task.id},
+    }
+    outbox.resume_payload_hash = digest
+    outbox.resume_source_log_id = source.id
+    outbox.claimed_turn_generation = task.turn_generation
+    outbox.attempt_count = 1
+    outbox.ready_at = now
+    outbox.claimed_at = now
+    outbox.lease_token = None
+    outbox.lease_expires_at = None
+    await db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_waiting_capability_queued_terminal_request_is_atomic(
+    client,
+    session_factory,
+    endpoint,
+    terminal_status,
+):
+    """No-runtime queued work, its outbox, and Task settle in this order."""
+
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(db)
+        )
+
+    response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == terminal_status
+        assert invocation.status == "cancelled"
+        assert invocation.active_task_id is None
+        assert execution.status == "cancelled"
+        assert execution.active_invocation_id is None
+        assert outbox.status == "cancelled"
+        assert outbox.active_task_id is None
+        assert outbox.active_invocation_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_waiting_capability_released_claimed_g_plus_one_can_stop(
+    client,
+    session_factory,
+    endpoint,
+    terminal_status,
+):
+    """A released pre-provider G+1 is replayable, but also stoppable."""
+
+    from backend.models.capability import (
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="resuming",
+            )
+        )
+    async with session_factory() as db:
+        await _promote_waiting_capability_to_released_claimed_g_plus_one(
+            db,
+            task_id=task_id,
+            invocation_id=invocation_id,
+            execution_id=execution_id,
+            outbox_id=outbox_id,
+        )
+
+    response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == terminal_status
+        assert task.turn_generation == 8
+        assert invocation.status == "cancelled"
+        assert outbox.status == "cancelled"
+        assert outbox.claimed_turn_generation == 8
+        assert outbox.resume_source_log_id == task.turn_source_log_id
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_quiesces_inflight_claim_before_cancelling(
+    client,
+    session_factory,
+):
+    """A consumer claiming G+1 on cancellation cannot race the Invocation."""
+
+    from backend.models.capability import (
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="resuming",
+            )
+        )
+
+    worker_started = asyncio.Event()
+    never = asyncio.Event()
+
+    async def claim_while_unwinding():
+        worker_started.set()
+        try:
+            await never.wait()
+        except asyncio.CancelledError:
+            async with session_factory() as db:
+                await _promote_waiting_capability_to_released_claimed_g_plus_one(
+                    db,
+                    task_id=task_id,
+                    invocation_id=invocation_id,
+                    execution_id=execution_id,
+                    outbox_id=outbox_id,
+                )
+
+    worker = asyncio.create_task(claim_while_unwinding())
+    backend.main.dispatcher._task_queue_workers[task_id] = worker
+    await worker_started.wait()
+    try:
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+    finally:
+        backend.main.dispatcher._task_queue_workers.pop(task_id, None)
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "cancelled"
+        assert task.turn_generation == 8
+        assert invocation.status == "cancelled"
+        assert outbox.status == "cancelled"
+        assert outbox.resume_actual_transport is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("endpoint", "terminal_status"),
+    (
+        pytest.param("stop-session", "completed", id="stop-session"),
+        pytest.param("cancel", "cancelled", id="cancel"),
+    ),
+)
+async def test_claimed_capability_resume_live_worker_stops_before_outbox_cancel(
+    client,
+    session_factory,
+    monkeypatch,
+    endpoint,
+    terminal_status,
+):
+    """Stop/cancel joins real claimed G+1 before settling its outbox."""
+
+    import backend.api.tasks as tasks_module
+    import backend.main
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.instance import Instance
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    from backend.services.capability_resume import materialize_resume_outbox
+    from backend.tests.test_capability_resume import (
+        _install_fake_result,
+        _seed_resume,
+    )
+    from backend.tests.test_service_dispatcher import _make_dispatcher
+
+    monkeypatch.setattr(
+        tasks_module,
+        "_find_session_jsonl",
+        lambda _session_id, provider="claude": "/tmp/fake.jsonl",
+    )
+    dispatcher = _make_dispatcher(session_factory)
+    dispatcher._resolve_resume_config_dir = AsyncMock(return_value=None)
+
+    async with session_factory() as db:
+        seed = await _seed_resume(db, invocation_status="ready")
+        instance = Instance(name="claimed-resume-stop", status="idle")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+    _install_fake_result(monkeypatch, seed.execution_id)
+    async with session_factory() as db:
+        ready = await materialize_resume_outbox(db, seed.outbox_id)
+    assert ready is not None and ready.status == "ready"
+
+    launch_entered = asyncio.Event()
+    async def block_before_provider_boundary(**kwargs):
+        assert kwargs["task_id"] == seed.task_id
+        assert kwargs["instance_id"] == instance_id
+        assert kwargs["task_turn_generation"] == 8
+        assert callable(kwargs["on_launch_admitted"])
+        launch_entered.set()
+        # Never invoke the provider-boundary callback. Cancellation must join
+        # this exact pre-provider worker before changing the durable outbox.
+        await asyncio.Event().wait()
+
+    dispatcher.instance_manager.launch = AsyncMock(
+        side_effect=block_before_provider_boundary
+    )
+
+    with (
+        patch.object(backend.main, "dispatcher", dispatcher),
+        patch.object(
+            backend.main,
+            "instance_manager",
+            dispatcher.instance_manager,
+        ),
+    ):
+        assert await dispatcher.enqueue_capability_resume(seed.outbox_id)
+        await asyncio.wait_for(launch_entered.wait(), timeout=2)
+
+        async with session_factory() as db:
+            claimed_task = await db.get(Task, seed.task_id)
+            claimed_outbox = await db.get(
+                CapabilityResumeOutbox,
+                seed.outbox_id,
+            )
+            claimed_source = await db.get(
+                LogEntry,
+                claimed_outbox.resume_source_log_id,
+            )
+            claimed_lease = claimed_outbox.lease_token
+            claimed_source_id = claimed_source.id
+            assert claimed_task.status == "executing"
+            assert claimed_task.turn_generation == 8
+            assert claimed_task.instance_id == instance_id
+            assert claimed_task.turn_source_log_id == claimed_source.id
+            assert claimed_outbox.status == "claimed"
+            assert claimed_outbox.claimed_turn_generation == 8
+            assert isinstance(claimed_lease, str) and len(claimed_lease) == 64
+            assert claimed_source.actual_transport is None
+            assert claimed_source.instance_id == instance_id
+
+        response = await client.post(
+            f"/api/tasks/{seed.task_id}/{endpoint}"
+        )
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, seed.task_id)
+        invocation = await db.get(
+            CapabilityInvocation,
+            seed.invocation_id,
+        )
+        execution = await db.get(
+            CapabilityExecution,
+            seed.execution_id,
+        )
+        outbox = await db.get(CapabilityResumeOutbox, seed.outbox_id)
+        source = await db.get(LogEntry, claimed_source_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == terminal_status
+        assert task.turn_generation == 8
+        assert task.instance_id is None
+        assert task.turn_source_log_id == claimed_source_id
+        assert invocation.status == "cancelled"
+        assert invocation.active_task_id is None
+        assert execution.status == "completed"
+        assert execution.active_invocation_id is None
+        assert outbox.status == "cancelled"
+        assert outbox.claimed_turn_generation == 8
+        assert outbox.resume_source_log_id == claimed_source_id
+        assert outbox.lease_token is None
+        assert outbox.resume_actual_transport is None
+        assert outbox.launched_at is None
+        assert source.actual_transport is None
+        assert source.instance_id == instance_id
+        assert instance.status == "idle"
+        assert instance.current_task_id is None
+
+    assert seed.task_id not in dispatcher._task_queue_workers
+    assert seed.task_id not in dispatcher._task_queue_active_messages
+    assert seed.task_id not in dispatcher._task_queue_inflight
+    assert seed.outbox_id not in dispatcher._queued_capability_resume_ids
+    assert instance_id not in dispatcher._instance_claim_owners
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_launched_outbox_fails_closed(
+    client,
+    session_factory,
+):
+    """Provider-boundary evidence must survive an inconsistent waiting Task."""
+
+    from backend.models.capability import (
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="resuming",
+            )
+        )
+    async with session_factory() as db:
+        await _promote_waiting_capability_to_released_claimed_g_plus_one(
+            db,
+            task_id=task_id,
+            invocation_id=invocation_id,
+            execution_id=execution_id,
+            outbox_id=outbox_id,
+        )
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        source = await db.get(LogEntry, outbox.resume_source_log_id)
+        now = datetime.utcnow()
+        source.actual_transport = "claude_exec"
+        outbox.status = "launched"
+        outbox.state_version += 1
+        outbox.active_task_id = None
+        outbox.active_invocation_id = None
+        outbox.resume_actual_transport = "claude_exec"
+        outbox.launched_at = now
+        await db.commit()
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort:
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert invocation.status == "resuming"
+        assert outbox.status == "launched"
+        assert outbox.resume_actual_transport == "claude_exec"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capability_key", "executor_kind", "endpoint", "terminal_status"),
+    (
+        pytest.param(
+            "plan",
+            "plan_agent",
+            "stop-session",
+            "completed",
+            id="running-plan-stop",
+        ),
+        pytest.param(
+            "code_review",
+            "code_review_task",
+            "cancel",
+            "cancelled",
+            id="running-review-cancel",
+        ),
+    ),
+)
+async def test_waiting_capability_running_executor_stops_before_outbox(
+    client,
+    session_factory,
+    capability_key,
+    executor_kind,
+    endpoint,
+    terminal_status,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                capability_key=capability_key,
+                executor_kind=executor_kind,
+                invocation_status="running",
+            )
+        )
+
+    order: list[str] = []
+
+    async def cancel_executor(callback_db, *, invocation_id: int):
+        order.append("executor")
+        invocation = await callback_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        execution = await callback_db.get(
+            CapabilityExecution,
+            execution_id,
+            populate_existing=True,
+        )
+        now = datetime.utcnow()
+        execution.status = "cancelled"
+        execution.state_version += 1
+        execution.active_invocation_id = None
+        execution.completed_at = now
+        invocation.status = "cancelled"
+        invocation.state_version += 1
+        invocation.active_task_id = None
+        invocation.completed_at = now
+        await callback_db.commit()
+
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=cancel_executor)
+    definition = MagicMock(
+        executor_kind=executor_kind,
+        executor=executor,
+    )
+    original_abort = backend.main.dispatcher.abort_task_queue
+
+    async def observed_abort(*args, **kwargs):
+        assert order == ["executor"]
+        order.append("outbox")
+        return await original_abort(*args, **kwargs)
+
+    with (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=definition,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+            side_effect=observed_abort,
+        ),
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/{endpoint}")
+
+    assert response.status_code == 200, response.text
+    assert order == ["executor", "outbox"]
+    executor.cancel.assert_awaited_once()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == terminal_status
+        assert outbox.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_executor_failure_preserves_task_and_outbox(
+    client,
+    session_factory,
+):
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, _invocation_id, _execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=RuntimeError("stop failed"))
+    definition = MagicMock(executor_kind="plan_agent", executor=executor)
+
+    with (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=definition,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+        ) as abort,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invocation_status", ("queued", "running"))
+async def test_waiting_capability_noop_cancellation_fails_closed(
+    client,
+    session_factory,
+    invocation_status,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status=invocation_status,
+            )
+        )
+
+    noop = AsyncMock(return_value=None)
+    registry_patch = (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=MagicMock(
+                executor_kind="plan_agent",
+                executor=MagicMock(cancel=noop),
+            ),
+        )
+        if invocation_status == "running"
+        else patch(
+            "backend.services.capability_service.cancel_invocation",
+            new=noop,
+        )
+    )
+    with (
+        registry_patch,
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+        ) as abort,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "did not reach one durable terminal state" in response.json()["detail"]
+    noop.assert_awaited_once()
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert invocation.status == invocation_status
+        assert execution.status == invocation_status
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registry_case", ["missing", "mismatched"])
+async def test_waiting_capability_active_executor_registry_fails_closed(
+    client,
+    session_factory,
+    registry_case,
+):
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, _invocation_id, _execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+    definition = None
+    if registry_case == "mismatched":
+        definition = MagicMock(
+            executor_kind="wrong_executor_kind",
+            executor=MagicMock(cancel=AsyncMock()),
+        )
+
+    with (
+        patch(
+            "backend.services.capability_registry.resolve_capability",
+            return_value=definition,
+        ),
+        patch.object(
+            backend.main.dispatcher,
+            "abort_task_queue",
+            new_callable=AsyncMock,
+        ) as abort,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "unavailable or mismatched" in response.json()["detail"]
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_executor_ack_loss_uses_durable_readback(
+    client,
+    session_factory,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+
+    async def cancel_then_lose_ack(callback_db, *, invocation_id: int):
+        invocation = await callback_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        execution = await callback_db.get(
+            CapabilityExecution,
+            execution_id,
+            populate_existing=True,
+        )
+        now = datetime.utcnow()
+        invocation.status = "cancelled"
+        invocation.state_version += 1
+        invocation.active_task_id = None
+        invocation.completed_at = now
+        execution.status = "cancelled"
+        execution.state_version += 1
+        execution.active_invocation_id = None
+        execution.completed_at = now
+        await callback_db.commit()
+        raise ConnectionError("response acknowledgement lost")
+
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=cancel_then_lose_ack)
+    definition = MagicMock(executor_kind="plan_agent", executor=executor)
+    with patch(
+        "backend.services.capability_registry.resolve_capability",
+        return_value=definition,
+    ):
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "cancelled"
+        assert invocation.status == "cancelled"
+        assert execution.status == "cancelled"
+        assert outbox.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_client_cancel_cannot_break_cleanup_barrier(
+    client,
+    session_factory,
+):
+    from backend.models.capability import (
+        CapabilityExecution,
+        CapabilityInvocation,
+        CapabilityResumeOutbox,
+    )
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task_id, invocation_id, execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                invocation_status="running",
+            )
+        )
+    entered = asyncio.Event()
+    allow_finish = asyncio.Event()
+
+    async def delayed_cancel(callback_db, *, invocation_id: int):
+        entered.set()
+        await allow_finish.wait()
+        invocation = await callback_db.get(
+            CapabilityInvocation,
+            invocation_id,
+            populate_existing=True,
+        )
+        execution = await callback_db.get(
+            CapabilityExecution,
+            execution_id,
+            populate_existing=True,
+        )
+        now = datetime.utcnow()
+        invocation.status = "cancelled"
+        invocation.state_version += 1
+        invocation.active_task_id = None
+        invocation.completed_at = now
+        execution.status = "cancelled"
+        execution.state_version += 1
+        execution.active_invocation_id = None
+        execution.completed_at = now
+        await callback_db.commit()
+
+    executor = MagicMock()
+    executor.cancel = AsyncMock(side_effect=delayed_cancel)
+    definition = MagicMock(executor_kind="plan_agent", executor=executor)
+    with patch(
+        "backend.services.capability_registry.resolve_capability",
+        return_value=definition,
+    ):
+        request = asyncio.create_task(
+            client.post(f"/api/tasks/{task_id}/cancel")
+        )
+        await entered.wait()
+        request.cancel()
+        await asyncio.sleep(0)
+        assert not request.done()
+        allow_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        invocation = await db.get(CapabilityInvocation, invocation_id)
+        execution = await db.get(CapabilityExecution, execution_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "cancelled"
+        assert invocation.status == "cancelled"
+        assert execution.status == "cancelled"
+        assert outbox.status == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_waiting_capability_queued_runtime_evidence_fails_closed(
+    client,
+    session_factory,
+):
+    from backend.models.capability import CapabilityResumeOutbox
+    from backend.models.task import Task
+    import backend.main
+
+    async with session_factory() as db:
+        task_id, _invocation_id, _execution_id, outbox_id = (
+            await _seed_waiting_capability_for_terminal_api(
+                db,
+                queued_runtime_evidence=True,
+            )
+        )
+
+    with patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort:
+        response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "no-runtime proof" in response.json()["detail"]
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        outbox = await db.get(CapabilityResumeOutbox, outbox_id)
+        assert task.status == "waiting_capability"
+        assert outbox.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_update_task_yields_to_receipt_after_api_precheck(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """The service-level CAS defeats receipt admission after authorization."""
+
+    import backend.services.worker_proxy as worker_proxy_module
+    from backend.models.task import Task
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="receipt-owned config",
+            description="d",
+            status="completed",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    @asynccontextmanager
+    async def receipt_wins_before_service_cas(locked_task_id):
+        assert locked_task_id == task_id
+        await persist_active_worker_receipt(session_factory, task_id)
+        yield
+
+    monkeypatch.setattr(
+        worker_proxy_module,
+        "get_task_operation_lock",
+        receipt_wins_before_service_cas,
+    )
+
+    response = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"title": "must not be saved"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.text
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current is not None
+    assert current.title == "receipt-owned config"
+
+
+async def _create_worker_task_for_handoff_edit_test(
+    session_factory,
+    *,
+    reserve_handoff: bool,
+) -> int:
+    """Create a Worker Task, optionally with a valid durable G -> G+1 marker."""
+
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    from backend.models.worker import Worker
+    from backend.services.worker_relay import (
+        _handoff_payload_digest,
+        reserve_worker_turn_handoff,
+        worker_task_generation,
+    )
+
+    async with session_factory() as db:
+        worker = Worker(
+            name="handoff-edit-worker",
+            status="ready",
+            private_ip="10.0.0.77",
+            auth_token="worker-token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="Worker handoff edit fence",
+            description="original description",
+            status="completed",
+            worker_id=worker.id,
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="medium",
+            system_prompt_mode=None,
+            enabled_skills={},
+        )
+        db.add(task)
+        await db.flush()
+        await db.refresh(task)
+
+        if reserve_handoff:
+            source = LogEntry(
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="reserved follow-up",
+            )
+            db.add(source)
+            await db.flush()
+            observed = worker_task_generation(
+                task,
+                expected_worker_id=worker.id,
+            )
+            assert observed is not None
+            request_payload = {
+                "message": "reserved follow-up",
+                "worker_turn_handoff_id": "a" * 32,
+                "worker_turn_handoff_retry_count": task.retry_count,
+                "worker_turn_handoff_from_generation": task.turn_generation,
+            }
+            reserved = await reserve_worker_turn_handoff(
+                db,
+                observed,
+                handoff_id=request_payload["worker_turn_handoff_id"],
+                source_log_id=source.id,
+                request_payload=request_payload,
+                request_digest=_handoff_payload_digest(request_payload),
+            )
+            assert reserved is not None
+
+        await db.commit()
+        return task.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param({"model": "gpt-5.6-terra"}, id="routing-model"),
+        pytest.param({"codex_service_tier": "priority"}, id="routing-tier"),
+        pytest.param(
+            {"enabled_skills": {"sub-agent": True}},
+            id="skills",
+        ),
+        pytest.param({"effort_level": "high"}, id="generic-effort"),
+        pytest.param(
+            {"system_prompt_mode": "append"},
+            id="generic-system-prompt",
+        ),
+        pytest.param(
+            {"description": "changed description"},
+            id="generic-description",
+        ),
+    ],
+)
+async def test_pending_worker_turn_handoff_blocks_task_configuration_edits(
+    client,
+    session_factory,
+    payload,
+):
+    """No execution-affecting PUT may cross an exact Worker turn handoff."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    task_id = await _create_worker_task_for_handoff_edit_test(
+        session_factory,
+        reserve_handoff=True,
+    )
+    with patch.object(task_api, "_proxy", new_callable=AsyncMock) as proxy:
+        response = await client.put(f"/api/tasks/{task_id}", json=payload)
+
+    assert response.status_code == 409
+    assert "Worker follow-up" in response.json()["detail"]
+    proxy.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.model == "gpt-5.6-sol"
+        assert task.codex_service_tier == "default"
+        assert task.enabled_skills == {}
+        assert task.effort_level == "medium"
+        assert task.system_prompt_mode is None
+        assert task.description == "original description"
+        assert task.worker_turn_handoff_id == "a" * 32
+        assert task.worker_turn_handoff_acknowledged is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "field", "expected"),
+    [
+        pytest.param(
+            {"enabled_skills": {"sub-agent": True}},
+            "enabled_skills",
+            {"sub-agent": True},
+            id="skills",
+        ),
+        pytest.param(
+            {"effort_level": "high"},
+            "effort_level",
+            "high",
+            id="generic-effort",
+        ),
+        pytest.param(
+            {"system_prompt_mode": "append"},
+            "system_prompt_mode",
+            "append",
+            id="generic-system-prompt",
+        ),
+        pytest.param(
+            {"description": "changed description"},
+            "description",
+            "changed description",
+            id="generic-description",
+        ),
+    ],
+)
+async def test_worker_task_configuration_edits_still_work_without_handoff(
+    client,
+    session_factory,
+    payload,
+    field,
+    expected,
+):
+    """The handoff fence must not freeze an ordinary quiescent Worker Task."""
+
+    from backend.models.task import Task
+
+    task_id = await _create_worker_task_for_handoff_edit_test(
+        session_factory,
+        reserve_handoff=False,
+    )
+
+    response = await client.put(f"/api/tasks/{task_id}", json=payload)
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert getattr(task, field) == expected
+        assert task.worker_turn_handoff_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("payload", "expected_model", "expected_tier"),
+    [
+        pytest.param(
+            {"model": "gpt-5.6-terra"},
+            "gpt-5.6-terra",
+            "default",
+            id="model",
+        ),
+        pytest.param(
+            {"codex_service_tier": "priority"},
+            "gpt-5.6-sol",
+            "priority",
+            id="tier",
+        ),
+    ],
+)
+async def test_worker_routing_edits_still_sync_without_handoff(
+    client,
+    session_factory,
+    monkeypatch,
+    payload,
+    expected_model,
+    expected_tier,
+):
+    """A marker-free routing PUT retains the existing Worker sync protocol."""
+
+    import backend.api.tasks as task_api
+    from backend.models.task import Task
+
+    task_id = await _create_worker_task_for_handoff_edit_test(
+        session_factory,
+        reserve_handoff=False,
+    )
+    calls = []
+
+    async def proxy(_task, method, path, body=None, **_kwargs):
+        calls.append((method, path))
+        base = {
+            "id": task_id,
+            "status": "completed",
+            "worker_id": None,
+            "shared_from_id": None,
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "default",
+            "pending": None,
+        }
+        if path.endswith("/routing-config/stage"):
+            return {**base, "pending": body}
+        if path.endswith("/routing-config/ack"):
+            return {
+                **base,
+                "model": expected_model,
+                "codex_service_tier": expected_tier,
+            }
+        return base
+
+    monkeypatch.setattr(task_api, "_proxy", proxy)
+
+    response = await client.put(f"/api/tasks/{task_id}", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert [method for method, _path in calls] == ["GET", "POST", "POST"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.model == expected_model
+        assert task.codex_service_tier == expected_tier
+        assert task.worker_turn_handoff_id is None
+
+
+@pytest.mark.asyncio
 async def test_attention_tag_create_update_and_clear_preserves_system_tags(client):
     created = await client.post("/api/tasks", json={
         "title": "Tagged session",
@@ -1339,8 +3455,12 @@ async def test_delete_stopped_plan_cleans_pipeline_history(
 ):
     from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
     from backend.models.task import Task
+    from backend.services.plan_runtime_receipt import (
+        new_prepared_runtime_receipt,
+    )
 
     async with session_factory() as db:
+        finished_at = datetime.utcnow()
         plan = Task(
             title="Disposable Plan",
             description="Plan this",
@@ -1350,17 +3470,26 @@ async def test_delete_stopped_plan_cleans_pipeline_history(
         )
         db.add(plan)
         await db.flush()
-        run = PlanAgentRun(plan_task_id=plan.id, status="completed")
+        run = PlanAgentRun(
+            plan_task_id=plan.id,
+            status="completed",
+            finished_at=finished_at,
+        )
         db.add(run)
         await db.flush()
-        db.add(
-            PlanAgentStep(
-                run_id=run.id,
-                step_type="planner",
-                provider="claude",
-                status="completed",
-            )
+        step = PlanAgentStep(
+            run_id=run.id,
+            step_type="planner",
+            provider="claude",
+            status="completed",
+            finished_at=finished_at,
         )
+        db.add(step)
+        await db.flush()
+        receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+        receipt.status = "cleaned"
+        receipt.cleaned_at = finished_at
+        db.add(receipt)
         await db.commit()
         plan_id = plan.id
         run_id = run.id
@@ -2437,10 +4566,14 @@ async def test_tracked_pty_background_terminal_request_clears_marker(
         _db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert stopped_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == terminal_status
+        assert worker_termination_operation_id is None
         assert expected_generations == [
             (instance_id, 41001, started_at)
         ]
@@ -2557,10 +4690,14 @@ async def test_owner_stop_preserves_new_background_generation(
         _db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert _task_id == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == terminal_status
+        assert worker_termination_operation_id is None
         assert expected_generations == [
             (instance_id, 42001, started_at)
         ]
@@ -2647,6 +4784,7 @@ async def test_stop_session_stops_ownerless_pty_background_generation(
             settled_generation,
         ) == (task_id, session_id, generation)
         assert expected["expected_status"] == "completed"
+        assert expected["expected_turn_generation"] == 0
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -3091,10 +5229,14 @@ async def test_terminal_request_cancellation_before_first_commit_still_reaps(
         _db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert stopped_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == terminal_status
+        assert worker_termination_operation_id is None
         assert [
             (owner_id, pid, owner_started_at)
             for owner_id, pid, owner_started_at in expected_generations
@@ -3458,6 +5600,7 @@ async def test_stop_helper_never_uses_historical_recycled_instance(
                 old_task.id,
                 db,
                 expected_generations=[],
+                expected_task_turn_generation=old_task.turn_generation,
             ) is False
             stop.assert_not_awaited()
 
@@ -3482,6 +5625,9 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
         )
         db.add(inst)
         await db.commit()
+        task_id = task.id
+        task_turn_generation = task.turn_generation
+        instance_id = inst.id
 
         with patch.object(
             backend.main.instance_manager,
@@ -3490,18 +5636,21 @@ async def test_stop_helper_rechecks_live_owner_inside_manager_lock(
             return_value=True,
         ) as stop:
             assert await _stop_task_process(
-                task.id,
+                task_id,
                 db,
-                expected_generations=[(inst.id, None, None)],
+                expected_generations=[(instance_id, None, None)],
+                expected_task_turn_generation=task_turn_generation,
             ) is True
             stop.assert_awaited_once_with(
-                inst.id,
-                expected_task_id=task.id,
+                instance_id,
+                expected_task_id=task_id,
+                expected_task_turn_generation=task_turn_generation,
                 expected_pid=None,
                 expected_started_at=None,
                 task_status="completed",
                 terminal_consumer_timeout=30.0,
                 consumer_cancel_timeout=10.0,
+                yield_to_worker_task_termination=True,
             )
 
 
@@ -3530,6 +5679,7 @@ async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
         db.add(instance)
         await db.commit()
         task_id, instance_id = task.id, instance.id
+        task_turn_generation = task.turn_generation
 
         with (
             patch.object(
@@ -3553,16 +5703,19 @@ async def test_stop_helper_reconciles_an_exact_dead_reverse_owner(
                     145_0775,
                     started_at,
                 )],
+                expected_task_turn_generation=task_turn_generation,
             ) is True
 
     stop.assert_awaited_once_with(
         instance_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=task_turn_generation,
         expected_pid=145_0775,
         expected_started_at=started_at,
         task_status="completed",
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
     reconcile.assert_awaited_once_with(
         instance_id,
@@ -3610,19 +5763,23 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
         stopped_instance_id,
         *,
         expected_task_id,
+        expected_task_turn_generation,
         expected_pid,
         expected_started_at,
         task_status,
         terminal_consumer_timeout,
         consumer_cancel_timeout,
+        yield_to_worker_task_termination,
     ):
         assert stopped_instance_id == instance_id
         assert expected_task_id == task_id
+        assert expected_task_turn_generation == 0
         assert expected_pid == 1111
         assert expected_started_at == old_started_at
         assert task_status == "completed"
         assert terminal_consumer_timeout == 30.0
         assert consumer_cancel_timeout == 10.0
+        assert yield_to_worker_task_termination is True
         async with session_factory() as db:
             instance = await db.get(Instance, instance_id)
             instance.pid = 2222
@@ -3651,6 +5808,7 @@ async def test_stop_helper_passes_exact_generation_for_same_task_aba(
                 expected_generations=[
                     (instance_id, 1111, old_started_at)
                 ],
+                expected_task_turn_generation=0,
             ) is False
             reconcile.assert_not_awaited()
 
@@ -3695,10 +5853,14 @@ async def test_cancel_stops_exact_owner_before_publishing_status(
         db,
         *,
         expected_generations,
+        expected_task_turn_generation,
         task_status,
+        worker_termination_operation_id,
     ):
         assert tid == task_id
+        assert expected_task_turn_generation == 0
         assert task_status == "cancelled"
+        assert worker_termination_operation_id is None
         assert expected_generations == [(instance_id, 9911, None)]
         async with session_factory() as verify_db:
             task = await verify_db.get(Task, task_id)

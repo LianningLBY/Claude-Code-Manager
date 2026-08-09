@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -15,6 +15,18 @@ class WorkspaceReviewRun(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    owner_task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    owner_task_retry_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    owner_task_turn_generation: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    owner_task_status: Mapped[str | None] = mapped_column(
+        String(24), nullable=True
+    )
     project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     harness_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True)
     agent_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)

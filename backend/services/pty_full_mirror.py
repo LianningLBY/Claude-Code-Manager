@@ -544,6 +544,8 @@ class FullMirrorCCMBackend(CCMBackend):
                             session_id,
                             background_generation,
                             session,
+                            task_retry_count=record.task_retry_count,
+                            task_turn_generation=record.task_turn_generation,
                         )
                     )
                 else:
@@ -754,13 +756,25 @@ class FullMirrorCCMBackend(CCMBackend):
                 "no response needed",
             }:
                 return
-            params["_retried"] = True
-            logger.warning(
-                "Task %d got empty/non-response (%r), re-enqueueing",
-                task_id,
-                combined[:80],
-            )
             from backend.main import dispatcher
+
+            retry_fence = await self._im._chat_automatic_relaunch_fence(
+                task_id,
+                params,
+                dispatcher=dispatcher,
+            )
+            if retry_fence is None:
+                # PTY completion proves only that this proxy settled, not that
+                # the model performed no tools before producing an empty final
+                # message.  The durable source/transport admission fence wins
+                # over this legacy one-shot convenience retry.
+                logger.error(
+                    "Task %d got empty/non-response (%r) after PTY provider "
+                    "admission; automatic replay was blocked",
+                    task_id,
+                    combined[:80],
+                )
+                return
             from backend.services.dispatcher import PRIORITY_USER
 
             current_message = (
@@ -773,6 +787,7 @@ class FullMirrorCCMBackend(CCMBackend):
                 priority=PRIORITY_USER,
                 source="retry",
                 current_message=current_message,
+                queue_admission_fence=retry_fence,
             )
             if isinstance(params.get("enabled_skills"), dict):
                 retry_kwargs["command_skills"] = dict(
@@ -786,7 +801,20 @@ class FullMirrorCCMBackend(CCMBackend):
                 retry_kwargs["queue_timestamp"] = params[
                     "queue_timestamp"
                 ]
-            await dispatcher.enqueue_message(**retry_kwargs)
+            admitted = await dispatcher.enqueue_message(**retry_kwargs)
+            if admitted is False:
+                logger.info(
+                    "Discarded stale PTY empty-reply retry for task %d after "
+                    "a queue clear",
+                    task_id,
+                )
+                return
+            params["_retried"] = True
+            logger.warning(
+                "Task %d got empty/non-response (%r), re-enqueued",
+                task_id,
+                combined[:80],
+            )
         except Exception:
             logger.exception(
                 "Empty-reply retry check failed for task %s", task_id
@@ -895,6 +923,13 @@ class FullMirrorCCMBackend(CCMBackend):
                         if generation is None:
                             return
                         autonomous_generation = generation
+                    state = im.pty_background_state_for(
+                        task_id,
+                        expected_session_id,
+                        generation,
+                    )
+                    if state is None:
+                        return
                     await im._process_event(
                         key,
                         task_id,
@@ -903,6 +938,10 @@ class FullMirrorCCMBackend(CCMBackend):
                         detached_autonomous=True,
                         expected_session_id=expected_session_id,
                         expected_background_generation=generation,
+                        expected_task_retry_count=state.task_retry_count,
+                        expected_task_turn_generation=(
+                            state.task_turn_generation
+                        ),
                     )
                     await im._finish_pty_autonomous_activity_locked(
                         task_id,

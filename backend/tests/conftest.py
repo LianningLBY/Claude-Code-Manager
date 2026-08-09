@@ -81,8 +81,15 @@ import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
 import backend.models.workspace_review  # noqa: F401
 import backend.models.test_harness  # noqa: F401
+import backend.models.worker_turn_handoff  # noqa: F401
+import backend.models.worker_task_termination  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
+import backend.models.capability  # noqa: F401
+import backend.models.code_review  # noqa: F401
+import backend.models.delivery  # noqa: F401
+import backend.models.task_share  # noqa: F401
+import backend.models.team_share  # noqa: F401
 
 @pytest.fixture(scope="session")
 def event_loop():

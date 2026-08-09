@@ -21,6 +21,7 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.test_harness import (
     TestHarnessAttempt,
+    TestHarnessChildBinding,
     TestHarnessEvent,
     TestHarnessEvidence,
     TestHarnessFinding,
@@ -47,6 +48,12 @@ from backend.services.test_harness_artifacts import (
     TestHarnessArtifactError,
     TestHarnessArtifactStore,
     test_harness_artifact_store,
+)
+from backend.services.test_harness_owner_fence import (
+    TestHarnessOwnerIdentity,
+    lock_test_harness_owner,
+    test_harness_owner_fence,
+    test_harness_owner_identity,
 )
 
 
@@ -216,11 +223,39 @@ class TestHarnessService:
         spec: TestHarnessSpec,
         owner_user_id: int | None = None,
     ) -> TestHarnessRun:
+        async with test_harness_owner_fence(task_id):
+            return await self._start_task_run_under_owner_fence(
+                task_id=task_id,
+                spec=spec,
+                owner_user_id=owner_user_id,
+            )
+
+    async def _start_task_run_under_owner_fence(
+        self,
+        *,
+        task_id: int,
+        spec: TestHarnessSpec,
+        owner_user_id: int | None = None,
+    ) -> TestHarnessRun:
         normalized = spec.normalized()
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
             if task is None:
                 raise TestHarnessError("Task not found")
+            browser_parent = await db.scalar(
+                select(TestHarnessChildBinding.id).where(
+                    TestHarnessChildBinding.child_task_id == task_id
+                )
+            )
+            metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+            if (
+                browser_parent is not None
+                or metadata.get("isolated_browser_agent") is True
+            ):
+                raise TestHarnessError(
+                    "Isolated Browser Agent Tasks cannot own nested Test Harness runs"
+                )
+            owner_identity = test_harness_owner_identity(task)
             project = await db.get(Project, task.project_id) if task.project_id else None
             runtime = self._runtime_for_task(task, normalized)
             plan = compile_test_plan(
@@ -250,6 +285,7 @@ class TestHarnessService:
             spec=normalized,
             plan=plan,
             runtime=runtime,
+            owner_identity=owner_identity,
         )
         if not created:
             return run
@@ -262,7 +298,15 @@ class TestHarnessService:
                     test_plan=plan,
                 )
             except BaseException as exc:
-                await self._fail_start(run.id, exc)
+                cleanup_status, cleanup_error = (
+                    await self._cancel_workspace_for_harness(run.id)
+                )
+                await self._fail_start(
+                    run.id,
+                    exc,
+                    cleanup_status=cleanup_status,
+                    cleanup_error=cleanup_error,
+                )
                 raise
         elif normalized.target_kind == "fixed_url":
             # A fixed URL needs the caller to reserve either an inline browser
@@ -295,6 +339,7 @@ class TestHarnessService:
         spec: TestHarnessSpec,
         plan: dict[str, Any],
         runtime: dict[str, Any],
+        owner_identity: TestHarnessOwnerIdentity | None = None,
     ) -> tuple[TestHarnessRun, bool]:
         scope = f"task:{task_id}" if task_id is not None else f"admin:{owner_user_id or 0}"
         fingerprint = request_fingerprint(
@@ -305,6 +350,20 @@ class TestHarnessService:
         )
         async with self._lock:
             async with self.db_factory() as db:
+                owner: Task | None = None
+                if task_id is not None:
+                    if owner_identity is None or owner_identity.task_id != task_id:
+                        raise TestHarnessError(
+                            "Harness Run has no exact owner generation"
+                        )
+                    try:
+                        # This is intentionally the first statement in the
+                        # materialization transaction. It turns a stale
+                        # preflight identity into a serialized writer CAS on
+                        # SQLite WAL as well as a row lock on server databases.
+                        owner = await lock_test_harness_owner(db, owner_identity)
+                    except RuntimeError as exc:
+                        raise TestHarnessError(str(exc)) from exc
                 if spec.idempotency_key:
                     existing = await db.scalar(
                         select(TestHarnessRun).where(
@@ -316,6 +375,19 @@ class TestHarnessService:
                         if existing.request_fingerprint != fingerprint:
                             raise TestHarnessIdempotencyError(
                                 "idempotency key already belongs to different test input"
+                            )
+                        if task_id is not None and (
+                            owner_identity is None
+                            or existing.owner_task_incarnation_id
+                            != owner_identity.incarnation_id
+                            or existing.owner_task_retry_count
+                            != owner_identity.retry_count
+                            or existing.owner_task_turn_generation
+                            != owner_identity.turn_generation
+                            or existing.owner_task_status != owner_identity.status
+                        ):
+                            raise TestHarnessIdempotencyError(
+                                "idempotency key belongs to another owner generation"
                             )
                         return existing, False
                 if task_id is not None:
@@ -344,6 +416,18 @@ class TestHarnessService:
                 run = TestHarnessRun(
                     id=run_id,
                     task_id=task_id,
+                    owner_task_incarnation_id=(
+                        owner.incarnation_id if owner is not None else None
+                    ),
+                    owner_task_retry_count=(
+                        owner.retry_count if owner is not None else None
+                    ),
+                    owner_task_turn_generation=(
+                        owner.turn_generation if owner is not None else None
+                    ),
+                    owner_task_status=(
+                        owner.status if owner is not None else None
+                    ),
                     project_id=project_id,
                     owner_user_id=owner_user_id,
                     target_kind=spec.target_kind,
@@ -428,6 +512,14 @@ class TestHarnessService:
 
         from backend.services.workspace_review import workspace_review_manager
 
+        if (
+            run.owner_task_incarnation_id is None
+            or run.owner_task_retry_count is None
+            or run.owner_task_turn_generation is None
+            or run.owner_task_status is None
+        ):
+            raise TestHarnessError("Harness Run has no durable owner generation")
+
         workspace_run = await workspace_review_manager.start(
             task_id=run.task_id,
             goal=spec.goal,
@@ -442,6 +534,13 @@ class TestHarnessService:
             harness_run_id=run_id,
             test_plan=test_plan,
             runtime_config=run.runtime_config,
+            owner_identity=TestHarnessOwnerIdentity(
+                task_id=run.task_id,
+                incarnation_id=run.owner_task_incarnation_id,
+                retry_count=run.owner_task_retry_count,
+                turn_generation=run.owner_task_turn_generation,
+                status=run.owner_task_status,
+            ),
         )
         await self._update_run(
             run_id,
@@ -489,16 +588,57 @@ class TestHarnessService:
             raise
         except Exception as exc:
             logger.exception("Test Harness workspace watcher failed run=%s", run_id)
-            try:
-                from backend.services.workspace_review import workspace_review_manager
+            cleanup_status, cleanup_error = (
+                await self._cancel_workspace_for_harness(run_id)
+            )
+            await self._fail_start(
+                run_id,
+                exc,
+                cleanup_status=cleanup_status,
+                cleanup_error=cleanup_error,
+            )
 
-                await workspace_review_manager.cancel(workspace_review_run_id)
-            except Exception:
-                logger.exception(
-                    "Could not cancel workspace review after Harness watcher failure run=%s",
-                    run_id,
+    async def _cancel_workspace_for_harness(
+        self,
+        run_id: str,
+    ) -> tuple[str, str | None]:
+        """Cancel a linked Preview and project its exact cleanup proof."""
+
+        from backend.services.workspace_review import workspace_review_manager
+
+        async with self.db_factory() as db:
+            workspace_run = await db.scalar(
+                select(WorkspaceReviewRun).where(
+                    WorkspaceReviewRun.harness_run_id == run_id
                 )
-            await self._fail_start(run_id, exc)
+            )
+        if workspace_run is None:
+            # Failure before WorkspaceReviewManager committed a Run created no
+            # Preview handle and therefore has nothing external to reap.
+            return "completed", None
+        try:
+            await workspace_review_manager.cancel(workspace_run.id)
+        except BaseException as exc:
+            logger.exception(
+                "Could not cancel workspace review after Harness failure run=%s",
+                run_id,
+            )
+            return "failed", _safe_error(exc)
+        async with self.db_factory() as db:
+            current = await db.get(WorkspaceReviewRun, workspace_run.id)
+        if current is None:
+            return "unconfirmed", "Workspace review cleanup record disappeared"
+        await self._sync_workspace_run(run_id, current)
+        if current.cleanup_status == "completed":
+            return "completed", None
+        if current.cleanup_status == "failed":
+            return "failed", (
+                current.cleanup_error or "Workspace review cleanup failed"
+            )
+        return "unconfirmed", (
+            current.cleanup_error
+            or "Workspace review cleanup did not reach a proven terminal state"
+        )
 
     async def _watch_workspace_run_inner(
         self,
@@ -902,11 +1042,63 @@ class TestHarnessService:
         job.harness_run_id = run_id
         payload = job.as_dict()
         attempt_id = uuid.uuid4().hex
+        async with self.db_factory() as lookup:
+            run_snapshot = await lookup.get(TestHarnessRun, run_id)
+            if run_snapshot is None:
+                raise TestHarnessError("Harness run not found")
+            if (
+                run_snapshot.task_id is None
+                or run_snapshot.owner_task_incarnation_id is None
+                or run_snapshot.owner_task_retry_count is None
+                or run_snapshot.owner_task_turn_generation is None
+                or run_snapshot.owner_task_status is None
+                or run_snapshot.status in HARNESS_TERMINAL_STATUSES
+            ):
+                raise TestHarnessError(
+                    "Harness Run has no active durable owner generation"
+                )
+            owner_identity = TestHarnessOwnerIdentity(
+                task_id=run_snapshot.task_id,
+                incarnation_id=run_snapshot.owner_task_incarnation_id,
+                retry_count=run_snapshot.owner_task_retry_count,
+                turn_generation=run_snapshot.owner_task_turn_generation,
+                status=run_snapshot.owner_task_status,
+            )
         async with self._db_lock:
             async with self.db_factory() as db:
-                run = await db.get(TestHarnessRun, run_id)
+                try:
+                    await lock_test_harness_owner(
+                        db,
+                        owner_identity,
+                    )
+                except RuntimeError as exc:
+                    raise TestHarnessError(str(exc)) from exc
+                run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(
+                            TestHarnessRun.id == run_id,
+                            TestHarnessRun.task_id == owner_identity.task_id,
+                            TestHarnessRun.owner_task_incarnation_id
+                            == owner_identity.incarnation_id,
+                            TestHarnessRun.owner_task_retry_count
+                            == owner_identity.retry_count,
+                            TestHarnessRun.owner_task_turn_generation
+                            == owner_identity.turn_generation,
+                            TestHarnessRun.owner_task_status
+                            == owner_identity.status,
+                            TestHarnessRun.status.not_in(
+                                HARNESS_TERMINAL_STATUSES
+                            ),
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
                 if run is None:
-                    raise TestHarnessError("Harness run not found")
+                    raise TestHarnessError(
+                        "Harness Run ended or changed owner before Browser attach"
+                    )
                 existing = await db.scalar(
                     select(TestHarnessAttempt).where(
                         TestHarnessAttempt.run_id == run_id,
@@ -971,14 +1163,24 @@ class TestHarnessService:
         run = await self.get_run_model(run_id)
         if run is None or run.task_id is None or run.target_kind != "fixed_url":
             raise TestHarnessError("Fixed URL harness run not found")
-        return await self._start_browser_for_url(
-            run=run,
-            url=str(run.target_spec["url"]),
-            network_policy="external_public",
-            inline=inline,
-            watch_terminal=True,
-            fail_run_on_error=True,
-        )
+        async with test_harness_owner_fence(run.task_id):
+            current = await self.get_run_model(run_id)
+            if (
+                current is None
+                or current.task_id != run.task_id
+                or current.status in HARNESS_TERMINAL_STATUSES
+            ):
+                raise TestHarnessError(
+                    "Fixed URL harness owner ended before Browser admission"
+                )
+            return await self._start_browser_for_url(
+                run=current,
+                url=str(current.target_spec["url"]),
+                network_policy="external_public",
+                inline=inline,
+                watch_terminal=True,
+                fail_run_on_error=True,
+            )
 
     async def start_managed_preview_browser(
         self,
@@ -993,14 +1195,24 @@ class TestHarnessService:
             or run.target_kind not in {"pull_request", "git_ref"}
         ):
             raise TestHarnessError("Git target Harness run not found")
-        return await self._start_browser_for_url(
-            run=run,
-            url=url,
-            network_policy="managed_preview",
-            inline=False,
-            watch_terminal=False,
-            fail_run_on_error=False,
-        )
+        async with test_harness_owner_fence(run.task_id):
+            current = await self.get_run_model(run_id)
+            if (
+                current is None
+                or current.task_id != run.task_id
+                or current.status in HARNESS_TERMINAL_STATUSES
+            ):
+                raise TestHarnessError(
+                    "Git target Harness owner ended before Browser admission"
+                )
+            return await self._start_browser_for_url(
+                run=current,
+                url=url,
+                network_policy="managed_preview",
+                inline=False,
+                watch_terminal=False,
+                fail_run_on_error=False,
+            )
 
     async def _start_browser_for_url(
         self,
@@ -1107,6 +1319,7 @@ class TestHarnessService:
                     logger.exception("Could not wake dispatcher for harness browser agent")
             return job
         except BaseException as exc:
+            cleanup_error: str | None = None
             if job is not None:
                 await browser_review_job_manager.fail_start(job.id, exc)
             if child_binding_id is not None:
@@ -1115,13 +1328,21 @@ class TestHarnessService:
                         child_binding_id,
                         reason=f"Browser Agent attach failed: {_safe_error(exc)}",
                     )
-                except BaseException:
+                except BaseException as cleanup_exc:
+                    cleanup_error = _safe_error(cleanup_exc)
                     logger.exception(
                         "Could not roll back Browser child binding %s",
                         child_binding_id,
                     )
             if fail_run_on_error:
-                await self._fail_start(run_id, exc)
+                await self._fail_start(
+                    run_id,
+                    exc,
+                    cleanup_status=(
+                        "completed" if cleanup_error is None else "failed"
+                    ),
+                    cleanup_error=cleanup_error,
+                )
             raise
 
     async def _watch_browser_job(
@@ -1148,7 +1369,38 @@ class TestHarnessService:
             raise
         except Exception as exc:
             logger.exception("Test Harness browser watcher failed run=%s", run_id)
-            await self._fail_start(run_id, exc)
+            cleanup_error: str | None = None
+            try:
+                stopped = await self.child_service.stop_for_harness_run(
+                    run_id,
+                    reason="Harness Browser watcher lost its durable job",
+                )
+            except BaseException as cleanup_exc:
+                stopped = False
+                cleanup_error = _safe_error(cleanup_exc)
+                logger.exception(
+                    "Could not stop Browser child after watcher failure run=%s",
+                    run_id,
+                )
+            await self._fail_start(
+                run_id,
+                exc,
+                cleanup_status=(
+                    "completed"
+                    if stopped
+                    else "failed"
+                    if cleanup_error is not None
+                    else "unconfirmed"
+                ),
+                cleanup_error=(
+                    cleanup_error
+                    or (
+                        None
+                        if stopped
+                        else "Browser watcher lost the job before cleanup was proven"
+                    )
+                ),
+            )
 
     async def sync_browser_job(self, job: Any) -> None:
         run_id = getattr(job, "harness_run_id", None)
@@ -1687,7 +1939,14 @@ class TestHarnessService:
         )
         return True
 
-    async def _fail_start(self, run_id: str, exc: BaseException) -> None:
+    async def _fail_start(
+        self,
+        run_id: str,
+        exc: BaseException,
+        *,
+        cleanup_status: str,
+        cleanup_error: str | None = None,
+    ) -> None:
         await self._update_run(
             run_id,
             values={
@@ -1695,6 +1954,8 @@ class TestHarnessService:
                 "stage": "failed",
                 "verdict": "error",
                 "error": _safe_error(exc),
+                "cleanup_status": cleanup_status,
+                "cleanup_error": cleanup_error,
                 "completed_at": datetime.utcnow(),
             },
             event_type="error",
@@ -1703,13 +1964,21 @@ class TestHarnessService:
             source_key="harness:failed",
         )
 
-    async def _mark_cancelled(self, run_id: str) -> None:
+    async def _mark_cancelled(
+        self,
+        run_id: str,
+        *,
+        cleanup_status: str,
+        cleanup_error: str | None = None,
+    ) -> None:
         await self._update_run(
             run_id,
             values={
                 "status": "cancelled",
                 "stage": "cancelled",
                 "verdict": "cancelled",
+                "cleanup_status": cleanup_status,
+                "cleanup_error": cleanup_error,
                 "completed_at": datetime.utcnow(),
             },
             event_type="lifecycle",
@@ -1733,10 +2002,12 @@ class TestHarnessService:
             title="正在停止测试运行",
             source_key="harness:cancelling",
         )
+        cleanup_status = "completed"
+        cleanup_error: str | None = None
         if run.workspace_review_run_id:
-            from backend.services.workspace_review import workspace_review_manager
-
-            await workspace_review_manager.cancel(run.workspace_review_run_id)
+            cleanup_status, cleanup_error = (
+                await self._cancel_workspace_for_harness(run_id)
+            )
         else:
             stopped_binding = await self.child_service.stop_for_harness_run(
                 run_id,
@@ -1754,29 +2025,44 @@ class TestHarnessService:
             if run.browser_review_job_id:
                 from backend.services.browser_review_jobs import browser_review_job_manager
 
-                await browser_review_job_manager.cancel(run.browser_review_job_id)
+                cancelled_job = await browser_review_job_manager.cancel(
+                    run.browser_review_job_id
+                )
+                if cancelled_job is None:
+                    cleanup_status = "unconfirmed"
+                    cleanup_error = (
+                        "Browser Review job disappeared before cleanup was proven"
+                    )
+                else:
+                    await self.sync_browser_job(cancelled_job)
         pipeline = self._pipelines.get(run_id)
         if pipeline is not None and not pipeline.done():
             pipeline.cancel()
             await asyncio.gather(pipeline, return_exceptions=True)
         current = await self.get_run_model(run_id)
         if current is not None and current.status not in HARNESS_TERMINAL_STATUSES:
-            await self._mark_cancelled(run_id)
+            await self._mark_cancelled(
+                run_id,
+                cleanup_status=cleanup_status,
+                cleanup_error=cleanup_error,
+            )
         return await self.get_run_model(run_id)
 
     async def cancel_for_task(self, task_id: int, *, reason: str) -> int:
         """Cascade an explicit owner stop/delete to all active Harness runs."""
 
-        async with self._lock:
-            return await self._cancel_for_task_unlocked(task_id, reason=reason)
+        async with test_harness_owner_fence(task_id):
+            async with self._lock:
+                return await self._cancel_for_task_unlocked(task_id, reason=reason)
 
     @asynccontextmanager
     async def owner_stop_fence(self, task_id: int, *, reason: str):
         """Prevent a new run from racing an explicit owner terminalization."""
 
-        async with self._lock:
-            await self._cancel_for_task_unlocked(task_id, reason=reason)
-            yield
+        async with test_harness_owner_fence(task_id):
+            async with self._lock:
+                await self._cancel_for_task_unlocked(task_id, reason=reason)
+                yield
 
     async def _cancel_for_task_unlocked(self, task_id: int, *, reason: str) -> int:
         """Cancel owner runs while the global run-admission lock is held."""
@@ -2203,10 +2489,13 @@ class TestHarnessService:
             from backend.services.browser_review_jobs import browser_review_job_manager
 
             jobs = await browser_review_job_manager.list()
-            # Every in-memory job may still be consumed by its owning pipeline
-            # after the Task itself becomes terminal. Incomplete durable
-            # attempts additionally retain staging across job-history pruning.
-            active_job_ids = {job.id for job in jobs}
+            # A nonterminal in-memory job may still write staging. Terminal
+            # jobs are protected only when their durable archive is incomplete;
+            # otherwise retaining them would make quota admission depend on
+            # the in-memory history limit instead of archive durability.
+            active_job_ids = {
+                job.id for job in jobs if job.status not in _BROWSER_TERMINAL
+            }
             active_job_ids.update(protected_staging_job_ids)
         except Exception:
             # Failure to prove which jobs are active must never turn into

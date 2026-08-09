@@ -15,8 +15,12 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task_share import TaskShare
+from backend.models.worker import Worker
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_tasks import capture_repo_revision
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
+)
 
 
 async def _legacy_plan_task(session_factory, **values) -> int:
@@ -61,6 +65,44 @@ async def test_chat_history_empty(client):
     resp = await client.get(f"/api/tasks/{task_id}/chat/history")
     assert resp.status_code == 200
     assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_chat_history_exposes_durable_turn_scope(client, session_factory):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Scoped", "description": "d", "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        db.add(LogEntry(
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=0,
+            turn_scope="autonomous",
+            event_type="result",
+            role="assistant",
+            content="background result",
+        ))
+        db.add(LogEntry(
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=0,
+            turn_scope="source",
+            actual_transport="codex_exec",
+            event_type="user_message",
+            role="user",
+            content="source input",
+        ))
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history")
+
+    assert resp.status_code == 200
+    messages = resp.json()
+    assert messages[0]["turn_scope"] == "autonomous"
+    assert messages[0]["actual_transport"] is None
+    assert messages[1]["turn_scope"] == "source"
+    assert messages[1]["actual_transport"] == "codex_exec"
 
 
 @pytest.mark.asyncio
@@ -459,6 +501,80 @@ async def test_codex_fork_rejects_active_source_without_native_rpc(
 
     assert response.status_code == 409
     read_thread.assert_not_awaited()
+
+
+@pytest.mark.parametrize("source_kind", ["plan_mode", "canonical_link"])
+@pytest.mark.asyncio
+async def test_codex_fork_rejects_plan_carriers_without_side_effects(
+    client,
+    session_factory,
+    source_kind,
+):
+    from backend.models.plan import PlanLegacyTaskLink
+
+    if source_kind == "plan_mode":
+        task_id = await _legacy_plan_task(
+            session_factory,
+            title="Codex Plan source",
+            description="plan request",
+            provider="codex",
+            model="gpt-5.6-sol",
+            status="completed",
+            session_id="thread-plan",
+            last_cwd="/tmp/project",
+        )
+    else:
+        created = await client.post("/api/tasks", json={
+            "title": "Migrated carrier",
+            "description": "historical plan request",
+            "target_repo": "/tmp/project",
+            "provider": "codex",
+        })
+        assert created.status_code == 201, created.text
+        task_id = created.json()["id"]
+        async with session_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "thread-migrated-plan"
+            task.last_cwd = "/tmp/project"
+            db.add(PlanLegacyTaskLink(legacy_task_id=task_id, plan_id=456))
+            await db.commit()
+
+    async with session_factory() as db:
+        task_count_before = await db.scalar(select(func.count(Task.id)))
+
+    with (
+        patch("backend.api.chat._codex_fork_home") as fork_home,
+        patch(
+            "backend.main.instance_manager.create_codex_thread",
+            new=AsyncMock(),
+        ) as create_thread,
+        patch(
+            "backend.main.instance_manager.read_codex_thread",
+            new=AsyncMock(),
+        ) as read_thread,
+        patch(
+            "backend.main.instance_manager.fork_codex_thread",
+            new=AsyncMock(),
+        ) as fork_thread,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/fork",
+            json={"anchor": {"type": "initial"}},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "Plan Tasks and migrated Plan carriers cannot fork into ordinary Tasks; "
+        "use the canonical Plan execution flow"
+    )
+    fork_home.assert_not_called()
+    create_thread.assert_not_awaited()
+    read_thread.assert_not_awaited()
+    fork_thread.assert_not_awaited()
+    async with session_factory() as db:
+        task_count_after = await db.scalar(select(func.count(Task.id)))
+    assert task_count_after == task_count_before
 
 
 @pytest.mark.asyncio
@@ -908,6 +1024,44 @@ async def test_plan_reject_success(client, session_factory):
     assert data["plan_approved"] is False
 
 
+@pytest.mark.asyncio
+async def test_plan_task_with_legacy_session_rejects_direct_chat(
+    client,
+    session_factory,
+):
+    """A stale Plan session must never become an ordinary coding turn."""
+
+    task_id = await _legacy_plan_task(
+        session_factory,
+        title="Plan with legacy session",
+        description="d",
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(
+                status="completed",
+                plan_approved=True,
+                session_id="legacy-plan-session",
+                last_cwd="/tmp",
+            )
+        )
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/chat",
+        json={"message": "turn this Plan into code"},
+    )
+
+    assert response.status_code == 409
+    assert "Plan Tasks do not accept direct chat" in response.json()["detail"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "completed"
+    assert task.turn_generation == 0
+
+
 @pytest.mark.parametrize("action", ["approve", "reject"])
 @pytest.mark.asyncio
 async def test_plan_transition_revalidates_after_operation_lock(
@@ -1005,7 +1159,212 @@ async def _create_task_with_session(client, session_factory, **extra_fields):
 def _mock_dispatcher():
     d = MagicMock()
     d.enqueue_message = AsyncMock()
+    d.snapshot_plan_queue_admission = AsyncMock(return_value=None)
     return d
+
+
+async def _approved_legacy_plan_for_target(
+    session_factory,
+    target_id: int,
+) -> int:
+    return await _legacy_plan_task(
+        session_factory,
+        title=f"Plan for #{target_id}",
+        plan_target_task_id=target_id,
+        status="completed",
+        plan_content="1. Apply the safe change\n2. Verify it",
+        plan_approved=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_plan_receipt_blocks_local_application_before_logging(
+    client,
+    session_factory,
+):
+    target_id = await _create_task_with_session(client, session_factory)
+    plan_id = await _approved_legacy_plan_for_target(
+        session_factory,
+        target_id,
+    )
+    await persist_active_worker_receipt(session_factory, plan_id)
+    dispatcher = _mock_dispatcher()
+    broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{target_id}/chat",
+            json={
+                "message": "Apply the selected Plan",
+                "plan_task_ids": [plan_id],
+            },
+        )
+
+    assert response.status_code == 409
+    assert "termination receipt" in response.json()["detail"]
+    dispatcher.enqueue_message.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        user_logs = await db.scalar(
+            select(func.count(LogEntry.id)).where(
+                LogEntry.task_id == target_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert plan.plan_applied_at is None
+    assert plan.plan_applied_log_id is None
+    assert user_logs == 0
+
+
+@pytest.mark.asyncio
+async def test_legacy_plan_receipt_wins_before_enqueue_failure_rollback(
+    client,
+    session_factory,
+):
+    target_id = await _create_task_with_session(client, session_factory)
+    plan_id = await _approved_legacy_plan_for_target(
+        session_factory,
+        target_id,
+    )
+    dispatcher = _mock_dispatcher()
+
+    async def stage_receipt_then_reject(**_kwargs):
+        await persist_active_worker_receipt(session_factory, plan_id)
+        raise RuntimeError("Dispatcher admission closed")
+
+    dispatcher.enqueue_message.side_effect = stage_receipt_then_reject
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{target_id}/chat",
+            json={
+                "message": "Apply before shutdown",
+                "plan_task_ids": [plan_id],
+            },
+        )
+
+    assert response.status_code == 409
+    assert "could not be restored" in response.json()["detail"]
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        user_log = await db.get(LogEntry, plan.plan_applied_log_id)
+    assert plan.plan_applied_at is not None
+    assert plan.plan_applied_log_id is not None
+    assert json.loads(user_log.raw_json)["applied_plans"][0]["id"] == plan_id
+
+
+@pytest.mark.asyncio
+async def test_worker_legacy_plan_receipt_blocks_manager_success_mirror(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        worker = Worker(
+            name="legacy-plan-worker",
+            status="ready",
+            private_ip="10.0.0.31",
+            auth_token="worker-token",
+        )
+        db.add(worker)
+        await db.flush()
+        target = Task(
+            title="Worker target",
+            description="d",
+            target_repo="/tmp",
+            status="completed",
+            session_id="worker-plan-session",
+            worker_id=worker.id,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Task(
+            title=f"Plan for #{target.id}",
+            description="legacy Plan",
+            target_repo="/tmp",
+            mode="plan",
+            status="completed",
+            plan_target_task_id=target.id,
+            plan_content="Apply safely",
+            plan_approved=True,
+        )
+        db.add(plan)
+        await db.commit()
+        target_id = target.id
+        plan_id = plan.id
+        worker_id = worker.id
+
+    proxy = MagicMock()
+    proxy.require_ready_worker = AsyncMock()
+    proxy.relay = MagicMock(
+        subscribe_task=AsyncMock(),
+        ensure_worker_turn_handoff_recovery=MagicMock(return_value=None),
+    )
+    proxy.sync_task_skill_selection = AsyncMock()
+    async with session_factory() as db:
+        proxy.require_ready_worker.return_value = await db.get(Worker, worker_id)
+
+    async def route_then_stage_receipt(
+        _task,
+        method,
+        _path,
+        *_args,
+        **_kwargs,
+    ):
+        if method == "GET":
+            return {
+                "id": target_id,
+                "status": "completed",
+                "worker_id": None,
+                "shared_from_id": None,
+                "provider": "claude",
+                "model": None,
+                "codex_service_tier": "default",
+                "pending": None,
+            }
+        await persist_active_worker_receipt(session_factory, plan_id)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": "worker-plan-session",
+            "applied_plan_task_ids": [plan_id],
+        }
+
+    proxy.proxy_to_worker = AsyncMock(side_effect=route_then_stage_receipt)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    with patch("backend.main.worker_proxy", proxy), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{target_id}/chat",
+            json={
+                "message": "Apply on the Worker",
+                "plan_task_ids": [plan_id],
+            },
+        )
+
+    assert response.status_code == 409
+    assert "Manager termination state changed" in response.json()["detail"]
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        user_log = await db.scalar(
+            select(LogEntry)
+            .where(
+                LogEntry.task_id == target_id,
+                LogEntry.event_type == "user_message",
+            )
+            .order_by(LogEntry.id.desc())
+        )
+    assert plan.plan_applied_at is None
+    assert plan.plan_applied_log_id is None
+    assert "applied_plans" not in json.loads(user_log.raw_json)
 
 
 @pytest.mark.asyncio
@@ -1608,8 +1967,7 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
     session_factory,
 ):
     """A shadow Task must never expose the sharer's database id as local."""
-    from types import SimpleNamespace
-
+    from backend.models.task_share import SharedTaskReceived
     from backend.services.shared_relay import SharedRelay
 
     created = await client.post("/api/tasks", json={
@@ -1618,6 +1976,19 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
         "target_repo": "/tmp",
     })
     task_id = created.json()["id"]
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.example.test",
+            remote_task_id=44,
+            share_token="relay-test-token",
+            local_task_id=task_id,
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = await db.get(Task, task_id)
+        shadow.shared_from_id = shared.id
+        await db.commit()
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     relay = SharedRelay(session_factory, broadcaster)
@@ -1633,7 +2004,7 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
                 "timestamp": "2026-07-30T01:02:03Z",
             },
         },
-        SimpleNamespace(local_task_id=task_id),
+        shared,
     )
 
     async with session_factory() as db:
@@ -2697,10 +3068,39 @@ async def test_inject_capabilities_advertise_attachment_protocol(
 
 
 @pytest.mark.asyncio
+async def test_inject_rejects_inactive_task_before_transport(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(return_value=True)
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        MagicMock(broadcast=AsyncMock()),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "must not steer an inactive task"},
+        )
+
+    assert response.status_code == 409
+    assert "no active provider turn" in response.json()["detail"]
+    mock_im.inject_pty_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inject_requires_pty_mode(client, session_factory):
     """PTY 模式关闭时注入返回 400。"""
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
 
     mock_im = MagicMock()
@@ -2719,7 +3119,7 @@ async def test_inject_rejects_direct_turn_when_global_pty_is_enabled(
     client, session_factory
 ):
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = True
@@ -2746,7 +3146,7 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     from backend.models.task import Task
 
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
 
     mock_im = MagicMock()
@@ -2787,6 +3187,9 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
             )
         ).scalar_one()
     assert event["id"] == stored.id
+    assert stored.task_retry_count == 0
+    assert stored.task_turn_generation == 0
+    assert stored.turn_scope == "foreground"
 
 
 @pytest.mark.asyncio
@@ -2805,6 +3208,7 @@ async def test_inject_delivers_uploaded_image_to_pty_and_persists_metadata(
         client,
         session_factory,
         provider="claude",
+        status="executing",
     )
 
     mock_im = MagicMock()
@@ -2877,7 +3281,7 @@ async def test_inject_no_live_session_409(client, session_factory):
     from backend.models.task import Task
 
     task_id = await _create_task_with_session(
-        client, session_factory, provider="claude"
+        client, session_factory, provider="claude", status="executing"
     )
 
     mock_im = MagicMock()
@@ -2901,7 +3305,7 @@ async def test_codex_inject_steers_without_pty_mode(
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex"
+        client, session_factory, provider="codex", status="executing"
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = False
@@ -2936,6 +3340,9 @@ async def test_codex_inject_steers_without_pty_mode(
     assert event["id"] == stored.id
     assert event["task_id"] == task_id
     assert event["timestamp"].endswith("Z")
+    assert stored.task_retry_count == 0
+    assert stored.task_turn_generation == 0
+    assert stored.turn_scope == "foreground"
 
 
 @pytest.mark.asyncio
@@ -2959,6 +3366,7 @@ async def test_codex_inject_uses_native_image_and_file_inputs(
         client,
         session_factory,
         provider="codex",
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock(return_value=True)
@@ -3019,6 +3427,7 @@ async def test_inject_rejects_non_upload_path_without_side_effects(
         client,
         session_factory,
         provider="codex",
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock(return_value=True)
@@ -3072,6 +3481,7 @@ async def test_inject_container_attachment_fails_before_persisting(
         client,
         session_factory,
         provider="claude",
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.pty_mode_enabled = True
@@ -3124,6 +3534,7 @@ async def test_codex_inject_rejects_stale_fast_view_before_steer(
         client,
         session_factory,
         provider="codex",
+        status="executing",
         model="gpt-5.6-sol",
         codex_service_tier="default",
     )
@@ -3159,7 +3570,7 @@ async def test_codex_inject_without_live_app_server_turn_returns_409(
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex"
+        client, session_factory, provider="codex", status="executing"
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock(return_value=False)
@@ -3182,7 +3593,7 @@ async def test_codex_inject_requires_app_server_enabled(
 
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex"
+        client, session_factory, provider="codex", status="executing"
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock()
@@ -3200,7 +3611,11 @@ async def test_codex_inject_requires_app_server_enabled(
 @pytest.mark.asyncio
 async def test_inject_rejects_remote_worker_task(client, session_factory):
     task_id = await _create_task_with_session(
-        client, session_factory, provider="codex", worker_id=7
+        client,
+        session_factory,
+        provider="codex",
+        worker_id=7,
+        status="executing",
     )
     mock_im = MagicMock()
     mock_im.inject_codex_message = AsyncMock()

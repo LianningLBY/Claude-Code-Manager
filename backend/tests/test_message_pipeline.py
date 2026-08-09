@@ -542,8 +542,11 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
         ))
         db.add(LogEntry(
             instance_id=1, task_id=task_id,
-            task_retry_count=7, event_type="message", role="assistant",
+            task_retry_count=7, task_turn_generation=11,
+            native_turn_id="native-turn-11",
+            event_type="message", role="assistant",
             content="Hello", is_error=False,
+            raw_json='{"turn_id":"legacy-turn"}',
         ))
         await db.commit()
 
@@ -552,6 +555,9 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
     assert len(msgs) == 1
     assert msgs[0]["content"] == "Hello"
     assert msgs[0]["task_retry_count"] == 7
+    assert msgs[0]["task_turn_generation"] == 11
+    assert msgs[0]["native_turn_id"] == "native-turn-11"
+    assert msgs[0]["turn_id"] == "native-turn-11"
 
 
 @pytest.mark.asyncio

@@ -400,34 +400,15 @@ class BrowserReviewJobManager:
                     ensure_ascii=False,
                     indent=2,
                 )
-                self._ensure_artifact_capacity(
-                    job,
-                    "telemetry.json",
-                    len(encoded_telemetry.encode("utf-8")),
-                )
-                _write_private_text(
-                    job.options.output_dir / "telemetry.json",
-                    encoded_telemetry,
-                )
+                self._write_artifact_text(job, "telemetry.json", encoded_telemetry)
 
             action_batch = event.get("action_batch")
             if isinstance(action_batch, list) and action_batch:
                 batch = {"step": job.steps, "actions": action_batch}
-                encoded_batch = json.dumps(batch, ensure_ascii=False) + "\n"
-                actions_path = job.options.output_dir / "actions.jsonl"
-                existing_size = actions_path.stat().st_size if actions_path.exists() else 0
-                self._ensure_artifact_capacity(
-                    job,
-                    "actions.jsonl",
-                    existing_size + len(encoded_batch.encode("utf-8")),
-                )
+                self._append_artifact_jsonl(job, "actions.jsonl", batch)
                 job.action_batches.append(batch)
                 if len(job.action_batches) > 250:
                     job.action_batches = job.action_batches[-250:]
-                _append_private_jsonl(
-                    actions_path,
-                    batch,
-                )
 
             screenshot = _decode_screenshot(event.get("screenshot_base64"))
             if screenshot is not None:
@@ -439,22 +420,13 @@ class BrowserReviewJobManager:
                     screenshot_name = "final.png"
                 else:
                     screenshot_name = f"step-{max(1, job.steps):02d}.png"
-                self._ensure_artifact_capacity(job, screenshot_name, len(screenshot))
-                _write_private_bytes(job.options.output_dir / screenshot_name, screenshot)
+                self._write_artifact_bytes(job, screenshot_name, screenshot)
                 job.latest_screenshot = screenshot_name
 
             report = event.get("report")
             if isinstance(report, str) and report.strip():
                 report_value = report.strip()
-                self._ensure_artifact_capacity(
-                    job,
-                    "report.md",
-                    len(report_value.encode("utf-8")),
-                )
-                _write_private_text(
-                    job.options.output_dir / "report.md",
-                    report_value,
-                )
+                self._write_artifact_text(job, "report.md", report_value)
             if report is not None or event.get("verdict") is not None:
                 job.verdict = normalize_verdict(event.get("verdict"), report=report)
             if event.get("findings") is not None:
@@ -511,6 +483,27 @@ class BrowserReviewJobManager:
                 raise BrowserReviewBusyError(
                     "A browser review is already running; wait for it or cancel it"
                 )
+            protected_job_ids = {
+                job.id
+                for job in self._jobs.values()
+                if job.status not in _TERMINAL_STATUSES
+            }
+            try:
+                protected_job_ids.update(
+                    await _read_incomplete_archive_job_ids()
+                )
+            except Exception:
+                # Losing the durable archive view must fail closed: cleanup is
+                # optional, while deleting the only retryable staging copy is
+                # irreversible. create_job_dir will return a quota error if
+                # the store is already full.
+                logger.exception(
+                    "Could not read protected Browser Review staging owners"
+                )
+            else:
+                self._artifact_store.cleanup_job_dirs(
+                    active_job_ids=protected_job_ids,
+                )
             job_id = uuid.uuid4().hex
             output_dir = self._artifact_store.create_job_dir(job_id)
             job = BrowserReviewJob(
@@ -552,6 +545,7 @@ class BrowserReviewJobManager:
                 api_key=api_key,
                 capture_only=job.capture_only,
                 progress_callback=on_progress,
+                artifact_store=self._artifact_store,
             )
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -589,15 +583,7 @@ class BrowserReviewJobManager:
                     assistant_report = snapshot.get("assistant_report")
                     if not job._read_report() and isinstance(assistant_report, str):
                         report_value = assistant_report.strip()
-                        self._ensure_artifact_capacity(
-                            job,
-                            "report.md",
-                            len(report_value.encode("utf-8")),
-                        )
-                        _write_private_text(
-                            job.options.output_dir / "report.md",
-                            report_value,
-                        )
+                        self._write_artifact_text(job, "report.md", report_value)
                     if status == "completed":
                         job.status = "completed"
                         job.stage = "completed"
@@ -676,16 +662,48 @@ class BrowserReviewJobManager:
                 job.error = _safe_error(exc)
                 job.completed_at = _now()
 
-    def _ensure_artifact_capacity(
-        self,
-        job: BrowserReviewJob,
-        name: str,
-        byte_size: int,
-    ) -> None:
+    @staticmethod
+    def _job_output_dir(job: BrowserReviewJob) -> Path:
         output_dir = job.options.output_dir
         if output_dir is None:
             raise RuntimeError("Browser Review job has no evidence directory")
-        self._artifact_store.ensure_job_capacity(output_dir, name, byte_size)
+        return output_dir
+
+    def _write_artifact_bytes(
+        self,
+        job: BrowserReviewJob,
+        name: str,
+        value: bytes,
+    ) -> None:
+        self._artifact_store.write_job_bytes(
+            self._job_output_dir(job),
+            name,
+            value,
+        )
+
+    def _write_artifact_text(
+        self,
+        job: BrowserReviewJob,
+        name: str,
+        value: str,
+    ) -> None:
+        self._artifact_store.write_job_text(
+            self._job_output_dir(job),
+            name,
+            value,
+        )
+
+    def _append_artifact_jsonl(
+        self,
+        job: BrowserReviewJob,
+        name: str,
+        value: dict[str, Any],
+    ) -> None:
+        self._artifact_store.append_job_jsonl(
+            self._job_output_dir(job),
+            name,
+            value,
+        )
 
     def _prune_terminal_locked(self) -> None:
         terminal_ids = [
@@ -891,22 +909,6 @@ def _decode_screenshot(value: Any) -> bytes | None:
     return screenshot
 
 
-def _write_private_bytes(path: Path, value: bytes) -> None:
-    path.write_bytes(value)
-    path.chmod(0o600)
-
-
-def _write_private_text(path: Path, value: str) -> None:
-    path.write_text(value, encoding="utf-8")
-    path.chmod(0o600)
-
-
-def _append_private_jsonl(path: Path, value: dict[str, Any]) -> None:
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
-    path.chmod(0o600)
-
-
 def _artifact_sort_key(name: str) -> tuple[int, str]:
     if name == "initial.png":
         return (0, name)
@@ -926,6 +928,26 @@ def _safe_error(exc: BaseException) -> str:
     if len(text) > 2_000:
         return text[:1_986] + "...<truncated>"
     return text
+
+
+async def _read_incomplete_archive_job_ids() -> set[str]:
+    """Return staging owners whose durable evidence is not yet complete."""
+
+    from backend.database import async_session
+    from backend.models.test_harness import TestHarnessAttempt
+    from backend.services.test_harness import ARCHIVE_COMPLETE
+
+    async with async_session() as db:
+        return set(
+            (
+                await db.execute(
+                    select(TestHarnessAttempt.browser_review_job_id).where(
+                        TestHarnessAttempt.archive_state != ARCHIVE_COMPLETE,
+                        TestHarnessAttempt.browser_review_job_id.is_not(None),
+                    )
+                )
+            ).scalars()
+        )
 
 
 browser_review_job_manager = BrowserReviewJobManager()

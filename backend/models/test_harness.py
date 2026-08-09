@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -34,6 +35,18 @@ class TestHarnessRun(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    owner_task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    owner_task_retry_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    owner_task_turn_generation: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    owner_task_status: Mapped[str | None] = mapped_column(
+        String(24), nullable=True
+    )
     project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     workspace_review_run_id: Mapped[str | None] = mapped_column(
@@ -237,11 +250,41 @@ class TestHarnessChildBinding(Base):
         String(32), nullable=True, unique=True, index=True
     )
     owner_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    owner_task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    owner_task_retry_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    owner_task_turn_generation: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    owner_task_status: Mapped[str | None] = mapped_column(
+        String(24), nullable=True
+    )
     child_task_id: Mapped[int] = mapped_column(
         Integer, nullable=False, unique=True, index=True
     )
+    child_task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     browser_review_job_id: Mapped[str] = mapped_column(
         String(32), nullable=False, unique=True, index=True
+    )
+    launch_profile_version: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    provider: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )
+    codex_service_tier: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )
+    task_mode: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    launch_config_digest: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
     )
     state: Mapped[str] = mapped_column(
         String(24), nullable=False, default="reserved", index=True

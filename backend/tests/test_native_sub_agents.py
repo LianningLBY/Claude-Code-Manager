@@ -95,18 +95,51 @@ def im(db_factory):
     return _make_im(db_factory)
 
 
+async def _create_native_task(
+    db_session,
+    *,
+    retry_count: int,
+    turn_generation: int,
+) -> Task:
+    task = Task(
+        title="native sub-agent owner",
+        description="exact logical turn",
+        status="executing",
+        retry_count=retry_count,
+        turn_generation=turn_generation,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
 @pytest.mark.asyncio
 async def test_spawn_progress_done_lifecycle(im, db_session):
+    task = await _create_native_task(
+        db_session,
+        retry_count=3,
+        turn_generation=17,
+    )
+    generation = {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
     info = {
         "tool_use_id": "toolu_abc",
         "kind": "native-monitor",
         "description": "watch smoke log",
     }
-    await im._upsert_native_sub_agent(7, "subagent_spawn", info)
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        info,
+        **generation,
+    )
 
     row = (
         await db_session.execute(
-            select(SubAgentSession).where(SubAgentSession.task_id == 7)
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
         )
     ).scalars().first()
     assert row is not None
@@ -115,23 +148,34 @@ async def test_spawn_progress_done_lifecycle(im, db_session):
     assert row.status == "running"
 
     # replay safety: duplicate spawn does not create a second row
-    await im._upsert_native_sub_agent(7, "subagent_spawn", info)
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        info,
+        **generation,
+    )
     rows = (
         await db_session.execute(
-            select(SubAgentSession).where(SubAgentSession.task_id == 7)
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
         )
     ).scalars().all()
     assert len(rows) == 1
 
     await im._upsert_native_sub_agent(
-        7, "subagent_progress", {**info, "summary": "step: deploy"}
+        task.id,
+        "subagent_progress",
+        {**info, "summary": "step: deploy"},
+        **generation,
     )
     await db_session.refresh(row)
     assert row.checks_done == 1
     assert "deploy" in row.last_summary
 
     await im._upsert_native_sub_agent(
-        7, "subagent_done", {**info, "timed_out": True}
+        task.id,
+        "subagent_done",
+        {**info, "timed_out": True},
+        **generation,
     )
     await db_session.refresh(row)
     assert row.status == "completed"
@@ -145,16 +189,30 @@ async def test_spawn_progress_done_lifecycle(im, db_session):
         "system_event",  # subagent_progress 同时写入聊天 system_event
         "sub_agent_session_status",
     ]
+    assert all(
+        event["task_retry_count"] == task.retry_count
+        and event["task_turn_generation"] == task.turn_generation
+        for _, event in im.broadcaster.events
+    )
 
 
 @pytest.mark.asyncio
 async def test_progress_for_unknown_agent_is_noop(im, db_session):
+    task = await _create_native_task(
+        db_session,
+        retry_count=4,
+        turn_generation=23,
+    )
     await im._upsert_native_sub_agent(
-        9, "subagent_progress", {"tool_use_id": "toolu_zzz", "summary": "x"}
+        task.id,
+        "subagent_progress",
+        {"tool_use_id": "toolu_zzz", "summary": "x"},
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
     )
     rows = (
         await db_session.execute(
-            select(SubAgentSession).where(SubAgentSession.task_id == 9)
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
         )
     ).scalars().all()
     assert rows == []
@@ -163,7 +221,18 @@ async def test_progress_for_unknown_agent_is_noop(im, db_session):
 
 @pytest.mark.asyncio
 async def test_missing_tool_use_id_ignored(im, db_session):
-    await im._upsert_native_sub_agent(9, "subagent_spawn", {"kind": "native-agent"})
+    task = await _create_native_task(
+        db_session,
+        retry_count=5,
+        turn_generation=29,
+    )
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        {"kind": "native-agent"},
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+    )
     rows = (
         await db_session.execute(select(SubAgentSession))
     ).scalars().all()
@@ -224,22 +293,44 @@ async def test_native_done_does_not_enqueue_auto_resume(im, db_session):
     fake_main.dispatcher = MagicMock()
     fake_main.dispatcher.enqueue_message = AsyncMock()
 
+    task = await _create_native_task(
+        db_session,
+        retry_count=6,
+        turn_generation=31,
+    )
+    generation = {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
     info = {
         "tool_use_id": "toolu_done",
         "kind": "native-agent",
         "description": "查文献",
     }
     with patch.dict(sys.modules, {"backend.main": fake_main}):
-        await im._upsert_native_sub_agent(11, "subagent_spawn", info)
         await im._upsert_native_sub_agent(
-            11, "subagent_done", {**info, "summary": "batch done"}
+            task.id,
+            "subagent_spawn",
+            info,
+            **generation,
+        )
+        await im._upsert_native_sub_agent(
+            task.id,
+            "subagent_done",
+            {**info, "summary": "batch done"},
+            **generation,
         )
 
     fake_main.dispatcher.enqueue_message.assert_not_called()
 
     row = (
         await db_session.execute(
-            select(SubAgentSession).where(SubAgentSession.task_id == 11)
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
         )
     ).scalars().first()
     assert row.status == "completed"
+    assert all(
+        event["task_retry_count"] == task.retry_count
+        and event["task_turn_generation"] == task.turn_generation
+        for _, event in im.broadcaster.events
+    )

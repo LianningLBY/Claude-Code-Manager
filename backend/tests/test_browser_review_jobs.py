@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+import backend.services.browser_review_jobs as browser_review_jobs_module
 from backend.services.browser_review import BrowserReviewOptions, BrowserReviewResult
 from backend.services.browser_review_jobs import (
     BrowserReviewBusyError,
@@ -13,6 +14,9 @@ from backend.services.browser_review_jobs import (
     _safe_tool_arguments,
 )
 from backend.services.test_harness_artifacts import TestHarnessArtifactStore as ArtifactStore
+from backend.services.test_harness_artifacts import (
+    TestHarnessArtifactQuotaError as ArtifactQuotaError,
+)
 
 
 def _artifact_store(tmp_path: Path) -> ArtifactStore:
@@ -323,6 +327,89 @@ async def test_terminal_job_history_is_bounded_without_deleting_staging(
     assert [job.id for job in await manager.list()] == [third.id, second.id]
     await manager.fail_start(third.id, RuntimeError("done"))
     await manager.shutdown()
+    assert first_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_reserve_reclaims_terminal_complete_staging_at_exact_quota(
+    monkeypatch,
+    tmp_path,
+):
+    store = ArtifactStore(
+        tmp_path / "artifacts",
+        max_file_bytes=8,
+        max_run_bytes=8,
+        max_task_bytes=8,
+        max_total_bytes=8,
+    )
+    manager = BrowserReviewJobManager(artifact_store=store)
+    options = BrowserReviewOptions(url="https://example.com")
+    first = await manager.prepare_agent(
+        options,
+        provider="codex",
+        codex_service_tier="default",
+    )
+    first_dir = first.options.output_dir
+    assert first_dir is not None
+    first_dir.joinpath("report.md").write_bytes(b"12345678")
+    await manager.fail_start(first.id, RuntimeError("terminal"))
+
+    async def no_incomplete_archives() -> set[str]:
+        return set()
+
+    monkeypatch.setattr(
+        browser_review_jobs_module,
+        "_read_incomplete_archive_job_ids",
+        no_incomplete_archives,
+    )
+    second = await manager.prepare_agent(
+        options,
+        provider="codex",
+        codex_service_tier="default",
+    )
+    assert not first_dir.exists()
+    assert second.options.output_dir is not None
+    assert second.options.output_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_reserve_preserves_incomplete_archive_and_returns_quota_error(
+    monkeypatch,
+    tmp_path,
+):
+    store = ArtifactStore(
+        tmp_path / "artifacts",
+        max_file_bytes=8,
+        max_run_bytes=8,
+        max_task_bytes=8,
+        max_total_bytes=8,
+    )
+    manager = BrowserReviewJobManager(artifact_store=store)
+    options = BrowserReviewOptions(url="https://example.com")
+    first = await manager.prepare_agent(
+        options,
+        provider="codex",
+        codex_service_tier="default",
+    )
+    first_dir = first.options.output_dir
+    assert first_dir is not None
+    first_dir.joinpath("report.md").write_bytes(b"12345678")
+    await manager.fail_start(first.id, RuntimeError("terminal"))
+
+    async def incomplete_archive() -> set[str]:
+        return {first.id}
+
+    monkeypatch.setattr(
+        browser_review_jobs_module,
+        "_read_incomplete_archive_job_ids",
+        incomplete_archive,
+    )
+    with pytest.raises(ArtifactQuotaError, match="storage is full"):
+        await manager.prepare_agent(
+            options,
+            provider="codex",
+            codex_service_tier="default",
+        )
     assert first_dir.exists()
 
 

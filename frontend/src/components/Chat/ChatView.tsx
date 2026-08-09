@@ -21,7 +21,7 @@ import type {
 import { DEFAULT_BROWSER_CHANNEL } from '../../config/browserReview';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { resolveAssetUrl } from '../../config/server';
-import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw } from '../icons';
+import { Send, ArrowLeft, Loader2, ChevronDown, ChevronRight, ChevronUp, Copy, Check, Paperclip, X, StopCircle, Pencil, ArrowDown, Star, ListPlus, ListTodo, Trash2, AlertCircle, Sparkles, GitBranch, Eye, RefreshCw, Pin } from '../icons';
 import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
@@ -29,6 +29,7 @@ import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/Task
 import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
 import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
 import { AttentionTag } from '../Tasks/AttentionTag';
+import { DeliveryRunPanel } from '../Tasks/DeliveryRunPanel';
 import { ExpandableText } from '../ExpandableText';
 import { copyToClipboard } from '../clipboard';
 import { formatMessageTime } from '../../config/timezone';
@@ -89,7 +90,13 @@ function workspaceReviewGoalFromToolInput(rawInput: unknown): string | null {
   }
 }
 
-interface LiveStreamCacheEntry {
+interface TaskTurnIdentity {
+  taskId: number;
+  retryCount: number;
+  turnGeneration: number;
+}
+
+interface LiveStreamCacheEntry extends TaskTurnIdentity {
   messages: ChatMessage[];
   updatedAt: number;
 }
@@ -100,6 +107,96 @@ const LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM = 200_000;
 const LIVE_STREAM_CACHE_TTL_MS = 4 * 60 * 60 * 1000;
 const liveStreamCache = new Map<number, LiveStreamCacheEntry>();
 
+function taskTurnIdentity(task: Pick<Task, 'id' | 'retry_count' | 'turn_generation'>): TaskTurnIdentity {
+  return {
+    taskId: task.id,
+    retryCount: task.retry_count,
+    turnGeneration: task.turn_generation,
+  };
+}
+
+function eventTaskTurnIdentity(
+  data: Record<string, unknown>,
+  taskId: number,
+): TaskTurnIdentity | null {
+  const retryCount = data.task_retry_count;
+  const turnGeneration = data.task_turn_generation;
+  const payloadTaskId = data.task_id;
+  if (
+    !Number.isInteger(retryCount)
+    || (retryCount as number) < 0
+    || !Number.isInteger(turnGeneration)
+    || (turnGeneration as number) < 0
+    || (
+      payloadTaskId !== undefined
+      && payloadTaskId !== null
+      && payloadTaskId !== taskId
+    )
+  ) {
+    return null;
+  }
+  return {
+    taskId,
+    retryCount: retryCount as number,
+    turnGeneration: turnGeneration as number,
+  };
+}
+
+function eventDeclaresTaskTurn(data: Record<string, unknown>): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(data, 'task_retry_count')
+    || Object.prototype.hasOwnProperty.call(data, 'task_turn_generation')
+  );
+}
+
+function sameTaskTurn(left: TaskTurnIdentity, right: TaskTurnIdentity): boolean {
+  return (
+    left.taskId === right.taskId
+    && left.retryCount === right.retryCount
+    && left.turnGeneration === right.turnGeneration
+  );
+}
+
+function compareTaskTurn(left: TaskTurnIdentity, right: TaskTurnIdentity): number {
+  if (left.taskId !== right.taskId) return 0;
+  if (left.turnGeneration !== right.turnGeneration) {
+    return left.turnGeneration - right.turnGeneration;
+  }
+  return left.retryCount - right.retryCount;
+}
+
+function messageMatchesTaskTurn(
+  message: ChatMessage,
+  identity: TaskTurnIdentity,
+): boolean {
+  return (
+    message.task_retry_count === identity.retryCount
+    && message.task_turn_generation === identity.turnGeneration
+  );
+}
+
+function messageMatchesStreamItem(
+  message: ChatMessage,
+  identity: TaskTurnIdentity,
+  itemId: string,
+): boolean {
+  return (
+    message.stream_item_id === itemId
+    && messageMatchesTaskTurn(message, identity)
+  );
+}
+
+function removeOtherTurnProvisionals(
+  messages: ChatMessage[],
+  identity: TaskTurnIdentity,
+): ChatMessage[] {
+  return messages.filter((message) => (
+    message.persisted
+    || !message.stream_item_id
+    || messageMatchesTaskTurn(message, identity)
+  ));
+}
+
 function taskHasActiveStream(task: Task): boolean {
   return (
     task.background_active === true
@@ -108,8 +205,11 @@ function taskHasActiveStream(task: Task): boolean {
   );
 }
 
-function clearLiveStreamCache(taskId: number): void {
-  liveStreamCache.delete(taskId);
+function clearLiveStreamCache(taskId: number, identity?: TaskTurnIdentity): void {
+  const cached = liveStreamCache.get(taskId);
+  if (!identity || (cached && sameTaskTurn(cached, identity))) {
+    liveStreamCache.delete(taskId);
+  }
 }
 
 function pruneLiveStreamCache(now: number): void {
@@ -125,12 +225,13 @@ function pruneLiveStreamCache(now: number): void {
   }
 }
 
-function syncLiveStreamCache(taskId: number, messages: ChatMessage[]): void {
+function syncLiveStreamCache(identity: TaskTurnIdentity, messages: ChatMessage[]): void {
   const liveMessages = messages
     .filter((message) => (
       !message.persisted
       && Boolean(message.stream_item_id)
       && (message.event_type === 'message' || message.event_type === 'thinking')
+      && messageMatchesTaskTurn(message, identity)
     ))
     .slice(-LIVE_STREAM_CACHE_MAX_ITEMS)
     .map((message) => ({
@@ -138,13 +239,19 @@ function syncLiveStreamCache(taskId: number, messages: ChatMessage[]): void {
       content: message.content?.slice(-LIVE_STREAM_CACHE_MAX_CHARS_PER_ITEM) ?? null,
     }));
   if (liveMessages.length === 0) {
-    clearLiveStreamCache(taskId);
+    clearLiveStreamCache(identity.taskId, identity);
     return;
   }
 
   const now = Date.now();
-  liveStreamCache.delete(taskId);
-  liveStreamCache.set(taskId, { messages: liveMessages, updatedAt: now });
+  const cached = liveStreamCache.get(identity.taskId);
+  if (cached && compareTaskTurn(identity, cached) < 0) return;
+  liveStreamCache.delete(identity.taskId);
+  liveStreamCache.set(identity.taskId, {
+    ...identity,
+    messages: liveMessages,
+    updatedAt: now,
+  });
   pruneLiveStreamCache(now);
 }
 
@@ -154,7 +261,13 @@ function restoreLiveStreamCache(task: Task): ChatMessage[] {
     return [];
   }
   pruneLiveStreamCache(Date.now());
-  return (liveStreamCache.get(task.id)?.messages || []).map((message) => ({ ...message }));
+  const cached = liveStreamCache.get(task.id);
+  const identity = taskTurnIdentity(task);
+  if (!cached || !sameTaskTurn(cached, identity)) {
+    clearLiveStreamCache(task.id);
+    return [];
+  }
+  return cached.messages.map((message) => ({ ...message }));
 }
 
 function loadStoredUploadResults(key: string): UploadResult[] {
@@ -288,7 +401,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return p?.name ?? null;
   }, [task.project_id, projects]);
   const providerLabel = task.provider === 'codex' ? 'Codex' : 'Claude';
+  const deliveryReadOnly = task.mode === 'delivery_loop' || task.delivery_run_id != null;
   const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
+  const activeTaskTurnRef = useRef<TaskTurnIdentity>(taskTurnIdentity(task));
   const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
   const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
   const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
@@ -388,6 +503,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [starred, setStarred] = useState(task.starred);
 
+  useEffect(() => {
+    const incoming = taskTurnIdentity(task);
+    const current = activeTaskTurnRef.current;
+    if (incoming.taskId !== current.taskId) {
+      clearLiveStreamCache(current.taskId, current);
+      activeTaskTurnRef.current = incoming;
+      setMessages(restoreLiveStreamCache(task));
+      return;
+    }
+    if (sameTaskTurn(incoming, current) || compareTaskTurn(incoming, current) < 0) {
+      return;
+    }
+
+    clearLiveStreamCache(task.id, current);
+    activeTaskTurnRef.current = incoming;
+    setMessages((previous) => {
+      const next = removeOtherTurnProvisionals(previous, incoming);
+      syncLiveStreamCache(incoming, next);
+      return next;
+    });
+  }, [task.id, task.retry_count, task.turn_generation]);
+
   useVisualViewportBounds(chatRootRef, !inline);
 
   // Temp model override (one-shot per message, not persisted to the task)
@@ -404,7 +541,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
-  const canInject = task.worker_id == null && task.shared_from_id == null && (
+  const canInject = !deliveryReadOnly && task.worker_id == null && task.shared_from_id == null && (
     task.provider === 'codex' ? codexAppServerEnabled : ptyMode
   );
   const injectTransport = task.provider === 'codex' ? 'Codex turn/steer' : 'Claude PTY';
@@ -725,9 +862,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [distillInstruction, setDistillInstruction] = useState('');
   const effectiveStatus = localStatus || task.status;
   const backgroundActive = localBackgroundActive ?? task.background_active === true;
+  const isWaitingCapability = effectiveStatus === 'waiting_capability';
+  const canInjectNow = canInject && !isWaitingCapability;
+  const effectiveStatusRef = useRef(effectiveStatus);
+  effectiveStatusRef.current = effectiveStatus;
+  useEffect(() => {
+    if (isWaitingCapability && injectMode) setInjectMode(false);
+  }, [injectMode, isWaitingCapability]);
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
-  const isProcessing = sending || backgroundActive || ['in_progress', 'executing'].includes(effectiveStatus);
+  const isProcessing = sending || backgroundActive || ['in_progress', 'executing', 'waiting_capability'].includes(effectiveStatus);
   const workspaceReviewCanBeConfigured = (
     workspaceReviewCapability?.available === true
     || workspaceReviewCapability?.suggested_config != null
@@ -814,10 +958,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }, 15_000);
     return () => window.clearTimeout(timer);
   }, [onTaskUpdated, stillRunning]);
-  const planAttentionCount = versionedPlans.filter((plan) =>
-    ['waiting_user', 'awaiting_review', 'planner', 'reviewer', 'queued', 'running'].includes(plan.display_state)
-    || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
-  ).length;
+  const planAttentionCount = versionedPlans.filter((plan) => (
+    plan.display_state === 'waiting_user'
+    || (!plan.read_only && (
+      ['awaiting_review', 'planner', 'reviewer', 'queued', 'running', 'cancelling'].includes(plan.display_state)
+      || (plan.display_state === 'approved' && Boolean(plan.current_version && !plan.current_version.applied))
+    ))
+  )).length;
   const [hasMoreHistory, setHasMoreHistory] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const historyCursorRef = useRef<{
@@ -1080,7 +1227,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // triggers autoDequeue in the same cycle as setSending(false) and the
     // ref still reads true → skips the queued message.
     const timer = setTimeout(() => {
-      if (sendingRef.current || backgroundActiveRef.current) return;
+      if (
+        sendingRef.current
+        || backgroundActiveRef.current
+        || ['in_progress', 'executing', 'waiting_capability'].includes(
+          effectiveStatusRef.current,
+        )
+      ) return;
       const queue = messageQueueRef.current;
       if (queue.length > 0) {
         const next = queue[0];
@@ -1109,6 +1262,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   // Handle real-time WebSocket messages via callback (not state) to avoid
   // losing messages when React batches rapid state updates.
+  const observeTaskTurn = useCallback((incoming: TaskTurnIdentity): number => {
+    const current = activeTaskTurnRef.current;
+    if (incoming.taskId !== current.taskId) return -1;
+    const comparison = compareTaskTurn(incoming, current);
+    if (comparison > 0) {
+      clearLiveStreamCache(current.taskId, current);
+      activeTaskTurnRef.current = incoming;
+    }
+    return comparison;
+  }, []);
+
   const handleWsMessage = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
     if (
@@ -1146,6 +1310,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       (msg.channel === `task:${task.id}` && (msg.data?.event === 'status_change' || msg.data?.event_type === 'status_change'))
     );
     if (isStatusChange) {
+      const statusIdentity = eventTaskTurnIdentity(msg.data!, task.id);
+      if (
+        (statusIdentity && observeTaskTurn(statusIdentity) < 0)
+        || (!statusIdentity && eventDeclaresTaskTurn(msg.data!))
+      ) {
+        return;
+      }
       const newStatus = (msg.data!.new_status as string) || '';
       const nextBackground = msg.data!.background_active;
       if (typeof msg.data!.background_active === 'boolean') {
@@ -1188,6 +1359,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )
     );
     if (isBackgroundActivity) {
+      const backgroundIdentity = eventTaskTurnIdentity(msg.data!, task.id);
+      if (
+        (backgroundIdentity && observeTaskTurn(backgroundIdentity) < 0)
+        || (!backgroundIdentity && eventDeclaresTaskTurn(msg.data!))
+      ) {
+        return;
+      }
       if (typeof msg.data!.background_active === 'boolean') {
         lastWsBackgroundAt.current = Date.now();
         setLocalBackgroundActive(msg.data!.background_active);
@@ -1409,10 +1587,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
 
     if (eventType === 'process_exit') {
-      clearLiveStreamCache(task.id);
+      const exitIdentity = eventTaskTurnIdentity(msg.data, task.id);
+      if (!exitIdentity || observeTaskTurn(exitIdentity) < 0) return;
+      clearLiveStreamCache(task.id, exitIdentity);
       // Small delay so any final output messages queued just before
       // process_exit are rendered before the "thinking" indicator hides.
       setTimeout(() => {
+        // A newer logical turn may start during this deliberate delay. The
+        // old exit may refresh history, but it must not stop the new spinner
+        // or dequeue another prompt into that active native session.
+        if (!sameTaskTurn(exitIdentity, activeTaskTurnRef.current)) return;
         // A foreground process_exit is not terminal while an exact native
         // background epoch is still active. Its false marker will drive the
         // normal terminal effect after the final autonomous output arrives.
@@ -1440,6 +1624,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     // Track context window usage
     if (eventType === 'context_usage' && msg.data) {
+      const usageIdentity = eventTaskTurnIdentity(msg.data, task.id);
+      if (
+        (usageIdentity && observeTaskTurn(usageIdentity) < 0)
+        || (!usageIdentity && eventDeclaresTaskTurn(msg.data))
+      ) {
+        return;
+      }
       setContextUsage((prev) => ({
         input_tokens: (msg.data!.input_tokens as number) || 0,
         cache_read_input_tokens: (msg.data!.cache_read_input_tokens as number) || 0,
@@ -1549,23 +1740,38 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (eventType === 'message_delta' || eventType === 'thinking_delta') {
       const delta = (msg.data.content as string) || '';
       const itemId = (msg.data.item_id as string) || null;
-      if (!delta || !itemId) return;
+      const identity = eventTaskTurnIdentity(msg.data, task.id);
+      if (!delta || !itemId || !identity) return;
+      const turnComparison = observeTaskTurn(identity);
+      if (turnComparison < 0) return;
       const renderedType = eventType === 'message_delta' ? 'message' : 'thinking';
+      const nativeTurnId = typeof msg.data.native_turn_id === 'string'
+        ? msg.data.native_turn_id
+        : null;
       setMessages((prev) => {
-        const index = prev.findIndex((entry) => entry.stream_item_id === itemId);
+        const current = turnComparison > 0
+          ? removeOtherTurnProvisionals(prev, identity)
+          : prev;
+        const index = current.findIndex((entry) => (
+          messageMatchesStreamItem(entry, identity, itemId)
+        ));
         if (index >= 0) {
-          const next = [...prev];
+          const next = [...current];
           next[index] = { ...next[index], content: `${next[index].content || ''}${delta}` };
-          syncLiveStreamCache(task.id, next);
+          syncLiveStreamCache(identity, next);
           return next;
         }
-        const next = [...prev, {
+        const next = [...current, {
           id: Date.now() + Math.random(), role: 'assistant', event_type: renderedType,
           content: delta, tool_name: null, tool_input: null, tool_output: null,
           is_error: false, loop_iteration: null, timestamp: new Date().toISOString(),
           image_urls: null, attachments: null, stream_item_id: itemId,
+          task_retry_count: identity.retryCount,
+          task_turn_generation: identity.turnGeneration,
+          native_turn_id: nativeTurnId,
+          turn_id: nativeTurnId,
         }];
-        syncLiveStreamCache(task.id, next);
+        syncLiveStreamCache(identity, next);
         return next;
       });
       return;
@@ -1593,6 +1799,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const persistedId = Number(msg.data.id);
     const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
     const itemId = (msg.data.item_id as string) || null;
+    const identity = eventTaskTurnIdentity(msg.data, task.id);
+    let turnComparison = 0;
+    if (itemId) {
+      if (!identity && !isPersisted) return;
+      if (identity) {
+        turnComparison = observeTaskTurn(identity);
+        if (turnComparison < 0 && !isPersisted) return;
+      }
+    }
+    const nativeTurnId = typeof msg.data.native_turn_id === 'string'
+      ? msg.data.native_turn_id
+      : typeof msg.data.turn_id === 'string'
+        ? msg.data.turn_id
+        : null;
     const entry: ChatMessage = {
       id: isPersisted ? persistedId : Date.now() + Math.random(),
       role: (msg.data.role as string) || 'assistant',
@@ -1607,36 +1827,45 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       image_urls: (msg.data.image_urls as string[]) || null,
       attachments: (msg.data.attachments as FileAttachment[]) || null,
       source: (msg.data.source as string) || null,
+      task_retry_count: identity?.retryCount ?? null,
+      task_turn_generation: identity?.turnGeneration ?? null,
+      native_turn_id: nativeTurnId,
       item_id: itemId,
       stream_item_id: itemId,
+      turn_id: nativeTurnId,
       native_item_type: (msg.data.native_item_type as string) || null,
       native_item_status: (msg.data.native_item_status as string) || null,
       pty_cold_start: Boolean(msg.data.pty_cold_start),
       persisted: isPersisted,
     };
     setMessages((prev) => {
-      const current = isPersisted
-        ? prev.filter((candidate) => !candidate.pty_cold_start)
+      const generationCurrent = turnComparison > 0 && identity
+        ? removeOtherTurnProvisionals(prev, identity)
         : prev;
+      const current = isPersisted
+        ? generationCurrent.filter((candidate) => !candidate.pty_cold_start)
+        : generationCurrent;
       if (isPersisted) {
         const next = mergeChatHistory([entry], current);
-        syncLiveStreamCache(task.id, next);
+        syncLiveStreamCache(activeTaskTurnRef.current, next);
         return next;
       }
-      if (itemId) {
-        const index = current.findIndex((candidate) => candidate.stream_item_id === itemId);
+      if (itemId && identity) {
+        const index = current.findIndex((candidate) => (
+          messageMatchesStreamItem(candidate, identity, itemId)
+        ));
         if (index >= 0) {
           const next = [...current];
           next[index] = entry;
-          syncLiveStreamCache(task.id, next);
+          syncLiveStreamCache(identity, next);
           return next;
         }
       }
       const next = [...current, entry];
-      syncLiveStreamCache(task.id, next);
+      syncLiveStreamCache(activeTaskTurnRef.current, next);
       return next;
     });
-  }, [markAskUserResolved, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
+  }, [markAskUserResolved, observeTaskTurn, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -1695,7 +1924,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const snapshot = cards.length ? [...filtered, ...cards] : filtered;
       setMessages((current) => {
         const next = mergeChatHistory(snapshot, current);
-        syncLiveStreamCache(task.id, next);
+        syncLiveStreamCache(activeTaskTurnRef.current, next);
         return next;
       });
     }).catch(() => {}).finally(() => setHistoryLoading(false));
@@ -1911,11 +2140,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         addChatFiles(files, (msg) => setDropError(msg));
       }
     },
-    disabled: injecting || (!task.session_id && !task.shared_from_id),
+    disabled: deliveryReadOnly || injecting || (!task.session_id && !task.shared_from_id),
   });
 
   useEffect(() => {
-    if (injecting || (!task.session_id && !task.shared_from_id)) return;
+    if (deliveryReadOnly || injecting || (!task.session_id && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
       if (injectingRef.current) return;
       const target = e.target;
@@ -1940,6 +2169,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     task.session_id,
     task.shared_from_id,
     addChatFiles,
+    deliveryReadOnly,
     injecting,
   ]);
 
@@ -2081,7 +2311,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       return;
     }
     // 注入模式：文本和已上传附件直达当前 turn，不新开 turn、不排队。
-    if (injectMode && canInject && !fromQueue) {
+    if (injectMode && canInjectNow && !fromQueue) {
       if (!isProcessing) {
         setError('注入仅在 turn 正在运行时可用；空闲时请关闭注入模式发送普通消息。');
         return;
@@ -2432,84 +2662,97 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       {/* Header — two rows */}
       <div className="px-3 sm:px-4 py-1.5 pt-[max(0.375rem,env(safe-area-inset-top))] border-b border-gray-800 bg-gray-900">
         {/* Row 1: back + task info + action buttons */}
-        <div className="flex items-center gap-2 sm:gap-3">
-          <button onClick={onBack} className="text-gray-400 hover:text-foreground shrink-0">
-            <ArrowLeft size={20} />
-          </button>
-          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-            <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
-            {task.mode === 'plan' ? (
-              <PlanPipelineBadge task={task} />
-            ) : (
-              <>
-                <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
-                  {providerLabel}
+        <div
+          data-testid="chat-header-primary"
+          className="flex items-center gap-2 sm:gap-3"
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-2 sm:gap-3">
+            <button onClick={onBack} className="shrink-0 text-gray-400 hover:text-foreground">
+              <ArrowLeft size={20} />
+            </button>
+            <div
+              data-testid="chat-task-badges"
+              className="flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-hidden"
+            >
+              <p className="text-foreground font-medium text-sm whitespace-nowrap">Task #{task.id}</p>
+              {task.mode === 'plan' ? (
+                <PlanPipelineBadge task={task} />
+              ) : (
+                <>
+                  <span className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${task.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
+                    {providerLabel}
+                  </span>
+                  <FastModeBadge task={task} />
+                </>
+              )}
+              {backgroundActive && (
+                <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
+                  后台运行中
                 </span>
-                <FastModeBadge task={task} />
-              </>
-            )}
-            {backgroundActive && (
-              <span className="text-xs bg-teal-600/25 text-teal-300 px-1.5 rounded font-medium whitespace-nowrap animate-pulse">
-                后台运行中
-              </span>
-            )}
-            {showFrontendReviewGoal && (
-              <span
-                className="whitespace-nowrap rounded bg-indigo-500/20 px-1.5 text-xs font-medium text-indigo-300"
-                title={frontendReviewGoalProgress.lastReason || '模型将自动判断是否继续下一轮'}
-              >
-                Goal 审查 · 第 {Math.max(1, frontendReviewGoalProgress.turn + (frontendReviewGoalProgress.active ? 1 : 0))} 轮 · 自动
-              </span>
-            )}
-            {task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
-              <span
-                data-testid="codex-main-mcp-status"
-                className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
-                  codexMainMcpEnabled
-                    ? 'bg-teal-600/25 text-teal-300'
-                    : 'bg-gray-700 text-gray-400'
-                }`}
-                title={
-                  codexMainMcpEnabled
-                    ? 'Codex 主任务 MCP 已启用'
-                    : 'Codex 主任务 MCP 已关闭'
-                }
-              >
-                MCP {codexMainMcpEnabled ? '已启用' : '已关闭'}
-              </span>
-            )}
-            {projectName && (
-              <span className="text-xs bg-emerald-600/30 text-emerald-300 px-1.5 rounded font-medium whitespace-nowrap truncate">{projectName}</span>
-            )}
+              )}
+              {showFrontendReviewGoal && (
+                <span
+                  className="whitespace-nowrap rounded bg-indigo-500/20 px-1.5 text-xs font-medium text-indigo-300"
+                  title={frontendReviewGoalProgress.lastReason || '模型将自动判断是否继续下一轮'}
+                >
+                  Goal 审查 · 第 {Math.max(1, frontendReviewGoalProgress.turn + (frontendReviewGoalProgress.active ? 1 : 0))} 轮 · 自动
+                </span>
+              )}
+              {!deliveryReadOnly && task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
+                <span
+                  data-testid="codex-main-mcp-status"
+                  className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
+                    codexMainMcpEnabled
+                      ? 'bg-teal-600/25 text-teal-300'
+                      : 'bg-gray-700 text-gray-400'
+                  }`}
+                  title={
+                    codexMainMcpEnabled
+                      ? 'Codex 主任务 MCP 已启用'
+                      : 'Codex 主任务 MCP 已关闭'
+                  }
+                >
+                  MCP <span className="hidden sm:inline">{codexMainMcpEnabled ? '已启用' : '已关闭'}</span>
+                </span>
+              )}
+              {projectName && (
+                <span className="min-w-0 flex-1 truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300">{projectName}</span>
+              )}
+            </div>
           </div>
-          <div className="flex items-center gap-1 shrink-0">
+          <div
+            data-testid="chat-header-actions"
+            className="flex shrink-0 items-center gap-0.5 sm:gap-1"
+          >
             <SubAgentIndicator
               taskId={task.id}
               count={monitorCount}
               active={monitorCount > 0}
               onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
             />
-            <button
-              type="button"
-              onClick={() => setShowBrowserReviewPanel((value) => !value)}
-              className={`relative rounded p-1.5 transition-colors ${
-                showBrowserReviewPanel
-                  ? 'bg-indigo-500/15 text-indigo-300'
-                  : 'text-gray-600 hover:text-indigo-400'
-              }`}
-              title={browserReviewDisplayMode === 'floating' ? '打开前端测试浮窗' : '打开前端测试栏'}
-              aria-label="Toggle Frontend Review panel"
-            >
-              <Eye size={18} />
-              <span
-                className={`absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full ${browserReviewAvailable ? 'bg-emerald-400' : 'bg-gray-500'}`}
-                aria-hidden="true"
-              />
-            </button>
-            {task.session_id && task.shared_from_id == null && (
+            {!deliveryReadOnly && (
+              <button
+                type="button"
+                onClick={() => setShowBrowserReviewPanel((value) => !value)}
+                className={`relative rounded p-1.5 transition-colors ${
+                  showBrowserReviewPanel
+                    ? 'bg-indigo-500/15 text-indigo-300'
+                    : 'text-gray-600 hover:text-indigo-400'
+                }`}
+                title={browserReviewDisplayMode === 'floating' ? '打开前端测试浮窗' : '打开前端测试栏'}
+                aria-label="Toggle Frontend Review panel"
+              >
+                <Eye size={18} />
+                <span
+                  className={`absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full ${browserReviewAvailable ? 'bg-emerald-400' : 'bg-gray-500'}`}
+                  aria-hidden="true"
+                />
+              </button>
+            )}
+            {!deliveryReadOnly && task.session_id && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
-                className={`flex items-center gap-1.5 rounded px-2 py-1 text-xs font-medium transition-colors ${
+                className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs font-medium transition-colors sm:px-2 ${
                   plansOpen
                     ? 'bg-indigo-500/15 text-indigo-300'
                     : 'text-gray-500 hover:bg-gray-800 hover:text-indigo-300'
@@ -2518,7 +2761,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 aria-label="Plans"
               >
                 <ListTodo size={16} />
-                <span>Plans</span>
+                <span className="hidden sm:inline">Plans</span>
                 {planAttentionCount > 0 && (
                   <span className="min-w-4 rounded-full bg-indigo-500 px-1 text-center text-[9px] font-bold leading-4 text-white">
                     {planAttentionCount}
@@ -2526,22 +2769,24 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 )}
               </button>
             )}
-            {task.mode !== 'plan' && (
+            {!deliveryReadOnly && task.mode !== 'plan' && (
               <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
             )}
-            <button
-              onClick={() => {
-                setDistillOpen(true);
-                setDistillResult(null);
-                setDistillError(null);
-                setDistilling(false);
-              }}
-              disabled={messages.length === 0}
-              className="p-1.5 transition-colors text-gray-600 hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed"
-              title="Distill skill from conversation"
-            >
-              <Sparkles size={18} />
-            </button>
+            {!deliveryReadOnly && (
+              <button
+                onClick={() => {
+                  setDistillOpen(true);
+                  setDistillResult(null);
+                  setDistillError(null);
+                  setDistilling(false);
+                }}
+                disabled={messages.length === 0}
+                className="p-1.5 transition-colors text-gray-600 hover:text-purple-400 disabled:opacity-30 disabled:cursor-not-allowed"
+                title="Distill skill from conversation"
+              >
+                <Sparkles size={18} />
+              </button>
+            )}
             <button
               onClick={handleStar}
               className={`p-1.5 transition-colors ${starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
@@ -2549,7 +2794,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Star size={18} fill={starred ? 'currentColor' : 'none'} />
             </button>
-            {(isProcessing || stillRunning) && (
+            {!deliveryReadOnly && (isProcessing || stillRunning) && (
               <button
                 onClick={async () => {
                   setInterrupting(true);
@@ -2604,7 +2849,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   finally { setInterrupting(false); }
                 }}
                 disabled={interrupting}
-                className="flex items-center gap-1 px-2.5 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded hover:bg-red-500/10 disabled:opacity-50"
+                className="flex items-center gap-1 px-1.5 py-1.5 text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded hover:bg-red-500/10 disabled:opacity-50 sm:px-2.5"
                 title="Interrupt session"
               >
                 <StopCircle size={14} />
@@ -2634,29 +2879,43 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   onClick={() => setTitleExpanded(!titleExpanded)}
                   className="text-[10px] text-gray-600 hover:text-gray-300 shrink-0 whitespace-nowrap"
                 >{titleExpanded ? 'less' : 'more'}</button>
-                <button
-                  onClick={() => { setTitleDraft(task.title || ''); setEditingTitle(true); }}
-                  className="text-gray-600 hover:text-gray-400 opacity-0 group-hover/title:opacity-100 transition-opacity shrink-0"
-                  title="Edit title"
-                >
-                  <Pencil size={10} />
-                </button>
+                {!deliveryReadOnly && (
+                  <button
+                    onClick={() => { setTitleDraft(task.title || ''); setEditingTitle(true); }}
+                    className="text-gray-600 hover:text-gray-400 opacity-0 group-hover/title:opacity-100 transition-opacity shrink-0"
+                    title="Edit title"
+                  >
+                    <Pencil size={10} />
+                  </button>
+                )}
               </div>
             )}
           </div>}
-          <AttentionTag
-            taskId={task.id}
-            value={task.attention_tag}
-            editing={editingAttentionTag}
-            onEdit={() => {
-              setEditingTitle(false);
-              setEditingAttentionTag(true);
-            }}
-            onCancel={() => setEditingAttentionTag(false)}
-            onSaved={(updated) => onTaskUpdated?.(updated)}
-            showAddButton
-            className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
-          />
+          {deliveryReadOnly ? (
+            task.attention_tag ? (
+              <span
+                className="inline-flex min-w-0 max-w-[45vw] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300 sm:max-w-xs"
+                title="Delivery-owned Task attention tag"
+              >
+                <Pin size={11} className="shrink-0" />
+                <span className="truncate">{task.attention_tag}</span>
+              </span>
+            ) : null
+          ) : (
+            <AttentionTag
+              taskId={task.id}
+              value={task.attention_tag}
+              editing={editingAttentionTag}
+              onEdit={() => {
+                setEditingTitle(false);
+                setEditingAttentionTag(true);
+              }}
+              onCancel={() => setEditingAttentionTag(false)}
+              onSaved={(updated) => onTaskUpdated?.(updated)}
+              showAddButton
+              className={editingAttentionTag ? 'flex-1' : 'max-w-[45vw] sm:max-w-xs'}
+            />
+          )}
           {contextUsage && (
             <span className="flex items-center shrink-0">
               <ContextUsageIndicator usage={contextUsage} />
@@ -2664,6 +2923,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           )}
         </div>
       </div>
+
+      {deliveryReadOnly && task.delivery_run_id != null && (
+        <div className="border-b border-gray-800 bg-gray-950 px-3 py-2 sm:px-4">
+          <DeliveryRunPanel runId={task.delivery_run_id} />
+        </div>
+      )}
 
       {task.metadata_?.forked_from_task_id && (
         <div className="px-4 py-1.5 border-b border-indigo-500/20 bg-indigo-500/5 text-xs text-indigo-300 flex items-center gap-1.5">
@@ -3055,6 +3320,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   审查报告不会结束本轮；Agent 会继续处理必要修改、构建测试和修改后复查。
                 </div>
               </div>
+            ) : isWaitingCapability ? (
+              <span>Waiting for requested capability...</span>
             ) : (
               <span>{providerLabel} is thinking...</span>
             )}
@@ -3076,7 +3343,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )}
 
       {/* Message Queue Display */}
-      {messageQueue.length > 0 && (
+      {!deliveryReadOnly && messageQueue.length > 0 && (
         <div className="border-t border-gray-800 bg-gray-900/50 px-4 py-2">
           <div className="max-w-3xl mx-auto">
             <div className="flex items-center justify-between mb-1.5">
@@ -3163,6 +3430,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )}
 
       {/* Input */}
+      {deliveryReadOnly ? (
+        <div
+          className="border-t border-indigo-500/20 bg-indigo-500/5 px-4 py-3 text-center text-xs text-indigo-200"
+          data-testid="delivery-read-only"
+        >
+          Delivery Run #{task.delivery_run_id ?? '?'} owns this Developer Task. Its conversation is read-only; workflow controls and PR status are shown above.
+        </div>
+      ) : (
       <div className="border-t border-gray-800 bg-gray-900 p-3">
         <div className="flex flex-col gap-2 max-w-3xl mx-auto">
           {selectedPlanVersionIds.length > 0 && (
@@ -3286,7 +3561,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Paperclip size={18} />
             </button>
-            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInject)} />
+            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInjectNow)} />
             <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)} />
             {task.worker_id == null && task.shared_from_id == null && (
               <button
@@ -3390,7 +3665,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               )}
             </div>
             {/* Live-turn injection: Claude PTY or Codex app-server steering. */}
-            {canInject && (
+            {canInjectNow && (
               <button
                 type="button"
                 onClick={() => setInjectMode((v) => !v)}
@@ -3434,7 +3709,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
           </div>
           {/* Row 2: full-width input */}
-          {injectMode && canInject && (
+          {injectMode && canInjectNow && (
             <div className="text-[10px] leading-relaxed text-teal-300/80">
               文本、图片和文件会注入当前 turn；只有服务器明确确认成功后才会清空输入和附件。
             </div>
@@ -3460,7 +3735,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               placeholder={
                 !task.session_id && !task.shared_from_id
                   ? 'Run the task first to start a session...'
-                  : injectMode && canInject
+                  : injectMode && canInjectNow
                     ? '注入模式：消息将直接注入运行中的 turn...'
                     : frontendReviewComposerMode
                       ? '描述这次要循环审查的页面、URL、流程或前端改动...'
@@ -3477,27 +3752,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!task.session_id && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInject && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!task.session_id && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
-                : injectMode && canInject
+                : injectMode && canInjectNow
                 ? (isProcessing ? '注入到运行中的 turn (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
                 : frontendReviewComposerMode ? '启动循环审查 (Ctrl+Enter)'
                 : workspaceReviewComposerMode ? '启动单次审查 (Ctrl+Enter)'
                 : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
-                injectMode && canInject ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
+                injectMode && canInjectNow ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : frontendReviewComposerMode ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
                 : workspaceReviewComposerMode ? 'bg-cyan-600 hover:bg-cyan-500 shadow-cyan-600/25'
                 : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {injectMode && canInject ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+              {injectMode && canInjectNow ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
             </button>
           </div>
           </div>
         </div>
       </div>
+      )}
         </div>
         <BrowserReviewPanel
           taskId={task.id}

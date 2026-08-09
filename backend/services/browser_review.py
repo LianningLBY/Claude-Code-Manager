@@ -14,7 +14,7 @@ import tempfile
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable
 import httpx
 
 from backend.services.browser_network import (
@@ -23,6 +23,9 @@ from backend.services.browser_network import (
     PublicEgressProxy,
     canonical_target_origin,
 )
+
+if TYPE_CHECKING:
+    from backend.services.test_harness_artifacts import TestHarnessArtifactStore
 
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
@@ -561,6 +564,7 @@ async def run_browser_review(
     api_key: str | None = None,
     capture_only: bool = False,
     progress_callback: BrowserReviewProgressCallback | None = None,
+    artifact_store: TestHarnessArtifactStore | None = None,
 ) -> BrowserReviewResult:
     """Run the complete browser review loop and persist its evidence artifacts."""
 
@@ -586,7 +590,12 @@ async def run_browser_review(
         )
         await page.wait_for_timeout(750)
         initial_screenshot = await page.screenshot(type="png", full_page=False)
-        _write_private_bytes(output_dir / "initial.png", initial_screenshot)
+        _write_artifact_bytes(
+            output_dir,
+            "initial.png",
+            initial_screenshot,
+            artifact_store=artifact_store,
+        )
         _emit_progress(
             progress_callback,
             stage="browser_ready",
@@ -643,13 +652,17 @@ async def run_browser_review(
                     )
                     action_count += len(actions)
                     _append_action_log(
-                        output_dir / "actions.jsonl",
+                        output_dir,
                         step=steps + 1,
                         actions=actions,
+                        artifact_store=artifact_store,
                     )
                     screenshot = await page.screenshot(type="png")
-                    _write_private_bytes(
-                        output_dir / f"step-{steps + 1:02d}.png", screenshot
+                    _write_artifact_bytes(
+                        output_dir,
+                        f"step-{steps + 1:02d}.png",
+                        screenshot,
+                        artifact_store=artifact_store,
                     )
                     _emit_progress(
                         progress_callback,
@@ -674,10 +687,17 @@ async def run_browser_review(
     screenshot_path = output_dir / "final.png"
     telemetry_path = output_dir / "telemetry.json"
     report_path = output_dir / "report.md"
-    _write_private_bytes(screenshot_path, final_screenshot)
-    _write_private_text(
-        telemetry_path,
+    _write_artifact_bytes(
+        output_dir,
+        "final.png",
+        final_screenshot,
+        artifact_store=artifact_store,
+    )
+    _write_artifact_text(
+        output_dir,
+        "telemetry.json",
         json.dumps(telemetry.snapshot(), ensure_ascii=False, indent=2),
+        artifact_store=artifact_store,
     )
 
     if capture_only:
@@ -690,12 +710,15 @@ async def run_browser_review(
         model_report = extract_output_text(final_response) or (
             "The model returned no final text report. Inspect `response.json` for details."
         )
-        _write_private_text(
-            output_dir / "response.json",
+        _write_artifact_text(
+            output_dir,
+            "response.json",
             json.dumps(final_response, ensure_ascii=False, indent=2),
+            artifact_store=artifact_store,
         )
-    _write_private_text(
-        report_path,
+    _write_artifact_text(
+        output_dir,
+        "report.md",
         _render_report(
             options=options,
             model_report=model_report,
@@ -704,6 +727,7 @@ async def run_browser_review(
             actions=action_count,
             capture_only=capture_only,
         ),
+        artifact_store=artifact_store,
     )
     _emit_progress(
         progress_callback,
@@ -952,14 +976,47 @@ def _write_private_text(path: Path, value: str) -> None:
     path.chmod(0o600)
 
 
+def _write_artifact_bytes(
+    output_dir: Path,
+    name: str,
+    value: bytes,
+    *,
+    artifact_store: TestHarnessArtifactStore | None,
+) -> None:
+    if artifact_store is not None:
+        artifact_store.write_job_bytes(output_dir, name, value)
+        return
+    _write_private_bytes(output_dir / name, value)
+
+
+def _write_artifact_text(
+    output_dir: Path,
+    name: str,
+    value: str,
+    *,
+    artifact_store: TestHarnessArtifactStore | None,
+) -> None:
+    if artifact_store is not None:
+        artifact_store.write_job_text(output_dir, name, value)
+        return
+    _write_private_text(output_dir / name, value)
+
+
 def _append_action_log(
-    path: Path, *, step: int, actions: list[dict[str, Any]]
+    output_dir: Path,
+    *,
+    step: int,
+    actions: list[dict[str, Any]],
+    artifact_store: TestHarnessArtifactStore | None,
 ) -> None:
     sanitized = _sanitize_actions(actions)
+    value = {"step": step, "actions": sanitized}
+    if artifact_store is not None:
+        artifact_store.append_job_jsonl(output_dir, "actions.jsonl", value)
+        return
+    path = output_dir / "actions.jsonl"
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(
-            json.dumps({"step": step, "actions": sanitized}, ensure_ascii=False) + "\n"
-        )
+        handle.write(json.dumps(value, ensure_ascii=False) + "\n")
     path.chmod(0o600)
 
 

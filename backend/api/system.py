@@ -22,6 +22,9 @@ from backend.services.claude_models import (
     CLAUDE_MODEL_EFFORTS,
 )
 from backend.services.git_info import git_head_commit
+from backend.services.legacy_plan_execution import (
+    LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION,
+)
 from backend.services.pr_review_runtime import (
     PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
     PR_REVIEW_TERMINAL_CHAT_VERSION,
@@ -87,7 +90,29 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "codex_service_tier_options": list(CODEX_SERVICE_TIERS),
         "codex_model_service_tiers": CODEX_MODEL_SERVICE_TIERS,
         "versioned_plan_worker_protocol": 3,
+        # Worker Task deletion returns/serves an exact Task+Plan cascade proof.
+        # Managers with first-class Plan mirrors fail closed on older Workers.
+        "plan_cascade_protocol": 1,
+        "worker_plan_reconciliation_protocol": 1,
+        # Exact cancellation is authenticated by the permanent Worker import
+        # receipt; an absent Run creates a tombstone before returning success.
+        "worker_plan_exact_cancel_protocol": 1,
+        # A Manager may resume a pre-Plan-v2 approved carrier already present
+        # on a Worker only after exact semantic readback.  This protocol never
+        # authorizes generic mode=plan Task creation.
+        "legacy_plan_execution_carrier_protocol": (
+            LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION
+        ),
         "plan_pipeline_defaults": plan_pipeline.model_dump(mode="json"),
+        "capability_core_enabled": settings.capability_core_enabled,
+        "auto_capability_enabled": (
+            settings.auto_capability_enabled
+            and settings.capability_core_enabled
+        ),
+        "delivery_loop_enabled": (
+            settings.delivery_loop_enabled
+            and settings.capability_core_enabled
+        ),
         # Manager must see this exact capability before forwarding a PR review
         # to a Worker. Older Workers would run it from their CCM checkout and
         # silently load unrelated CLAUDE.md/AGENTS.md instructions.

@@ -59,8 +59,22 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
                 },
             )
 
-        async def attach_browser_job(self, *, run_id, job, **_kwargs):
-            job.harness_run_id = run_id
+        async def start_fixed_url_browser(self, *, run_id, inline):
+            assert run_id == "h" * 32
+            assert inline is False
+            job = await manager.prepare_agent(
+                BrowserReviewOptions(
+                    url=self.spec.target["url"],
+                    goal=self.spec.goal,
+                    model=settings.default_codex_model,
+                    reasoning_effort="medium",
+                ),
+                provider="codex",
+                codex_service_tier="default",
+                harness_run_id=run_id,
+            )
+            await manager.attach_task(job.id, 92, owner_task_id=91)
+            return job
 
         async def sync_browser_job(self, _job):
             return None
@@ -101,11 +115,16 @@ async def test_browser_review_api_creates_ccm_task_and_records_evidence(
         )
         assert created.status_code == 202, created.text
         job_id = created.json()["id"]
-        assert created.json()["task_id"] == 91
+        assert created.json()["task_id"] == 92
+        assert created.json()["owner_task_id"] == 91
         assert created.json()["browser_channel"] == "chromium"
         assert created_task["provider"] == "codex"
-        assert created_task["enabled_skills"] == {"browser-review": job_id}
-        assert "finish_review" in created_task["description"]
+        assert created_task["status"] == "completed"
+        assert created_task["archived"] is True
+        assert created_task["enabled_skills"] == {}
+        assert created_task["metadata_"] == {
+            "standalone_browser_review_owner": True
+        }
 
         context = await client.get(
             f"/api/browser-reviews/{job_id}/internal/context"

@@ -12,6 +12,7 @@ _subagent_only_callback，报告只存在于 JSONL、聊天永久不可见。
 import asyncio
 import json
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -29,6 +30,9 @@ from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
 from backend.models.sub_agent import SubAgentSession
+from backend.models.worker_task_termination import (
+    WorkerTaskTerminationReceipt,
+)
 
 
 async def _make_inst_task(db_factory):
@@ -49,12 +53,106 @@ def _make_im(db_factory):
     return InstanceManager(db_factory, broadcaster), broadcaster
 
 
+def _active_worker_termination_receipt(
+    task: Task,
+) -> WorkerTaskTerminationReceipt:
+    """Build one constraint-valid Worker receipt owning this Task."""
+
+    now = datetime.utcnow()
+    return WorkerTaskTerminationReceipt(
+        operation_id=uuid.uuid4().hex,
+        task_id=task.id,
+        active_task_id=task.id,
+        side="worker",
+        worker_id=None,
+        operation="stop_session",
+        status="accepted",
+        state_version=1,
+        source_task_incarnation_id=task.incarnation_id,
+        source_task_status=task.status,
+        source_task_retry_count=task.retry_count,
+        source_task_turn_generation=task.turn_generation,
+        source_task_source_log_id=task.turn_source_log_id,
+        source_task_instance_id=task.instance_id,
+        source_task_started_at=task.started_at,
+        source_task_completed_at=task.completed_at,
+        source_task_session_id=task.session_id,
+        source_task_pty_background_generation=(
+            task.pty_background_generation
+        ),
+        request_payload={
+            "test": "pty-termination-admission",
+            "task_id": task.id,
+        },
+        request_digest="d" * 64,
+        attempt_count=0,
+        reconcile_count=0,
+        next_reconcile_at=now,
+        accepted_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+async def _persist_active_worker_termination_receipt(
+    db_factory,
+    task_id: int,
+    *,
+    executing: bool = False,
+) -> WorkerTaskTerminationReceipt:
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        receipt = _active_worker_termination_receipt(task)
+        if executing:
+            receipt.status = "executing"
+            receipt.state_version = 2
+            receipt.execution_token = uuid.uuid4().hex
+            receipt.next_reconcile_at = datetime.utcnow() + timedelta(seconds=90)
+        db.add(receipt)
+        await db.commit()
+        return receipt
+
+
 async def _entries(db_factory, task_id):
     async with db_factory() as db:
         result = await db.execute(
             select(LogEntry).where(LogEntry.task_id == task_id).order_by(LogEntry.id)
         )
         return result.scalars().all()
+
+
+async def _wait_for_pty_background_state(
+    im,
+    *,
+    task_id,
+    session_id,
+    owner_task,
+    timeout=5,
+):
+    """Wait for the post-commit in-memory epoch without starving SQLite.
+
+    ``register_pty_background_generation`` runs only after the durable Task
+    marker commits, so this is a stronger synchronization point than polling
+    the database in a tight loop. Repeated read transactions can otherwise
+    delay the arm writer under full-suite load and make these concurrency
+    tests depend on scheduler timing.
+    """
+
+    async def wait_until_registered():
+        while True:
+            state = im._pty_background_states.get((task_id, session_id))
+            if state is not None:
+                return state
+            if owner_task.done():
+                await owner_task
+                pytest.fail("PTY owner exited before its background epoch was armed")
+            await asyncio.sleep(0.01)
+
+    try:
+        return await asyncio.wait_for(wait_until_registered(), timeout)
+    except asyncio.TimeoutError:
+        pytest.fail("PTY background epoch was not armed before the deadline")
 
 
 async def _run_pre_noted_background_event(
@@ -98,6 +196,8 @@ async def _run_pre_noted_background_event(
                     detached_autonomous=True,
                     expected_session_id=session_id,
                     expected_background_generation=generation,
+                    expected_task_retry_count=0,
+                    expected_task_turn_generation=0,
                 )
         return generation
     finally:
@@ -129,6 +229,7 @@ class TestAutonomousUserSanitization:
         assert len(entries) == 1
         assert entries[0].event_type == "system_event"
         assert entries[0].role == "system"
+        assert entries[0].turn_scope == "autonomous"
         assert "bjv0gacf8" in entries[0].content
         assert "completed" in entries[0].content
         # 广播的也是消毒后的 system_event
@@ -138,6 +239,8 @@ class TestAutonomousUserSanitization:
         ]
         assert any(e.get("event_type") == "system_event" for e in broadcast_events)
         assert not any(e.get("role") == "user" for e in broadcast_events)
+        assert broadcast_events[-1]["turn_scope"] == "autonomous"
+        assert broadcast_events[-1]["actual_transport"] is None
 
     async def test_channel_echo_dropped(self, db_factory):
         """channel 注入回显（发送时已入库过）直接丢弃，不重复。"""
@@ -154,6 +257,43 @@ class TestAutonomousUserSanitization:
         assert await _entries(db_factory, task_id) == []
         broadcaster.broadcast.assert_not_awaited()
 
+    async def test_native_sub_agent_upsert_rejects_retry_aba(
+        self,
+        db_factory,
+    ):
+        """A post-commit lifecycle callback cannot cross a retry boundary."""
+
+        _inst_id, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.retry_count = 2
+            task.turn_generation = 7
+            await db.commit()
+
+        im, broadcaster = _make_im(db_factory)
+        await im._upsert_native_sub_agent(
+            task_id,
+            "subagent_spawn",
+            {
+                "tool_use_id": "stale-native-agent",
+                "kind": "native-agent",
+                "description": "must not be created",
+            },
+            task_retry_count=1,
+            task_turn_generation=7,
+        )
+
+        async with db_factory() as db:
+            sessions = (
+                await db.execute(
+                    select(SubAgentSession).where(
+                        SubAgentSession.task_id == task_id
+                    )
+                )
+            ).scalars().all()
+        assert sessions == []
+        broadcaster.broadcast.assert_not_awaited()
+
     async def test_non_autonomous_user_event_unchanged(self, db_factory):
         """非 autonomous 的 user 事件维持原行为（turn 内 orphan 回填依赖它）。"""
         inst_id, task_id = await _make_inst_task(db_factory)
@@ -168,6 +308,54 @@ class TestAutonomousUserSanitization:
         entries = await _entries(db_factory, task_id)
         assert len(entries) == 1
         assert entries[0].role == "user"
+        assert entries[0].turn_scope == "foreground"
+
+    async def test_broadcast_uses_committed_scope_not_raw_event_metadata(
+        self,
+        db_factory,
+    ):
+        inst_id, task_id = await _make_inst_task(db_factory)
+        im, broadcaster = _make_im(db_factory)
+
+        await im._process_event(inst_id, task_id, {
+            "event_type": "result",
+            "role": "assistant",
+            "content": "trusted producer boundary",
+            # Neither field is trusted input. The persisted entry classifies
+            # this ordinary event as foreground and cannot carry a transport.
+            "turn_scope": "orphan",
+            "actual_transport": "codex_exec",
+        })
+
+        entries = await _entries(db_factory, task_id)
+        assert len(entries) == 1
+        assert entries[0].turn_scope == "foreground"
+        assert entries[0].actual_transport is None
+        task_events = [
+            call.args[1]
+            for call in broadcaster.broadcast.await_args_list
+            if call.args[0] == f"task:{task_id}"
+        ]
+        assert task_events[-1]["turn_scope"] == "foreground"
+        assert task_events[-1]["actual_transport"] is None
+
+    async def test_orphan_scope_wins_over_autonomous(self, db_factory):
+        """A replayed autonomous event remains ineligible terminal evidence."""
+
+        inst_id, task_id = await _make_inst_task(db_factory)
+        im, _broadcaster = _make_im(db_factory)
+
+        await im._process_event(inst_id, task_id, {
+            "event_type": "message",
+            "role": "assistant",
+            "content": "stale autonomous replay",
+            "autonomous": True,
+            "orphan": True,
+        })
+
+        entries = await _entries(db_factory, task_id)
+        assert len(entries) == 1
+        assert entries[0].turn_scope == "orphan"
 
     async def test_autonomous_assistant_message_logged_and_unread(self, db_factory):
         """autonomous assistant 产出正常入库 + 亮未读 + 广播（修复的主目标）。"""
@@ -243,6 +431,8 @@ class TestAutonomousUserSanitization:
             detached_autonomous=True,
             expected_session_id="session-old",
             expected_background_generation="old-background-generation",
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
         )
 
         async with db_factory() as db:
@@ -284,6 +474,44 @@ class TestAutonomousUserSanitization:
             detached_autonomous=True,
             expected_session_id="closed-session",
             expected_background_generation="cleared-generation",
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
+        )
+
+        assert await _entries(db_factory, task_id) == []
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_detached_autonomous_event_rejects_retry_aba_with_same_turn(
+        self,
+        db_factory,
+    ):
+        """A logical-turn retry cannot adopt output from its prior attempt."""
+
+        inst_id, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = "retried-background-session"
+            task.pty_background_generation = "retried-background-generation"
+            task.retry_count = 2
+            task.turn_generation = 7
+            await db.commit()
+
+        im, broadcaster = _make_im(db_factory)
+        await im._process_event(
+            inst_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "late output from retry one",
+                "autonomous": True,
+            },
+            detached_autonomous=True,
+            expected_session_id="retried-background-session",
+            expected_background_generation="retried-background-generation",
+            expected_task_retry_count=1,
+            expected_task_turn_generation=7,
         )
 
         assert await _entries(db_factory, task_id) == []
@@ -446,6 +674,10 @@ class TestFullMirrorBackend:
                 "queue_timestamp": 12.5,
             },
         }
+        retry_fence = object()
+        im._chat_automatic_relaunch_fence = AsyncMock(
+            return_value=retry_fence
+        )
         backend = self._bare_backend(im)
         backend._get_recent_assistant_texts = AsyncMock(return_value=[])
         dispatcher = MagicMock()
@@ -464,7 +696,100 @@ class TestFullMirrorBackend:
             command_skills={"monitor": True},
             model_override="claude-opus-4-8",
             queue_timestamp=12.5,
+            queue_admission_fence=retry_fence,
         )
+
+    async def test_source_less_empty_pty_reply_is_not_reenqueued(
+        self,
+        db_factory,
+    ):
+        async with db_factory() as db:
+            instance = Instance(name="pty-empty-source-less")
+            task = Task(
+                title="pty empty source-less",
+                status="cancelled",
+                provider="claude",
+            )
+            db.add_all([instance, task])
+            await db.commit()
+            instance_id = instance.id
+            task_id = task.id
+            turn_generation = task.turn_generation
+
+        im, _ = _make_im(db_factory)
+        im._launch_params[instance_id] = {
+            "prompt": "must not revive cancelled task",
+            "current_message": "must not revive cancelled task",
+            "task_turn_generation": turn_generation,
+        }
+        backend = self._bare_backend(im)
+        backend._get_recent_assistant_texts = AsyncMock(return_value=[])
+        dispatcher = MagicMock()
+        dispatcher.snapshot_queue_admission = AsyncMock(
+            return_value=object()
+        )
+        dispatcher.enqueue_message = AsyncMock()
+
+        with patch("backend.main.dispatcher", dispatcher):
+            await backend._maybe_retry_empty_reply(instance_id, task_id)
+
+        dispatcher.enqueue_message.assert_not_awaited()
+        assert "_retried" not in im._launch_params[instance_id]
+
+    async def test_admitted_exact_source_empty_pty_reply_is_not_reenqueued(
+        self,
+        db_factory,
+    ):
+        async with db_factory() as db:
+            instance = Instance(name="pty-empty-exact-source")
+            task = Task(
+                title="pty empty exact source",
+                status="completed",
+                provider="claude",
+                retry_count=2,
+                turn_generation=7,
+            )
+            db.add_all([instance, task])
+            await db.flush()
+            source = LogEntry(
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                task_turn_generation=task.turn_generation,
+                turn_scope="source",
+                event_type="user_message",
+                role="user",
+                content="perform one side effect",
+                is_error=False,
+                actual_transport="claude_pty",
+            )
+            db.add(source)
+            await db.flush()
+            task.turn_source_log_id = source.id
+            await db.commit()
+            instance_id = instance.id
+            task_id = task.id
+            source_id = source.id
+
+        im, _ = _make_im(db_factory)
+        im._launch_params[instance_id] = {
+            "prompt": "perform one side effect",
+            "current_message": "perform one side effect",
+            "task_turn_generation": 7,
+            "source_log_id": source_id,
+        }
+        backend = self._bare_backend(im)
+        backend._get_recent_assistant_texts = AsyncMock(return_value=[])
+        dispatcher = MagicMock()
+        dispatcher.snapshot_queue_admission = AsyncMock(
+            return_value=object()
+        )
+        dispatcher.enqueue_message = AsyncMock()
+
+        with patch("backend.main.dispatcher", dispatcher):
+            await backend._maybe_retry_empty_reply(instance_id, task_id)
+
+        dispatcher.enqueue_message.assert_not_awaited()
+        assert "_retried" not in im._launch_params[instance_id]
 
     async def test_foreground_event_forwards_immutable_consumer_record(self):
         im = MagicMock()
@@ -750,6 +1075,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=4,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -844,6 +1170,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=4,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -855,14 +1182,12 @@ class TestFullMirrorBackend:
             )
 
         exit_task = asyncio.create_task(exit_turn())
-        for _ in range(50):
-            await asyncio.sleep(0)
-            async with db_factory() as db:
-                task = await db.get(Task, task_id)
-                if task.pty_background_generation is not None:
-                    break
-        else:
-            pytest.fail("chat background epoch was not armed")
+        await _wait_for_pty_background_state(
+            im,
+            task_id=task_id,
+            session_id=session.session_id,
+            owner_task=exit_task,
+        )
 
         async with db_factory() as db:
             task = await db.get(Task, task_id)
@@ -995,6 +1320,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=3,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_event(
@@ -1063,14 +1389,16 @@ class TestFullMirrorBackend:
             )
 
         exit_task = asyncio.create_task(exit_turn())
-        for _ in range(100):
-            await asyncio.sleep(0.01)
-            async with db_factory() as db:
-                task = await db.get(Task, task_id)
-                if task.pty_background_generation is not None:
-                    break
-        else:
-            pytest.fail("background Bash epoch was not armed")
+        state = await _wait_for_pty_background_state(
+            im,
+            task_id=task_id,
+            session_id=session.session_id,
+            owner_task=exit_task,
+        )
+
+        async with db_factory() as db:
+            armed_task = await db.get(Task, task_id)
+            assert armed_task.pty_background_generation == state.generation
 
         tracker = session._ccm_background_work_tracker
         assert tracker.background_commands == {
@@ -1260,6 +1588,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=5,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1271,18 +1600,12 @@ class TestFullMirrorBackend:
             )
 
         exit_task = asyncio.create_task(exit_turn())
-        for _ in range(50):
-            await asyncio.sleep(0)
-            async with db_factory() as db:
-                armed = await db.get(Task, task_id)
-                if armed.pty_background_generation is not None:
-                    state = im._pty_background_states.get(
-                        (task_id, session.session_id)
-                    )
-                    if state is not None:
-                        break
-        else:
-            pytest.fail("chat background epoch was not armed")
+        state = await _wait_for_pty_background_state(
+            im,
+            task_id=task_id,
+            session_id=session.session_id,
+            owner_task=exit_task,
+        )
 
         session.has_pending_subagents = False
         session._reader._tracker.has_pending = False
@@ -1323,6 +1646,8 @@ class TestFullMirrorBackend:
             {
                 "event": "status_change",
                 "task_id": task_id,
+                "task_retry_count": 5,
+                "task_turn_generation": 0,
                 "new_status": "failed",
                 "instance_id": instance_id,
                 "background_active": False,
@@ -1400,6 +1725,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=2,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1412,20 +1738,12 @@ class TestFullMirrorBackend:
             )
 
         exit_task = asyncio.create_task(exit_initial_turn())
-        for _ in range(50):
-            await asyncio.sleep(0)
-            async with db_factory() as db:
-                armed_task = await db.get(Task, task_id)
-                if (
-                    armed_task.pty_background_generation is not None
-                    and getattr(
-                        session.on_autonomous_event, "__name__", ""
-                    )
-                    == "_full_autonomous_mirror"
-                ):
-                    break
-        else:
-            pytest.fail("dispatcher-owned PTY epoch was not armed")
+        await _wait_for_pty_background_state(
+            im,
+            task_id=task_id,
+            session_id=session.session_id,
+            owner_task=exit_task,
+        )
 
         assert session.on_autonomous_event.__name__ == (
             "_full_autonomous_mirror"
@@ -1560,6 +1878,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=1,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1685,6 +2004,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=4,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -1778,6 +2098,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.processes[instance_id] = old_proxy
@@ -1830,6 +2151,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=started_at + timedelta(seconds=1),
         )
         im.processes[instance_id] = new_proxy
@@ -1893,6 +2215,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=1,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im._claim_pty_terminal_owner(record, "consumer")
@@ -1962,6 +2285,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=3,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im._claim_pty_terminal_owner(record, "consumer")
@@ -2078,6 +2402,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=5,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im._claim_pty_terminal_owner(record, "consumer")
@@ -2182,6 +2507,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=6,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         won_a, won_b = await asyncio.gather(
@@ -2251,6 +2577,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=3,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.register_pty_background_generation(
@@ -2258,6 +2585,8 @@ class TestFullMirrorBackend:
             proxy.session.session_id,
             generation,
             proxy.session,
+            task_retry_count=3,
+            task_turn_generation=0,
         )
         state = im._pty_background_states[
             (task_id, proxy.session.session_id)
@@ -2402,6 +2731,8 @@ class TestFullMirrorBackend:
             Session.session_id,
             "early-complete-generation",
             Session(),
+            task_retry_count=0,
+            task_turn_generation=0,
         )
         state.outcome = "completed"
         im._discard_pty_background_state(
@@ -2594,6 +2925,8 @@ class TestFullMirrorBackend:
             session.session_id,
             "watchdog-generation",
             session,
+            task_retry_count=0,
+            task_turn_generation=0,
         )
         state = im._pty_background_states[
             (task_id, session.session_id)
@@ -2613,6 +2946,120 @@ class TestFullMirrorBackend:
             task = await db.get(Task, task_id)
             assert task.status == "failed"
             assert task.background_active is False
+
+    async def test_detached_watchdog_suppresses_old_events_after_retry_wins(
+        self, db_factory, monkeypatch
+    ):
+        """A G+1 commit before publication suppresses every old watchdog event."""
+
+        im, broadcaster = _make_im(db_factory)
+        _, task_id = await _make_inst_task(db_factory)
+        session_id = "watchdog-publication-race-session"
+        generation = "watchdog-publication-race-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+
+            def __init__(self):
+                self.session_id = session_id
+                self.is_alive = True
+
+            async def stop(self):
+                self.is_alive = False
+
+        session = Session()
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.started_monotonic = 0
+        monkeypatch.setattr(
+            "backend.services.instance_manager.PTY_BACKGROUND_MAX_SECONDS",
+            0,
+        )
+
+        stop_committed = asyncio.Event()
+        release_stop_result = asyncio.Event()
+        real_stop = im.stop_detached_pty_background_generation
+
+        async def stop_then_hold_result(*args, **kwargs):
+            stopped = await real_stop(*args, **kwargs)
+            assert stopped is True
+            stop_committed.set()
+            await release_stop_result.wait()
+            return stopped
+
+        monkeypatch.setattr(
+            im,
+            "stop_detached_pty_background_generation",
+            stop_then_hold_result,
+        )
+
+        broadcast_entered = asyncio.Event()
+        release_broadcast = asyncio.Event()
+
+        async def broadcast_barrier(*_args, **_kwargs):
+            broadcast_entered.set()
+            await release_broadcast.wait()
+
+        broadcaster.broadcast.side_effect = broadcast_barrier
+        watchdog = asyncio.create_task(
+            im._fail_pty_background_generation(state)
+        )
+        broadcast_waiter = asyncio.create_task(broadcast_entered.wait())
+        try:
+            await asyncio.wait_for(stop_committed.wait(), 1)
+            async with db_factory() as db:
+                replacement = await db.get(Task, task_id)
+                assert replacement.status == "failed"
+                assert replacement.pty_background_generation is None
+                replacement.status = "executing"
+                replacement.retry_count = 1
+                replacement.turn_generation = 1
+                replacement.session_id = "watchdog-publication-race-g1"
+                replacement.completed_at = None
+                await db.commit()
+
+            release_stop_result.set()
+            completed, _pending = await asyncio.wait(
+                {watchdog, broadcast_waiter},
+                timeout=1,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            assert watchdog in completed
+            assert await watchdog is True
+            assert broadcast_entered.is_set() is False
+            broadcaster.broadcast.assert_not_awaited()
+        finally:
+            release_stop_result.set()
+            release_broadcast.set()
+            if not watchdog.done():
+                watchdog.cancel()
+            if not broadcast_waiter.done():
+                broadcast_waiter.cancel()
+            await asyncio.gather(
+                watchdog,
+                broadcast_waiter,
+                return_exceptions=True,
+            )
+
+        async with db_factory() as db:
+            replacement = await db.get(Task, task_id)
+            assert replacement.status == "executing"
+            assert replacement.retry_count == 1
+            assert replacement.turn_generation == 1
+            assert replacement.session_id == "watchdog-publication-race-g1"
 
     async def test_old_autonomous_sentinel_cannot_clear_new_background_epoch(
         self, db_factory
@@ -2653,6 +3100,8 @@ class TestFullMirrorBackend:
             session.session_id,
             new_generation,
             session,
+            task_retry_count=0,
+            task_turn_generation=0,
         )
 
         await im.finish_pty_autonomous_activity(
@@ -2736,6 +3185,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=3,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
 
@@ -2851,6 +3301,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=9,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.processes[instance_id] = proxy
@@ -2859,7 +3310,12 @@ class TestFullMirrorBackend:
         backend._consumers[instance_id] = consumer
         backend._proxies[instance_id] = proxy
         im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=9,
+            task_turn_generation=0,
         )
 
         async def stop_backend(key):
@@ -2942,13 +3398,19 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=10,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         backend._sessions[instance_id] = session
         backend._consumers[instance_id] = consumer
         backend._proxies[instance_id] = proxy
         im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=10,
+            task_turn_generation=0,
         )
 
         noted = asyncio.Event()
@@ -3060,13 +3522,19 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=14,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         backend._sessions[instance_id] = session
         backend._consumers[instance_id] = consumer
         backend._proxies[instance_id] = proxy
         state = im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=14,
+            task_turn_generation=0,
         )
         handoff = im.note_pty_autonomous_activity(
             task_id, session.session_id
@@ -3192,7 +3660,12 @@ class TestFullMirrorBackend:
             task.pty_background_generation = generation
             await db.commit()
         im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=11,
+            task_turn_generation=0,
         )
 
         noted = asyncio.Event()
@@ -3216,6 +3689,7 @@ class TestFullMirrorBackend:
                 generation,
                 expected_status="completed",
                 expected_retry_count=11,
+                expected_turn_generation=0,
                 expected_instance_id=None,
                 expected_started_at=None,
                 expected_completed_at=completed_at,
@@ -3277,7 +3751,12 @@ class TestFullMirrorBackend:
             task.pty_background_generation = generation
             await db.commit()
         state = im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=12,
+            task_turn_generation=0,
         )
 
         noted = asyncio.Event()
@@ -3305,6 +3784,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=12,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=completed_at,
@@ -3336,6 +3816,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=12,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=completed_at,
@@ -3394,7 +3875,12 @@ class TestFullMirrorBackend:
             task.pty_background_generation = generation
             await db.commit()
         state = im.register_pty_background_generation(
-            task_id, session.session_id, generation, session
+            task_id,
+            session.session_id,
+            generation,
+            session,
+            task_retry_count=13,
+            task_turn_generation=0,
         )
         handoff = im.note_pty_autonomous_activity(
             task_id, session.session_id
@@ -3406,6 +3892,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=13,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=completed_at,
@@ -3447,6 +3934,7 @@ class TestFullMirrorBackend:
             generation,
             expected_status="completed",
             expected_retry_count=13,
+            expected_turn_generation=0,
             expected_instance_id=None,
             expected_started_at=None,
             expected_completed_at=replacement_completed_at,
@@ -3489,6 +3977,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=old_started_at,
         )
         object.__setattr__(record, "pty_terminal_owner", "consumer")
@@ -3527,6 +4016,8 @@ class TestFullMirrorBackend:
             proxy.session.session_id,
             "old-background",
             proxy.session,
+            task_retry_count=2,
+            task_turn_generation=0,
         )
         assert not await im.stop(
             instance_id,
@@ -3619,6 +4110,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=5,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         backend.stop = AsyncMock(
@@ -3626,6 +4118,16 @@ class TestFullMirrorBackend:
                 "consumer-owned terminal path must not call backend.stop"
             )
         )
+        consumer_wait_entered = asyncio.Event()
+        release_consumer_wait = asyncio.Event()
+        original_wait_for_output_consumer = im.wait_for_output_consumer
+
+        async def gated_wait_for_output_consumer(*args, **kwargs):
+            consumer_wait_entered.set()
+            await release_consumer_wait.wait()
+            return await original_wait_for_output_consumer(*args, **kwargs)
+
+        im.wait_for_output_consumer = gated_wait_for_output_consumer
 
         begin_exit.set()
         await container_finalize_entered.wait()
@@ -3642,10 +4144,7 @@ class TestFullMirrorBackend:
                 consumer_cancel_timeout=0.2,
             )
         )
-        for _ in range(100):
-            if instance_id in im._stopping:
-                break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(consumer_wait_entered.wait(), timeout=1)
         assert instance_id in im._stopping
         assert not im._instance_lifecycle_lock(instance_id).locked()
         with pytest.raises(
@@ -3654,6 +4153,7 @@ class TestFullMirrorBackend:
             await im.launch(instance_id, "must not race stop")
 
         release_container_finalize.set()
+        release_consumer_wait.set()
         assert await asyncio.wait_for(stopping, timeout=1) is True
         backend.stop.assert_not_awaited()
 
@@ -3728,6 +4228,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=6,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         im.finalize_pty_container_exec = AsyncMock(
@@ -3837,6 +4338,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=7,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
 
@@ -4027,6 +4529,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=2,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
         status = await im.finalize_pty_chat_generation(
@@ -4039,10 +4542,32 @@ class TestFullMirrorBackend:
         async with db_factory() as db:
             task = await db.get(Task, task_id)
             inst = await db.get(Instance, instance_id)
+            markers = (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task_id,
+                        LogEntry.event_type == "system_event",
+                        LogEntry.is_error.is_(True),
+                    )
+                )
+            ).scalars().all()
             assert task.status == "failed"
             assert task.completed_at is not None
             assert "code 9" in task.error_message
             assert inst.status == "error"
+            assert len(markers) == 1
+            marker = markers[0]
+            assert marker.turn_scope == "foreground"
+            assert marker.role == "system"
+            assert marker.task_retry_count == 2
+            assert marker.task_turn_generation == 0
+            assert json.loads(marker.raw_json) == {
+                "type": "ccm.turn.failed",
+                "version": 1,
+                "provider": "claude",
+                "reason": "process_exit_before_response",
+                "exit_code": 9,
+            }
 
     async def test_handoff_during_terminal_commit_rearms_before_publish(
         self, db_factory
@@ -4111,6 +4636,7 @@ class TestFullMirrorBackend:
             provider="claude",
             task_id=task_id,
             task_retry_count=4,
+            task_turn_generation=0,
             instance_started_at=started_at,
         )
 
@@ -4190,6 +4716,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=3,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await im._process_event(
@@ -4291,6 +4818,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=2,
+                task_turn_generation=0,
                 instance_started_at=started_at,
             )
             await backend.on_exit(
@@ -4365,6 +4893,7 @@ class TestFullMirrorBackend:
                 provider="claude",
                 task_id=task_id,
                 task_retry_count=7,
+                task_turn_generation=0,
                 instance_started_at=old_started_at,
             )
             await backend.on_exit(
@@ -4416,13 +4945,14 @@ class TestFullMirrorBackend:
             from backend.services.instance_manager import _OutputConsumerRecord
 
             old_record = _OutputConsumerRecord(
-                old_proxy,
-                consumer,
-                True,
-                "claude",
-                task_id,
-                0,
-                datetime.utcnow(),
+                process=old_proxy,
+                task=consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=0,
+                instance_started_at=datetime.utcnow(),
             )
             setattr(
                 consumer, "_ccm_output_consumer_record", old_record
@@ -4444,13 +4974,14 @@ class TestFullMirrorBackend:
             from backend.services.instance_manager import _OutputConsumerRecord
 
             new_record = _OutputConsumerRecord(
-                new_proxy,
-                new_consumer,
-                True,
-                "claude",
-                task_id,
-                0,
-                datetime.utcnow(),
+                process=new_proxy,
+                task=new_consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=0,
+                task_turn_generation=1,
+                instance_started_at=datetime.utcnow(),
             )
             backend._consumers[instance_id] = new_consumer
             im._tasks[instance_id] = new_consumer
@@ -4479,6 +5010,10 @@ class TestFullMirrorBackend:
         im._finish_pty_autonomous_activity_locked = AsyncMock()
         im._is_pty_autonomous_terminal.return_value = False
         im._is_pty_autonomous_activity.return_value = True
+        im.pty_background_state_for.return_value = SimpleNamespace(
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
         backend = self._bare_backend(im)
         session = MagicMock()
 
@@ -4503,6 +5038,8 @@ class TestFullMirrorBackend:
             detached_autonomous=True,
             expected_session_id="session-27",
             expected_background_generation="background-generation",
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
         )
 
     async def test_mirror_drops_event_when_background_admission_fails(self):
@@ -4584,3 +5121,510 @@ class TestFullMirrorBackend:
             im, _ = _make_im(db_factory)
         fake_cls.assert_called_once_with(im)
         assert im._pty_enabled is True
+
+
+class TestWorkerTerminationReceiptPtyAdmission:
+    """A durable Worker stop receipt owns all remaining PTY side effects."""
+
+    async def test_active_receipt_blocks_completed_only_autonomous_admission(
+        self,
+        db_factory,
+    ):
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-completed-only"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            await db.commit()
+        await _persist_active_worker_termination_receipt(
+            db_factory, task_id
+        )
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        session = Session()
+        im, broadcaster = _make_im(db_factory)
+        generation = await im.begin_pty_autonomous_activity(
+            task_id,
+            session_id,
+            session,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "must yield to the receipt",
+                "autonomous": True,
+            },
+        )
+
+        assert generation is None
+        assert (task_id, session_id) not in im._pty_background_states
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation is None
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_active_receipt_blocks_foreground_background_arm(
+        self,
+        db_factory,
+    ):
+        instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-arm"
+        started_at = datetime.utcnow()
+
+        class Session:
+            def __init__(self):
+                self.session_id = session_id
+
+        class Proxy:
+            pid = 6101
+
+            def __init__(self):
+                self.session = Session()
+
+        proxy = Proxy()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 2
+            task.turn_generation = 4
+            task.instance_id = instance_id
+            task.session_id = session_id
+            task.started_at = started_at
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+        receipt = await _persist_active_worker_termination_receipt(
+            db_factory, task_id, executing=True
+        )
+
+        im, broadcaster = _make_im(db_factory)
+        consumer = asyncio.current_task()
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=2,
+            task_turn_generation=4,
+            instance_started_at=started_at,
+        )
+
+        assert not await im.arm_pty_background_generation(
+            instance_id,
+            task_id,
+            session_id,
+            "blocked-generation",
+            record,
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "executing"
+            assert task.pty_background_generation is None
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_active_receipt_blocks_chat_terminal_commit(
+        self,
+        db_factory,
+    ):
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        class Proxy:
+            pid = 6102
+            returncode = 0
+
+        proxy = Proxy()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 3
+            task.turn_generation = 5
+            task.instance_id = instance_id
+            task.started_at = started_at
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = proxy.pid
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+        await _persist_active_worker_termination_receipt(
+            db_factory, task_id
+        )
+
+        im, broadcaster = _make_im(db_factory)
+        consumer = asyncio.current_task()
+        im.processes[instance_id] = proxy
+        record = im._track_output_consumer(
+            instance_id,
+            proxy,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=3,
+            task_turn_generation=5,
+            instance_started_at=started_at,
+        )
+
+        assert (
+            await im.finalize_pty_chat_generation(
+                instance_id,
+                task_id,
+                0,
+                record,
+            )
+            is None
+        )
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "executing"
+            assert task.completed_at is None
+            assert task.instance_id == instance_id
+            assert inst.status == "running"
+            assert inst.pid == proxy.pid
+            assert inst.current_task_id == task_id
+        assert await _entries(db_factory, task_id) == []
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_completion_loser_retains_exact_state_for_receipt_executor(
+        self,
+        db_factory,
+    ):
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-completion"
+        generation = "receipt-completion-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+        await _persist_active_worker_termination_receipt(
+            db_factory, task_id
+        )
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        im, broadcaster = _make_im(db_factory)
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            Session(),
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.terminal_seen = True
+        watcher = state.watcher
+        try:
+            assert not await im._try_complete_pty_background_generation(
+                state
+            )
+            assert im._pty_background_states[(task_id, session_id)] is state
+            assert state.done.is_set() is False
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "completed"
+                assert task.pty_background_generation == generation
+            broadcaster.broadcast.assert_not_awaited()
+        finally:
+            state.outcome = "test-cleanup"
+            im._discard_pty_background_state(
+                (task_id, session_id), generation
+            )
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def test_watchdog_yields_before_stopping_receipt_owned_session(
+        self,
+        db_factory,
+    ):
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-watchdog"
+        generation = "receipt-watchdog-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+        await _persist_active_worker_termination_receipt(
+            db_factory, task_id
+        )
+
+        class Session:
+            has_pending_subagents = False
+
+            def __init__(self):
+                self.session_id = session_id
+                self.is_alive = True
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+
+        session = Session()
+        im, broadcaster = _make_im(db_factory)
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.started_monotonic = 0
+        watcher = state.watcher
+        try:
+            assert not await im._fail_pty_background_generation(state)
+            assert session.stop_calls == 0
+            assert session.is_alive is True
+            assert im._pty_background_states[(task_id, session_id)] is state
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "completed"
+                assert task.pty_background_generation == generation
+            broadcaster.broadcast.assert_not_awaited()
+        finally:
+            state.outcome = "test-cleanup"
+            im._discard_pty_background_state(
+                (task_id, session_id), generation
+            )
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def test_watchdog_preserves_owner_if_receipt_wins_after_session_stop(
+        self,
+        db_factory,
+    ):
+        """A late receipt may inherit a stopped Session, never cleared proof."""
+
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-watchdog-final-cas"
+        generation = "receipt-watchdog-final-cas-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+
+            def __init__(self):
+                self.session_id = session_id
+                self.is_alive = True
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+                await _persist_active_worker_termination_receipt(
+                    db_factory, task_id
+                )
+
+        session = Session()
+        im, broadcaster = _make_im(db_factory)
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.started_monotonic = 0
+        watcher = state.watcher
+        try:
+            assert not await im._fail_pty_background_generation(state)
+            assert session.stop_calls == 1
+            assert session.is_alive is False
+            assert im._pty_background_states[(task_id, session_id)] is state
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "completed"
+                assert task.pty_background_generation == generation
+            broadcaster.broadcast.assert_not_awaited()
+        finally:
+            state.outcome = "test-cleanup"
+            im._discard_pty_background_state(
+                (task_id, session_id), generation
+            )
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def test_receipt_owned_detached_stop_is_not_self_blocked(
+        self,
+        db_factory,
+    ):
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-owned-detached-stop"
+        generation = "receipt-owned-detached-generation"
+        completed_at = datetime.utcnow()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = completed_at
+            task.pty_background_generation = generation
+            await db.commit()
+        receipt = await _persist_active_worker_termination_receipt(
+            db_factory, task_id, executing=True
+        )
+
+        class Session:
+            has_pending_subagents = False
+
+            def __init__(self):
+                self.session_id = session_id
+                self.is_alive = True
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+
+        session = Session()
+        im, broadcaster = _make_im(db_factory)
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        watcher = state.watcher
+
+        assert await im.stop_detached_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            expected_status="completed",
+            expected_retry_count=0,
+            expected_turn_generation=0,
+            expected_instance_id=None,
+            expected_started_at=None,
+            expected_completed_at=completed_at,
+            yield_to_worker_task_termination=False,
+            worker_termination_operation_id=receipt.operation_id,
+            worker_termination_operation="stop_session",
+            worker_termination_execution_token=receipt.execution_token,
+            worker_termination_state_version=receipt.state_version,
+        )
+        assert session.stop_calls == 1
+        assert session.is_alive is False
+        assert (task_id, session_id) not in im._pty_background_states
+        if watcher is not None:
+            await asyncio.gather(watcher, return_exceptions=True)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation is None
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_active_receipt_drops_matching_detached_event(
+        self,
+        db_factory,
+    ):
+        instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "receipt-detached-event"
+        generation = "receipt-detached-event-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            task.has_unread = False
+            await db.commit()
+        await _persist_active_worker_termination_receipt(
+            db_factory, task_id
+        )
+
+        im, broadcaster = _make_im(db_factory)
+        await im._process_event(
+            instance_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "must not persist after receipt admission",
+                "autonomous": True,
+            },
+            detached_autonomous=True,
+            expected_session_id=session_id,
+            expected_background_generation=generation,
+            expected_task_retry_count=0,
+            expected_task_turn_generation=0,
+        )
+
+        assert await _entries(db_factory, task_id) == []
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.has_unread is False
+            assert task.pty_background_generation == generation
+        broadcaster.broadcast.assert_not_awaited()
+
+    async def test_active_receipt_blocks_native_subagent_creation(
+        self,
+        db_factory,
+    ):
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.completed_at = datetime.utcnow()
+            await db.commit()
+        await _persist_active_worker_termination_receipt(
+            db_factory, task_id
+        )
+
+        im, broadcaster = _make_im(db_factory)
+        await im._upsert_native_sub_agent(
+            task_id,
+            "subagent_spawn",
+            {
+                "tool_use_id": "receipt-owned-native-agent",
+                "kind": "native-agent",
+                "description": "must not be created",
+            },
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+
+        async with db_factory() as db:
+            rows = (
+                await db.execute(
+                    select(SubAgentSession).where(
+                        SubAgentSession.task_id == task_id
+                    )
+                )
+            ).scalars().all()
+            assert rows == []
+        broadcaster.broadcast.assert_not_awaited()

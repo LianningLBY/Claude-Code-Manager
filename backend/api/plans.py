@@ -30,7 +30,9 @@ from backend.services.plan_tasks import (
     capture_repo_revision,
     latest_task_log_id,
     mark_plan_superseded,
+    PlanTerminalQuiescenceError,
     plan_staleness,
+    run_plan_terminal_transition,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
 from backend.services.task_creation import (
@@ -39,6 +41,10 @@ from backend.services.task_creation import (
 )
 from backend.services.task_queue import TaskQueue
 from backend.services.worker_proxy import get_task_operation_lock
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 
 router = APIRouter(prefix="/api/tasks", tags=["plans"])
@@ -140,6 +146,30 @@ def _require_revisable_plan(plan: Task) -> None:
         raise HTTPException(400, "Task is not in plan review state")
 
 
+async def _fence_plan_task_admission(
+    db: AsyncSession,
+    task_id: int,
+) -> None:
+    """Order Plan creation against durable Task termination ownership."""
+
+    fenced = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task_id,
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+    )
+    if fenced.rowcount == 1:
+        return
+    if await active_worker_task_termination_receipt(db, task_id):
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
+    raise HTTPException(409, "Task changed while Plan admission was starting")
+
+
 def _plan_upload_fields(
     task: Task,
 ) -> tuple[list[str] | None, list[str] | None, list[dict] | None]:
@@ -170,6 +200,7 @@ async def _create_related_plan(
     target: Task,
     body: RelatedPlanCreate,
 ) -> Task:
+    await _fence_plan_task_admission(db, target.id)
     active_count = await db.scalar(
         select(func.count(Task.id)).where(
             Task.plan_target_task_id == target.id,
@@ -247,84 +278,135 @@ async def _create_related_plan(
         if target.worker_id is not None
         else await capture_repo_revision(target.last_cwd or target.target_repo)
     )
-    plan = await stage_task_record(
-        db,
-        title=(
-            body.title.strip()
-            if body.title and body.title.strip()
-            else (
-                f"Plan for #{target.id}: {target.title.strip()}"
-                if target.title and target.title.strip()
-                else f"Plan for #{target.id}"
-            )
-        )[:200],
-        description=body.input.strip(),
-        status="pending",
-        priority=target.priority,
-        project_id=target.project_id,
-        target_repo=target.target_repo,
-        target_branch=target.target_branch,
-        merge_status="pending",
-        worker_id=target.worker_id,
-        created_by=get_current_user_id(request),
-        max_retries=target.max_retries,
-        mode="plan",
-        provider=provider,
-        model=model,
-        codex_service_tier=codex_service_tier,
-        effort_level=effort,
-        thinking_budget=None,
-        timeout_hours=target.timeout_hours,
-        enable_workflows=False,
-        enabled_skills={},
-        selected_user_skills=[],
-        metadata_={
-            "created_from_plan_target_task_id": target.id,
-            **(
-                {
-                    "file_paths": [upload.path for upload in uploads],
-                    "image_paths": [
-                        upload.path for upload in uploads if upload.is_image
-                    ],
-                    "attachments": [
-                        upload.public_dict() for upload in uploads
-                    ],
-                }
-                if uploads
-                else {}
-            ),
-            **(
-                {"revised_from_plan_task_id": supersedes.id}
-                if supersedes is not None
-                else {}
-            ),
-        },
-        plan_target_task_id=target.id,
-        plan_context_session_id=target.session_id,
-        plan_context_log_id=context_log_id,
-        plan_context_snapshot=context_snapshot,
-        plan_repo_revision=repo_revision,
-        supersedes_plan_task_id=(
-            supersedes.id if supersedes is not None else None
-        ),
-        plan_pipeline_config=pipeline.model_dump(mode="json"),
-    )
-    if supersedes is not None and not await mark_plan_superseded(
-        db,
-        supersedes,
-        successor_id=plan.id,
-    ):
-        await db.rollback()
-        raise HTTPException(
-            409,
-            "Plan changed while its revision was being created",
-        )
-    await db.commit()
-    await db.refresh(plan)
-    if superseded_id is not None:
-        from backend.services.task_events import broadcast_status_change
+    target_id = target.id
 
-        await broadcast_status_change(superseded_id, "superseded")
+    async def stage_plan(
+        current_target: Task,
+        current_supersedes: Task | None,
+    ) -> Task:
+        return await stage_task_record(
+            db,
+            title=(
+                body.title.strip()
+                if body.title and body.title.strip()
+                else (
+                    f"Plan for #{current_target.id}: {current_target.title.strip()}"
+                    if current_target.title and current_target.title.strip()
+                    else f"Plan for #{current_target.id}"
+                )
+            )[:200],
+            description=body.input.strip(),
+            status="pending",
+            priority=current_target.priority,
+            project_id=current_target.project_id,
+            target_repo=current_target.target_repo,
+            target_branch=current_target.target_branch,
+            merge_status="pending",
+            worker_id=current_target.worker_id,
+            created_by=get_current_user_id(request),
+            max_retries=current_target.max_retries,
+            mode="plan",
+            provider=provider,
+            model=model,
+            codex_service_tier=codex_service_tier,
+            effort_level=effort,
+            thinking_budget=None,
+            timeout_hours=current_target.timeout_hours,
+            enable_workflows=False,
+            enabled_skills={},
+            selected_user_skills=[],
+            metadata_={
+                "created_from_plan_target_task_id": current_target.id,
+                **(
+                    {
+                        "file_paths": [upload.path for upload in uploads],
+                        "image_paths": [
+                            upload.path for upload in uploads if upload.is_image
+                        ],
+                        "attachments": [
+                            upload.public_dict() for upload in uploads
+                        ],
+                    }
+                    if uploads
+                    else {}
+                ),
+                **(
+                    {"revised_from_plan_task_id": current_supersedes.id}
+                    if current_supersedes is not None
+                    else {}
+                ),
+            },
+            plan_target_task_id=current_target.id,
+            plan_context_session_id=current_target.session_id,
+            plan_context_log_id=context_log_id,
+            plan_context_snapshot=context_snapshot,
+            plan_repo_revision=repo_revision,
+            supersedes_plan_task_id=(
+                current_supersedes.id
+                if current_supersedes is not None
+                else None
+            ),
+            plan_pipeline_config=pipeline.model_dump(mode="json"),
+        )
+
+    if supersedes is None:
+        plan = await stage_plan(target, None)
+        await db.commit()
+    else:
+        async def commit_supersede() -> Task:
+            db.expire_all()
+            current_target = await db.get(Task, target_id)
+            current_supersedes = await db.get(Task, superseded_id)
+            if current_target is None or current_supersedes is None:
+                raise HTTPException(
+                    409,
+                    "Plan or target disappeared during revision",
+                )
+            await require_task_control(request, current_target, db)
+            await require_task_control(request, current_supersedes, db)
+            if (
+                current_supersedes.mode != "plan"
+                or current_supersedes.plan_target_task_id != current_target.id
+            ):
+                raise HTTPException(
+                    400,
+                    "Superseded Plan does not belong to this Task",
+                )
+            _require_revisable_plan(current_supersedes)
+            exact_active_count = await db.scalar(
+                select(func.count(Task.id)).where(
+                    Task.plan_target_task_id == current_target.id,
+                    Task.mode == "plan",
+                    Task.status.in_(ACTIVE_PLAN_STATUSES),
+                )
+            )
+            if int(exact_active_count or 0) >= MAX_ACTIVE_PLANS_PER_TASK:
+                raise HTTPException(
+                    429,
+                    f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans",
+                )
+            staged = await stage_plan(current_target, current_supersedes)
+            if not await mark_plan_superseded(
+                db,
+                current_supersedes,
+                successor_id=staged.id,
+            ):
+                raise HTTPException(
+                    409,
+                    "Plan changed while its revision was being created",
+                )
+            return staged
+
+        try:
+            plan = await run_plan_terminal_transition(
+                db,
+                superseded_id,
+                "superseded",
+                commit_supersede,
+            )
+        except PlanTerminalQuiescenceError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    await db.refresh(plan)
     if plan.project_id:
         try:
             from backend.services.task_sharing import auto_share_new_task
@@ -361,6 +443,13 @@ async def create_related_plan(
     if target is None:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, target, db)
+    from backend.api.tasks import _require_not_isolated_browser_child
+
+    await _require_not_isolated_browser_child(
+        db,
+        target,
+        action="used as a Plan owner",
+    )
     if not target.session_id:
         raise HTTPException(400, "Run the target Task before creating a session Plan")
     if target.shared_from_id is not None:
@@ -376,6 +465,11 @@ async def create_related_plan(
         if target is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, target, db)
+        await _require_not_isolated_browser_child(
+            db,
+            target,
+            action="used as a Plan owner",
+        )
         return await _create_related_plan(
             db=db,
             request=request,
@@ -571,63 +665,87 @@ async def revise_plan(
             legacy_effort=current_source.effort_level,
         )
         if current_source.plan_target_task_id is None:
-            revision = await stage_task_record(
-                db,
-                title=(
-                    body.title.strip()
-                    if body.title and body.title.strip()
-                    else f"Revision of Plan #{current_source.id}"
-                )[:200],
-                description=prompt,
-                status="pending",
-                priority=current_source.priority,
-                project_id=current_source.project_id,
-                target_repo=current_source.target_repo,
-                target_branch=current_source.target_branch,
-                merge_status="pending",
-                worker_id=current_source.worker_id,
-                created_by=get_current_user_id(request),
-                max_retries=current_source.max_retries,
-                mode="plan",
-                provider=revision_pipeline.planner.primary.provider,
-                model=revision_pipeline.planner.primary.model,
-                codex_service_tier=current_source.codex_service_tier,
-                effort_level=revision_pipeline.planner.primary.effort,
-                plan_pipeline_config=(
-                    revision_pipeline.model_dump(mode="json")
-                ),
-                timeout_hours=current_source.timeout_hours,
-                enable_workflows=False,
-                enabled_skills={},
-                selected_user_skills=[],
-                metadata_={
-                    "revised_from_plan_task_id": current_source.id
-                },
-                plan_context_session_id=None,
-                plan_context_log_id=None,
-                plan_repo_revision=await capture_repo_revision(
-                    current_source.last_cwd or current_source.target_repo
-                ),
-                supersedes_plan_task_id=current_source.id,
+            repo_revision = await capture_repo_revision(
+                current_source.last_cwd or current_source.target_repo
             )
-            if not await mark_plan_superseded(
-                db,
-                current_source,
-                successor_id=revision.id,
-            ):
-                await db.rollback()
-                raise HTTPException(
-                    409,
-                    "Plan changed while its revision was being created",
-                )
-            await db.commit()
-            await db.refresh(revision)
-            from backend.services.task_events import broadcast_status_change
 
-            await broadcast_status_change(
-                plan_task_id,
-                "superseded",
-            )
+            async def commit_standalone_supersede() -> Task:
+                db.expire_all()
+                exact_source = await db.get(Task, plan_task_id)
+                if exact_source is None:
+                    raise HTTPException(409, "Plan disappeared during revision")
+                await require_task_control(request, exact_source, db)
+                _require_revisable_plan(exact_source)
+                if exact_source.plan_target_task_id is not None:
+                    raise HTTPException(
+                        409,
+                        "Plan target changed while its revision was being created",
+                    )
+                exact_prompt = (
+                    f"{exact_source.description or ''}\n\n"
+                    "Previous Plan:\n"
+                    f"{exact_source.plan_content or '(no completed plan)'}\n\n"
+                    "User revision feedback:\n"
+                    f"{body.feedback.strip()}"
+                )
+                staged = await stage_task_record(
+                    db,
+                    title=(
+                        body.title.strip()
+                        if body.title and body.title.strip()
+                        else f"Revision of Plan #{exact_source.id}"
+                    )[:200],
+                    description=exact_prompt,
+                    status="pending",
+                    priority=exact_source.priority,
+                    project_id=exact_source.project_id,
+                    target_repo=exact_source.target_repo,
+                    target_branch=exact_source.target_branch,
+                    merge_status="pending",
+                    worker_id=exact_source.worker_id,
+                    created_by=get_current_user_id(request),
+                    max_retries=exact_source.max_retries,
+                    mode="plan",
+                    provider=revision_pipeline.planner.primary.provider,
+                    model=revision_pipeline.planner.primary.model,
+                    codex_service_tier=exact_source.codex_service_tier,
+                    effort_level=revision_pipeline.planner.primary.effort,
+                    plan_pipeline_config=(
+                        revision_pipeline.model_dump(mode="json")
+                    ),
+                    timeout_hours=exact_source.timeout_hours,
+                    enable_workflows=False,
+                    enabled_skills={},
+                    selected_user_skills=[],
+                    metadata_={
+                        "revised_from_plan_task_id": exact_source.id
+                    },
+                    plan_context_session_id=None,
+                    plan_context_log_id=None,
+                    plan_repo_revision=repo_revision,
+                    supersedes_plan_task_id=exact_source.id,
+                )
+                if not await mark_plan_superseded(
+                    db,
+                    exact_source,
+                    successor_id=staged.id,
+                ):
+                    raise HTTPException(
+                        409,
+                        "Plan changed while its revision was being created",
+                    )
+                return staged
+
+            try:
+                revision = await run_plan_terminal_transition(
+                    db,
+                    plan_task_id,
+                    "superseded",
+                    commit_standalone_supersede,
+                )
+            except PlanTerminalQuiescenceError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            await db.refresh(revision)
             if revision.project_id:
                 try:
                     from backend.services.task_sharing import auto_share_new_task
@@ -679,6 +797,12 @@ async def create_plan_execution_task(
         if plan is None:
             raise HTTPException(404, "Plan Task not found")
         await require_task_control(request, plan, db)
+        if plan.canonical_plan_id is not None:
+            raise HTTPException(
+                409,
+                "Migrated Plan carriers already contain their exact execution "
+                "application; use the canonical Plan instead",
+            )
         if plan.mode != "plan" or plan.plan_target_task_id is not None:
             raise HTTPException(400, "Only standalone Plans create execution Tasks")
         if plan.plan_approved is not True or not plan.plan_content:
@@ -688,6 +812,8 @@ async def create_plan_execution_task(
             if existing is None:
                 raise HTTPException(409, "Recorded execution Task no longer exists")
             return PlanExecutionResponse(plan_task=plan, execution_task=existing)
+
+        await _fence_plan_task_admission(db, plan.id)
 
         metadata = deepcopy(plan.metadata_ or {})
         metadata["created_from_plan_task_id"] = plan.id
@@ -732,6 +858,7 @@ async def create_plan_execution_task(
                 Task.id == plan.id,
                 Task.plan_execution_task_id.is_(None),
                 Task.plan_approved.is_(True),
+                no_active_worker_task_termination_predicate(),
             )
             .values(plan_execution_task_id=execution.id)
         )

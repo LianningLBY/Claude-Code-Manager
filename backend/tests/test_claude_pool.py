@@ -767,6 +767,11 @@ class TestChatPoolRotationRegression:
         im._launch_params[1] = {"prompt": "hello"}
         im.get_recent_log_contents = AsyncMock(return_value=["You've hit your limit"])
         im.launch = AsyncMock()
+        # This regression isolates account/session migration after admission.
+        # Exact pre-provider replay fencing is covered by
+        # test_service_instance_manager; bypass it here rather than relying on
+        # the old source-less MagicMock Task shape, which now fails closed.
+        im._chat_automatic_relaunch_is_blocked = AsyncMock(return_value=False)
 
         ok = await im._try_chat_pool_rotation(1, 42, 1, "You've hit your limit")
 
@@ -1469,6 +1474,10 @@ class TestChatTransientRetryCodex:
         im._launch_params[1] = {"prompt": "hello", "provider": provider}
         im.get_recent_log_contents = AsyncMock(return_value=[log_text])
         im.launch = AsyncMock()
+        # These provider-routing tests intentionally isolate the relaunch
+        # arguments. Source/transport admission safety has its own exact-turn
+        # matrix in test_service_instance_manager.
+        im._chat_automatic_relaunch_is_blocked = AsyncMock(return_value=False)
         return im
 
     @pytest.mark.asyncio

@@ -15,7 +15,15 @@ router = APIRouter()
 
 _MAX_WS_CHANNELS = 100
 _WS_ACL_RECHECK_SECONDS = 5.0
-_GLOBAL_CHANNELS = {"tasks", "plans", "workers", "system", "system_update", "pr-monitor"}
+_GLOBAL_CHANNELS = {
+    "tasks",
+    "plans",
+    "workers",
+    "system",
+    "system_update",
+    "pr-monitor",
+    "capabilities",
+}
 _INSTANCE_CHANNEL_RE = re.compile(r"instance:([1-9]\d*)\Z")
 _TASK_CHANNEL_RE = re.compile(r"task:([1-9]\d*)\Z")
 _PLAN_CHANNEL_RE = re.compile(r"plan:([1-9]\d*)\Z")

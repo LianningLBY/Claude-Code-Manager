@@ -1,14 +1,34 @@
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import desc, func, select
+from datetime import datetime, timezone
+import hashlib
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from sqlalchemy import delete, desc, func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
-from backend.api.deps import require_project_access
+from backend.api.deps import get_current_user_id, require_project_access
+from backend.models.delivery import DeliveryRun
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
-from backend.schemas.project_todo import ProjectTodoCreate, ProjectTodoResponse, ProjectTodoUpdate
+from backend.models.task import Task
+from backend.schemas.project_todo import (
+    ProjectTodoCreate,
+    ProjectTodoResponse,
+    ProjectTodoTaskCreate,
+    ProjectTodoUpdate,
+)
+from backend.schemas.task import TaskResponse
+from backend.services.task_creation import stage_task_record
 
 router = APIRouter(prefix="/api/projects/{project_id}/todos", tags=["project-todos"])
+
+_TODO_TASK_ADMISSION_KEY = "project_todo_task_admission"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 async def _require_project(project_id: int, db: AsyncSession) -> Project:
@@ -18,14 +38,95 @@ async def _require_project(project_id: int, db: AsyncSession) -> Project:
     return project
 
 
-async def _require_todo(project_id: int, todo_id: int, db: AsyncSession) -> ProjectTodo:
-    result = await db.execute(
-        select(ProjectTodo).where(ProjectTodo.id == todo_id, ProjectTodo.project_id == project_id)
+async def _require_todo(
+    project_id: int,
+    todo_id: int,
+    db: AsyncSession,
+    *,
+    for_update: bool = False,
+) -> ProjectTodo:
+    statement = select(ProjectTodo).where(
+        ProjectTodo.id == todo_id,
+        ProjectTodo.project_id == project_id,
     )
+    if for_update:
+        statement = statement.with_for_update().execution_options(
+            populate_existing=True
+        )
+    result = await db.execute(statement)
     todo = result.scalar_one_or_none()
     if not todo:
         raise HTTPException(404, "Todo not found")
     return todo
+
+
+def _todo_has_no_delivery_owner():
+    return ~select(DeliveryRun.id).where(
+        DeliveryRun.source_todo_id == ProjectTodo.id
+    ).exists()
+
+
+async def _delivery_owner_id(db: AsyncSession, todo_id: int) -> int | None:
+    return await db.scalar(
+        select(DeliveryRun.id)
+        .where(DeliveryRun.source_todo_id == todo_id)
+        .limit(1)
+    )
+
+
+async def _require_unowned_todo(db: AsyncSession, todo: ProjectTodo) -> None:
+    owner_id = await _delivery_owner_id(db, todo.id)
+    if owner_id is not None:
+        raise HTTPException(
+            409,
+            f"Todo is owned by Delivery Run {owner_id} and is immutable",
+        )
+
+
+def _todo_task_request_hash(body: ProjectTodoTaskCreate) -> str:
+    payload = {
+        "schema_version": 1,
+        **body.model_dump(mode="json"),
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def _replayed_todo_task(
+    db: AsyncSession,
+    *,
+    todo: ProjectTodo,
+    request_hash: str,
+) -> Task | None:
+    """Return the one exact Task already claimed by this Todo, if any."""
+
+    if todo.created_task_id is None:
+        return None
+    task = await db.get(Task, todo.created_task_id, populate_existing=True)
+    marker = (
+        (task.metadata_ or {}).get(_TODO_TASK_ADMISSION_KEY)
+        if task is not None and isinstance(task.metadata_, dict)
+        else None
+    )
+    if (
+        task is None
+        or task.project_id != todo.project_id
+        or todo.task_request_hash != request_hash
+        or not isinstance(marker, dict)
+        or marker.get("schema_version") != 1
+        or marker.get("todo_id") != todo.id
+        or marker.get("request_hash") != request_hash
+    ):
+        raise HTTPException(
+            409,
+            "Todo is already claimed by a different or unverifiable Task request",
+        )
+    return task
 
 
 @router.get("", response_model=list[ProjectTodoResponse])
@@ -88,26 +189,40 @@ async def update_project_todo(
     """Partial update. Also the canonical way to archive (status='archived')
     or restore (status='open') — DELETE is reserved for permanent removal."""
     await require_project_access(request, project_id, db)
-    todo = await _require_todo(project_id, todo_id, db)
+    todo = await _require_todo(project_id, todo_id, db, for_update=True)
+    await _require_unowned_todo(db, todo)
     updates = body.model_dump(exclude_unset=True)
 
     if "title" in updates and updates["title"] is not None:
         title = updates["title"].strip()
         if not title:
             raise HTTPException(400, "Title is required")
-        todo.title = title
+        updates["title"] = title
     if "prompt" in updates and updates["prompt"] is not None:
         prompt = updates["prompt"].strip()
         if not prompt:
             raise HTTPException(400, "Prompt is required")
-        todo.prompt = prompt
-    if "status" in updates and updates["status"] is not None:
-        todo.status = updates["status"]
-    if "sort_order" in updates and updates["sort_order"] is not None:
-        todo.sort_order = updates["sort_order"]
-    if "created_task_id" in updates:
-        todo.created_task_id = updates["created_task_id"]
-    # updated_at is bumped automatically by the model's onupdate=_utcnow on flush.
+        updates["prompt"] = prompt
+
+    guarded = await db.execute(
+        update(ProjectTodo)
+        .where(
+            ProjectTodo.id == todo.id,
+            ProjectTodo.project_id == project_id,
+            _todo_has_no_delivery_owner(),
+        )
+        .values(**updates, updated_at=_utcnow())
+        .execution_options(synchronize_session=False)
+    )
+    if guarded.rowcount != 1:
+        owner_id = await _delivery_owner_id(db, todo.id)
+        await db.rollback()
+        if owner_id is not None:
+            raise HTTPException(
+                409,
+                f"Todo is owned by Delivery Run {owner_id} and is immutable",
+            )
+        raise HTTPException(409, "Todo changed while it was being updated")
 
     await db.commit()
     await db.refresh(todo)
@@ -123,7 +238,136 @@ async def delete_project_todo(
 ):
     """Permanently delete a todo. To hide without destroying, PATCH status='archived'."""
     await require_project_access(request, project_id, db)
-    todo = await _require_todo(project_id, todo_id, db)
-    await db.delete(todo)
+    todo = await _require_todo(project_id, todo_id, db, for_update=True)
+    await _require_unowned_todo(db, todo)
+    deleted = await db.execute(
+        delete(ProjectTodo).where(
+            ProjectTodo.id == todo.id,
+            ProjectTodo.project_id == project_id,
+            _todo_has_no_delivery_owner(),
+        )
+    )
+    if deleted.rowcount != 1:
+        owner_id = await _delivery_owner_id(db, todo.id)
+        await db.rollback()
+        if owner_id is not None:
+            raise HTTPException(
+                409,
+                f"Todo is owned by Delivery Run {owner_id} and is immutable",
+            )
+        raise HTTPException(409, "Todo changed while it was being deleted")
     await db.commit()
     return {"ok": True}
+
+
+@router.post("/{todo_id}/task", response_model=TaskResponse, status_code=201)
+async def create_task_from_todo(
+    project_id: int,
+    todo_id: int,
+    body: ProjectTodoTaskCreate,
+    request: Request,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Atomically create an ordinary Task and claim its source Todo.
+
+    The conditional claim shares the Todo row with Delivery admission.  A
+    normal Task and a Delivery Run can therefore never both survive a race.
+    """
+
+    await require_project_access(request, project_id, db)
+    project = await _require_project(project_id, db)
+    todo = await _require_todo(project_id, todo_id, db, for_update=True)
+    await _require_unowned_todo(db, todo)
+    request_hash = _todo_task_request_hash(body)
+    task = await _replayed_todo_task(
+        db,
+        todo=todo,
+        request_hash=request_hash,
+    )
+    if task is not None:
+        # The Todo is the single-use idempotency domain.  Closing this read
+        # transaction also refreshes the response boundary after a prior POST
+        # committed but its HTTP response was lost.
+        await db.commit()
+        response.status_code = 200
+    elif todo.status != "open":
+        raise HTTPException(409, "Todo is not open or is already claimed")
+
+    if task is None:
+        try:
+            task = await stage_task_record(
+                db,
+                title=body.title,
+                description=body.prompt,
+                status="pending",
+                priority=0,
+                project_id=project.id,
+                target_repo=project.local_path,
+                target_branch=project.default_branch or "main",
+                worker_id=project.worker_id,
+                created_by=get_current_user_id(request),
+                provider=body.provider,
+                model=body.model,
+                codex_service_tier=body.codex_service_tier,
+                effort_level=body.effort_level,
+                timeout_hours=body.timeout_hours,
+                mode="auto",
+                metadata_={
+                    _TODO_TASK_ADMISSION_KEY: {
+                        "schema_version": 1,
+                        "todo_id": todo.id,
+                        "request_hash": request_hash,
+                    }
+                },
+            )
+            claimed = await db.execute(
+                update(ProjectTodo)
+                .where(
+                    ProjectTodo.id == todo.id,
+                    ProjectTodo.project_id == project.id,
+                    ProjectTodo.status == "open",
+                    ProjectTodo.created_task_id.is_(None),
+                    ProjectTodo.task_request_hash.is_(None),
+                    _todo_has_no_delivery_owner(),
+                )
+                .values(
+                    status="done",
+                    created_task_id=task.id,
+                    task_request_hash=request_hash,
+                    updated_at=_utcnow(),
+                )
+            )
+            if claimed.rowcount != 1:
+                raise HTTPException(
+                    409,
+                    "Todo was claimed by another Task or Delivery Run",
+                )
+            await db.commit()
+            await db.refresh(task)
+        except HTTPException:
+            await db.rollback()
+            raise
+        except ValueError as exc:
+            await db.rollback()
+            raise HTTPException(422, str(exc)) from exc
+        except IntegrityError as exc:
+            await db.rollback()
+            raise HTTPException(409, "Todo Task admission conflicted") from exc
+
+    assert task is not None
+    try:
+        from backend.main import dispatcher
+
+        if dispatcher is not None:
+            dispatcher.wake()
+    except (ImportError, AttributeError):
+        pass
+    if task.project_id is not None:
+        try:
+            from backend.services.task_sharing import auto_share_new_task
+
+            await auto_share_new_task(db, task.id, task.project_id)
+        except Exception:
+            pass
+    return task

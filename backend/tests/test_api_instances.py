@@ -10,6 +10,9 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.tests.worker_termination_helpers import (
+    persist_active_worker_receipt,
+)
 
 def _make_mock_instance_manager(is_running_val=False, launch_pid=12345, stop_val=True):
     mock = MagicMock()
@@ -46,9 +49,28 @@ def _make_mock_dispatcher():
     return mock
 
 
-async def _assign_running_task(session_factory, instance_id: int) -> int:
+def _make_mock_capability_resume_coordinator():
+    mock = MagicMock()
+    mock.start = AsyncMock()
+    mock.shutdown = AsyncMock()
+    return mock
+
+
+async def _assign_running_task(
+    session_factory,
+    instance_id: int,
+    *,
+    retry_count: int = 0,
+    turn_generation: int = 0,
+) -> int:
     async with session_factory() as db:
-        task = Task(title="running task", description="owner", status="executing")
+        task = Task(
+            title="running task",
+            description="owner",
+            status="executing",
+            retry_count=retry_count,
+            turn_generation=turn_generation,
+        )
         db.add(task)
         await db.flush()
         instance = await db.get(Instance, instance_id)
@@ -152,6 +174,37 @@ async def test_get_instance(client):
 async def test_get_instance_not_found(client):
     resp = await client.get("/api/instances/9999")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_instance_responses_expose_current_task_generation(
+    client,
+    session_factory,
+):
+    created = await client.post("/api/instances", json={"name": "observed"})
+    instance_id = created.json()["id"]
+    assert created.json()["current_task_retry_count"] is None
+    assert created.json()["current_task_turn_generation"] is None
+
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        retry_count=3,
+        turn_generation=7,
+    )
+
+    detail = await client.get(f"/api/instances/{instance_id}")
+    listed = await client.get("/api/instances")
+
+    assert detail.status_code == 200
+    assert detail.json()["current_task_id"] == task_id
+    assert detail.json()["current_task_retry_count"] == 3
+    assert detail.json()["current_task_turn_generation"] == 7
+    listed_instance = next(
+        item for item in listed.json() if item["id"] == instance_id
+    )
+    assert listed_instance["current_task_retry_count"] == 3
+    assert listed_instance["current_task_turn_generation"] == 7
 
 
 @pytest.mark.asyncio
@@ -556,13 +609,18 @@ async def test_cleanup_reconciles_dead_terminal_pid(
 async def test_stop_instance_success(client, session_factory):
     created = await client.post("/api/instances", json={"name": "running"})
     inst_id = created.json()["id"]
-    task_id = await _assign_running_task(session_factory, inst_id)
+    task_id = await _assign_running_task(
+        session_factory,
+        inst_id,
+        turn_generation=4,
+    )
     mock_im = _make_mock_instance_manager(stop_val=True)
     with patch("backend.main.instance_manager", mock_im):
         resp = await client.post(
             f"/api/instances/{inst_id}/stop",
             json={
                 "expected_task_id": task_id,
+                "expected_task_turn_generation": 4,
                 "expected_pid": 12345,
                 "expected_started_at": None,
             },
@@ -571,11 +629,148 @@ async def test_stop_instance_success(client, session_factory):
     mock_im.stop.assert_awaited_once_with(
         inst_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=4,
         expected_pid=12345,
         expected_started_at=None,
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_yields_to_active_worker_termination_receipt(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/instances",
+        json={"name": "receipt-owned-stop"},
+    )
+    instance_id = created.json()["id"]
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=5,
+    )
+    await persist_active_worker_receipt(session_factory, task_id)
+
+    mock_im = _make_mock_instance_manager(stop_val=True)
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+    ):
+        response = await client.post(
+            f"/api/instances/{instance_id}/stop",
+            json={
+                "expected_task_id": task_id,
+                "expected_task_turn_generation": 5,
+                "expected_pid": 12345,
+                "expected_started_at": None,
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.json()["detail"]
+    mock_rl.stop.assert_not_awaited()
+    mock_im.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_rechecks_receipt_after_operation_lock_wait(
+    client,
+    session_factory,
+):
+    from backend.services.worker_proxy import get_task_operation_lock
+
+    created = await client.post(
+        "/api/instances",
+        json={"name": "receipt-wins-stop-race"},
+    )
+    instance_id = created.json()["id"]
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=6,
+    )
+    operation_lock = get_task_operation_lock(task_id)
+    await operation_lock.acquire()
+    mock_im = _make_mock_instance_manager(stop_val=True)
+    mock_rl = _make_mock_ralph_loop()
+    try:
+        with (
+            patch("backend.main.instance_manager", mock_im),
+            patch("backend.main.ralph_loop", mock_rl),
+        ):
+            request = asyncio.create_task(
+                client.post(
+                    f"/api/instances/{instance_id}/stop",
+                    json={
+                        "expected_task_id": task_id,
+                        "expected_task_turn_generation": 6,
+                        "expected_pid": 12345,
+                        "expected_started_at": None,
+                    },
+                )
+            )
+            await asyncio.sleep(0)
+            assert not request.done()
+            await persist_active_worker_receipt(session_factory, task_id)
+            operation_lock.release()
+            response = await request
+    finally:
+        if operation_lock.locked():
+            operation_lock.release()
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.json()["detail"]
+    mock_rl.stop.assert_not_awaited()
+    mock_im.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_surfaces_receipt_that_wins_lifecycle_sql_gate(
+    client,
+    session_factory,
+):
+    created = await client.post(
+        "/api/instances",
+        json={"name": "late-receipt-stop"},
+    )
+    instance_id = created.json()["id"]
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=7,
+    )
+
+    async def receipt_wins_final_gate(*_args, **kwargs):
+        assert kwargs["yield_to_worker_task_termination"] is True
+        await persist_active_worker_receipt(session_factory, task_id)
+        return False
+
+    mock_im = _make_mock_instance_manager(stop_val=False)
+    mock_im.stop.side_effect = receipt_wins_final_gate
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+    ):
+        response = await client.post(
+            f"/api/instances/{instance_id}/stop",
+            json={
+                "expected_task_id": task_id,
+                "expected_task_turn_generation": 7,
+                "expected_pid": 12345,
+                "expected_started_at": None,
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "termination receipt" in response.json()["detail"]
+    mock_rl.stop.assert_awaited_once_with(instance_id)
+    mock_im.stop.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -589,6 +784,7 @@ async def test_stop_instance_not_running(client, session_factory):
             f"/api/instances/{inst_id}/stop",
             json={
                 "expected_task_id": task_id,
+                "expected_task_turn_generation": 0,
                 "expected_pid": 12345,
                 "expected_started_at": None,
             },
@@ -607,6 +803,7 @@ async def test_stop_instance_rejects_stale_task_owner(client, session_factory):
             f"/api/instances/{inst_id}/stop",
             json={
                 "expected_task_id": current_task_id + 1,
+                "expected_task_turn_generation": 0,
                 "expected_pid": 12345,
                 "expected_started_at": None,
             },
@@ -635,6 +832,7 @@ async def test_stop_instance_rejects_stale_pid_or_start_generation(
             f"/api/instances/{instance_id}/stop",
             json={
                 "expected_task_id": task_id,
+                "expected_task_turn_generation": 0,
                 "expected_pid": 54321,
                 "expected_started_at": started_at.isoformat(),
             },
@@ -643,6 +841,7 @@ async def test_stop_instance_rejects_stale_pid_or_start_generation(
             f"/api/instances/{instance_id}/stop",
             json={
                 "expected_task_id": task_id,
+                "expected_task_turn_generation": 0,
                 "expected_pid": 12345,
                 "expected_started_at": datetime(
                     2026, 4, 5, 6, 7, 9
@@ -653,6 +852,57 @@ async def test_stop_instance_rejects_stale_pid_or_start_generation(
     assert stale_pid.status_code == 409
     assert stale_start.status_code == 409
     mock_im.stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_instance_rejects_stale_turn_with_same_process_generation(
+    client,
+    session_factory,
+):
+    created = await client.post("/api/instances", json={"name": "hot-pty"})
+    instance_id = created.json()["id"]
+    started_at = datetime(2026, 8, 6, 1, 2, 3)
+    task_id = await _assign_running_task(
+        session_factory,
+        instance_id,
+        turn_generation=8,
+    )
+    async with session_factory() as db:
+        instance = await db.get(Instance, instance_id)
+        instance.started_at = started_at
+        await db.commit()
+
+    observed = await client.get(f"/api/instances/{instance_id}")
+    assert observed.json()["current_task_turn_generation"] == 8
+
+    # A hot PTY turn reuses the same Task, PID and started_at. Only the Task's
+    # durable turn generation distinguishes the replacement model turn.
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.turn_generation = 9
+        await db.commit()
+
+    mock_im = _make_mock_instance_manager(stop_val=True)
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+        patch("backend.services.instance_manager.os.kill") as signal_process,
+    ):
+        response = await client.post(
+            f"/api/instances/{instance_id}/stop",
+            json={
+                "expected_task_id": task_id,
+                "expected_task_turn_generation": 8,
+                "expected_pid": 12345,
+                "expected_started_at": started_at.isoformat(),
+            },
+        )
+
+    assert response.status_code == 409
+    mock_rl.stop.assert_not_awaited()
+    mock_im.stop.assert_not_awaited()
+    signal_process.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -672,6 +922,7 @@ async def test_stop_instance_fails_closed_when_legacy_ralph_owner_remains(
             f"/api/instances/{inst_id}/stop",
             json={
                 "expected_task_id": task_id,
+                "expected_task_turn_generation": 0,
                 "expected_pid": 12345,
                 "expected_started_at": None,
             },
@@ -683,10 +934,12 @@ async def test_stop_instance_fails_closed_when_legacy_ralph_owner_remains(
     mock_im.stop.assert_awaited_once_with(
         inst_id,
         expected_task_id=task_id,
+        expected_task_turn_generation=0,
         expected_pid=12345,
         expected_started_at=None,
         terminal_consumer_timeout=30.0,
         consumer_cancel_timeout=10.0,
+        yield_to_worker_task_termination=True,
     )
 
 
@@ -754,7 +1007,6 @@ async def test_direct_run_codex_task_is_also_retired(client):
         "description": "Continue work",
         "target_repo": "/tmp",
         "provider": "codex",
-        "session_id": "thread-manual-1",
     })
     task_id = task_resp.json()["id"]
 
@@ -904,19 +1156,100 @@ async def test_dispatcher_status(client):
 @pytest.mark.asyncio
 async def test_dispatcher_start(client):
     mock_disp = _make_mock_dispatcher()
-    with patch("backend.main.dispatcher", mock_disp):
+    mock_resume = _make_mock_capability_resume_coordinator()
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
         resp = await client.post("/api/dispatcher/start")
     assert resp.status_code == 200
     mock_disp.start.assert_awaited_once()
+    mock_resume.start.assert_awaited_once()
 
 
 @pytest.mark.asyncio
 async def test_dispatcher_stop(client):
     mock_disp = _make_mock_dispatcher()
-    with patch("backend.main.dispatcher", mock_disp):
+    mock_resume = _make_mock_capability_resume_coordinator()
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
         resp = await client.post("/api/dispatcher/stop")
     assert resp.status_code == 200
+    mock_resume.shutdown.assert_awaited_once()
     mock_disp.stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_start_rolls_back_when_resume_start_fails(client):
+    state = {"dispatcher": False, "resume": False}
+
+    async def start_dispatcher_runtime():
+        state["dispatcher"] = True
+
+    async def stop_dispatcher_runtime():
+        state["dispatcher"] = False
+
+    async def start_resume_runtime():
+        raise RuntimeError("resume recovery failed")
+
+    async def stop_resume_runtime():
+        state["resume"] = False
+
+    mock_disp = _make_mock_dispatcher()
+    mock_disp.start.side_effect = start_dispatcher_runtime
+    mock_disp.stop.side_effect = stop_dispatcher_runtime
+    mock_resume = _make_mock_capability_resume_coordinator()
+    mock_resume.start.side_effect = start_resume_runtime
+    mock_resume.shutdown.side_effect = stop_resume_runtime
+
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
+        response = await client.post("/api/dispatcher/start")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "resume recovery failed"
+    assert state == {"dispatcher": False, "resume": False}
+    mock_resume.shutdown.assert_awaited_once_with()
+    mock_disp.stop.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_stop_restores_resume_when_dispatcher_stop_fails(
+    client,
+):
+    state = {"dispatcher": True, "resume": True}
+
+    async def stop_dispatcher_runtime():
+        raise RuntimeError("dispatch loop ignored cancellation")
+
+    async def stop_resume_runtime():
+        state["resume"] = False
+
+    async def start_resume_runtime():
+        state["resume"] = True
+
+    mock_disp = _make_mock_dispatcher()
+    mock_disp.stop.side_effect = stop_dispatcher_runtime
+    mock_resume = _make_mock_capability_resume_coordinator()
+    mock_resume.shutdown.side_effect = stop_resume_runtime
+    mock_resume.start.side_effect = start_resume_runtime
+
+    with (
+        patch("backend.main.dispatcher", mock_disp),
+        patch("backend.main.capability_resume_coordinator", mock_resume),
+    ):
+        response = await client.post("/api/dispatcher/stop")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "dispatch loop ignored cancellation"
+    assert state == {"dispatcher": True, "resume": True}
+    mock_resume.shutdown.assert_awaited_once_with()
+    mock_disp.stop.assert_awaited_once_with()
+    mock_resume.start.assert_awaited_once_with()
 
 
 # === Ralph ===

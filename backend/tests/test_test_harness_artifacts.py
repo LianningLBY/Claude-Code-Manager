@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -185,3 +187,135 @@ def test_orphan_and_expired_job_cleanup_is_scoped_to_managed_root(tmp_path):
     assert store.cleanup_job_dirs(now=datetime.now(timezone.utc)) == 1
     assert not job_dir.exists()
     assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_job_cleanup_reclaims_oldest_eligible_staging_at_quota_equality(tmp_path):
+    store = _store(
+        tmp_path,
+        max_file_bytes=8,
+        max_run_bytes=8,
+        max_task_bytes=8,
+        max_total_bytes=8,
+    )
+    oldest = store.create_job_dir("1" * 32)
+    oldest.joinpath("report.md").write_bytes(b"12345678")
+    newer = store.jobs_root / ("2" * 32)
+    newer.mkdir(mode=0o700)
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).timestamp()
+    os.utime(oldest, (old, old))
+
+    assert store.total_bytes() == store.max_total_bytes
+    assert store.cleanup_job_dirs(active_job_ids={newer.name}) == 1
+    assert not oldest.exists()
+    assert newer.exists()
+
+
+def test_shared_root_lock_makes_job_quota_check_and_write_atomic(tmp_path):
+    limits = {
+        "max_file_bytes": 6,
+        "max_run_bytes": 8,
+        "max_task_bytes": 8,
+        "max_total_bytes": 8,
+    }
+    first_store = _store(tmp_path, **limits)
+    second_store = _store(tmp_path, **limits)
+    first_dir = first_store.create_job_dir("1" * 32)
+    second_dir = second_store.create_job_dir("2" * 32)
+    barrier = threading.Barrier(2)
+
+    def write(store, job_dir, name):
+        barrier.wait()
+        try:
+            store.write_job_bytes(job_dir, name, b"123456")
+        except ArtifactQuotaError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [
+            executor.submit(
+                write,
+                first_store,
+                first_dir,
+                "report.md",
+            ),
+            executor.submit(
+                write,
+                second_store,
+                second_dir,
+                "telemetry.json",
+            ),
+        ]
+
+    assert sorted(future.result() for future in outcomes) == [False, True]
+    assert first_store.total_bytes() == 6
+
+
+@pytest.mark.parametrize("quota_scope", ["run", "task", "total"])
+def test_concurrent_archives_cannot_overshoot_scoped_quota(tmp_path, quota_scope):
+    limits = {
+        "max_file_bytes": 6,
+        "max_run_bytes": 6 if quota_scope != "run" else 8,
+        "max_task_bytes": 8 if quota_scope == "task" else 16,
+        "max_total_bytes": 8 if quota_scope == "total" else 64,
+    }
+    if quota_scope == "total":
+        limits["max_task_bytes"] = 6
+    first_store = _store(tmp_path, **limits)
+    second_store = _store(tmp_path, **limits)
+    first_source = tmp_path / "first.md"
+    second_source = tmp_path / "second.md"
+    first_source.write_bytes(b"123456")
+    second_source.write_bytes(b"abcdef")
+    barrier = threading.Barrier(2)
+
+    first_identity = {
+        "task_id": 7,
+        "run_id": "a" * 32,
+        "attempt_id": "1" * 32,
+    }
+    if quota_scope == "run":
+        second_identity = {
+            "task_id": 7,
+            "run_id": "a" * 32,
+            "attempt_id": "2" * 32,
+        }
+    elif quota_scope == "task":
+        second_identity = {
+            "task_id": 7,
+            "run_id": "b" * 32,
+            "attempt_id": "2" * 32,
+        }
+    else:
+        second_identity = {
+            "task_id": 8,
+            "run_id": "b" * 32,
+            "attempt_id": "2" * 32,
+        }
+
+    def archive(store, source, identity):
+        barrier.wait()
+        try:
+            store.archive(source, name="report.md", **identity)
+        except ArtifactQuotaError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = [
+            executor.submit(
+                archive,
+                first_store,
+                first_source,
+                first_identity,
+            ),
+            executor.submit(
+                archive,
+                second_store,
+                second_source,
+                second_identity,
+            ),
+        ]
+
+    assert sorted(future.result() for future in outcomes) == [False, True]
+    assert first_store.total_bytes() == 6

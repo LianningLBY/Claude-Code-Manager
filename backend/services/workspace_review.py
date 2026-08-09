@@ -33,11 +33,18 @@ from backend.database import async_session
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessChildBinding
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.test_harness_children import TestHarnessChildService
 from backend.services.test_harness_contracts import DEFAULT_BROWSER_CHANNEL
+from backend.services.test_harness_owner_fence import (
+    TestHarnessOwnerIdentity,
+    lock_test_harness_owner,
+    test_harness_owner_fence,
+    test_harness_owner_identity,
+)
 from backend.services.test_harness_runtime import resolve_harness_runtime
 
 
@@ -1051,6 +1058,7 @@ class WorkspaceReviewManager:
         preview_config_override: dict[str, Any] | None = None,
         test_plan: dict[str, Any] | None = None,
         runtime_config: dict[str, Any] | None = None,
+        owner_identity: TestHarnessOwnerIdentity | None = None,
     ) -> WorkspaceReviewRun:
         if mode not in _ALLOWED_MODES:
             raise WorkspaceReviewError("workspace review mode must be review_only or fix_loop")
@@ -1063,7 +1071,43 @@ class WorkspaceReviewManager:
             raise WorkspaceReviewError("workspace review goal is required")
 
         async with self._lock:
+            async with async_session() as lookup:
+                task_snapshot = await lookup.get(Task, task_id)
+                if task_snapshot is None:
+                    raise WorkspaceReviewError("Task not found")
+                browser_parent = await lookup.scalar(
+                    select(TestHarnessChildBinding.id).where(
+                        TestHarnessChildBinding.child_task_id == task_id
+                    )
+                )
+                metadata = (
+                    task_snapshot.metadata_
+                    if isinstance(task_snapshot.metadata_, dict)
+                    else {}
+                )
+                if (
+                    browser_parent is not None
+                    or metadata.get("isolated_browser_agent") is True
+                ):
+                    raise WorkspaceReviewError(
+                        "Isolated Browser Agent Tasks cannot own Workspace Reviews"
+                    )
+                expected_owner = owner_identity or test_harness_owner_identity(
+                    task_snapshot
+                )
+                if expected_owner.task_id != task_id:
+                    raise WorkspaceReviewError(
+                        "Workspace review owner identity does not match Task"
+                    )
+
             async with async_session() as db:
+                try:
+                    # Begin a fresh writer transaction at the owner Task. A
+                    # preceding WAL read snapshot cannot safely be upgraded
+                    # after delete wins on another connection.
+                    task = await lock_test_harness_owner(db, expected_owner)
+                except RuntimeError as exc:
+                    raise WorkspaceReviewError(str(exc)) from exc
                 active = await db.scalar(
                     select(WorkspaceReviewRun.id).where(
                         WorkspaceReviewRun.task_id == task_id,
@@ -1071,10 +1115,9 @@ class WorkspaceReviewManager:
                     )
                 )
                 if active is not None:
-                    raise WorkspaceReviewBusyError("This Task already has an active workspace review")
-                task = await db.get(Task, task_id)
-                if task is None:
-                    raise WorkspaceReviewError("Task not found")
+                    raise WorkspaceReviewBusyError(
+                        "This Task already has an active workspace review"
+                    )
                 project = await db.get(Project, task.project_id) if task.project_id else None
                 workspace = (
                     _safe_workspace_override(workspace_override)
@@ -1100,6 +1143,10 @@ class WorkspaceReviewManager:
                 run = WorkspaceReviewRun(
                     id=uuid.uuid4().hex,
                     task_id=task.id,
+                    owner_task_incarnation_id=task.incarnation_id,
+                    owner_task_retry_count=task.retry_count,
+                    owner_task_turn_generation=task.turn_generation,
+                    owner_task_status=task.status,
                     project_id=task.project_id,
                     harness_run_id=harness_run_id,
                     mode=mode,
@@ -1143,6 +1190,105 @@ class WorkspaceReviewManager:
             for key, value in values.items():
                 setattr(run, key, value)
             await db.commit()
+
+    async def _materialize_browser_child(
+        self,
+        *,
+        run_id: str,
+        owner_task_id: int,
+        options: BrowserReviewOptions,
+        provider: str,
+        tier: str,
+        effort: str,
+        target_repo: Path,
+        test_plan: dict[str, Any] | None,
+    ) -> tuple[Any, Task, Any]:
+        """Commit prepare -> reserve -> attach -> activate under owner fence."""
+
+        from backend.services.browser_review_jobs import browser_review_job_manager
+
+        async with test_harness_owner_fence(owner_task_id):
+            async with async_session() as db:
+                current_run = await db.get(WorkspaceReviewRun, run_id)
+                owner = await db.get(Task, owner_task_id)
+                if (
+                    current_run is None
+                    or current_run.task_id != owner_task_id
+                    or current_run.status in _TERMINAL
+                    or owner is None
+                ):
+                    raise WorkspaceReviewError(
+                        "Workspace review owner ended before Browser admission"
+                    )
+                created_by = owner.created_by
+
+            job = None
+            binding = None
+            try:
+                job = await browser_review_job_manager.prepare_agent(
+                    options,
+                    provider=provider,
+                    codex_service_tier=tier,
+                    harness_run_id=current_run.harness_run_id,
+                )
+                child, binding = await self.child_service.reserve_child(
+                    owner_task_id=owner_task_id,
+                    browser_review_job_id=job.id,
+                    harness_run_id=current_run.harness_run_id,
+                    workspace_review_run_id=run_id,
+                    child_values={
+                        "title": (
+                            f"Workspace Browser Review: Task {owner_task_id}"[:200]
+                        ),
+                        "description": _browser_agent_prompt(
+                            job.id,
+                            job.options,
+                            profile=current_run.profile,
+                            test_plan=test_plan,
+                        ),
+                        "priority": 0,
+                        "max_retries": 0,
+                        "mode": "auto",
+                        "target_repo": str(target_repo),
+                        "provider": provider,
+                        "model": options.model,
+                        "codex_service_tier": tier,
+                        "effort_level": effort,
+                        "timeout_hours": 1.0,
+                        "enabled_skills": {"browser-review": job.id},
+                        "created_by": created_by,
+                        "archived": True,
+                    },
+                )
+                await browser_review_job_manager.attach_task(
+                    job.id,
+                    child.id,
+                    owner_task_id=owner_task_id,
+                )
+                await self.child_service.activate(binding.id)
+                await self._update(
+                    run_id,
+                    agent_task_id=child.id,
+                    browser_review_job_id=job.id,
+                    status="reviewing",
+                    stage="browser_agent_queued",
+                )
+                return job, child, binding
+            except BaseException as exc:
+                if binding is not None:
+                    try:
+                        await self.child_service.stop_binding(
+                            binding.id,
+                            reason=f"Browser child admission failed: {exc}",
+                        )
+                    except BaseException:
+                        logger.exception(
+                            "Could not stop failed Workspace Browser child %s",
+                            binding.id,
+                        )
+                if job is not None:
+                    await browser_review_job_manager.fail_start(job.id, exc)
+                raise
 
     async def _run_pipeline(
         self,
@@ -1218,54 +1364,18 @@ class WorkspaceReviewManager:
                 max_steps=resolved_max_steps,
                 max_actions=resolved_max_actions,
             )
-            job = await browser_review_job_manager.prepare_agent(
-                options,
+            job, child, binding = await self._materialize_browser_child(
+                run_id=run_id,
+                owner_task_id=parent.id,
+                options=options,
                 provider=provider,
-                codex_service_tier=tier,
-                harness_run_id=run.harness_run_id,
+                tier=tier,
+                effort=effort,
+                target_repo=handle.temp_dir,
+                test_plan=test_plan,
             )
             job_id = job.id
-            child, binding = await self.child_service.reserve_child(
-                owner_task_id=parent.id,
-                browser_review_job_id=job.id,
-                harness_run_id=run.harness_run_id,
-                workspace_review_run_id=run_id,
-                child_values={
-                    "title": f"Workspace Browser Review: Task {parent.id}"[:200],
-                    "description": _browser_agent_prompt(
-                        job.id,
-                        job.options,
-                        profile=run.profile,
-                        test_plan=test_plan,
-                    ),
-                    "priority": 0,
-                    "max_retries": 0,
-                    "mode": "auto",
-                    "target_repo": str(handle.temp_dir),
-                    "provider": provider,
-                    "model": model,
-                    "codex_service_tier": tier,
-                    "effort_level": effort,
-                    "timeout_hours": 1.0,
-                    "enabled_skills": {"browser-review": job.id},
-                    "created_by": created_by,
-                    "archived": True,
-                },
-            )
             child_binding_id = binding.id
-            await browser_review_job_manager.attach_task(
-                job.id,
-                child.id,
-                owner_task_id=parent.id,
-            )
-            await self.child_service.activate(binding.id)
-            await self._update(
-                run_id,
-                agent_task_id=child.id,
-                browser_review_job_id=job.id,
-                status="reviewing",
-                stage="browser_agent_queued",
-            )
             try:
                 from backend.main import dispatcher
 
@@ -1484,7 +1594,22 @@ class WorkspaceReviewManager:
             pipeline.cancel()
             await asyncio.gather(pipeline, return_exceptions=True)
         else:
-            await self.preview_manager.stop(run_id)
+            cleanup_error: str | None = None
+            try:
+                await self.preview_manager.stop(run_id)
+            except Exception as exc:
+                cleanup_error = str(exc)[:4000]
+            async with async_session() as db:
+                current = await db.get(WorkspaceReviewRun, run_id)
+                if current is not None:
+                    current.status = "cancelled"
+                    current.stage = "cancelled"
+                    current.completed_at = current.completed_at or datetime.utcnow()
+                    current.cleanup_status = (
+                        "completed" if cleanup_error is None else "failed"
+                    )
+                    current.cleanup_error = cleanup_error
+                    await db.commit()
         async with async_session() as db:
             return await db.get(WorkspaceReviewRun, run_id)
 

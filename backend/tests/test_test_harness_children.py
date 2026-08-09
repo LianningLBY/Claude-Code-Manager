@@ -5,8 +5,10 @@ import uuid
 from datetime import datetime
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.database import Base
 from backend.models.task import Task
 from backend.models.test_harness import (
     TestHarnessChildBinding as ChildBindingModel,
@@ -21,7 +23,18 @@ from backend.services.test_harness_children import (
     CHILD_STOP_FAILED,
     TestHarnessChildError as ChildError,
     TestHarnessChildService as ChildService,
+    browser_child_ssh_grant_error,
 )
+from backend.services.test_harness_owner_fence import (
+    lock_test_harness_owner as durable_owner_lock,
+    test_harness_owner_fence as owner_fence,
+)
+from backend.services.test_harness import (
+    TestHarnessError as HarnessError,
+    TestHarnessService as HarnessService,
+)
+from backend.services.test_harness_contracts import TestHarnessSpec as HarnessSpec
+import backend.services.test_harness_children as child_service_module
 
 
 async def _owner_and_run(db_factory, *, suffix: str = "") -> tuple[int, str]:
@@ -42,6 +55,10 @@ async def _owner_and_run(db_factory, *, suffix: str = "") -> tuple[int, str]:
             RunModel(
                 id=run_id,
                 task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
                 target_kind="fixed_url",
                 target_spec={"url": "https://example.com"},
                 test_plan={"objective": "Review the page"},
@@ -89,6 +106,25 @@ def _cancelling_stopper(db_factory, calls: list[int] | None = None):
                 await db.commit()
 
     return stop
+
+
+@pytest.mark.asyncio
+async def test_owner_fence_context_is_not_reentrant_in_spawned_task():
+    child_started = asyncio.Event()
+    child_entered = asyncio.Event()
+
+    async def child() -> None:
+        child_started.set()
+        async with owner_fence(991):
+            child_entered.set()
+
+    async with owner_fence(991):
+        operation = asyncio.create_task(child())
+        await asyncio.wait_for(child_started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not child_entered.is_set()
+    await asyncio.wait_for(operation, timeout=1)
+    assert child_entered.is_set()
 
 
 @pytest.mark.asyncio
@@ -147,6 +183,125 @@ async def test_isolated_pending_task_without_binding_is_never_claimed(db_factory
         assert await TaskQueue(db).dequeue() is None
         persisted = await db.get(Task, orphan.id)
         assert persisted.status == "pending"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drift_target", "drift_value"),
+    [
+        ("provider", "claude"),
+        ("model", "gpt-5.6-luna"),
+        ("effort_level", "low"),
+        ("codex_service_tier", "priority"),
+        ("timeout_hours", 2.0),
+        ("max_retries", 3),
+        ("capability_policy", {"plan": {"max_invocations": 1}}),
+        ("worker_id", 41),
+        ("shared_from_id", 42),
+        ("tags", {"pr-review": True}),
+        ("session_id", "must-not-resume"),
+        ("last_cwd", "/tmp/must-not-resume"),
+        ("enabled_skills", {"browser-review": "wrong-job"}),
+        ("metadata_", {"isolated_browser_agent": False}),
+        ("launch_config_digest", "0" * 64),
+    ],
+)
+async def test_dequeue_rejects_any_browser_launch_binding_drift(
+    db_factory,
+    drift_target,
+    drift_value,
+):
+    owner_id, run_id = await _owner_and_run(db_factory, suffix=drift_target)
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-drift",
+        harness_run_id=run_id,
+        child_values=_child_values("job-drift"),
+    )
+    await service.activate(binding.id)
+
+    async with db_factory() as db:
+        if drift_target == "launch_config_digest":
+            durable_binding = await db.get(ChildBindingModel, binding.id)
+            durable_binding.launch_config_digest = drift_value
+        else:
+            durable_child = await db.get(Task, child.id)
+            setattr(durable_child, drift_target, drift_value)
+        await db.commit()
+
+    async with db_factory() as db:
+        assert await TaskQueue(db).dequeue(instance_id=91) is None
+        durable_child = await db.get(Task, child.id)
+        durable_binding = await db.get(ChildBindingModel, binding.id)
+        assert durable_child.status == "pending"
+        assert durable_binding.state == CHILD_READY
+
+
+@pytest.mark.asyncio
+async def test_browser_child_allows_only_runtime_account_metadata(db_factory):
+    owner_id, run_id = await _owner_and_run(db_factory)
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-account-route",
+        harness_run_id=run_id,
+        child_values=_child_values("job-account-route"),
+    )
+    await service.activate(binding.id)
+
+    async with db_factory() as db:
+        durable = await db.get(Task, child.id)
+        durable.metadata_ = {
+            **durable.metadata_,
+            "codex_account_id": "codex-account-2",
+        }
+        await db.commit()
+        claimed = await TaskQueue(db).dequeue(instance_id=92)
+        assert claimed is not None and claimed.id == child.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "values",
+    [
+        {"session_id": "existing-session"},
+        {"last_cwd": "/tmp/existing-session"},
+        {"capability_policy": {"plan": {"max_invocations": 1}}},
+        {"worker_id": 7},
+        {"shared_from_id": 8},
+        {"delivery_run_id": 9, "delivery_role": "developer"},
+        {"tags": {"pr-review": True}},
+        {"metadata_": {"arbitrary_prompt_input": "forbidden"}},
+    ],
+)
+async def test_browser_child_reservation_rejects_resume_capability_and_metadata(
+    db_factory,
+    values,
+):
+    owner_id, run_id = await _owner_and_run(db_factory)
+    service = ChildService(db_factory=db_factory)
+    with pytest.raises(ChildError):
+        await service.reserve_child(
+            owner_task_id=owner_id,
+            browser_review_job_id="job-invalid-profile",
+            harness_run_id=run_id,
+            child_values={
+                **_child_values("job-invalid-profile"),
+                **values,
+            },
+        )
+
+
+def test_browser_child_ssh_collision_hook_is_fail_closed():
+    child = Task(metadata_={"isolated_browser_agent": True})
+    ordinary = Task(metadata_={})
+
+    assert "cannot receive SSH" in (
+        browser_child_ssh_grant_error(child, has_ssh_grant=True) or ""
+    )
+    assert browser_child_ssh_grant_error(child, has_ssh_grant=False) is None
+    assert browser_child_ssh_grant_error(ordinary, has_ssh_grant=True) is None
 
 
 @pytest.mark.asyncio
@@ -324,3 +479,163 @@ async def test_natural_completion_projects_to_binding(db_factory):
         assert await TaskQueue(db).mark_completed(child.id)
         durable = await db.get(ChildBindingModel, binding.id)
         assert durable.state == CHILD_COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_wal_delete_winner_prevents_late_harness_run_materialization(
+    monkeypatch,
+    tmp_path,
+):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'harness-run-fence.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            owner = Task(
+                title="WAL Harness owner",
+                description="owner",
+                status="completed",
+                provider="codex",
+                model="gpt-5.6-sol",
+                effort_level="high",
+            )
+            setup.add(owner)
+            await setup.commit()
+            owner_id = owner.id
+
+        service = HarnessService(db_factory=sessions)
+        reached_materialization = asyncio.Event()
+        resume_materialization = asyncio.Event()
+        original_create_run = service._create_run
+
+        async def paused_create_run(**kwargs):
+            reached_materialization.set()
+            await resume_materialization.wait()
+            return await original_create_run(**kwargs)
+
+        monkeypatch.setattr(service, "_create_run", paused_create_run)
+        operation = asyncio.create_task(
+            service.start_task_run(
+                task_id=owner_id,
+                spec=HarnessSpec(
+                    target_kind="fixed_url",
+                    target={"url": "https://example.com"},
+                    goal="Review",
+                ),
+            )
+        )
+        await asyncio.wait_for(reached_materialization.wait(), timeout=1)
+        async with sessions() as deleter:
+            assert await TaskQueue(deleter)._delete_under_owner_fence(owner_id)
+        resume_materialization.set()
+        with pytest.raises(HarnessError, match="owner Task"):
+            await asyncio.wait_for(operation, timeout=1)
+
+        async with sessions() as verify:
+            assert await verify.get(Task, owner_id) is None
+            assert await verify.scalar(select(func.count(RunModel.id))) == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("reserve", "activate"))
+async def test_wal_delete_winner_prevents_late_browser_child_publication(
+    monkeypatch,
+    tmp_path,
+    transition,
+):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / f'harness-child-{transition}.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        owner_id, run_id = await _owner_and_run(sessions, suffix=transition)
+        service = ChildService(db_factory=sessions)
+        child = None
+        binding = None
+        if transition == "activate":
+            child, binding = await service.reserve_child(
+                owner_task_id=owner_id,
+                browser_review_job_id="job-wal-activate",
+                harness_run_id=run_id,
+                child_values=_child_values("job-wal-activate"),
+            )
+
+        reached_owner_cas = asyncio.Event()
+        resume_owner_cas = asyncio.Event()
+
+        async def paused_owner_lock(db, identity):
+            reached_owner_cas.set()
+            await resume_owner_cas.wait()
+            return await durable_owner_lock(db, identity)
+
+        monkeypatch.setattr(
+            child_service_module,
+            "lock_test_harness_owner",
+            paused_owner_lock,
+        )
+        if transition == "reserve":
+            operation = asyncio.create_task(
+                service.reserve_child(
+                    owner_task_id=owner_id,
+                    browser_review_job_id="job-wal-reserve",
+                    harness_run_id=run_id,
+                    child_values=_child_values("job-wal-reserve"),
+                )
+            )
+        else:
+            assert binding is not None and child is not None
+            operation = asyncio.create_task(service.activate(binding.id))
+
+        await asyncio.wait_for(reached_owner_cas.wait(), timeout=1)
+        async with sessions() as winner:
+            run = await winner.get(RunModel, run_id)
+            assert run is not None
+            run.status = "completed"
+            run.stage = "completed"
+            run.cleanup_status = "completed"
+            run.completed_at = datetime.utcnow()
+            if transition == "activate":
+                durable_binding = await winner.get(
+                    ChildBindingModel,
+                    binding.id,
+                )
+                durable_child = await winner.get(Task, child.id)
+                assert durable_binding is not None and durable_child is not None
+                durable_binding.state = CHILD_STOPPED
+                durable_binding.completed_at = datetime.utcnow()
+                durable_child.status = "cancelled"
+                durable_child.completed_at = datetime.utcnow()
+            await winner.commit()
+        async with sessions() as deleter:
+            assert await TaskQueue(deleter)._delete_under_owner_fence(owner_id)
+
+        resume_owner_cas.set()
+        with pytest.raises(ChildError, match="owner Task"):
+            await asyncio.wait_for(operation, timeout=1)
+        async with sessions() as verify:
+            assert await verify.get(Task, owner_id) is None
+            assert await verify.scalar(select(func.count(Task.id))) == 0
+            assert await verify.scalar(
+                select(func.count(ChildBindingModel.id))
+            ) == 0
+    finally:
+        await engine.dispose()

@@ -22,6 +22,10 @@ from backend.schemas.monitor_session import (
     MonitorCompleteRequest,
 )
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 router = APIRouter(prefix="/api/tasks/{task_id}/monitor-sessions", tags=["monitor"])
 
@@ -39,6 +43,34 @@ def _monitor_admission_lock(task_id: int) -> asyncio.Lock:
         lock = asyncio.Lock()
         _monitor_admission_locks[task_id] = lock
     return lock
+
+
+def _task_relay_generation(task: Task) -> dict[str, int]:
+    """Freeze the Task generation carried by one monitor relay event."""
+
+    return {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
+
+
+async def _read_task_relay_generation(
+    db: AsyncSession,
+    task_id: int,
+) -> dict[str, int]:
+    row = (
+        await db.execute(
+            select(Task.retry_count, Task.turn_generation).where(
+                Task.id == task_id
+            )
+        )
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(404, "Task not found")
+    return {
+        "task_retry_count": row.retry_count,
+        "task_turn_generation": row.turn_generation,
+    }
 
 
 async def _settle_shielded(operation: asyncio.Task) -> asyncio.CancelledError | None:
@@ -231,6 +263,7 @@ async def create_monitor_session(
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(status=Task.status)
             )
@@ -240,6 +273,11 @@ async def create_monitor_session(
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise HTTPException(404, "Task not found")
+                if await active_worker_task_termination_receipt(db, task_id):
+                    raise HTTPException(
+                        409,
+                        "Task has an active Worker termination receipt",
+                    )
                 _require_monitor_capability(task)
                 if task.worker_id is not None:
                     from backend.main import worker_proxy
@@ -262,6 +300,7 @@ async def create_monitor_session(
             if task is None:
                 raise HTTPException(404, "Task not found")
             _require_monitor_capability(task)
+            relay_generation = _task_relay_generation(task)
             skills = task.enabled_skills or {}
             if not skills.get("monitor"):
                 raise HTTPException(
@@ -316,7 +355,12 @@ async def create_monitor_session(
 
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
-        {"event": "monitor_session_created", "monitor_session_id": ms.id, "description": ms.description},
+        {
+            "event": "monitor_session_created",
+            "monitor_session_id": ms.id,
+            "description": ms.description,
+            **relay_generation,
+        },
     )
 
     return ms
@@ -372,6 +416,7 @@ async def delete_monitor_session(
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, db)
+    relay_generation = _task_relay_generation(task)
     if task is not None and task.worker_id is not None:
         # 本地行是镜像（id 是 Manager 自增），worker 端要用 remote_id
         from backend.main import worker_proxy
@@ -446,6 +491,7 @@ async def delete_monitor_session(
                 "event": "monitor_session_status",
                 "monitor_session_id": session_id,
                 "status": "cancelled",
+                **relay_generation,
             },
         )
 
@@ -487,6 +533,9 @@ async def create_monitor_check(
     import json as _json
     from backend.main import dispatcher
     from backend.models.log_entry import LogEntry
+
+    relay_generation = await _read_task_relay_generation(db, task_id)
+    queue_admission_fence = await dispatcher.snapshot_queue_admission(task_id)
 
     next_check = MonitorSession.checks_done + 1
     reaches_limit = next_check >= MonitorSession.max_checks
@@ -615,15 +664,16 @@ async def create_monitor_check(
             f"[Monitor #{session_id} 汇报] {body.summary}\n\n"
             "请向用户简要转达这个监控结果。"
         )
-        await dispatcher.enqueue_message(
+        admitted = await dispatcher.enqueue_message(
             task_id=task_id,
             prompt=report_prompt,
             priority=PRIORITY_MONITOR_IMPORTANT,
             source="monitor:report",
             user_message_text=f"[Monitor #{session_id}] {body.summary}",
             monitor_session_id=session_id,
+            queue_admission_fence=queue_admission_fence,
         )
-        chat_injected = True
+        chat_injected = admitted is not False
 
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
@@ -636,6 +686,7 @@ async def create_monitor_check(
             "is_important": body.is_important,
             "chat_injected": chat_injected,
             "source": "monitor",
+            **relay_generation,
         },
     )
 
@@ -646,6 +697,7 @@ async def create_monitor_check(
                 "event": "monitor_session_status",
                 "monitor_session_id": session_id,
                 "status": "completed",
+                **relay_generation,
             },
         )
         from backend.services.dispatcher import PRIORITY_MONITOR_COMPLETE
@@ -662,6 +714,7 @@ async def create_monitor_check(
             source="monitor:complete",
             user_message_text=f"[Monitor #{session_id}] 监控完成: {body.summary}",
             monitor_session_id=session_id,
+            queue_admission_fence=queue_admission_fence,
         )
     return check
 
@@ -676,6 +729,10 @@ async def complete_monitor_session(
 ):
     """Sub-agent marks itself as complete."""
     require_internal_service(request)
+    from backend.main import dispatcher
+
+    relay_generation = await _read_task_relay_generation(db, task_id)
+    queue_admission_fence = await dispatcher.snapshot_queue_admission(task_id)
     completed = await db.execute(
         update(MonitorSession)
         .where(
@@ -720,7 +777,6 @@ async def complete_monitor_session(
     db.add(check)
     await db.commit()
 
-    from backend.main import dispatcher
     import json as _json
 
     chat_injected = False
@@ -736,11 +792,17 @@ async def complete_monitor_session(
             "is_important": False,
             "chat_injected": False,
             "source": "monitor",
+            **relay_generation,
         },
     )
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
-        {"event": "monitor_session_status", "monitor_session_id": session_id, "status": "completed"},
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": session_id,
+            "status": "completed",
+            **relay_generation,
+        },
     )
 
     # Check if the last report_status already notified the main agent
@@ -789,6 +851,7 @@ async def complete_monitor_session(
             source="monitor:complete",
             user_message_text=f"[Monitor #{session_id}] 监控完成: {body.reason}",
             monitor_session_id=session_id,
+            queue_admission_fence=queue_admission_fence,
         )
 
     return {"ok": True, "message": "Session completed. Your task is done — stop all activity now."}

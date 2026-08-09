@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
-from typing import Iterator
+from typing import Any, Iterator
 
 from backend.config import settings
 
@@ -25,6 +27,24 @@ _STORAGE_KEY_RE = re.compile(
     r"(?P<attempt>[0-9a-f]{32})/(?P<digest>[0-9a-f]{64})--(?P<name>[^/]+)$"
 )
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+# Artifact stores are intentionally cheap to construct in tests and auxiliary
+# services, so an instance-local mutex is insufficient: two stores pointed at
+# the same root must serialize quota admission and filesystem mutation.  Keep
+# the registry process-wide and key it by the already-canonicalized root.
+_ROOT_LOCKS_GUARD = threading.Lock()
+_ROOT_LOCKS: dict[str, Any] = {}
+
+
+def _shared_root_lock(root: Path) -> Any:
+    key = os.fspath(root)
+    with _ROOT_LOCKS_GUARD:
+        lock = _ROOT_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ROOT_LOCKS[key] = lock
+        return lock
 
 
 class TestHarnessArtifactError(RuntimeError):
@@ -83,6 +103,7 @@ class TestHarnessArtifactStore:
         # handles platform roots such as macOS /var -> /private/var; every later
         # access still requires this exact canonical path to remain non-symlink.
         self.root = Path(os.path.abspath(configured)).resolve(strict=False)
+        self._root_lock = _shared_root_lock(self.root)
         self.max_file_bytes = int(
             max_file_bytes or settings.test_harness_artifact_max_file_bytes
         )
@@ -123,26 +144,39 @@ class TestHarnessArtifactStore:
         return self.root / "runs"
 
     def ensure_root(self) -> None:
-        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._require_private_directory(self.root, fix_mode=True)
-        for child in (self.jobs_root, self.runs_root):
-            child.mkdir(mode=0o700, exist_ok=True)
-            self._require_private_directory(child, fix_mode=True)
+        with self._root_lock:
+            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._require_private_directory(self.root, fix_mode=True)
+            for child in (self.jobs_root, self.runs_root):
+                child.mkdir(mode=0o700, exist_ok=True)
+                self._require_private_directory(child, fix_mode=True)
 
     def create_job_dir(self, job_id: str) -> Path:
-        self._validate_id(job_id, "job")
-        self.ensure_root()
-        if self.total_bytes() >= self.max_total_bytes:
-            raise TestHarnessArtifactQuotaError("Test Harness evidence storage is full")
-        path = self.jobs_root / job_id
-        try:
-            path.mkdir(mode=0o700)
-        except FileExistsError as exc:
-            raise TestHarnessArtifactError("Browser Review job directory already exists") from exc
-        self._require_private_directory(path, fix_mode=True)
-        return path
+        with self._root_lock:
+            self._validate_id(job_id, "job")
+            self.ensure_root()
+            if self.total_bytes() >= self.max_total_bytes:
+                raise TestHarnessArtifactQuotaError("Test Harness evidence storage is full")
+            path = self.jobs_root / job_id
+            try:
+                path.mkdir(mode=0o700)
+            except FileExistsError as exc:
+                raise TestHarnessArtifactError(
+                    "Browser Review job directory already exists"
+                ) from exc
+            self._require_private_directory(path, fix_mode=True)
+            return path
 
     def ensure_job_capacity(self, job_dir: Path, name: str, incoming_size: int) -> None:
+        with self._root_lock:
+            self._ensure_job_capacity_locked(job_dir, name, incoming_size)
+
+    def _ensure_job_capacity_locked(
+        self,
+        job_dir: Path,
+        name: str,
+        incoming_size: int,
+    ) -> None:
         self._validate_artifact_name(name)
         if incoming_size < 0 or incoming_size > self.max_file_bytes:
             raise TestHarnessArtifactQuotaError(
@@ -157,7 +191,87 @@ class TestHarnessArtifactStore:
         if self.total_bytes() + delta > self.max_total_bytes:
             raise TestHarnessArtifactQuotaError("Test Harness evidence storage is full")
 
+    def write_job_bytes(self, job_dir: Path, name: str, value: bytes) -> Path:
+        """Atomically admit and replace one managed staging artifact."""
+
+        if not isinstance(value, bytes):
+            raise TestHarnessArtifactError("Browser Review artifact bytes are invalid")
+        with self._root_lock:
+            return self._write_job_bytes_locked(job_dir, name, value)
+
+    def write_job_text(self, job_dir: Path, name: str, value: str) -> Path:
+        if not isinstance(value, str):
+            raise TestHarnessArtifactError("Browser Review artifact text is invalid")
+        return self.write_job_bytes(job_dir, name, value.encode("utf-8"))
+
+    def append_job_jsonl(
+        self,
+        job_dir: Path,
+        name: str,
+        value: dict[str, Any],
+    ) -> Path:
+        """Append one complete JSON line under the same quota/write fence."""
+
+        if not isinstance(value, dict):
+            raise TestHarnessArtifactError("Browser Review action log entry is invalid")
+        encoded = (json.dumps(value, ensure_ascii=False) + "\n").encode("utf-8")
+        with self._root_lock:
+            managed = self._managed_job_dir(job_dir)
+            target = managed / name
+            current = self._read_regular_bytes(target)
+            return self._write_job_bytes_locked(managed, name, current + encoded)
+
+    def _write_job_bytes_locked(self, job_dir: Path, name: str, value: bytes) -> Path:
+        managed = self._managed_job_dir(job_dir)
+        self._ensure_job_capacity_locked(managed, name, len(value))
+        target = managed / name
+        temporary = managed / f".{name}.{uuid.uuid4().hex}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temporary, flags, 0o600)
+        try:
+            _write_all(fd, value)
+            os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        else:
+            os.close(fd)
+        try:
+            os.replace(temporary, target)
+            os.chmod(target, 0o600, follow_symlinks=False)
+            self._fsync_directory(managed)
+        except BaseException:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        return target
+
     def archive(
+        self,
+        source: Path,
+        *,
+        task_id: int,
+        run_id: str,
+        attempt_id: str,
+        name: str,
+    ) -> ArchivedArtifact:
+        with self._root_lock:
+            return self._archive_locked(
+                source,
+                task_id=task_id,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                name=name,
+            )
+
+    def _archive_locked(
         self,
         source: Path,
         *,
@@ -271,6 +385,20 @@ class TestHarnessArtifactStore:
         expected_sha256: str,
         expected_size: int,
     ) -> OpenedHarnessArtifact:
+        with self._root_lock:
+            return self._open_locked(
+                storage_key,
+                expected_sha256=expected_sha256,
+                expected_size=expected_size,
+            )
+
+    def _open_locked(
+        self,
+        storage_key: str,
+        *,
+        expected_sha256: str,
+        expected_size: int,
+    ) -> OpenedHarnessArtifact:
         path, name = self._storage_path(storage_key)
         fd = self._open_regular_readonly(path)
         try:
@@ -301,10 +429,15 @@ class TestHarnessArtifactStore:
             raise
 
     def resolve_path(self, storage_key: str) -> Path:
-        path, _name = self._storage_path(storage_key)
-        return path
+        with self._root_lock:
+            path, _name = self._storage_path(storage_key)
+            return path
 
     def remove(self, storage_key: str) -> bool:
+        with self._root_lock:
+            return self._remove_locked(storage_key)
+
+    def _remove_locked(self, storage_key: str) -> bool:
         try:
             path, _name = self._storage_path(storage_key)
         except TestHarnessArtifactError:
@@ -320,6 +453,10 @@ class TestHarnessArtifactStore:
         return True
 
     def remove_job_dir(self, job_id: str) -> bool:
+        with self._root_lock:
+            return self._remove_job_dir_locked(job_id)
+
+    def _remove_job_dir_locked(self, job_id: str) -> bool:
         self._validate_id(job_id, "job")
         self.ensure_root()
         path = self.jobs_root / job_id
@@ -338,39 +475,74 @@ class TestHarnessArtifactStore:
         active_job_ids: set[str] | None = None,
         now: datetime | None = None,
     ) -> int:
+        with self._root_lock:
+            return self._cleanup_job_dirs_locked(
+                active_job_ids=active_job_ids,
+                now=now,
+            )
+
+    def _cleanup_job_dirs_locked(
+        self,
+        *,
+        active_job_ids: set[str] | None = None,
+        now: datetime | None = None,
+    ) -> int:
         self.ensure_root()
         active = active_job_ids or set()
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=self.retention_days)
         removed = 0
-        for candidate in list(self.jobs_root.iterdir()):
+        candidates: list[tuple[datetime, str]] = []
+        for candidate in self.jobs_root.iterdir():
             if candidate.name in active or not _ID_RE.fullmatch(candidate.name):
                 continue
             try:
                 info = candidate.lstat()
             except FileNotFoundError:
                 continue
+            if not stat.S_ISDIR(info.st_mode) or candidate.is_symlink():
+                continue
             modified = datetime.fromtimestamp(info.st_mtime, tz=timezone.utc)
-            over_quota = self.total_bytes() > self.max_total_bytes
-            if modified <= cutoff or over_quota:
-                if self.remove_job_dir(candidate.name):
-                    removed += 1
+            candidates.append((modified, candidate.name))
+
+        # Retention and quota admission are deterministic: reclaim the oldest
+        # eligible staging directory first.  Equality is full because
+        # ``create_job_dir`` rejects total_bytes >= max_total_bytes.
+        for modified, candidate_name in sorted(candidates):
+            at_capacity = self.total_bytes() >= self.max_total_bytes
+            if modified > cutoff and not at_capacity:
+                continue
+            if self._remove_job_dir_locked(candidate_name):
+                removed += 1
         return removed
 
     def list_job_artifacts(self, job_dir: str | os.PathLike[str]) -> list[str]:
-        managed = self._managed_job_dir(Path(job_dir))
-        result: list[str] = []
-        for candidate in managed.iterdir():
-            if _ARTIFACT_RE.fullmatch(candidate.name) is None:
-                continue
-            try:
-                info = candidate.lstat()
-            except FileNotFoundError:
-                continue
-            if stat.S_ISREG(info.st_mode) and not candidate.is_symlink():
-                result.append(candidate.name)
-        return sorted(result)
+        with self._root_lock:
+            managed = self._managed_job_dir(Path(job_dir))
+            result: list[str] = []
+            for candidate in managed.iterdir():
+                if _ARTIFACT_RE.fullmatch(candidate.name) is None:
+                    continue
+                try:
+                    info = candidate.lstat()
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISREG(info.st_mode) and not candidate.is_symlink():
+                    result.append(candidate.name)
+            return sorted(result)
 
     def cleanup_orphan_archives(
+        self,
+        referenced_keys: set[str],
+        *,
+        older_than: datetime | None = None,
+    ) -> int:
+        with self._root_lock:
+            return self._cleanup_orphan_archives_locked(
+                referenced_keys,
+                older_than=older_than,
+            )
+
+    def _cleanup_orphan_archives_locked(
         self,
         referenced_keys: set[str],
         *,
@@ -403,11 +575,12 @@ class TestHarnessArtifactStore:
         return removed
 
     def is_managed_job_dir(self, path: str | os.PathLike[str]) -> bool:
-        try:
-            self._managed_job_dir(Path(path))
-        except TestHarnessArtifactError:
-            return False
-        return True
+        with self._root_lock:
+            try:
+                self._managed_job_dir(Path(path))
+            except TestHarnessArtifactError:
+                return False
+            return True
 
     def run_prefix(self, *, task_id: int, run_id: str, attempt_id: str) -> str:
         self._validate_id(run_id, "run")
@@ -415,13 +588,15 @@ class TestHarnessArtifactStore:
         return f"runs/task-{task_id}/{run_id}/{attempt_id}"
 
     def total_bytes(self) -> int:
-        self.ensure_root_shallow()
-        return self._tree_size(self.root)
+        with self._root_lock:
+            self.ensure_root_shallow()
+            return self._tree_size(self.root)
 
     def ensure_root_shallow(self) -> None:
-        if not self.root.exists():
-            self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._require_private_directory(self.root, fix_mode=True)
+        with self._root_lock:
+            if not self.root.exists():
+                self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self._require_private_directory(self.root, fix_mode=True)
 
     def _storage_path(self, storage_key: str) -> tuple[Path, str]:
         match = _STORAGE_KEY_RE.fullmatch(storage_key)
@@ -484,6 +659,56 @@ class TestHarnessArtifactStore:
             os.close(fd)
             raise TestHarnessArtifactError("Browser Review artifact is not a regular file")
         return fd
+
+    def _read_regular_bytes(self, path: Path) -> bytes:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return b""
+        fd = self._open_regular_readonly(path)
+        try:
+            before = os.fstat(fd)
+            if before.st_size > self.max_file_bytes:
+                raise TestHarnessArtifactQuotaError(
+                    f"Browser Review artifact exceeds {self.max_file_bytes} bytes"
+                )
+            chunks: list[bytes] = []
+            total = 0
+            while chunk := os.read(fd, min(1024 * 1024, self.max_file_bytes + 1)):
+                total += len(chunk)
+                if total > self.max_file_bytes:
+                    raise TestHarnessArtifactQuotaError(
+                        f"Browser Review artifact exceeds {self.max_file_bytes} bytes"
+                    )
+                chunks.append(chunk)
+            after = os.fstat(fd)
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or total != before.st_size
+            ):
+                raise TestHarnessArtifactError(
+                    "Browser Review artifact changed while reading"
+                )
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        directory_fd = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     @staticmethod
     def _regular_file_size(path: Path) -> int:

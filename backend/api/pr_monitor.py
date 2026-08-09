@@ -35,6 +35,7 @@ from backend.models.pr_monitor import (
     PRRepairWake,
 )
 from backend.models.task import Task
+from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
 from backend.services.pr_review_actions import (
     FindingActionConflict,
     lock_pr_repo_action_boundary,
@@ -51,7 +52,7 @@ from backend.schemas.pr_monitor import (
     MonitoredRepoCreate,
     MonitoredRepoUpdate,
     MonitoredRepoResponse,
-    MonitoredRepoDetailResponse,
+    MonitoredRepoSecretResponse,
     PRReviewResponse,
     PRReviewDetailResponse,
     PRReviewerRunResponse,
@@ -76,6 +77,24 @@ _PR_SYNCHRONIZE_LOCKS: WeakKeyDictionary[
     asyncio.AbstractEventLoop,
     dict[int, asyncio.Lock],
 ] = WeakKeyDictionary()
+_DELIVERY_REPO_FROZEN_FIELDS = frozenset(
+    {
+        "project_id",
+        "enabled",
+        "auto_merge",
+        "provider",
+        "review_model",
+        "review_effort",
+        "review_mode",
+        "wait_for_ci",
+        "required_checks",
+        "auto_repair",
+        "max_repair_attempts",
+        "merge_queue_mode",
+        "default_branch",
+        "allowed_authors",
+    }
+)
 
 
 def _pr_repo_write_lock(repo_id: int) -> asyncio.Lock:
@@ -84,6 +103,47 @@ def _pr_repo_write_lock(repo_id: int) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     locks = _PR_SYNCHRONIZE_LOCKS.setdefault(loop, {})
     return locks.setdefault(repo_id, asyncio.Lock())
+
+
+async def _delivery_repo_run_reference(
+    db: AsyncSession,
+    *,
+    repo_id: int,
+    active_only: bool,
+) -> int | None:
+    """Return a Run whose durable Delivery scope owns this monitor."""
+
+    from backend.models.delivery import DeliveryRun
+
+    statement = select(DeliveryRun.id).where(
+        DeliveryRun.monitored_repo_id == repo_id,
+    )
+    if active_only:
+        statement = statement.where(DeliveryRun.activity != "terminal")
+    return (await db.execute(statement.limit(1).with_for_update())).scalar_one_or_none()
+
+
+async def _require_legacy_pr_effect_allowed(
+    db: AsyncSession,
+    *,
+    action: str,
+    review: PRReview | None = None,
+    monitor_run: PRMonitorRun | None = None,
+    task: Task | None = None,
+) -> None:
+    """Reject legacy mutation of a Delivery-controlled PR lifecycle."""
+
+    if await legacy_pr_effect_is_forbidden(
+        db,
+        review=review,
+        monitor_run=monitor_run,
+        task=task,
+    ):
+        raise HTTPException(
+            409,
+            f"Delivery-owned PR state cannot be {action} through legacy "
+            "PR Monitor controls",
+        )
 
 
 def _action_response_payload(action: PRFindingAction) -> dict:
@@ -335,6 +395,12 @@ async def _quiesce_monitor_runs(
         runs[0].status in {"merged", "closed"} or runs[0].completed_at is not None
     ):
         raise HTTPException(409, "Cannot pause a terminal PR Monitor Run")
+    if run_id is not None:
+        await _require_legacy_pr_effect_allowed(
+            db,
+            action="paused",
+            monitor_run=runs[0],
+        )
     run_ids = [item.id for item in runs]
 
     review_filter = PRReview.repo_id == repo_id
@@ -500,7 +566,7 @@ async def _withdraw_pending_merge_actions(db: AsyncSession, *, repo_id: int) -> 
             run.state_version += 1
 
 
-@router.post("/repos", response_model=MonitoredRepoDetailResponse)
+@router.post("/repos", response_model=MonitoredRepoSecretResponse)
 async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSession = Depends(get_db)):
     if body.review_mode == "single" and body.wait_for_ci:
         raise HTTPException(400, "wait_for_ci requires review_mode=panel")
@@ -563,7 +629,7 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
     return repo
 
 
-@router.get("/repos/{repo_id}", response_model=MonitoredRepoDetailResponse)
+@router.get("/repos/{repo_id}", response_model=MonitoredRepoResponse)
 async def get_repo(
     repo_id: int,
     request: Request,
@@ -576,7 +642,7 @@ async def get_repo(
     return repo
 
 
-@router.put("/repos/{repo_id}", response_model=MonitoredRepoDetailResponse)
+@router.put("/repos/{repo_id}", response_model=MonitoredRepoResponse)
 async def update_repo(
     repo_id: int,
     body: MonitoredRepoUpdate,
@@ -601,6 +667,24 @@ async def update_repo(
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, repo)
+
+        changed_delivery_policy = {
+            key
+            for key in _DELIVERY_REPO_FROZEN_FIELDS & update_data.keys()
+            if update_data[key] != getattr(repo, key)
+        }
+        if changed_delivery_policy:
+            active_delivery_run = await _delivery_repo_run_reference(
+                db,
+                repo_id=repo_id,
+                active_only=True,
+            )
+            if active_delivery_run is not None:
+                raise HTTPException(
+                    409,
+                    "PR Monitor policy is frozen while Delivery Run "
+                    f"{active_delivery_run} is active",
+                )
 
         effective_mode = update_data.get("review_mode", repo.review_mode)
         effective_wait = update_data.get("wait_for_ci", repo.wait_for_ci)
@@ -715,6 +799,18 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, locked_repo)
+        delivery_run_id = await _delivery_repo_run_reference(
+            db,
+            repo_id=repo_id,
+            active_only=False,
+        )
+        if delivery_run_id is not None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Cannot delete a PR monitor referenced by Delivery Run "
+                f"{delivery_run_id}",
+            )
         active_fix_action = await _active_finding_action_for_repo(db, repo_id)
         if active_fix_action is not None:
             await db.rollback()
@@ -859,6 +955,17 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, repo)
         if repo.enabled:
+            active_delivery_run = await _delivery_repo_run_reference(
+                db,
+                repo_id=repo_id,
+                active_only=True,
+            )
+            if active_delivery_run is not None:
+                raise HTTPException(
+                    409,
+                    "Cannot disable a PR monitor while Delivery Run "
+                    f"{active_delivery_run} is active",
+                )
             await _quiesce_monitor_runs(
                 db,
                 repo_id=repo_id,
@@ -870,7 +977,10 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
         return repo
 
 
-@router.post("/repos/{repo_id}/regenerate-secret", response_model=MonitoredRepoDetailResponse)
+@router.post(
+    "/repos/{repo_id}/regenerate-secret",
+    response_model=MonitoredRepoSecretResponse,
+)
 async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     repo = await db.get(MonitoredRepo, repo_id)
     if not repo:
@@ -883,6 +993,17 @@ async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = D
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
         await _require_pr_monitor_access(request, db, repo)
+        active_delivery_run = await _delivery_repo_run_reference(
+            db,
+            repo_id=repo_id,
+            active_only=True,
+        )
+        if active_delivery_run is not None:
+            raise HTTPException(
+                409,
+                "Cannot rotate the webhook secret while Delivery Run "
+                f"{active_delivery_run} is active",
+            )
         if await _active_finding_action_for_repo(db, repo_id) is not None:
             raise HTTPException(
                 409,
@@ -1019,6 +1140,13 @@ async def _perform_immediate_finding_action(
     finding, review, repo = await _load_authorized_finding(
         request, db, finding_id
     )
+    await _require_legacy_pr_effect_allowed(
+        db,
+        action=(
+            "ignored" if action_type == "ignore" else "given legacy advice"
+        ),
+        review=review,
+    )
     from backend.services.pr_review_actions import (
         FindingActionConflict,
         create_immediate_finding_action,
@@ -1096,6 +1224,11 @@ async def create_review_finding_fix(
 ):
     finding, review, repo = await _load_authorized_finding(
         request, db, finding_id
+    )
+    await _require_legacy_pr_effect_allowed(
+        db,
+        action="repaired",
+        review=review,
     )
     from backend.services.pr_review_actions import FindingActionConflict
     from backend.services.pr_review_fix import FixConfirmationError, create_fix_task
@@ -1263,8 +1396,13 @@ async def confirm_review_finding_fix(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    action, _, _, repo = await _load_authorized_finding_action(
+    action, _, review, repo = await _load_authorized_finding_action(
         request, db, action_id
+    )
+    await _require_legacy_pr_effect_allowed(
+        db,
+        action="confirmed for repair",
+        review=review,
     )
     from backend.services.pr_review_fix import FixConfirmationError, confirm_fix
 
@@ -1348,6 +1486,12 @@ async def submit_finding_rebuttal(
     if review is None or run is None or repo is None:
         raise HTTPException(409, "Finding lifecycle is incomplete")
     await _require_pr_monitor_access(request, db, repo)
+    await _require_legacy_pr_effect_allowed(
+        db,
+        action="rebutted",
+        review=review,
+        monitor_run=run,
+    )
     if (
         review.status not in {"commented", "approved"}
         or run.status not in {"waiting_for_fix", "paused"}
@@ -1428,6 +1572,13 @@ async def submit_finding_rebuttal(
         if repo is None or run is None or review is None or finding is None:
             raise HTTPException(409, "Finding lifecycle changed before adjudication")
         await _require_pr_monitor_access(request, db, repo)
+        await _require_legacy_pr_effect_allowed(
+            db,
+            action="rebutted",
+            review=review,
+            monitor_run=run,
+            task=developer,
+        )
         if developer is None:
             raise HTTPException(409, "Bound Developer Task no longer exists")
         await require_task_control(request, developer, db)
@@ -1559,6 +1710,12 @@ async def bind_monitor_developer(
                 raise HTTPException(404, "Repository, Run, or Developer Task not found")
             await _require_pr_monitor_access(request, db, repo)
             await require_task_control(request, task, db)
+            await _require_legacy_pr_effect_allowed(
+                db,
+                action="bound to a Developer",
+                monitor_run=run,
+                task=task,
+            )
             if not repo.enabled:
                 raise HTTPException(409, "Cannot bind a Developer while the monitor is disabled")
             if run.status in {"merged", "closed"} or run.completed_at is not None:
@@ -1703,6 +1860,11 @@ async def unbind_monitor_developer(run_id: int, request: Request, db: AsyncSessi
             await _require_pr_monitor_access(request, db, repo)
             if run.developer_task_id != task_id:
                 raise HTTPException(409, "Developer binding changed concurrently")
+            await _require_legacy_pr_effect_allowed(
+                db,
+                action="unbound from its Developer",
+                monitor_run=run,
+            )
             if run.status in {"merged", "closed"} or run.completed_at is not None:
                 raise HTTPException(409, "Cannot unbind a terminal PR Monitor Run")
             active_repair = (await db.execute(select(PRRepairWake.id).where(
@@ -1779,6 +1941,11 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
         if repo is None or run is None:
             raise HTTPException(404, "Repository or PR Monitor Run not found")
         await _require_pr_monitor_access(request, db, repo)
+        await _require_legacy_pr_effect_allowed(
+            db,
+            action="resumed",
+            monitor_run=run,
+        )
         if not repo.enabled:
             raise HTTPException(409, "Enable the PR monitor before resuming a Run")
         if run.status != "paused":
@@ -1941,32 +2108,86 @@ async def enqueue_monitor_merge(
     if run is None:
         raise HTTPException(404, "PR Monitor Run not found")
     repo = await db.get(MonitoredRepo, run.repo_id)
-    review = await db.get(PRReview, run.current_review_id) if run.current_review_id else None
-    if repo is None or review is None:
-        raise HTTPException(409, "PR Monitor Gate subject is incomplete")
+    if repo is None:
+        raise HTTPException(404, "Repository not found")
     await _require_pr_monitor_access(request, db, repo)
-    if run.status != "ready_to_merge":
-        raise HTTPException(409, "The exact PR head is not ready to enter Merge Queue")
-    action = (await db.execute(select(PRMergeQueueAction).where(
-        PRMergeQueueAction.monitor_run_id == run.id,
-        PRMergeQueueAction.trigger_head_sha == run.current_head_sha,
-    ))).scalar_one_or_none()
-    if action is None:
-        action = PRMergeQueueAction(
-            monitor_run_id=run.id, review_id=review.id,
-            trigger_base_sha=run.current_base_sha,
-            trigger_head_sha=run.current_head_sha,
-            status="pending", action_nonce=secrets.token_hex(24),
+    repo_id = repo.id
+    await db.rollback()
+    async with _pr_repo_write_lock(repo_id):
+        try:
+            repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
+            raise HTTPException(404, "Repository not found") from exc
+        run = (
+            await db.execute(
+                select(PRMonitorRun)
+                .where(
+                    PRMonitorRun.id == run_id,
+                    PRMonitorRun.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        review = None
+        if run is not None and run.current_review_id is not None:
+            review = (
+                await db.execute(
+                    select(PRReview)
+                    .where(
+                        PRReview.id == run.current_review_id,
+                        PRReview.repo_id == repo_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+        if run is None or review is None:
+            raise HTTPException(409, "PR Monitor Gate subject is incomplete")
+        await _require_pr_monitor_access(request, db, repo)
+        await _require_legacy_pr_effect_allowed(
+            db,
+            action="enqueued for merge",
+            review=review,
+            monitor_run=run,
         )
-        db.add(action)
-    elif action.status == "shadow":
-        action.status = "pending"
-    else:
-        raise HTTPException(409, f"Merge Queue action is already {action.status}")
-    run.status = "merge_queue_pending"
-    run.state_version += 1
-    await db.commit()
-    return await get_monitor_run(run.id, request, db)
+        if run.status != "ready_to_merge":
+            raise HTTPException(
+                409,
+                "The exact PR head is not ready to enter Merge Queue",
+            )
+        action = (
+            await db.execute(
+                select(PRMergeQueueAction)
+                .where(
+                    PRMergeQueueAction.monitor_run_id == run.id,
+                    PRMergeQueueAction.trigger_head_sha
+                    == run.current_head_sha,
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if action is None:
+            action = PRMergeQueueAction(
+                monitor_run_id=run.id,
+                review_id=review.id,
+                trigger_base_sha=run.current_base_sha,
+                trigger_head_sha=run.current_head_sha,
+                status="pending",
+                action_nonce=secrets.token_hex(24),
+            )
+            db.add(action)
+        elif action.status == "shadow":
+            action.status = "pending"
+        else:
+            raise HTTPException(
+                409,
+                f"Merge Queue action is already {action.status}",
+            )
+        run.status = "merge_queue_pending"
+        run.state_version += 1
+        await db.commit()
+    return await get_monitor_run(run_id, request, db)
 
 
 # --- Webhook endpoint ---
@@ -2467,6 +2688,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                                 db,
                                 reason="Superseded by new push",
                                 operation_locks_held=True,
+                                allow_delivery_effect_stop=True,
                             )
                         )
                     except TaskTerminationConflict as exc:
@@ -2496,6 +2718,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                             db,
                             expected_status=terminated.terminal_status,
                             expected_retry_count=terminated.retry_count,
+                            expected_turn_generation=terminated.turn_generation,
                             expected_instance_id=terminated.instance_id,
                             expected_started_at=terminated.started_at,
                             expected_completed_at=terminated.completed_at,

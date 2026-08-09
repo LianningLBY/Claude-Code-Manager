@@ -18,6 +18,20 @@ import { getTaskStatusLabel } from '../components/Tasks/taskStatus';
 
 const PAGE_SIZE = 20;
 
+function isDeliveryOwnedTask(task: Task): boolean {
+  return task.mode === 'delivery_loop' || task.delivery_run_id != null;
+}
+
+function taskStatusColorKey(task: Task): string {
+  if (task.background_active) return 'background';
+  if (isDeliveryOwnedTask(task)) {
+    if (task.delivery_activity === 'running') return 'executing';
+    if (task.delivery_activity === 'waiting') return 'delivery_waiting';
+    if (task.delivery_activity === 'paused') return 'delivery_paused';
+  }
+  return task.status;
+}
+
 interface TasksPageProps {
   chatTaskId: number | null;
   onChatTaskChange: (id: number | null) => void;
@@ -301,7 +315,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [statusFilterParam, showArchived, projectFilter, starredFilter, unreadFilter]);
 
-  const statusOptions = ['pending', 'in_progress', 'executing', 'plan_review', 'completed', 'superseded', 'failed'];
+  const statusOptions = ['pending', 'in_progress', 'executing', 'waiting_capability', 'delivery_waiting', 'plan_review', 'completed', 'superseded', 'failed'];
   const [showFilterDropdown, setShowFilterDropdown] = useState(false);
   const filterDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -320,6 +334,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     pending: 'Pending',
     in_progress: 'In Progress',
     executing: 'Executing',
+    waiting_capability: 'Waiting Capability',
+    delivery_waiting: 'Delivery Waiting',
     plan_review: 'Plan Review',
     completed: 'Completed',
     superseded: 'Superseded',
@@ -330,6 +346,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     pending: 'bg-yellow-500',
     in_progress: 'bg-blue-500',
     executing: 'bg-blue-400',
+    waiting_capability: 'bg-violet-400',
+    delivery_waiting: 'bg-indigo-500',
     plan_review: 'bg-purple-500',
     completed: 'bg-green-500',
     superseded: 'bg-gray-500',
@@ -671,7 +689,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       pending: 'bg-yellow-500',
       in_progress: 'bg-blue-500',
       executing: 'bg-blue-400 animate-pulse',
+      waiting_capability: 'bg-violet-400 animate-pulse',
       background: 'bg-teal-400 animate-pulse',
+      delivery_waiting: 'bg-indigo-400',
+      delivery_paused: 'bg-amber-400',
       plan_review: 'bg-purple-500',
       superseded: 'bg-gray-500',
       completed: 'bg-green-500',
@@ -700,10 +721,14 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                 .map((t, idx) => {
                 const proj = t.project_id ? projects.find((p) => p.id === t.project_id) : undefined;
                 const colorDef = proj ? TAG_COLOR_OPTIONS.find((c) => c.key === proj.badge_color) : undefined;
+                const deliveryOwned = isDeliveryOwnedTask(t);
                 return (
                 <div
                   key={t.id}
-                  {...sidebarReorder.itemProps(t, idx)}
+                  {...(deliveryOwned
+                    ? sidebarReorder.dropTargetProps(t, idx)
+                    : sidebarReorder.itemProps(t, idx))}
+                  data-testid={`task-sidebar-row-${t.id}`}
                   onClick={() => handleOpenChat(t)}
                   className={`w-full text-left px-3 py-2.5 transition-colors border-b border-gray-800/50 cursor-pointer ${
                     sidebarReorder.draggingId === t.id ? 'opacity-40' : ''
@@ -716,7 +741,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                   <div className="flex items-center gap-2">
                     {/* 状态只靠圆点颜色表达（绿=完成 红=失败 蓝=运行 黄=等待） */}
                     <span
-                      className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[t.background_active ? 'background' : t.status] || 'bg-gray-500'}`}
+                      data-testid={`task-sidebar-status-${t.id}`}
+                      className={`w-2 h-2 rounded-full shrink-0 ${sidebarStatusColors[taskStatusColorKey(t)] || 'bg-gray-500'}`}
                       title={getTaskStatusLabel(t)}
                     />
                     <span className={`text-xs truncate flex-1 ${chatTask?.id === t.id ? 'text-foreground font-medium' : 'text-gray-300'}`}>
@@ -744,7 +770,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     )}
                   </div>
                   <div className="flex items-center gap-1.5 mt-1 ml-4" onClick={(e) => e.stopPropagation()}>
-                    <PluginsBadge task={t} onRefresh={refresh} />
+                    {!deliveryOwned && <PluginsBadge task={t} onRefresh={refresh} />}
                     <SubAgentsBadge task={t} />
                     <span className="flex-1" />
                     <button
@@ -754,20 +780,24 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     >
                       <Star size={13} fill={t.starred ? 'currentColor' : 'none'} />
                     </button>
-                    <button
-                      onClick={() => window.dispatchEvent(new CustomEvent('ccm-share-task', { detail: { task: t } }))}
-                      className="p-1 text-gray-600 hover:text-blue-400 transition-colors"
-                      title="Share"
-                    >
-                      <Share2 size={13} />
-                    </button>
-                    <button
-                      onClick={async () => { await api.archiveTask(t.id); skipFreezeOnce.current = true; refresh(); }}
-                      className="p-1 text-gray-600 hover:text-amber-400 transition-colors"
-                      title={t.archived ? 'Unarchive' : 'Archive'}
-                    >
-                      {t.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
-                    </button>
+                    {!deliveryOwned && (
+                      <>
+                        <button
+                          onClick={() => window.dispatchEvent(new CustomEvent('ccm-share-task', { detail: { task: t } }))}
+                          className="p-1 text-gray-600 hover:text-blue-400 transition-colors"
+                          title="Share"
+                        >
+                          <Share2 size={13} />
+                        </button>
+                        <button
+                          onClick={async () => { await api.archiveTask(t.id); skipFreezeOnce.current = true; refresh(); }}
+                          className="p-1 text-gray-600 hover:text-amber-400 transition-colors"
+                          title={t.archived ? 'Unarchive' : 'Archive'}
+                        >
+                          {t.archived ? <ArchiveRestore size={13} /> : <Archive size={13} />}
+                        </button>
+                      </>
+                    )}
                   </div>
                 </div>
               );})}

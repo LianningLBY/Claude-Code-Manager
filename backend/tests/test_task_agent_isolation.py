@@ -1,8 +1,10 @@
 import json
 import os
 import stat
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -153,8 +155,16 @@ def test_claude_isolation_preflight_scrubs_manager_tokens(
     tmp_path,
     monkeypatch,
 ):
-    path = tmp_path / "settings.json"
-    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(
+        34,
+        ["/Users/operator/.ssh"],
+        ssh_capabilities={"read"},
+    )
     monkeypatch.setenv("AUTH_TOKEN", "deployment-secret")
     monkeypatch.setenv("CCM_INTERNAL_SERVICE_TOKEN", "internal-secret")
     monkeypatch.setenv("CCM_ASK_USER_TOKEN", "task-secret")
@@ -165,25 +175,109 @@ def test_claude_isolation_preflight_scrubs_manager_tokens(
         captured["env"] = kwargs["env"]
         return SimpleNamespace(
             returncode=0,
-            stdout="Claude Code doctor\nEverything looks healthy",
+            stdout="2.1.224 (Claude Code)",
         )
 
     monkeypatch.setattr("subprocess.run", fake_run)
 
     validate_claude_task_isolation_settings(path, claude_binary="claude")
 
-    assert captured["argv"] == [
-        "claude",
-        "--settings",
-        str(path),
-        "--setting-sources",
-        "",
-        "--strict-mcp-config",
-        "doctor",
-    ]
+    assert captured["argv"] == ["claude", "--version"]
     assert "AUTH_TOKEN" not in captured["env"]
     assert "CCM_INTERNAL_SERVICE_TOKEN" not in captured["env"]
     assert "CCM_ASK_USER_TOKEN" not in captured["env"]
+
+
+def test_claude_isolation_preflight_rejects_weakened_local_policy(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(
+        35,
+        ["/Users/operator/.ssh"],
+        ssh_capabilities={"exec"},
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["sandbox"]["allowUnsandboxedCommands"] = True
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    subprocess_run = Mock()
+    monkeypatch.setattr("subprocess.run", subprocess_run)
+
+    with pytest.raises(TaskAgentIsolationError, match="allowUnsandboxedCommands"):
+        validate_claude_task_isolation_settings(
+            path,
+            claude_binary="claude",
+        )
+
+    subprocess_run.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("stdout", "error"),
+    [
+        ("2.1.167 (Claude Code)", "too old"),
+        ("Claude Code development build", "valid CLI version"),
+    ],
+)
+def test_claude_isolation_preflight_rejects_unsupported_cli(
+    tmp_path,
+    monkeypatch,
+    stdout,
+    error,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(
+        36,
+        ["/Users/operator/.ssh"],
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=stdout,
+        ),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match=error):
+        validate_claude_task_isolation_settings(
+            path,
+            claude_binary="claude",
+        )
+
+
+def test_claude_isolation_preflight_times_out_without_model_input(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(
+        37,
+        ["/Users/operator/.ssh"],
+    )
+
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("claude --version", 5)
+
+    monkeypatch.setattr("subprocess.run", timeout)
+
+    with pytest.raises(TaskAgentIsolationError, match="timed out"):
+        validate_claude_task_isolation_settings(
+            path,
+            claude_binary="claude",
+        )
 
 
 def test_task_claude_wrapper_is_private_and_uses_exact_cli_boundary():

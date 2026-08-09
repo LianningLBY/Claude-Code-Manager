@@ -149,6 +149,50 @@ def _set_spec_snapshot_runtime(monkeypatch):
     )
 
 
+def test_task_incarnation_is_bound_to_every_scoped_mcp_credential(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+    issued: list[dict] = []
+
+    def capture_token(**claims):
+        issued.append(claims)
+        return "scoped-token"
+
+    monkeypatch.setattr(
+        internal_service_auth,
+        "issue_internal_service_token",
+        capture_token,
+    )
+    incarnation = "a" * 32
+
+    build_mcp_server_specs(42, task_incarnation_id=incarnation)
+    build_task_ssh_mcp_server_specs(
+        42,
+        task_incarnation_id=incarnation,
+        capabilities=("read",),
+    )
+    build_monitor_agent_mcp_server_specs(
+        7,
+        42,
+        task_incarnation_id=incarnation,
+    )
+    build_sub_agent_controller_mcp_server_specs(
+        42,
+        task_incarnation_id=incarnation,
+    )
+    build_sub_agent_mcp_server_specs(
+        9,
+        42,
+        task_incarnation_id=incarnation,
+    )
+
+    assert len(issued) == 5
+    assert all(claims["task_id"] == 42 for claims in issued)
+    assert all(
+        claims["task_incarnation_id"] == incarnation
+        for claims in issued
+    )
+
+
 def test_main_mcp_server_spec_snapshot(monkeypatch):
     _set_spec_snapshot_runtime(monkeypatch)
 

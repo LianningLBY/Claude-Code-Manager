@@ -31,6 +31,7 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
 )
 from backend.models.task import Task
+from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
 from backend.services.pr_review_actions import (
     FindingActionConflict,
     is_current_review_snapshot,
@@ -45,6 +46,9 @@ from backend.services.pr_review_service import (
     _gh_pr_view,
     _validated_pr_snapshot,
     verify_pr_review_snapshot_current,
+)
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
 )
 
 
@@ -835,6 +839,23 @@ async def create_fix_task(
         if existing.finding_id != finding_id or existing.action_type != "ai_fix":
             await db.rollback()
             raise FindingActionConflict("Idempotency key is already in use")
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise FindingActionConflict("Finding is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         existing_id = existing.id
         expired = await _expire_creation_reservation(db, existing)
         if expired:
@@ -876,6 +897,23 @@ async def create_fix_task(
             or fenced_existing.action_type != "ai_fix"
         ):
             raise FindingActionConflict("Idempotency key is already in use")
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.repo_id == repo_id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            raise FindingActionConflict("Finding is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         return fenced_existing
     review = (
         await db.execute(
@@ -905,6 +943,10 @@ async def create_fix_task(
         finding_id=finding_id,
     ):
         raise FindingActionConflict("Finding is not available for AI repair")
+    if await legacy_pr_effect_is_forbidden(db, review=review):
+        raise FindingActionConflict(
+            "Delivery-owned PR findings cannot use legacy AI repair"
+        )
     if not await is_current_review_snapshot(db, review):
         raise FindingActionConflict(
             "This finding belongs to a superseded PR snapshot"
@@ -970,6 +1012,10 @@ async def create_fix_task(
         ):
             raise FindingActionConflict(
                 "Finding is no longer available for AI repair"
+            )
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FindingActionConflict(
+                "Delivery-owned PR findings cannot use legacy AI repair"
             )
     active_action = (
         await db.execute(
@@ -1186,7 +1232,10 @@ async def create_fix_task(
 
         model = app_settings.default_codex_model
     try:
-        task = Task(
+        from backend.services.task_creation import stage_task_record
+
+        task = await stage_task_record(
+            db,
             title=(
                 f"PR Fix: {repo.repo_full_name}#{review.pr_number} / "
                 f"{finding.title}"
@@ -1205,8 +1254,6 @@ async def create_fix_task(
             project_id=await _get_or_create_pr_monitor_project(db),
             worker_id=repo.worker_id,
         )
-        db.add(task)
-        await db.flush()
         action_result = dict(action.result or {})
         action_result.update({
             "head_repo_full_name": source_repo,
@@ -1954,23 +2001,99 @@ async def _commit_task_transition(
     *,
     action: PRFindingAction,
     finding: PRFinding,
+    task: Task,
     action_values: dict,
     finding_status: str,
 ) -> bool:
     """Commit a model-Task terminal state only while no push owner exists."""
 
+    task_identity = {
+        "id": task.id,
+        "incarnation_id": task.incarnation_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "turn_source_log_id": task.turn_source_log_id,
+        "worker_id": task.worker_id,
+        "instance_id": task.instance_id,
+        "session_id": task.session_id,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+    }
+    action_identity = {
+        "id": action.id,
+        "task_id": action.task_id,
+    }
     values = dict(action_values)
     values["updated_at"] = datetime.utcnow()
     if values.get("status") not in {
         "pending", "running", "awaiting_confirmation", "cancelling",
     }:
         values["active_fix_finding_id"] = None
+    # Patch parsing and GitHub validation may span a SQLite WAL read snapshot.
+    # Make the Task proof the first statement of a fresh writer transaction so
+    # a concurrently committed receipt becomes a clean CAS miss, never a
+    # SQLITE_BUSY_SNAPSHOT upgrade failure.
+    await db.rollback()
+    task_guard = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task_identity["id"],
+            (
+                Task.incarnation_id.is_(None)
+                if task_identity["incarnation_id"] is None
+                else Task.incarnation_id == task_identity["incarnation_id"]
+            ),
+            Task.status == task_identity["status"],
+            Task.retry_count == task_identity["retry_count"],
+            Task.turn_generation == task_identity["turn_generation"],
+            (
+                Task.turn_source_log_id.is_(None)
+                if task_identity["turn_source_log_id"] is None
+                else Task.turn_source_log_id
+                == task_identity["turn_source_log_id"]
+            ),
+            (
+                Task.worker_id.is_(None)
+                if task_identity["worker_id"] is None
+                else Task.worker_id == task_identity["worker_id"]
+            ),
+            (
+                Task.instance_id.is_(None)
+                if task_identity["instance_id"] is None
+                else Task.instance_id == task_identity["instance_id"]
+            ),
+            (
+                Task.session_id.is_(None)
+                if task_identity["session_id"] is None
+                else Task.session_id == task_identity["session_id"]
+            ),
+            (
+                Task.started_at.is_(None)
+                if task_identity["started_at"] is None
+                else Task.started_at == task_identity["started_at"]
+            ),
+            (
+                Task.completed_at.is_(None)
+                if task_identity["completed_at"] is None
+                else Task.completed_at == task_identity["completed_at"]
+            ),
+            Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_guard.rowcount != 1:
+        await db.rollback()
+        return False
+
     changed = await db.execute(
         update(PRFindingAction)
         .where(
-            PRFindingAction.id == action.id,
+            PRFindingAction.id == action_identity["id"],
             PRFindingAction.status == "running",
-            PRFindingAction.task_id == action.task_id,
+            PRFindingAction.task_id == action_identity["task_id"],
             PRFindingAction.operation_token.is_(None),
             PRFindingAction.confirmed_at.is_(None),
         )
@@ -2037,6 +2160,7 @@ async def handle_fix_task_completion(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "failed",
                 "error_message": "PR fix action state is invalid",
@@ -2060,30 +2184,27 @@ async def handle_fix_task_completion(
             allowed_files=set(allowed),
         )
     except (GitInfrastructureError, GhError) as exc:
-        now = await _database_now(db)
-        await db.execute(
-            update(PRFindingAction)
-            .where(
-                PRFindingAction.id == action.id,
-                PRFindingAction.status == "running",
-                PRFindingAction.confirmed_at.is_(None),
-                PRFindingAction.operation_token.is_(None),
-            )
-            .values(
-                error_message=(
+        await _commit_task_transition(
+            db,
+            action=action,
+            finding=finding,
+            task=task,
+            action_values={
+                "status": "running",
+                "error_message": (
                     "PR fix validation infrastructure is unavailable; "
                     "recovery will retry: " + str(exc)
                 )[:2000],
-                updated_at=now,
-            )
+            },
+            finding_status="open",
         )
-        await db.commit()
         return
     except PRHeadDriftError as exc:
         await _commit_task_transition(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "stale",
                 "error_message": str(exc)[:2000],
@@ -2097,6 +2218,7 @@ async def handle_fix_task_completion(
             db,
             action=action,
             finding=finding,
+            task=task,
             action_values={
                 "status": "failed",
                 "error_message": str(exc)[:2000],
@@ -2123,6 +2245,7 @@ async def handle_fix_task_completion(
         db,
         action=action,
         finding=finding,
+        task=task,
         action_values={
             "result": result_data,
             "patch_sha256": patch_sha256,
@@ -2169,6 +2292,7 @@ async def handle_fix_task_failure(
         db,
         action=action,
         finding=finding,
+        task=task,
         action_values={
             "status": "failed",
             "error_message": (
@@ -2200,6 +2324,10 @@ async def confirm_fix(
         repo = await db.get(MonitoredRepo, review.repo_id) if review else None
         if finding is None or review is None or repo is None:
             raise FixConfirmationError("PR fix action is not available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            raise FixConfirmationError(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         if action.status == "completed":
             return action
         recovering_push = (
@@ -2234,6 +2362,11 @@ async def confirm_fix(
         ):
             await db.rollback()
             raise FixConfirmationError("PR fix action is no longer available")
+        if await legacy_pr_effect_is_forbidden(db, review=review):
+            await db.rollback()
+            raise FixConfirmationError(
+                "Delivery-owned PR findings cannot use legacy AI repair"
+            )
         if action.status == "completed":
             await db.rollback()
             completed = await db.get(
@@ -2653,6 +2786,7 @@ async def _finish_cancelled_fix_action(
                 task_id,
                 db,
                 reason="PR finding fix action cancelled",
+                allow_delivery_effect_stop=True,
             )
         except TaskTerminationConflict as exc:
             raise FixConfirmationError(
@@ -2837,8 +2971,36 @@ async def reconcile_finding_action(
     action_id: int,
     *,
     worker_relay=None,
+    operation_lock_held: bool = False,
 ) -> bool:
     """Converge one incomplete model, cancellation, or push generation."""
+
+    if not operation_lock_held:
+        async with db_factory() as discovery_db:
+            discovery = await discovery_db.get(
+                PRFindingAction,
+                action_id,
+                populate_existing=True,
+            )
+            lock_task_id = (
+                discovery.task_id
+                if discovery is not None
+                and discovery.action_type == "ai_fix"
+                and discovery.status == "running"
+                and discovery.confirmed_at is None
+                and type(discovery.task_id) is int
+                else None
+            )
+        if lock_task_id is not None:
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            async with get_task_operation_lock(lock_task_id):
+                return await reconcile_finding_action(
+                    db_factory,
+                    action_id,
+                    worker_relay=worker_relay,
+                    operation_lock_held=True,
+                )
 
     async with db_factory() as db:
         action = await db.get(PRFindingAction, action_id, populate_existing=True)

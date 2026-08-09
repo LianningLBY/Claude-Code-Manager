@@ -10,6 +10,8 @@ Covers dispatcher ownership recovery and stale-state cleanup:
 - Interrupted task status change (pending → completed)
 """
 import asyncio
+import hashlib
+import json
 import os
 from datetime import datetime
 import pytest
@@ -18,14 +20,27 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.models.capability import (
+    CapabilityExecution,
+    CapabilityInvocation,
+    CapabilityResumeOutbox,
+)
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.log_entry import LogEntry
+from backend.models.plan import PlanApplicationReceipt
 from backend.models.sub_agent import SubAgentSession
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.services.dispatcher import (
     GlobalDispatcher,
     _TaskLifecycleGeneration,
 )
+from backend.services.capability_resume import (
+    claim_resume_publication,
+    claim_resume_turn_locked,
+    materialize_resume_outbox,
+)
+from backend.services.capability_service import capability_task_lock
 from backend.services.task_queue import TaskQueue
 
 
@@ -64,6 +79,281 @@ async def _lifecycle_generation(dispatcher, db_factory, task_id):
         task = await db.get(Task, task_id)
         assert task is not None
         return dispatcher._task_lifecycle_generation(task)
+
+
+async def _seed_claimed_capability_resume(
+    db_factory,
+    *,
+    persisted_pid: int | None,
+    generation: int = 7,
+):
+    """Create one exact executing G+1 resume with a persisted reverse owner."""
+
+    digest = "d" * 64
+    async with db_factory() as db:
+        task = Task(
+            title="Capability restart recovery",
+            description="continue after capability",
+            status="waiting_capability",
+            mode="auto",
+            provider="claude",
+            model="claude-opus-4-6",
+            codex_service_tier="default",
+            retry_count=2,
+            turn_generation=generation,
+            session_id="session-restart-recovery",
+        )
+        db.add(task)
+        await db.flush()
+        assert task.incarnation_id is not None
+
+        instance = Instance(
+            name="capability-resume-owner",
+            status="running",
+            pid=persisted_pid,
+        )
+        db.add(instance)
+        await db.flush()
+
+        request_source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=generation,
+            turn_scope="source",
+            actual_transport="claude_exec",
+            event_type="user_message",
+            role="user",
+            content="original request",
+            is_error=False,
+        )
+        output_text = "requesting capability guidance"
+        request_output = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=generation,
+            turn_scope="foreground",
+            event_type="result",
+            role="assistant",
+            content=output_text,
+            is_error=False,
+        )
+        db.add_all((request_source, request_output))
+        await db.flush()
+        task.turn_source_log_id = request_source.id
+
+        invocation = CapabilityInvocation(
+            task_id=task.id,
+            capability_key="plan",
+            source="agent_request",
+            purpose="advisory",
+            status="failed",
+            state_version=1,
+            idempotency_key=f"restart-{task.id}-{generation}",
+            input_payload={"prompt": "give safe guidance"},
+            input_hash=digest,
+            subject_kind="task_generation",
+            subject_ref={"task_id": task.id, "generation": generation},
+            subject_hash=digest,
+            executor_kind="plan",
+            executor_config={},
+            executor_config_hash=digest,
+            policy_snapshot={"allowed": True},
+            policy_hash=digest,
+            resume_policy="resume_task",
+            max_attempts=1,
+            request_task_incarnation_id=task.incarnation_id,
+            request_task_retry_count=task.retry_count,
+            request_task_instance_id=instance.id,
+            request_task_session_id=task.session_id,
+            request_task_turn_generation=generation,
+            request_source_log_id=request_source.id,
+            request_output_log_id=request_output.id,
+            request_terminal_log_id=request_output.id,
+            request_reason="Need exact guidance",
+            request_protocol_version=1,
+            request_output_hash=hashlib.sha256(
+                output_text.encode("utf-8")
+            ).hexdigest(),
+            error_code="capability_failed",
+            error_message="capability failed",
+            completed_at=datetime.utcnow(),
+        )
+        db.add(invocation)
+        await db.flush()
+        execution = CapabilityExecution(
+            invocation_id=invocation.id,
+            attempt=1,
+            status="failed",
+            state_version=1,
+            idempotency_key=f"restart-execution-{task.id}-{generation}",
+            executor_kind="plan",
+            input_hash=digest,
+            error_code="execution_failed",
+            error_message="execution failed",
+            started_at=datetime.utcnow(),
+            completed_at=datetime.utcnow(),
+        )
+        outbox = CapabilityResumeOutbox(
+            task_id=task.id,
+            invocation_id=invocation.id,
+            active_task_id=task.id,
+            active_invocation_id=invocation.id,
+            status="pending",
+            request_task_incarnation_id=task.incarnation_id,
+            request_task_retry_count=task.retry_count,
+            from_turn_generation=generation,
+            request_task_session_id=task.session_id,
+            request_source_log_id=request_source.id,
+            request_output_log_id=request_output.id,
+            request_terminal_log_id=request_output.id,
+        )
+        db.add_all((execution, outbox))
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+        outbox_id = outbox.id
+
+    async with db_factory() as db:
+        await materialize_resume_outbox(db, outbox_id)
+    async with db_factory() as db:
+        envelope = await claim_resume_publication(db, outbox_id)
+    assert envelope is not None and envelope.lease_token is not None
+
+    async with capability_task_lock(task_id):
+        async with db_factory() as db:
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == task_id)
+                    .with_for_update()
+                )
+            ).scalar_one()
+            claim = await claim_resume_turn_locked(
+                db,
+                task=task,
+                outbox_id=outbox_id,
+                lease_token=envelope.lease_token,
+                instance_id=instance_id,
+                transport="claude_exec",
+            )
+            instance = await db.get(Instance, instance_id)
+            instance.current_task_id = task_id
+            await db.commit()
+
+    return {
+        "task_id": task_id,
+        "instance_id": instance_id,
+        "outbox_id": outbox_id,
+        "source_log_id": claim.source_log_id,
+        "turn_generation": claim.turn_generation,
+    }
+
+
+def _worker_handoff_payload_digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+async def _seed_claimed_worker_handoff(
+    db_factory,
+    *,
+    handoff_id: str,
+    actual_transport: str | None,
+):
+    """Persist one exact claimed G+1 with only a forward Instance pointer."""
+
+    retry_count = 3
+    from_generation = 5
+    claimed_generation = from_generation + 1
+    message = "continue exact Worker turn"
+    request_payload = {
+        "message": message,
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": retry_count,
+        "worker_turn_handoff_from_generation": from_generation,
+    }
+    async with db_factory() as db:
+        instance = Instance(name="worker-pre-spawn", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claimed Worker turn",
+            description="old task description",
+            status="executing",
+            retry_count=retry_count,
+            turn_generation=claimed_generation,
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=retry_count,
+            task_turn_generation=claimed_generation,
+            turn_scope="source",
+            actual_transport=actual_transport,
+            event_type="user_message",
+            role="user",
+            content=message,
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        queue_payload = {
+            "prompt": message,
+            "priority": 0,
+            "source": "user",
+            "user_message_text": None,
+            "command_skills": None,
+            "model_override": None,
+            "expected_task_routing": ["claude", None, "default"],
+            "source_log_id": source.id,
+            "current_message": message,
+            "queue_timestamp": 1234.5,
+            "allow_new_session": False,
+            "delivery_key": None,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": retry_count,
+            "worker_turn_handoff_from_generation": from_generation,
+        }
+        db.add(
+            WorkerTurnHandoffReceipt(
+                handoff_id=handoff_id,
+                task_id=task.id,
+                source_log_id=source.id,
+                side="worker",
+                worker_id=None,
+                retry_count=retry_count,
+                from_generation=from_generation,
+                status="claimed",
+                request_payload=request_payload,
+                request_digest=_worker_handoff_payload_digest(request_payload),
+                queue_payload=queue_payload,
+                queue_payload_digest=_worker_handoff_payload_digest(queue_payload),
+                response={"ok": True, "queued": True},
+                claimed_turn_generation=claimed_generation,
+            )
+        )
+        await db.commit()
+        return {
+            "task_id": task.id,
+            "instance_id": instance.id,
+            "source_log_id": source.id,
+            "handoff_id": handoff_id,
+            "retry_count": retry_count,
+            "from_generation": from_generation,
+            "claimed_generation": claimed_generation,
+        }
 
 
 # === _cleanup_stale_state tests ===
@@ -272,6 +562,102 @@ async def test_cleanup_resets_dead_pid_instance(db_factory):
         assert inst.status == "error"
         assert inst.pid is None
         assert inst.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_replays_exact_pre_provider_capability_resume(db_factory):
+    """A dead pre-provider G+1 claim returns to waiting without creating G+2."""
+
+    seed = await _seed_claimed_capability_resume(
+        db_factory,
+        persisted_pid=999999,
+    )
+    d = _make_dispatcher(db_factory)
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, seed["task_id"])
+        instance = await db.get(Instance, seed["instance_id"])
+        outbox = await db.get(CapabilityResumeOutbox, seed["outbox_id"])
+        source = await db.get(LogEntry, seed["source_log_id"])
+
+        assert task.status == "waiting_capability"
+        assert task.instance_id is None
+        assert task.turn_generation == seed["turn_generation"] == 8
+        assert task.turn_source_log_id == seed["source_log_id"]
+        assert source.actual_transport is None
+        assert outbox.status == "claimed"
+        assert outbox.claimed_turn_generation == seed["turn_generation"]
+        assert outbox.resume_source_log_id == seed["source_log_id"]
+        assert outbox.lease_token is None
+        assert outbox.error_code == "resume_restart_replay"
+        assert instance.status == "error"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fails_capability_resume_after_provider_boundary(
+    db_factory,
+):
+    """A dead provider-bound G+1 is failed closed and never republished."""
+
+    seed = await _seed_claimed_capability_resume(
+        db_factory,
+        persisted_pid=999999,
+    )
+    async with db_factory() as db:
+        source = await db.get(LogEntry, seed["source_log_id"])
+        source.actual_transport = "claude_exec"
+        await db.commit()
+    d = _make_dispatcher(db_factory)
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, seed["task_id"])
+        instance = await db.get(Instance, seed["instance_id"])
+        outbox = await db.get(CapabilityResumeOutbox, seed["outbox_id"])
+
+        assert task.status == "failed"
+        assert task.instance_id is None
+        assert "provider boundary" in task.error_message
+        assert outbox.status == "failed"
+        assert outbox.resume_actual_transport == "claude_exec"
+        assert outbox.error_code == "resume_runtime_lost_after_launch"
+        assert instance.status == "error"
+        assert instance.pid is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retains_unmanaged_capability_resume_owner_evidence(
+    db_factory,
+):
+    """An unknown live PID blocks replay and retains both ownership links."""
+
+    seed = await _seed_claimed_capability_resume(
+        db_factory,
+        persisted_pid=os.getpid(),
+    )
+    d = _make_dispatcher(db_factory)
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, seed["task_id"])
+        instance = await db.get(Instance, seed["instance_id"])
+        outbox = await db.get(CapabilityResumeOutbox, seed["outbox_id"])
+
+        assert task.status == "failed"
+        assert task.instance_id == seed["instance_id"]
+        assert "Unmanaged process PID" in task.error_message
+        assert outbox.status == "failed"
+        assert outbox.error_code == "resume_unmanaged_runtime"
+        assert instance.status == "error"
+        assert instance.pid == os.getpid()
+        assert instance.current_task_id == seed["task_id"]
 
 
 @pytest.mark.asyncio
@@ -696,7 +1082,7 @@ async def test_cleanup_resets_instance_with_no_pid(db_factory):
 
 @pytest.mark.asyncio
 async def test_cleanup_resets_stuck_executing_task(db_factory):
-    """An unowned executing claim returns to pending, never fake success."""
+    """A legacy unowned execution without boundary proof fails closed."""
     d = _make_dispatcher(db_factory)
 
     async with db_factory() as db:
@@ -710,8 +1096,461 @@ async def test_cleanup_resets_stuck_executing_task(db_factory):
 
     async with db_factory() as db:
         t = await db.get(Task, task_id)
-        assert t.status == "pending"
+        assert t.status == "failed"
         assert t.instance_id is None
+        assert "provider-boundary proof" in t.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_replays_only_exact_hidden_initial_turn(db_factory):
+    """A boundary-free canonical G1 source still denotes Task.description."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="initial-pre-spawn", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="initial exact turn",
+            description="run original task",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=1,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps({
+                "original_source_log_id": None,
+                "transport": None,
+            }),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id, source_id = task.id, source.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.get(LogEntry, source_id)
+    assert task.status == "pending"
+    assert task.turn_generation == 1
+    assert task.turn_source_log_id == source_id
+    assert source.actual_transport is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_does_not_replay_visible_queued_turn_without_outbox(
+    db_factory,
+):
+    """A lost visible follow-up must not fall back to Task.description."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="ordinary follow-up",
+            description="old task description",
+            status="executing",
+            retry_count=2,
+            turn_generation=7,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=2,
+            task_turn_generation=7,
+            turn_scope="source",
+            event_type="user_message",
+            role="user",
+            content="new follow-up text",
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "failed"
+    assert task.turn_generation == 7
+    assert "lost its durable replay envelope" in task.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fails_exact_turn_with_actual_transport(db_factory):
+    """Durable transport selection means a provider effect may exist."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="admitted-pre-spawn", status="idle")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="admitted initial turn",
+            description="run once",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=1,
+            turn_scope="source",
+            actual_transport="codex_app_server",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps({
+                "original_source_log_id": None,
+                "transport": "codex",
+            }),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "failed"
+    assert "transport codex_app_server" in task.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fails_modern_g1_without_source_pointer(db_factory):
+    """A pointer-less modern generation is not legacy replay evidence."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="missing modern source",
+            description="cannot prove prompt identity",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+            turn_source_log_id=None,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "failed"
+    assert "lost its durable replay envelope" in task.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fails_later_hidden_source_less_turn(db_factory):
+    """A source-less G>1 may be an internal wake, not Task.description."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="internal wake",
+            description="old task description",
+            status="executing",
+            retry_count=0,
+            turn_generation=2,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=2,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps({
+                "original_source_log_id": None,
+                "transport": None,
+            }),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "failed"
+    assert "lost its durable replay envelope" in task.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_does_not_revive_concurrent_cancelled_initial_turn(
+    db_factory,
+):
+    """The pre-lock generation snapshot prevents cancel -> pending revival."""
+
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        task = Task(
+            title="cancel races startup",
+            description="run once",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=1,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps({
+                "original_source_log_id": None,
+                "transport": None,
+            }),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+
+    original_execute = AsyncSession.execute
+    task_select_count = 0
+    cancellation_injected = False
+
+    async def execute_with_cancel_race(session, statement, *args, **kwargs):
+        nonlocal task_select_count, cancellation_injected
+        from_tables = getattr(statement, "get_final_froms", lambda: [])()
+        if any(getattr(table, "name", None) == "tasks" for table in from_tables):
+            task_select_count += 1
+            if task_select_count == 2:
+                await original_execute(
+                    session,
+                    update(Task)
+                    .where(Task.id == task_id, Task.status == "executing")
+                    .values(status="cancelled"),
+                )
+                await session.commit()
+                cancellation_injected = True
+        return await original_execute(session, statement, *args, **kwargs)
+
+    with patch.object(
+        AsyncSession,
+        "execute",
+        new=execute_with_cancel_race,
+    ):
+        await d._cleanup_stale_state()
+
+    assert cancellation_injected
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+    assert task.status == "cancelled"
+    assert task.turn_generation == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery_status", ["launching", "launched"])
+async def test_cleanup_quarantines_exact_plan_launch_claim(
+    db_factory,
+    delivery_status,
+):
+    """Plan boundary evidence overrides the otherwise replayable G1 shape."""
+
+    d = _make_dispatcher(db_factory)
+    receipt_key = f"restart-plan-{delivery_status}"
+    async with db_factory() as db:
+        task = Task(
+            title="source-less Plan turn",
+            description="old description",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=1,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps({
+                "original_source_log_id": None,
+                "transport": None,
+            }),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        db.add(PlanApplicationReceipt(
+            receipt_key=receipt_key,
+            target_task_id=task.id,
+            plan_version_ids=[],
+            status="committed",
+            response={"ok": True},
+            delivery_status=delivery_status,
+            outbox_payload={"prompt": "apply Plan once"},
+            payload_digest="0" * 64,
+            launch_evidence={
+                "task_id": task.id,
+                "retry_count": 0,
+                "turn_generation": 1,
+                "source_log_id": None,
+            },
+        ))
+        await db.commit()
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.scalar(select(PlanApplicationReceipt).where(
+            PlanApplicationReceipt.receipt_key == receipt_key
+        ))
+    assert task.status == "failed"
+    assert "exact Plan launch claim" in task.error_message
+    assert receipt.delivery_status == "uncertain"
+    assert "duplicate execution" in receipt.delivery_error
+
+
+@pytest.mark.asyncio
+async def test_cleanup_quarantines_worker_claim_after_transport_ack_loss(
+    db_factory,
+):
+    """A committed route outranks a stale claimed callback receipt."""
+
+    d = _make_dispatcher(db_factory)
+    seed = await _seed_claimed_worker_handoff(
+        db_factory,
+        handoff_id="7" * 32,
+        actual_transport="claude_exec",
+    )
+    task_id = seed["task_id"]
+    handoff_id = seed["handoff_id"]
+    claimed_generation = seed["claimed_generation"]
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert task.status == "failed"
+    assert task.instance_id is None
+    assert task.turn_generation == claimed_generation
+    assert "durable transport claude_exec" in task.error_message
+    assert receipt.status == "launching"
+    assert receipt.claimed_turn_generation == claimed_generation
+
+    # The converged post-boundary receipt is not selected by later Worker
+    # recovery passes and cannot put this exact G+1 back into memory.
+    d._ensure_queue_worker = MagicMock()
+    await d._recover_worker_turn_handoff_outbox()
+    assert d._get_task_queue(task_id).empty()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_replays_pretransport_claimed_worker_handoff_exactly(
+    db_factory,
+):
+    """An orphan forward owner does not invalidate a pre-transport G+1."""
+
+    d = _make_dispatcher(db_factory)
+    seed = await _seed_claimed_worker_handoff(
+        db_factory,
+        handoff_id="8" * 32,
+        actual_transport=None,
+    )
+    task_id = seed["task_id"]
+    claimed_generation = seed["claimed_generation"]
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, seed["instance_id"])
+        source = await db.get(LogEntry, seed["source_log_id"])
+    assert task.instance_id == instance.id
+    assert instance.status == "idle"
+    assert instance.current_task_id is None
+    assert source.actual_transport is None
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            seed["handoff_id"],
+        )
+    assert task.status == "executing"
+    assert task.instance_id is None
+    assert task.turn_generation == claimed_generation
+    assert task.completed_at is None
+    assert task.error_message is None
+    assert receipt.status == "claimed"
+    assert receipt.claimed_turn_generation == claimed_generation
+
+    d._ensure_queue_worker = MagicMock()
+    await d._recover_worker_turn_handoff_outbox()
+    # Recovery is idempotent while the exact handoff already owns the volatile
+    # queue slot; it must not enqueue a second copy or create G+2.
+    await d._recover_worker_turn_handoff_outbox()
+    queue = d._get_task_queue(task_id)
+    assert queue.qsize() == 1
+    recovered = queue.get_nowait()
+    assert recovered.source_log_id == seed["source_log_id"]
+    assert recovered.worker_turn_handoff_id == seed["handoff_id"]
+    assert recovered.claimed_retry_count == seed["retry_count"]
+    assert recovered.claimed_turn_generation == claimed_generation
+    assert (
+        recovered.worker_turn_handoff_claimed_generation
+        == claimed_generation
+    )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            seed["handoff_id"],
+        )
+    assert task.turn_generation == claimed_generation
+    assert receipt.status == "claimed"
+    assert receipt.claimed_turn_generation == claimed_generation
 
 
 @pytest.mark.asyncio
@@ -797,11 +1636,16 @@ async def test_cleanup_fails_multi_owner_corruption_without_replay(db_factory):
 
 @pytest.mark.asyncio
 async def test_cleanup_requeues_unique_consistent_dead_owner(db_factory):
-    """A unique dead generation retries despite an older terminal log."""
+    """An exact unlaunched initial turn retries despite an older terminal log."""
     d = _make_dispatcher(db_factory)
 
     async with db_factory() as db:
-        task = Task(title="unique owner", status="executing")
+        task = Task(
+            title="unique owner",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+        )
         db.add(task)
         await db.flush()
         owner = Instance(
@@ -813,6 +1657,23 @@ async def test_cleanup_requeues_unique_consistent_dead_owner(db_factory):
         db.add(owner)
         await db.flush()
         task.instance_id = owner.id
+        source = LogEntry(
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=1,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            content=None,
+            raw_json=json.dumps({
+                "original_source_log_id": None,
+                "transport": None,
+            }),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
         db.add(
             LogEntry(
                 task_id=task.id,
@@ -932,7 +1793,7 @@ async def test_cleanup_preserves_live_owner_while_removing_dead_duplicate(
 
 @pytest.mark.asyncio
 async def test_cleanup_resets_stuck_in_progress_task(db_factory):
-    """An unowned in-progress claim returns to pending."""
+    """A legacy unowned in-progress claim is never blindly replayed."""
     d = _make_dispatcher(db_factory)
 
     async with db_factory() as db:
@@ -946,7 +1807,8 @@ async def test_cleanup_resets_stuck_in_progress_task(db_factory):
 
     async with db_factory() as db:
         t = await db.get(Task, task_id)
-        assert t.status == "pending"
+        assert t.status == "failed"
+        assert "automatic replay was blocked" in t.error_message
 
 
 @pytest.mark.asyncio
@@ -966,7 +1828,7 @@ async def test_cleanup_preserves_session_id(db_factory):
 
     async with db_factory() as db:
         t = await db.get(Task, task_id)
-        assert t.status == "pending"
+        assert t.status == "failed"
         assert t.session_id == "abc-123"
 
 
@@ -1103,8 +1965,8 @@ async def test_cleanup_called_on_start(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_safety_reset_instance_still_running(db_factory):
-    """If instance is still 'running' after lifecycle, safety net resets it."""
+async def test_safety_reset_fails_unclassified_task_and_releases_instance(db_factory):
+    """A dead lifecycle owner is released without inventing task success."""
     d = _make_dispatcher(db_factory)
 
     async with db_factory() as db:
@@ -1131,12 +1993,17 @@ async def test_safety_reset_instance_still_running(db_factory):
         assert inst.pid is None
         assert inst.current_task_id is None
         t = await db.get(Task, task_id)
-        assert t.status == "completed"
+        assert t.status == "failed"
+        assert t.error_message == (
+            "Dispatcher lifecycle exited without an authoritative terminal "
+            "result; automatic completion was blocked"
+        )
+        assert t.completed_at is not None
 
 
 @pytest.mark.asyncio
 async def test_safety_reset_writes_task_before_instance(db_factory):
-    """The fallback completion cannot invert the lifecycle DB lock order."""
+    """The fallback failure cannot invert the lifecycle DB lock order."""
 
     d = _make_dispatcher(db_factory)
     async with db_factory() as db:
@@ -1425,6 +2292,7 @@ async def test_safety_reset_handles_db_error(db_factory):
             worker_id=None,
             shared_from_id=None,
             retry_count=0,
+            turn_generation=0,
             instance_id=99999,
             started_at=None,
             completed_at=None,
@@ -1916,12 +2784,46 @@ async def test_cleanup_multiple_stale_entities(db_factory):
         # One alive instance
         inst3 = Instance(name="alive", status="idle")
         # Two stuck tasks
-        task1 = Task(title="stuck-1", description="t", status="executing")
-        task2 = Task(title="stuck-2", description="t", status="in_progress")
+        task1 = Task(
+            title="stuck-1",
+            description="t",
+            status="executing",
+            retry_count=0,
+            turn_generation=1,
+        )
+        task2 = Task(
+            title="stuck-2",
+            description="t",
+            status="in_progress",
+            retry_count=0,
+            turn_generation=1,
+        )
         # One normal task
         task3 = Task(title="normal", description="t", status="pending")
         for obj in [inst1, inst2, inst3, task1, task2, task3]:
             db.add(obj)
+        await db.flush()
+        sources = [
+            LogEntry(
+                task_id=task.id,
+                task_retry_count=0,
+                task_turn_generation=1,
+                turn_scope="source",
+                event_type="turn_source",
+                role="system",
+                content=None,
+                raw_json=json.dumps({
+                    "original_source_log_id": None,
+                    "transport": None,
+                }),
+                is_error=False,
+            )
+            for task in (task1, task2)
+        ]
+        db.add_all(sources)
+        await db.flush()
+        task1.turn_source_log_id = sources[0].id
+        task2.turn_source_log_id = sources[1].id
         await db.commit()
         for obj in [inst1, inst2, inst3, task1, task2, task3]:
             await db.refresh(obj)

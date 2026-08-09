@@ -44,6 +44,7 @@ describe('PlanCatalog', () => {
   it.each([
     ['queued', 'text-blue-300'],
     ['waiting_user', 'text-amber-300'],
+    ['cancelling', 'text-orange-300'],
     ['awaiting_review', 'text-purple-300'],
     ['approved', 'text-emerald-300'],
     ['applied', 'text-teal-300'],
@@ -73,6 +74,12 @@ describe('PlanCatalog', () => {
 
   it('hides archive actions for active Plans', () => {
     render(<PlanCatalog plans={[{ ...plan(1, 'Running Plan'), active_run_id: 42 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={vi.fn()} onSetArchived={vi.fn()} />);
+    expect(screen.queryByRole('button', { name: 'Archive Plan #1' })).not.toBeInTheDocument();
+  });
+
+  it('labels Capability ownership and hides archive for a terminal read-only Plan', () => {
+    render(<PlanCatalog plans={[{ ...plan(1, 'Capability Plan'), ownership: 'capability', read_only: true }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={vi.fn()} onSetArchived={vi.fn()} />);
+    expect(screen.getByText('Capability · read-only')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Archive Plan #1' })).not.toBeInTheDocument();
   });
 

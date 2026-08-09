@@ -50,6 +50,8 @@ from backend.api.user_skills import router as user_skills_router
 from backend.api.team_sharing import router as team_sharing_router
 from backend.api.plans import router as plans_router
 from backend.api.plan_resources import router as plan_resources_router
+from backend.api.capabilities import router as capabilities_router
+from backend.api.delivery_runs import router as delivery_runs_router
 from backend.middleware.auth import TokenAuthMiddleware
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 from backend.services.instance_manager import InstanceManager
@@ -63,6 +65,19 @@ from backend.services.deployment_start_guard import (
 )
 from backend.services.sub_agent_watcher import SubAgentWatcher
 from backend.services.cloudrouter_accounts import CloudRouterAccountStore
+from backend.services.capability_coordinator import CapabilityCoordinator
+from backend.services.capability_resume import CapabilityResumeCoordinator
+from backend.services.capability_registry import register_capability
+from backend.services.code_review_capability import (
+    CodeReviewCapabilityExecutor,
+    code_review_capability_definition,
+)
+from backend.services.plan_capability import (
+    PlanCapabilityExecutor,
+    plan_capability_definition,
+)
+from backend.services.delivery_controller import DeliveryController
+from backend.services.delivery_publisher import GitHubDeliveryPublisher
 
 # Logging: surface INFO from our services AND claude_pty in the server log.
 # Without this, PTY delivery/turn diagnostics are invisible (learned the
@@ -94,7 +109,183 @@ dispatcher = GlobalDispatcher(
 dispatcher.cloudrouter_store = cloudrouter_store
 instance_manager.task_message_enqueuer = dispatcher.enqueue_message
 
+# Register provider-neutral capability adapters independently from admission.
+# Keeping them present while the feature flag is dark lets startup recovery
+# finish or cancel work admitted by an earlier process without creating new
+# queued invocations.
+plan_capability_executor = PlanCapabilityExecutor(
+    wake_callback=dispatcher.wake,
+    stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+)
+register_capability(
+    plan_capability_definition(
+        executor=plan_capability_executor,
+    ),
+    replace=True,
+)
+register_capability(
+    code_review_capability_definition(
+        executor=CodeReviewCapabilityExecutor(wake_callback=dispatcher.wake)
+    ),
+    replace=True,
+)
+
 sub_agent_watcher = SubAgentWatcher(db_factory=async_session, broadcaster=broadcaster)
+capability_coordinator = CapabilityCoordinator(
+    db_factory=async_session,
+    poll_interval_seconds=(
+        settings.capability_coordinator_poll_interval_seconds
+    ),
+    max_concurrency=settings.capability_coordinator_max_concurrency,
+    scan_limit=settings.capability_coordinator_scan_limit,
+    initial_backoff_seconds=(
+        settings.capability_coordinator_initial_backoff_seconds
+    ),
+    max_backoff_seconds=settings.capability_coordinator_max_backoff_seconds,
+)
+capability_resume_coordinator = CapabilityResumeCoordinator(
+    db_factory=async_session,
+    publisher=dispatcher.enqueue_capability_resume,
+)
+dispatcher.capability_invocation_wake = capability_coordinator.wake
+_dispatcher_runtime_lifecycle_lock = asyncio.Lock()
+delivery_controller = DeliveryController(
+    db_factory=async_session,
+    capability_coordinator=capability_coordinator,
+    dispatcher=dispatcher,
+    publisher=GitHubDeliveryPublisher(async_session),
+    # Feature flags gate new Run admission. The controller must remain alive
+    # to recover exact work admitted by an earlier process/configuration.
+    enabled=True,
+)
+
+
+async def _await_dispatcher_runtime_transition(
+    operation: asyncio.Task[None],
+) -> None:
+    """Delay caller cancellation until one paired runtime transition settles."""
+
+    cancellation: asyncio.CancelledError | None = None
+    while not operation.done():
+        try:
+            await asyncio.shield(operation)
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        except BaseException:
+            break
+    operation.result()
+    if cancellation is not None:
+        raise cancellation
+
+
+async def _restore_capability_resume_after_stop_failure(
+    *,
+    stop_error: BaseException,
+) -> None:
+    """Restore the resume producer when Dispatcher pause is unconfirmed."""
+
+    try:
+        await capability_resume_coordinator.start()
+    except BaseException as restore_error:
+        # GlobalDispatcher.stop() closes its public admission flag before it
+        # waits for the exact background loops.  If both that wait and this
+        # restoration fail, fresh work remains fail-closed even though the
+        # retained loop could not be reaped synchronously.
+        raise RuntimeError(
+            "Dispatcher stop was not confirmed and the capability resume "
+            "coordinator could not be restored; new Dispatcher admission "
+            "remains closed"
+        ) from restore_error
+    raise stop_error
+
+
+async def _start_dispatcher_runtime_locked() -> None:
+    await dispatcher.start()
+    try:
+        await capability_resume_coordinator.start()
+    except BaseException as start_error:
+        # start() can fail during its synchronous recovery pass before its
+        # runner is published.  shutdown() is still required so a future
+        # implementation cannot leak a partially published runner.
+        shutdown_error: BaseException | None = None
+        try:
+            await capability_resume_coordinator.shutdown()
+        except BaseException as exc:
+            shutdown_error = exc
+            logger.exception(
+                "Capability resume coordinator start rollback failed"
+            )
+        try:
+            await dispatcher.stop()
+        except BaseException as stop_error:
+            logger.exception(
+                "Dispatcher rollback failed after capability resume "
+                "coordinator start failure"
+            )
+            await _restore_capability_resume_after_stop_failure(
+                stop_error=stop_error,
+            )
+        if shutdown_error is not None:
+            raise RuntimeError(
+                "Capability resume coordinator failed to start and its "
+                "rollback could not be confirmed; Dispatcher was paused"
+            ) from start_error
+        raise
+
+
+async def start_dispatcher_runtime() -> None:
+    """Start Dispatcher and its durable resume producer as one lifecycle."""
+
+    async def transition() -> None:
+        async with _dispatcher_runtime_lifecycle_lock:
+            await _start_dispatcher_runtime_locked()
+
+    operation = asyncio.create_task(
+        transition(),
+        name="dispatcher-runtime-start",
+    )
+    await _await_dispatcher_runtime_transition(operation)
+
+
+async def _stop_dispatcher_runtime_locked() -> None:
+    try:
+        await capability_resume_coordinator.shutdown()
+    except BaseException as shutdown_error:
+        # A shutdown exception does not prove whether the runner crossed its
+        # terminal boundary.  Re-start is idempotent and restores the original
+        # running state before returning the failed transition to the caller.
+        try:
+            await capability_resume_coordinator.start()
+        except BaseException as restore_error:
+            raise RuntimeError(
+                "Capability resume coordinator shutdown failed and its "
+                "running state could not be restored"
+            ) from restore_error
+        raise shutdown_error
+
+    try:
+        await dispatcher.stop()
+    except BaseException as stop_error:
+        logger.exception(
+            "Dispatcher stop failed; restoring capability resume coordinator"
+        )
+        await _restore_capability_resume_after_stop_failure(
+            stop_error=stop_error,
+        )
+
+
+async def stop_dispatcher_runtime() -> None:
+    """Pause Dispatcher and its durable resume producer atomically."""
+
+    async def transition() -> None:
+        async with _dispatcher_runtime_lifecycle_lock:
+            await _stop_dispatcher_runtime_locked()
+
+    operation = asyncio.create_task(
+        transition(),
+        name="dispatcher-runtime-stop",
+    )
+    await _await_dispatcher_runtime_transition(operation)
 
 # Codex account pool (optional, CODEX_POOL_ENABLED=true)
 codex_pool = None
@@ -201,6 +392,18 @@ if settings.worker_enabled:
         )
     except Exception:
         logger.exception("Worker provisioner init failed — workers disabled")
+
+# The same runtime also runs on a Worker where Manager-side Worker support may
+# be disabled.  It must still recover locally accepted/executing receipts and
+# keep their durable dequeue gate authoritative across restart.
+from backend.services.worker_task_termination import (
+    WorkerTaskTerminationCoordinator,
+)
+
+worker_task_termination_coordinator = WorkerTaskTerminationCoordinator(
+    async_session,
+    worker_proxy=worker_proxy,
+)
 
 
 async def _sync_tags():
@@ -425,6 +628,7 @@ async def _shutdown_runtime_services(
     upload_cleanup_task,
     tmp_cleanup_task,
     backup_svc,
+    worker_relay_recovery_task=None,
     pr_review_recovery_task=None,
 ) -> None:
     """Run every shutdown stage and re-raise the first teardown failure."""
@@ -438,6 +642,7 @@ async def _shutdown_runtime_services(
     background_tasks = [
         task
         for task in (
+            worker_relay_recovery_task,
             heartbeat_task,
             worker_health_task,
             upload_cleanup_task,
@@ -517,6 +722,49 @@ async def _shutdown_runtime_services(
         failures.append(exc)
         logger.exception("Ralph loop shutdown failed")
 
+    # Delivery reconciliation may enqueue Capability or Dispatcher work, so
+    # close it before either downstream runtime is dismantled.
+    try:
+        await delivery_controller.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Delivery Controller shutdown failed")
+
+    # Resume publication is a downstream producer of Dispatcher queue work.
+    # Quiesce it before Capability callbacks and queue transports are removed.
+    try:
+        await capability_resume_coordinator.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Capability resume coordinator shutdown failed")
+
+    # Capability callbacks may wake or stop Dispatcher-owned Plan/review
+    # lifecycles. Close their admission and await exact callbacks before
+    # dismantling Dispatcher transports.
+    try:
+        await capability_coordinator.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Capability coordinator shutdown failed")
+
+    # Stop receipt reconciliation while both the Worker relay and Dispatcher
+    # resources it may use for exact readback/reaping are still available.
+    try:
+        await worker_task_termination_coordinator.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Worker termination coordinator shutdown failed")
+
+    # Relay recovery and health producers are already quiescent above. Close
+    # relay-owned sockets/tasks before Dispatcher starts dismantling the local
+    # execution paths that accepted Worker handoffs depend on.
+    if worker_relay is not None:
+        try:
+            await worker_relay.shutdown()
+        except BaseException as exc:
+            failures.append(exc)
+            logger.exception("Worker relay shutdown failed")
+
     # Close every Dispatcher admission path before taking down transports.
     # A failure is retained, but later cleanup must still run: those transports
     # may be the only remaining handles capable of reaping child processes.
@@ -577,6 +825,32 @@ async def _shutdown_runtime_services(
         # Preserve the original exception type/traceback for systemd/test
         # visibility. Secondary cleanup failures were already logged above.
         raise failures[0]
+
+
+async def _start_execution_runtimes() -> None:
+    """Start execution runtimes from downstream owner to controller."""
+
+    # Reconcile Worker-local accepted/executing rows synchronously while their
+    # SQL active_task_id gate still excludes every TaskQueue claim.  Only after
+    # this pass may Dispatcher expose dequeue; the periodic runner handles
+    # transient cleanup failures without releasing that gate.
+    await worker_task_termination_coordinator.recover_once(
+        include_manager=False
+    )
+    if settings.auto_start_dispatcher:
+        # Dispatcher and the durable resume producer form one public runtime.
+        # Start them adjacently so a failed recovery scan can roll back the
+        # Dispatcher before any upstream producer is exposed.
+        await start_dispatcher_runtime()
+    if worker_relay is not None:
+        await worker_relay.start()
+    await worker_task_termination_coordinator.start()
+    # This remains active when capability admission is disabled: it must still
+    # recover/cancel work that was already running before a feature rollback.
+    await capability_coordinator.start()
+    # Admission is gated by both feature flags at the API boundary. Recovery
+    # stays active and starts after both downstream execution runtimes.
+    await delivery_controller.start()
 
 
 async def _recover_pending_pr_review_publications() -> bool:
@@ -722,16 +996,18 @@ async def _runtime_lifespan(app: FastAPI):
     await _sync_tags()
     sub_agent_watcher.start()
     await _ensure_claude_warmup()
-    if settings.auto_start_dispatcher:
-        await dispatcher.start()
+    await _start_execution_runtimes()
     pr_review_recovery_task = None
+    worker_relay_recovery_task = None
 
     # Worker 健康监控循环 + Manager 重启后恢复所有 relay 连接
     worker_health_task = None
     if worker_provisioner is not None:
         import asyncio as _asyncio
         worker_health_task = _asyncio.create_task(worker_provisioner.health_check_loop())
-        _asyncio.create_task(_recover_worker_relays())
+        worker_relay_recovery_task = _asyncio.create_task(
+            _recover_worker_relays()
+        )
 
     # Recover shared task relays
 
@@ -779,6 +1055,7 @@ async def _runtime_lifespan(app: FastAPI):
         await _shutdown_runtime_services(
             heartbeat_task=heartbeat_task,
             worker_health_task=worker_health_task,
+            worker_relay_recovery_task=worker_relay_recovery_task,
             upload_cleanup_task=upload_cleanup_task,
             tmp_cleanup_task=tmp_cleanup_task,
             backup_svc=backup_svc,
@@ -803,6 +1080,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Claude Code Manager", version="0.1.0", lifespan=lifespan)
+app.state.internal_service_db_factory = async_session
 
 
 @app.middleware("http")
@@ -867,6 +1145,8 @@ app.include_router(user_skills_router)
 app.include_router(team_sharing_router)
 app.include_router(plans_router)
 app.include_router(plan_resources_router)
+app.include_router(capabilities_router)
+app.include_router(delivery_runs_router)
 
 # Serve frontend static files in production
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"

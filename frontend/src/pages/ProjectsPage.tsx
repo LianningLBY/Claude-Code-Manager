@@ -1092,7 +1092,7 @@ export function ProjectsPage() {
                     />
                   </div>
 
-                  <ProjectTodoList projectId={p.id} />
+                  <ProjectTodoList projectId={p.id} project={p} />
                 </div>
               </div>
 

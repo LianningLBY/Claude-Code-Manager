@@ -76,6 +76,26 @@ vi.mock('../../api/client', () => ({
       blob: new Blob(['artifact']),
       filename: '汇报稿.md',
     }),
+    getDeliveryRun: vi.fn().mockResolvedValue({
+      id: 42,
+      phase: 'monitoring',
+      activity: 'waiting',
+      outcome: null,
+      cycle_count: 2,
+      max_cycles: 10,
+      turn_count: 2,
+      delivery_branch: 'ccm/delivery/42-controlled-delivery',
+      wait_reason: 'pr_monitor',
+      pause_reason: null,
+      error_code: null,
+      error_message: null,
+      pr_number: 123,
+      pr_url: 'https://github.com/acme/repo/pull/123',
+      allowed_actions: [],
+    }),
+    pauseDeliveryRun: vi.fn(),
+    resumeDeliveryRun: vi.fn(),
+    cancelDeliveryRun: vi.fn(),
   },
 }));
 
@@ -123,6 +143,7 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     merge_status: 'pending',
     instance_id: null,
     retry_count: 0,
+    turn_generation: 0,
     max_retries: 3,
     mode: 'auto',
     todo_file_path: null,
@@ -312,6 +333,68 @@ describe('ChatView', () => {
       }
     }
   });
+
+  it('renders Delivery-owned developer conversations as read-only', async () => {
+    render(
+      <ChatView
+        task={makeTask({
+          mode: 'delivery_loop',
+          delivery_run_id: 42,
+          delivery_role: 'developer',
+          status: 'in_progress',
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+        })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    expect(screen.getByTestId('delivery-read-only')).toHaveTextContent(
+      'Delivery Run #42 owns this Developer Task',
+    );
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Plans' })).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Edit title')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Interrupt session')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Fork Codex session')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Distill skill from conversation')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Add attention tag')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(await screen.findByRole('region', { name: 'Delivery Run #42' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
+    expect(screen.getByText(/observation-only/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'PR #123' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/repo/pull/123',
+    );
+    expect(screen.getByTitle('Star')).toBeInTheDocument();
+  });
+
+  it('keeps mobile header badges and compact actions on one row', async () => {
+    render(
+      <ChatView
+        task={makeTask({ provider: 'codex', project_id: 7 })}
+        projects={[{ id: 7, name: 'A long mobile project name' } as Project]}
+        onBack={onBack}
+      />,
+    );
+
+    await screen.findByTestId('codex-main-mcp-status');
+
+    const header = screen.getByTestId('chat-header-primary');
+    expect(header.className).toContain('items-center');
+    expect(header.className).not.toContain('flex-col');
+
+    const badges = screen.getByTestId('chat-task-badges');
+    expect(badges.className).toContain('flex-nowrap');
+    expect(badges.className).toContain('overflow-hidden');
+
+    const actions = screen.getByTestId('chat-header-actions');
+    expect(actions.className).toContain('shrink-0');
+    expect(screen.getByText('Plans').className).toContain('hidden');
+    expect(screen.getByText('Plans').className).toContain('sm:inline');
+  }, 15_000);
 
   describe('chat conflict state', () => {
     it('does not show Interrupt for a non-busy 409 rejection', async () => {
@@ -686,6 +769,71 @@ describe('ChatView', () => {
         expect(screen.getByTitle('Interrupt session')).toBeInTheDocument();
       },
     );
+
+    it('queues follow-ups and disables live injection while waiting on a capability', async () => {
+      const task = makeTask({
+        id: 303,
+        provider: 'codex',
+        status: 'waiting_capability',
+        worker_id: null,
+        shared_from_id: null,
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Waiting for requested capability...')).toBeInTheDocument();
+      await waitFor(() => expect(api.getRuntimeSettings).toHaveBeenCalled());
+      expect(screen.queryByTitle(/Codex turn\/steer/)).not.toBeInTheDocument();
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        'continue after the review',
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.injectTaskMessage).not.toHaveBeenCalled();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('does not auto-dequeue a queued message when the yielding source process exits', async () => {
+      const task = makeTask({
+        id: 304,
+        status: 'waiting_capability',
+        retry_count: 2,
+        turn_generation: 7,
+      });
+      localStorage.setItem(
+        `ccm-chat-queue-${task.id}`,
+        JSON.stringify([{ text: 'wait for durable resume' }]),
+      );
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_250));
+      });
+
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+      expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
 
     it('shows the background badge while the foreground status is still executing', () => {
       const task = makeTask({ id: 31, status: 'executing', background_active: false });
@@ -2830,6 +2978,256 @@ describe('Codex app-server 增量消息', () => {
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
   });
 
+  it('丢弃缺少 retry 或 turn generation 的 delta', async () => {
+    const task = makeTask({
+      id: 20,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 3,
+      turn_generation: 8,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:20',
+        data: {
+          event_type: 'message_delta', item_id: 'missing-retry',
+          content: 'must not render without retry', task_turn_generation: 8,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:20',
+        data: {
+          event_type: 'message_delta', item_id: 'missing-turn',
+          content: 'must not render without turn', task_retry_count: 3,
+        },
+      });
+    });
+
+    expect(screen.queryByText('must not render without retry')).not.toBeInTheDocument();
+    expect(screen.queryByText('must not render without turn')).not.toBeInTheDocument();
+  });
+
+  it('does not let an old process_exit stop a newer logical turn during the terminal delay', async () => {
+    const task = makeTask({
+      id: 201,
+      provider: 'codex',
+      status: 'completed',
+      retry_count: 2,
+      turn_generation: 40,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:201',
+        data: {
+          event_type: 'message_delta', item_id: 'next-turn', content: 'working',
+          task_retry_count: 2, task_turn_generation: 41,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:201',
+        data: { event_type: 'transient_retry', attempt: 1, delay: 1 },
+      });
+      capturedOnMessage!({
+        channel: 'task:201',
+        data: {
+          event_type: 'process_exit', exit_code: 0,
+          task_retry_count: 2, task_turn_generation: 40,
+        },
+      });
+    });
+
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 650));
+    });
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+  });
+
+  it('drops old exact status, background, and context events after observing a newer turn', async () => {
+    const task = makeTask({
+      id: 202,
+      provider: 'codex',
+      status: 'completed',
+      retry_count: 3,
+      turn_generation: 50,
+    });
+    const view = render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'tasks',
+        data: {
+          event: 'status_change', task_id: 202, new_status: 'executing',
+          task_retry_count: 3, task_turn_generation: 51,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'tasks',
+        data: {
+          event: 'status_change', task_id: 202, new_status: 'completed',
+          task_retry_count: 3, task_turn_generation: 50,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event_type: 'context_usage', input_tokens: 50,
+          cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+          output_tokens: 0, total_input_tokens: 50, context_window: 100,
+          task_retry_count: 3, task_turn_generation: 51,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event_type: 'context_usage', input_tokens: 1,
+          cache_read_input_tokens: 0, cache_creation_input_tokens: 0,
+          output_tokens: 0, total_input_tokens: 1, context_window: 100,
+          task_retry_count: 3, task_turn_generation: 50,
+        },
+      });
+    });
+
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+    expect(screen.getByText('50%')).toBeInTheDocument();
+    expect(screen.queryByText('1%')).not.toBeInTheDocument();
+
+    view.unmount();
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event: 'background_activity', background_active: true,
+          task_retry_count: 3, task_turn_generation: 51,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:202',
+        data: {
+          event: 'background_activity', background_active: false,
+          task_retry_count: 3, task_turn_generation: 50,
+        },
+      });
+    });
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+  });
+
+  it('advances within one retry, drops late old-turn deltas, and only replaces the matching generation', async () => {
+    const task = makeTask({
+      id: 211,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 4,
+      turn_generation: 10,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          event_type: 'message_delta', item_id: 'reused-item', content: 'old provisional',
+          task_retry_count: 4, task_turn_generation: 10,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          event_type: 'message_delta', item_id: 'reused-item', content: 'new provisional',
+          task_retry_count: 4, task_turn_generation: 11,
+        },
+      });
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          event_type: 'message_delta', item_id: 'reused-item', content: ' late old suffix',
+          task_retry_count: 4, task_turn_generation: 10,
+        },
+      });
+    });
+
+    expect(screen.queryByText('old provisional')).not.toBeInTheDocument();
+    expect(screen.queryByText(/late old suffix/)).not.toBeInTheDocument();
+    expect(screen.getByText('new provisional')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          id: 710,
+          event_type: 'message', item_id: 'reused-item', role: 'assistant',
+          content: 'old persisted final', task_retry_count: 4,
+          task_turn_generation: 10,
+        },
+      });
+    });
+    expect(screen.getByText('old persisted final')).toBeInTheDocument();
+    expect(screen.getByText('new provisional')).toBeInTheDocument();
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:211',
+        data: {
+          id: 711,
+          event_type: 'message', item_id: 'reused-item', role: 'assistant',
+          content: 'new persisted final', task_retry_count: 4,
+          task_turn_generation: 11,
+        },
+      });
+    });
+    expect(screen.queryByText('new provisional')).not.toBeInTheDocument();
+    expect(screen.getByText('new persisted final')).toBeInTheDocument();
+    expect(screen.getByText('old persisted final')).toBeInTheDocument();
+  });
+
+  it('does not restore a cached provisional after the Task advances to another turn', async () => {
+    const firstTurn = makeTask({
+      id: 212,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 1,
+      turn_generation: 20,
+    });
+    const first = render(<ChatView task={firstTurn} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:212',
+        data: {
+          event_type: 'thinking_delta', item_id: 'cached-old-turn',
+          content: 'cached old reasoning', task_retry_count: 1,
+          task_turn_generation: 20,
+        },
+      });
+    });
+    expect(screen.getByText('cached old reasoning')).toBeInTheDocument();
+    first.unmount();
+
+    const second = render(
+      <ChatView
+        task={{ ...firstTurn, turn_generation: 21 }}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+    expect(screen.queryByText('cached old reasoning')).not.toBeInTheDocument();
+    second.unmount();
+
+    render(<ChatView task={firstTurn} projects={projects} onBack={onBack} />);
+    expect(screen.queryByText('cached old reasoning')).not.toBeInTheDocument();
+  });
+
   it('按 item_id 合并 delta，并用最终消息原位替换而不重复', async () => {
     const task = makeTask({ id: 21, provider: 'codex' });
     render(<ChatView task={task} projects={projects} onBack={onBack} />);
@@ -2838,11 +3236,17 @@ describe('Codex app-server 增量消息', () => {
     await act(async () => {
       capturedOnMessage!({
         channel: 'task:21',
-        data: { event_type: 'message_delta', item_id: 'msg-1', content: 'Hel' },
+        data: {
+          event_type: 'message_delta', item_id: 'msg-1', content: 'Hel',
+          task_retry_count: 0, task_turn_generation: 0,
+        },
       });
       capturedOnMessage!({
         channel: 'task:21',
-        data: { event_type: 'message_delta', item_id: 'msg-1', content: 'lo' },
+        data: {
+          event_type: 'message_delta', item_id: 'msg-1', content: 'lo',
+          task_retry_count: 0, task_turn_generation: 0,
+        },
       });
     });
     expect(screen.getAllByText('Hello')).toHaveLength(1);
@@ -2852,7 +3256,8 @@ describe('Codex app-server 增量消息', () => {
         channel: 'task:21',
         data: {
           event_type: 'message', item_id: 'msg-1', role: 'assistant',
-          content: 'Hello', is_error: false,
+          content: 'Hello', is_error: false, task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2871,6 +3276,8 @@ describe('Codex app-server 增量消息', () => {
           event_type: 'thinking_delta',
           item_id: 'reasoning-1',
           content: 'first half',
+          task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2887,6 +3294,8 @@ describe('Codex app-server 增量消息', () => {
           event_type: 'thinking_delta',
           item_id: 'reasoning-1',
           content: ' second half',
+          task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -2901,6 +3310,8 @@ describe('Codex app-server 增量消息', () => {
           item_id: 'reasoning-1',
           role: 'assistant',
           content: 'first half second half',
+          task_retry_count: 0,
+          task_turn_generation: 0,
         },
       });
     });
@@ -3019,7 +3430,7 @@ describe('independent Plan attachments', () => {
 
     expect(selectedButton).toHaveAttribute('aria-current', 'true');
     expect(selectedButton).toHaveClass('border-indigo-500/70', 'bg-indigo-500/15');
-    expect(within(selectedButton).getByText('Awaiting review'))
+    expect(within(selectedButton).getByText('Needs approval'))
       .toHaveClass('text-indigo-300', 'ring-indigo-500/30');
     expect(otherButton).not.toHaveAttribute('aria-current');
   });

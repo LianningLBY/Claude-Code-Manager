@@ -82,7 +82,7 @@ describe('FilesPage managed SSH workspace', () => {
     render(<FilesPage />);
 
     await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
-    await user.click(await screen.findByRole('button', { name: /production-box/i }));
+    await user.click(await screen.findByRole('button', { name: /^production-box\b/i }));
 
     await waitFor(() => {
       expect(api.managedSSHListDir).toHaveBeenCalledWith(41, '/');
@@ -215,6 +215,44 @@ describe('FilesPage managed SSH workspace', () => {
         task_capabilities: ['read', 'exec'],
       }),
     ));
+  });
+
+  it('sends the displayed profile revision when editing', async () => {
+    const user = userEvent.setup();
+    render(<FilesPage />);
+
+    await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
+    await screen.findByRole('button', { name: /^production-box\b/i });
+    await user.click(screen.getByRole('button', { name: 'edit' }));
+    await user.clear(screen.getByLabelText('Name'));
+    await user.type(screen.getByLabelText('Name'), 'production-renamed');
+    await user.click(screen.getByRole('button', { name: /^Save$/i }));
+
+    await waitFor(() => expect(api.updateSSHProfile).toHaveBeenCalledWith(
+      41,
+      expect.objectContaining({
+        revision: 1,
+        name: 'production-renamed',
+      }),
+    ));
+  });
+
+  it('sends the displayed profile revision when deleting', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(api.deleteSSHProfile).mockResolvedValue({ ok: true });
+    const user = userEvent.setup();
+    render(<FilesPage />);
+
+    await user.click(screen.getByRole('button', { name: /SSH workspace/i }));
+    await screen.findByRole('button', { name: /^production-box\b/i });
+    await user.click(screen.getByRole('button', {
+      name: 'Delete production-box',
+    }));
+
+    await waitFor(() => {
+      expect(api.deleteSSHProfile).toHaveBeenCalledWith(41, 1);
+    });
+    confirmSpy.mockRestore();
   });
 
   it('keeps a legacy connection in the unified list and migrates it through PEM upload', async () => {

@@ -14,6 +14,12 @@ from backend.services.task_ssh_access import (
     task_ssh_grant_snapshots,
     valid_task_ssh_capabilities,
 )
+from backend.config import settings
+
+
+@pytest.fixture(autouse=True)
+def _managed_ssh_auth(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "ccm-managed-ssh-test-token")
 
 
 async def _seed_task_profile(db_factory, *, with_grant: bool = False):

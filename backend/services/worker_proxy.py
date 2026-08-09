@@ -10,14 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import stat
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from datetime import datetime
 from weakref import WeakKeyDictionary
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from fastapi.responses import StreamingResponse
 from starlette.background import BackgroundTask
 
@@ -27,6 +31,11 @@ from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.legacy_plan_execution import (
+    LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION,
+    LegacyPlanExecutionCarrierProof,
+    parse_legacy_plan_execution_carrier_proof,
+)
 from backend.services.pr_review_runtime import (
     PR_REVIEW_SNAPSHOT_CONTEXT_VERSION,
     PR_REVIEW_TERMINAL_CHAT_HEADER,
@@ -40,8 +49,111 @@ from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_SCOPE_VERSION,
 )
 from backend.services.worker_relay import worker_task_generation
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 logger = logging.getLogger(__name__)
+
+
+_WORKER_DESTROY_CLAIM_SEAL = object()
+
+
+WORKER_PLAN_RECONCILIATION_PROTOCOL = 1
+WORKER_PLAN_EXACT_CANCEL_PROTOCOL = 1
+
+
+class WorkerPlanRemoteAbsent(RuntimeError):
+    """Exact read-only audit proved that the Worker never imported the Run."""
+
+
+class WorkerPlanRemoteIdentityConflict(RuntimeError):
+    """The Worker Run id exists but belongs to another immutable payload."""
+
+
+class WorkerPlanRemoteCancelled(RuntimeError):
+    """The exact Worker import was tombstoned before it could be admitted."""
+
+
+class WorkerPlanReconciliationUnsupported(RuntimeError):
+    """The Worker cannot provide the required read-only identity proof."""
+
+
+@dataclass(frozen=True)
+class WorkerDestroyLifecycleClaim:
+    """Opaque authority for one already-claimed Worker destroy lifecycle.
+
+    The public Worker proxy remains ready-only.  This token is created only
+    from the row returned by the ``ready|stopped|error -> destroying`` CAS and
+    lets the destroy coordinator perform the narrow stop/readback handshake
+    while that exact Worker endpoint still owns the Task.
+    """
+
+    _seal: object = field(repr=False, compare=False)
+    worker_id: int
+    created_at: datetime | None
+    updated_at: datetime | None
+    cloud_instance_id: str | None
+    private_ip: str | None
+    ccm_port: int
+    auth_token: str | None = field(repr=False)
+
+
+def capture_worker_destroy_lifecycle_claim(
+    worker: Worker,
+) -> WorkerDestroyLifecycleClaim:
+    """Freeze the stable identity behind one successful destroy CAS."""
+
+    if worker.status != "destroying":
+        raise ValueError("Worker destroy claim requires destroying status")
+    return WorkerDestroyLifecycleClaim(
+        _seal=_WORKER_DESTROY_CLAIM_SEAL,
+        worker_id=worker.id,
+        created_at=worker.created_at,
+        updated_at=worker.updated_at,
+        cloud_instance_id=worker.cloud_instance_id,
+        private_ip=worker.private_ip,
+        ccm_port=worker.ccm_port,
+        auth_token=worker.auth_token,
+    )
+
+
+def _worker_destroy_lifecycle_predicates(
+    claim: WorkerDestroyLifecycleClaim,
+) -> tuple:
+    """Return the durable CAS fence for one opaque in-process destroy claim."""
+
+    if (
+        not isinstance(claim, WorkerDestroyLifecycleClaim)
+        or claim._seal is not _WORKER_DESTROY_CLAIM_SEAL
+    ):
+        raise ValueError("invalid Worker destroy lifecycle claim")
+    return (
+        Worker.id == claim.worker_id,
+        Worker.status == "destroying",
+        (
+            Worker.created_at.is_(None)
+            if claim.created_at is None
+            else Worker.created_at == claim.created_at
+        ),
+        (
+            Worker.updated_at.is_(None)
+            if claim.updated_at is None
+            else Worker.updated_at == claim.updated_at
+        ),
+        (
+            Worker.cloud_instance_id.is_(None)
+            if claim.cloud_instance_id is None
+            else Worker.cloud_instance_id == claim.cloud_instance_id
+        ),
+        (
+            Worker.private_ip.is_(None)
+            if claim.private_ip is None
+            else Worker.private_ip == claim.private_ip
+        ),
+        Worker.ccm_port == claim.ccm_port,
+    )
 
 # (worker_id, manager_project_id) -> Lock，防并发 task 重复建项目
 _project_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -53,6 +165,54 @@ _task_operation_locks: WeakKeyDictionary[
 
 class WorkerEndpointNotFoundError(Exception):
     """A caller-requested signal that the Worker returned an exact HTTP 404."""
+
+
+class WorkerTaskForwardOutcomeUncertainError(RuntimeError):
+    """The initial create request may already have committed on the Worker.
+
+    Retrying that POST without an idempotent remote receipt can create a
+    second execution or make the Manager declare failure while the Worker is
+    still running.  ``cancellation`` preserves an outer shutdown request after
+    the Manager has durably quarantined the ambiguous claim.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.cancellation = cancellation
+
+
+class WorkerTaskForwardAdmissionBlockedError(RuntimeError):
+    """A durable termination receipt won before initial Worker creation."""
+
+
+class WorkerTaskMutationOutcomeUncertainError(RuntimeError):
+    """A Worker mutation may have committed without a readable response.
+
+    Callers which opt into this contract must durably quarantine the exact
+    Manager-side generation before releasing the per-Task operation lock.  In
+    particular, blindly replaying a cancel/stop POST is unsafe: the first
+    request may already have terminated the only remote execution.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        cancellation: asyncio.CancelledError | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.cancellation = cancellation
+
+
+class WorkerTaskPlanDeleteProtocolUnsupported(RuntimeError):
+    """The Worker cannot prove atomic Task + first-class Plan deletion."""
 
 
 def get_task_operation_lock(task_id: int) -> asyncio.Lock:
@@ -116,6 +276,32 @@ class WorkerProxy:
             )
         return worker
 
+    async def _require_destroy_lifecycle_claim(
+        self,
+        claim: WorkerDestroyLifecycleClaim,
+    ) -> Worker:
+        """Resolve one opaque destroy claim without widening ready admission."""
+
+        async with self.db_factory() as db:
+            worker = (
+                await db.execute(
+                    select(Worker).where(
+                        *_worker_destroy_lifecycle_predicates(claim)
+                    )
+                )
+            ).scalar_one_or_none()
+        # Keep the internal credential out of SQL parameters: driver errors are
+        # routinely logged and may render bound values. ``updated_at`` already
+        # fences every supported credential mutation; compare the token again
+        # in memory before it can authorize a request.
+        if worker is None or worker.auth_token != claim.auth_token:
+            raise HTTPException(
+                409,
+                "Worker destroy lifecycle or endpoint identity changed; "
+                "remote Task mutation was refused",
+            )
+        return worker
+
     async def _require_versioned_plan_protocol(self, worker: Worker) -> None:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
@@ -131,6 +317,180 @@ class WorkerProxy:
             raise RuntimeError(
                 f"Worker {worker.name} does not support versioned Plan protocol 3"
             )
+
+    async def _require_worker_plan_reconciliation_protocol(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Fail closed when a Worker cannot prove exact import identity."""
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise WorkerPlanReconciliationUnsupported(
+                f"Worker {worker.name} returned invalid recovery capabilities"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("versioned_plan_worker_protocol") != 3
+            or payload.get("worker_plan_reconciliation_protocol")
+            != WORKER_PLAN_RECONCILIATION_PROTOCOL
+        ):
+            raise WorkerPlanReconciliationUnsupported(
+                f"Worker {worker.name} does not support read-only Worker Plan "
+                f"reconciliation protocol {WORKER_PLAN_RECONCILIATION_PROTOCOL}"
+            )
+
+    async def _require_worker_plan_exact_cancel_protocol(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Fail closed unless cancellation is bound to immutable import id."""
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} returned invalid cancellation capabilities"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("versioned_plan_worker_protocol") != 3
+            or payload.get("worker_plan_exact_cancel_protocol")
+            != WORKER_PLAN_EXACT_CANCEL_PROTOCOL
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} does not support exact Worker Plan "
+                f"cancellation protocol {WORKER_PLAN_EXACT_CANCEL_PROTOCOL}"
+            )
+
+    async def require_task_plan_delete_protocol(
+        self,
+        task: Task,
+        operation_id: str,
+        *,
+        operation_lock_held: bool = False,
+    ) -> None:
+        """Preflight an exact durable delete before its mutation boundary."""
+
+        if not operation_lock_held:
+            raise ValueError(
+                "Task/Plan delete protocol check requires the Task operation lock"
+            )
+        if self.db_factory is None:
+            raise WorkerTaskPlanDeleteProtocolUnsupported(
+                "Worker Task deletion receipt storage is unavailable"
+            )
+        async with self.db_factory() as db:
+            receipt = await active_worker_task_termination_receipt(db, task.id)
+        if (
+            receipt is None
+            or receipt.operation_id != operation_id
+            or receipt.side != "manager"
+            or receipt.operation != "delete"
+            or receipt.status != "pending_remote"
+            or receipt.worker_id != task.worker_id
+        ):
+            raise WorkerTaskPlanDeleteProtocolUnsupported(
+                "Task deletion protocol check lost its exact durable owner"
+            )
+        worker = await self.require_ready_worker(task.worker_id)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+            response.raise_for_status()
+            payload = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise WorkerTaskPlanDeleteProtocolUnsupported(
+                f"Worker {worker.name} deletion capabilities are unavailable"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("plan_cascade_protocol") != 1
+        ):
+            raise WorkerTaskPlanDeleteProtocolUnsupported(
+                f"Worker {worker.name} does not support atomic Task/Plan "
+                "deletion protocol 1"
+            )
+
+    async def _require_legacy_plan_execution_carrier_protocol(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Require exact readback before trusting an existing Plan carrier."""
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("legacy_plan_execution_carrier_protocol")
+            != LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} does not support legacy Plan execution "
+                f"carrier protocol "
+                f"{LEGACY_PLAN_EXECUTION_CARRIER_PROTOCOL_VERSION}"
+            )
+
+    async def get_legacy_plan_execution_carrier_proof(
+        self,
+        worker: Worker,
+        task_id: int,
+    ) -> LegacyPlanExecutionCarrierProof | None:
+        """Read one existing Worker's semantic carrier proof, never create it."""
+
+        if type(task_id) is not int or task_id <= 0:
+            raise ValueError("legacy Plan carrier task_id must be positive")
+        await self._require_legacy_plan_execution_carrier_protocol(worker)
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/legacy-plan-execution-carrier-proof",
+                ),
+                headers=self._headers(worker),
+            )
+        if response.status_code in {404, 409}:
+            # Both outcomes prove that the assigned Worker cannot supply the
+            # exact migrated carrier.  Recovery must durably quarantine the
+            # Manager mirror instead of retrying a permanent 409 forever.
+            return None
+        response.raise_for_status()
+        try:
+            proof = parse_legacy_plan_execution_carrier_proof(response.json())
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} returned an invalid legacy Plan "
+                "execution carrier proof"
+            ) from exc
+        if proof.task_id != task_id:
+            raise RuntimeError(
+                f"Worker {worker.name} returned a legacy Plan carrier proof "
+                "for another Task"
+            )
+        return proof
 
     async def get_plan_repo_revision(
         self,
@@ -186,6 +546,61 @@ class WorkerProxy:
         payload = response.json()
         if not isinstance(payload, dict) or payload.get("receipt_key") != receipt_key:
             raise RuntimeError("Worker returned an invalid Plan application receipt")
+        return payload
+
+    async def get_worker_turn_handoff_receipt(
+        self,
+        worker: Worker,
+        task_id: int,
+        handoff_id: str,
+    ) -> dict | None:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/worker-turn-handoffs/{handoff_id}",
+                ),
+                headers=self._headers(worker),
+            )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("handoff_id") != handoff_id
+            or payload.get("task_id") != task_id
+        ):
+            raise RuntimeError(
+                "Worker returned an invalid turn handoff receipt"
+            )
+        return payload
+
+    async def resume_worker_turn_handoff(
+        self,
+        worker: Worker,
+        task_id: int,
+        handoff_id: str,
+    ) -> dict:
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                self._api(
+                    worker,
+                    f"/api/tasks/{task_id}/worker-turn-handoffs/"
+                    f"{handoff_id}/resume",
+                ),
+                headers=self._headers(worker),
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if (
+            not isinstance(payload, dict)
+            or payload.get("handoff_id") != handoff_id
+            or payload.get("task_id") != task_id
+        ):
+            raise RuntimeError(
+                "Worker returned an invalid turn handoff resume receipt"
+            )
         return payload
 
     async def resolve_plan_application_receipt(
@@ -287,17 +702,43 @@ class WorkerProxy:
             "human_decision": version.human_decision,
         }
 
+    @staticmethod
+    def _versioned_plan_import_digest(
+        payload: dict,
+        attachment_receipt: list[dict],
+    ) -> str:
+        """Match the Worker's immutable import identity byte-for-byte."""
+
+        identity = {
+            key: value
+            for key, value in payload.items()
+            if key not in {"manager_claim_generation", "attachment_manifest"}
+        }
+        identity["attachment_receipt"] = attachment_receipt
+        return hashlib.sha256(
+            json.dumps(
+                identity,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+
     async def run_versioned_plan_until_pause(
         self,
         plan: Plan,
         run: PlanAgentRun,
+        *,
+        on_remote_possible: Callable[[str], Awaitable[None]] | None = None,
     ) -> dict:
         """Mirror/resume one Manager PlanRun and return an authoritative pause."""
 
         if plan.worker_id is None or run.worker_id != plan.worker_id:
             raise RuntimeError("Plan Run Worker assignment changed before forwarding")
         worker = await self.require_ready_worker(plan.worker_id)
-        await self._require_versioned_plan_protocol(worker)
+        # A new mutating import is admitted only when the same Worker can
+        # later prove its exact identity after an ACK loss/restart.
+        await self._require_worker_plan_reconciliation_protocol(worker)
         worker_project_id = (
             await self.ensure_worker_project(worker, plan)
             if plan.project_id is not None
@@ -374,6 +815,15 @@ class WorkerProxy:
             "attachments": attachments or None,
             "attachment_manifest": attachment_manifest or None,
         }
+        import_digest = self._versioned_plan_import_digest(
+            payload,
+            attachment_manifest,
+        )
+        # The callback commits Manager-side uncertainty before the first
+        # mutating Plan import request. If it is cancelled or fails, the POST
+        # must never be attempted.
+        if on_remote_possible is not None:
+            await on_remote_possible(import_digest)
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 self._api(worker, "/api/plans/worker-import"),
@@ -390,8 +840,33 @@ class WorkerProxy:
         )
         if not isinstance(remote_run, dict) or remote_run.get("id") != run.id:
             raise RuntimeError("Worker returned an invalid Plan Run import receipt")
+        if imported.get("import_payload_digest") != import_digest:
+            raise RuntimeError(
+                "Worker Plan import receipt does not match the immutable payload"
+            )
         if imported.get("attachment_receipt") != attachment_manifest:
             raise RuntimeError("Worker Plan attachment receipt does not match the manifest")
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            validate_worker_plan_outcome_graph,
+        )
+
+        try:
+            validate_worker_plan_outcome_graph(
+                {
+                    "protocol": 3,
+                    "base_worker_version_id": base_worker_version_id,
+                    "run": remote_run,
+                    "versions": [],
+                },
+                plan_id=plan.id,
+                run_id=run.id,
+                require_version_closure=False,
+            )
+        except WorkerPlanDispatchConflict as exc:
+            raise RuntimeError(
+                "Worker returned an invalid Plan Run import receipt"
+            ) from exc
 
         if remote_run.get("status") == "waiting_user":
             remote_input_id = remote_run.get("open_input_request_id")
@@ -464,6 +939,22 @@ class WorkerProxy:
                 remote_run = response.json()
             if not isinstance(remote_run, dict) or remote_run.get("id") != run.id:
                 raise RuntimeError("Worker returned an invalid Plan Run snapshot")
+            try:
+                validate_worker_plan_outcome_graph(
+                    {
+                        "protocol": 3,
+                        "base_worker_version_id": base_worker_version_id,
+                        "run": remote_run,
+                        "versions": [],
+                    },
+                    plan_id=plan.id,
+                    run_id=run.id,
+                    require_version_closure=False,
+                )
+            except WorkerPlanDispatchConflict as exc:
+                raise RuntimeError(
+                    "Worker returned an invalid Plan Run snapshot"
+                ) from exc
 
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
@@ -478,13 +969,234 @@ class WorkerProxy:
             version
             for version in versions
             if isinstance(version, dict)
+            and type(version.get("produced_by_run_id")) is int
             and version.get("produced_by_run_id") == run.id
         ]
-        return {
+        outcome = {
             "protocol": 3,
             "base_worker_version_id": base_worker_version_id,
             "run": remote_run,
             "versions": versions,
+        }
+        try:
+            validate_worker_plan_outcome_graph(
+                outcome,
+                plan_id=plan.id,
+                run_id=run.id,
+            )
+        except WorkerPlanDispatchConflict as exc:
+            raise RuntimeError("Worker returned an invalid Plan outcome graph") from exc
+        return outcome
+
+    async def _read_worker_plan_import_audit(
+        self,
+        *,
+        worker: Worker,
+        plan_id: int,
+        run_id: int,
+        payload_digest: str,
+    ) -> dict:
+        """Read one exact Worker mirror without creating or resuming it."""
+
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.get(
+                self._api(
+                    worker,
+                    f"/api/plan-runs/{run_id}/worker-import-audit",
+                ),
+                headers=self._headers(worker),
+                params={
+                    "plan_id": plan_id,
+                    "payload_digest": payload_digest,
+                },
+            )
+        if response.status_code == 409:
+            raise WorkerPlanRemoteIdentityConflict(
+                "Worker Plan Run identity conflicts with the durable Manager receipt"
+            )
+        response.raise_for_status()
+        try:
+            audit = response.json()
+        except Exception as exc:
+            raise RuntimeError("Worker returned an invalid Plan import audit") from exc
+        if (
+            not isinstance(audit, dict)
+            or audit.get("protocol") != WORKER_PLAN_RECONCILIATION_PROTOCOL
+            or type(audit.get("plan_id")) is not int
+            or audit.get("plan_id") != plan_id
+            or type(audit.get("run_id")) is not int
+            or audit.get("run_id") != run_id
+            or audit.get("payload_digest") != payload_digest
+            or audit.get("state") not in {"absent", "cancelled", "matched"}
+        ):
+            raise RuntimeError("Worker returned an invalid Plan import audit")
+        if audit["state"] in {"absent", "cancelled"} and (
+            audit.get("run") is not None
+            or audit.get("versions") != []
+            or audit.get("base_worker_version_id") is not None
+        ):
+            raise RuntimeError("Worker returned an invalid absent Plan audit")
+        if audit["state"] == "matched":
+            remote = audit.get("run")
+            versions = audit.get("versions")
+            if (
+                not isinstance(remote, dict)
+                or type(remote.get("id")) is not int
+                or remote.get("id") != run_id
+                or type(remote.get("plan_id")) is not int
+                or remote.get("plan_id") != plan_id
+                or not isinstance(versions, list)
+            ):
+                raise RuntimeError("Worker returned an invalid matched Plan audit")
+            from backend.services.worker_plan_dispatch import (
+                WorkerPlanDispatchConflict,
+                validate_worker_plan_outcome_graph,
+            )
+
+            try:
+                validate_worker_plan_outcome_graph(
+                    {
+                        "protocol": 3,
+                        "base_worker_version_id": audit.get(
+                            "base_worker_version_id"
+                        ),
+                        "run": remote,
+                        "versions": versions,
+                    },
+                    plan_id=plan_id,
+                    run_id=run_id,
+                )
+            except WorkerPlanDispatchConflict as exc:
+                raise RuntimeError(
+                    "Worker returned an invalid matched Plan audit"
+                ) from exc
+        return audit
+
+    async def reconcile_versioned_plan_until_pause(
+        self,
+        plan: Plan,
+        run: PlanAgentRun,
+        *,
+        payload_digest: str,
+    ) -> dict:
+        """Recover a maybe-imported Run through exact readback, never import.
+
+        The only mutation allowed here is replaying an already committed
+        Manager input answer after an audit proves the exact Worker Run is
+        still waiting on that exact request.  The answer endpoint has its own
+        generation and idempotency fences.
+        """
+
+        if (
+            plan.worker_id is None
+            or run.worker_id != plan.worker_id
+            or len(payload_digest) != 64
+        ):
+            raise WorkerPlanRemoteIdentityConflict(
+                "Worker Plan recovery identity is inconsistent"
+            )
+        worker = await self.require_ready_worker(plan.worker_id)
+        await self._require_worker_plan_reconciliation_protocol(worker)
+        audit = await self._read_worker_plan_import_audit(
+            worker=worker,
+            plan_id=plan.id,
+            run_id=run.id,
+            payload_digest=payload_digest,
+        )
+        if audit["state"] == "absent":
+            raise WorkerPlanRemoteAbsent(
+                "Worker audit proved that the Plan Run was never imported"
+            )
+        if audit["state"] == "cancelled":
+            raise WorkerPlanRemoteCancelled(
+                "Worker audit proved that the exact Plan import was cancelled"
+            )
+
+        remote_run = audit["run"]
+        base_worker_version_id = audit.get("base_worker_version_id")
+        timeout_seconds = (
+            plan.timeout_hours * 3600
+            if plan.timeout_hours is not None and plan.timeout_hours > 0
+            else (
+                None
+                if plan.timeout_hours == 0
+                else settings.task_timeout_seconds
+            )
+        )
+        deadline = (
+            asyncio.get_running_loop().time() + max(300.0, timeout_seconds + 300)
+            if timeout_seconds is not None
+            else None
+        )
+        while True:
+            if remote_run.get("status") == "waiting_user":
+                remote_input_id = remote_run.get("open_input_request_id")
+                async with self.db_factory() as db:
+                    answer = (
+                        await db.execute(
+                            select(PlanInputRequest)
+                            .where(
+                                PlanInputRequest.run_id == run.id,
+                                PlanInputRequest.worker_id == worker.id,
+                                PlanInputRequest.worker_input_request_id
+                                == remote_input_id,
+                                PlanInputRequest.status == "answered",
+                            )
+                            .order_by(PlanInputRequest.id.desc())
+                            .limit(1)
+                        )
+                    ).scalar_one_or_none()
+                if answer is None:
+                    break
+                answer_paths, answer_images, answer_attachments = (
+                    self._plan_attachment_payload(answer.attachments)
+                )
+                if answer_paths:
+                    await self.push_files(worker, answer_paths)
+                answer_manifest = self._attachment_manifest(answer_paths)
+                async with httpx.AsyncClient(timeout=30) as client:
+                    response = await client.post(
+                        self._api(
+                            worker,
+                            f"/api/plan-runs/{run.id}/input-requests/"
+                            f"{remote_input_id}/answer",
+                        ),
+                        headers=self._headers(worker),
+                        json={
+                            "expected_run_generation": remote_run["generation"],
+                            "idempotency_key": answer.answer_idempotency_key,
+                            "answers": answer.answers or [],
+                            "response_text": answer.response_text,
+                            "file_paths": answer_paths or None,
+                            "image_paths": answer_images or None,
+                            "attachments": answer_attachments or None,
+                            "attachment_manifest": answer_manifest or None,
+                        },
+                    )
+                    response.raise_for_status()
+
+            if remote_run.get("status") not in {"queued", "running", "waiting_user"}:
+                break
+            if deadline is not None and asyncio.get_running_loop().time() >= deadline:
+                raise RuntimeError("Worker Plan Run reconciliation timed out")
+            await asyncio.sleep(1)
+            audit = await self._read_worker_plan_import_audit(
+                worker=worker,
+                plan_id=plan.id,
+                run_id=run.id,
+                payload_digest=payload_digest,
+            )
+            if audit["state"] != "matched":
+                raise WorkerPlanRemoteIdentityConflict(
+                    "Worker Plan mirror disappeared during reconciliation"
+                )
+            remote_run = audit["run"]
+
+        return {
+            "protocol": 3,
+            "base_worker_version_id": base_worker_version_id,
+            "run": remote_run,
+            "versions": audit["versions"],
         }
 
     async def materialize_plan_version(
@@ -527,15 +1239,118 @@ class WorkerProxy:
             raise RuntimeError("Worker returned an invalid Version materialization receipt")
         return remote_id
 
-    async def cancel_versioned_plan_run(self, worker_id: int, run_id: int) -> None:
+    async def cancel_versioned_plan_run(
+        self,
+        worker_id: int,
+        run_id: int,
+        *,
+        plan_id: int,
+        payload_digest: str,
+    ) -> dict:
+        if (
+            type(plan_id) is not int
+            or plan_id <= 0
+            or type(run_id) is not int
+            or run_id <= 0
+            or not isinstance(payload_digest, str)
+            or len(payload_digest) != 64
+            or any(character not in "0123456789abcdef" for character in payload_digest)
+        ):
+            raise RuntimeError("Worker Plan cancellation identity is invalid")
         worker = await self.require_ready_worker(worker_id)
-        await self._require_versioned_plan_protocol(worker)
+        await self._require_worker_plan_exact_cancel_protocol(worker)
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
-                self._api(worker, f"/api/plan-runs/{run_id}/cancel"),
+                self._api(
+                    worker,
+                    f"/api/plan-runs/{run_id}/worker-import-cancel",
+                ),
                 headers=self._headers(worker),
+                json={
+                    "protocol": WORKER_PLAN_EXACT_CANCEL_PROTOCOL,
+                    "plan_id": plan_id,
+                    "payload_digest": payload_digest,
+                },
             )
         response.raise_for_status()
+        try:
+            receipt = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                "Worker returned an invalid Plan cancellation receipt"
+            ) from exc
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("protocol") != WORKER_PLAN_EXACT_CANCEL_PROTOCOL
+            or receipt.get("state") not in {"absent", "cancelled", "terminal"}
+            or type(receipt.get("plan_id")) is not int
+            or receipt.get("plan_id") != plan_id
+            or type(receipt.get("run_id")) is not int
+            or receipt.get("run_id") != run_id
+            or receipt.get("payload_digest") != payload_digest
+            or (
+                receipt.get("state") == "absent"
+                and receipt.get("run") is not None
+            )
+            or (
+                receipt.get("state") == "cancelled"
+                and (
+                    not isinstance(receipt.get("run"), dict)
+                    or type(receipt["run"].get("id")) is not int
+                    or receipt["run"].get("id") != run_id
+                    or type(receipt["run"].get("plan_id")) is not int
+                    or receipt["run"].get("plan_id") != plan_id
+                    or receipt["run"].get("status") != "cancelled"
+                )
+            )
+            or (
+                receipt.get("state") == "terminal"
+                and (
+                    not isinstance(receipt.get("run"), dict)
+                    or type(receipt["run"].get("id")) is not int
+                    or receipt["run"].get("id") != run_id
+                    or type(receipt["run"].get("plan_id")) is not int
+                    or receipt["run"].get("plan_id") != plan_id
+                    or receipt["run"].get("status") not in {"completed", "failed"}
+                    or not isinstance(receipt.get("versions"), list)
+                    or isinstance(receipt.get("base_worker_version_id"), bool)
+                    or (
+                        receipt.get("base_worker_version_id") is not None
+                        and not isinstance(
+                            receipt.get("base_worker_version_id"),
+                            int,
+                        )
+                    )
+                )
+            )
+        ):
+            raise RuntimeError(
+                "Worker returned a non-terminal exact Plan cancellation receipt"
+            )
+        if receipt["state"] == "terminal":
+            from backend.services.worker_plan_dispatch import (
+                WorkerPlanDispatchConflict,
+                validate_worker_terminal_outcome_graph,
+            )
+
+            try:
+                validate_worker_terminal_outcome_graph(
+                    {
+                        "protocol": 3,
+                        "base_worker_version_id": receipt.get(
+                            "base_worker_version_id"
+                        ),
+                        "run": receipt["run"],
+                        "versions": receipt["versions"],
+                    },
+                    plan_id=plan_id,
+                    run_id=run_id,
+                )
+            except WorkerPlanDispatchConflict as exc:
+                raise RuntimeError(
+                    "Worker returned an invalid terminal Plan outcome graph"
+                ) from exc
+        return receipt
 
     # ------------------------------------------------------------------
     # 项目映射（设计 §8）
@@ -734,7 +1549,7 @@ class WorkerProxy:
             return await self._forward_task_to_worker_locked(current)
 
     async def _authoritative_forward_task(self, task: Task) -> Task:
-        """Reload one claimed generation before serializing Worker create."""
+        """Fence one claimed generation immediately before Worker effects."""
 
         if self.db_factory is None:
             return task
@@ -744,12 +1559,52 @@ class WorkerProxy:
                 "Task is no longer assigned to a Worker before forwarding"
             )
         async with self.db_factory() as db:
-            current = await db.get(Task, task.id)
-        if current is None or worker_task_generation(current) != expected:
-            raise RuntimeError(
-                "Task Worker generation changed before initial forwarding"
+            # This is the portable Task-side writer fence shared with
+            # termination admission. ``forward_task_to_worker`` holds the
+            # per-Task operation lock across this check and every following
+            # Worker effect, so a receipt either wins first and blocks the
+            # POST, or waits until this exact forwarding attempt settles.
+            admitted = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task.id,
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(status=Task.status)
             )
-        return current
+            if admitted.rowcount != 1:
+                current = await db.get(Task, task.id, populate_existing=True)
+                current_generation = (
+                    worker_task_generation(current)
+                    if current is not None
+                    else None
+                )
+                await db.rollback()
+                if current_generation == expected:
+                    raise WorkerTaskForwardAdmissionBlockedError(
+                        "Task termination owns the claimed Worker generation"
+                    )
+                raise RuntimeError(
+                    "Task Worker generation changed before initial forwarding"
+                )
+            current = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == task.id,
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if current is None or worker_task_generation(current) != expected:
+                await db.rollback()
+                raise RuntimeError(
+                    "Task Worker generation changed before initial forwarding"
+                )
+            await db.commit()
+            return current
 
     async def _forward_task_to_worker_locked(self, task: Task):
         worker = await self.get_worker(task.worker_id)
@@ -843,28 +1698,48 @@ class WorkerProxy:
             "attachments": attachment_records or None,
             "attention_tag": task.attention_tag,
         }
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post(
-                self._api(worker, "/api/tasks"),
-                headers=self._headers(worker),
-                json=payload,
-            )
-            # 不检查会卡死在 in_progress：422 字段校验失败 / 500 都要立刻暴露
-            r.raise_for_status()
-            if (task.codex_service_tier or "default") == "priority":
-                try:
-                    created = r.json()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
-                    ) from exc
-                if (
-                    not isinstance(created, dict)
-                    or created.get("codex_service_tier") != "priority"
-                ):
-                    raise RuntimeError(
-                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
-                    )
+        post_started = False
+        try:
+            async with httpx.AsyncClient(timeout=30) as c:
+                post_started = True
+                r = await c.post(
+                    self._api(worker, "/api/tasks"),
+                    headers=self._headers(worker),
+                    json=payload,
+                )
+                # Once POST has started, even an HTTP error or malformed ACK
+                # cannot prove that the Worker did not commit and wake its
+                # dispatcher.  Surface a distinct uncertainty contract so the
+                # Manager never blindly resends the create request.
+                r.raise_for_status()
+                if (task.codex_service_tier or "default") == "priority":
+                    try:
+                        created = r.json()
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                        ) from exc
+                    if (
+                        not isinstance(created, dict)
+                        or created.get("codex_service_tier") != "priority"
+                    ):
+                        raise RuntimeError(
+                            f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                        )
+        except asyncio.CancelledError as exc:
+            if not post_started:
+                raise
+            raise WorkerTaskForwardOutcomeUncertainError(
+                f"Worker {worker.name} initial Task POST was cancelled after "
+                "its outcome became uncertain",
+                cancellation=exc,
+            ) from exc
+        except Exception as exc:
+            if not post_started:
+                raise
+            raise WorkerTaskForwardOutcomeUncertainError(
+                f"Worker {worker.name} initial Task POST outcome is uncertain: {exc}"
+            ) from exc
         logger.info("task %s forwarded to worker %s", task.id, worker.id)
 
     async def _user_skill_snapshots(self, task: Task) -> list[dict]:
@@ -1088,6 +1963,7 @@ class WorkerProxy:
         surface_endpoint_not_found: bool = False,
         operation_lock_held: bool = False,
         pr_review_terminal_chat: bool = False,
+        quarantine_on_transport_uncertainty: bool = False,
     ):
         if pr_review_terminal_chat and not is_pr_review_task(task):
             raise ValueError(
@@ -1103,6 +1979,9 @@ class WorkerProxy:
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
                 pr_review_terminal_chat=pr_review_terminal_chat,
+                quarantine_on_transport_uncertainty=(
+                    quarantine_on_transport_uncertainty
+                ),
             )
         async with self.task_operation_lock(task.id):
             return await self._proxy_to_worker_locked(
@@ -1114,6 +1993,9 @@ class WorkerProxy:
                 allow_task_absent=allow_task_absent,
                 surface_endpoint_not_found=surface_endpoint_not_found,
                 pr_review_terminal_chat=pr_review_terminal_chat,
+                quarantine_on_transport_uncertainty=(
+                    quarantine_on_transport_uncertainty
+                ),
             )
 
     async def _proxy_to_worker_locked(
@@ -1127,30 +2009,214 @@ class WorkerProxy:
         allow_task_absent: bool,
         surface_endpoint_not_found: bool,
         pr_review_terminal_chat: bool,
+        quarantine_on_transport_uncertainty: bool,
     ):
+        # A durable Manager receipt owns every remote mutation until its exact
+        # result is ACKed. The reconciliation loop itself traverses this common
+        # proxy, so admit only that receipt's identity-bound GET/PUT/ACK paths;
+        # all ordinary Plan/Monitor/Sub-Agent/config requests must wait.
+        if self.db_factory is not None:
+            async with self.db_factory() as db:
+                active_receipt = await active_worker_task_termination_receipt(
+                    db,
+                    task.id,
+                )
+            if active_receipt is not None:
+                if active_receipt.operation == "delete":
+                    exact_receipt_request = bool(
+                        active_receipt.side == "manager"
+                        and active_receipt.worker_id == task.worker_id
+                        and active_receipt.status == "conflict"
+                        and body is None
+                        and (
+                            (
+                                method == "DELETE"
+                                and path == f"/api/tasks/{task.id}"
+                            )
+                            or (
+                                method == "GET"
+                                and path
+                                == (
+                                    f"/api/tasks/{task.id}/"
+                                    "plan-delete-audit"
+                                )
+                            )
+                        )
+                    )
+                else:
+                    receipt_path = (
+                        f"/api/tasks/{task.id}/termination-receipts/"
+                        f"{active_receipt.operation_id}"
+                    )
+                    exact_receipt_request = bool(
+                        active_receipt.side == "manager"
+                        and active_receipt.worker_id == task.worker_id
+                        and (
+                            (
+                                method == "GET"
+                                and path == receipt_path
+                                and body is None
+                            )
+                            or (
+                                method == "PUT"
+                                and path == receipt_path
+                                and isinstance(body, dict)
+                            )
+                            or (
+                                method == "POST"
+                                and path == f"{receipt_path}/ack"
+                                and isinstance(body, dict)
+                            )
+                        )
+                    )
+                if not exact_receipt_request:
+                    raise HTTPException(
+                        409,
+                        "Task has an active Worker termination receipt",
+                    )
         worker = await self.require_ready_worker(task.worker_id)
+        return await self._proxy_to_authorized_worker_locked(
+            worker,
+            task,
+            method,
+            path,
+            body,
+            require_json=require_json,
+            allow_task_absent=allow_task_absent,
+            surface_endpoint_not_found=surface_endpoint_not_found,
+            pr_review_terminal_chat=pr_review_terminal_chat,
+            quarantine_on_transport_uncertainty=(
+                quarantine_on_transport_uncertainty
+            ),
+        )
+
+    async def _proxy_to_claimed_destroying_worker(
+        self,
+        task: Task,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        destroy_claim: WorkerDestroyLifecycleClaim,
+        require_json: bool = False,
+        allow_task_absent: bool = False,
+        surface_endpoint_not_found: bool = False,
+        operation_lock_held: bool = False,
+        quarantine_on_transport_uncertainty: bool = False,
+    ):
+        """Proxy only for exact terminal reconciliation during Worker destroy."""
+
+        if not operation_lock_held:
+            raise ValueError(
+                "claimed Worker destroy proxy requires the Task operation lock"
+            )
+        receipt_prefix = f"/api/tasks/{task.id}/termination-receipts/"
+        receipt_suffix = path[len(receipt_prefix):] if path.startswith(receipt_prefix) else ""
+        receipt_operation_id = (
+            receipt_suffix[:-4] if receipt_suffix.endswith("/ack") else receipt_suffix
+        )
+        valid_receipt_id = bool(
+            len(receipt_operation_id) == 32
+            and all(char in "0123456789abcdef" for char in receipt_operation_id)
+        )
+        receipt_get = method == "GET" and valid_receipt_id and not receipt_suffix.endswith("/ack")
+        receipt_put = method == "PUT" and valid_receipt_id and not receipt_suffix.endswith("/ack")
+        receipt_ack = method == "POST" and valid_receipt_id and receipt_suffix.endswith("/ack")
+        allowed_request = bool(
+            (receipt_get and body is None)
+            or ((receipt_put or receipt_ack) and isinstance(body, dict))
+        )
+        if (
+            not allowed_request
+            or require_json is not True
+            or allow_task_absent
+            or surface_endpoint_not_found
+            or quarantine_on_transport_uncertainty
+        ):
+            raise ValueError(
+                "Worker destroy claim authorizes only exact termination receipt "
+                "GET/PUT/ACK requests"
+            )
+        if task.worker_id != destroy_claim.worker_id:
+            raise HTTPException(
+                409,
+                "Task moved away from the claimed destroying Worker",
+            )
+        worker = await self._require_destroy_lifecycle_claim(destroy_claim)
+        return await self._proxy_to_authorized_worker_locked(
+            worker,
+            task,
+            method,
+            path,
+            body,
+            require_json=require_json,
+            allow_task_absent=allow_task_absent,
+            surface_endpoint_not_found=surface_endpoint_not_found,
+            pr_review_terminal_chat=False,
+            quarantine_on_transport_uncertainty=(
+                quarantine_on_transport_uncertainty
+            ),
+        )
+
+    async def _proxy_to_authorized_worker_locked(
+        self,
+        worker: Worker,
+        task: Task,
+        method: str,
+        path: str,
+        body=None,
+        *,
+        require_json: bool,
+        allow_task_absent: bool,
+        surface_endpoint_not_found: bool,
+        pr_review_terminal_chat: bool,
+        quarantine_on_transport_uncertainty: bool,
+    ):
         await self.relay.subscribe_task(worker, task.id)
         headers = self._headers(worker)
         if pr_review_terminal_chat:
             headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
                 PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
             )
-        async with httpx.AsyncClient(timeout=60) as c:
-            try:
+        request_started = False
+        try:
+            async with httpx.AsyncClient(timeout=60) as c:
+                request_started = True
                 r = await c.request(
                     method, self._api(worker, path),
                     headers=headers, json=body,
                 )
-            except (httpx.TimeoutException, TimeoutError) as exc:
-                raise HTTPException(
-                    503,
-                    f"Worker {worker.name} 请求超时，请稍后重试",
+        except asyncio.CancelledError as exc:
+            if quarantine_on_transport_uncertainty and request_started:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} request was cancelled after "
+                    "the mutation boundary",
+                    status_code=503,
+                    cancellation=exc,
                 ) from exc
-            except (httpx.RequestError, OSError) as exc:
-                raise HTTPException(
-                    502,
-                    f"Worker 网关连接失败，无法连接到 Worker {worker.name}",
+            raise
+        except (httpx.TimeoutException, TimeoutError) as exc:
+            if quarantine_on_transport_uncertainty and request_started:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} request timed out after the "
+                    "mutation boundary",
+                    status_code=503,
                 ) from exc
+            raise HTTPException(
+                503,
+                f"Worker {worker.name} 请求超时，请稍后重试",
+            ) from exc
+        except (httpx.RequestError, OSError) as exc:
+            if quarantine_on_transport_uncertainty and request_started:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} connection was lost after the "
+                    "mutation boundary",
+                    status_code=502,
+                ) from exc
+            raise HTTPException(
+                502,
+                f"Worker 网关连接失败，无法连接到 Worker {worker.name}",
+            ) from exc
 
         # Worker token is an internal Manager→Worker credential.  Never
         # propagate a remote 401/403: doing so makes the frontend treat the
@@ -1175,6 +2241,12 @@ class WorkerProxy:
             ):
                 return {"ok": True, "already_deleted": True}
         if not 200 <= r.status_code < 300:
+            if quarantine_on_transport_uncertainty:
+                raise WorkerTaskMutationOutcomeUncertainError(
+                    f"Worker {worker.name} returned HTTP {r.status_code} "
+                    "after the mutation boundary",
+                    status_code=502,
+                )
             raise HTTPException(
                 502,
                 f"Worker 上游请求失败（远端 HTTP {r.status_code}）",
@@ -1183,6 +2255,12 @@ class WorkerProxy:
             return r.json()
         except Exception as exc:
             if require_json:
+                if quarantine_on_transport_uncertainty:
+                    raise WorkerTaskMutationOutcomeUncertainError(
+                        f"Worker {worker.name} returned an unreadable "
+                        "confirmation after the mutation boundary",
+                        status_code=502,
+                    ) from exc
                 raise HTTPException(
                     502,
                     f"Worker {worker.name} returned an invalid confirmation",

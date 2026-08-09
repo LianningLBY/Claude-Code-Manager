@@ -24,6 +24,9 @@ from backend.models.pr_monitor import (
     PRReview,
 )
 from backend.models.task import Task
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -220,7 +223,10 @@ async def create_rebuttal_task(
     model = repo.review_model or (
         settings.default_codex_model if provider == "codex" else None
     )
-    task = Task(
+    from backend.services.task_creation import stage_task_record
+
+    task = await stage_task_record(
+        db,
         title=f"PR Rebuttal Adjudication: {repo.repo_full_name}#{review.pr_number}",
         description=build_adjudication_prompt(
             repo_name=repo.repo_full_name, pr_number=review.pr_number,
@@ -240,8 +246,6 @@ async def create_rebuttal_task(
         project_id=await _get_or_create_pr_monitor_project(db),
         worker_id=repo.worker_id,
     )
-    db.add(task)
-    await db.flush()
     rebuttal.task_id = task.id
     run.status = "adjudicating"
     run.state_version += 1
@@ -391,6 +395,7 @@ async def complete_adjudication(
                 else Task.completed_at == expected_completed_at
             ),
             Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
         )
         .values(status=Task.status)
         .execution_options(synchronize_session=False)
@@ -502,7 +507,12 @@ async def fail_adjudication(
     review_id = rebuttal.pr_review_id
     await db.rollback()
     task = (await db.execute(
-        select(Task).where(Task.id == task_id).with_for_update()
+        select(Task)
+        .where(
+            Task.id == task_id,
+            no_active_worker_task_termination_predicate(),
+        )
+        .with_for_update()
         .execution_options(populate_existing=True)
     )).scalar_one_or_none()
     repo = (await db.execute(
@@ -545,6 +555,36 @@ async def fail_adjudication(
         or run.current_head_sha != review.head_sha
     ):
         await db.commit()
+        return
+    task_guard = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task.id,
+            Task.status == task.status,
+            Task.retry_count == task.retry_count,
+            (
+                Task.worker_id.is_(None)
+                if task.worker_id is None
+                else Task.worker_id == task.worker_id
+            ),
+            (
+                Task.started_at.is_(None)
+                if task.started_at is None
+                else Task.started_at == task.started_at
+            ),
+            (
+                Task.completed_at.is_(None)
+                if task.completed_at is None
+                else Task.completed_at == task.completed_at
+            ),
+            Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if task_guard.rowcount != 1:
+        await db.rollback()
         return
     message = error[:1000]
     rebuttal_changed = await db.execute(

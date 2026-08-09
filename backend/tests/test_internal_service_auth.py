@@ -6,7 +6,12 @@ import pytest
 
 from backend.config import settings
 from backend.middleware.auth import TokenAuthMiddleware
+from backend.models.task import Task
 from backend.services import internal_service_auth as auth
+
+
+_TASK_INCARNATION = "a" * 32
+_REPLACEMENT_INCARNATION = "b" * 32
 
 
 @pytest.fixture(autouse=True)
@@ -24,12 +29,34 @@ def _internal_auth_state(monkeypatch):
 
 
 def _issue(audience: str, **claims) -> str:
+    if claims.get("task_id") is not None:
+        claims.setdefault("task_incarnation_id", _TASK_INCARNATION)
     return auth.issue_internal_service_token(
         audience=audience,
         owner_kind="test",
         owner_id=f"{audience}-owner",
         **claims,
     )
+
+
+def test_task_scoped_tokens_require_exact_incarnation():
+    with pytest.raises(
+        auth.InternalServiceTokenError,
+        match="task incarnation id",
+    ):
+        auth.issue_internal_service_token(
+            audience="ccm_ssh",
+            task_id=42,
+            owner_kind="task-turn",
+            owner_id=42,
+        )
+    with pytest.raises(ValueError, match="requires a Task id"):
+        auth.issue_internal_service_token(
+            audience="ccm_ssh",
+            task_incarnation_id=_TASK_INCARNATION,
+            owner_kind="task-turn",
+            owner_id=42,
+        )
 
 
 def test_ssh_credential_is_bound_to_task_method_and_route():
@@ -132,6 +159,7 @@ def test_tampered_expired_and_revoked_credentials_are_rejected(monkeypatch):
     token = auth.issue_internal_service_token(
         audience="ccm_ssh",
         task_id=42,
+        task_incarnation_id=_TASK_INCARNATION,
         owner_kind="task-turn",
         owner_id=42,
         ttl_seconds=10,
@@ -157,6 +185,7 @@ def test_tampered_expired_and_revoked_credentials_are_rejected(monkeypatch):
     fresh = auth.issue_internal_service_token(
         audience="ccm_ssh",
         task_id=42,
+        task_incarnation_id=_TASK_INCARNATION,
         owner_kind="task-turn",
         owner_id=42,
         ttl_seconds=10,
@@ -175,6 +204,7 @@ def test_identical_owner_scope_reuses_token_until_revoked(monkeypatch):
     first = auth.issue_internal_service_token(
         audience="ccm_ssh",
         task_id=42,
+        task_incarnation_id=_TASK_INCARNATION,
         owner_kind="task-turn",
         owner_id=42,
         ttl_seconds=600,
@@ -182,6 +212,7 @@ def test_identical_owner_scope_reuses_token_until_revoked(monkeypatch):
     second = auth.issue_internal_service_token(
         audience="ccm_ssh",
         task_id=42,
+        task_incarnation_id=_TASK_INCARNATION,
         owner_kind="task-turn",
         owner_id=42,
         ttl_seconds=600,
@@ -192,6 +223,7 @@ def test_identical_owner_scope_reuses_token_until_revoked(monkeypatch):
     replacement = auth.issue_internal_service_token(
         audience="ccm_ssh",
         task_id=42,
+        task_incarnation_id=_TASK_INCARNATION,
         owner_kind="task-turn",
         owner_id=42,
         ttl_seconds=600,
@@ -200,8 +232,21 @@ def test_identical_owner_scope_reuses_token_until_revoked(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_middleware_requires_bearer_and_never_elevates_scoped_token():
+async def test_middleware_requires_bearer_and_rejects_reused_task_identity(
+    db_factory,
+):
+    async with db_factory() as db:
+        db.add(Task(
+            id=42,
+            incarnation_id=_TASK_INCARNATION,
+            title="internal auth task",
+            description="test",
+            status="pending",
+        ))
+        await db.commit()
+
     app = FastAPI()
+    app.state.internal_service_db_factory = db_factory
     app.add_middleware(TokenAuthMiddleware)
 
     @app.get("/api/tasks/42/ssh-access")
@@ -232,6 +277,38 @@ async def test_middleware_requires_bearer_and_never_elevates_scoped_token():
             headers={"Authorization": f"Bearer {token}"},
         )
 
+        # Simulate a Manager restart (in-memory revocation/cache state is gone)
+        # followed by replacement of the externally visible integer Task id.
+        with auth._revocation_lock:
+            auth._owner_tokens.clear()
+            auth._owner_token_cache.clear()
+            auth._revoked_tokens.clear()
+        async with db_factory() as db:
+            original = await db.get(Task, 42)
+            await db.delete(original)
+            await db.commit()
+            db.add(Task(
+                id=42,
+                incarnation_id=_REPLACEMENT_INCARNATION,
+                title="replacement internal auth task",
+                description="test",
+                status="pending",
+            ))
+            await db.commit()
+        stale_rejected = await client.get(
+            "/api/tasks/42/ssh-access",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        replacement_token = _issue(
+            "ccm_ssh",
+            task_id=42,
+            task_incarnation_id=_REPLACEMENT_INCARNATION,
+        )
+        replacement_allowed = await client.get(
+            "/api/tasks/42/ssh-access",
+            headers={"Authorization": f"Bearer {replacement_token}"},
+        )
+
     assert allowed.status_code == 200
     assert allowed.json() == {
         "auth_type": "internal_service",
@@ -240,3 +317,5 @@ async def test_middleware_requires_bearer_and_never_elevates_scoped_token():
     }
     assert query_rejected.status_code == 401
     assert admin_rejected.status_code == 403
+    assert stale_rejected.status_code == 401
+    assert replacement_allowed.status_code == 200

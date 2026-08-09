@@ -28,6 +28,18 @@ def require_admin(request: Request):
         raise HTTPException(403, "Admin only")
 
 
+def require_ssh_auth_configured() -> None:
+    """Keep durable Manager SSH credentials closed in auth-disabled mode."""
+
+    from backend.config import settings
+
+    if not settings.auth_token:
+        raise HTTPException(
+            503,
+            "Managed SSH requires AUTH_TOKEN authentication to be configured",
+        )
+
+
 def require_internal_service(request: Request) -> None:
     """Allow scoped CCM callbacks (and the legacy deployment credential).
 

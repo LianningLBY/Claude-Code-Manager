@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Iterable
@@ -52,6 +54,13 @@ CLAUDE_SUB_AGENT_BUILTIN_TOOLS = (
 
 class TaskAgentIsolationError(RuntimeError):
     """The provider could not prove the required Task isolation boundary."""
+
+
+_MIN_CLAUDE_ISOLATION_VERSION = (2, 1, 168)
+_CLAUDE_VERSION_RE = re.compile(
+    r"(?<![0-9])(?P<major>[0-9]+)\.(?P<minor>[0-9]+)\."
+    r"(?P<patch>[0-9]+)(?![0-9])"
+)
 
 
 def _canonical_protected_paths(values: Iterable[str]) -> tuple[str, ...]:
@@ -236,18 +245,152 @@ def generate_claude_aux_isolation_settings(
     )
 
 
+def _validate_claude_isolation_payload(payload: object) -> None:
+    """Prove the generated file still carries CCM's exact security policy."""
+
+    if not isinstance(payload, dict):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation settings must be a JSON object"
+        )
+    for key, expected in {
+        "disableAutoMode": "disable",
+        "disableAgentView": True,
+        "disableRemoteControl": True,
+        "disableSkillShellExecution": True,
+    }.items():
+        if payload.get(key) != expected:
+            raise TaskAgentIsolationError(
+                f"Claude Task isolation setting {key} is not fail-closed"
+            )
+
+    permissions = payload.get("permissions")
+    if not isinstance(permissions, dict):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation permissions are missing"
+        )
+    if (
+        permissions.get("defaultMode") != "acceptEdits"
+        or permissions.get("disableBypassPermissionsMode") != "disable"
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation permission mode is not fail-closed"
+        )
+    allowed = permissions.get("allow")
+    expected_allowed = _mcp_allow_rules()
+    if (
+        not isinstance(allowed, list)
+        or len(allowed) != len(expected_allowed)
+        or set(allowed) != set(expected_allowed)
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation MCP allow-list is invalid"
+        )
+
+    sandbox = payload.get("sandbox")
+    if not isinstance(sandbox, dict):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation sandbox is missing"
+        )
+    for key, expected in {
+        "enabled": True,
+        "failIfUnavailable": True,
+        "autoAllowBashIfSandboxed": True,
+        "allowUnsandboxedCommands": False,
+        "excludedCommands": [],
+    }.items():
+        if sandbox.get(key) != expected:
+            raise TaskAgentIsolationError(
+                f"Claude Task isolation sandbox setting {key} is unsafe"
+            )
+
+    filesystem = sandbox.get("filesystem")
+    if not isinstance(filesystem, dict):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation filesystem policy is missing"
+        )
+    deny_read = filesystem.get("denyRead")
+    deny_write = filesystem.get("denyWrite")
+    if (
+        not isinstance(deny_read, list)
+        or not deny_read
+        or deny_read != deny_write
+        or any(
+            not isinstance(path, str)
+            or not os.path.isabs(path)
+            or os.path.abspath(path) == os.path.sep
+            for path in deny_read
+        )
+        or str(runtime_secret_root()) not in deny_read
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation credential paths are not fully denied"
+        )
+
+    expected_permission_denies = {
+        rule
+        for path in deny_read
+        for rule in (
+            f"Read({_permission_path(path)})",
+            f"Read({_permission_path(path)}/**)",
+            f"Edit({_permission_path(path)})",
+            f"Edit({_permission_path(path)}/**)",
+        )
+    }
+    permission_denies = permissions.get("deny")
+    if (
+        not isinstance(permission_denies, list)
+        or set(permission_denies) != expected_permission_denies
+        or len(permission_denies) != len(expected_permission_denies)
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation permission denies are incomplete"
+        )
+
+    credentials = sandbox.get("credentials")
+    files = credentials.get("files") if isinstance(credentials, dict) else None
+    if (
+        not isinstance(files, list)
+        or files
+        != [{"path": path, "mode": "deny"} for path in deny_read]
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation credential-file policy is incomplete"
+        )
+
+    network = sandbox.get("network")
+    if not isinstance(network, dict) or network not in ({
+        "strictAllowlist": True,
+        "allowedDomains": [],
+        "deniedDomains": [],
+        "allowAllUnixSockets": False,
+        "allowLocalBinding": False,
+    }, {
+        "strictAllowlist": True,
+        "allowedDomains": ["*"],
+        "deniedDomains": [],
+        "allowAllUnixSockets": False,
+        "allowLocalBinding": False,
+    }):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation network policy is invalid"
+        )
+
+
 def validate_claude_task_isolation_settings(
     settings_path: Path,
     *,
     claude_binary: str,
-    timeout_seconds: float = 15.0,
+    timeout_seconds: float = 5.0,
 ) -> None:
-    """Make the installed CLI parse the security file before model input.
+    """Validate exact local policy plus a known-capable CLI version."""
 
-    Claude print mode otherwise ignores an invalid settings file. ``doctor``
-    currently reports validation failures with exit code zero, so both output
-    and process status are checked.
-    """
+    try:
+        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TaskAgentIsolationError(
+            "Claude Task isolation settings are unreadable or invalid JSON"
+        ) from exc
+    _validate_claude_isolation_payload(payload)
 
     env = {
         key: value
@@ -262,15 +405,7 @@ def validate_claude_task_isolation_settings(
     }
     try:
         result = subprocess.run(
-            [
-                claude_binary,
-                "--settings",
-                str(settings_path),
-                "--setting-sources",
-                "",
-                "--strict-mcp-config",
-                "doctor",
-            ],
+            [claude_binary, "--version"],
             cwd=os.path.sep,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -280,16 +415,28 @@ def validate_claude_task_isolation_settings(
             timeout=timeout_seconds,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise TaskAgentIsolationError(
+            "Claude version preflight timed out"
+        ) from exc
     except (OSError, subprocess.SubprocessError) as exc:
         raise TaskAgentIsolationError(
-            "Claude Task isolation settings could not be validated"
+            "Claude version preflight could not be executed"
         ) from exc
     output = result.stdout or ""
-    if result.returncode != 0 or "invalid settings" in output.lower():
+    match = _CLAUDE_VERSION_RE.search(output)
+    if result.returncode != 0 or match is None:
         raise TaskAgentIsolationError(
-            "Claude rejected the required Task isolation settings"
+            "Claude did not report a valid CLI version"
         )
-    if "claude code doctor" not in output.lower():
+    installed = tuple(
+        int(match.group(name))
+        for name in ("major", "minor", "patch")
+    )
+    if installed < _MIN_CLAUDE_ISOLATION_VERSION:
         raise TaskAgentIsolationError(
-            "Claude did not confirm the Task isolation settings preflight"
+            "Claude CLI is too old for the required Task isolation policy; "
+            "install version "
+            + ".".join(str(value) for value in _MIN_CLAUDE_ISOLATION_VERSION)
+            + " or newer"
         )

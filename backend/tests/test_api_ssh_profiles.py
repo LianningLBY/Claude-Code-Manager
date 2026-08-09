@@ -1,7 +1,9 @@
+import asyncio
 import os
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
@@ -10,6 +12,11 @@ from backend.services.ssh_executor import (
     derive_openssh_public_key,
 )
 from backend.config import settings
+
+
+@pytest_asyncio.fixture
+async def client(authenticated_client):
+    yield authenticated_client
 
 
 def _private_key_file(tmp_path: Path) -> Path:
@@ -54,6 +61,7 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
     task_policy = await client.put(
         f"/api/ssh-profiles/{profile['id']}",
         json={
+            "revision": 1,
             "task_access_enabled": True,
             "task_capabilities": ["read", "read", "exec"],
         },
@@ -63,13 +71,15 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
     assert task_policy.json()["task_capabilities"] == ["read", "exec"]
 
     rename = await client.put(
-        f"/api/ssh-profiles/{profile['id']}", json={"name": "staging-a"},
+        f"/api/ssh-profiles/{profile['id']}",
+        json={"revision": 2, "name": "staging-a"},
     )
     assert rename.status_code == 200
     assert rename.json()["revision"] == 2
 
     identity = await client.put(
-        f"/api/ssh-profiles/{profile['id']}", json={"username": "release"},
+        f"/api/ssh-profiles/{profile['id']}",
+        json={"revision": 2, "username": "release"},
     )
     assert identity.status_code == 200
     assert identity.json()["revision"] == 3
@@ -84,7 +94,7 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
     key_path.chmod(0o600)
     rotated = await client.put(
         f"/api/ssh-profiles/{profile['id']}",
-        json={"key_path": str(key_path)},
+        json={"revision": 3, "key_path": str(key_path)},
     )
     assert rotated.status_code == 200
     assert rotated.json()["revision"] == 4
@@ -102,7 +112,9 @@ async def test_managed_profile_crud_masks_key_and_revisions_identity(
     assert listing.status_code == 200
     assert [item["name"] for item in listing.json()] == ["staging-a"]
 
-    deleted = await client.delete(f"/api/ssh-profiles/{profile['id']}")
+    deleted = await client.delete(
+        f"/api/ssh-profiles/{profile['id']}?revision=4"
+    )
     assert deleted.status_code == 200
     assert (await client.get("/api/ssh-profiles")).json() == []
     assert (await client.get(f"/api/ssh-profiles/{profile['id']}")).status_code == 404
@@ -127,7 +139,7 @@ async def test_profile_endpoint_change_requires_new_host_key(client, tmp_path):
 
     rejected = await client.put(
         f"/api/ssh-profiles/{profile_id}",
-        json={"host": "new.example.internal"},
+        json={"revision": 1, "host": "new.example.internal"},
     )
 
     assert rejected.status_code == 400
@@ -152,7 +164,7 @@ async def test_profile_allowed_roots_are_normalized_and_revisioned(client, tmp_p
 
     updated = await client.put(
         f"/api/ssh-profiles/{profile['id']}",
-        json={"allowed_roots": ["/srv/app"]},
+        json={"revision": 1, "allowed_roots": ["/srv/app"]},
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["revision"] == 2
@@ -160,9 +172,64 @@ async def test_profile_allowed_roots_are_normalized_and_revisioned(client, tmp_p
     for invalid in ([], ["relative/path"], None):
         rejected = await client.put(
             f"/api/ssh-profiles/{profile['id']}",
-            json={"allowed_roots": invalid},
+            json={"revision": 2, "allowed_roots": invalid},
         )
         assert rejected.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_profile_security_updates_and_delete_use_revision_cas(
+    client,
+    tmp_path,
+):
+    key_path = _private_key_file(tmp_path)
+    host_key = derive_openssh_public_key(key_path)
+    created = await client.post("/api/ssh-profiles", json={
+        "name": "revision-cas",
+        "host": "cas.example.internal",
+        "username": "deploy",
+        "key_path": str(key_path),
+        "host_key_value": host_key,
+    })
+    assert created.status_code == 201, created.text
+    profile_id = created.json()["id"]
+
+    first, second = await asyncio.gather(
+        client.put(f"/api/ssh-profiles/{profile_id}", json={
+            "revision": 1,
+            "task_access_enabled": True,
+            "task_capabilities": ["read"],
+        }),
+        client.put(f"/api/ssh-profiles/{profile_id}", json={
+            "revision": 1,
+            "allowed_roots": ["/srv/app"],
+        }),
+    )
+
+    assert sorted((first.status_code, second.status_code)) == [200, 409]
+    current = (await client.get(f"/api/ssh-profiles/{profile_id}")).json()
+    assert current["revision"] == 2
+    assert (
+        (
+            current["task_access_enabled"] is True
+            and current["task_capabilities"] == ["read"]
+            and current["allowed_roots"] == ["/"]
+        )
+        or (
+            current["task_access_enabled"] is False
+            and current["task_capabilities"] == []
+            and current["allowed_roots"] == ["/srv/app"]
+        )
+    )
+
+    stale_delete = await client.delete(
+        f"/api/ssh-profiles/{profile_id}?revision=1"
+    )
+    assert stale_delete.status_code == 409
+    deleted = await client.delete(
+        f"/api/ssh-profiles/{profile_id}?revision=2"
+    )
+    assert deleted.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -196,13 +263,13 @@ async def test_profile_rejects_inconsistent_task_policy(client, tmp_path):
     created = await client.post("/api/ssh-profiles", json=base)
     inconsistent_update = await client.put(
         f"/api/ssh-profiles/{created.json()['id']}",
-        json={"task_access_enabled": True},
+        json={"revision": 1, "task_access_enabled": True},
     )
     assert inconsistent_update.status_code == 422
 
     null_policy = await client.put(
         f"/api/ssh-profiles/{created.json()['id']}",
-        json={"task_capabilities": None},
+        json={"revision": 1, "task_capabilities": None},
     )
     assert null_policy.status_code == 422
 
@@ -308,7 +375,7 @@ async def test_upload_private_key_creates_and_deletes_managed_profile_key(
     replacement_token = replacement_upload.json()["upload_token"]
     rotated = await client.put(
         f"/api/ssh-profiles/{created.json()['id']}",
-        json={"key_upload_token": replacement_token},
+        json={"revision": 1, "key_upload_token": replacement_token},
     )
     assert rotated.status_code == 200, rotated.text
     assert rotated.json()["revision"] == 2
@@ -316,7 +383,9 @@ async def test_upload_private_key_creates_and_deletes_managed_profile_key(
     managed = store_root / "managed" / replacement_token
     assert managed.is_file()
 
-    deleted = await client.delete(f"/api/ssh-profiles/{created.json()['id']}")
+    deleted = await client.delete(
+        f"/api/ssh-profiles/{created.json()['id']}?revision=2"
+    )
     assert deleted.status_code == 200
     assert not managed.exists()
 

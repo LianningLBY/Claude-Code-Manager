@@ -12,15 +12,28 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import select, update
 
+from backend.models.delivery import DeliveryRun
 from backend.models.log_entry import LogEntry
-from backend.models.pr_monitor import MonitoredRepo, PRFinding, PRReview, PRReviewerRun
+from backend.models.pr_monitor import (
+    MonitoredRepo,
+    PRFinding,
+    PRMonitorRun,
+    PRReview,
+    PRReviewerRun,
+)
+from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.worker import Worker
 from backend.services import pr_review_service
+from backend.services.delivery_service import value_hash
 from backend.services.pr_review_service import (
     GhError,
     build_review_prompt,
     check_and_update_review,
     create_pr_review_task,
+)
+from backend.tests.worker_termination_helpers import (
+    persist_active_manager_receipt,
 )
 
 
@@ -1676,6 +1689,101 @@ async def test_check_review_enforces_frozen_action_policy(
 
 
 @pytest.mark.asyncio
+async def test_delivery_durable_publication_never_resumes_approved_merged(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    """A corrupted/replayed outbox cannot broaden a Delivery policy."""
+
+    project = Project(
+        name="delivery-publication-policy",
+        local_path="/srv/repos/delivery-publication-policy",
+        git_url="git@github.com:owner/repo.git",
+        has_remote=True,
+        default_branch="main",
+        status="ready",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    policy = {
+        "schema_version": 1,
+        "terminal": "ready_to_merge",
+        "auto_merge": False,
+        "pr_monitor": {
+            "repo_id": repo.id,
+            "repo_full_name": repo.repo_full_name,
+        },
+    }
+    run = DeliveryRun(
+        admission_scope="system",
+        idempotency_key="service-pr-review-publication",
+        request_hash="f" * 64,
+        project_id=project.id,
+        monitored_repo_id=repo.id,
+        title="Delivery publication fence",
+        requirements="Never merge automatically.",
+        requirements_hash="1" * 64,
+        policy_snapshot=policy,
+        policy_hash=value_hash(policy),
+        base_branch="main",
+        delivery_branch="ccm/delivery/publication-fence",
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+        pr_number=PR_DATA["number"],
+        phase="monitoring",
+        activity="waiting",
+        wait_reason="pr_monitor",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review, task = await _make_review(
+        db_session,
+        repo,
+        auto_merge=True,
+    )
+    review.delivery_id = f"delivery:{run.id}:{PR_DATA['head_sha']}"
+    await _arm_publishing(
+        db_session,
+        review,
+        task,
+        action="approved_merged",
+    )
+    lease_token = "1" * 48
+    review.publishing_lease_token = lease_token
+    review.publishing_lease_expires_at = datetime.utcnow() + timedelta(minutes=5)
+    await db_session.commit()
+
+    publish = AsyncMock()
+    identity = AsyncMock(return_value=ACTOR)
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            identity,
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
+    ):
+        await pr_review_service._resume_publishing_review_under_lease(
+            db_session,
+            review.id,
+            repo.repo_full_name,
+            lease_token=lease_token,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "error"
+    assert review.action_taken == "error"
+    assert "Durable PR publication state is invalid" in review.review_summary
+    identity.assert_not_awaited()
+    publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_check_review_discards_non_owner_task(
     db_session,
     repo,
@@ -2018,7 +2126,141 @@ async def test_publication_lease_fences_concurrent_processes(
             task_started_at=started_at,
             nonce=ACTION_NONCE,
             lease_token=first_token,
+            expected_delivery_id=PR_DATA["delivery_id"],
         )
+
+
+@pytest.mark.asyncio
+async def test_publication_guard_rejects_delivery_ownership_change(
+    session_factory,
+):
+    """A legacy publication cannot mutate GitHub after Delivery adoption."""
+
+    async with session_factory() as db:
+        repo = _make_repo(auto_merge=True)
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo, auto_merge=True)
+        await _arm_publishing(
+            db,
+            review,
+            task,
+            action="approved_merged",
+        )
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+        legacy_delivery_id = review.delivery_id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    async with session_factory() as db:
+        await db.execute(
+            update(PRReview)
+            .where(PRReview.id == review_id)
+            .values(delivery_id=f"delivery:91:{PR_DATA['head_sha']}")
+        )
+        await db.commit()
+
+        assert not await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=legacy_delivery_id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publication_guard_rejects_active_manager_termination_receipt(
+    session_factory,
+):
+    """A pending remote stop revokes publication authority before GitHub."""
+
+    lease_token = "9" * 48
+    async with session_factory() as db:
+        repo = _make_repo()
+        worker = Worker(name="publication-receipt-worker", status="ready")
+        db.add_all((repo, worker))
+        await db.flush()
+        review, task = await _make_review(db, repo)
+        task.worker_id = worker.id
+        await _arm_publishing(db, review, task)
+        review.publishing_lease_token = lease_token
+        review.publishing_lease_expires_at = (
+            datetime.utcnow() + timedelta(minutes=5)
+        )
+        await db.commit()
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+
+    await persist_active_manager_receipt(session_factory, task_id)
+
+    async with session_factory() as db:
+        assert not await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=PR_DATA["delivery_id"],
+        )
+
+    authenticated_login = AsyncMock(return_value=ACTOR)
+    publish = AsyncMock()
+    gh_api = AsyncMock()
+    gh_view = AsyncMock()
+    find_evidence = AsyncMock()
+    async with session_factory() as db:
+        with (
+            patch.object(
+                pr_review_service,
+                "_gh_authenticated_login",
+                authenticated_login,
+            ),
+            patch.object(
+                pr_review_service,
+                "_publish_review_action",
+                publish,
+            ),
+            patch.object(pr_review_service, "_gh_api_json", gh_api),
+            patch.object(pr_review_service, "_gh_pr_view", gh_view),
+            patch.object(
+                pr_review_service,
+                "_find_review_evidence",
+                find_evidence,
+            ),
+        ):
+            await pr_review_service._resume_publishing_review_under_lease(
+                db,
+                review_id,
+                "owner/repo",
+                lease_token=lease_token,
+            )
+
+    authenticated_login.assert_not_awaited()
+    publish.assert_not_awaited()
+    gh_api.assert_not_awaited()
+    gh_view.assert_not_awaited()
+    find_evidence.assert_not_awaited()
+    async with session_factory() as db:
+        stored = await db.get(PRReview, review_id)
+        assert stored.status == "publishing"
+        assert stored.pending_action == "lgtm_comment"
 
 
 @pytest.mark.asyncio
@@ -2057,6 +2299,73 @@ async def test_recover_incomplete_review_claims_exact_completed_generation(
     async with session_factory() as db:
         stored = await db.get(PRReview, review_id)
         assert stored.status == "approved"
+
+
+@pytest.mark.asyncio
+async def test_full_recovery_projects_terminal_error_to_monitor_once(
+    session_factory,
+    no_broadcast,
+):
+    """The periodic entry point closes and then leaves the error gap closed."""
+
+    async with session_factory() as db:
+        repo = _make_repo(review_mode="panel")
+        db.add(repo)
+        await db.flush()
+        monitor = PRMonitorRun(
+            repo_id=repo.id,
+            pr_number=PR_DATA["number"],
+            current_base_sha=PR_DATA["base_sha"],
+            current_head_sha=PR_DATA["head_sha"],
+            status="reviewing",
+        )
+        db.add(monitor)
+        await db.flush()
+        review = PRReview(
+            monitor_run_id=monitor.id,
+            repo_id=repo.id,
+            pr_number=PR_DATA["number"],
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            delivery_id=PR_DATA["delivery_id"],
+            pr_title=PR_DATA["title"],
+            pr_author=PR_DATA["author"],
+            pr_url=PR_DATA["url"],
+            status="error",
+            action_taken="error",
+            review_summary="review transport failed permanently",
+            completed_at=datetime.utcnow(),
+        )
+        db.add(review)
+        await db.flush()
+        monitor.current_review_id = review.id
+        await db.commit()
+        monitor_id = monitor.id
+        review_id = review.id
+
+    assert (
+        await pr_review_service.recover_incomplete_pr_reviews(session_factory)
+        == 1
+    )
+    async with session_factory() as db:
+        recovered_monitor = await db.get(PRMonitorRun, monitor_id)
+        recovered_review = await db.get(PRReview, review_id)
+        assert recovered_review.status == "error"
+        assert recovered_review.action_taken == "error"
+        assert recovered_monitor.status == "paused"
+        assert recovered_monitor.pause_reason == (
+            f"review_error:{review_id}:review transport failed permanently"
+        )
+        recovered_version = recovered_monitor.state_version
+
+    assert (
+        await pr_review_service.recover_incomplete_pr_reviews(session_factory)
+        == 0
+    )
+    async with session_factory() as db:
+        unchanged_monitor = await db.get(PRMonitorRun, monitor_id)
+        assert unchanged_monitor.status == "paused"
+        assert unchanged_monitor.state_version == recovered_version
 
 
 @pytest.mark.asyncio
@@ -2191,6 +2500,53 @@ async def test_recover_incomplete_terminal_failure_finishes_review_error(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("task_status", ["failed", "cancelled", "conflict"])
+async def test_recover_terminal_review_yields_to_manager_termination_receipt(
+    session_factory,
+    no_broadcast,
+    task_status,
+):
+    """Receipt ownership fences reviewing terminal projection."""
+
+    async with session_factory() as db:
+        repo = _make_repo()
+        worker = Worker(name=f"recovery-receipt-{task_status}", status="ready")
+        db.add_all((repo, worker))
+        await db.flush()
+        review, task = await _make_review(
+            db,
+            repo,
+            task_status=task_status,
+        )
+        task.worker_id = worker.id
+        await db.commit()
+        review_id = review.id
+        task_id = task.id
+
+    await persist_active_manager_receipt(session_factory, task_id)
+
+    publish = AsyncMock()
+    with patch.object(
+        pr_review_service,
+        "_publish_review_action",
+        publish,
+    ):
+        recovered = await pr_review_service.recover_incomplete_pr_reviews(
+            session_factory
+        )
+
+    assert recovered == 0
+    publish.assert_not_awaited()
+    no_broadcast.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = await db.get(PRReview, review_id)
+        assert stored.status == "reviewing"
+        assert stored.action_taken is None
+        assert stored.review_summary is None
+        assert stored.completed_at is None
+
+
+@pytest.mark.asyncio
 async def test_recover_incomplete_superseded_terminal_never_publishes(
     session_factory,
     no_broadcast,
@@ -2282,6 +2638,7 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
             stopped=False,
             cleared_messages=0,
             retry_count=current.retry_count,
+            turn_generation=current.turn_generation,
             instance_id=current.instance_id,
             started_at=current.started_at,
             completed_at=current.completed_at,

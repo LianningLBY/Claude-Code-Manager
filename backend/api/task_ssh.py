@@ -10,6 +10,7 @@ from backend.api.deps import (
     get_current_user_id,
     require_admin,
     require_internal_service,
+    require_ssh_auth_configured,
     require_task_access,
     require_task_control,
 )
@@ -51,7 +52,11 @@ from backend.services.task_ssh_access import (
 )
 
 
-router = APIRouter(prefix="/api/tasks/{task_id}", tags=["task-ssh"])
+router = APIRouter(
+    prefix="/api/tasks/{task_id}",
+    tags=["task-ssh"],
+    dependencies=[Depends(require_ssh_auth_configured)],
+)
 MAX_TASK_SSH_DIRECTORY_ENTRIES = 2000
 MAX_TASK_SSH_WRITE_BYTES = 1024 * 1024
 

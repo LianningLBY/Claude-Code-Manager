@@ -23,6 +23,14 @@ class TaskSSHAccessError(ValueError):
         self.detail = detail
 
 
+def _require_managed_ssh_auth() -> None:
+    if not settings.auth_token:
+        raise TaskSSHAccessError(
+            503,
+            "Managed SSH requires AUTH_TOKEN authentication to be configured",
+        )
+
+
 @dataclass(frozen=True)
 class PreparedTaskSSHGrant:
     profile_id: int
@@ -252,6 +260,7 @@ async def prepare_task_ssh_grants(
     ]
     if not parsed:
         return []
+    _require_managed_ssh_auth()
     if project_id is not None:
         # Serialize Task creation-with-grants against both team and outbound
         # Project sharing. Existing Task grant replacement instead locks the
@@ -479,6 +488,7 @@ async def resolve_task_ssh_profile(
     profile_id: int,
     required_capability: str,
 ) -> SSHProfile:
+    _require_managed_ssh_auth()
     task = await db.get(Task, task_id)
     if task is None:
         raise TaskSSHAccessError(404, "Task not found")
@@ -536,6 +546,8 @@ async def valid_task_ssh_capabilities(
     db: AsyncSession,
     task: Task,
 ) -> set[str]:
+    if not settings.auth_token:
+        return set()
     if task_ssh_scope_invalid_reason(
         worker_id=task.worker_id,
         shared_from_id=task.shared_from_id,

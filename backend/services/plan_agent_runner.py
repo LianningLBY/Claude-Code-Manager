@@ -17,7 +17,11 @@ from typing import Any
 from sqlalchemy import select, update
 
 from backend.config import settings
-from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentRuntimeReceipt,
+    PlanAgentStep,
+)
 from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.models.instance import Instance
 from backend.models.task import Task
@@ -46,6 +50,19 @@ from backend.services.codex_pool import (
     is_rate_limited as is_codex_rate_limited,
 )
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.plan_runtime_receipt import (
+    PlanRuntimeReceiptError,
+    RuntimeReceiptSnapshot,
+    bind_claude_process,
+    bind_codex_thread,
+    bind_codex_transport,
+    mark_runtime_cleaned,
+    new_prepared_runtime_receipt,
+    prepare_runtime_attempt,
+    reconcile_runtime_receipt,
+    runtime_generation_is_clean,
+    runtime_token_environment,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +320,8 @@ class _RetainedProcess:
     provider: str
     provider_home: str | None
     process_group_id: int | None
+    runtime_receipt: RuntimeReceiptSnapshot | None = None
+    runtime_db_factory: Any | None = None
     cleanup_task: asyncio.Task[None] | None = None
 
 
@@ -314,6 +333,8 @@ class _RetainedCodexTurn:
     thread_id: str
     registry: Any
     app_server_guard: Any
+    runtime_receipt: RuntimeReceiptSnapshot | None = None
+    runtime_db_factory: Any | None = None
     cleanup_task: asyncio.Task[None] | None = None
 
 
@@ -471,6 +492,8 @@ def _register_process(
     task_id: int,
     provider: str,
     provider_home: str | None,
+    runtime_receipt: RuntimeReceiptSnapshot | None = None,
+    runtime_db_factory=None,
 ) -> tuple[int, _RetainedProcess]:
     process_group_id = None
     if os.name == "posix":
@@ -484,6 +507,8 @@ def _register_process(
         provider=provider,
         provider_home=_canonical_home(provider_home),
         process_group_id=process_group_id,
+        runtime_receipt=runtime_receipt,
+        runtime_db_factory=runtime_db_factory,
     )
     token = id(process)
     _PLAN_AGENT_PROCESSES[token] = retained
@@ -586,6 +611,14 @@ async def _shielded_terminate(
             break
     try:
         cleanup.result()
+        if (
+            retained.runtime_receipt is not None
+            and retained.runtime_db_factory is not None
+        ):
+            await mark_runtime_cleaned(
+                retained.runtime_db_factory,
+                retained.runtime_receipt,
+            )
     except Exception as exc:
         retained.cleanup_task = None
         raise PlanAgentCleanupError(
@@ -628,6 +661,8 @@ def _register_codex_turn(
     thread_id: str,
     registry: Any,
     app_server_guard: Any,
+    runtime_receipt: RuntimeReceiptSnapshot | None = None,
+    runtime_db_factory=None,
 ) -> tuple[int, _RetainedCodexTurn]:
     retained = _RetainedCodexTurn(
         process=process,
@@ -636,6 +671,8 @@ def _register_codex_turn(
         thread_id=thread_id,
         registry=registry,
         app_server_guard=app_server_guard,
+        runtime_receipt=runtime_receipt,
+        runtime_db_factory=runtime_db_factory,
     )
     token = id(process)
     _PLAN_AGENT_CODEX_TURNS[token] = retained
@@ -690,6 +727,14 @@ async def _shielded_cleanup_codex_turn(
             break
     try:
         cleanup.result()
+        if (
+            retained.runtime_receipt is not None
+            and retained.runtime_db_factory is not None
+        ):
+            await mark_runtime_cleaned(
+                retained.runtime_db_factory,
+                retained.runtime_receipt,
+            )
     except Exception as exc:
         retained.cleanup_task = None
         raise PlanAgentCleanupError(
@@ -1326,6 +1371,7 @@ class PlanAgentRunner:
         step_id: int | None = None,
         delta_idle_timeout: float | None = None,
         json_whitespace_limit: int | None = None,
+        runtime_receipt=None,
     ) -> tuple[bytes, bytes, int]:
         registry = self.instance_manager._ensure_codex_app_server_registry()
         process = None
@@ -1338,6 +1384,32 @@ class PlanAgentRunner:
             async with self.instance_manager.codex_home_app_server_guard(
                 home
             ) as admitted_home:
+                async def bind_started_thread(thread_id: str) -> None:
+                    nonlocal runtime_receipt
+                    if runtime_receipt is None:
+                        return
+                    runtime_receipt = await bind_codex_thread(
+                        self.db_factory,
+                        runtime_receipt.id,
+                        codex_home=admitted_home,
+                        thread_id=thread_id,
+                    )
+
+                async def publish_prepared_turn(
+                    prepared_process: CodexTurnProcess,
+                    thread_id: str,
+                ) -> None:
+                    nonlocal runtime_receipt
+                    if runtime_receipt is None:
+                        return
+                    runtime_receipt = await bind_codex_transport(
+                        self.db_factory,
+                        runtime_receipt.id,
+                        pid=prepared_process.pid,
+                        codex_home=admitted_home,
+                        thread_id=thread_id,
+                    )
+
                 process, thread_id = await registry.start_turn(
                     codex_home=admitted_home,
                     prompt=prompt,
@@ -1355,6 +1427,12 @@ class PlanAgentRunner:
                     sandbox_mode="read-only",
                     disable_autonomous_features=True,
                     output_schema=schema,
+                    on_thread_started=(
+                        bind_started_thread if runtime_receipt is not None else None
+                    ),
+                    on_turn_prepared=(
+                        publish_prepared_turn if runtime_receipt is not None else None
+                    ),
                 )
             token, retained = _register_codex_turn(
                 process,
@@ -1364,6 +1442,10 @@ class PlanAgentRunner:
                 registry=registry,
                 app_server_guard=(
                     self.instance_manager.codex_home_app_server_guard
+                ),
+                runtime_receipt=runtime_receipt,
+                runtime_db_factory=(
+                    self.db_factory if runtime_receipt is not None else None
                 ),
             )
             if self.codex_pool:
@@ -1504,6 +1586,18 @@ class PlanAgentRunner:
                     retained,
                     delayed_cancellation=delayed_cancellation,
                 )
+            elif runtime_receipt is not None:
+                cleaned = await reconcile_runtime_receipt(
+                    self.db_factory,
+                    self.instance_manager,
+                    receipt_id=runtime_receipt.id,
+                    allow_transport_kill=False,
+                )
+                if not cleaned:
+                    raise PlanAgentCleanupError(
+                        "Codex Plan runtime launch cleanup could not be confirmed",
+                        provider="codex",
+                    )
 
     @staticmethod
     async def _wait_for_codex_delta_stall(
@@ -1597,6 +1691,73 @@ class PlanAgentRunner:
         step_id: int | None = None,
         step_type: str | None = None,
     ) -> tuple[dict, str]:
+        runtime_receipt = None
+        if step_id is not None:
+            try:
+                runtime_receipt = await prepare_runtime_attempt(
+                    self.db_factory,
+                    step_id,
+                )
+            except PlanRuntimeReceiptError as exc:
+                raise PlanAgentCleanupError(
+                    "Plan Agent runtime receipt could not be prepared",
+                    provider=provider,
+                    stderr=str(exc),
+                ) from exc
+        try:
+            return await self._run_process_attempt(
+                task_id=task_id,
+                provider=provider,
+                model=model,
+                effort=effort,
+                cwd=cwd,
+                prompt=prompt,
+                schema=schema,
+                timeout=timeout,
+                home=home,
+                step_id=step_id,
+                step_type=step_type,
+                runtime_receipt=runtime_receipt,
+            )
+        except BaseException as exc:
+            if runtime_receipt is not None:
+                cleanup = asyncio.create_task(
+                    reconcile_runtime_receipt(
+                        self.db_factory,
+                        self.instance_manager,
+                        receipt_id=runtime_receipt.id,
+                        allow_transport_kill=False,
+                    )
+                )
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                if not cleanup.result():
+                    raise PlanAgentCleanupError(
+                        "Plan Agent runtime cleanup is not durably confirmed",
+                        provider=provider,
+                        stderr=str(exc),
+                    ) from exc
+            raise
+
+    async def _run_process_attempt(
+        self,
+        *,
+        task_id: int,
+        provider: str,
+        model: str,
+        effort: str | None,
+        cwd: str,
+        prompt: str,
+        schema: dict,
+        timeout: int,
+        home: str | None,
+        step_id: int | None,
+        step_type: str | None,
+        runtime_receipt: RuntimeReceiptSnapshot | None,
+    ) -> tuple[dict, str]:
         env = {
             key: value
             for key, value in os.environ.items()
@@ -1620,6 +1781,8 @@ class PlanAgentRunner:
                     else _CLAUDE_AUTH_ENV_KEYS
                 ):
                     env.pop(key, None)
+            if runtime_receipt is not None:
+                env.update(runtime_token_environment(runtime_receipt))
 
             if provider == "codex":
                 if not settings.codex_app_server_enabled:
@@ -1651,6 +1814,7 @@ class PlanAgentRunner:
                         json_whitespace_limit=(
                             settings.plan_structured_output_whitespace_limit
                         ),
+                        runtime_receipt=runtime_receipt,
                     )
                 except CodexAppServerBusyError as exc:
                     raise PlanRouteUnavailable(
@@ -1725,7 +1889,18 @@ class PlanAgentRunner:
                     task_id=task_id,
                     provider=provider,
                     provider_home=admitted_home,
+                    runtime_receipt=runtime_receipt,
+                    runtime_db_factory=(
+                        self.db_factory if runtime_receipt is not None else None
+                    ),
                 )
+                if runtime_receipt is not None:
+                    runtime_receipt = await bind_claude_process(
+                        self.db_factory,
+                        runtime_receipt.id,
+                        process.pid,
+                    )
+                    retained.runtime_receipt = runtime_receipt
                 if (
                     provider == "claude"
                     and self.claude_pool
@@ -1783,6 +1958,19 @@ class PlanAgentRunner:
                         retained,
                         communicate_task,
                     )
+                elif runtime_receipt is not None:
+                    cleaned = await reconcile_runtime_receipt(
+                        self.db_factory,
+                        self.instance_manager,
+                        receipt_id=runtime_receipt.id,
+                        allow_transport_kill=False,
+                    )
+                    if not cleaned:
+                        raise PlanAgentCleanupError(
+                            "Claude Plan runtime launch cleanup could not be confirmed",
+                            provider=provider,
+                            stderr=str(exc),
+                        ) from exc
                 raise PlanAgentError(
                     f"{provider.title()} Plan Agent process failed",
                     provider=provider,
@@ -2103,6 +2291,11 @@ class PlanAgentRunner:
                 status="running",
             )
             db.add(step)
+            await db.flush()
+            # Commit the opaque runtime token before any provider process or
+            # native thread can be created.  A hard crash in the later
+            # spawn->identity window is recoverable by this durable token.
+            db.add(new_prepared_runtime_receipt(step, attempt_index=1))
             await db.commit()
             await db.refresh(step)
             step_id = step.id
@@ -2126,6 +2319,29 @@ class PlanAgentRunner:
         account_id: str | None = None,
         status: str | None = None,
     ) -> None:
+        async with self.db_factory() as db:
+            receipt_ids = list(
+                (
+                    await db.execute(
+                        select(PlanAgentRuntimeReceipt.id).where(
+                            PlanAgentRuntimeReceipt.step_id == step_id,
+                            PlanAgentRuntimeReceipt.status != "cleaned",
+                        )
+                    )
+                ).scalars()
+            )
+        for receipt_id in receipt_ids:
+            cleaned = await reconcile_runtime_receipt(
+                self.db_factory,
+                self.instance_manager,
+                receipt_id=receipt_id,
+                allow_transport_kill=False,
+            )
+            if not cleaned:
+                raise PlanAgentCleanupError(
+                    f"Plan Step #{step_id} runtime cleanup is not durable",
+                    provider="unknown",
+                )
         async with self.db_factory() as db:
             step = await db.get(PlanAgentStep, step_id)
             if step is None:
@@ -2303,6 +2519,15 @@ class PlanAgentRunner:
     ) -> None:
         if run.instance_id is None:
             return
+        if not await runtime_generation_is_clean(
+            db,
+            run_id=run.id,
+            generation=run.generation,
+        ):
+            raise PlanAgentCleanupError(
+                f"Plan Run #{run.id} provider runtime cleanup is not durable",
+                provider="unknown",
+            )
         now = datetime.utcnow()
         if run.last_execution_started_at is not None:
             run.execution_seconds = float(run.execution_seconds or 0) + max(

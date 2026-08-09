@@ -107,6 +107,7 @@ def _ccm_server_spec(
     enabled_tools: tuple[str, ...],
     api_base: str | None,
     task_id: int | None = None,
+    task_incarnation_id: str | None = None,
     monitor_session_id: int | None = None,
     sub_agent_session_id: int | None = None,
     credential_owner_kind: str,
@@ -132,6 +133,7 @@ def _ccm_server_spec(
     scoped_token = issue_internal_service_token(
         audience=name,
         task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
         monitor_session_id=monitor_session_id,
         sub_agent_session_id=sub_agent_session_id,
         owner_kind=credential_owner_kind,
@@ -163,6 +165,7 @@ def build_mcp_server_specs(
     enabled_skills: dict | None = None,
     api_base: str | None = None,
     *,
+    task_incarnation_id: str | None = None,
     provider: str = "claude",
     codex_monitor_enabled: bool = False,
 ) -> tuple[McpServerSpec, ...]:
@@ -196,6 +199,7 @@ def build_mcp_server_specs(
             enabled_tools=enabled_tools,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             credential_owner_kind="task-turn",
             credential_owner_id=task_id,
         ),
@@ -206,6 +210,7 @@ def build_task_ssh_mcp_server_specs(
     task_id: int,
     api_base: str | None = None,
     *,
+    task_incarnation_id: str | None = None,
     capabilities: Sequence[str] = ("exec", "read", "write"),
 ) -> tuple[McpServerSpec, ...]:
     """Build the required, Task-scoped SSH capability server."""
@@ -226,6 +231,7 @@ def build_task_ssh_mcp_server_specs(
             enabled_tools=tuple(enabled_tools),
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             credential_owner_kind="task-turn",
             credential_owner_id=task_id,
         ),
@@ -237,6 +243,8 @@ def build_monitor_agent_mcp_server_specs(
     task_id: int,
     api_base: str | None = None,
     turn_generation: int | None = None,
+    *,
+    task_incarnation_id: str | None = None,
 ) -> tuple[McpServerSpec, ...]:
     """Build MCP callback specs for one monitor agent."""
 
@@ -258,6 +266,7 @@ def build_monitor_agent_mcp_server_specs(
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             monitor_session_id=monitor_session_id,
             credential_owner_kind="monitor-turn",
             credential_owner_id=(
@@ -272,6 +281,8 @@ def build_monitor_agent_mcp_server_specs(
 def build_sub_agent_controller_mcp_server_specs(
     task_id: int,
     api_base: str | None = None,
+    *,
+    task_incarnation_id: str | None = None,
 ) -> tuple[McpServerSpec, ...]:
     """Expose only the tools a Codex parent needs for the Sub-Agent skill."""
 
@@ -283,6 +294,7 @@ def build_sub_agent_controller_mcp_server_specs(
             enabled_tools=CCM_SUB_AGENT_CONTROLLER_TOOLS,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             credential_owner_kind="task-turn",
             credential_owner_id=task_id,
         ),
@@ -293,6 +305,8 @@ def build_sub_agent_mcp_server_specs(
     session_id: int,
     task_id: int,
     api_base: str | None = None,
+    *,
+    task_incarnation_id: str | None = None,
 ) -> tuple[McpServerSpec, ...]:
     """Build MCP callback specs for one sub-agent."""
 
@@ -309,6 +323,7 @@ def build_sub_agent_mcp_server_specs(
             enabled_tools=CCM_SUB_AGENT_TOOLS,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             sub_agent_session_id=session_id,
             credential_owner_kind="sub-agent",
             credential_owner_id=session_id,
@@ -483,17 +498,24 @@ def generate_mcp_config(
     api_base: str | None = None,
     *,
     task_ssh_capabilities: Sequence[str] = (),
+    task_incarnation_id: str | None = None,
 ) -> Path:
     """为指定 task 生成 MCP config JSON 文件。
 
     ccm_skills server 始终包含（提供 $help 等默认命令）。
     Returns: 临时文件路径，进程结束后由调用方清理。
     """
-    specs = build_mcp_server_specs(task_id, enabled_skills, api_base)
+    specs = build_mcp_server_specs(
+        task_id,
+        enabled_skills,
+        api_base,
+        task_incarnation_id=task_incarnation_id,
+    )
     if task_ssh_capabilities:
         specs += build_task_ssh_mcp_server_specs(
             task_id,
             api_base,
+            task_incarnation_id=task_incarnation_id,
             capabilities=task_ssh_capabilities,
         )
     return _write_claude_mcp_config(
@@ -519,6 +541,8 @@ def generate_monitor_agent_mcp_config(
     task_id: int,
     api_base: str | None = None,
     turn_generation: int | None = None,
+    *,
+    task_incarnation_id: str | None = None,
 ) -> Path:
     """为 monitor 子 agent 生成专用 MCP config。
 
@@ -533,6 +557,7 @@ def generate_monitor_agent_mcp_config(
         task_id,
         api_base,
         turn_generation,
+        task_incarnation_id=task_incarnation_id,
     )
     return _write_claude_mcp_config(
         specs,
@@ -580,14 +605,23 @@ def cleanup_monitor_agent_mcp_config(
 
 
 def generate_sub_agent_mcp_config(
-    session_id: int, task_id: int, api_base: str | None = None
+    session_id: int,
+    task_id: int,
+    api_base: str | None = None,
+    *,
+    task_incarnation_id: str | None = None,
 ) -> Path:
     """为 sub-agent 子进程生成专用 MCP config。
 
     Returns:
         配置文件路径，调用方负责清理。
     """
-    specs = build_sub_agent_mcp_server_specs(session_id, task_id, api_base)
+    specs = build_sub_agent_mcp_server_specs(
+        session_id,
+        task_id,
+        api_base,
+        task_incarnation_id=task_incarnation_id,
+    )
     return _write_claude_mcp_config(
         specs,
         namespace="sub-agent",

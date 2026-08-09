@@ -23,6 +23,10 @@ from backend.models.task import Task
 from backend.models.sub_agent import SubAgentSession, SubAgentReport
 from backend.models.project import Project
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 
 router = APIRouter(prefix="/api/tasks/{task_id}/sub-agent-sessions", tags=["sub-agent-tasks"])
 
@@ -196,6 +200,7 @@ async def create_sub_agent_session(
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(status=Task.status)
             )
@@ -204,6 +209,11 @@ async def create_sub_agent_session(
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise HTTPException(404, "Task not found")
+                if await active_worker_task_termination_receipt(db, task_id):
+                    raise HTTPException(
+                        409,
+                        "Task has an active Worker termination receipt",
+                    )
                 if task.worker_id is not None:
                     from backend.main import worker_proxy
                     if worker_proxy is None:
@@ -477,6 +487,9 @@ async def sub_agent_submit_result(
 ):
     """Sub-agent submits final result and marks completed."""
     require_internal_service(request)
+    from backend.main import dispatcher
+
+    queue_admission_fence = await dispatcher.snapshot_queue_admission(task_id)
     completed = await db.execute(
         update(SubAgentSession)
         .where(
@@ -520,8 +533,6 @@ async def sub_agent_submit_result(
     db.add(report)
     await db.commit()
 
-    from backend.main import dispatcher
-
     # Broadcast completion event (panel update only, no chat insert)
     await dispatcher.broadcaster.broadcast(
         f"task:{task_id}",
@@ -546,6 +557,7 @@ async def sub_agent_submit_result(
         source="sub-agent:result",
         user_message_text=result_text,
         monitor_session_id=session_id,
+        queue_admission_fence=queue_admission_fence,
     )
 
     # Kill the subprocess since it's done

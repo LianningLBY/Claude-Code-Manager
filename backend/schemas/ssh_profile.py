@@ -98,6 +98,7 @@ class SSHProfileCreate(_SSHProfileConnectionFields):
 
 
 class SSHProfileUpdate(BaseModel):
+    revision: int = Field(ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=100)
     host: str | None = Field(default=None, min_length=1, max_length=253)
     port: int | None = Field(default=None, ge=1, le=65535)

@@ -79,6 +79,39 @@ async def test_org_registry_mutations_are_not_unsigned_public_writes(
 
 
 @pytest.mark.asyncio
+async def test_only_internal_service_can_choose_task_id(secured_client):
+    client, session_factory = secured_client
+    _, member_token = await _create_user(
+        session_factory,
+        email="task-id-member@example.com",
+        role="member",
+    )
+    payload = {
+        "id": 91001,
+        "title": "manager-owned identity",
+        "description": "only an internal forward may choose this id",
+    }
+
+    rejected = await client.post(
+        "/api/tasks",
+        headers=_headers(member_token),
+        json=payload,
+    )
+    accepted = await client.post(
+        "/api/tasks",
+        headers={"Authorization": "Bearer security-service-token"},
+        json=payload,
+    )
+
+    assert rejected.status_code == 403
+    assert rejected.json()["detail"] == (
+        "Internal service authentication required"
+    )
+    assert accepted.status_code == 201, accepted.text
+    assert accepted.json()["id"] == payload["id"]
+
+
+@pytest.mark.asyncio
 async def test_task_and_project_targets_require_exact_resource_access(
     secured_client,
 ):
@@ -671,6 +704,10 @@ async def test_pr_monitor_detail_reviews_and_mutations_require_exact_worker_owne
             headers=alice_headers,
         ),
         await client.post(
+            f"/api/pr-monitor/repos/{ids['repo']}/regenerate-secret",
+            headers=alice_headers,
+        ),
+        await client.post(
             "/api/pr-monitor/repos",
             headers=alice_headers,
             json={
@@ -691,7 +728,8 @@ async def test_pr_monitor_detail_reviews_and_mutations_require_exact_worker_owne
         headers=bob_headers,
     )
     assert detail.status_code == 200
-    assert detail.json()["webhook_secret"] == "full-private-secret"
+    assert detail.json()["webhook_secret"] == "full***"
+    assert "full-private-secret" not in detail.text
     assert reviews.status_code == 200
     assert [row["id"] for row in reviews.json()] == [ids["review"]]
 

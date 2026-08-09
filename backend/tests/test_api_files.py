@@ -23,6 +23,9 @@ def _managed_files_app(profile):
     app = FastAPI()
     app.include_router(files_module.router)
     app.dependency_overrides[files_module.require_admin] = lambda: None
+    app.dependency_overrides[
+        files_module.require_ssh_auth_configured
+    ] = lambda: None
     app.dependency_overrides[files_module.get_db] = override_db
     return app
 
@@ -241,6 +244,9 @@ async def test_ssh_download_removes_temporary_file_after_response(
     app = FastAPI()
     app.include_router(files_module.router)
     app.dependency_overrides[files_module.require_admin] = lambda: None
+    app.dependency_overrides[
+        files_module.require_ssh_auth_configured
+    ] = lambda: None
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(

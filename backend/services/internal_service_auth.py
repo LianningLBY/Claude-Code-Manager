@@ -27,6 +27,7 @@ _TOKEN_TTL_SECONDS = 24 * 60 * 60
 _CLOCK_SKEW_SECONDS = 30
 _MAX_TOKEN_LENGTH = 4096
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+_TASK_INCARNATION_RE = re.compile(r"^[0-9a-f]{32}$")
 
 
 class InternalServiceTokenError(ValueError):
@@ -44,6 +45,7 @@ class InternalServiceClaims:
     token_id: str
     expires_at: int
     task_id: int | None = None
+    task_incarnation_id: str | None = None
     monitor_session_id: int | None = None
     sub_agent_session_id: int | None = None
     owner_kind: str | None = None
@@ -92,6 +94,17 @@ def _safe_segment(value: Any, field: str, *, optional: bool = True) -> str | Non
     return value
 
 
+def _task_incarnation(value: Any, *, optional: bool = True) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not _TASK_INCARNATION_RE.fullmatch(value):
+        raise InternalServiceTokenError(
+            401,
+            "Invalid internal task incarnation id",
+        )
+    return value
+
+
 def _cleanup_revocations(now: int) -> None:
     expired_cached = [
         (cache_key, cached[2])
@@ -122,6 +135,7 @@ def issue_internal_service_token(
     *,
     audience: str,
     task_id: int | None = None,
+    task_incarnation_id: str | None = None,
     monitor_session_id: int | None = None,
     sub_agent_session_id: int | None = None,
     owner_kind: str,
@@ -137,6 +151,12 @@ def issue_internal_service_token(
     owner_kind = _safe_segment(owner_kind, "owner kind", optional=False) or ""
     owner_id_value = _safe_segment(str(owner_id), "owner id", optional=False) or ""
     task_id = _positive_int(task_id, "task id")
+    task_incarnation_id = _task_incarnation(
+        task_incarnation_id,
+        optional=task_id is None,
+    )
+    if task_id is None and task_incarnation_id is not None:
+        raise ValueError("Task incarnation requires a Task id")
     monitor_session_id = _positive_int(
         monitor_session_id,
         "monitor session id",
@@ -160,6 +180,7 @@ def issue_internal_service_token(
         owner_id_value,
         audience,
         str(task_id or ""),
+        str(task_incarnation_id or ""),
         str(monitor_session_id or ""),
         str(sub_agent_session_id or ""),
         str(ttl_seconds),
@@ -188,6 +209,7 @@ def issue_internal_service_token(
     }
     for key, value in (
         ("task_id", task_id),
+        ("task_incarnation_id", task_incarnation_id),
         ("monitor_session_id", monitor_session_id),
         ("sub_agent_session_id", sub_agent_session_id),
     ):
@@ -286,6 +308,10 @@ def _decode_claims(token: str) -> InternalServiceClaims:
         token_id=_safe_segment(payload.get("jti"), "token id", optional=False) or "",
         expires_at=expires_at,
         task_id=_positive_int(payload.get("task_id"), "task id"),
+        task_incarnation_id=_task_incarnation(
+            payload.get("task_incarnation_id"),
+            optional=payload.get("task_id") is None,
+        ),
         monitor_session_id=_positive_int(
             payload.get("monitor_session_id"),
             "monitor session id",
@@ -297,6 +323,11 @@ def _decode_claims(token: str) -> InternalServiceClaims:
         owner_kind=_safe_segment(payload.get("owner_kind"), "owner kind"),
         owner_id=_safe_segment(payload.get("owner_id"), "owner id"),
     )
+    if claims.task_id is None and claims.task_incarnation_id is not None:
+        raise InternalServiceTokenError(
+            401,
+            "Internal Task incarnation has no Task id",
+        )
     with _revocation_lock:
         _cleanup_revocations(now)
         if claims.token_id in _revoked_tokens:
@@ -381,6 +412,53 @@ def authenticate_internal_service_token(
             "Internal service credential is not authorized for this route",
         )
     return claims
+
+
+async def validate_internal_service_task_incarnation(
+    claims: InternalServiceClaims,
+    *,
+    db_factory=None,
+) -> None:
+    """Revalidate a scoped token against the current durable Task row."""
+
+    if claims.task_id is None:
+        return
+    if claims.task_incarnation_id is None:
+        raise InternalServiceTokenError(
+            401,
+            "Internal service credential has no Task incarnation",
+        )
+    if db_factory is None:
+        from backend.database import async_session
+
+        db_factory = async_session
+    from sqlalchemy import select
+
+    from backend.models.task import Task
+
+    try:
+        async with db_factory() as db:
+            current_incarnation = await db.scalar(
+                select(Task.incarnation_id).where(Task.id == claims.task_id)
+            )
+    except InternalServiceTokenError:
+        raise
+    except Exception as exc:
+        raise InternalServiceTokenError(
+            503,
+            "Internal service Task authority could not be verified",
+        ) from exc
+    if (
+        not isinstance(current_incarnation, str)
+        or not hmac.compare_digest(
+            current_incarnation,
+            claims.task_incarnation_id,
+        )
+    ):
+        raise InternalServiceTokenError(
+            401,
+            "Internal service credential belongs to a different Task incarnation",
+        )
 
 
 def is_internal_service_token(token: str) -> bool:

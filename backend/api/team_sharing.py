@@ -5,7 +5,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select, delete
+from sqlalchemy import select, delete, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
@@ -14,6 +14,10 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.api.deps import get_current_user_id, get_current_user_role
+from backend.services.task_sharing import (
+    _writable_share_block_reason,
+    lock_task_share_authority,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,24 +35,50 @@ class UnshareBody(BaseModel):
     target_id: int = Field(gt=0)
 
 
-async def _require_share_target(
+async def _lock_share_target(
     target_type: Literal["user", "group"],
     target_id: int,
     db: AsyncSession,
 ) -> None:
+    """Take a portable target-row lock and re-check target validity."""
+
     if target_type == "user":
         from backend.models.user import User
 
-        target = await db.get(User, target_id)
+        locked = await db.execute(
+            update(User)
+            .where(User.id == target_id, User.is_active.is_(True))
+            .values(id=User.id)
+        )
     else:
         from backend.models.user_group import UserGroup
 
-        target = await db.get(UserGroup, target_id)
-    if target is None or (
-        target_type == "user"
-        and not getattr(target, "is_active", False)
-    ):
+        locked = await db.execute(
+            update(UserGroup)
+            .where(UserGroup.id == target_id)
+            .values(id=UserGroup.id)
+        )
+    if locked.rowcount != 1:
         raise HTTPException(404, "Share target not found")
+
+
+async def _lock_project_share_authority(
+    project_id: int,
+    db: AsyncSession,
+) -> Project:
+    """Lock Project before target/grant rows, including on SQLite."""
+
+    locked = await db.execute(
+        update(Project)
+        .where(Project.id == project_id)
+        .values(id=Project.id)
+    )
+    if locked.rowcount != 1:
+        raise HTTPException(404, "Project not found")
+    project = await db.get(Project, project_id, populate_existing=True)
+    if project is None:
+        raise HTTPException(404, "Project not found")
+    return project
 
 
 async def _can_share_project(user_id: int | None, user_role: str, project_id: int, db: AsyncSession) -> bool:
@@ -83,21 +113,15 @@ async def share_project(project_id: int, body: ShareBody, request: Request, db: 
         raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to share this project")
-    await _require_share_target(body.target_type, body.target_id, db)
-    locked_project = (
-        await db.execute(
-            select(Project).where(Project.id == project_id).with_for_update()
-        )
-    ).scalar_one_or_none()
-    if locked_project is None:
-        raise HTTPException(404, "Project not found")
-    # Lock current Tasks in a stable order. Grant replacement takes the same
-    # Task lock, closing the share-vs-grant race on databases with row locks.
+    await _lock_project_share_authority(project_id, db)
+    if not await _can_share_project(user_id, user_role, project_id, db):
+        raise HTTPException(403, "No permission to share this project")
+    # Grant replacement uses the same Project -> Task lock order. A no-op
+    # UPDATE is intentional because SQLite ignores SELECT ... FOR UPDATE.
     await db.execute(
-        select(Task.id)
+        update(Task)
         .where(Task.project_id == project_id)
-        .order_by(Task.id)
-        .with_for_update()
+        .values(id=Task.id)
     )
     from backend.services.task_ssh_access import project_has_task_ssh_grants
 
@@ -106,12 +130,15 @@ async def share_project(project_id: int, body: ShareBody, request: Request, db: 
             409,
             "Remove SSH grants from this Project's Tasks before sharing it",
         )
+    await _lock_share_target(body.target_type, body.target_id, db)
     existing = await db.execute(
-        select(TeamProjectShare).where(
+        select(TeamProjectShare)
+        .where(
             TeamProjectShare.project_id == project_id,
             TeamProjectShare.target_type == body.target_type,
             TeamProjectShare.target_id == body.target_id,
         )
+        .with_for_update()
     )
     if existing.scalar_one_or_none():
         return {"ok": True, "message": "Already shared"}
@@ -149,13 +176,22 @@ async def unshare_project(project_id: int, body: UnshareBody, request: Request, 
         raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to manage this project's sharing")
-    await db.execute(
-        delete(TeamProjectShare).where(
-            TeamProjectShare.project_id == project_id,
-            TeamProjectShare.target_type == body.target_type,
-            TeamProjectShare.target_id == body.target_id,
+    await _lock_project_share_authority(project_id, db)
+    if not await _can_share_project(user_id, user_role, project_id, db):
+        raise HTTPException(403, "No permission to manage this project's sharing")
+    shares = (
+        await db.execute(
+            select(TeamProjectShare)
+            .where(
+                TeamProjectShare.project_id == project_id,
+                TeamProjectShare.target_type == body.target_type,
+                TeamProjectShare.target_id == body.target_id,
+            )
+            .with_for_update()
         )
-    )
+    ).scalars().all()
+    for share in shares:
+        await db.delete(share)
     await db.commit()
     # Notify via Feishu (only for user targets, skip self-revoke)
     if body.target_type == "user" and body.target_id != user_id:
@@ -184,8 +220,13 @@ async def list_project_shares(project_id: int, request: Request, db: AsyncSessio
         raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to view this project's shares")
+    await _lock_project_share_authority(project_id, db)
+    if not await _can_share_project(user_id, user_role, project_id, db):
+        raise HTTPException(403, "No permission to view this project's shares")
     result = await db.execute(
-        select(TeamProjectShare).where(TeamProjectShare.project_id == project_id)
+        select(TeamProjectShare)
+        .where(TeamProjectShare.project_id == project_id)
+        .with_for_update()
     )
     shares = result.scalars().all()
     return [{"id": s.id, "target_type": s.target_type, "target_id": s.target_id,
@@ -203,14 +244,16 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
         raise HTTPException(404, "Task not found")
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to share this task")
-    await _require_share_target(body.target_type, body.target_id, db)
-    task = (
-        await db.execute(
-            select(Task).where(Task.id == task_id).with_for_update()
-        )
-    ).scalar_one_or_none()
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    if not await lock_task_share_authority(db, task):
+        raise HTTPException(409, "Task changed while sharing")
+    # The first check avoids taking a write lock for an obviously unauthorized
+    # caller.  This second check is authoritative: the Task may have changed
+    # while this request waited for the Task -> grant lock order.
+    if not await _can_share_task(user_id, user_role, task, db):
+        raise HTTPException(403, "No permission to share this task")
+    blocked = _writable_share_block_reason(task)
+    if blocked is not None:
+        raise HTTPException(409, blocked)
     from backend.services.task_ssh_access import task_has_any_ssh_grants
 
     if await task_has_any_ssh_grants(db, task_id):
@@ -218,6 +261,7 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
             409,
             "Remove this Task's SSH grants before sharing it",
         )
+    await _lock_share_target(body.target_type, body.target_id, db)
     # Verify target has Project access
     if task.project_id:
         proj_share = await db.execute(
@@ -230,11 +274,13 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
         if not proj_share.scalar_one_or_none():
             raise HTTPException(400, "Target does not have Project access. Share the Project first.")
     existing = await db.execute(
-        select(TeamTaskShare).where(
+        select(TeamTaskShare)
+        .where(
             TeamTaskShare.task_id == task_id,
             TeamTaskShare.target_type == body.target_type,
             TeamTaskShare.target_id == body.target_id,
         )
+        .with_for_update()
     )
     if existing.scalar_one_or_none():
         return {"ok": True, "message": "Already shared"}
@@ -271,13 +317,23 @@ async def unshare_task(task_id: int, body: UnshareBody, request: Request, db: As
         raise HTTPException(404, "Task not found")
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to manage this task's sharing")
-    await db.execute(
-        delete(TeamTaskShare).where(
-            TeamTaskShare.task_id == task_id,
-            TeamTaskShare.target_type == body.target_type,
-            TeamTaskShare.target_id == body.target_id,
+    if not await lock_task_share_authority(db, task):
+        raise HTTPException(409, "Task changed while unsharing")
+    if not await _can_share_task(user_id, user_role, task, db):
+        raise HTTPException(403, "No permission to manage this task's sharing")
+    shares = (
+        await db.execute(
+            select(TeamTaskShare)
+            .where(
+                TeamTaskShare.task_id == task_id,
+                TeamTaskShare.target_type == body.target_type,
+                TeamTaskShare.target_id == body.target_id,
+            )
+            .with_for_update()
         )
-    )
+    ).scalars().all()
+    for share in shares:
+        await db.delete(share)
     await db.commit()
     # Notify via Feishu (only for user targets, skip self-revoke)
     if body.target_type == "user" and body.target_id != user_id:
@@ -305,8 +361,14 @@ async def list_task_shares(task_id: int, request: Request, db: AsyncSession = De
         raise HTTPException(404, "Task not found")
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to view this task's shares")
+    if not await lock_task_share_authority(db, task):
+        raise HTTPException(409, "Task changed while listing shares")
+    if not await _can_share_task(user_id, user_role, task, db):
+        raise HTTPException(403, "No permission to view this task's shares")
     result = await db.execute(
-        select(TeamTaskShare).where(TeamTaskShare.task_id == task_id)
+        select(TeamTaskShare)
+        .where(TeamTaskShare.task_id == task_id)
+        .with_for_update()
     )
     shares = result.scalars().all()
     return [{"id": s.id, "target_type": s.target_type, "target_id": s.target_id,
@@ -408,6 +470,15 @@ async def update_group(group_id: int, body: GroupCreate, request: Request, db: A
     group = await db.get(UserGroup, group_id)
     if not group:
         raise HTTPException(404, "Group not found")
+    await db.rollback()
+    locked = await db.execute(
+        update(UserGroup)
+        .where(UserGroup.id == group_id)
+        .values(id=UserGroup.id)
+    )
+    if locked.rowcount != 1:
+        raise HTTPException(404, "Group not found")
+    group = await db.get(UserGroup, group_id, populate_existing=True)
     group.name = body.name
     group.description = body.description
     await db.commit()
@@ -423,6 +494,25 @@ async def delete_group(group_id: int, request: Request, db: AsyncSession = Depen
     group = await db.get(UserGroup, group_id)
     if not group:
         raise HTTPException(404, "Group not found")
+    await db.rollback()
+    locked = await db.execute(
+        update(UserGroup)
+        .where(UserGroup.id == group_id)
+        .values(id=UserGroup.id)
+    )
+    if locked.rowcount != 1:
+        raise HTTPException(404, "Group not found")
+    group = await db.get(UserGroup, group_id, populate_existing=True)
+    # Team share tables deliberately have no foreign keys.  Purge group-target
+    # grants in the same transaction so a reused group id cannot inherit them.
+    await db.execute(delete(TeamTaskShare).where(
+        TeamTaskShare.target_type == "group",
+        TeamTaskShare.target_id == group_id,
+    ))
+    await db.execute(delete(TeamProjectShare).where(
+        TeamProjectShare.target_type == "group",
+        TeamProjectShare.target_id == group_id,
+    ))
     await db.execute(delete(UserGroupMember).where(UserGroupMember.group_id == group_id))
     await db.delete(group)
     await db.commit()

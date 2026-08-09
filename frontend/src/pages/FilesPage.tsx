@@ -193,6 +193,7 @@ interface ManagedSSHPanelProps {
 
 interface ManagedProfileDraft {
   id: number | null;
+  revision: number | null;
   legacyId: string | null;
   name: string;
   host: string;
@@ -214,6 +215,7 @@ interface ManagedProfileDraft {
 function emptyManagedDraft(): ManagedProfileDraft {
   return {
     id: null,
+    revision: null,
     legacyId: null,
     name: '',
     host: '',
@@ -275,6 +277,7 @@ function ManagedSSHPanel({
   const startEdit = (profile: ManagedSSHProfile) => {
     beginEditing({
       id: profile.id,
+      revision: profile.revision,
       legacyId: null,
       name: profile.name,
       host: profile.host,
@@ -419,7 +422,11 @@ function ManagedSSHPanel({
         };
         saved = await api.createSSHProfile(input);
       } else {
+        if (editing.revision === null) {
+          throw new Error('SSH profile revision is missing; refresh and try again.');
+        }
         saved = await api.updateSSHProfile(editing.id, {
+          revision: editing.revision,
           ...common,
           ...(editing.keyUploadToken
             ? { key_upload_token: editing.keyUploadToken }
@@ -457,7 +464,7 @@ function ManagedSSHPanel({
     setBusy(true);
     setMessage(null);
     try {
-      await api.deleteSSHProfile(profile.id);
+      await api.deleteSSHProfile(profile.id, profile.revision);
       if (editing?.id === profile.id) {
         abandonUploadedKey(editing);
         setEditing(null);
@@ -519,7 +526,7 @@ function ManagedSSHPanel({
             <div className="mt-2 flex gap-2 text-xs">
               <button disabled={busy} onClick={() => testManagedProfile(profile)} className="text-emerald-400 hover:text-emerald-300 disabled:opacity-50">test</button>
               {isAdmin && <button disabled={busy} onClick={() => startEdit(profile)} className="text-indigo-400 hover:text-indigo-300 disabled:opacity-50">edit</button>}
-              {isAdmin && <button disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>}
+              {isAdmin && <button aria-label={`Delete ${profile.name}`} disabled={busy} onClick={() => deleteManagedProfile(profile)} className="ml-auto text-red-400 hover:text-red-300 disabled:opacity-50"><Trash2 size={12} /></button>}
             </div>
           </div>
         ))}

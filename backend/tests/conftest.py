@@ -82,10 +82,15 @@ import backend.models.discussion  # noqa: F401
 import backend.models.monitor_session  # noqa: F401
 import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker  # noqa: F401
+import backend.models.worker_turn_handoff  # noqa: F401
+import backend.models.worker_task_termination  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.ssh_profile  # noqa: F401
 import backend.models.task_ssh_grant  # noqa: F401
+import backend.models.capability  # noqa: F401
+import backend.models.code_review  # noqa: F401
+import backend.models.delivery  # noqa: F401
 import backend.models.task_share  # noqa: F401
 import backend.models.team_share  # noqa: F401
 
@@ -157,6 +162,39 @@ async def client(app):
     transport = ASGITransport(app=real_app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest_asyncio.fixture
+async def authenticated_client(app):
+    """Admin API client for security features that require AUTH_TOKEN."""
+
+    real_app, factory = app
+    from backend.config import settings
+
+    token = "ccm-managed-ssh-test-token"
+    original_token = settings.auth_token
+    had_factory = hasattr(real_app.state, "internal_service_db_factory")
+    original_factory = getattr(
+        real_app.state,
+        "internal_service_db_factory",
+        None,
+    )
+    settings.auth_token = token
+    real_app.state.internal_service_db_factory = factory
+    transport = ASGITransport(app=real_app)
+    try:
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as c:
+            yield c
+    finally:
+        settings.auth_token = original_token
+        if had_factory:
+            real_app.state.internal_service_db_factory = original_factory
+        else:
+            delattr(real_app.state, "internal_service_db_factory")
 
 
 @pytest_asyncio.fixture

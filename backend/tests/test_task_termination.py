@@ -1,6 +1,7 @@
 """Regression tests for generation-safe Task termination orchestration."""
 
 import asyncio
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -11,6 +12,60 @@ from sqlalchemy import select
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorSession
 from backend.models.task import Task
+from backend.models.worker import Worker
+from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ("local", "authoritative"))
+async def test_internal_termination_yields_to_active_worker_receipt(
+    db_factory,
+    entrypoint,
+):
+    """Service callers cannot bypass durable receipt ownership."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+    from backend.tests.worker_termination_helpers import (
+        persist_active_worker_receipt,
+    )
+
+    async with db_factory() as db:
+        task = Task(
+            title=f"receipt-owned {entrypoint} termination",
+            description="test",
+            status="pending",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    await persist_active_worker_receipt(db_factory, task_id)
+    abort = AsyncMock(return_value=0)
+    with patch.object(backend.main.dispatcher, "abort_task_queue", abort):
+        async with db_factory() as db:
+            with pytest.raises(
+                termination.TaskGenerationTerminationConflict,
+                match="active Worker termination receipt",
+            ):
+                if entrypoint == "local":
+                    await termination.terminate_local_task_generation(
+                        task_id,
+                        db,
+                        reason="ordinary internal cleanup",
+                    )
+                else:
+                    await termination.terminate_authoritative_task_generation(
+                        task_id,
+                        db,
+                        reason="ordinary internal cleanup",
+                    )
+
+    abort.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current is not None
+    assert current.status == "pending"
 
 
 @pytest.mark.asyncio
@@ -1090,6 +1145,94 @@ async def test_local_termination_rejects_new_background_marker_aba(
 
 
 @pytest.mark.asyncio
+async def test_local_termination_rejects_turn_generation_only_aba(
+    db_factory,
+):
+    """A stopped old owner cannot terminalize a newly admitted logical turn."""
+
+    import backend.main
+    import backend.services.task_termination as termination
+
+    started_at = datetime.utcnow()
+    async with db_factory() as db:
+        task = Task(
+            title="turn generation ABA",
+            description="test",
+            status="executing",
+            turn_generation=7,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="turn-generation-owner",
+            status="running",
+            pid=54302,
+            current_task_id=task.id,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+
+    async def stop_old_turn(_instance_id, **_kwargs):
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            owner = await db.get(Instance, instance_id)
+            owner.status = "idle"
+            owner.pid = None
+            owner.current_task_id = None
+            task.turn_generation += 1
+            await db.commit()
+        return True
+
+    async with db_factory() as db:
+        with (
+            patch.object(
+                backend.main.dispatcher,
+                "abort_task_queue",
+                new_callable=AsyncMock,
+                return_value=0,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "wait_for_task_launch_barrier",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+            patch.object(
+                backend.main.instance_manager,
+                "stop",
+                new_callable=AsyncMock,
+                side_effect=stop_old_turn,
+            ),
+            patch(
+                "backend.services.task_events.broadcast_status_change",
+                new_callable=AsyncMock,
+            ) as publish,
+        ):
+            with pytest.raises(
+                termination.TaskGenerationTerminationConflict,
+                match="newer generation",
+            ):
+                await termination.terminate_local_task_generation(
+                    task_id,
+                    db,
+                    reason="superseded",
+                )
+
+    publish.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 8
+    assert (current.metadata_ or {}).get("pr_review_superseded") is True
+
+
+@pytest.mark.asyncio
 async def test_local_termination_revalidates_authority_after_queue_abort(
     db_factory,
 ):
@@ -1188,12 +1331,438 @@ async def test_local_termination_reconciles_conflict_as_terminal(db_factory):
     publish.assert_not_awaited()
 
 
+_REMOTE_RECEIPT_TIME = "2026-08-07T01:02:03.000000"
+
+
+def _durable_worker_success_receipt(
+    request_payload: dict,
+    request_digest: str,
+    *,
+    result_turn_generation: int | None = None,
+) -> dict:
+    """Build the strict Worker receipt returned by PUT/readback/ACK."""
+
+    from backend.services.worker_task_termination import canonical_json_digest
+
+    expected = request_payload["expected_remote"]
+    turn_generation = (
+        expected["turn_generation"]
+        if result_turn_generation is None
+        else result_turn_generation
+    )
+    result = {
+        "version": 2,
+        "operation_id": request_payload["operation_id"],
+        "task_id": request_payload["task_id"],
+        "operation": request_payload["operation"],
+        "request_digest": request_digest,
+        "task": {
+            "id": request_payload["task_id"],
+            "status": "completed",
+            "retry_count": expected["retry_count"],
+            "turn_generation": turn_generation,
+            "instance_id": None,
+            "started_at": None,
+            "completed_at": _REMOTE_RECEIPT_TIME,
+            "session_id": None,
+            "error_message": None,
+            "background_active": False,
+        },
+        "response": {"ok": True},
+    }
+    return {
+        "version": 2,
+        "operation_id": request_payload["operation_id"],
+        "task_id": request_payload["task_id"],
+        "side": "worker",
+        "worker_id": None,
+        "operation": request_payload["operation"],
+        "status": "succeeded",
+        "state_version": 3,
+        "source": {
+            "incarnation_id": "1" * 32,
+            "status": expected["status"],
+            "retry_count": expected["retry_count"],
+            "turn_generation": expected["turn_generation"],
+            "source_log_id": None,
+            "instance_id": None,
+            "started_at": None,
+            "completed_at": None,
+            "session_id": None,
+            "pty_background_generation": None,
+        },
+        "request_payload": deepcopy(request_payload),
+        "request_digest": request_digest,
+        "result_payload": result,
+        "result_digest": canonical_json_digest(result),
+        "attempt_count": 1,
+        "reconcile_count": 0,
+        "last_error": None,
+        "accepted_at": _REMOTE_RECEIPT_TIME,
+        "completed_at": _REMOTE_RECEIPT_TIME,
+        "ack_intent_at": None,
+        "acknowledged_at": None,
+        "created_at": _REMOTE_RECEIPT_TIME,
+        "updated_at": _REMOTE_RECEIPT_TIME,
+    }
+
+
+async def _manager_termination_receipt(db_factory, task_id: int):
+    async with db_factory() as db:
+        receipts = list(
+            (
+                await db.execute(
+                    select(WorkerTaskTerminationReceipt).where(
+                        WorkerTaskTerminationReceipt.task_id == task_id,
+                        WorkerTaskTerminationReceipt.side == "manager",
+                    )
+                )
+            ).scalars()
+        )
+    assert len(receipts) == 1
+    return receipts[0]
+
+
 @pytest.mark.asyncio
-async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
+@pytest.mark.parametrize(
+    "remote_turn_generation",
+    [None, 6],
+    ids=["missing", "different"],
+)
+async def test_worker_termination_rejects_invalid_receipt_generation_identity(
+    db_factory,
+    remote_turn_generation,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="termination-worker",
+            status="ready",
+            private_ip="10.0.0.8",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="remote termination fence",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            turn_generation=5,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+    proxy = AsyncMock()
+
+    async def return_invalid_receipt(route, method, path, **kwargs):
+        receipt = await _manager_termination_receipt(db_factory, task_id)
+        remote = _durable_worker_success_receipt(
+            receipt.request_payload,
+            receipt.request_digest,
+        )
+        expected_remote = remote["request_payload"]["expected_remote"]
+        if remote_turn_generation is None:
+            expected_remote.pop("turn_generation")
+        else:
+            expected_remote["turn_generation"] = remote_turn_generation
+        return remote
+
+    proxy.proxy_to_worker.side_effect = return_invalid_receipt
+
+    with patch.object(backend.main, "worker_proxy", proxy):
+        async with db_factory() as db:
+            with pytest.raises(termination.WorkerTaskTerminationConflict):
+                await termination.terminate_worker_task_generation(
+                    task_id,
+                    db,
+                    operation_locks_held=True,
+                )
+
+    proxy.proxy_to_worker.assert_awaited_once()
+    request = proxy.proxy_to_worker.await_args
+    assert request.args[1] == "GET"
+    receipt = await _manager_termination_receipt(db_factory, task_id)
+    assert request.args[2].endswith(
+        f"/termination-receipts/{receipt.operation_id}"
+    )
+    assert receipt.operation == "supersede"
+    assert receipt.status == "conflict"
+    assert receipt.active_task_id == task_id
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [None, [], "not-an-object"])
+async def test_worker_termination_rejects_non_object_receipt(
+    db_factory,
+    remote,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="malformed-termination-worker",
+            status="ready",
+            private_ip="10.0.0.18",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="malformed remote termination receipt",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.return_value = remote
+    with patch.object(backend.main, "worker_proxy", proxy):
+        async with db_factory() as db:
+            with pytest.raises(
+                termination.WorkerTaskTerminationConflict,
+                match="invalid termination receipt",
+            ):
+                await termination.terminate_worker_task_generation(
+                    task_id,
+                    db,
+                    operation_locks_held=True,
+                )
+
+    proxy.proxy_to_worker.assert_awaited_once()
+    request = proxy.proxy_to_worker.await_args
+    assert request.args[1] == "GET"
+    receipt = await _manager_termination_receipt(db_factory, task_id)
+    assert request.args[2].endswith(
+        f"/termination-receipts/{receipt.operation_id}"
+    )
+    assert receipt.operation == "supersede"
+    assert receipt.status == "conflict"
+    assert receipt.active_task_id == task_id
+
+
+@pytest.mark.asyncio
+async def test_worker_termination_sends_and_confirms_exact_turn_generation(
+    db_factory,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+    import backend.services.worker_task_termination as durable_termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="successful-termination-worker",
+            status="ready",
+            private_ip="10.0.0.9",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="remote exact termination",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            retry_count=2,
+            turn_generation=9,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+    proxy = AsyncMock()
+    manager_statuses = []
+    worker_result = None
+
+    async def reconcile_remote_receipt(route, method, path, **kwargs):
+        nonlocal worker_result
+
+        receipt = await _manager_termination_receipt(db_factory, task_id)
+        manager_statuses.append((method, receipt.status, receipt.ack_intent_at))
+        if method == "GET":
+            return durable_termination.receipt_not_found_payload(
+                task_id,
+                receipt.operation_id,
+            )
+        if method == "PUT":
+            body = kwargs["body"]
+            worker_result = _durable_worker_success_receipt(
+                body["request_payload"],
+                body["request_digest"],
+            )
+            return worker_result
+        assert method == "POST"
+        acknowledged = deepcopy(worker_result)
+        acknowledged["status"] = "acknowledged"
+        acknowledged["state_version"] += 1
+        acknowledged["acknowledged_at"] = _REMOTE_RECEIPT_TIME
+        return acknowledged
+
+    proxy.proxy_to_worker.side_effect = reconcile_remote_receipt
+
+    with (
+        patch.object(backend.main, "worker_proxy", proxy),
+        patch.object(
+            backend.main.broadcaster,
+            "broadcast",
+            new_callable=AsyncMock,
+        ) as publish,
+    ):
+        async with db_factory() as db:
+            terminated = await termination.terminate_worker_task_generation(
+                task_id,
+                db,
+                operation_locks_held=True,
+            )
+
+    assert terminated.observed.turn_generation == 9
+    assert terminated.resulting.turn_generation == 9
+    assert [call.args[1] for call in proxy.proxy_to_worker.await_args_list] == [
+        "GET",
+        "PUT",
+        "POST",
+    ]
+    receipt = await _manager_termination_receipt(db_factory, task_id)
+    receipt_path = f"/termination-receipts/{receipt.operation_id}"
+    assert all(
+        call.args[2].endswith(
+            receipt_path + ("/ack" if call.args[1] == "POST" else "")
+        )
+        for call in proxy.proxy_to_worker.await_args_list
+    )
+    put = proxy.proxy_to_worker.await_args_list[1]
+    request_payload = put.kwargs["body"]["request_payload"]
+    assert put.kwargs["body"]["operation"] == "supersede"
+    assert request_payload["operation_id"] == receipt.operation_id
+    assert request_payload["expected_remote"] == {
+        "status": "executing",
+        "retry_count": 2,
+        "turn_generation": 9,
+    }
+    assert manager_statuses[0][1:] == ("pending_remote", None)
+    assert manager_statuses[1][1:] == ("pending_remote", None)
+    assert manager_statuses[2][1] == "awaiting_ack"
+    assert manager_statuses[2][2] is not None
+    assert receipt.status == "settled"
+    assert receipt.active_task_id is None
+    assert receipt.result_payload == worker_result["result_payload"]
+    assert receipt.result_digest == worker_result["result_digest"]
+    publish.assert_awaited_once_with(
+        "tasks",
+        {
+            "event": "status_change",
+            "task_id": task_id,
+            "task_retry_count": 2,
+            "task_turn_generation": 9,
+            "new_status": "completed",
+            "background_active": False,
+        },
+    )
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "completed"
+    assert current.retry_count == 2
+    assert current.turn_generation == 9
+    assert current.metadata_["pr_review_superseded"] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_termination_rejects_result_from_different_turn(
+    db_factory,
+):
+    import backend.main
+    import backend.services.task_termination as termination
+    import backend.services.worker_task_termination as durable_termination
+
+    async with db_factory() as db:
+        worker = Worker(
+            name="stale-result-worker",
+            status="ready",
+            private_ip="10.0.0.10",
+            auth_token="token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="stale remote result",
+            description="test",
+            status="executing",
+            worker_id=worker.id,
+            turn_generation=14,
+            tags=["pr-review"],
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+    proxy = AsyncMock()
+
+    async def return_stale_result(route, method, path, **kwargs):
+        receipt = await _manager_termination_receipt(db_factory, task_id)
+        if method == "GET":
+            return durable_termination.receipt_not_found_payload(
+                task_id,
+                receipt.operation_id,
+            )
+        assert method == "PUT"
+        body = kwargs["body"]
+        return _durable_worker_success_receipt(
+            body["request_payload"],
+            body["request_digest"],
+            result_turn_generation=15,
+        )
+
+    proxy.proxy_to_worker.side_effect = return_stale_result
+
+    with patch.object(backend.main, "worker_proxy", proxy):
+        async with db_factory() as db:
+            with pytest.raises(termination.WorkerTaskTerminationConflict):
+                await termination.terminate_worker_task_generation(
+                    task_id,
+                    db,
+                    operation_locks_held=True,
+                )
+
+    assert [call.args[1] for call in proxy.proxy_to_worker.await_args_list] == [
+        "GET",
+        "PUT",
+    ]
+    receipt = await _manager_termination_receipt(db_factory, task_id)
+    put = proxy.proxy_to_worker.await_args_list[1]
+    assert put.args[2].endswith(
+        f"/termination-receipts/{receipt.operation_id}"
+    )
+    assert (
+        put.kwargs["body"]["request_payload"]["expected_remote"][
+            "turn_generation"
+        ]
+        == 14
+    )
+    assert receipt.status == "conflict"
+    assert receipt.active_task_id == task_id
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 14
+
+
+@pytest.mark.asyncio
+async def test_legacy_internal_termination_mutation_is_disabled(
     client,
     session_factory,
 ):
-    """Forwarded PR tags survive TaskCreate and authorize safe termination."""
+    """The legacy snapshot stays readable but its mutation is fail-closed."""
 
     import backend.main
 
@@ -1220,13 +1789,15 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
         f"/api/tasks/{task_id}/terminate-generation"
     )
     assert termination_snapshot.status_code == 200, termination_snapshot.text
-    assert termination_snapshot.json()["pty_background_generation"] is None
+    snapshot = termination_snapshot.json()
+    assert snapshot["pty_background_generation"] is None
 
     missing_marker = await client.post(
         f"/api/tasks/{task_id}/terminate-generation",
         json={
             "expected_status": "executing",
             "expected_retry_count": 0,
+            "expected_turn_generation": snapshot["turn_generation"],
             "expected_instance_id": None,
             "expected_started_at": None,
             "expected_completed_at": None,
@@ -1239,12 +1810,13 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
         "abort_task_queue",
         new_callable=AsyncMock,
         return_value=0,
-    ):
+    ) as abort:
         response = await client.post(
             f"/api/tasks/{task_id}/terminate-generation",
             json={
                 "expected_status": "executing",
                 "expected_retry_count": 0,
+                "expected_turn_generation": snapshot["turn_generation"],
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
@@ -1252,11 +1824,13 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
             },
         )
 
-    assert response.status_code == 200, response.text
-    assert response.json()["id"] == task_id
-    assert response.json()["status"] == "completed"
-    assert response.json()["error_message"] == "Superseded by new PR push"
-    assert response.json()["metadata_"]["pr_review_superseded"] is True
+    assert response.status_code == 409, response.text
+    assert "durable termination receipt" in response.json()["detail"]
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert (current.metadata_ or {}).get("pr_review_superseded") is not True
 
 
 @pytest.mark.asyncio
@@ -1273,13 +1847,13 @@ async def test_internal_termination_endpoint_returns_exact_terminal_snapshot(
         ),
     ),
 )
-async def test_internal_termination_accepts_pr_fix_task_generations(
+async def test_legacy_internal_termination_rejects_pr_fix_task_generations(
     client,
     session_factory,
     marker_kind,
     initial_status,
 ):
-    """Worker fix tags and Manager fix metadata authorize exact cleanup."""
+    """Review markers cannot opt back into the pre-receipt mutation path."""
 
     import backend.main
 
@@ -1350,6 +1924,7 @@ async def test_internal_termination_accepts_pr_fix_task_generations(
             json={
                 "expected_status": snapshot["status"],
                 "expected_retry_count": snapshot["retry_count"],
+                "expected_turn_generation": snapshot["turn_generation"],
                 "expected_instance_id": snapshot["instance_id"],
                 "expected_started_at": snapshot["started_at"],
                 "expected_completed_at": snapshot["completed_at"],
@@ -1359,15 +1934,13 @@ async def test_internal_termination_accepts_pr_fix_task_generations(
             },
         )
 
-    assert response.status_code == 200, response.text
-    assert response.json()["status"] == "completed"
-    assert response.json()["metadata_"]["pr_review_superseded"] is True
-    abort.assert_awaited_once()
-    assert abort.await_args.args == (task_id,)
-    assert abort.await_args.kwargs["cancel_durable"] is False
-    assert abort.await_args.kwargs["durable_db"] is not None
-    assert lease_events == ["acquired", "terminal_committed", "released"]
-    assert task_id not in backend.main.dispatcher._cancel_durable_queue_tasks
+    assert response.status_code == 409, response.text
+    assert "durable termination receipt" in response.json()["detail"]
+    abort.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == initial_status
+    assert (current.metadata_ or {}).get("pr_review_superseded") is not True
 
 
 @pytest.mark.asyncio
@@ -1404,6 +1977,7 @@ async def test_internal_termination_rejects_plain_tasks_before_cleanup(
             json={
                 "expected_status": "pending",
                 "expected_retry_count": 0,
+                "expected_turn_generation": 0,
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
@@ -1629,6 +2203,7 @@ async def test_hidden_termination_rejects_stale_remote_generation_before_abort(
             json={
                 "expected_status": "executing",
                 "expected_retry_count": 0,
+                "expected_turn_generation": 0,
                 "expected_instance_id": None,
                 "expected_started_at": None,
                 "expected_completed_at": None,
@@ -1702,6 +2277,7 @@ async def test_hidden_termination_rejects_background_generation_aba(
             json={
                 "expected_status": snapshot["status"],
                 "expected_retry_count": snapshot["retry_count"],
+                "expected_turn_generation": snapshot["turn_generation"],
                 "expected_instance_id": snapshot["instance_id"],
                 "expected_started_at": snapshot["started_at"],
                 "expected_completed_at": snapshot["completed_at"],

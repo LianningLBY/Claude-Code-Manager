@@ -150,6 +150,7 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             InternalServiceTokenError,
             authenticate_internal_service_token,
             is_internal_service_token,
+            validate_internal_service_task_incarnation,
         )
 
         if is_internal_service_token(token):
@@ -165,6 +166,14 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
                     token,
                     method=request.method,
                     path=path,
+                )
+                await validate_internal_service_task_incarnation(
+                    claims,
+                    db_factory=getattr(
+                        request.app.state,
+                        "internal_service_db_factory",
+                        None,
+                    ),
                 )
             except InternalServiceTokenError as exc:
                 return JSONResponse(

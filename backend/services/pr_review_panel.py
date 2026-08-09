@@ -21,6 +21,9 @@ from backend.models.pr_monitor import (
     PRReviewerRun,
 )
 from backend.models.task import Task
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,14 @@ class _PanelTerminalMalformed(_PanelTerminalError):
 
 class _PanelTerminalConflict(_PanelTerminalError):
     """Candidate logs contain more than one distinct strict result."""
+
+
+async def _commit_review_error(db: AsyncSession, review: PRReview) -> None:
+    """Commit a Review error and its exact PR Monitor transition together."""
+
+    from backend.services.pr_monitor_loop import record_review_error
+
+    await record_review_error(db, review_id=review.id)
 
 
 ENGINEERING_DESIGN_STANDARD = """Every reviewer must apply the same repository-wide engineering standard.
@@ -398,6 +409,7 @@ async def _add_panel_tasks(
     context: dict,
 ) -> None:
     from backend.config import settings
+    from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
     from backend.services.pr_review_service import _get_or_create_pr_monitor_project
 
     if review.base_sha is None or review.head_sha is None or review.action_nonce is None:
@@ -407,6 +419,12 @@ async def _add_panel_tasks(
     base_sha = review.base_sha
     head_sha = review.head_sha
     nonce = review.action_nonce
+    delivery_policy = await frozen_delivery_pr_policy(db, review)
+    frozen_auto_merge = (
+        delivery_policy.auto_merge
+        if delivery_policy is not None
+        else bool(repo.auto_merge)
+    )
     provider = (repo.provider or "claude").lower()
     model = repo.review_model or (settings.default_codex_model if provider == "codex" else None)
     project_id = await _get_or_create_pr_monitor_project(db)
@@ -433,7 +451,10 @@ async def _add_panel_tasks(
         )
         db.add(run)
         await db.flush()
-        task = Task(
+        from backend.services.task_creation import stage_task_record
+
+        task = await stage_task_record(
+            db,
             title=f"PR Review ({role}): {repo_name}#{pr_number}",
             description=prompt,
             mode="auto",
@@ -444,7 +465,7 @@ async def _add_panel_tasks(
                 "pr_reviewer_role": role,
                 "pr_base_sha": base_sha,
                 "pr_head_sha": head_sha,
-                "pr_auto_merge": bool(repo.auto_merge),
+                "pr_auto_merge": frozen_auto_merge,
                 "pr_action_nonce": nonce,
             },
             provider=provider,
@@ -453,8 +474,6 @@ async def _add_panel_tasks(
             project_id=project_id,
             worker_id=repo.worker_id,
         )
-        db.add(task)
-        await db.flush()
         run.task_id = task.id
         first_task_id = first_task_id or task.id
     review.task_id = first_task_id
@@ -845,6 +864,85 @@ def _render_gate_body(runs: list[PRReviewerRun], findings: list[PRFinding]) -> s
     return "\n\n".join(sections)
 
 
+async def _guard_exact_terminal_task(
+    db: AsyncSession,
+    task: Task,
+    *,
+    statuses: set[str],
+) -> bool:
+    """Acquire a SQLite-safe proof that no termination receipt owns Task."""
+
+    if task.status not in statuses or task.pty_background_generation is not None:
+        return False
+    identity = {
+        "id": task.id,
+        "incarnation_id": task.incarnation_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "turn_source_log_id": task.turn_source_log_id,
+        "worker_id": task.worker_id,
+        "instance_id": task.instance_id,
+        "session_id": task.session_id,
+        "started_at": task.started_at,
+        "completed_at": task.completed_at,
+    }
+    # Terminal interpretation may have established a long-lived SQLite WAL
+    # read snapshot.  Discard it so the no-op UPDATE is the first statement in
+    # a fresh writer transaction; otherwise a receipt that committed meanwhile
+    # can surface as SQLITE_BUSY_SNAPSHOT instead of a deterministic CAS miss.
+    await db.rollback()
+    guarded = await db.execute(
+        update(Task)
+        .where(
+            Task.id == identity["id"],
+            (
+                Task.incarnation_id.is_(None)
+                if identity["incarnation_id"] is None
+                else Task.incarnation_id == identity["incarnation_id"]
+            ),
+            Task.status == identity["status"],
+            Task.retry_count == identity["retry_count"],
+            Task.turn_generation == identity["turn_generation"],
+            (
+                Task.turn_source_log_id.is_(None)
+                if identity["turn_source_log_id"] is None
+                else Task.turn_source_log_id == identity["turn_source_log_id"]
+            ),
+            (
+                Task.worker_id.is_(None)
+                if identity["worker_id"] is None
+                else Task.worker_id == identity["worker_id"]
+            ),
+            (
+                Task.instance_id.is_(None)
+                if identity["instance_id"] is None
+                else Task.instance_id == identity["instance_id"]
+            ),
+            (
+                Task.session_id.is_(None)
+                if identity["session_id"] is None
+                else Task.session_id == identity["session_id"]
+            ),
+            (
+                Task.started_at.is_(None)
+                if identity["started_at"] is None
+                else Task.started_at == identity["started_at"]
+            ),
+            (
+                Task.completed_at.is_(None)
+                if identity["completed_at"] is None
+                else Task.completed_at == identity["completed_at"]
+            ),
+            Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    return guarded.rowcount == 1
+
+
 async def check_and_update_reviewer_run(
     db: AsyncSession,
     *,
@@ -902,6 +1000,48 @@ async def check_and_update_reviewer_run(
         or review.head_sha is None
     ):
         return False
+    if not await _guard_exact_terminal_task(
+        db,
+        task,
+        statuses={"completed"},
+    ):
+        await db.rollback()
+        return False
+    review = (await db.execute(
+        select(PRReview)
+        .where(PRReview.id == review_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    run = (await db.execute(
+        select(PRReviewerRun)
+        .where(PRReviewerRun.id == reviewer_run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    task = (await db.execute(
+        select(Task)
+        .where(Task.id == task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (
+        review is None
+        or run is None
+        or task is None
+        or run.pr_review_id != review.id
+        or run.task_id != task.id
+        or run.status not in {"pending", "reviewing"}
+        or review.status != "reviewing"
+        or task.status != "completed"
+        or task.retry_count != retry_count
+        or task.started_at is None
+        or task.pty_background_generation is not None
+        or review.base_sha is None
+        or review.head_sha is None
+    ):
+        await db.rollback()
+        return False
     claimed = await db.execute(
         update(PRReviewerRun)
         .where(
@@ -935,7 +1075,7 @@ async def check_and_update_reviewer_run(
             f"{run.role} reviewer failed closed: {terminal_error}"
         )
         review.completed_at = datetime.utcnow()
-        await db.commit()
+        await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
         return True
     run.status = "passed" if parsed["verdict"] == "pass" else "changes_required"
@@ -961,7 +1101,7 @@ async def check_and_update_reviewer_run(
         review.action_taken = "error"
         review.review_summary = "A required reviewer failed closed"
         review.completed_at = datetime.utcnow()
-        await db.commit()
+        await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
         return True
     if not all(item.status in {"passed", "changes_required"} for item in runs):
@@ -975,7 +1115,7 @@ async def check_and_update_reviewer_run(
         review.action_taken = "error"
         review.review_summary = "Reviewer panel findings exceed the publication limit"
         review.completed_at = datetime.utcnow()
-        await db.commit()
+        await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
         return True
     blockers = any(item.severity in BLOCKING_SEVERITIES and item.status == "open" for item in findings)
@@ -986,7 +1126,44 @@ async def check_and_update_reviewer_run(
         review.action_taken = "error"
         review.review_summary = "Panel publication policy is invalid"
         review.completed_at = datetime.utcnow()
-        await db.commit()
+        await _commit_review_error(db, review)
+        return True
+    try:
+        from backend.services.delivery_pr_policy import (
+            DeliveryPRPolicyError,
+            frozen_delivery_pr_policy,
+        )
+
+        delivery_policy = await frozen_delivery_pr_policy(
+            db,
+            review,
+            monitor_run_id=review.monitor_run_id,
+        )
+    except DeliveryPRPolicyError as exc:
+        review.status = "error"
+        review.action_taken = "error"
+        review.review_summary = f"Delivery publication policy is invalid: {exc}"
+        review.completed_at = datetime.utcnow()
+        await _commit_review_error(db, review)
+        await pr_review_service._broadcast_review_update(
+            review.id,
+            "error",
+            "error",
+        )
+        return True
+    if delivery_policy is not None and frozen_auto_merge is not False:
+        review.status = "error"
+        review.action_taken = "error"
+        review.review_summary = (
+            "Delivery-owned reviews cannot publish an auto-merge action"
+        )
+        review.completed_at = datetime.utcnow()
+        await _commit_review_error(db, review)
+        await pr_review_service._broadcast_review_update(
+            review.id,
+            "error",
+            "error",
+        )
         return True
     action = "review_comments" if blockers else ("approved_merged" if frozen_auto_merge else "lgtm_comment")
     try:
@@ -999,7 +1176,7 @@ async def check_and_update_reviewer_run(
             f"{str(exc)[:500]}"
         )
         review.completed_at = datetime.utcnow()
-        await db.commit()
+        await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(
             review.id,
             "error",
@@ -1033,26 +1210,103 @@ async def fail_reviewer_run(
     task_id: int,
     error: str,
 ) -> int | None:
-    run = await db.get(PRReviewerRun, reviewer_run_id, populate_existing=True)
-    if run is None or run.task_id != task_id or run.status not in {"pending", "reviewing"}:
+    review_id = await db.scalar(
+        select(PRReviewerRun.pr_review_id).where(
+            PRReviewerRun.id == reviewer_run_id,
+            PRReviewerRun.task_id == task_id,
+        )
+    )
+    if review_id is None:
         return None
-    review = await db.get(PRReview, run.pr_review_id, populate_existing=True)
+    review = (
+        await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    run = (
+        await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.id == reviewer_run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    task = await db.get(Task, task_id, populate_existing=True)
+    if (
+        review is None
+        or run is None
+        or task is None
+        or run.pr_review_id != review.id
+        or run.task_id != task_id
+        or run.status not in {"pending", "reviewing"}
+        or review.status not in {"reviewing", "error"}
+        or (review.status == "error" and review.action_taken != "error")
+    ):
+        await db.rollback()
+        return None
+    if not await _guard_exact_terminal_task(
+        db,
+        task,
+        statuses={"completed", "failed", "cancelled", "conflict"},
+    ):
+        await db.rollback()
+        return None
+    review = (
+        await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    run = (
+        await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.id == reviewer_run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    task = await db.get(Task, task_id, populate_existing=True)
+    if (
+        review is None
+        or run is None
+        or task is None
+        or run.pr_review_id != review.id
+        or run.task_id != task.id
+        or run.status not in {"pending", "reviewing"}
+        or review.status not in {"reviewing", "error"}
+        or (review.status == "error" and review.action_taken != "error")
+        or task.status not in {"completed", "failed", "cancelled", "conflict"}
+        or task.pty_background_generation is not None
+    ):
+        await db.rollback()
+        return None
     run.status = "error"
     run.error_message = error[:1000]
     run.completed_at = datetime.utcnow()
-    if review is not None and review.status == "reviewing":
+    if review.status == "reviewing":
         review.status = "error"
         review.action_taken = "error"
         review.review_summary = f"{run.role} task failed: {error[:500]}"
         review.completed_at = datetime.utcnow()
-    await db.commit()
-    return review.id if review is not None else None
+        await _commit_review_error(db, review)
+    else:
+        # Another required role already terminalized the parent Review. Keep
+        # this exact ReviewerRun's failure durable without incrementing the
+        # Monitor generation a second time.
+        await db.commit()
+    return review.id
 
 
 async def recover_panel_reviews(db_factory) -> int:
     """Recover terminal role Tasks that completed across a Manager restart."""
 
     from backend.services.pr_review_service import pr_review_action_lock
+    from backend.services.worker_proxy import get_task_operation_lock
 
     async with db_factory() as db:
         rows = list((await db.execute(
@@ -1076,25 +1330,31 @@ async def recover_panel_reviews(db_factory) -> int:
         )).all())
     recovered = 0
     for run_id, review_id, task_id, status, retry_count, worker_id in rows:
-        async with pr_review_action_lock(review_id):
-            async with db_factory() as db:
-                if status == "completed":
-                    processed = await check_and_update_reviewer_run(
-                        db,
-                        reviewer_run_id=run_id,
-                        task_id=task_id,
-                        retry_count=retry_count,
-                        db_factory=db_factory,
-                        defer_missing_terminal=worker_id is not None,
-                    )
-                    if not processed:
-                        continue
-                else:
-                    await fail_reviewer_run(
-                        db,
-                        reviewer_run_id=run_id,
-                        task_id=task_id,
-                        error=f"Reviewer task ended with status={status}",
-                    )
-                recovered += 1
+        # Match the online Dispatcher order: Task operation -> Review action.
+        # The service callbacks themselves do not reacquire this non-reentrant
+        # lock because their online callers already hold it.
+        async with get_task_operation_lock(task_id):
+            async with pr_review_action_lock(review_id):
+                async with db_factory() as db:
+                    if status == "completed":
+                        processed = await check_and_update_reviewer_run(
+                            db,
+                            reviewer_run_id=run_id,
+                            task_id=task_id,
+                            retry_count=retry_count,
+                            db_factory=db_factory,
+                            defer_missing_terminal=worker_id is not None,
+                        )
+                        if not processed:
+                            continue
+                    else:
+                        changed_review_id = await fail_reviewer_run(
+                            db,
+                            reviewer_run_id=run_id,
+                            task_id=task_id,
+                            error=f"Reviewer task ended with status={status}",
+                        )
+                        if changed_review_id is None:
+                            continue
+                    recovered += 1
     return recovered

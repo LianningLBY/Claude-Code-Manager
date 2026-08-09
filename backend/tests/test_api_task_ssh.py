@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519
 from sqlalchemy import select
@@ -15,6 +16,17 @@ from backend.services.task_ssh_access import (
     prepare_task_ssh_grants,
 )
 from backend.models.task import Task
+from backend.config import settings
+
+
+@pytest.fixture(autouse=True)
+def _managed_ssh_auth(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "ccm-managed-ssh-test-token")
+
+
+@pytest_asyncio.fixture
+async def client(authenticated_client):
+    yield authenticated_client
 
 
 def _private_key_file(tmp_path: Path) -> Path:
@@ -127,6 +139,7 @@ async def test_profile_policy_change_invalidates_existing_grant(client, tmp_path
     assert created.status_code == 201, created.text
 
     changed = await client.put(f"/api/ssh-profiles/{profile_id}", json={
+        "revision": 1,
         "task_access_enabled": False,
         "task_capabilities": [],
     })
@@ -254,7 +267,7 @@ async def test_task_ssh_execute_fails_closed_after_profile_revision_change(
 
     changed = await client.put(
         f"/api/ssh-profiles/{profile_id}",
-        json={"username": "release"},
+        json={"revision": 1, "username": "release"},
     )
     assert changed.status_code == 200
     assert changed.json()["revision"] == 2

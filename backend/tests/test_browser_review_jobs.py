@@ -413,6 +413,43 @@ async def test_reserve_preserves_incomplete_archive_and_returns_quota_error(
     assert first_dir.exists()
 
 
+@pytest.mark.asyncio
+async def test_exact_full_store_reclaims_before_next_job_admission(tmp_path):
+    store = ArtifactStore(
+        tmp_path / "exact-full-artifacts",
+        max_file_bytes=16,
+        max_run_bytes=16,
+        max_task_bytes=16,
+        max_total_bytes=16,
+    )
+    terminal_dir = store.create_job_dir("a" * 32)
+    store.write_job_bytes(terminal_dir, "report.md", b"x" * 16)
+    calls: list[int] = []
+
+    async def reclaim(required_free_bytes: int) -> int:
+        calls.append(required_free_bytes)
+        return store.cleanup_job_dirs(
+            required_free_bytes=required_free_bytes,
+        )
+
+    manager = BrowserReviewJobManager(
+        artifact_store=store,
+        admission_reclaimer=reclaim,
+    )
+    job = await manager.prepare_agent(
+        BrowserReviewOptions(url="https://example.com"),
+        provider="codex",
+        codex_service_tier="default",
+    )
+
+    assert calls == [1]
+    assert not terminal_dir.exists()
+    assert job.options.output_dir is not None
+    assert job.options.output_dir.exists()
+    await manager.fail_start(job.id, RuntimeError("done"))
+    await manager.shutdown()
+
+
 def test_trace_tool_arguments_redact_typed_text_and_hide_report_body():
     typed = _safe_tool_arguments(
         "browser_type_text",

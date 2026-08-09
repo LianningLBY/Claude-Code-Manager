@@ -2422,10 +2422,15 @@ class TestHarnessService:
             owner_user_id=owner_user_id,
         )
 
-    async def cleanup_evidence(self) -> int:
-        """Apply TTL and task/global quotas without touching active runs."""
+    async def cleanup_evidence(self, *, required_free_bytes: int = 0) -> int:
+        """Apply TTL/quotas and reserve capacity without touching live evidence."""
 
         cutoff = datetime.utcnow() - timedelta(days=self.artifact_store.retention_days)
+        required = max(0, int(required_free_bytes))
+        retained_global_limit = max(
+            0,
+            self.artifact_store.max_total_bytes - required,
+        )
         removed_keys: list[str] = []
         kept_global = 0
         kept_by_task: dict[int, int] = {}
@@ -2456,7 +2461,7 @@ class TestHarnessService:
                     )
                     exceeds_global = (
                         kept_global + evidence.byte_size
-                        > self.artifact_store.max_total_bytes
+                        > retained_global_limit
                     )
                     if not active and (expired or exceeds_task or exceeds_global):
                         removed_keys.append(evidence.storage_path)
@@ -2503,7 +2508,10 @@ class TestHarnessService:
             clean_job_dirs = False
             active_job_ids = set(protected_staging_job_ids)
         if clean_job_dirs:
-            self.artifact_store.cleanup_job_dirs(active_job_ids=active_job_ids)
+            self.artifact_store.cleanup_job_dirs(
+                active_job_ids=active_job_ids,
+                required_free_bytes=required,
+            )
         return len(removed_keys)
 
     async def _retention_loop(self) -> None:

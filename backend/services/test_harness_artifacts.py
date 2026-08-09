@@ -474,11 +474,13 @@ class TestHarnessArtifactStore:
         *,
         active_job_ids: set[str] | None = None,
         now: datetime | None = None,
+        required_free_bytes: int = 0,
     ) -> int:
         with self._root_lock:
             return self._cleanup_job_dirs_locked(
                 active_job_ids=active_job_ids,
                 now=now,
+                required_free_bytes=required_free_bytes,
             )
 
     def _cleanup_job_dirs_locked(
@@ -486,9 +488,12 @@ class TestHarnessArtifactStore:
         *,
         active_job_ids: set[str] | None = None,
         now: datetime | None = None,
+        required_free_bytes: int = 0,
     ) -> int:
         self.ensure_root()
         active = active_job_ids or set()
+        required = max(0, int(required_free_bytes))
+        target_total = max(0, self.max_total_bytes - required)
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=self.retention_days)
         removed = 0
         candidates: list[tuple[datetime, str]] = []
@@ -506,9 +511,15 @@ class TestHarnessArtifactStore:
 
         # Retention and quota admission are deterministic: reclaim the oldest
         # eligible staging directory first.  Equality is full because
-        # ``create_job_dir`` rejects total_bytes >= max_total_bytes.
+        # ``create_job_dir`` rejects total_bytes >= max_total_bytes. An
+        # admission caller can additionally reserve the first write byte.
         for modified, candidate_name in sorted(candidates):
-            at_capacity = self.total_bytes() >= self.max_total_bytes
+            current_total = self.total_bytes()
+            at_capacity = (
+                current_total >= self.max_total_bytes
+                if required == 0
+                else current_total > target_total
+            )
             if modified > cutoff and not at_capacity:
                 continue
             if self._remove_job_dir_locked(candidate_name):

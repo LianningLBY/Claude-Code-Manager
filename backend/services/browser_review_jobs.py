@@ -47,6 +47,7 @@ _TASK_TERMINAL_STATUSES = frozenset(
 _MAX_SCREENSHOT_BYTES = 15 * 1024 * 1024
 BrowserReviewRunner = Callable[..., Awaitable[BrowserReviewResult]]
 BrowserReviewTaskReader = Callable[[int], Awaitable[dict[str, Any] | None]]
+BrowserReviewAdmissionReclaimer = Callable[[int], Awaitable[int | None]]
 
 
 class BrowserReviewBusyError(RuntimeError):
@@ -167,6 +168,7 @@ class BrowserReviewJobManager:
         poll_interval: float = 0.5,
         artifact_store: TestHarnessArtifactStore | None = None,
         history_limit: int | None = None,
+        admission_reclaimer: BrowserReviewAdmissionReclaimer | None = None,
     ) -> None:
         self._runner = runner
         self._task_reader = task_reader or _read_task_snapshot
@@ -182,6 +184,7 @@ class BrowserReviewJobManager:
         )
         self._jobs: dict[str, BrowserReviewJob] = {}
         self._lock = asyncio.Lock()
+        self._admission_reclaimer = admission_reclaimer
 
     async def start(
         self,
@@ -475,6 +478,19 @@ class BrowserReviewJobManager:
         harness_run_id: str | None = None,
     ) -> BrowserReviewJob:
         options.validate()
+        if self._artifact_store.total_bytes() >= self._artifact_store.max_total_bytes:
+            if self._admission_reclaimer is not None:
+                await self._admission_reclaimer(1)
+            else:
+                # Runtime import avoids a module cycle. The identity check is
+                # important for CLI/tests that intentionally supply another
+                # artifact store and therefore have no durable Harness DB.
+                from backend.services.test_harness import test_harness_service
+
+                if test_harness_service.artifact_store is self._artifact_store:
+                    await test_harness_service.cleanup_evidence(
+                        required_free_bytes=1
+                    )
         async with self._lock:
             self._prune_terminal_locked()
             if any(

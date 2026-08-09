@@ -304,6 +304,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (mode !== 'delivery_loop') return;
     clearFileUploads();
     setSelectedSecretIds([]);
+    setSelectedSSHGrants([]);
     setCloneFromTaskId('');
     setPriority(0);
     setThinkingBudget('');
@@ -576,9 +577,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       }));
 
       if (mode === 'delivery_loop') {
-        if (uploadedPaths.length > 0 || selectedSecretIds.length > 0) {
+        if (
+          uploadedPaths.length > 0
+          || selectedSecretIds.length > 0
+          || selectedSSHGrants.length > 0
+        ) {
           throw new Error(
-            'Delivery Loop V1 does not accept Task attachments or Task secrets. '
+            'Delivery Loop V1 does not accept Task attachments, secrets, or SSH grants. '
             + 'Put durable requirements in the prompt or repository.',
           );
         }

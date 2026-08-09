@@ -45,6 +45,7 @@ from backend.services.codex_app_server import (
 from backend.services.codex_tier_proxy import CodexTierProxyRoute
 from backend.services.mcp_config import (
     McpServerSpec,
+    build_browser_review_mcp_server_specs,
     build_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     build_task_ssh_mcp_server_specs,
@@ -61,12 +62,21 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.test_harness import (
+    TestHarnessChildBinding as HarnessChildBindingModel,
+    TestHarnessRun as HarnessRunModel,
+)
 from backend.models.ssh_profile import SSHProfile
 from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.models.worktree import Worktree
 from backend.services import worker_task_termination as termination
 from backend.services.delivery_service import value_hash
+from backend.services.task_queue import TaskQueue
+from backend.services.test_harness_children import (
+    TestHarnessChildService as HarnessChildService,
+)
+from backend.services.test_harness import TestHarnessService
 
 
 @pytest.fixture(autouse=True)
@@ -216,6 +226,84 @@ def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
         claude_config_dir=str(root / "claude"),
         codex_home=str(root / "codex"),
     )
+
+
+async def _isolated_browser_launch_scope(
+    db_factory,
+    *,
+    instance_name: str,
+    job_id: str,
+    provider: str,
+) -> tuple[Instance, Task]:
+    """Create, bind, activate and claim one immutable Browser child."""
+
+    run_id = f"{job_id}-run"[:32].ljust(32, "0")
+    model = "gpt-5.6-sol" if provider == "codex" else "claude-opus-4-6"
+    async with db_factory() as db:
+        instance = Instance(name=instance_name)
+        owner = Task(
+            title=f"{instance_name} owner",
+            description="Own the isolated Browser review",
+            status="completed",
+            provider=provider,
+            model=model,
+            effort_level="high",
+        )
+        db.add_all([instance, owner])
+        await db.flush()
+        db.add(
+            HarnessRunModel(
+                id=run_id,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                browser_review_job_id=job_id,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Review the page"},
+                runtime_config={"provider": provider},
+                request_fingerprint="a" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="preparing",
+            )
+        )
+        await db.commit()
+        instance_id = instance.id
+        owner_id = owner.id
+
+    child_service = HarnessChildService(db_factory=db_factory)
+    child, binding = await child_service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id=job_id,
+        harness_run_id=run_id,
+        child_values={
+            "title": "Isolated Browser Agent",
+            "description": "Review one frozen target",
+            "priority": 0,
+            "max_retries": 0,
+            "mode": "auto",
+            "provider": provider,
+            "model": model,
+            "codex_service_tier": "default",
+            "effort_level": "high",
+            "target_repo": None,
+            "target_branch": None,
+            "project_id": None,
+            "enabled_skills": {"browser-review": job_id},
+            "archived": True,
+        },
+    )
+    await child_service.activate(binding.id)
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue(instance_id=instance_id)
+        assert claimed is not None
+        assert claimed.id == child.id
+        instance = await db.get(Instance, instance_id)
+        assert instance is not None
+        return instance, claimed
 
 
 async def _delivery_launch_scope(db_factory, tmp_path):
@@ -806,6 +894,48 @@ async def test_ordinary_task_launch_remains_compatible_without_auth_token(
         assert "CCM_INTERNAL_SERVICE_TOKEN" not in config["mcpServers"][
             "ccm_skills"
         ].get("env", {})
+
+
+@pytest.mark.asyncio
+async def test_ordinary_codex_task_ignores_whitespace_review_auth_when_main_mcp_disabled(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """Blank AUTH_TOKEN must not turn optional review MCPs into a hard gate."""
+
+    monkeypatch.setattr(settings, "auth_token", " \t\n ")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    instance_id, task_id = await _create_project_agent_launch_task(
+        db_factory,
+        tmp_path,
+        provider="codex",
+    )
+    manager = InstanceManager(db_factory, MagicMock())
+    manager._persist_actual_turn_transport = AsyncMock(return_value=True)
+
+    async def launch_codex(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        return 19_172
+
+    manager._launch_codex_app_server = AsyncMock(side_effect=launch_codex)
+    with patch(
+        "backend.services.container_manager.is_shared_project",
+        new=AsyncMock(return_value=False),
+    ):
+        pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="ordinary Task with blank review auth",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-blank-review-auth-home"),
+        )
+
+    assert pid == 19_172
+    kwargs = manager._launch_codex_app_server.await_args.kwargs
+    assert kwargs["mcp_specs"] == ()
 
 
 @pytest.mark.asyncio
@@ -2057,6 +2187,66 @@ def _make_mock_process(pid=12345, returncode=0):
     return proc
 
 
+async def _consume_tracked_output(
+    manager,
+    db_factory,
+    instance_id,
+    task_id,
+    process,
+    *,
+    chat_initiated=True,
+    provider="claude",
+    loop_iteration=None,
+):
+    """Run a direct consumer test with the exact generation launch installs."""
+
+    started_at = datetime.utcnow()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task is not None
+        assert instance is not None
+        task.instance_id = instance_id
+        task.started_at = started_at
+        instance.status = "running"
+        instance.pid = process.pid
+        instance.started_at = started_at
+        instance.current_task_id = task_id
+        await db.commit()
+        retry_count = task.retry_count
+        turn_generation = task.turn_generation
+
+    consumer = asyncio.current_task()
+    assert consumer is not None
+    record = _OutputConsumerRecord(
+        process=process,
+        task=consumer,
+        chat_initiated=chat_initiated,
+        provider=provider,
+        task_id=task_id,
+        task_retry_count=retry_count,
+        task_turn_generation=turn_generation,
+        instance_started_at=started_at,
+    )
+    manager.processes[instance_id] = process
+    manager._tasks[instance_id] = consumer
+    manager._consumer_records[instance_id] = record
+    try:
+        await manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            loop_iteration=loop_iteration,
+            chat_initiated=chat_initiated,
+            provider=provider,
+        )
+    finally:
+        if manager._consumer_records.get(instance_id) is record:
+            manager._consumer_records.pop(instance_id, None)
+        if manager._tasks.get(instance_id) is consumer:
+            manager._tasks.pop(instance_id, None)
+
+
 def _managed_ssh_profile(name: str = "launch-ssh") -> SSHProfile:
     managed_root = Path(settings.ssh_key_storage_dir) / "managed"
     managed_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -2292,13 +2482,15 @@ async def test_codex_task_pre_turn_failure_never_falls_back_to_exec(
     )
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     manager._launch_codex_app_server = AsyncMock(
-        side_effect=RuntimeError("protocol unavailable before turn/start")
+        side_effect=CodexRequiredMcpPreTurnError(
+            "required MCP was not admitted before turn/start"
+        )
     )
     manager._spawn_managed_direct_process = AsyncMock()
 
     with pytest.raises(
         CodexRequiredMcpError,
-        match="required ccm_ssh could be guaranteed",
+        match="Task credential isolation could not be confirmed",
     ):
         await manager.launch(
             instance_id=instance_id,
@@ -3949,8 +4141,10 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     try:
         config = json.loads(config_path.read_text())
         assert set(config["mcpServers"]) == {
+            "ccm_frontend_review",
             "ccm_skills",
             "ccm_ssh",
+            "ccm_workspace_review",
         }
         ssh_args = config["mcpServers"]["ccm_ssh"]["args"]
         assert ssh_args[0] == "-I"
@@ -4347,7 +4541,11 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
 
     assert pid == 45_678
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
-    assert [spec.name for spec in specs] == ["ccm_ssh"]
+    assert [spec.name for spec in specs] == [
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+        "ccm_ssh",
+    ]
     ssh_spec = next(spec for spec in specs if spec.name == "ccm_ssh")
     assert ssh_spec.required is True
     assert ssh_spec.enabled_tools == (
@@ -5042,6 +5240,530 @@ async def test_codex_task_requires_isolated_app_server_when_disabled(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+@pytest.mark.parametrize("blank_auth", ["", " \t\n "])
+async def test_browser_review_child_requires_scoped_auth_before_runtime_materialization(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+    blank_auth,
+):
+    inst, task = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name=f"{provider}-browser-review-no-auth",
+        job_id=f"job-no-auth-{provider}",
+        provider=provider,
+    )
+    monkeypatch.setattr(settings, "auth_token", blank_auth)
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with (
+        patch(
+            "backend.services.mcp_config.materialize_trusted_python_asset",
+        ) as materialize,
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as spawn,
+    ):
+        with pytest.raises(
+            LaunchSupersededError,
+            match="requires AUTH_TOKEN-backed scoped authentication",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must fail before Browser runtime materialization",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider=provider,
+                model=task.model,
+                effort_level=task.effort_level,
+                enabled_skills=task.enabled_skills,
+                config_dir=(
+                    str(tmp_path / "codex-browser-no-auth-home")
+                    if provider == "codex"
+                    else None
+                ),
+            )
+
+    materialize.assert_not_called()
+    spawn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_browser_review_requires_mcp_only_app_server(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    inst, task = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name="codex-browser-review-exec",
+        job_id="job-abc",
+        provider="codex",
+    )
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(
+            CodexRequiredMcpError,
+            match="app-server read-only sandbox",
+        ):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="review the browser",
+                task_id=task.id,
+                cwd="/tmp",
+                provider="codex",
+                model=task.model,
+                effort_level=task.effort_level,
+                enabled_skills=task.enabled_skills,
+                config_dir=str(tmp_path / "codex-browser-review-home"),
+            )
+
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_browser_review_uses_proven_mcp_only_profile(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    inst, task = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name="codex-browser-review-app-server",
+        job_id="job-bound",
+        provider="codex",
+    )
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+
+    async def launch_after_final_admission(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        return 4321
+
+    with patch.object(
+        im,
+        "_launch_codex_app_server",
+        new_callable=AsyncMock,
+        side_effect=launch_after_final_admission,
+    ) as launch_app_server:
+        pid = await im.launch(
+            instance_id=inst.id,
+            prompt="use only the bound browser tools",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="codex",
+            model=task.model,
+            effort_level=task.effort_level,
+            enabled_skills=task.enabled_skills,
+            config_dir=str(tmp_path / "codex-browser-mcp-only-home"),
+        )
+
+    assert pid == 4321
+    kwargs = launch_app_server.await_args.kwargs
+    assert kwargs["mcp_only"] is True
+    assert kwargs["tools_disabled"] is False
+    assert kwargs["sandbox_mode"] == "read-only"
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["skill_context"] == ""
+    assert [spec.name for spec in kwargs["mcp_specs"]] == ["ccm_browser_review"]
+
+
+@pytest.mark.asyncio
+async def test_browser_final_admission_preserves_callback_lock_order(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """Final admission follows owner -> Run -> binding -> child -> Instance."""
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    inst, task = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name="browser-final-lock-order",
+        job_id="job-final-lock-order",
+        provider="codex",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    async def launch_after_final_admission(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        return 43_210
+
+    manager._launch_codex_app_server = AsyncMock(
+        side_effect=launch_after_final_admission
+    )
+    original_execute = AsyncSession.execute
+    sql_events: list[str] = []
+
+    async def record_sql(session, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        table_name = getattr(table, "name", None)
+        if table_name is not None:
+            sql_events.append(f"update:{table_name}")
+        else:
+            get_final_froms = getattr(statement, "get_final_froms", None)
+            if callable(get_final_froms):
+                names = [
+                    getattr(candidate, "name", None)
+                    for candidate in get_final_froms()
+                ]
+                names = [name for name in names if name]
+                if len(names) == 1:
+                    sql_events.append(f"select:{names[0]}")
+        return await original_execute(session, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", new=record_sql):
+        assert await asyncio.wait_for(
+            manager.launch(
+                instance_id=inst.id,
+                prompt="cross only after ordered durable proof",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider="codex",
+                model=task.model,
+                effort_level=task.effort_level,
+                codex_service_tier=task.codex_service_tier,
+                enabled_skills=task.enabled_skills,
+                config_dir=str(tmp_path / "codex-final-lock-order"),
+            ),
+            timeout=5,
+        ) == 43_210
+
+    expected = [
+        "update:tasks",
+        "select:test_harness_runs",
+        "update:test_harness_child_bindings",
+        "update:tasks",
+        "select:instances",
+    ]
+    cursor = 0
+    for event in sql_events:
+        if cursor < len(expected) and event == expected[cursor]:
+            cursor += 1
+    assert cursor == len(expected), sql_events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "transport"),
+    [
+        ("claude", "direct"),
+        ("claude", "pty"),
+        ("codex", "app_server"),
+    ],
+)
+@pytest.mark.parametrize(
+    "stop_intent",
+    [
+        "binding_stopping",
+        "run_cancelling",
+        "binding_digest",
+        "task_skill_drift",
+        "owner_gate",
+    ],
+)
+async def test_browser_stop_intent_wins_final_provider_admission(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+    transport,
+    stop_intent,
+):
+    """A durable stop committed after preflight must veto every provider."""
+
+    from backend.services.test_harness_children import (
+        browser_binding_owner_identity,
+    )
+    from backend.services.test_harness_owner_fence import (
+        install_test_harness_owner_terminal_gate,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "use_pty_mode", transport == "pty")
+    job_id = f"job-final-{provider}-{transport}-{stop_intent}"
+    inst, task = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name=f"browser-final-{provider}-{transport}-{stop_intent}",
+        job_id=job_id,
+        provider=provider,
+    )
+
+    boundary_calls = 0
+
+    async def publish_stop_after_preflight(_project_id, _db_factory):
+        nonlocal boundary_calls
+        boundary_calls += 1
+        if boundary_calls != 2:
+            return
+        async with db_factory() as db:
+            binding = await db.scalar(
+                select(HarnessChildBindingModel).where(
+                    HarnessChildBindingModel.child_task_id == task.id
+                )
+            )
+            assert binding is not None
+            if stop_intent == "binding_stopping":
+                binding.state = "stopping"
+                binding.stop_requested_at = datetime.utcnow()
+            elif stop_intent == "run_cancelling":
+                run = await db.get(HarnessRunModel, binding.harness_run_id)
+                assert run is not None
+                run.status = "cancelling"
+            elif stop_intent == "binding_digest":
+                binding.launch_config_digest = "0" * 64
+            elif stop_intent == "task_skill_drift":
+                child = await db.get(Task, task.id)
+                assert child is not None
+                child.enabled_skills = {"browser-review": "wrong-job"}
+            else:
+                await install_test_harness_owner_terminal_gate(
+                    db,
+                    browser_binding_owner_identity(binding),
+                    reason="race test terminal gate",
+                )
+            await db.commit()
+
+    monkeypatch.setattr(
+        "backend.services.instance_manager."
+        "_require_unshared_project_agent_launch",
+        publish_stop_after_preflight,
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    provider_effects: list[str] = []
+    process = _make_mock_process(pid=54_321)
+
+    async def direct_spawn(*_args, **_kwargs):
+        provider_effects.append("direct_spawn")
+        return process
+
+    async def pty_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        provider_effects.append("pty_send_prompt")
+        return process.pid
+
+    async def app_server_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        provider_effects.append("app_server_turn_start")
+        return process.pid
+
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=direct_spawn
+    )
+    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+    manager._launch_pty = AsyncMock(side_effect=pty_launch)
+    manager._launch_codex_app_server = AsyncMock(
+        side_effect=app_server_launch
+    )
+    if transport == "pty":
+        manager._pty_enabled = True
+        manager._pty_backend = MagicMock()
+    owner_callback = AsyncMock()
+
+    with pytest.raises(
+        LaunchSupersededError,
+        match=(
+            {
+                "binding_stopping": "binding stopped or changed",
+                "run_cancelling": "Harness run stopped or changed",
+                "binding_digest": "binding stopped or changed",
+                "task_skill_drift": "lost its exact MCP-only skill binding",
+                "owner_gate": "already terminalizing",
+            }[stop_intent]
+        ),
+    ):
+        await asyncio.wait_for(
+            manager.launch(
+                instance_id=inst.id,
+                prompt="must not cross the provider boundary",
+                task_id=task.id,
+                cwd=str(tmp_path),
+                provider=provider,
+                model=task.model,
+                effort_level=task.effort_level,
+                codex_service_tier=task.codex_service_tier,
+                enabled_skills=task.enabled_skills,
+                config_dir=(
+                    str(tmp_path / f"codex-final-{stop_intent}")
+                    if provider == "codex"
+                    else None
+                ),
+                on_launch_admitted=owner_callback,
+            ),
+            timeout=5,
+        )
+
+    assert boundary_calls == 2
+    assert provider_effects == []
+    owner_callback.assert_not_awaited()
+    manager._spawn_managed_direct_process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("drift_target", "drift_value"),
+    [
+        ("provider", "claude"),
+        ("model", "gpt-5.6-luna"),
+        ("effort_level", "low"),
+        ("codex_service_tier", "priority"),
+        ("timeout_hours", 2.0),
+        ("max_retries", 1),
+        ("capability_policy", {"plan": {"max_invocations": 1}}),
+        ("worker_id", 51),
+        ("shared_from_id", 52),
+        ("tags", {"pr-review": True}),
+        ("session_id", "attacker-controlled-resume"),
+        ("last_cwd", "/tmp/attacker-controlled-resume"),
+        ("enabled_skills", {"browser-review": "wrong-job"}),
+        ("metadata_", {"isolated_browser_agent": False}),
+        ("launch_config_digest", "0" * 64),
+    ],
+)
+async def test_browser_launch_rejects_post_claim_binding_drift(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    drift_target,
+    drift_value,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    inst, claimed = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name=f"browser-drift-{drift_target}",
+        job_id="job-launch-drift",
+        provider="codex",
+    )
+    async with db_factory() as db:
+        binding = await db.scalar(
+            select(HarnessChildBindingModel).where(
+                HarnessChildBindingModel.child_task_id == claimed.id
+            )
+        )
+        assert binding is not None
+        if drift_target == "launch_config_digest":
+            binding.launch_config_digest = drift_value
+        else:
+            durable_task = await db.get(Task, claimed.id)
+            setattr(durable_task, drift_target, drift_value)
+        await db.commit()
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch.object(
+        im,
+        "_launch_codex_app_server",
+        new_callable=AsyncMock,
+    ) as launch_app_server:
+        with pytest.raises(LaunchSupersededError):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must fail before crossing the provider boundary",
+                task_id=claimed.id,
+                cwd=str(tmp_path),
+                provider=claimed.provider,
+                model=claimed.model,
+                effort_level=claimed.effort_level,
+                codex_service_tier=claimed.codex_service_tier,
+                enabled_skills=claimed.enabled_skills,
+                config_dir=str(tmp_path / "codex-browser-drift-home"),
+            )
+
+    launch_app_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_rejects_explicit_resume_even_without_task_drift(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    inst, claimed = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name="browser-explicit-resume",
+        job_id="job-explicit-resume",
+        provider="codex",
+    )
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch.object(
+        im,
+        "_launch_codex_app_server",
+        new_callable=AsyncMock,
+    ) as launch_app_server:
+        with pytest.raises(LaunchSupersededError, match="never resume"):
+            await im.launch(
+                instance_id=inst.id,
+                prompt="must not cross the provider boundary",
+                task_id=claimed.id,
+                cwd=str(tmp_path),
+                provider=claimed.provider,
+                model=claimed.model,
+                effort_level=claimed.effort_level,
+                codex_service_tier=claimed.codex_service_tier,
+                enabled_skills=claimed.enabled_skills,
+                config_dir=str(tmp_path / "codex-browser-resume-home"),
+                resume_session_id="forged-resume-session",
+            )
+
+    launch_app_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claude_browser_review_disables_builtins_but_keeps_bound_mcp(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "use_pty_mode", False)
+    inst, task = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name="claude-browser-review-tools",
+        job_id="job-claude",
+        provider="claude",
+    )
+
+    process = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.task_message_enqueuer = AsyncMock()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=process,
+    ) as spawn:
+        await im.launch(
+            instance_id=inst.id,
+            prompt="use only browser evidence tools",
+            task_id=task.id,
+            cwd=str(tmp_path),
+            provider="claude",
+            model=task.model,
+            effort_level=task.effort_level,
+            enabled_skills=task.enabled_skills,
+        )
+
+    argv = list(spawn.await_args.args)
+    tools_index = argv.index("--tools")
+    assert argv[tools_index + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" in argv
+    assert "--setting-sources" in argv
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
 async def test_invalid_required_exec_mcp_fails_before_subprocess_spawn(
     db_factory, monkeypatch, tmp_path,
 ):
@@ -5233,10 +5955,19 @@ async def test_rollout_enabled_routes_fresh_and_resume_with_task_scoped_mcp(
     launch_kwargs = im._launch_codex_app_server.await_args.kwargs
     assert launch_kwargs["resume_session_id"] == resume_session_id
     specs = launch_kwargs["mcp_specs"]
-    assert len(specs) == 1
-    assert specs[0].required is True
-    assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
+    assert all(spec.required is True for spec in specs)
+    assert all(
+        spec.args[spec.args.index("--task-id") + 1] == str(task.id)
+        for spec in specs
+    )
     assert "ccm_command_help" in specs[0].enabled_tools
+    assert "test_git_target" in specs[2].enabled_tools
+    assert "compare_test_runs" in specs[2].enabled_tools
 
 
 @pytest.mark.asyncio
@@ -5961,7 +6692,11 @@ async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
 
     exec_mock.assert_not_awaited()
     specs = im._launch_codex_app_server.await_args.kwargs["mcp_specs"]
-    assert len(specs) == 1
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
     assert specs[0].args[specs[0].args.index("--task-id") + 1] == str(task.id)
     assert "ccm_command_help" in specs[0].enabled_tools
     assert "Codex transport fail-closed" in caplog.text
@@ -6070,12 +6805,16 @@ async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
         assert "ccm_command_help" in specs[0].enabled_tools
         assert "create_sub_agent" in specs[0].enabled_tools
     else:
-        assert set(specs[0].enabled_tools) == {
+        controller_spec = next(
+            spec for spec in specs if "create_sub_agent" in spec.enabled_tools
+        )
+        assert set(controller_spec.enabled_tools) == {
             "ccm_read_skill",
             "create_sub_agent",
             "check_sub_agents",
             "stop_sub_agent",
         }
+        assert any(spec.name == "ccm_frontend_review" for spec in specs)
 
 
 @pytest.mark.asyncio
@@ -6429,7 +7168,11 @@ async def test_launch_codex_app_server_uses_passed_task_scoped_specs(
 
     assert pid == 7655
     specs = registry.start_turn.await_args.kwargs["mcp_specs"]
-    assert len(specs) == 1
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
     spec = specs[0]
     assert spec.name == "ccm_skills"
     assert spec.required is True
@@ -7804,7 +8547,9 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
     im.get_recent_log_contents = AsyncMock(return_value=[])
 
     with patch("backend.main.dispatcher", dispatcher):
-        await im._consume_output(
+        await _consume_tracked_output(
+            im,
+            db_factory,
             inst.id,
             task.id,
             process,
@@ -11278,7 +12023,14 @@ async def test_consume_output_chat_initiated_restores_task_status(db_factory):
     im = InstanceManager(db_factory, broadcaster)
     im.processes[inst_id] = mock_proc
 
-    await im._consume_output(inst_id, task_id, mock_proc, chat_initiated=True)
+    await _consume_tracked_output(
+        im,
+        db_factory,
+        inst_id,
+        task_id,
+        mock_proc,
+        chat_initiated=True,
+    )
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)
@@ -11321,7 +12073,9 @@ async def test_native_exit_resume_carries_precommit_queue_fence(db_factory):
     dispatcher.enqueue_message = AsyncMock(return_value=True)
 
     with patch("backend.main.dispatcher", dispatcher):
-        await manager._consume_output(
+        await _consume_tracked_output(
+            manager,
+            db_factory,
             instance_id,
             task_id,
             process,
@@ -11374,7 +12128,9 @@ async def test_admitted_exact_source_empty_reply_is_never_reenqueued(
     dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
 
     with patch("backend.main.dispatcher", dispatcher):
-        await manager._consume_output(
+        await _consume_tracked_output(
+            manager,
+            db_factory,
             instance_id,
             task_id,
             process,
@@ -11415,7 +12171,9 @@ async def test_source_less_empty_reply_is_never_reenqueued(db_factory):
     dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
 
     with patch("backend.main.dispatcher", dispatcher):
-        await manager._consume_output(
+        await _consume_tracked_output(
+            manager,
+            db_factory,
             instance_id,
             task_id,
             process,
@@ -11743,7 +12501,9 @@ async def test_consume_output_chat_initiated_error_marks_failed(
     )
     im.cloudrouter_store = store
 
-    await im._consume_output(
+    await _consume_tracked_output(
+        im,
+        db_factory,
         inst_id,
         task_id,
         mock_proc,
@@ -11817,7 +12577,9 @@ async def test_consume_output_fatal_result_overrides_zero_exit(db_factory):
     im = InstanceManager(db_factory, broadcaster)
     im.processes[inst_id] = mock_proc
 
-    await im._consume_output(
+    await _consume_tracked_output(
+        im,
+        db_factory,
         inst_id,
         task_id,
         mock_proc,
@@ -11880,7 +12642,9 @@ async def test_codex_turn_failed_does_not_append_generic_process_exit(
     )
     manager.processes[inst_id] = process
 
-    await manager._consume_output(
+    await _consume_tracked_output(
+        manager,
+        db_factory,
         inst_id,
         task_id,
         process,
@@ -11986,7 +12750,9 @@ async def test_codex_error_notification_respects_will_retry(
     manager._try_proactive_pool_switch = AsyncMock(return_value=False)
     manager.processes[inst_id] = process
 
-    await manager._consume_output(
+    await _consume_tracked_output(
+        manager,
+        db_factory,
         inst_id,
         task_id,
         process,
@@ -12089,7 +12855,14 @@ async def test_consume_output_chat_initiated_interrupt_marks_completed(db_factor
     im = InstanceManager(db_factory, broadcaster)
     im.processes[inst_id] = mock_proc
 
-    await im._consume_output(inst_id, task_id, mock_proc, chat_initiated=True)
+    await _consume_tracked_output(
+        im,
+        db_factory,
+        inst_id,
+        task_id,
+        mock_proc,
+        chat_initiated=True,
+    )
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)
@@ -12212,22 +12985,47 @@ async def test_chat_terminal_publication_yields_to_postcommit_worker_receipt(
         instance_id, task_id = instance.id, task.id
 
     factory_entries = 0
+    receipt_staged = False
 
     @asynccontextmanager
     async def receipt_before_publication_factory():
-        nonlocal factory_entries
+        nonlocal factory_entries, receipt_staged
         factory_entries += 1
-        if factory_entries == 2:
-            # The first consumer transaction committed Task completed and
-            # released the reverse Instance owner. A terminal receipt can still
-            # be accepted before the old generation publishes its status/exit.
-            await persist_active_worker_receipt(db_factory, task_id)
         async with db_factory() as db:
-            yield db
+            terminal_instance_update = False
+
+            class SessionProxy:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                async def execute(self, statement, *args, **kwargs):
+                    nonlocal terminal_instance_update
+                    if (
+                        getattr(getattr(statement, "table", None), "name", None)
+                        == "instances"
+                    ):
+                        terminal_instance_update = True
+                    return await db.execute(statement, *args, **kwargs)
+
+                async def commit(self):
+                    nonlocal receipt_staged
+                    await db.commit()
+                    if terminal_instance_update and not receipt_staged:
+                        # The exact terminal transaction committed Task completed
+                        # and released the reverse Instance owner. A receipt can
+                        # still win before old-generation publication.
+                        await persist_active_worker_receipt(db_factory, task_id)
+                        receipt_staged = True
+
+            yield SessionProxy()
 
     process = _make_mock_process(pid=pid, returncode=0)
     broadcaster = MagicMock(broadcast=AsyncMock())
-    manager = InstanceManager(receipt_before_publication_factory, broadcaster)
+    manager = InstanceManager(
+        receipt_before_publication_factory,
+        broadcaster,
+        test_harness_service=TestHarnessService(db_factory=db_factory),
+    )
     manager.processes[instance_id] = process
     consumer = asyncio.create_task(
         manager._consume_output(
@@ -12258,6 +13056,7 @@ async def test_chat_terminal_publication_yields_to_postcommit_worker_receipt(
             task_id,
         )
     assert factory_entries >= 2
+    assert receipt_staged is True
     assert receipt is not None
     assert current_task.status == "completed"
     assert current_task.retry_count == 4
@@ -12518,7 +13317,11 @@ async def test_consumer_recovery_yields_when_worker_receipt_wins_before_task_cas
 
     process = _make_mock_process(pid=pid, returncode=1)
     broadcaster = MagicMock(broadcast=AsyncMock())
-    manager = InstanceManager(receipt_before_task_cas_factory, broadcaster)
+    manager = InstanceManager(
+        receipt_before_task_cas_factory,
+        broadcaster,
+        test_harness_service=TestHarnessService(db_factory=db_factory),
+    )
     manager._consume_output_impl = AsyncMock(
         side_effect=RuntimeError("receipt race bookkeeping")
     )
@@ -12649,6 +13452,7 @@ async def test_consumer_exception_recovery_locks_task_before_instance(
     manager = InstanceManager(
         recording_factory,
         MagicMock(broadcast=AsyncMock()),
+        test_harness_service=TestHarnessService(db_factory=db_factory),
     )
     await _run_crashed_chat_consumer(
         manager,
@@ -12830,6 +13634,7 @@ async def test_consumer_exception_recovery_suppresses_stale_failed_publication(
     manager = InstanceManager(
         retry_after_recovery_commit_factory,
         broadcaster,
+        test_harness_service=TestHarnessService(db_factory=db_factory),
     )
     await _run_crashed_chat_consumer(
         manager,
@@ -13462,7 +14267,11 @@ async def test_direct_chat_terminal_transaction_locks_task_before_instance(
 
     process = _make_mock_process(pid=73_101, returncode=0)
     broadcaster = MagicMock(broadcast=AsyncMock())
-    manager = InstanceManager(recording_factory, broadcaster)
+    manager = InstanceManager(
+        recording_factory,
+        broadcaster,
+        test_harness_service=TestHarnessService(db_factory=db_factory),
+    )
     manager.processes[instance_id] = process
     consumer = asyncio.create_task(
         manager._consume_output(
@@ -13553,6 +14362,7 @@ async def test_direct_chat_consumer_suppresses_events_after_retry_claim(
     manager = InstanceManager(
         replacement_after_terminal_commit_factory,
         broadcaster,
+        test_harness_service=TestHarnessService(db_factory=db_factory),
     )
     manager.processes[instance_id] = process
     consumer = asyncio.create_task(
@@ -13719,7 +14529,14 @@ async def test_consume_output_chat_initiated_no_override_cancelled(db_factory):
     im = InstanceManager(db_factory, broadcaster)
     im.processes[inst_id] = mock_proc
 
-    await im._consume_output(inst_id, task_id, mock_proc, chat_initiated=True)
+    await _consume_tracked_output(
+        im,
+        db_factory,
+        inst_id,
+        task_id,
+        mock_proc,
+        chat_initiated=True,
+    )
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)
@@ -13945,7 +14762,9 @@ class _FakeDB:
 
     async def scalar(self, stmt):
         self.executed.append(stmt)
-        return datetime.utcnow()
+        # The launch preflight uses scalar() to discover an optional immutable
+        # Browser child binding.  Ordinary PTY fixtures have no such binding.
+        return None
 
     async def get(self, model, pk, **_kwargs):
         if model is Task:
@@ -14645,6 +15464,41 @@ async def test_stop_uses_pty_backend_for_managed_instance():
     ok = await im.stop(5)
     assert ok is True
     assert stopped == [5]
+    assert 5 not in im.processes
+
+
+@pytest.mark.asyncio
+async def test_stop_completes_pty_proxy_from_confirmed_dead_native_session():
+    """A lost on_exit callback must not strand a proxy after native reap."""
+
+    from claude_pty.adapters.ccm import _PTYProcessProxy
+
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+    im.broadcaster.broadcast = AsyncMock()
+    proxy = _PTYProcessProxy()
+    native_process = types.SimpleNamespace(exit_code=-signal.SIGTERM)
+    native_session = types.SimpleNamespace(
+        is_alive=False,
+        _process=native_process,
+    )
+    proxy.session = native_session
+    proxy.pid = 51_337
+    im.processes[5] = proxy
+
+    class FakeBackend:
+        _sessions = {5: native_session}
+
+        async def stop(self, instance_id):
+            assert instance_id == 5
+            # Native process is already reaped, but the dependency's cancelled
+            # consumer never reached proxy.complete().
+
+    im._pty_backend = FakeBackend()
+    ok = await im.stop(5)
+
+    assert ok is True
+    assert proxy.returncode == -signal.SIGTERM
+    assert await proxy.wait() == -signal.SIGTERM
     assert 5 not in im.processes
 
 

@@ -16,6 +16,7 @@ class TaskSSHGrant(Base):
             "ssh_profile_id",
             name="uq_task_ssh_grants_task_profile",
         ),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

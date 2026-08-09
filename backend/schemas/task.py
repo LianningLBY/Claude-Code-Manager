@@ -28,6 +28,14 @@ class UserSkillSnapshotPayload(BaseModel):
     content: str = ""
 
 
+class FrontendReviewConfig(BaseModel):
+    """Task-scoped frontend review workflow selected by the composer UI."""
+
+    mode: Literal["goal"] = "goal"
+    profile: Literal["standard", "exhaustive"] = "standard"
+    max_iterations: int = Field(default=5, ge=1, le=10)
+
+
 def _normalize_task_provider(value: object) -> str:
     """Canonicalize an explicit task provider without accepting empty input."""
 
@@ -86,6 +94,7 @@ class TaskCreate(BaseModel):
     goal_condition: str | None = None  # goal only: natural-language completion condition
     goal_max_turns: int = 30  # goal only: max turns before auto-fail
     goal_evaluator_model: str | None = None  # goal only: evaluator model (default haiku)
+    frontend_review: FrontendReviewConfig | None = None
     # API callers that omit provider follow the deployment-wide default.
     provider: str = Field(
         default_factory=lambda: settings.default_provider,
@@ -134,6 +143,9 @@ class TaskCreate(BaseModel):
 
     @model_validator(mode='after')
     def validate_mode_fields(self):
+        if self.frontend_review is not None:
+            self.mode = 'goal'
+            self.goal_max_turns = self.frontend_review.max_iterations
         if self.delivery_run_id is not None or self.delivery_role is not None:
             raise ValueError(
                 "delivery_run_id and delivery_role are reserved for the "
@@ -152,7 +164,7 @@ class TaskCreate(BaseModel):
             raise ValueError('description is required for non-loop tasks')
         if self.mode == 'loop' and not self.todo_file_path:
             raise ValueError('todo_file_path is required for loop tasks')
-        if self.mode == 'goal' and not self.goal_condition:
+        if self.mode == 'goal' and not self.goal_condition and self.frontend_review is None:
             raise ValueError('goal_condition is required for goal tasks')
         return self
 

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, JSON, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -10,6 +10,7 @@ class SSHProfile(Base):
     """Manager-owned SSH connection whose private key never leaves the host."""
 
     __tablename__ = "ssh_profiles"
+    __table_args__ = {"mysql_engine": "InnoDB"}
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
@@ -33,13 +34,13 @@ class SSHProfile(Base):
         JSON,
         nullable=False,
         default=list,
-        server_default="[]",
+        server_default=text("('[]')"),
     )
     allowed_roots: Mapped[list[str]] = mapped_column(
         JSON,
         nullable=False,
         default=lambda: ["/"],
-        server_default='["/"]',
+        server_default=text("('[\"/\"]')"),
     )
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     last_tested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -39,6 +39,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("name"),
+        mysql_engine="InnoDB",
     )
     op.create_index(
         op.f("ix_ssh_profiles_created_by"),

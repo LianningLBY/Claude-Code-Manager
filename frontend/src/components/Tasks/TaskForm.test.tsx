@@ -694,6 +694,20 @@ describe('TaskForm persisted defaults', () => {
     });
   });
 });
+describe('TaskForm frontend review entry location', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it('does not show the looping frontend review control on Task creation', () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: '选择前端审查模式' }))
+      .not.toBeInTheDocument();
+  });
+});
+
 describe('TaskForm Auto capabilities', () => {
   const enabledConfig = {
     default_provider: 'claude',

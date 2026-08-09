@@ -12,11 +12,26 @@ from sqlalchemy.sql.functions import FunctionElement
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessChildBinding
 from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services.task_creation import (
     purge_task_access_grants,
     stage_task_record,
+)
+from backend.services.test_harness_children import (
+    CHILD_COMPLETED,
+    CHILD_READY,
+    CHILD_RUNNING,
+    browser_binding_owner_identity,
+    browser_child_binding_error,
+    browser_child_owner_error,
+)
+from backend.services.test_harness_owner_fence import (
+    TestHarnessOwnerGraphConflict,
+    has_active_test_harness_owner_graph,
+    lock_test_harness_owner,
+    no_active_test_harness_owner_graph_predicate,
 )
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
@@ -213,6 +228,467 @@ class TaskDeletePreflight:
 
     task_id: int
     plan_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TestHarnessDeleteGraph:
+    """Locked terminal Harness ownership graph for one Task deletion."""
+
+    run_ids: tuple[str, ...]
+    workspace_run_ids: tuple[str, ...]
+    binding_ids: tuple[str, ...]
+    evidence_storage_keys: tuple[str, ...]
+    child_tasks: tuple[tuple[int, str, str, int, int], ...]
+    child_instances: tuple[
+        tuple[int, int, str, int | None, datetime | None], ...
+    ]
+
+
+async def _lock_test_harness_delete_graph(
+    db: AsyncSession,
+    task_id: int,
+    task_incarnation_id: str | None,
+) -> TestHarnessDeleteGraph | None:
+    """Lock and prove that no live Browser child can outlive its owner."""
+
+    from backend.models.test_harness import (
+        BrowserReviewOperationReceipt,
+        TestHarnessChildBinding,
+        TestHarnessEvidence,
+        TestHarnessRun,
+        TestHarnessSandboxLease,
+    )
+    from backend.models.workspace_review import WorkspaceReviewRun
+    from backend.services.test_harness_children import CHILD_TERMINAL_STATES
+    from backend.services.test_harness_contracts import HARNESS_TERMINAL_STATUSES
+
+    runs = list(
+        (
+            await db.execute(
+                select(TestHarnessRun)
+                .where(TestHarnessRun.task_id == task_id)
+                .order_by(TestHarnessRun.id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    workspace_runs = list(
+        (
+            await db.execute(
+                select(WorkspaceReviewRun)
+                .where(WorkspaceReviewRun.task_id == task_id)
+                .order_by(WorkspaceReviewRun.id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    bindings = list(
+        (
+            await db.execute(
+                select(TestHarnessChildBinding)
+                .where(TestHarnessChildBinding.owner_task_id == task_id)
+                .order_by(TestHarnessChildBinding.id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    if any(
+        run.status not in HARNESS_TERMINAL_STATUSES
+        or run.cleanup_status != "completed"
+        for run in runs
+    ):
+        return None
+    if any(
+        run.status not in {"completed", "failed", "cancelled"}
+        or run.cleanup_status != "completed"
+        for run in workspace_runs
+    ):
+        return None
+    if any(binding.state not in CHILD_TERMINAL_STATES for binding in bindings):
+        return None
+    binding_ids = [binding.id for binding in bindings]
+    operation_receipts = (
+        list(
+            (
+                await db.execute(
+                    select(BrowserReviewOperationReceipt)
+                    .where(
+                        BrowserReviewOperationReceipt.binding_id.in_(binding_ids)
+                    )
+                    .order_by(BrowserReviewOperationReceipt.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        if binding_ids
+        else []
+    )
+    if any(receipt.status == "permitted" for receipt in operation_receipts):
+        # A missing ACK is an unknown external side effect until exact child
+        # reap marks it uncertain. Never erase that proof opportunistically.
+        return None
+    has_graph = bool(runs or workspace_runs or bindings)
+    if has_graph and (
+        not task_incarnation_id
+        or any(
+            run.owner_task_incarnation_id != task_incarnation_id
+            for run in runs
+        )
+        or any(
+            run.owner_task_incarnation_id != task_incarnation_id
+            for run in workspace_runs
+        )
+        or any(
+            binding.owner_task_incarnation_id != task_incarnation_id
+            for binding in bindings
+        )
+    ):
+        return None
+
+    run_ids = {run.id for run in runs}
+    workspace_run_ids = {run.id for run in workspace_runs}
+    if any(
+        binding.harness_run_id is not None
+        and binding.harness_run_id not in run_ids
+        for binding in bindings
+    ) or any(
+        binding.workspace_review_run_id is not None
+        and binding.workspace_review_run_id not in workspace_run_ids
+        for binding in bindings
+    ):
+        return None
+    if any(
+        run.workspace_review_run_id is not None
+        and run.workspace_review_run_id not in workspace_run_ids
+        for run in runs
+    ):
+        return None
+
+    if run_ids:
+        leases = list(
+            (
+                await db.execute(
+                    select(TestHarnessSandboxLease)
+                    .where(TestHarnessSandboxLease.run_id.in_(run_ids))
+                    .order_by(TestHarnessSandboxLease.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        if any(lease.cleanup_status != "completed" for lease in leases):
+            return None
+        evidence_rows = list(
+            (
+                await db.execute(
+                    select(TestHarnessEvidence)
+                    .where(TestHarnessEvidence.run_id.in_(run_ids))
+                    .order_by(TestHarnessEvidence.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+    else:
+        evidence_rows = []
+
+    child_ids = sorted({binding.child_task_id for binding in bindings})
+    referenced_child_ids = {
+        int(agent_task_id)
+        for agent_task_id in (
+            *(run.agent_task_id for run in runs),
+            *(run.agent_task_id for run in workspace_runs),
+        )
+        if agent_task_id is not None and agent_task_id != task_id
+    }
+    if referenced_child_ids != set(child_ids):
+        # An old/incomplete pipeline without a Binding cannot be proven safe
+        # to erase, and a Binding not referenced by its owning Run is equally
+        # malformed. Startup recovery must reconcile it first.
+        return None
+    # Canonical Task creation uses SQLite AUTOINCREMENT / database sequences,
+    # so a Browser child must sort after its extant owner.  Fail closed on
+    # corrupt legacy rows instead of introducing owner->child vs child->owner
+    # lock cycles in supported databases.
+    if any(child_id <= task_id for child_id in child_ids):
+        return None
+    children = list(
+        (
+            await db.execute(
+                select(Task)
+                .where(Task.id.in_(child_ids))
+                .order_by(Task.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    ) if child_ids else []
+    children_by_id = {child.id: child for child in children}
+    from backend.services.test_harness_children import (
+        TASK_TERMINAL_STATUSES,
+        browser_child_binding_error,
+    )
+
+    for binding in bindings:
+        child = children_by_id.get(binding.child_task_id)
+        legacy_untrusted_profile = (
+            binding.launch_profile_version is None
+            and binding.provider is None
+            and binding.model is None
+            and binding.reasoning_effort is None
+            and binding.codex_service_tier is None
+            and binding.task_mode is None
+            and binding.launch_config_digest is None
+        )
+        if (
+            child is None
+            or not child.incarnation_id
+            or binding.child_task_incarnation_id != child.incarnation_id
+            or child.status not in TASK_TERMINAL_STATUSES
+            or child.archived is not True
+            or (
+                not legacy_untrusted_profile
+                and browser_child_binding_error(binding, child) is not None
+            )
+        ):
+            return None
+
+    child_instances: list[Instance] = []
+    if child_ids:
+        from backend.models.capability import CapabilityInvocation
+        from backend.models.code_review import CodeReviewRun
+        from backend.models.monitor_session import MonitorSession
+        from backend.models.plan import Plan
+        from backend.models.worker_task_termination import (
+            WorkerTaskTerminationReceipt,
+        )
+
+        child_instances = list(
+            (
+                await db.execute(
+                    select(Instance)
+                    .where(Instance.current_task_id.in_(child_ids))
+                    .order_by(Instance.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars()
+        )
+        from backend.main import dispatcher, instance_manager
+
+        for instance in child_instances:
+            dispatcher_lifecycle = getattr(
+                dispatcher,
+                "_running_tasks",
+                {},
+            ).get(instance.id)
+            if (
+                instance_manager.is_running(instance.id)
+                or (
+                    dispatcher_lifecycle is not None
+                    and not dispatcher_lifecycle.done()
+                )
+                or instance.status == "running"
+                or (
+                    instance.pid is not None
+                    and (
+                        instance.status not in {"error", "stopped"}
+                        or not persisted_pid_is_definitively_dead(instance.pid)
+                    )
+                )
+            ):
+                return None
+        unexpected_task_child = await db.scalar(
+            select(Task.id)
+            .where(
+                or_(
+                    Task.plan_target_task_id.in_(child_ids),
+                    Task.supersedes_plan_task_id.in_(child_ids),
+                )
+            )
+            .limit(1)
+        )
+        unexpected_capability = await db.scalar(
+            select(CapabilityInvocation.id)
+            .where(CapabilityInvocation.task_id.in_(child_ids))
+            .limit(1)
+        )
+        unexpected_monitor = await db.scalar(
+            select(MonitorSession.id)
+            .where(MonitorSession.task_id.in_(child_ids))
+            .limit(1)
+        )
+        unexpected_review = await db.scalar(
+            select(CodeReviewRun.id)
+            .where(
+                or_(
+                    CodeReviewRun.developer_task_id.in_(child_ids),
+                    CodeReviewRun.reviewer_task_id.in_(child_ids),
+                )
+            )
+            .limit(1)
+        )
+        unexpected_worker_receipt = await db.scalar(
+            select(WorkerTaskTerminationReceipt.operation_id)
+            .where(WorkerTaskTerminationReceipt.task_id.in_(child_ids))
+            .limit(1)
+        )
+        nested_harness_owner = await db.scalar(
+            select(TestHarnessRun.id)
+            .where(TestHarnessRun.task_id.in_(child_ids))
+            .limit(1)
+        )
+        nested_workspace_owner = await db.scalar(
+            select(WorkspaceReviewRun.id)
+            .where(WorkspaceReviewRun.task_id.in_(child_ids))
+            .limit(1)
+        )
+        nested_browser_owner = await db.scalar(
+            select(TestHarnessChildBinding.id)
+            .where(TestHarnessChildBinding.owner_task_id.in_(child_ids))
+            .limit(1)
+        )
+        nested_plan_owner = await db.scalar(
+            select(Plan.id)
+            .where(Plan.target_task_id.in_(child_ids))
+            .limit(1)
+        )
+        if any(
+            value is not None
+            for value in (
+                unexpected_task_child,
+                unexpected_capability,
+                unexpected_monitor,
+                unexpected_review,
+                unexpected_worker_receipt,
+                nested_harness_owner,
+                nested_workspace_owner,
+                nested_browser_owner,
+                nested_plan_owner,
+            )
+        ):
+            return None
+
+    return TestHarnessDeleteGraph(
+        run_ids=tuple(sorted(run_ids)),
+        workspace_run_ids=tuple(sorted(workspace_run_ids)),
+        binding_ids=tuple(binding.id for binding in bindings),
+        evidence_storage_keys=tuple(
+            sorted({evidence.storage_path for evidence in evidence_rows})
+        ),
+        child_tasks=tuple(
+            (
+                child.id,
+                child.incarnation_id,
+                child.status,
+                child.retry_count,
+                child.turn_generation,
+            )
+            for child in children
+        ),
+        child_instances=tuple(
+            (
+                instance.id,
+                int(instance.current_task_id),
+                instance.status,
+                instance.pid,
+                instance.started_at,
+            )
+            for instance in child_instances
+        ) if child_ids else (),
+    )
+
+
+async def _delete_test_harness_graph(
+    db: AsyncSession,
+    graph: TestHarnessDeleteGraph,
+) -> None:
+    """Delete the already-locked graph in dependency order."""
+
+    from backend.models.test_harness import (
+        BrowserReviewOperationReceipt,
+        TestHarnessAttempt,
+        TestHarnessChildBinding,
+        TestHarnessEvent,
+        TestHarnessEvidence,
+        TestHarnessFinding,
+        TestHarnessRun,
+        TestHarnessSandboxLease,
+    )
+    from backend.models.workspace_review import WorkspaceReviewRun
+
+    for instance_id, child_task_id, status, pid, started_at in graph.child_instances:
+        predicates = [
+            Instance.id == instance_id,
+            Instance.current_task_id == child_task_id,
+            Instance.status == status,
+            Instance.pid.is_(None) if pid is None else Instance.pid == pid,
+            (
+                Instance.started_at.is_(None)
+                if started_at is None
+                else Instance.started_at == started_at
+            ),
+        ]
+        detached = await db.execute(
+            update(Instance)
+            .where(*predicates)
+            .values(current_task_id=None, pid=None)
+        )
+        if detached.rowcount != 1:
+            raise RuntimeError(
+                "Browser child Instance generation changed during owner deletion"
+            )
+
+    if graph.binding_ids:
+        await db.execute(
+            sa_delete(BrowserReviewOperationReceipt).where(
+                BrowserReviewOperationReceipt.binding_id.in_(graph.binding_ids)
+            )
+        )
+        await db.execute(
+            sa_delete(TestHarnessChildBinding).where(
+                TestHarnessChildBinding.id.in_(graph.binding_ids)
+            )
+        )
+    if graph.run_ids:
+        for model in (
+            TestHarnessEvidence,
+            TestHarnessFinding,
+            TestHarnessEvent,
+            TestHarnessAttempt,
+            TestHarnessSandboxLease,
+        ):
+            await db.execute(
+                sa_delete(model).where(model.run_id.in_(graph.run_ids))
+            )
+        await db.execute(
+            sa_delete(TestHarnessRun).where(
+                TestHarnessRun.id.in_(graph.run_ids)
+            )
+        )
+    if graph.workspace_run_ids:
+        await db.execute(
+            sa_delete(WorkspaceReviewRun).where(
+                WorkspaceReviewRun.id.in_(graph.workspace_run_ids)
+            )
+        )
+    for child_id, incarnation_id, status, retry_count, turn_generation in graph.child_tasks:
+        await purge_task_access_grants(db, child_id)
+        await db.execute(
+            sa_delete(LogEntry).where(LogEntry.task_id == child_id)
+        )
+        deleted = await db.execute(
+            sa_delete(Task).where(
+                Task.id == child_id,
+                Task.incarnation_id == incarnation_id,
+                Task.status == status,
+                Task.retry_count == retry_count,
+                Task.turn_generation == turn_generation,
+                Task.archived.is_(True),
+            )
+        )
+        if deleted.rowcount != 1:
+            raise RuntimeError(
+                "Browser child Task generation changed during owner deletion"
+            )
 
 
 def task_generation_fence(task: Task) -> TaskGenerationFence:
@@ -457,6 +933,7 @@ class TaskQueue:
         *,
         operation_lock_held: bool = False,
         expected_incarnation_id: str | None = None,
+        reject_active_harness_owner_graph: bool = False,
         **kwargs,
     ) -> Task | None:
         """Update one Task only while no durable termination owns it.
@@ -479,6 +956,9 @@ class TaskQueue:
                     task_id,
                     operation_lock_held=True,
                     expected_incarnation_id=expected_incarnation_id,
+                    reject_active_harness_owner_graph=(
+                        reject_active_harness_owner_graph
+                    ),
                     **kwargs,
                 )
 
@@ -522,12 +1002,30 @@ class TaskQueue:
                     else (Task.status != "waiting_capability",)
                 ),
                 no_active_worker_task_termination_predicate(),
+                *(
+                    (no_active_test_harness_owner_graph_predicate(),)
+                    if reject_active_harness_owner_graph
+                    else ()
+                ),
             )
             .values(**values)
             .execution_options(synchronize_session=False)
         )
         if changed.rowcount != 1:
             await self.db.rollback()
+            if (
+                reject_active_harness_owner_graph
+                and await has_active_test_harness_owner_graph(
+                    self.db,
+                    task_id,
+                )
+            ):
+                await self.db.rollback()
+                raise TestHarnessOwnerGraphConflict(
+                    "Task owns an active Test Harness, Workspace Review, or "
+                    "Browser Agent graph; wait for it to finish before "
+                    "editing the Task"
+                )
             if await active_worker_task_termination_receipt(self.db, task_id):
                 await self.db.rollback()
                 raise WorkerTaskTerminationConflict(
@@ -556,6 +1054,38 @@ class TaskQueue:
         )
 
     async def delete(
+        self,
+        task_id: int,
+        *,
+        expected_fence: TaskDeleteFence | None = None,
+        remote_worker_deleted: bool = False,
+        before_delete: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        remote_delete_confirm: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        prepare_remote_worker_delete: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        worker_delete_operation_id: str | None = None,
+    ) -> bool:
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_fence,
+        )
+
+        async with test_harness_owner_fence(task_id):
+            return await self._delete_under_owner_fence(
+                task_id,
+                expected_fence=expected_fence,
+                remote_worker_deleted=remote_worker_deleted,
+                before_delete=before_delete,
+                remote_delete_confirm=remote_delete_confirm,
+                prepare_remote_worker_delete=prepare_remote_worker_delete,
+                worker_delete_operation_id=worker_delete_operation_id,
+            )
+
+    async def _delete_under_owner_fence(
         self,
         task_id: int,
         *,
@@ -670,6 +1200,23 @@ class TaskQueue:
         if reviewer_run_id is not None:
             return False
 
+        isolated_browser_marker = bool(
+            isinstance(task.metadata_, dict)
+            and task.metadata_.get("isolated_browser_agent") is True
+        )
+        reverse_browser_binding = await self.db.scalar(
+            select(TestHarnessChildBinding.id)
+            .where(TestHarnessChildBinding.child_task_id == task_id)
+            .limit(1)
+        )
+        if isolated_browser_marker or reverse_browser_binding is not None:
+            # A Browser child is created together with its immutable binding;
+            # an existing Task can never be attached later. Reject it before
+            # taking the child Task write lock, so owner deletion keeps the
+            # sole Task lock order owner -> child.
+            await self.db.rollback()
+            return False
+
         task_predicates = [
             Task.id == task_id,
             Task.status == observed_status,
@@ -739,6 +1286,15 @@ class TaskQueue:
             if locked_worker_delete_receipt is None:
                 await self.db.rollback()
                 return False
+
+        test_harness_graph = await _lock_test_harness_delete_graph(
+            self.db,
+            task_id,
+            task.incarnation_id,
+        )
+        if test_harness_graph is None:
+            await self.db.rollback()
+            return False
 
         # Capability lifecycle uses the same global Task -> Invocation ->
         # Execution lock order. Active work owns an external adapter handle or
@@ -1275,6 +1831,12 @@ class TaskQueue:
             await self.db.commit()
             return True
 
+        try:
+            await _delete_test_harness_graph(self.db, test_harness_graph)
+        except BaseException:
+            await self.db.rollback()
+            raise
+
         # Neither task_shares nor team_task_shares can be left to database
         # cascades: SQLite may not enforce the former FK, while the latter has
         # no Task FK.  Keeping this inside the fenced delete transaction also
@@ -1397,18 +1959,44 @@ class TaskQueue:
             await self.db.rollback()
             return False
         await self.db.commit()
+
         from backend.services.internal_service_auth import (
             revoke_internal_service_owner,
         )
+        from backend.services.ask_user import ask_user_registry
 
-        revoke_internal_service_owner("task-turn", task_id)
-        if observed_incarnation_id:
-            from backend.services.ask_user import ask_user_registry
+        deleted_task_generations = (
+            (task_id, observed_incarnation_id),
+            *(
+                (child_id, child_incarnation_id)
+                for child_id, child_incarnation_id, *_rest
+                in test_harness_graph.child_tasks
+            ),
+        )
+        for deleted_task_id, deleted_incarnation_id in deleted_task_generations:
+            revoke_internal_service_owner("task-turn", deleted_task_id)
+            if deleted_incarnation_id:
+                ask_user_registry.discard_for_task(
+                    deleted_task_id,
+                    deleted_incarnation_id,
+                )
 
-            ask_user_registry.discard_for_task(
-                task_id,
-                observed_incarnation_id,
+        if test_harness_graph.evidence_storage_keys:
+            from backend.services.test_harness_artifacts import (
+                test_harness_artifact_store,
             )
+
+            for storage_key in test_harness_graph.evidence_storage_keys:
+                if not test_harness_artifact_store.remove(storage_key):
+                    # The authoritative Task/evidence rows are already gone;
+                    # retain an explicit error rather than pretending a
+                    # corrupt/symlink archive path was physically removed.
+                    import logging
+
+                    logging.getLogger(__name__).error(
+                        "Could not remove deleted Test Harness evidence %s",
+                        storage_key,
+                    )
         return True
 
     async def dequeue(
@@ -1469,6 +2057,70 @@ class TaskQueue:
                 # them; final launch barriers independently fail closed.
                 blocked_ids.add(candidate_id)
                 continue
+            binding = await self.db.scalar(
+                select(TestHarnessChildBinding).where(
+                    TestHarnessChildBinding.child_task_id == candidate_id
+                )
+            )
+            isolated_browser_marker = bool(
+                (candidate.metadata_ or {}).get("isolated_browser_agent") is True
+            )
+            isolated_browser_child = binding is not None or isolated_browser_marker
+            if isolated_browser_child:
+                if (
+                    binding is None
+                    or binding.state != CHILD_READY
+                    or browser_child_binding_error(binding, candidate) is not None
+                ):
+                    # Missing, reserved, stopping and recovered bindings all
+                    # fail closed. The complete immutable launch tuple is
+                    # checked before the claim CAS; launch repeats it after
+                    # Instance ownership is committed.
+                    blocked_ids.add(candidate_id)
+                    continue
+                binding_id = binding.id
+                owner_identity = browser_binding_owner_identity(binding)
+                # Candidate/binding discovery is a read snapshot. End it
+                # before the durable owner writer fence so SQLite WAL never
+                # attempts a stale read->write upgrade after owner deletion.
+                await self.db.rollback()
+                self.db.expire_all()
+                try:
+                    owner = await lock_test_harness_owner(
+                        self.db,
+                        owner_identity,
+                    )
+                except RuntimeError:
+                    await self.db.rollback()
+                    self.db.expire_all()
+                    blocked_ids.add(candidate_id)
+                    continue
+                binding = await self.db.scalar(
+                    select(TestHarnessChildBinding)
+                    .where(TestHarnessChildBinding.id == binding_id)
+                    .execution_options(populate_existing=True)
+                )
+                candidate = await self.db.get(
+                    Task,
+                    candidate_id,
+                    populate_existing=True,
+                )
+                if (
+                    binding is None
+                    or candidate is None
+                    or binding.state != CHILD_READY
+                    or browser_child_binding_error(binding, candidate) is not None
+                    or browser_binding_owner_identity(binding) != owner_identity
+                ):
+                    await self.db.rollback()
+                    self.db.expire_all()
+                    blocked_ids.add(candidate_id)
+                    continue
+                if browser_child_owner_error(binding, owner) is not None:
+                    await self.db.rollback()
+                    self.db.expire_all()
+                    blocked_ids.add(candidate_id)
+                    continue
             from backend.services.worker_relay import (
                 has_worker_execution_quarantine,
             )
@@ -1503,6 +2155,24 @@ class TaskQueue:
                 )
                 .values(**values)
             )
+            if claimed.rowcount and isolated_browser_child:
+                binding_claimed = await self.db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(
+                        TestHarnessChildBinding.id == binding.id,
+                        TestHarnessChildBinding.state == CHILD_READY,
+                    )
+                    .values(
+                        state=CHILD_RUNNING,
+                        claimed_retry_count=candidate.retry_count,
+                        claimed_instance_id=instance_id,
+                        error=None,
+                    )
+                )
+                if not binding_claimed.rowcount:
+                    await self.db.rollback()
+                    self.db.expire_all()
+                    continue
             await self.db.commit()
             if not claimed.rowcount:
                 # Another dispatcher won after our candidate SELECT.  Expire a
@@ -1618,6 +2288,57 @@ class TaskQueue:
         if instance_id is not None:
             predicate.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicate, generation_fence)
+        task = await self.db.get(Task, task_id, populate_existing=True)
+        binding = await self.db.scalar(
+            select(TestHarnessChildBinding).where(
+                TestHarnessChildBinding.child_task_id == task_id
+            )
+        )
+        isolated_browser_child = binding is not None or bool(
+            ((task.metadata_ or {}) if task is not None else {}).get(
+                "isolated_browser_agent"
+            )
+            is True
+        )
+        if isolated_browser_child and (
+            task is None
+            or binding is None
+            or binding.state != CHILD_RUNNING
+            or browser_child_binding_error(binding, task) is not None
+        ):
+            await self.db.rollback()
+            return False
+        if isolated_browser_child and binding is not None:
+            binding_id = binding.id
+            owner_identity = browser_binding_owner_identity(binding)
+            await self.db.rollback()
+            self.db.expire_all()
+            try:
+                owner = await lock_test_harness_owner(
+                    self.db,
+                    owner_identity,
+                )
+            except RuntimeError:
+                await self.db.rollback()
+                return False
+            binding = await self.db.scalar(
+                select(TestHarnessChildBinding)
+                .where(TestHarnessChildBinding.id == binding_id)
+                .execution_options(populate_existing=True)
+            )
+            task = await self.db.get(Task, task_id, populate_existing=True)
+            if (
+                task is None
+                or binding is None
+                or binding.state != CHILD_RUNNING
+                or browser_binding_owner_identity(binding) != owner_identity
+                or browser_child_binding_error(binding, task) is not None
+            ):
+                await self.db.rollback()
+                return False
+            if browser_child_owner_error(binding, owner) is not None:
+                await self.db.rollback()
+                return False
         result = await self.db.execute(
             update(Task)
             .where(*predicate)
@@ -1629,6 +2350,23 @@ class TaskQueue:
                 completed_at=None,
             )
         )
+        if result.rowcount and isolated_browser_child:
+            released = await self.db.execute(
+                update(TestHarnessChildBinding)
+                .where(
+                    TestHarnessChildBinding.child_task_id == task_id,
+                    TestHarnessChildBinding.state == CHILD_RUNNING,
+                )
+                .values(
+                    state=CHILD_READY,
+                    claimed_retry_count=None,
+                    claimed_instance_id=None,
+                    error=reason,
+                )
+            )
+            if not released.rowcount:
+                await self.db.rollback()
+                return False
         await self.db.commit()
         return bool(result.rowcount)
 
@@ -1646,6 +2384,8 @@ class TaskQueue:
         instance_id: int | None = None,
         generation_fence: TaskGenerationFence | None = None,
         rollback_on_miss: bool = False,
+        task_updates: dict | None = None,
+        commit: bool = True,
     ) -> Task | None:
         """CAS a retryable task back to pending and release old ownership.
 
@@ -1667,23 +2407,77 @@ class TaskQueue:
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicates, generation_fence)
+        values = {
+            "status": "pending",
+            "retry_count": Task.retry_count + 1,
+            "instance_id": None,
+            "error_message": None,
+            "started_at": None,
+            "completed_at": None,
+            "pty_background_generation": None,
+            # The source pointer is exact retry/generation provenance. Clear it
+            # in the same CAS that advances retry_count so no reader can treat
+            # the previous provider-boundary evidence as belonging to the retry.
+            "turn_source_log_id": None,
+        }
+        if task_updates:
+            values.update(task_updates)
+        task = await self.db.get(Task, task_id, populate_existing=True)
+        binding = await self.db.scalar(
+            select(TestHarnessChildBinding).where(
+                TestHarnessChildBinding.child_task_id == task_id
+            )
+        )
+        isolated_browser_child = binding is not None or bool(
+            ((task.metadata_ or {}) if task is not None else {}).get(
+                "isolated_browser_agent"
+            )
+            is True
+        )
+        if isolated_browser_child:
+            if (
+                task is None
+                or binding is None
+                or binding.state not in {CHILD_READY, CHILD_RUNNING}
+                or browser_child_binding_error(binding, task) is not None
+                or bool(task_updates)
+            ):
+                await self.db.rollback()
+                return None
+            binding_id = binding.id
+            owner_identity = browser_binding_owner_identity(binding)
+            await self.db.rollback()
+            self.db.expire_all()
+            try:
+                owner = await lock_test_harness_owner(
+                    self.db,
+                    owner_identity,
+                )
+            except RuntimeError:
+                await self.db.rollback()
+                return None
+            binding = await self.db.scalar(
+                select(TestHarnessChildBinding)
+                .where(TestHarnessChildBinding.id == binding_id)
+                .execution_options(populate_existing=True)
+            )
+            task = await self.db.get(Task, task_id, populate_existing=True)
+            if (
+                task is None
+                or binding is None
+                or binding.state not in {CHILD_READY, CHILD_RUNNING}
+                or browser_binding_owner_identity(binding) != owner_identity
+                or browser_child_binding_error(binding, task) is not None
+            ):
+                await self.db.rollback()
+                return None
+            if browser_child_owner_error(binding, owner) is not None:
+                await self.db.rollback()
+                return None
         result = await self.db.execute(
             update(Task)
             .where(*predicates)
-            .values(
-                status="pending",
-                retry_count=Task.retry_count + 1,
-                instance_id=None,
-                error_message=None,
-                started_at=None,
-                completed_at=None,
-                pty_background_generation=None,
-                # The source pointer is exact retry/generation provenance.
-                # Clear it in the same CAS that advances retry_count so no
-                # reader can temporarily treat the previous provider-boundary
-                # evidence as belonging to the fresh retry.
-                turn_source_log_id=None,
-            )
+            .values(**values)
         )
         if not result.rowcount:
             if rollback_on_miss:
@@ -1694,7 +2488,29 @@ class TaskQueue:
                 # in the same transaction opt into rollback_on_miss.
                 await self.db.commit()
             return None
-        await self.db.commit()
+        if isolated_browser_child and binding is not None:
+            released = await self.db.execute(
+                update(TestHarnessChildBinding)
+                .where(
+                    TestHarnessChildBinding.id == binding.id,
+                    TestHarnessChildBinding.state.in_(
+                        (CHILD_READY, CHILD_RUNNING)
+                    ),
+                )
+                .values(
+                    state=CHILD_READY,
+                    claimed_retry_count=None,
+                    claimed_instance_id=None,
+                    error=None,
+                )
+            )
+            if not released.rowcount:
+                await self.db.rollback()
+                return None
+        if commit:
+            await self.db.commit()
+        else:
+            await self.db.flush()
         self.db.expire_all()
         task = await self.get(task_id)
         if task is not None:
@@ -1706,7 +2522,15 @@ class TaskQueue:
             update(Task)
             .where(
                 Task.id == task_id,
-                Task.status.in_(("pending", "in_progress", "executing", "merging")),
+                Task.status.in_(
+                    (
+                        "pending_activation",
+                        "pending",
+                        "in_progress",
+                        "executing",
+                        "merging",
+                    )
+                ),
                 no_active_worker_task_termination_predicate(),
             )
             .values(status="cancelled", completed_at=datetime.utcnow())

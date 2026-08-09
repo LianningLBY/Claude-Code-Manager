@@ -1,5 +1,7 @@
 """Tests for MCP config generation and cleanup."""
 import json
+import os
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -10,21 +12,28 @@ from backend.mcp import (
     ccm_monitor_agent_server,
     ccm_skills_http_server,
     ccm_sub_agent_server,
+    ccm_workspace_review_server,
     ccm_ssh_server,
 )
 from backend.services import mcp_config
 from backend.services import internal_api_endpoint
 from backend.services import internal_service_auth
 from backend.services.mcp_config import (
+    CCM_BROWSER_REVIEW_TOOLS,
+    CCM_FRONTEND_REVIEW_TOOLS,
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
     CCM_SUB_AGENT_CONTROLLER_TOOLS,
     CCM_SUB_AGENT_TOOLS,
+    CCM_WORKSPACE_REVIEW_TOOLS,
     McpServerSpec,
     build_mcp_server_specs,
+    build_browser_review_mcp_server_specs,
+    build_frontend_review_mcp_server_specs,
     build_monitor_agent_mcp_server_specs,
     build_sub_agent_controller_mcp_server_specs,
     build_sub_agent_mcp_server_specs,
+    build_workspace_review_mcp_server_specs,
     build_task_ssh_mcp_server_specs,
     cleanup_mcp_config,
     cleanup_monitor_agent_mcp_config,
@@ -132,7 +141,7 @@ def test_generate_mcp_config_empty_skills_still_includes_ccm_skills():
 
 
 def test_generate_mcp_config_skills_do_not_add_extra_servers():
-    """启用任意 skill 不再产生独立的 per-skill server，只有 ccm_skills 一个入口。"""
+    """普通 skill 不增加服务；固定的 Task 工具服务保持存在。"""
     path = generate_mcp_config(
         1,
         {"worker": True, "monitor": True},
@@ -141,8 +150,194 @@ def test_generate_mcp_config_skills_do_not_add_extra_servers():
         **TASK_ACTIVE_GENERATION,
     )
     config = json.loads(path.read_text())
-    assert set(config["mcpServers"].keys()) == {"ccm_skills"}
+    assert set(config["mcpServers"].keys()) == {
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    }
     path.unlink(missing_ok=True)
+
+
+def test_browser_review_adds_required_task_scoped_server(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+    specs = build_mcp_server_specs(
+        73,
+        {"browser-review": "job-abc"},
+        api_base="http://127.0.0.1:8795",
+        provider="codex",
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )
+
+    assert [spec.name for spec in specs] == ["ccm_browser_review"]
+    browser_spec = specs[0]
+    assert browser_spec == build_browser_review_mcp_server_specs(
+        "job-abc",
+        api_base="http://127.0.0.1:8795",
+        task_id=73,
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
+    assert browser_spec.required is True
+    assert browser_spec.enabled_tools == CCM_BROWSER_REVIEW_TOOLS
+    assert browser_spec.args[0] == "-I"
+    verify_materialized_trusted_python_asset(
+        "ccm_browser_review_server",
+        Path(browser_spec.args[1]),
+    )
+    assert "--job-id" in browser_spec.args
+    assert "job-abc" in browser_spec.args
+    assert "--auth-token" not in browser_spec.args
+    assert dict(browser_spec.env) == TRUSTED_MCP_ENV
+
+
+def test_browser_bundle_ignores_shadow_backend_on_isolated_help(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "secret-token")
+    monkeypatch.setattr(
+        internal_service_auth,
+        "issue_internal_service_token",
+        lambda **_kwargs: "scoped-token",
+    )
+    spec = build_browser_review_mcp_server_specs(
+        "job-shadow-proof",
+        task_id=73,
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
+    entrypoint = Path(spec.args[1])
+    verify_materialized_trusted_python_asset(
+        "ccm_browser_review_server",
+        entrypoint,
+    )
+    marker = tmp_path / "shadow-imported"
+    shadow = tmp_path / "backend"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        f"Path({str(marker)!r}).write_text('imported')\n",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.update(spec.env)
+    try:
+        result = subprocess.run(
+            [spec.command, "-I", str(entrypoint), "--help"],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+    finally:
+        cleanup_mcp_config(73)
+
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("blank_token", ["", " ", "\t\n"])
+def test_browser_review_requires_auth_before_materializing_runtime(
+    monkeypatch,
+    blank_token,
+):
+    monkeypatch.setattr(settings, "auth_token", blank_token)
+    materialized: list[str] = []
+    monkeypatch.setattr(
+        mcp_config,
+        "materialize_trusted_python_asset",
+        lambda name, **_kwargs: materialized.append(name),
+    )
+
+    with pytest.raises(ValueError, match="requires AUTH_TOKEN"):
+        build_browser_review_mcp_server_specs(
+            "job-no-auth",
+            task_id=73,
+            task_incarnation_id=TASK_INCARNATION,
+            **TASK_ACTIVE_GENERATION,
+        )
+
+    assert materialized == []
+
+
+def test_ordinary_task_omits_review_servers_for_blank_auth(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", " \t\n ")
+    monkeypatch.setattr(
+        internal_service_auth,
+        "issue_internal_service_token",
+        lambda **_kwargs: "scoped-token",
+    )
+    materialized: list[str] = []
+    monkeypatch.setattr(
+        mcp_config,
+        "materialize_trusted_python_asset",
+        lambda name, **_kwargs: materialized.append(name) or Path(f"/{name}"),
+    )
+
+    specs = build_mcp_server_specs(
+        73,
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )
+
+    assert [spec.name for spec in specs] == ["ccm_skills"]
+    assert materialized == ["ccm_skills_http_server"]
+
+
+def test_ordinary_task_adds_repeatable_frontend_review_server(monkeypatch):
+    _set_spec_snapshot_runtime(monkeypatch)
+    specs = build_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+        provider="codex",
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )
+
+    assert [spec.name for spec in specs] == [
+        "ccm_skills",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    ]
+    frontend_spec = specs[1]
+    verify_materialized_trusted_python_asset(
+        "ccm_browser_review_server",
+        Path(frontend_spec.args[1]),
+    )
+    assert frontend_spec == build_frontend_review_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
+    assert frontend_spec.enabled_tools == CCM_FRONTEND_REVIEW_TOOLS
+    assert frontend_spec.enabled_tools == ("start_review", "check_review", "stop_review")
+    assert "browser_open" not in frontend_spec.enabled_tools
+    assert "--task-id" in frontend_spec.args
+    assert "73" in frontend_spec.args
+    workspace_spec = specs[2]
+    verify_materialized_trusted_python_asset(
+        "ccm_workspace_review_server",
+        Path(workspace_spec.args[1]),
+    )
+    assert workspace_spec == build_workspace_review_mcp_server_specs(
+        73,
+        api_base="http://127.0.0.1:8795",
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
+    assert workspace_spec.enabled_tools == CCM_WORKSPACE_REVIEW_TOOLS
+    assert workspace_spec.enabled_tools == (
+        "workspace_review_capabilities",
+        "test_current_changes",
+        "check_current_changes_review",
+        "stop_current_changes_review",
+        "test_git_target",
+        "compare_test_runs",
+    )
 
 
 def test_generate_mcp_config_monitor_enabled():
@@ -209,37 +404,50 @@ def _set_spec_snapshot_runtime(monkeypatch):
 def test_main_mcp_server_spec_snapshot(monkeypatch):
     _set_spec_snapshot_runtime(monkeypatch)
 
-    (spec,) = build_mcp_server_specs(
+    specs = build_mcp_server_specs(
         42,
         {"monitor": True},
         api_base="http://manager:8321",
         task_incarnation_id=TASK_INCARNATION,
         **TASK_ACTIVE_GENERATION,
     )
+    spec = specs[0]
     entrypoint = Path(spec.args[1])
     verify_materialized_trusted_python_asset(
         "ccm_skills_http_server",
         entrypoint,
     )
     assert spec == McpServerSpec(
-            name="ccm_skills",
-            command="/srv/ccm/.venv/bin/python3",
-            args=(
-                "-I",
-                str(entrypoint),
-                "--task-id",
-                "42",
-                "--api-base",
-                "http://manager:8321",
-            ),
-            cwd=None,
-            env=TRUSTED_MCP_ENV,
-            required=True,
-            enabled_tools=EXPECTED_MAIN_TOOLS,
-            default_tools_approval_mode="approve",
-            startup_timeout_sec=10.0,
-            tool_timeout_sec=60.0,
+        name="ccm_skills",
+        command="/srv/ccm/.venv/bin/python3",
+        args=(
+            "-I",
+            str(entrypoint),
+            "--task-id",
+            "42",
+            "--api-base",
+            "http://manager:8321",
+        ),
+        cwd=None,
+        env=TRUSTED_MCP_ENV,
+        required=True,
+        enabled_tools=EXPECTED_MAIN_TOOLS,
+        default_tools_approval_mode="approve",
+        startup_timeout_sec=10.0,
+        tool_timeout_sec=60.0,
     )
+    assert specs[1] == build_frontend_review_mcp_server_specs(
+        42,
+        api_base="http://manager:8321",
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
+    assert specs[2] == build_workspace_review_mcp_server_specs(
+        42,
+        api_base="http://manager:8321",
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
     assert CCM_SKILLS_TOOLS == EXPECTED_MAIN_TOOLS
 
 
@@ -368,6 +576,7 @@ def test_sub_agent_controller_spec_is_narrow_and_required(monkeypatch):
         (ccm_skills_http_server, CCM_SKILLS_TOOLS),
         (ccm_monitor_agent_server, CCM_MONITOR_AGENT_TOOLS),
         (ccm_sub_agent_server, CCM_SUB_AGENT_TOOLS),
+        (ccm_workspace_review_server, CCM_WORKSPACE_REVIEW_TOOLS),
     ],
 )
 def test_spec_enabled_tools_match_registered_server_tools(
@@ -467,20 +676,31 @@ def test_claude_json_output_remains_compatible(
             ],
             "env": TRUSTED_MCP_ENV,
         }
+        expected_names = {expected_name}
+        if expected_name == "ccm_skills":
+            expected_names.add("ccm_frontend_review")
+            expected_names.add("ccm_workspace_review")
+            assert "--task-id" in servers["ccm_frontend_review"]["args"]
+            assert "--task-id" in servers["ccm_workspace_review"]["args"]
+        assert set(servers) == expected_names
     finally:
         cleanup()
 
 
 def test_default_api_base_and_empty_auth_token(monkeypatch):
+    monkeypatch.setattr(internal_api_endpoint, "_observed_api_base", None)
     monkeypatch.setattr(settings, "host", "0.0.0.0")
     monkeypatch.setattr(settings, "port", 8321)
+    monkeypatch.setattr(settings, "internal_api_base_url", "")
     monkeypatch.setattr(settings, "auth_token", "")
 
-    (spec,) = build_mcp_server_specs(
+    specs = build_mcp_server_specs(
         42,
         task_incarnation_id=TASK_INCARNATION,
         **TASK_ACTIVE_GENERATION,
     )
+    assert [item.name for item in specs] == ["ccm_skills"]
+    spec = specs[0]
 
     assert spec.args[-2:] == ("--api-base", "http://127.0.0.1:8321")
     assert "--auth-token" not in spec.args
@@ -577,6 +797,8 @@ def test_claude_task_ssh_config_is_added_without_replacing_skills_server(
         assert set(config["mcpServers"]) == {
             "ccm_skills",
             "ccm_ssh",
+            "ccm_frontend_review",
+            "ccm_workspace_review",
         }
         ssh_entrypoint = Path(config["mcpServers"]["ccm_ssh"]["args"][1])
         verify_materialized_trusted_python_asset(
@@ -610,26 +832,43 @@ def test_ccm_ssh_server_hides_tools_outside_granted_capabilities(monkeypatch):
     assert set(removed) == {"new_effect_id", "run_command", "write_file"}
 
 
+def test_observed_asgi_port_overrides_cli_stale_settings(monkeypatch):
+    monkeypatch.setattr(internal_api_endpoint, "_observed_api_base", None)
+    monkeypatch.setattr(settings, "host", "0.0.0.0")
+    monkeypatch.setattr(settings, "port", 8000)
+    monkeypatch.setattr(settings, "internal_api_base_url", "")
+
+    internal_api_endpoint.observe_asgi_server(("127.0.0.1", 8803))
+    spec = build_mcp_server_specs(
+        42,
+        task_incarnation_id=TASK_INCARNATION,
+        **TASK_ACTIVE_GENERATION,
+    )[0]
+
+    api_base_index = spec.args.index("--api-base")
+    assert spec.args[api_base_index + 1] == "http://127.0.0.1:8803"
+
+
 def test_codex_main_server_advertises_monitor_only_for_confirmed_local_scope():
-    (claude_spec,) = build_mcp_server_specs(
+    claude_spec = build_mcp_server_specs(
         42,
         provider="claude",
         task_incarnation_id=TASK_INCARNATION,
         **TASK_ACTIVE_GENERATION,
-    )
-    (closed_codex_spec,) = build_mcp_server_specs(
+    )[0]
+    closed_codex_spec = build_mcp_server_specs(
         42,
         provider="codex",
         task_incarnation_id=TASK_INCARNATION,
         **TASK_ACTIVE_GENERATION,
-    )
-    (local_codex_spec,) = build_mcp_server_specs(
+    )[0]
+    local_codex_spec = build_mcp_server_specs(
         42,
         provider="codex",
         codex_monitor_enabled=True,
         task_incarnation_id=TASK_INCARNATION,
         **TASK_ACTIVE_GENERATION,
-    )
+    )[0]
 
     monitor_tools = {"create_monitor", "check_monitors", "stop_monitor"}
     assert monitor_tools.issubset(claude_spec.enabled_tools)
@@ -654,12 +893,12 @@ def test_platform_paths_are_preserved(monkeypatch, root, python):
     monkeypatch.setattr(mcp_config, "_VENV_PYTHON", python)
     monkeypatch.setattr(settings, "auth_token", "")
 
-    (spec,) = build_mcp_server_specs(
+    spec = build_mcp_server_specs(
         42,
         api_base="http://127.0.0.1:8000",
         task_incarnation_id=TASK_INCARNATION,
         **TASK_ACTIVE_GENERATION,
-    )
+    )[0]
     rendered = render_claude_mcp_config((spec,))
 
     assert spec.command == python
@@ -844,7 +1083,11 @@ def test_codex_renderers_share_each_role_spec(
 
     app_server_config = render_codex_mcp_config(specs)
 
-    assert set(app_server_config["mcp_servers"]) == {expected_name}
+    expected_names = {expected_name}
+    if expected_name == "ccm_skills":
+        expected_names.add("ccm_frontend_review")
+        expected_names.add("ccm_workspace_review")
+    assert set(app_server_config["mcp_servers"]) == expected_names
     assert (
         app_server_config["mcp_servers"][expected_name][
             "default_tools_approval_mode"

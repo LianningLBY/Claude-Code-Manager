@@ -40,6 +40,8 @@ import backend.models.worktree  # noqa: F401
 import backend.models.global_settings  # noqa: F401
 import backend.models.secret  # noqa: F401
 import backend.models.quick_phrase  # noqa: F401
+import backend.models.workspace_review  # noqa: F401
+import backend.models.test_harness  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.ssh_profile  # noqa: F401
 import backend.models.task_ssh_grant  # noqa: F401
@@ -59,8 +61,16 @@ PUBLISHED_BRANCH_MERGE_REVISION = "7e4b9c1d2a63"
 PR_REVIEW_PANEL_REVISION = "7a1d4e9c2b60"
 PR_FINDING_ACTIONS_REVISION = "b7c9e2f4a610"
 ATTENTION_TAG_REVISION = "2f6c8a1d4e90"
+WORKSPACE_REVIEW_REVISION = "5a7d2c9e1b40"
+TEST_HARNESS_REVISION = "7d2f4b9a6c10"
 FIRST_CLASS_PLAN_HEAD_REVISION = "d4a7c9e2f1b6"
 MAIN_PLAN_MERGE_REVISION = "e5b8d1c4a7f2"
+BROWSER_PLAN_MERGE_REVISION = "9f2c6b4d8a10"
+SANDBOX_LEASE_REVISION = "c8f1a2d4e6b9"
+RESOLVED_TARGET_REVISION = "d9a2b4c6e8f1"
+CHILD_BINDING_REVISION = "e0b3c5d7f9a1"
+ARCHIVE_STATE_REVISION = "f1c4e6a8b0d2"
+CHILD_LAUNCH_PROFILE_REVISION = "2a6c8e0f4b1d"
 SSH_PROFILES_REVISION = "73c4a9e1b2d0"
 TASK_SSH_GRANTS_REVISION = "84d5b0f2c3e1"
 TASK_SSH_POLICY_REVISION = "91e6a4c8d2f0"
@@ -69,6 +79,8 @@ MAIN_SSH_MERGE_REVISION = "f9b2c4d6e8a1"
 TASK_SCOPED_TOKEN_INCARNATION_REVISION = "b4e7c1a9d2f0"
 TASK_SSH_EFFECT_REVISION = "c2f8a6d4e1b9"
 DISCUSSION_LEASE_REVISION = "d1a9c4e7b260"
+COMBINED_BROWSER_MAIN_REVISION = "4e8a1c6d9b20"
+BROWSER_OPERATION_RECEIPT_REVISION = "6f3b9d2a7c10"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -79,7 +91,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = DISCUSSION_LEASE_REVISION
+CURRENT_HEAD_REVISION = BROWSER_OPERATION_RECEIPT_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -210,6 +222,27 @@ def _load_task_ssh_effect_migration(module_suffix: str = "test"):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _load_revision_migration(filename: str, module_suffix: str = "test"):
+    migration_path = PROJECT_ROOT / "alembic" / "versions" / filename
+    spec = importlib.util.spec_from_file_location(
+        f"revision_migration_{migration_path.stem}_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_browser_operation_receipt_migration(
+    module_suffix: str = "test",
+):
+    return _load_revision_migration(
+        "6f3b9d2a7c10_add_browser_operation_receipts.py",
+        module_suffix,
+    )
 
 
 def _mysql_terminal_state(
@@ -4708,7 +4741,13 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "ssh_profiles", "task_ssh_grants", "task_ssh_effect_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plan_agent_runtime_receipts", "plan_agent_worker_dispatch_receipts", "plan_agent_worker_import_receipts", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plan_agent_runtime_receipts", "plan_agent_worker_dispatch_receipts", "plan_agent_worker_import_receipts", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions", "workspace_review_runs", "test_harness_runs", "test_harness_attempts", "test_harness_events", "test_harness_evidence", "test_harness_findings", "test_harness_sandbox_leases", "test_harness_child_bindings"}
+        expected_tables |= {
+            "browser_review_operation_receipts",
+            "ssh_profiles",
+            "task_ssh_grants",
+            "task_ssh_effect_receipts",
+        }
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -4776,6 +4815,108 @@ class TestFreshMigration:
             "idempotency_key",
         ) in delivery_run_unique_columns
         assert ("source_todo_id",) in delivery_run_unique_columns
+
+        child_binding_cols = _get_table_columns(
+            engine, "test_harness_child_bindings"
+        )
+        assert {
+            "harness_run_id",
+            "workspace_review_run_id",
+            "owner_task_id",
+            "child_task_id",
+            "browser_review_job_id",
+            "state",
+            "launch_profile_version",
+            "provider",
+            "model",
+            "reasoning_effort",
+            "codex_service_tier",
+            "task_mode",
+            "launch_config_digest",
+            "owner_task_incarnation_id",
+            "owner_task_retry_count",
+            "owner_task_turn_generation",
+            "owner_task_status",
+            "child_task_incarnation_id",
+        }.issubset(child_binding_cols)
+
+        operation_receipt_cols = _get_table_columns(
+            engine,
+            "browser_review_operation_receipts",
+        )
+        assert {
+            "id",
+            "browser_review_job_id",
+            "operation_id",
+            "binding_id",
+            "harness_run_id",
+            "workspace_review_run_id",
+            "owner_task_id",
+            "owner_task_incarnation_id",
+            "owner_task_retry_count",
+            "owner_task_turn_generation",
+            "owner_task_status",
+            "child_task_id",
+            "child_task_incarnation_id",
+            "child_task_retry_count",
+            "child_task_turn_generation",
+            "child_task_status",
+            "action_kind",
+            "request_digest",
+            "execution_nonce_digest",
+            "status",
+            "ack_digest",
+            "result_data",
+            "error",
+            "created_at",
+            "acknowledged_at",
+        }.issubset(operation_receipt_cols)
+        operation_receipt_column_info = {
+            item["name"]: item
+            for item in inspect(engine).get_columns(
+                "browser_review_operation_receipts"
+            )
+        }
+        for generation_column in (
+            "owner_task_turn_generation",
+            "child_task_turn_generation",
+        ):
+            assert isinstance(
+                operation_receipt_column_info[generation_column]["type"],
+                BigInteger,
+            )
+
+        for run_table in ("test_harness_runs", "workspace_review_runs"):
+            run_cols = _get_table_columns(engine, run_table)
+            assert {
+                "owner_task_incarnation_id",
+                "owner_task_retry_count",
+                "owner_task_turn_generation",
+                "owner_task_status",
+            }.issubset(run_cols)
+        for identity_table in (
+            "test_harness_runs",
+            "workspace_review_runs",
+            "test_harness_child_bindings",
+        ):
+            identity_columns = {
+                item["name"]: item
+                for item in inspect(engine).get_columns(identity_table)
+            }
+            assert isinstance(
+                identity_columns["owner_task_turn_generation"]["type"],
+                BigInteger,
+            )
+
+        attempt_cols = _get_table_columns(engine, "test_harness_attempts")
+        assert {
+            "artifact_staging_root",
+            "artifact_archive_prefix",
+            "archive_state",
+            "archive_manifest",
+            "archive_error",
+            "archived_at",
+        }.issubset(attempt_cols)
 
         log_cols = _get_table_columns(engine, "log_entries")
         assert "loop_iteration" in log_cols
@@ -5017,6 +5158,561 @@ class TestFreshMigration:
             ).scalar_one()
         assert revision == CURRENT_HEAD_REVISION
         engine.dispose()
+
+    def test_archive_state_migration_preserves_legacy_pointer_and_roundtrips(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "archive-state-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, CHILD_BINDING_REVISION)
+
+        run_id = "a" * 32
+        attempt_id = "b" * 32
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_runs ("
+                    "id, target_kind, target_spec, test_plan, runtime_config, "
+                    "request_fingerprint, root_run_id, attempt_number, status, "
+                    "stage, stale, cleanup_status, event_sequence, created_at"
+                    ") VALUES ("
+                    ":id, 'fixed_url', '{}', '{}', '{}', :fingerprint, :id, "
+                    "1, 'completed', 'completed', 0, 'completed', 0, :created_at"
+                    ")"
+                ),
+                {
+                    "id": run_id,
+                    "fingerprint": "c" * 64,
+                    "created_at": "2026-08-08 00:00:00",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_attempts ("
+                    "id, run_id, ordinal, status, stage, provider, model, "
+                    "reasoning_effort, codex_service_tier, artifact_root, "
+                    "result_data, created_at"
+                    ") VALUES ("
+                    ":id, :run_id, 1, 'completed', 'completed', 'codex', "
+                    "'gpt-5.6-sol', 'medium', 'default', :artifact_root, '{}', "
+                    ":created_at"
+                    ")"
+                ),
+                {
+                    "id": attempt_id,
+                    "run_id": run_id,
+                    "artifact_root": "/private/tmp/legacy-browser-job",
+                    "created_at": "2026-08-08 00:00:00",
+                },
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, ARCHIVE_STATE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT artifact_staging_root, artifact_archive_prefix, "
+                    "archive_state, archive_manifest, archive_error, archived_at "
+                    "FROM test_harness_attempts WHERE id = :id"
+                ),
+                {"id": attempt_id},
+            ).one()
+        assert row.artifact_staging_root == "/private/tmp/legacy-browser-job"
+        assert row.artifact_archive_prefix is None
+        assert row.archive_state == "staging"
+        manifest = row.archive_manifest
+        if isinstance(manifest, str):
+            manifest = json.loads(manifest)
+        assert manifest == {}
+        assert row.archive_error is None
+        assert row.archived_at is None
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, CHILD_BINDING_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        attempt_cols = _get_table_columns(engine, "test_harness_attempts")
+        assert "artifact_root" in attempt_cols
+        assert "archive_state" not in attempt_cols
+        assert "artifact_staging_root" not in attempt_cols
+        engine.dispose()
+
+    def test_child_launch_profile_backfills_only_durable_task_identities(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "child-launch-profile-backfill.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, ARCHIVE_STATE_REVISION)
+
+        run_id = "a" * 32
+        workspace_id = "b" * 32
+        binding_id = "c" * 32
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO tasks ("
+                    "id, title, description, status, priority, "
+                    "target_branch, merge_status, retry_count, max_retries, "
+                    "mode, created_at"
+                    ") VALUES "
+                    "(1, 'owner', 'owner', 'completed', 0, "
+                    "'main', 'pending', 3, 0, 'auto', :created_at), "
+                    "(2, 'child', 'child', 'cancelled', 0, "
+                    "'main', 'pending', 0, 0, 'auto', :created_at)"
+                ),
+                {
+                    "created_at": "2026-08-09 00:00:00",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_runs ("
+                    "id, task_id, agent_task_id, target_kind, target_spec, "
+                    "test_plan, runtime_config, request_fingerprint, "
+                    "root_run_id, attempt_number, status, stage, stale, "
+                    "cleanup_status, event_sequence, created_at"
+                    ") VALUES ("
+                    ":id, 1, 2, 'fixed_url', '{}', '{}', '{}', :fingerprint, "
+                    ":id, 1, 'completed', 'completed', 0, 'completed', 0, "
+                    ":created_at)"
+                ),
+                {
+                    "id": run_id,
+                    "fingerprint": "3" * 64,
+                    "created_at": "2026-08-09 00:00:00",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO workspace_review_runs ("
+                    "id, task_id, agent_task_id, mode, profile, goal, status, "
+                    "stage, workspace_path, git_head, workspace_fingerprint, "
+                    "preview_config, stale, cleanup_status, created_at"
+                    ") VALUES ("
+                    ":id, 1, 2, 'review_only', 'standard', 'Review', "
+                    "'completed', 'completed', '/tmp/workspace', :head, "
+                    ":fingerprint, '{}', 0, 'completed', :created_at)"
+                ),
+                {
+                    "id": workspace_id,
+                    "head": "4" * 40,
+                    "fingerprint": "5" * 64,
+                    "created_at": "2026-08-09 00:00:00",
+                },
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO test_harness_child_bindings ("
+                    "id, harness_run_id, owner_task_id, child_task_id, "
+                    "browser_review_job_id, state, created_at"
+                    ") VALUES ("
+                    ":id, :run_id, 1, 2, 'legacy-job', 'stopped', :created_at)"
+                ),
+                {
+                    "id": binding_id,
+                    "run_id": run_id,
+                    "created_at": "2026-08-09 00:00:00",
+                },
+            )
+        engine.dispose()
+
+        # Bring the independent main branch to its published head. Delivery
+        # introduced Task incarnation/turn identity after the Browser branch
+        # had already shipped, so a database at this point legitimately has
+        # both f1c4... and d3c8... stamped until the new merge revision runs.
+        _run_alembic(cfg, command.upgrade, WORKER_PLAN_IMPORT_RECEIPT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "UPDATE tasks SET incarnation_id = :incarnation, "
+                    "turn_generation = :generation WHERE id = :task_id"
+                ),
+                [
+                    {
+                        "incarnation": "1" * 32,
+                        "generation": 2**31 + 7,
+                        "task_id": 1,
+                    },
+                    {
+                        "incarnation": "2" * 32,
+                        "generation": 2**31 + 5,
+                        "task_id": 2,
+                    },
+                ],
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CHILD_LAUNCH_PROFILE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            task_identities = {
+                row.id: (
+                    row.incarnation_id,
+                    row.retry_count,
+                    row.turn_generation,
+                    row.status,
+                )
+                for row in conn.execute(
+                    text(
+                        "SELECT id, incarnation_id, retry_count, "
+                        "turn_generation, status FROM tasks WHERE id IN (1, 2)"
+                    )
+                )
+            }
+            run = conn.execute(
+                text(
+                    "SELECT owner_task_incarnation_id, "
+                    "owner_task_retry_count, owner_task_turn_generation, "
+                    "owner_task_status FROM test_harness_runs WHERE id = :id"
+                ),
+                {"id": run_id},
+            ).one()
+            workspace = conn.execute(
+                text(
+                    "SELECT owner_task_incarnation_id, "
+                    "owner_task_retry_count, owner_task_turn_generation, "
+                    "owner_task_status FROM workspace_review_runs WHERE id = :id"
+                ),
+                {"id": workspace_id},
+            ).one()
+            binding = conn.execute(
+                text(
+                    "SELECT owner_task_incarnation_id, "
+                    "owner_task_retry_count, owner_task_turn_generation, "
+                    "owner_task_status, child_task_incarnation_id, "
+                    "launch_profile_version, launch_config_digest "
+                    "FROM test_harness_child_bindings WHERE id = :id"
+                ),
+                {"id": binding_id},
+            ).one()
+        owner_identity = task_identities[1]
+        child_identity = task_identities[2]
+        assert isinstance(owner_identity[0], str) and len(owner_identity[0]) == 32
+        assert isinstance(child_identity[0], str) and len(child_identity[0]) == 32
+        assert owner_identity == ("1" * 32, 3, 2**31 + 7, "completed")
+        assert child_identity == ("2" * 32, 0, 2**31 + 5, "cancelled")
+        assert tuple(run) == owner_identity
+        assert tuple(workspace) == owner_identity
+        assert tuple(binding) == (
+            *owner_identity,
+            child_identity[0],
+            None,
+            None,
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, ARCHIVE_STATE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "owner_task_incarnation_id" not in _get_table_columns(
+            engine,
+            "test_harness_runs",
+        )
+        assert "launch_profile_version" not in _get_table_columns(
+            engine,
+            "test_harness_child_bindings",
+        )
+        engine.dispose()
+
+    def test_browser_operation_receipt_migration_roundtrip(self, tmp_path):
+        db_path = str(tmp_path / "browser-operation-receipt-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            COMBINED_BROWSER_MAIN_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            "browser_review_operation_receipts"
+            not in _get_all_tables(engine)
+        )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert set(_get_table_columns(
+            engine,
+            "browser_review_operation_receipts",
+        )) == {
+            "id",
+            "browser_review_job_id",
+            "operation_id",
+            "binding_id",
+            "harness_run_id",
+            "workspace_review_run_id",
+            "owner_task_id",
+            "owner_task_incarnation_id",
+            "owner_task_retry_count",
+            "owner_task_turn_generation",
+            "owner_task_status",
+            "child_task_id",
+            "child_task_incarnation_id",
+            "child_task_retry_count",
+            "child_task_turn_generation",
+            "child_task_status",
+            "action_kind",
+            "request_digest",
+            "execution_nonce_digest",
+            "status",
+            "ack_digest",
+            "result_data",
+            "error",
+            "created_at",
+            "acknowledged_at",
+        }
+        assert {
+            tuple(constraint["column_names"])
+            for constraint in inspector.get_unique_constraints(
+                "browser_review_operation_receipts"
+            )
+        } == {("browser_review_job_id", "operation_id")}
+        assert {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints(
+                "browser_review_operation_receipts"
+            )
+        } == {"ck_browser_review_operation_status"}
+        assert {
+            index["name"]
+            for index in inspector.get_indexes(
+                "browser_review_operation_receipts"
+            )
+        } == {
+            "ix_browser_review_operation_receipts_binding_id",
+            "ix_browser_review_operation_receipts_browser_review_job_id",
+            "ix_browser_review_operation_receipts_child_task_id",
+            "ix_browser_review_operation_receipts_harness_run_id",
+            "ix_browser_review_operation_receipts_owner_task_id",
+            "ix_browser_review_operation_receipts_status",
+            "ix_browser_review_operation_receipts_workspace_review_run_id",
+        }
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            COMBINED_BROWSER_MAIN_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            "browser_review_operation_receipts"
+            not in _get_all_tables(engine)
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == COMBINED_BROWSER_MAIN_REVISION
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "browser_review_operation_receipts" in _get_all_tables(engine)
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == BROWSER_OPERATION_RECEIPT_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        "status",
+        ["permitted", "completed", "uncertain"],
+    )
+    def test_browser_operation_receipt_downgrade_refuses_evidence(
+        self,
+        tmp_path,
+        status,
+    ):
+        db_path = str(tmp_path / f"browser-operation-{status}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO browser_review_operation_receipts (
+                    id, browser_review_job_id, operation_id, binding_id,
+                    harness_run_id, workspace_review_run_id,
+                    owner_task_id, owner_task_incarnation_id,
+                    owner_task_retry_count, owner_task_turn_generation,
+                    owner_task_status, child_task_id,
+                    child_task_incarnation_id, child_task_retry_count,
+                    child_task_turn_generation, child_task_status,
+                    action_kind, request_digest, execution_nonce_digest,
+                    status, ack_digest, result_data, error, created_at,
+                    acknowledged_at
+                ) VALUES (
+                    :id, :job_id, :operation_id, :binding_id,
+                    :harness_run_id, NULL,
+                    1, :owner_incarnation_id,
+                    0, 0, 'completed', 2,
+                    :child_incarnation_id, 0,
+                    0, 'in_progress',
+                    'click', :request_digest, :nonce_digest,
+                    :status, NULL, '{}', NULL,
+                    '2026-08-09 00:00:00', NULL
+                )
+            """), {
+                "id": "a" * 32,
+                "job_id": "b" * 32,
+                "operation_id": "operation-1",
+                "binding_id": "c" * 32,
+                "harness_run_id": "d" * 32,
+                "owner_incarnation_id": "e" * 32,
+                "child_incarnation_id": "f" * 32,
+                "request_digest": "1" * 64,
+                "nonce_digest": "2" * 64,
+                "status": status,
+            })
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="permanent.*evidence"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                COMBINED_BROWSER_MAIN_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT status FROM browser_review_operation_receipts"
+            )).scalar_one() == status
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == BROWSER_OPERATION_RECEIPT_REVISION
+        engine.dispose()
+
+    def test_browser_operation_receipt_offline_downgrade_fails_closed(
+        self,
+        monkeypatch,
+    ):
+        module = _load_browser_operation_receipt_migration(
+            "offline_downgrade"
+        )
+        monkeypatch.setattr(module.context, "is_offline_mode", lambda: True)
+        get_bind = MagicMock()
+        monkeypatch.setattr(module.op, "get_bind", get_bind)
+
+        with pytest.raises(RuntimeError, match="Offline.*downgrade.*refused"):
+            module._assert_downgrade_safe()
+
+        get_bind.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_table",
+        [
+            "test_harness_child_bindings",
+            "task_ssh_effect_receipts",
+            "project_shares",
+            "instances",
+        ],
+    )
+    def test_browser_operation_mysql_preflight_rejects_non_innodb(
+        self,
+        monkeypatch,
+        bad_table,
+    ):
+        module = _load_browser_operation_receipt_migration(
+            "mysql_preflight"
+        )
+        rows = [
+            (table, "MyISAM" if table == bad_table else "InnoDB")
+            for table in module._MYSQL_TRANSACTION_TABLES
+        ]
+        bind = SimpleNamespace(
+            execute=MagicMock(
+                return_value=SimpleNamespace(all=lambda: rows)
+            ),
+        )
+        monkeypatch.setattr(
+            module.op,
+            "get_context",
+            lambda: SimpleNamespace(
+                dialect=SimpleNamespace(name="mysql")
+            ),
+        )
+        monkeypatch.setattr(module.context, "is_offline_mode", lambda: False)
+        monkeypatch.setattr(module.op, "get_bind", lambda: bind)
+
+        with pytest.raises(
+            RuntimeError,
+            match=bad_table,
+        ):
+            module._require_mysql_transaction_tables()
+
+        bind.execute.assert_called_once()
+
+    def test_browser_operation_mysql_preflight_accepts_all_innodb(
+        self,
+        monkeypatch,
+    ):
+        module = _load_browser_operation_receipt_migration(
+            "mysql_preflight_ok"
+        )
+        rows = [
+            (table, "InnoDB")
+            for table in module._MYSQL_TRANSACTION_TABLES
+        ]
+        bind = SimpleNamespace(
+            execute=MagicMock(
+                return_value=SimpleNamespace(all=lambda: rows)
+            ),
+        )
+        monkeypatch.setattr(
+            module.op,
+            "get_context",
+            lambda: SimpleNamespace(
+                dialect=SimpleNamespace(name="mysql")
+            ),
+        )
+        monkeypatch.setattr(module.context, "is_offline_mode", lambda: False)
+        monkeypatch.setattr(module.op, "get_bind", lambda: bind)
+
+        module._require_mysql_transaction_tables()
+
+        bind.execute.assert_called_once()
+
+    def test_browser_operation_mysql_offline_upgrade_fails_closed(
+        self,
+        monkeypatch,
+    ):
+        module = _load_browser_operation_receipt_migration(
+            "mysql_offline_upgrade"
+        )
+        monkeypatch.setattr(
+            module.op,
+            "get_context",
+            lambda: SimpleNamespace(
+                dialect=SimpleNamespace(name="mysql")
+            ),
+        )
+        monkeypatch.setattr(module.context, "is_offline_mode", lambda: True)
+        get_bind = MagicMock()
+        monkeypatch.setattr(module.op, "get_bind", get_bind)
+
+        with pytest.raises(RuntimeError, match="Offline.*upgrade.*refused"):
+            module._require_mysql_transaction_tables()
+
+        get_bind.assert_not_called()
 
 
 class TestAlreadyMigratedDb:
@@ -5961,6 +6657,148 @@ class TestSchemaConsistency:
         mysql_ddl = str(CreateTable(table).compile(dialect=mysql.dialect()))
         assert "ENGINE=InnoDB" in mysql_ddl
 
+    def test_transactional_feature_metadata_uses_innodb_on_mysql(self):
+        for table_name in (
+            "workspace_review_runs",
+            "test_harness_runs",
+            "test_harness_attempts",
+            "test_harness_events",
+            "test_harness_evidence",
+            "test_harness_findings",
+            "test_harness_sandbox_leases",
+            "test_harness_child_bindings",
+            "browser_review_operation_receipts",
+            "ssh_profiles",
+            "task_ssh_grants",
+            "task_ssh_effect_receipts",
+        ):
+            table = Base.metadata.tables[table_name]
+            mysql_ddl = str(
+                CreateTable(table).compile(dialect=mysql.dialect())
+            )
+            assert "ENGINE=InnoDB" in mysql_ddl, table_name
+
+    @pytest.mark.parametrize(
+        ("filename", "table_names"),
+        [
+            (
+                "5a7d2c9e1b40_add_workspace_review_runs.py",
+                ("workspace_review_runs",),
+            ),
+            (
+                "7d2f4b9a6c10_add_test_harness_records.py",
+                (
+                    "test_harness_runs",
+                    "test_harness_attempts",
+                    "test_harness_events",
+                    "test_harness_evidence",
+                    "test_harness_findings",
+                ),
+            ),
+            (
+                "c8f1a2d4e6b9_add_test_harness_sandbox_leases.py",
+                ("test_harness_sandbox_leases",),
+            ),
+            (
+                "e0b3c5d7f9a1_add_test_harness_child_bindings.py",
+                ("test_harness_child_bindings",),
+            ),
+            (
+                "6f3b9d2a7c10_add_browser_operation_receipts.py",
+                ("browser_review_operation_receipts",),
+            ),
+            (
+                "73c4a9e1b2d0_add_managed_ssh_profiles.py",
+                ("ssh_profiles",),
+            ),
+            (
+                "84d5b0f2c3e1_add_task_ssh_grants.py",
+                ("task_ssh_grants",),
+            ),
+            (
+                "c2f8a6d4e1b9_add_task_ssh_effect_receipts.py",
+                ("task_ssh_effect_receipts",),
+            ),
+        ],
+    )
+    def test_transactional_feature_migrations_use_innodb_on_mysql(
+        self,
+        filename,
+        table_names,
+    ):
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        module = _load_revision_migration(filename, "mysql_innodb")
+        output = io.StringIO()
+        migration_context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        patches = {"op": Operations(migration_context)}
+        if hasattr(module, "_require_mysql_transaction_tables"):
+            patches["_require_mysql_transaction_tables"] = lambda: None
+        with patch.multiple(module, **patches):
+            module.upgrade()
+
+        ddl = output.getvalue()
+        for table_name in table_names:
+            start = ddl.index(f"CREATE TABLE {table_name}")
+            statement = ddl[start:ddl.index(";", start)]
+            assert "ENGINE=InnoDB" in statement, table_name
+
+    @pytest.mark.parametrize(
+        ("filename", "expected_default"),
+        [
+            (
+                "91e6a4c8d2f0_add_ssh_profile_task_policy.py",
+                "task_capabilities JSON NOT NULL DEFAULT ('[]')",
+            ),
+            (
+                "a6d9f2c4e8b1_add_ssh_profile_allowed_roots.py",
+                "allowed_roots JSON NOT NULL DEFAULT ('[\"/\"]')",
+            ),
+            (
+                "f1c4e6a8b0d2_add_test_harness_archive_state.py",
+                "archive_manifest JSON NOT NULL DEFAULT ('{}')",
+            ),
+        ],
+    )
+    def test_json_defaults_compile_as_mysql_expressions(
+        self,
+        filename,
+        expected_default,
+    ):
+        from alembic.migration import MigrationContext
+        from alembic.operations import Operations
+
+        module = _load_revision_migration(filename, "mysql_json_default")
+        output = io.StringIO()
+        migration_context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(migration_context)):
+            module.upgrade()
+
+        ddl = " ".join(output.getvalue().split())
+        assert expected_default in ddl
+
+    def test_json_default_metadata_compiles_as_mysql_expressions(self):
+        ssh_ddl = " ".join(str(CreateTable(
+            Base.metadata.tables["ssh_profiles"]
+        ).compile(dialect=mysql.dialect())).split())
+        assert "task_capabilities JSON NOT NULL DEFAULT ('[]')" in ssh_ddl
+        assert (
+            "allowed_roots JSON NOT NULL DEFAULT ('[\"/\"]')"
+            in ssh_ddl
+        )
+
+        attempt_ddl = " ".join(str(CreateTable(
+            Base.metadata.tables["test_harness_attempts"]
+        ).compile(dialect=mysql.dialect())).split())
+        assert "archive_manifest JSON NOT NULL DEFAULT ('{}')" in attempt_ddl
+
     def test_worker_termination_constraints_compile_on_all_dialects(self):
         table = Base.metadata.tables["worker_task_termination_receipts"]
         for dialect in (
@@ -6534,7 +7372,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_head_after_main_ssh_merge(self, tmp_path):
+    def test_migration_graph_has_one_combined_head(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -6542,6 +7380,45 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == COMBINED_BROWSER_MAIN_REVISION
+        )
+        assert set(
+            script.get_revision(COMBINED_BROWSER_MAIN_REVISION).down_revision
+        ) == {
+            CHILD_LAUNCH_PROFILE_REVISION,
+            DISCUSSION_LEASE_REVISION,
+        }
+        assert set(
+            script.get_revision(CHILD_LAUNCH_PROFILE_REVISION).down_revision
+        ) == {ARCHIVE_STATE_REVISION, WORKER_PLAN_IMPORT_RECEIPT_REVISION}
+        assert script.get_revision(ARCHIVE_STATE_REVISION).down_revision == CHILD_BINDING_REVISION
+        assert (
+            script.get_revision(CHILD_BINDING_REVISION).down_revision
+            == RESOLVED_TARGET_REVISION
+        )
+        assert (
+            script.get_revision(RESOLVED_TARGET_REVISION).down_revision
+            == SANDBOX_LEASE_REVISION
+        )
+        assert (
+            script.get_revision(SANDBOX_LEASE_REVISION).down_revision
+            == BROWSER_PLAN_MERGE_REVISION
+        )
+        assert (
+            script.get_revision(BROWSER_PLAN_MERGE_REVISION).down_revision
+            == (TEST_HARNESS_REVISION, MAIN_PLAN_MERGE_REVISION)
+        )
+        assert (
+            script.get_revision(TEST_HARNESS_REVISION).down_revision
+            == WORKSPACE_REVIEW_REVISION
+        )
+        assert (
+            script.get_revision(WORKSPACE_REVIEW_REVISION).down_revision
+            == ATTENTION_TAG_REVISION
+        )
+
+        assert (
+            script.get_revision(DISCUSSION_LEASE_REVISION).down_revision
             == TASK_SSH_EFFECT_REVISION
         )
         assert (
@@ -6632,6 +7509,66 @@ class TestPublishedMigrationHistory:
             == PUBLISHED_BRANCH_MERGE_REVISION
         )
 
+    @pytest.mark.parametrize(
+        "parent_revision",
+        [CHILD_LAUNCH_PROFILE_REVISION, DISCUSSION_LEASE_REVISION],
+    )
+    def test_each_combined_parent_upgrades_to_browser_operation_head(
+        self,
+        tmp_path,
+        parent_revision,
+    ):
+        db_path = str(tmp_path / f"combined-parent-{parent_revision}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, parent_revision)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalars().all() == [parent_revision]
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "browser_review_operation_receipts" in _get_all_tables(engine)
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    def test_combined_browser_main_merge_downgrades_and_reupgrades(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "combined-browser-main-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, COMBINED_BROWSER_MAIN_REVISION)
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            CHILD_LAUNCH_PROFILE_REVISION,
+        )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert set(conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalars()) == {
+                CHILD_LAUNCH_PROFILE_REVISION,
+                DISCUSSION_LEASE_REVISION,
+            }
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, COMBINED_BROWSER_MAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == COMBINED_BROWSER_MAIN_REVISION
+        engine.dispose()
+
     def test_deployed_main_plan_head_upgrades_to_capability_head(self, tmp_path):
         db_path = str(tmp_path / "main-plan-to-capability.db")
         cfg = _alembic_cfg(db_path)
@@ -6670,6 +7607,43 @@ class TestPublishedMigrationHistory:
         task_columns = _get_table_columns(engine, "tasks")
         assert "attention_tag" in task_columns
         assert "plan_target_task_id" in task_columns
+        with engine.connect() as conn:
+            assert conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar_one() == CURRENT_HEAD_REVISION
+        engine.dispose()
+
+    def test_deployed_browser_harness_head_upgrades_to_combined_plan_head(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "browser-to-combined.db")
+        cfg = _alembic_cfg(db_path)
+
+        # This is the exact state deployed by the browser feature branch before
+        # it was rebased onto the first-class Plan migration history.
+        _run_alembic(cfg, command.upgrade, TEST_HARNESS_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        tables = _get_all_tables(engine)
+        assert "workspace_review_runs" in tables
+        assert "test_harness_runs" in tables
+        assert "plans" not in tables
+        assert "plan_pipeline_config" not in _get_table_columns(
+            engine,
+            "global_settings",
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        tables = _get_all_tables(engine)
+        assert "workspace_review_runs" in tables
+        assert "test_harness_runs" in tables
+        assert "plans" in tables
+        assert "plan_pipeline_config" in _get_table_columns(
+            engine,
+            "global_settings",
+        )
         with engine.connect() as conn:
             assert conn.execute(
                 text("SELECT version_num FROM alembic_version")

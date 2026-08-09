@@ -35,9 +35,19 @@ from backend.models.plan_agent import (
 from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.test_harness import (
+    TestHarnessAttempt,
+    TestHarnessChildBinding,
+    TestHarnessEvent,
+    TestHarnessEvidence,
+    TestHarnessFinding,
+    TestHarnessRun,
+    TestHarnessSandboxLease,
+)
 from backend.models.task_share import TaskShare
 from backend.models.team_share import TeamTaskShare
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
+from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.delivery_service import DeliveryCreateSpec, create_delivery_run
 from backend.services.task_sharing import lock_task_share_authority
 from backend.services.task_queue import (
@@ -48,6 +58,7 @@ from backend.services.task_queue import (
     task_delete_fence,
     task_generation_fence,
 )
+from backend.services.test_harness_children import TestHarnessChildService
 
 
 @pytest_asyncio.fixture
@@ -119,6 +130,165 @@ async def _pending_delivery_task(queue: TaskQueue, *, admitted: bool) -> Task:
     await queue.db.commit()
     await queue.db.refresh(task)
     return task
+
+
+async def _terminal_browser_owner_graph(
+    queue: TaskQueue,
+) -> tuple[int, int, str, str, int]:
+    """Create a fully terminal owner -> Harness -> Browser child graph."""
+
+    owner = await queue.create(
+        title="Harness delete owner",
+        description="durable owner",
+        status="completed",
+        archived=True,
+        provider="codex",
+        model="gpt-5.6-sol",
+        effort_level="high",
+    )
+    owner_id = owner.id
+    run_id = "a" * 32
+    queue.db.add(
+        TestHarnessRun(
+            id=run_id,
+            task_id=owner_id,
+            owner_task_incarnation_id=owner.incarnation_id,
+            owner_task_retry_count=owner.retry_count,
+            owner_task_turn_generation=owner.turn_generation,
+            owner_task_status=owner.status,
+            target_kind="fixed_url",
+            target_spec={"url": "https://example.com"},
+            test_plan={"objective": "Review"},
+            runtime_config={"provider": "codex"},
+            request_fingerprint="b" * 64,
+            root_run_id=run_id,
+            status="running",
+            stage="waiting_for_browser",
+        )
+    )
+    await queue.db.commit()
+    sessions = async_sessionmaker(
+        queue.db.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    child_service = TestHarnessChildService(db_factory=sessions)
+    child, binding = await child_service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-delete-graph",
+        harness_run_id=run_id,
+        child_values={
+            "title": "Immutable Browser child",
+            "description": "Review the frozen target",
+            "priority": 0,
+            "max_retries": 0,
+            "mode": "auto",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "default",
+            "effort_level": "high",
+            "enabled_skills": {"browser-review": "job-delete-graph"},
+            "archived": True,
+        },
+    )
+    child_id = child.id
+    binding_id = binding.id
+    await child_service.abort_reservation(
+        binding_id,
+        RuntimeError("terminal before launch"),
+    )
+
+    queue.db.expire_all()
+    run = await queue.db.get(TestHarnessRun, run_id)
+    durable_child = await queue.db.get(Task, child_id)
+    assert run is not None and durable_child is not None
+    run.status = "completed"
+    run.stage = "completed"
+    run.cleanup_status = "completed"
+    run.completed_at = datetime.utcnow()
+    instance = Instance(
+        name="terminal Browser instance",
+        status="stopped",
+        current_task_id=child_id,
+    )
+    queue.db.add(instance)
+    await queue.db.flush()
+    durable_child.instance_id = instance.id
+    queue.db.add_all(
+        [
+            LogEntry(
+                task_id=child_id,
+                event_type="message",
+                role="assistant",
+                content="private child output",
+            ),
+            LogEntry(
+                task_id=owner_id,
+                event_type="system_event",
+                content="private owner output",
+            ),
+            *_task_access_grants(child_id, suffix="browser-child"),
+            TestHarnessAttempt(
+                id="c" * 32,
+                run_id=run_id,
+                ordinal=1,
+                status="completed",
+                stage="completed",
+                provider="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+                codex_service_tier="default",
+                browser_review_job_id="job-delete-graph",
+                archive_state="complete",
+                archive_manifest={"version": 1, "expected": [], "archived": {}},
+                result_data={},
+            ),
+            TestHarnessEvent(
+                run_id=run_id,
+                sequence=1,
+                event_type="lifecycle",
+                title="complete",
+                data={},
+            ),
+            TestHarnessEvidence(
+                id="d" * 32,
+                run_id=run_id,
+                attempt_id="c" * 32,
+                kind="report",
+                name="report.md",
+                content_type="text/markdown",
+                storage_path="runs/task-1/report.md",
+                sha256="e" * 64,
+                byte_size=1,
+                metadata_={},
+            ),
+            TestHarnessFinding(
+                id="f" * 32,
+                run_id=run_id,
+                ordinal=1,
+                fingerprint="1" * 64,
+                scenario_id="page",
+                severity="low",
+                category="visual",
+                title="finding",
+                reproduction=[],
+                evidence_names=[],
+            ),
+            TestHarnessSandboxLease(
+                id="2" * 32,
+                run_id=run_id,
+                backend="docker",
+                lease_nonce="nonce-delete-graph",
+                image_ref="sandbox:test",
+                status="stopped",
+                phase="cleaned",
+                runtime_metadata={},
+                cleanup_status="completed",
+            ),
+        ]
+    )
+    await queue.db.commit()
+    return owner_id, child_id, run_id, binding_id, instance.id
 
 
 @pytest.mark.asyncio
@@ -955,6 +1125,340 @@ def _task_access_grants(task_id: int, *, suffix: str):
             shared_by=7,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_delete_harness_owner_removes_terminal_child_and_fk_off_graph(queue):
+    owner_id, child_id, run_id, binding_id, instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+    await queue.db.execute(text("PRAGMA foreign_keys=OFF"))
+
+    assert await queue.delete(owner_id) is True
+    assert await queue.db.get(Task, owner_id) is None
+    assert await queue.db.get(Task, child_id) is None
+    assert await queue.db.get(TestHarnessRun, run_id) is None
+    assert await queue.db.get(TestHarnessChildBinding, binding_id) is None
+    for model in (
+        TestHarnessAttempt,
+        TestHarnessEvent,
+        TestHarnessEvidence,
+        TestHarnessFinding,
+        TestHarnessSandboxLease,
+    ):
+        assert await queue.db.scalar(select(model).limit(1)) is None
+    assert await queue.db.scalar(
+        select(LogEntry.id).where(LogEntry.task_id.in_((owner_id, child_id)))
+    ) is None
+    assert await queue.db.scalar(
+        select(TaskShare.id).where(TaskShare.task_id == child_id)
+    ) is None
+    assert await queue.db.scalar(
+        select(TeamTaskShare.id).where(TeamTaskShare.task_id == child_id)
+    ) is None
+    instance = await queue.db.get(Instance, instance_id)
+    assert instance is not None
+    assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_delete_harness_owner_immediately_removes_archived_evidence_file(
+    queue,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services import test_harness_artifacts as artifact_module
+    from backend.services.test_harness_artifacts import TestHarnessArtifactStore
+
+    owner_id, _child_id, run_id, _binding_id, _instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+    store = TestHarnessArtifactStore(
+        tmp_path / "harness-artifacts",
+        max_file_bytes=1024,
+        max_run_bytes=2048,
+        max_task_bytes=4096,
+        max_total_bytes=8192,
+    )
+    source = tmp_path / "report.md"
+    source.write_text("private archived evidence", encoding="utf-8")
+    archived = store.archive(
+        source,
+        task_id=owner_id,
+        run_id=run_id,
+        attempt_id="c" * 32,
+        name="report.md",
+    )
+    evidence = await queue.db.get(TestHarnessEvidence, "d" * 32)
+    assert evidence is not None
+    evidence.storage_path = archived.storage_key
+    evidence.sha256 = archived.sha256
+    evidence.byte_size = archived.byte_size
+    await queue.db.commit()
+    monkeypatch.setattr(
+        artifact_module,
+        "test_harness_artifact_store",
+        store,
+    )
+
+    assert archived.path.is_file()
+    assert await queue.delete(owner_id) is True
+    assert not archived.path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_kind", ["harness", "workspace"])
+@pytest.mark.parametrize("cleanup_status", ["pending", "failed", "unconfirmed"])
+async def test_delete_harness_owner_preserves_unproven_cleanup_graph(
+    queue,
+    run_kind,
+    cleanup_status,
+):
+    owner_id, child_id, run_id, binding_id, _instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+    owner = await queue.db.get(Task, owner_id)
+    run = await queue.db.get(TestHarnessRun, run_id)
+    assert owner is not None and run is not None
+    if run_kind == "harness":
+        run.cleanup_status = cleanup_status
+        run.cleanup_error = "cleanup was not proven"
+    else:
+        workspace_id = "9" * 32
+        run.workspace_review_run_id = workspace_id
+        queue.db.add(
+            WorkspaceReviewRun(
+                id=workspace_id,
+                task_id=owner_id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                harness_run_id=run_id,
+                agent_task_id=child_id,
+                browser_review_job_id="job-delete-graph",
+                mode="review_only",
+                profile="standard",
+                goal="Review",
+                status="completed",
+                stage="completed",
+                workspace_path="/tmp/workspace",
+                git_head="a" * 40,
+                workspace_fingerprint="b" * 64,
+                preview_config={},
+                cleanup_status=cleanup_status,
+                cleanup_error="cleanup was not proven",
+                completed_at=datetime.utcnow(),
+            )
+        )
+    await queue.db.commit()
+
+    assert await queue.delete(owner_id) is False
+    assert await queue.db.get(Task, owner_id) is not None
+    assert await queue.db.get(Task, child_id) is not None
+    assert await queue.db.get(TestHarnessRun, run_id) is not None
+    assert await queue.db.get(TestHarnessChildBinding, binding_id) is not None
+    if run_kind == "workspace":
+        assert await queue.db.get(WorkspaceReviewRun, "9" * 32) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "downstream_kind",
+    ["harness", "workspace", "binding", "plan"],
+)
+async def test_delete_harness_owner_rejects_browser_child_downstream_ownership(
+    queue,
+    downstream_kind,
+):
+    owner_id, child_id, run_id, binding_id, _instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+    child = await queue.db.get(Task, child_id)
+    assert child is not None
+    if downstream_kind == "harness":
+        queue.db.add(
+            TestHarnessRun(
+                id="3" * 32,
+                task_id=child_id,
+                owner_task_incarnation_id=child.incarnation_id,
+                owner_task_retry_count=child.retry_count,
+                owner_task_turn_generation=child.turn_generation,
+                owner_task_status=child.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://nested.example"},
+                test_plan={"objective": "Nested review"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="4" * 64,
+                root_run_id="3" * 32,
+                status="completed",
+                stage="completed",
+                cleanup_status="completed",
+                completed_at=datetime.utcnow(),
+            )
+        )
+    elif downstream_kind == "workspace":
+        queue.db.add(
+            WorkspaceReviewRun(
+                id="5" * 32,
+                task_id=child_id,
+                owner_task_incarnation_id=child.incarnation_id,
+                owner_task_retry_count=child.retry_count,
+                owner_task_turn_generation=child.turn_generation,
+                owner_task_status=child.status,
+                mode="review_only",
+                profile="standard",
+                goal="Nested workspace review",
+                status="completed",
+                stage="completed",
+                workspace_path="/tmp/nested-workspace",
+                git_head="6" * 40,
+                workspace_fingerprint="7" * 64,
+                preview_config={},
+                cleanup_status="completed",
+                completed_at=datetime.utcnow(),
+            )
+        )
+    elif downstream_kind == "binding":
+        nested_child = Task(
+            title="Nested Browser child",
+            description="must not be orphaned",
+            status="cancelled",
+            archived=True,
+        )
+        queue.db.add(nested_child)
+        await queue.db.flush()
+        queue.db.add(
+            TestHarnessChildBinding(
+                id="8" * 32,
+                harness_run_id="3" * 32,
+                owner_task_id=child_id,
+                owner_task_incarnation_id=child.incarnation_id,
+                owner_task_retry_count=child.retry_count,
+                owner_task_turn_generation=child.turn_generation,
+                owner_task_status=child.status,
+                child_task_id=nested_child.id,
+                child_task_incarnation_id=nested_child.incarnation_id,
+                browser_review_job_id="nested-browser-job",
+                state="stopped",
+                completed_at=datetime.utcnow(),
+            )
+        )
+    else:
+        queue.db.add(
+            Plan(
+                title="Nested child Plan",
+                initial_request="must retain this downstream aggregate",
+                target_task_id=child_id,
+                pipeline_config={},
+            )
+        )
+    await queue.db.commit()
+
+    assert await queue.delete(owner_id) is False
+    assert await queue.db.get(Task, owner_id) is not None
+    assert await queue.db.get(Task, child_id) is not None
+    assert await queue.db.get(TestHarnessRun, run_id) is not None
+    assert await queue.db.get(TestHarnessChildBinding, binding_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_harness_child_directly_never_detaches_owner_graph(queue):
+    owner_id, child_id, run_id, binding_id, _instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+
+    assert await queue.delete(child_id) is False
+    assert await queue.db.get(Task, owner_id) is not None
+    assert await queue.db.get(Task, child_id) is not None
+    assert await queue.db.get(TestHarnessRun, run_id) is not None
+    assert await queue.db.get(TestHarnessChildBinding, binding_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_owner_and_child_delete_keep_owner_first_task_lock_order(
+    queue,
+):
+    owner_id, child_id, _run_id, _binding_id, _instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+    sessions = async_sessionmaker(
+        queue.db.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    await queue.db.rollback()
+
+    async def delete(task_id: int) -> bool:
+        async with sessions() as db:
+            return await TaskQueue(db).delete(task_id)
+
+    owner_result, child_result = await asyncio.wait_for(
+        asyncio.gather(delete(owner_id), delete(child_id)),
+        timeout=2,
+    )
+
+    assert owner_result is True
+    assert child_result is False
+    async with sessions() as db:
+        assert await db.get(Task, owner_id) is None
+        assert await db.get(Task, child_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_harness_owner_rejects_reused_task_id_incarnation(queue):
+    owner_id, child_id, run_id, binding_id, _instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+    old_incarnation = (
+        await queue.db.get(Task, owner_id)
+    ).incarnation_id
+    await queue.db.execute(delete(Task).where(Task.id == owner_id))
+    await queue.db.commit()
+    replacement = await queue.create(
+        id=owner_id,
+        title="Reused owner integer",
+        description="different security identity",
+        status="completed",
+    )
+    assert replacement.incarnation_id != old_incarnation
+
+    assert await queue.delete(owner_id) is False
+    assert await queue.db.get(Task, owner_id) is not None
+    assert await queue.db.get(Task, child_id) is not None
+    assert await queue.db.get(TestHarnessRun, run_id) is not None
+    assert await queue.db.get(TestHarnessChildBinding, binding_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_harness_graph_exception_rolls_back_every_row(queue):
+    owner_id, child_id, run_id, binding_id, instance_id = (
+        await _terminal_browser_owner_graph(queue)
+    )
+
+    async def fail_mid_graph(db, graph):
+        await db.execute(
+            delete(TestHarnessEvent).where(TestHarnessEvent.run_id == run_id)
+        )
+        raise RuntimeError("injected Harness graph failure")
+
+    with patch(
+        "backend.services.task_queue._delete_test_harness_graph",
+        new=fail_mid_graph,
+    ):
+        with pytest.raises(RuntimeError, match="injected Harness graph failure"):
+            await queue.delete(owner_id)
+
+    queue.db.expire_all()
+    assert await queue.db.get(Task, owner_id) is not None
+    assert await queue.db.get(Task, child_id) is not None
+    assert await queue.db.get(TestHarnessRun, run_id) is not None
+    assert await queue.db.get(TestHarnessChildBinding, binding_id) is not None
+    assert await queue.db.scalar(
+        select(TestHarnessEvent.id).where(TestHarnessEvent.run_id == run_id)
+    ) is not None
+    instance = await queue.db.get(Instance, instance_id)
+    assert instance is not None and instance.current_task_id == child_id
 
 
 @pytest.mark.asyncio

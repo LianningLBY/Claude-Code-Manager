@@ -29,7 +29,6 @@ interface TaskFormProps {
 const NEW_PROJECT_VALUE = '__new__';
 const STORAGE_KEY = 'cc_default_task_config';
 const DELIVERY_ADMISSION_SCOPE = 'task-form';
-
 interface StoredTaskDefaults {
   priority?: number;
   mode?: string;
@@ -679,6 +678,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setSelectedSecretIds([]);
       setSelectedSSHGrants([]);
       setCloneFromTaskId('');
+      setGoalCondition('');
+      setGoalMaxTurns('30');
       setAutoPlanBudget(0);
       setAutoReviewBudget(0);
       setAutoCapabilityMaxInvocations(1);

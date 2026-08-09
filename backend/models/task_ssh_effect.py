@@ -144,6 +144,7 @@ class TaskSSHEffectReceipt(Base):
             "task_turn_generation",
             "task_status",
         ),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[int] = mapped_column(

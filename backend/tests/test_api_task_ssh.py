@@ -10,6 +10,7 @@ from sqlalchemy.exc import IntegrityError
 
 from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.models.task_ssh_effect import TaskSSHEffectReceipt
+from backend.models.test_harness import TestHarnessRun
 from backend.models.ssh_profile import SSHProfile
 from backend.services.ssh_executor import (
     SSHCommandResult,
@@ -545,6 +546,8 @@ async def test_duplicate_task_ssh_grants_reject_before_task_creation(
         (None, 73, None),
         (None, None, {"ccm_worker_managed_task": True}),
         (None, None, {"ccm_user_skill_snapshots": []}),
+        (None, None, {"isolated_browser_agent": True}),
+        (None, None, {"frontend_review": {"enabled": True}}),
     ],
 )
 async def test_nonlocal_task_scope_cannot_receive_manager_local_ssh_grant(
@@ -568,6 +571,16 @@ async def test_nonlocal_task_scope_cannot_receive_manager_local_ssh_grant(
     [
         ("shared_from_id", 73, "task_shared"),
         ("metadata_", {"ccm_worker_managed_task": True}, "task_worker_managed"),
+        (
+            "metadata_",
+            {"isolated_browser_agent": True},
+            "task_isolated_browser_agent",
+        ),
+        (
+            "metadata_",
+            {"frontend_review": {"enabled": True}},
+            "task_frontend_review",
+        ),
     ],
 )
 @pytest.mark.asyncio
@@ -609,6 +622,63 @@ async def test_existing_grant_fails_closed_in_nonlocal_task_scope(
     assert executed.status_code == 409
     assert invalid_reason in executed.text
     assert replaced.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_active_browser_harness_blocks_late_managed_ssh_grant(
+    client,
+    db_session,
+    tmp_path,
+):
+    profile_id, _ = await _create_profile(client, tmp_path)
+    created = await client.post(
+        "/api/tasks",
+        json={"description": "Browser lifecycle owns this Task"},
+    )
+    assert created.status_code == 201, created.text
+    task_id = created.json()["id"]
+    task = await db_session.get(Task, task_id)
+    assert task is not None
+    run_id = "a" * 32
+    db_session.add(
+        TestHarnessRun(
+            id=run_id,
+            task_id=task_id,
+            owner_task_incarnation_id=task.incarnation_id,
+            owner_task_retry_count=task.retry_count,
+            owner_task_turn_generation=task.turn_generation,
+            owner_task_status=task.status,
+            target_kind="fixed_url",
+            target_spec={"kind": "fixed_url", "url": "https://example.com"},
+            test_plan={"objective": "Inspect"},
+            runtime_config={},
+            request_fingerprint="b" * 64,
+            root_run_id=run_id,
+            attempt_number=1,
+            status="running",
+            stage="browser_ready",
+            cleanup_status="pending",
+        )
+    )
+    await db_session.commit()
+
+    response = await client.put(
+        f"/api/tasks/{task_id}/ssh-grants",
+        json={
+            "grants": [
+                {"profile_id": profile_id, "capabilities": ["exec"]}
+            ]
+        },
+    )
+
+    assert response.status_code == 409
+    assert "active Browser Review or Test Harness" in response.text
+    assert (
+        await db_session.scalar(
+            select(TaskSSHGrant.id).where(TaskSSHGrant.task_id == task_id)
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio

@@ -32,9 +32,9 @@ _SSH_GUARD_MARKER = "task_ssh_guard_hook.py"
 
 def _hook_command(*, script_path: str | Path | None = None) -> str:
     from backend.config import settings
+    from backend.services.internal_api_endpoint import resolve_internal_api_base
 
-    host = settings.host if settings.host != "0.0.0.0" else "127.0.0.1"
-    api_base = f"http://{host}:{settings.port}"
+    api_base = resolve_internal_api_base()
     timeout = int(getattr(settings, "ask_user_timeout", 1800)) + 60
 
     parts = [

@@ -455,6 +455,11 @@ def task_ssh_scope_invalid_reason(
         return "task_shared"
     if is_worker_managed_task_metadata(metadata):
         return "task_worker_managed"
+    normalized_metadata = metadata if isinstance(metadata, Mapping) else {}
+    if normalized_metadata.get("isolated_browser_agent") is True:
+        return "task_isolated_browser_agent"
+    if normalized_metadata.get("frontend_review") is not None:
+        return "task_frontend_review"
     return None
 
 
@@ -737,6 +742,61 @@ async def replace_task_ssh_grants(
                 409,
                 "Managed SSH grants cannot be added while a Monitor or "
                 "Sub-Agent is running",
+            )
+
+        # Harness admission takes the same exact Task writer fence before it
+        # materializes a Run.  Whichever side wins is therefore visible to the
+        # loser: a Task can never acquire Manager-held SSH credentials while
+        # it owns a live Browser/Preview lifecycle.
+        from backend.models.test_harness import (
+            TestHarnessChildBinding,
+            TestHarnessRun,
+        )
+        from backend.models.workspace_review import WorkspaceReviewRun
+        from backend.services.test_harness_contracts import (
+            HARNESS_TERMINAL_STATUSES,
+        )
+
+        active_harness_run_id = await db.scalar(
+            select(TestHarnessRun.id)
+            .where(
+                TestHarnessRun.task_id == task_id,
+                TestHarnessRun.status.not_in(HARNESS_TERMINAL_STATUSES),
+            )
+            .limit(1)
+        )
+        active_workspace_run_id = await db.scalar(
+            select(WorkspaceReviewRun.id)
+            .where(
+                WorkspaceReviewRun.task_id == task_id,
+                WorkspaceReviewRun.status.not_in(
+                    {"completed", "failed", "cancelled"}
+                ),
+            )
+            .limit(1)
+        )
+        active_browser_binding_id = await db.scalar(
+            select(TestHarnessChildBinding.id)
+            .where(
+                TestHarnessChildBinding.owner_task_id == task_id,
+                TestHarnessChildBinding.state.not_in(
+                    {"stopped", "completed"}
+                ),
+            )
+            .limit(1)
+        )
+        if any(
+            value is not None
+            for value in (
+                active_harness_run_id,
+                active_workspace_run_id,
+                active_browser_binding_id,
+            )
+        ):
+            raise TaskSSHAccessError(
+                409,
+                "Managed SSH grants cannot be combined with an active "
+                "Browser Review or Test Harness run",
             )
 
     prepared = await prepare_task_ssh_grants(

@@ -47,6 +47,16 @@ from backend.models.task_share import TaskShare, ProjectShare, SharedTaskReceive
 from backend.models.user import User  # noqa: F401
 from backend.models.team_share import TeamProjectShare, TeamTaskShare  # noqa: F401
 from backend.models.user_group import UserGroup, UserGroupMember  # noqa: F401
+from backend.models.workspace_review import WorkspaceReviewRun  # noqa: F401
+from backend.models.test_harness import (  # noqa: F401
+    TestHarnessAttempt,
+    TestHarnessChildBinding,
+    TestHarnessEvent,
+    TestHarnessEvidence,
+    TestHarnessFinding,
+    TestHarnessRun,
+    TestHarnessSandboxLease,
+)
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep  # noqa: F401
 from backend.models.plan import Plan, PlanVersion, PlanInputRequest, PlanApplication, PlanLegacyTaskLink  # noqa: F401
 from backend.models.capability import (  # noqa: F401

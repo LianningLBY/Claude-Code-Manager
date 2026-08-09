@@ -38,6 +38,12 @@ def is_super_admin(request: Request) -> bool:
 
 def require_admin(request: Request):
     """Raise 403 if not admin/super_admin."""
+    # Scoped child credentials have already been restricted to an exact
+    # method/path by authentication middleware.  Let those callbacks traverse
+    # routers that are otherwise admin-only; this does not grant access to any
+    # additional route.
+    if getattr(request.state, "auth_type", None) == "internal_service":
+        return
     if not is_admin(request):
         raise HTTPException(403, "Admin only")
 

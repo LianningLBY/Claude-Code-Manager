@@ -48,6 +48,12 @@ from backend.api.org import router as org_router
 from backend.api.ask_user import router as ask_user_router
 from backend.api.user_skills import router as user_skills_router
 from backend.api.team_sharing import router as team_sharing_router
+from backend.api.browser_reviews import (
+    router as browser_reviews_router,
+    task_router as task_browser_reviews_router,
+)
+from backend.api.workspace_reviews import router as workspace_reviews_router
+from backend.api.test_harness import router as test_harness_router
 from backend.api.plans import router as plans_router
 from backend.api.plan_resources import router as plan_resources_router
 from backend.api.capabilities import router as capabilities_router
@@ -65,6 +71,7 @@ from backend.services.deployment_start_guard import (
 )
 from backend.services.sub_agent_watcher import SubAgentWatcher
 from backend.services.cloudrouter_accounts import CloudRouterAccountStore
+from backend.services.browser_review_jobs import browser_review_job_manager
 from backend.services.capability_coordinator import CapabilityCoordinator
 from backend.services.capability_resume import CapabilityResumeCoordinator
 from backend.services.capability_registry import register_capability
@@ -717,6 +724,28 @@ async def _shutdown_runtime_services(
             failures.append(exc)
             logger.exception("Background task shutdown failed")
 
+    try:
+        from backend.services.test_harness import test_harness_service
+
+        await test_harness_service.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Test harness watcher shutdown failed")
+
+    try:
+        from backend.services.workspace_review import workspace_review_manager
+
+        await workspace_review_manager.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Workspace review preview shutdown failed")
+
+    try:
+        await browser_review_job_manager.shutdown()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("Browser review job shutdown failed")
+
     # Discussion agents are independent subprocess trees and are not owned by
     # Dispatcher/InstanceManager.  Stop them explicitly before the remaining
     # process supervisors are dismantled.
@@ -1023,6 +1052,38 @@ async def _runtime_lifespan(app: FastAPI):
             instance_manager.set_pty_mode(row.use_pty_mode)
     await _reset_stale_discussion_agents()
     await _cleanup_stale_sub_agents()
+    # Browser Agent Tasks are ordinary executable Tasks underneath, but their
+    # launch authority comes from a durable Harness binding. Reap interrupted
+    # bindings before any review projection is failed and, critically, before
+    # Dispatcher can claim pending work.
+    from backend.services.test_harness_children import test_harness_child_service
+
+    recovered_browser_children = (
+        await test_harness_child_service.recover_interrupted()
+    )
+    if recovered_browser_children:
+        logger.warning(
+            "Recovered %d interrupted Browser Agent child Task(s)",
+            recovered_browser_children,
+        )
+    from backend.services.workspace_review import workspace_review_manager
+    interrupted_workspace_reviews = (
+        await workspace_review_manager.recover_interrupted_runs()
+    )
+    if interrupted_workspace_reviews:
+        logger.warning(
+            "Marked %d interrupted workspace review run(s) failed",
+            interrupted_workspace_reviews,
+        )
+    from backend.services.test_harness import test_harness_service
+    interrupted_test_harness_runs = (
+        await test_harness_service.recover_interrupted_runs()
+    )
+    if interrupted_test_harness_runs:
+        logger.warning(
+            "Marked %d interrupted test harness run(s) failed",
+            interrupted_test_harness_runs,
+        )
     await _recover_stale_worker_lifecycles()
     await _sync_tags()
     sub_agent_watcher.start()
@@ -1123,7 +1184,6 @@ async def remember_internal_api_endpoint(request: Request, call_next):
     observe_asgi_server(request.scope.get("server"))
     return await call_next(request)
 
-
 app.add_middleware(TokenAuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -1173,6 +1233,10 @@ app.include_router(org_router)
 app.include_router(ask_user_router)
 app.include_router(user_skills_router)
 app.include_router(team_sharing_router)
+app.include_router(browser_reviews_router)
+app.include_router(task_browser_reviews_router)
+app.include_router(workspace_reviews_router)
+app.include_router(test_harness_router)
 app.include_router(plans_router)
 app.include_router(plan_resources_router)
 app.include_router(capabilities_router)

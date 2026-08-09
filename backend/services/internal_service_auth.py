@@ -32,6 +32,9 @@ _GENERATION_BOUND_TASK_AUDIENCES = frozenset({
     "ccm_ssh",
     "ccm_skills",
     "ccm_ask_user",
+    "ccm_frontend_review",
+    "ccm_workspace_review",
+    "ccm_browser_review",
 })
 
 
@@ -83,7 +86,10 @@ def _b64decode(value: str) -> bytes:
 def _deployment_secret() -> bytes:
     from backend.config import settings
 
-    return (getattr(settings, "auth_token", "") or "").encode("utf-8")
+    value = getattr(settings, "auth_token", "")
+    if not isinstance(value, str) or not value.strip():
+        return b""
+    return value.encode("utf-8")
 
 
 def _positive_int(value: Any, field: str, *, optional: bool = True) -> int | None:
@@ -447,6 +453,42 @@ def _route_allowed(claims: InternalServiceClaims, method: str, path: str) -> boo
 
     if claims.audience == "ccm_ask_user" and task_id is not None:
         return method == "POST" and path == "/api/ask-user/wait"
+
+    if claims.audience in {
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+    } and task_id is not None:
+        base = rf"/api/tasks/{task_id}/test-runs"
+        if method == "GET" and path == f"{base}/capabilities":
+            return True
+        if method == "POST" and path == f"{base}/internal/start":
+            return True
+        if method in {"GET", "POST"} and _fullmatch(
+            rf"{base}/[0-9a-f]{{32}}/internal/(status|stop)",
+            path,
+        ):
+            return (method == "GET") == path.endswith("/status")
+        return method == "GET" and _fullmatch(
+            rf"{base}/[0-9a-f]{{32}}/compare/[0-9a-f]{{32}}",
+            path,
+        )
+
+    if (
+        claims.audience == "ccm_browser_review"
+        and task_id is not None
+        and claims.owner_kind == "browser-review-job"
+        and claims.owner_id is not None
+        and re.fullmatch(r"[0-9a-f]{32}", claims.owner_id)
+    ):
+        base = rf"/api/browser-reviews/{claims.owner_id}/internal"
+        if method == "GET" and path == f"{base}/context":
+            return True
+        if method == "POST" and path == f"{base}/events":
+            return True
+        return method == "POST" and _fullmatch(
+            rf"{base}/operations/[0-9a-f]{{32}}/(permit|ack)",
+            path,
+        )
 
     if claims.audience == "ccm_skills" and task_id is not None:
         task_path = f"/api/tasks/{task_id}"

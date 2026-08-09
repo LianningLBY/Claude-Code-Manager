@@ -461,6 +461,7 @@ def upgrade() -> None:
             "effect_id",
             name="uq_task_ssh_effect_task_effect",
         ),
+        mysql_engine="InnoDB",
     )
     op.create_index(
         "ix_task_ssh_effect_receipts_task_id",

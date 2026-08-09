@@ -33,6 +33,7 @@ def upgrade() -> None:
             "ssh_profile_id",
             name="uq_task_ssh_grants_task_profile",
         ),
+        mysql_engine="InnoDB",
     )
     op.create_index(
         op.f("ix_task_ssh_grants_task_id"),

@@ -40,7 +40,10 @@ from backend.services.capability_resume import (
     materialize_resume_outbox,
 )
 from backend.services.capability_service import capability_task_lock
-from backend.services.instance_manager import InstanceManager
+from backend.services.instance_manager import (
+    ConsumerRecoveryUnsettledError,
+    InstanceManager,
+)
 from backend.services.terminal_arbitration import bind_turn_source
 
 
@@ -260,6 +263,16 @@ async def _run_direct_terminal(
         instance_started_at=scope.started_at,
     )
     await asyncio.wait_for(consumer, timeout=2)
+
+
+def _failing_harness_service(calls: list[tuple[tuple, dict]]):
+    @asynccontextmanager
+    async def owner_stop_fence(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise RuntimeError("Harness cleanup could not be proven")
+        yield  # pragma: no cover
+
+    return SimpleNamespace(owner_stop_fence=owner_stop_fence)
 
 
 async def _prepare_claimed_resume(db_factory, monkeypatch):
@@ -605,6 +618,80 @@ async def test_user_interrupt_completes_without_parsing_terminal_action(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pty", "returncode"),
+    [(False, 0), (False, 7), (True, 0), (True, 7)],
+    ids=("direct-success-capability", "direct-failure", "pty-success-capability", "pty-failure"),
+)
+async def test_chat_terminal_preserves_owner_when_harness_cleanup_fails(
+    db_factory,
+    pty,
+    returncode,
+):
+    scope = await _terminal_scope(
+        db_factory,
+        transport="claude_pty" if pty else "claude_exec",
+        reason="must remain active when child cleanup fails",
+        generation=12 + returncode + int(pty),
+        pid=81_200 + returncode + int(pty),
+    )
+    fence_calls: list[tuple[tuple, dict]] = []
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+        test_harness_service=_failing_harness_service(fence_calls),
+    )
+
+    if pty:
+        process = _process(pid=scope.pid, returncode=returncode)
+        manager.processes[scope.instance_id] = process
+        record = manager._track_output_consumer(
+            scope.instance_id,
+            process,
+            asyncio.current_task(),
+            chat_initiated=True,
+            provider="claude",
+            task_id=scope.task_id,
+            task_retry_count=scope.retry_count,
+            task_turn_generation=scope.generation,
+            instance_started_at=scope.started_at,
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="Harness cleanup could not be proven",
+        ):
+            await manager.finalize_pty_chat_generation(
+                scope.instance_id,
+                scope.task_id,
+                returncode,
+                record,
+            )
+    else:
+        with pytest.raises(ConsumerRecoveryUnsettledError):
+            await _run_direct_terminal(
+                manager,
+                scope,
+                returncode=returncode,
+            )
+
+    async with db_factory() as db:
+        task = await db.get(Task, scope.task_id)
+        instance = await db.get(Instance, scope.instance_id)
+        invocation_count = await db.scalar(
+            select(func.count(CapabilityInvocation.id)).where(
+                CapabilityInvocation.task_id == scope.task_id
+            )
+        )
+        assert task.status == "executing"
+        assert task.completed_at is None
+        assert instance.status == "running"
+        assert instance.pid == scope.pid
+        assert instance.current_task_id == scope.task_id
+        assert invocation_count == 0
+    assert fence_calls
+
+
+@pytest.mark.asyncio
 async def test_pty_handoff_during_commit_withdraws_unpublished_admission(
     db_factory,
     monkeypatch,
@@ -710,7 +797,7 @@ async def test_pty_handoff_during_commit_withdraws_unpublished_admission(
 
 
 @pytest.mark.asyncio
-async def test_terminal_lock_order_starts_with_capability_then_lifecycle(
+async def test_terminal_lock_order_starts_with_harness_then_capability_then_lifecycle(
     db_factory,
     monkeypatch,
 ):
@@ -731,6 +818,14 @@ async def test_terminal_lock_order_starts_with_capability_then_lifecycle(
         async def __aexit__(self, *_args):
             events.append("lifecycle-exit")
 
+    @asynccontextmanager
+    async def harness_fence(*_args, **_kwargs):
+        events.append("harness-enter")
+        try:
+            yield True
+        finally:
+            events.append("harness-exit")
+
     monkeypatch.setattr(
         "backend.services.capability_service.capability_task_lock",
         capability_lock,
@@ -741,14 +836,28 @@ async def test_terminal_lock_order_starts_with_capability_then_lifecycle(
         "_instance_lifecycle_lock",
         lambda _instance_id: LifecycleLock(),
     )
+    monkeypatch.setattr(
+        manager,
+        "_test_harness_owner_terminal_context",
+        harness_fence,
+    )
 
-    async with manager._chat_terminal_locks(1, 2):
+    async with manager._chat_terminal_locks(
+        1,
+        2,
+        expected_retry_count=0,
+        expected_turn_generation=1,
+        reason="test terminal ordering",
+    ) as fenced:
+        assert fenced is True
         events.append("body")
 
     assert events == [
+        "harness-enter",
         "capability-enter",
         "lifecycle-enter",
         "body",
         "lifecycle-exit",
         "capability-exit",
+        "harness-exit",
     ]

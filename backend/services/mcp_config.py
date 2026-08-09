@@ -62,6 +62,33 @@ CCM_SUB_AGENT_CONTROLLER_TOOLS = (
     "check_sub_agents",
     "stop_sub_agent",
 )
+CCM_BROWSER_REVIEW_TOOLS = (
+    "browser_open",
+    "browser_observe",
+    "browser_inspect",
+    "browser_scroll",
+    "browser_wait",
+    "browser_move",
+    "browser_click",
+    "browser_double_click",
+    "browser_type_text",
+    "browser_keypress",
+    "browser_drag",
+    "finish_review",
+)
+CCM_FRONTEND_REVIEW_TOOLS = (
+    "start_review",
+    "check_review",
+    "stop_review",
+)
+CCM_WORKSPACE_REVIEW_TOOLS = (
+    "workspace_review_capabilities",
+    "test_current_changes",
+    "check_current_changes_review",
+    "stop_current_changes_review",
+    "test_git_target",
+    "compare_test_runs",
+)
 CCM_SSH_TOOLS = (
     "list_connections",
     "new_effect_id",
@@ -104,6 +131,22 @@ def _api_base(api_base: str | None) -> str:
     return resolve_internal_api_base(api_base)
 
 
+def _review_scoped_auth_configured() -> bool:
+    """Return whether review MCPs can derive a non-blank deployment secret."""
+
+    from backend.config import settings
+
+    token = getattr(settings, "auth_token", None)
+    return isinstance(token, str) and bool(token.strip())
+
+
+def _require_review_scoped_auth(name: str) -> None:
+    if not _review_scoped_auth_configured():
+        raise ValueError(
+            f"{name} requires AUTH_TOKEN-backed scoped authentication"
+        )
+
+
 def _ccm_server_spec(
     *,
     name: str,
@@ -123,6 +166,7 @@ def _ccm_server_spec(
     trusted_runtime_asset: str | None = None,
     runtime_namespace: str | None = None,
     runtime_identifier: int | None = None,
+    require_scoped_token: bool = False,
 ) -> McpServerSpec:
     from backend.services.internal_service_auth import (
         INTERNAL_TOKEN_ENV,
@@ -134,6 +178,22 @@ def _ccm_server_spec(
     ):
         raise ValueError("Task-scoped MCP requires a durable Task incarnation")
     resolved_api_base = _api_base(api_base)
+    scoped_token = issue_internal_service_token(
+        audience=name,
+        task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
+        monitor_session_id=monitor_session_id,
+        sub_agent_session_id=sub_agent_session_id,
+        owner_kind=credential_owner_kind,
+        owner_id=credential_owner_id,
+    )
+    if require_scoped_token and not scoped_token:
+        raise ValueError(
+            f"{name} requires AUTH_TOKEN-backed scoped authentication"
+        )
     del module  # A Task MCP may never import a live backend module.
     if trusted_runtime_asset is None:
         raise ValueError("Task-scoped MCP requires a frozen trusted entrypoint")
@@ -160,21 +220,9 @@ def _ccm_server_spec(
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
-    server_cwd = None
-    scoped_token = issue_internal_service_token(
-        audience=name,
-        task_id=task_id,
-        task_incarnation_id=task_incarnation_id,
-        task_retry_count=task_retry_count,
-        task_turn_generation=task_turn_generation,
-        task_status=task_status,
-        monitor_session_id=monitor_session_id,
-        sub_agent_session_id=sub_agent_session_id,
-        owner_kind=credential_owner_kind,
-        owner_id=credential_owner_id,
-    )
     if scoped_token:
         server_env[INTERNAL_TOKEN_ENV] = scoped_token
+    server_cwd = None
 
     return McpServerSpec(
         name=name,
@@ -227,7 +275,22 @@ def build_mcp_server_specs(
             if tool not in CODEX_UNSUPPORTED_MAIN_TOOLS
         )
 
-    return (
+    browser_review_job_id = (enabled_skills or {}).get("browser-review")
+    if isinstance(browser_review_job_id, str) and browser_review_job_id.strip():
+        # A fixed Browser Review Task is a deliberately context-minimized
+        # black-box agent. It receives only the bound browser evidence tools,
+        # never the ordinary Task controller/context toolset.
+        return build_browser_review_mcp_server_specs(
+            browser_review_job_id.strip(),
+            api_base=api_base,
+            task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
+        )
+
+    specs = [
         _ccm_server_spec(
             name="ccm_skills",
             module="backend.mcp.ccm_skills_server",
@@ -245,7 +308,31 @@ def build_mcp_server_specs(
             runtime_namespace="task",
             runtime_identifier=task_id,
         ),
-    )
+    ]
+    from backend.config import settings
+
+    if _review_scoped_auth_configured():
+        specs.extend(
+            build_frontend_review_mcp_server_specs(
+                task_id,
+                api_base=api_base,
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
+            )
+        )
+        specs.extend(
+            build_workspace_review_mcp_server_specs(
+                task_id,
+                api_base=api_base,
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
+            )
+        )
+    return tuple(specs)
 
 
 def build_task_ssh_mcp_server_specs(
@@ -300,6 +387,156 @@ def build_task_ssh_mcp_server_specs(
             trusted_runtime_asset="ccm_ssh_server",
             runtime_namespace="task",
             runtime_identifier=task_id,
+        ),
+    )
+
+
+def _validate_review_task_generation(
+    *,
+    task_id: int,
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
+) -> None:
+    if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
+        raise ValueError("review MCP requires a positive Task id")
+    if not re.fullmatch(r"[0-9a-f]{32}", task_incarnation_id):
+        raise ValueError("review MCP requires a durable Task incarnation")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for value in (task_retry_count, task_turn_generation)
+    ):
+        raise ValueError("review MCP requires an exact non-negative generation")
+    if task_status not in {"in_progress", "executing"}:
+        raise ValueError("review MCP requires an exact active Task status")
+
+
+def build_frontend_review_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+    *,
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
+) -> tuple[McpServerSpec, ...]:
+    """Expose repeatable browser review tools inside an ordinary Task."""
+
+    _require_review_scoped_auth("ccm_frontend_review")
+    _validate_review_task_generation(
+        task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
+    )
+    return (
+        _ccm_server_spec(
+            name="ccm_frontend_review",
+            module="backend.mcp.ccm_browser_review_server",
+            context_args=("--task-id", str(task_id)),
+            enabled_tools=CCM_FRONTEND_REVIEW_TOOLS,
+            api_base=api_base,
+            task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
+            trusted_runtime_asset="ccm_browser_review_server",
+            runtime_namespace="task",
+            runtime_identifier=task_id,
+            require_scoped_token=True,
+        ),
+    )
+
+
+def build_browser_review_mcp_server_specs(
+    job_id: str,
+    *,
+    task_id: int,
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
+    api_base: str | None = None,
+) -> tuple[McpServerSpec, ...]:
+    """Build the isolated, task-scoped browser tools for one review job."""
+
+    normalized_job_id = job_id.strip()
+    if not normalized_job_id:
+        raise ValueError("browser review job id cannot be empty")
+    _require_review_scoped_auth("ccm_browser_review")
+    _validate_review_task_generation(
+        task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
+    )
+    return (
+        _ccm_server_spec(
+            name="ccm_browser_review",
+            module="backend.mcp.ccm_browser_review_server",
+            context_args=("--job-id", normalized_job_id),
+            enabled_tools=CCM_BROWSER_REVIEW_TOOLS,
+            api_base=api_base,
+            task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
+            credential_owner_kind="browser-review-job",
+            credential_owner_id=normalized_job_id,
+            trusted_runtime_asset="ccm_browser_review_server",
+            runtime_namespace="task",
+            runtime_identifier=task_id,
+            require_scoped_token=True,
+        ),
+    )
+
+
+def build_workspace_review_mcp_server_specs(
+    task_id: int,
+    api_base: str | None = None,
+    *,
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
+) -> tuple[McpServerSpec, ...]:
+    """Expose current-branch Preview + isolated Browser Agent orchestration."""
+
+    _require_review_scoped_auth("ccm_workspace_review")
+    _validate_review_task_generation(
+        task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
+    )
+    return (
+        _ccm_server_spec(
+            name="ccm_workspace_review",
+            module="backend.mcp.ccm_workspace_review_server",
+            context_args=("--task-id", str(task_id)),
+            enabled_tools=CCM_WORKSPACE_REVIEW_TOOLS,
+            api_base=api_base,
+            task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
+            credential_owner_kind="task-turn",
+            credential_owner_id=task_id,
+            trusted_runtime_asset="ccm_workspace_review_server",
+            runtime_namespace="task",
+            runtime_identifier=task_id,
+            require_scoped_token=True,
         ),
     )
 

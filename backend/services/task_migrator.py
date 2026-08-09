@@ -44,6 +44,10 @@ from backend.services.task_queue import (
     PR_REVIEW_SUPERSEDED_METADATA_KEY,
     task_retry_not_superseded_predicate,
 )
+from backend.services.test_harness_owner_fence import (
+    has_active_test_harness_owner_graph,
+    no_active_test_harness_owner_graph_predicate,
+)
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import has_worker_execution_quarantine
 from backend.services.worker_routing_config import WORKER_ROUTING_SAFE_STATUSES
@@ -726,11 +730,22 @@ class TaskMigrator:
                     task_retry_not_superseded_predicate(),
                     _no_active_capability_resume_outbox_predicate(),
                     no_active_worker_task_termination_predicate(),
+                    no_active_test_harness_owner_graph_predicate(),
                 )
                 .values(status="migrating")
             )
             if result.rowcount != 1:
                 await db.rollback()
+                if await has_active_test_harness_owner_graph(
+                    db,
+                    observed.task_id,
+                ):
+                    await db.rollback()
+                    raise MigrationError(
+                        "Task owns an active Test Harness, Workspace Review, "
+                        "or Browser Agent graph; wait for it to finish before "
+                        "migrating the Task"
+                    )
                 current = await db.get(Task, observed.task_id)
                 if current is None:
                     raise MigrationError("task 不存在")

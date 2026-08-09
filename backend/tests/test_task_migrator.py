@@ -14,6 +14,7 @@ from backend.models.capability import (
     CapabilityResumeOutbox,
 )
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessRun
 from backend.models.plan import Plan
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.worker import Worker
@@ -1304,6 +1305,43 @@ async def test_migration_claim_rejects_incarnation_only_aba(
     assert current is not None
     assert current.status == "completed"
     assert current.incarnation_id == "f" * 32
+
+
+async def test_migration_claim_rejects_active_harness_owner_graph(
+    db_factory,
+    session_factory,
+):
+    task = await _mk_task(session_factory, status="completed")
+    run_id = "9" * 32
+    async with session_factory() as db:
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=task.id,
+                owner_task_incarnation_id=task.incarnation_id,
+                owner_task_retry_count=task.retry_count,
+                owner_task_turn_generation=task.turn_generation,
+                owner_task_status=task.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "freeze migration"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="9" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="waiting_for_agent",
+            )
+        )
+        await db.commit()
+
+    migrator = _migrator(db_factory)
+    with pytest.raises(MigrationError, match="active Test Harness"):
+        await migrator._claim_migration(migration_task_generation(task))
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current is not None
+    assert current.status == "completed"
 
 
 async def test_worker_sync_response_cannot_borrow_new_manager_generation(

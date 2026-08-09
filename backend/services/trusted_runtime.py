@@ -14,11 +14,13 @@ inside the already-imported Manager process; no Task child imports the mutable
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shlex
 import stat
 import sys
+import zipfile
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -45,6 +47,29 @@ _ASSET_PATHS: Mapping[str, Path] = MappingProxyType({
     "ccm_sub_agent_server": (
         _CCM_ROOT / "backend" / "mcp" / "ccm_sub_agent_server.py"
     ),
+    "ccm_workspace_review_server": (
+        _CCM_ROOT / "backend" / "mcp" / "ccm_workspace_review_server.py"
+    ),
+})
+_BUNDLED_ASSET_PATHS: Mapping[str, Mapping[str, Path]] = MappingProxyType({
+    # The Browser child owns Playwright state, but authorization and durable
+    # effect receipts remain Manager HTTP calls.  Its browser/network helpers
+    # are frozen into the same zipapp so ``python -I`` never falls back to a
+    # Task-mutable checkout import.
+    "ccm_browser_review_server": MappingProxyType({
+        "__main__.py": (
+            _CCM_ROOT / "backend" / "mcp" / "ccm_browser_review_server.py"
+        ),
+        "backend/services/browser_review.py": (
+            _CCM_ROOT / "backend" / "services" / "browser_review.py"
+        ),
+        "backend/services/browser_network.py": (
+            _CCM_ROOT / "backend" / "services" / "browser_network.py"
+        ),
+        "backend/services/test_harness_contracts.py": (
+            _CCM_ROOT / "backend" / "services" / "test_harness_contracts.py"
+        ),
+    }),
 })
 _MAX_ASSET_BYTES = 1024 * 1024
 
@@ -111,6 +136,51 @@ def _read_startup_asset(name: str, path: Path) -> bytes:
     except (SyntaxError, ValueError) as exc:
         raise TrustedRuntimeError(
             f"Trusted runtime asset is not valid Python: {name}"
+        ) from exc
+    return payload
+
+
+def _build_startup_bundle(
+    name: str,
+    paths: Mapping[str, Path],
+) -> bytes:
+    """Build one deterministic, import-isolated zipapp from startup bytes."""
+
+    members = {
+        archive_path: _read_startup_asset(
+            f"{name}:{archive_path}",
+            source_path,
+        )
+        for archive_path, source_path in paths.items()
+    }
+    # Explicit package markers make absolute ``backend.services`` imports
+    # resolve inside the zipapp on every supported Python/zipimport version.
+    members["backend/__init__.py"] = b"# frozen trusted runtime package\n"
+    members["backend/services/__init__.py"] = (
+        b"# frozen trusted runtime package\n"
+    )
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_STORED) as bundle:
+        for archive_path in sorted(members):
+            info = zipfile.ZipInfo(archive_path, date_time=(1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_STORED
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | 0o400) << 16
+            bundle.writestr(info, members[archive_path])
+    payload = output.getvalue()
+    if not payload or len(payload) > _MAX_ASSET_BYTES:
+        raise TrustedRuntimeError(
+            f"Trusted runtime bundle size is invalid: {name}"
+        )
+    try:
+        with zipfile.ZipFile(io.BytesIO(payload), mode="r") as bundle:
+            if bundle.testzip() is not None or "__main__.py" not in bundle.namelist():
+                raise TrustedRuntimeError(
+                    f"Trusted runtime bundle is invalid: {name}"
+                )
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise TrustedRuntimeError(
+            f"Trusted runtime bundle could not be verified: {name}"
         ) from exc
     return payload
 
@@ -237,10 +307,18 @@ def require_trusted_python_runtime() -> None:
 # later edits this checkout cannot alter the bytes used by its hook/MCP child.
 RUNNING_PYTHON = _resolve_running_python()
 TRUSTED_RUNTIME_PROTECTED_ROOTS = _startup_protected_roots()
-_TRUSTED_ASSETS: Mapping[str, bytes] = MappingProxyType({
-    name: _read_startup_asset(name, path)
-    for name, path in _ASSET_PATHS.items()
-})
+_TRUSTED_ASSETS: Mapping[str, bytes] = MappingProxyType(
+    {
+        **{
+            name: _read_startup_asset(name, path)
+            for name, path in _ASSET_PATHS.items()
+        },
+        **{
+            name: _build_startup_bundle(name, paths)
+            for name, paths in _BUNDLED_ASSET_PATHS.items()
+        },
+    }
+)
 _TRUSTED_DIGESTS: Mapping[str, str] = MappingProxyType({
     name: hashlib.sha256(payload).hexdigest()
     for name, payload in _TRUSTED_ASSETS.items()
@@ -268,7 +346,8 @@ def trusted_python_asset_filename(name: str) -> str:
     """Return the content-addressed filename for one frozen entrypoint."""
 
     digest = trusted_asset_digest(name)
-    return f"{name.replace('_', '-')}-{digest[:16]}.py"
+    suffix = ".pyz" if name in _BUNDLED_ASSET_PATHS else ".py"
+    return f"{name.replace('_', '-')}-{digest[:16]}{suffix}"
 
 
 def verify_materialized_trusted_python_asset(name: str, path: Path) -> bytes:

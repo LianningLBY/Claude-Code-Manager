@@ -89,6 +89,11 @@ from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
 
+
+def _is_isolated_browser_task(task: Task) -> bool:
+    metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+    return metadata.get("isolated_browser_agent") is True
+
 if TYPE_CHECKING:
     from backend.services.claude_pool import ClaudePool
     from backend.services.codex_pool import CodexPool
@@ -233,6 +238,12 @@ _DOC_SYNC_NOTE = (
     "注意：如需修改 CLAUDE.md 或 AGENTS.md，两个文件的关键内容必须保持同步——"
     "往其中一个写入新内容时，把相同的意思也写进另一个（不要求逐字一致；"
     "若两者是 symlink 关系则改一处即可，无需额外操作）。"
+)
+
+_TASK_ARTIFACT_LINK_NOTE = (
+    "如果在任务工作区创建或修改了供用户查看、下载的产物文件，最终回复必须把每个产物写成 "
+    "Markdown 链接，不要只输出裸文件路径。链接目标优先使用相对当前工作目录的路径；"
+    "路径包含空格时用尖括号包裹，例如 `[下载报告](<reports/final report.pdf>)`。"
 )
 
 _MATH_FORMAT_HINT = (
@@ -521,6 +532,10 @@ class ClaudeAccountRoutingError(QueuedMessagePrelaunchError):
 
 class TaskStartPausedError(RuntimeError):
     """A new task turn reached the admission gate during maintenance."""
+
+
+class TaskStartConflictError(RuntimeError):
+    """A different queued turn already owns this Task's start admission."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -913,10 +928,23 @@ class GlobalDispatcher:
         db_factory,
         instance_manager: InstanceManager,
         broadcaster: WebSocketBroadcaster,
+        test_harness_service=None,
     ):
         self.db_factory = db_factory
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
+        if test_harness_service is None:
+            from backend.services.test_harness import (
+                TestHarnessService,
+                test_harness_service as global_test_harness_service,
+            )
+
+            test_harness_service = (
+                global_test_harness_service
+                if global_test_harness_service.db_factory is db_factory
+                else TestHarnessService(db_factory=db_factory)
+            )
+        self.test_harness_service = test_harness_service
         # Injected by backend.main after the generic Capability coordinator is
         # constructed.  Durable polling remains the fallback source of truth.
         self.capability_invocation_wake: Callable[[], None] | None = None
@@ -2440,7 +2468,11 @@ class GlobalDispatcher:
             pass
 
     @asynccontextmanager
-    async def task_start_guard(self):
+    async def task_start_guard(
+        self,
+        *,
+        require_idle_task_id: int | None = None,
+    ):
         """Admit one new Task start and serialize it with maintenance.
 
         The caller must commit the Task's active status before leaving the
@@ -2450,6 +2482,13 @@ class GlobalDispatcher:
         async with self._dispatch_claim_lock:
             if self._dispatch_paused or self._shutting_down:
                 raise TaskStartPausedError("task starts are paused for maintenance")
+            if (
+                require_idle_task_id is not None
+                and require_idle_task_id in self._pending_task_starts
+            ):
+                raise TaskStartConflictError(
+                    f"task {require_idle_task_id} already has a queued turn"
+                )
             fence = self.deployment_task_start_fence
             if fence is None:
                 yield
@@ -8126,14 +8165,16 @@ class GlobalDispatcher:
         image_paths = metadata.get("image_paths") or []
         secret_ids = metadata.get("secret_ids") or []
         secrets_block = await _build_secrets_block(self.db_factory, secret_ids)
-        # PR reviews run against an immutable remote GitHub snapshot described
-        # by their own prompt.  Adding the normal preamble here would tell
-        # Claude to read the CCM checkout's CLAUDE.md; Codex would likewise load
-        # its AGENTS.md from cwd.  The lifecycle therefore also gives these
-        # tasks a neutral task-private directory.
+        # PR and Browser reviews receive a frozen, purpose-built prompt. Adding
+        # the normal preamble would tell Claude to discover repository docs;
+        # Codex would likewise auto-load AGENTS.md from cwd. Their lifecycle
+        # therefore uses a neutral task-private directory too.
+        isolated_review_task = (
+            is_pr_sandbox_task(task) or _is_isolated_browser_task(task)
+        )
         parts = (
             []
-            if is_pr_sandbox_task(task)
+            if isolated_review_task
             else [_agent_doc_preamble(task)]
         )
         if secrets_block:
@@ -8149,7 +8190,7 @@ class GlobalDispatcher:
             if command_args:
                 task_description = command_args
             parts.append(command.prompt_template)
-        if not is_pr_sandbox_task(task):
+        if not isolated_review_task:
             math_hint = _conditional_math_format_hint(task_description)
             if math_hint:
                 parts.append(math_hint)
@@ -9217,7 +9258,12 @@ class GlobalDispatcher:
         itself after a concurrent cancel → retry cleared its ownership.
         """
 
-        async with self.db_factory() as db:
+        async with self._test_harness_terminal_db(
+            generation,
+            reason="Task mode lifecycle entered executing status",
+        ) as db:
+            if db is None:
+                return False
             claimed = await db.execute(
                 update(Task)
                 .where(
@@ -9301,7 +9347,132 @@ class GlobalDispatcher:
             return None
         return source
 
+    async def _test_harness_terminal_context(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        reason: str,
+    ):
+        """Return an exact owner-graph stop fence, or ``None`` if stale."""
+
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        async with self.db_factory() as db:
+            task = await self._read_owned_lifecycle_task(db, generation)
+            if task is None:
+                return None
+            identity = test_harness_owner_identity(task)
+        return self.test_harness_service.owner_stop_fence(
+            generation.task_id,
+            reason=reason,
+            expected_identity=identity,
+        )
+
+    @asynccontextmanager
+    async def _test_harness_terminal_db(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        reason: str,
+    ):
+        """Open a DB writer only while the old owner identity is fenced."""
+
+        terminal_context = await self._test_harness_terminal_context(
+            generation,
+            reason=reason,
+        )
+        if terminal_context is None:
+            yield None
+            return
+        async with terminal_context:
+            async with self.db_factory() as db:
+                yield db
+
+    @staticmethod
+    def _terminal_task_has_exact_test_harness_gate(
+        task: Task,
+        generation: _TaskLifecycleGeneration,
+    ) -> bool:
+        """Return whether an earlier terminalizer proved owner-graph cleanup.
+
+        The durable gate records the active status from immediately before the
+        terminal transition.  It is safe to reuse only for the same Task
+        incarnation and lifecycle generation; a terminal status by itself is
+        never evidence that Browser/Harness descendants were reaped.
+        """
+
+        from backend.services.test_harness_owner_fence import (
+            TestHarnessOwnerIdentity,
+            TEST_HARNESS_TERMINAL_GATE_KEY,
+            test_harness_owner_terminal_gate_matches,
+        )
+
+        if (
+            task.status
+            not in {"completed", "failed", "cancelled", "conflict", "superseded"}
+            or task.id != generation.task_id
+            or task.retry_count != generation.retry_count
+            or task.turn_generation != generation.turn_generation
+            or not isinstance(task.incarnation_id, str)
+            or not task.incarnation_id
+        ):
+            return False
+        metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+        gate = metadata.get(TEST_HARNESS_TERMINAL_GATE_KEY)
+        if not isinstance(gate, dict):
+            return False
+        source_status = gate.get("status")
+        if source_status not in {"in_progress", "executing"}:
+            return False
+        return test_harness_owner_terminal_gate_matches(
+            task,
+            TestHarnessOwnerIdentity(
+                task_id=task.id,
+                incarnation_id=task.incarnation_id,
+                retry_count=generation.retry_count,
+                turn_generation=generation.turn_generation,
+                status=source_status,
+            ),
+        )
+
     async def _finalize_fresh_lifecycle_replay_safely(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        pending_reason: str | None,
+        failure_reason: str,
+        consume_retry: bool = False,
+        allow_unbound_prelaunch: bool = False,
+        pending_broadcast_extra: dict | None = None,
+    ) -> _TaskLifecycleFinalization | None:
+        terminal_context = await self._test_harness_terminal_context(
+            generation,
+            reason=failure_reason,
+        )
+        if terminal_context is None:
+            return None
+        try:
+            async with terminal_context:
+                return await self._finalize_fresh_lifecycle_replay_under_harness_fence(
+                    generation,
+                    pending_reason=pending_reason,
+                    failure_reason=failure_reason,
+                    consume_retry=consume_retry,
+                    allow_unbound_prelaunch=allow_unbound_prelaunch,
+                    pending_broadcast_extra=pending_broadcast_extra,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before finalizing Task %s",
+                generation.task_id,
+            )
+            return None
+
+    async def _finalize_fresh_lifecycle_replay_under_harness_fence(
         self,
         generation: _TaskLifecycleGeneration,
         *,
@@ -9397,10 +9568,15 @@ class GlobalDispatcher:
                         f"{failure_reason}; exact turn source evidence is stale "
                         "or malformed, so automatic replay was blocked"
                     )
+                from backend.services.frontend_review_goal import (
+                    frontend_review_goal_terminal_updates,
+                )
+
                 values = {
                     "status": "failed",
                     "error_message": error_message[:2000],
                     "completed_at": datetime.utcnow(),
+                    **frontend_review_goal_terminal_updates(task),
                 }
                 target_status = "failed"
 
@@ -9478,6 +9654,35 @@ class GlobalDispatcher:
         return finalized.generation.status
 
     async def _complete_owned_task_result(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        count_completion: bool = False,
+        admit_agent_capability: bool = False,
+    ) -> tuple[bool, bool]:
+        terminal_context = await self._test_harness_terminal_context(
+            generation,
+            reason="Task lifecycle reached terminal completion",
+        )
+        if terminal_context is None:
+            return False, False
+        try:
+            async with terminal_context:
+                return await self._complete_owned_task_result_under_harness_fence(
+                    generation,
+                    count_completion=count_completion,
+                    admit_agent_capability=admit_agent_capability,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before completing Task %s",
+                generation.task_id,
+            )
+            return False, False
+
+    async def _complete_owned_task_result_under_harness_fence(
         self,
         generation: _TaskLifecycleGeneration,
         *,
@@ -9598,6 +9803,16 @@ class GlobalDispatcher:
 
                 if completed:
                     observed_generation = self._task_status_generation(task)
+                    from backend.services.frontend_review_goal import (
+                        frontend_review_goal_terminal_updates,
+                    )
+
+                    terminal_values = {
+                        "status": "completed",
+                        "completed_at": datetime.utcnow(),
+                        "error_message": None,
+                        **frontend_review_goal_terminal_updates(task),
+                    }
                     changed = await db.execute(
                         update(Task)
                         .where(
@@ -9607,11 +9822,7 @@ class GlobalDispatcher:
                             task_retry_not_superseded_predicate(),
                             no_active_worker_task_termination_predicate(),
                         )
-                        .values(
-                            status="completed",
-                            completed_at=datetime.utcnow(),
-                            error_message=None,
-                        )
+                        .values(**terminal_values)
                     )
                     if not changed.rowcount:
                         await db.rollback()
@@ -9862,6 +10073,32 @@ class GlobalDispatcher:
         generation: _TaskLifecycleGeneration,
         reason: str,
     ) -> bool:
+        terminal_context = await self._test_harness_terminal_context(
+            generation,
+            reason=reason,
+        )
+        if terminal_context is None:
+            return False
+        try:
+            async with terminal_context:
+                return await self._fail_owned_task_under_harness_fence(
+                    generation,
+                    reason,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before failing Task %s",
+                generation.task_id,
+            )
+            return False
+
+    async def _fail_owned_task_under_harness_fence(
+        self,
+        generation: _TaskLifecycleGeneration,
+        reason: str,
+    ) -> bool:
         """Fail and broadcast only the still-active task generation."""
 
         async with self.db_factory() as db:
@@ -9873,6 +10110,16 @@ class GlobalDispatcher:
             if task is None:
                 return False
             observed_generation = self._task_status_generation(task)
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            terminal_values = {
+                "status": "failed",
+                "error_message": reason,
+                "completed_at": datetime.utcnow(),
+                **frontend_review_goal_terminal_updates(task),
+            }
             changed = await db.execute(
                 update(Task)
                 .where(
@@ -9880,11 +10127,7 @@ class GlobalDispatcher:
                     task_retry_not_superseded_predicate(),
                     no_active_worker_task_termination_predicate(),
                 )
-                .values(
-                    status="failed",
-                    error_message=reason,
-                    completed_at=datetime.utcnow(),
-                )
+                .values(**terminal_values)
             )
             if not changed.rowcount:
                 await db.rollback()
@@ -10169,22 +10412,31 @@ class GlobalDispatcher:
             # === Step 2: Determine cwd and update task ===
             # 必须是绝对路径：PTY 模式按 cwd 推导 JSONL 轮询路径，"." 会落空
             review_task = is_pr_sandbox_task(task)
+            browser_review_task = _is_isolated_browser_task(task)
+            neutral_review_cwd = review_task or browser_review_task
             cwd = (
                 isolated_pr_review_cwd(task)
-                if review_task
+                if neutral_review_cwd
                 else task.last_cwd or task.target_repo or os.getcwd()
             )
 
             # 存量项目统一补 AGENTS.md（Codex 指令文件）：有 CLAUDE.md 而无
             # AGENTS.md 时注入 symlink，任何项目下次跑任务时自动补齐。
             # 不 commit（由 agent 的正常 git 流程带入），幂等且绝不阻断任务。
-            if not review_task:
+            if not neutral_review_cwd:
                 from backend.services.agent_docs import ensure_agents_md
 
                 ensure_agents_md(task.target_repo or cwd)
             thinking_budget = task.thinking_budget
             effort_level = task.effort_level or settings.default_effort
-            async with self.db_factory() as db:
+            if lifecycle_generation is None:
+                return
+            async with self._test_harness_terminal_db(
+                lifecycle_generation,
+                reason="Initial Task lifecycle entered executing status",
+            ) as db:
+                if db is None:
+                    return
                 # This no-op generation UPDATE is also the Task write barrier.
                 # Refresh mutable launch settings only after it succeeds: a
                 # settings save may have committed after dequeue handed us
@@ -11194,15 +11446,41 @@ class GlobalDispatcher:
         instance_id: int,
         generation: _TaskLifecycleGeneration,
     ):
+        """Serialize stale reset in Harness -> Instance lifecycle order.
+
+        The process-local owner fence is deliberately acquired before the
+        Instance lifecycle lock.  ``owner_stop_fence`` re-enters this same
+        fence after the runtime-dead check to install the durable database
+        gate and drain the graph.  Installing that durable gate earlier would
+        incorrectly cancel a graph if a live launch won the lifecycle race;
+        acquiring no Harness fence here would deadlock with cancellation,
+        which holds the owner fence while stopping an exact Browser child.
+        """
+
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_fence,
+        )
+
+        async with test_harness_owner_fence(generation.task_id):
+            await self._reset_instance_if_stale_under_harness_fence(
+                instance_id,
+                generation,
+            )
+
+    async def _reset_instance_if_stale_under_harness_fence(
+        self,
+        instance_id: int,
+        generation: _TaskLifecycleGeneration,
+    ):
         """Safety-reset only the exact inactive owner generation.
 
         A reusable Instance may already have a new owner by the time an older
         lifecycle reaches ``finally``.  Ownership predicates prevent that old
-        cleanup from erasing the new PID/current_task_id.  The manager lock
-        closes the smaller race where a new launch starts between checking the
-        in-memory process and committing the CAS updates.  The transaction
-        locks and writes Task before Instance, matching every other lifecycle
-        path and preventing a cross-path deadlock.
+        cleanup from erasing the new PID/current_task_id.  The caller already
+        holds the Harness owner fence; the manager lock then closes the smaller
+        race where a new launch starts between checking the in-memory process
+        and committing the CAS updates.  The transaction locks and writes Task
+        before Instance, matching every other lifecycle path.
         """
         try:
             if generation.instance_id != instance_id:
@@ -11219,6 +11497,44 @@ class GlobalDispatcher:
                 current_process = self.instance_manager.processes.get(instance_id)
                 if current_process is not None and current_process.returncode is None:
                     return
+
+                terminal_context = await self._test_harness_terminal_context(
+                    generation,
+                    reason=(
+                        "Dispatcher lifecycle exited without an authoritative "
+                        "terminal result"
+                    ),
+                )
+                if terminal_context is None:
+                    # A preceding terminal writer may already have installed
+                    # the exact gate and drained the owner graph before this
+                    # lifecycle reaches ``finally``.  Admit that one case, but
+                    # never infer cleanup merely from a terminal Task status.
+                    async with self.db_factory() as db:
+                        terminal_task = await self._read_same_lifecycle_task(
+                            db,
+                            generation,
+                        )
+                    if (
+                        terminal_task is None
+                        or not self._terminal_task_has_exact_test_harness_gate(
+                            terminal_task,
+                            generation,
+                        )
+                    ):
+                        return
+                    reused_terminal_gate = True
+                else:
+                    reused_terminal_gate = False
+                    # owner_stop_fence durably installs the exact generation
+                    # gate before draining every Harness/Workspace/Browser
+                    # child. Once it exits successfully the gate keeps new
+                    # materialization closed across processes, so the safety
+                    # CAS below may run in its own fresh transaction. Cleanup
+                    # failure raises here and deliberately preserves both Task
+                    # and reverse Instance proof.
+                    async with terminal_context:
+                        pass
 
                 async with self.db_factory() as db:
                     # Global database lock order is Task -> Instance.  Do not
@@ -11245,6 +11561,18 @@ class GlobalDispatcher:
                         for_update=True,
                     )
                     if task_owner is None:
+                        return
+                    if task_owner.status not in ("executing", "in_progress"):
+                        if not self._terminal_task_has_exact_test_harness_gate(
+                            task_owner,
+                            generation,
+                        ):
+                            await db.rollback()
+                            return
+                    elif reused_terminal_gate:
+                        # A terminal Task cannot legitimately become active
+                        # again within one immutable lifecycle generation.
+                        await db.rollback()
                         return
 
                     owner = (
@@ -11320,6 +11648,43 @@ class GlobalDispatcher:
                         # transaction and is rolled back with a newer Instance.
                         await db.rollback()
                         return
+                    receipt_task = await db.get(
+                        Task,
+                        generation.task_id,
+                        populate_existing=True,
+                    )
+                    if receipt_task is None:
+                        await db.rollback()
+                        return
+                    if receipt_task.status in {
+                        "completed",
+                        "failed",
+                        "cancelled",
+                        "conflict",
+                        "superseded",
+                    }:
+                        from backend.services.test_harness_children import (
+                            finalize_reaped_browser_child_binding,
+                        )
+
+                        try:
+                            await finalize_reaped_browser_child_binding(
+                                db,
+                                receipt_task,
+                                instance_id=instance_id,
+                            )
+                        except Exception:
+                            # Preserve the reverse Instance owner as exact
+                            # recovery evidence if the Browser claim cannot be
+                            # joined to this lifecycle generation.
+                            await db.rollback()
+                            logger.exception(
+                                "Could not persist Browser child reap receipt "
+                                "for Task %s / Instance %s",
+                                generation.task_id,
+                                instance_id,
+                            )
+                            return
                     if task_reset is not None:
                         resulting_generation = await self._read_task_status_generation(
                             db,
@@ -12309,13 +12674,33 @@ class GlobalDispatcher:
                     codex_service_tier=task.codex_service_tier,
                 )
             else:
-                resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
-                turn_prompt = self._build_goal_followup_prompt(
-                    task,
-                    resume_reason,
-                    turn,
-                    max_turns,
+                from backend.services.frontend_review_goal import (
+                    frontend_review_goal_activation,
                 )
+
+                activation = (
+                    frontend_review_goal_activation(task.metadata_)
+                    if turn == 0
+                    else None
+                )
+                resume_reason = last_reason or "上一轮未能完成评估，请检查当前进度并继续完成目标。"
+                if activation is not None:
+                    secrets_block = await _build_secrets_block(
+                        self.db_factory,
+                        activation["secret_ids"],
+                    )
+                    turn_prompt = self._build_frontend_review_goal_activation_prompt(
+                        task,
+                        activation,
+                        secrets_block=secrets_block,
+                    )
+                else:
+                    turn_prompt = self._build_goal_followup_prompt(
+                        task,
+                        resume_reason,
+                        turn,
+                        max_turns,
+                    )
                 turn_resume_session = session_id
                 # Resume on the session's resident account (no config_dir drift →
                 # PTY hot session preserved); migrate / fall back if cooled down.
@@ -12395,6 +12780,20 @@ class GlobalDispatcher:
                 turn,
                 terminal_proof,
             )
+            frontend_review_evidence_ready = True
+            frontend_review_evidence_reason = ""
+            from backend.services.frontend_review_goal import (
+                collect_frontend_review_goal_evidence,
+                frontend_review_goal_config,
+            )
+
+            if frontend_review_goal_config(task.metadata_) is not None:
+                (
+                    frontend_review_evidence,
+                    frontend_review_evidence_ready,
+                    frontend_review_evidence_reason,
+                ) = await collect_frontend_review_goal_evidence(task.id)
+                conversation_summary += frontend_review_evidence
 
             # Evaluate goal condition. Operational failures are distinct from
             # an actual "not achieved" verdict, so they never consume a goal
@@ -12437,7 +12836,12 @@ class GlobalDispatcher:
                 return
 
             turn += 1
-            last_reason = eval_result.reason
+            achieved = eval_result.achieved
+            evaluation_reason = eval_result.reason
+            if achieved and not frontend_review_evidence_ready:
+                achieved = False
+                evaluation_reason = frontend_review_evidence_reason
+            last_reason = evaluation_reason
 
             # Update progress in DB
             async with self.db_factory() as db:
@@ -12446,7 +12850,7 @@ class GlobalDispatcher:
                     .where(*self._task_lifecycle_generation_predicates(generation))
                     .values(
                         goal_turns_used=turn,
-                        goal_last_reason=eval_result.reason,
+                        goal_last_reason=evaluation_reason,
                     )
                 )
                 await db.commit()
@@ -12465,8 +12869,8 @@ class GlobalDispatcher:
                     "event_type": "goal_evaluation",
                     "turn": turn,
                     "max_turns": max_turns,
-                    "achieved": eval_result.achieved,
-                    "reason": eval_result.reason,
+                    "achieved": achieved,
+                    "reason": evaluation_reason,
                     "task_retry_count": generation.retry_count,
                     "task_turn_generation": generation.turn_generation,
                 },
@@ -12477,13 +12881,13 @@ class GlobalDispatcher:
                     "event": "goal_evaluation",
                     "task_id": task.id,
                     "turn": turn,
-                    "achieved": eval_result.achieved,
+                    "achieved": achieved,
                     "task_retry_count": generation.retry_count,
                     "task_turn_generation": generation.turn_generation,
                 },
             )
 
-            if eval_result.achieved:
+            if achieved:
                 try:
                     # Progress publication and broadcasts above await external
                     # work; close that final tail window before completion.
@@ -12557,6 +12961,15 @@ class GlobalDispatcher:
                 f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
             )
 
+        from backend.services.frontend_review_goal import (
+            build_frontend_review_goal_protocol,
+            frontend_review_goal_config,
+        )
+
+        frontend_review = frontend_review_goal_config(metadata)
+        if frontend_review is not None:
+            parts.append(build_frontend_review_goal_protocol(frontend_review))
+
         math_hint = _conditional_math_format_hint(
             f"{task.description}\n{task.goal_condition or ''}"
         )
@@ -12588,6 +13001,45 @@ class GlobalDispatcher:
             f"本轮结束时请简要说明完成了什么、当前状态如何。"
         )
         return _prepend_task_artifact_policy(task, prompt)
+
+    def _build_frontend_review_goal_activation_prompt(
+        self,
+        task: Task,
+        activation: dict,
+        *,
+        secrets_block: str = "",
+    ) -> str:
+        """Build turn zero when Goal review starts from an existing chat."""
+
+        from backend.services.frontend_review_goal import (
+            build_frontend_review_goal_protocol,
+            frontend_review_goal_config,
+        )
+
+        config = frontend_review_goal_config(task.metadata_)
+        if config is None:
+            raise RuntimeError("Frontend Review Goal activation is missing config")
+        parts = [
+            _agent_doc_preamble(task),
+            build_frontend_review_goal_protocol(config),
+        ]
+        if secrets_block:
+            parts.append(secrets_block)
+        file_paths = activation.get("file_paths") or []
+        if file_paths:
+            file_list = "\n".join(f"- {path}" for path in file_paths)
+            parts.append(f"请先用 Read 工具查看用户随本次审查提供的文件：\n{file_list}")
+        parts.append(
+            "用户在当前 Task 中启动了新的循环前端审查。"
+            "以下内容是本轮的新目标，请在保留当前 session 上下文的同时以它为准：\n\n"
+            f"{activation['message']}"
+        )
+        parts.append(
+            f"目标完成条件：\n{task.goal_condition}\n\n"
+            f"请持续执行审查、必要的修改和复查，最多 {task.goal_max_turns or 5} 轮。"
+            "每轮结束时请给出可审计摘要；是否继续由独立评估器判断。"
+        )
+        return "\n\n".join(parts)
 
     async def _collect_goal_conversation(
         self,
@@ -20458,6 +20910,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             "original_skills": {},
             "temporary_skill_token": None,
             "capability_phase_fence": None,
+            "harness_owner_context": None,
         }
 
         async def process_and_cleanup():
@@ -20492,6 +20945,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     # explicit release immediately before the provider wait.
                     # Release even when cleanup itself fails.
                     self._release_capability_resume_phase_fence(cleanup_state)
+                    await self._release_queued_harness_owner_fence(cleanup_state)
 
         if msg.capability_resume_outbox_id is not None:
             from backend.services.capability_service import capability_task_lock
@@ -20519,6 +20973,56 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             return
         cleanup_state["capability_phase_fence"] = None
         phase_fence.release()
+
+    async def _enter_queued_harness_owner_fence(
+        self,
+        task: Task,
+        db,
+        msg: QueuedMessage,
+        cleanup_state: dict,
+        *,
+        reason: str,
+    ) -> None:
+        """Drain the old exact owner before a queued turn changes identity.
+
+        Capability resume originally takes its task lock at queue entry.  The
+        Harness fence is globally outermost, so rotate that lock here and
+        re-acquire it only after owner cleanup.  The final Task CAS revalidates
+        the durable resume envelope, making the unlocked handoff fail-closed.
+        """
+
+        if cleanup_state.get("harness_owner_context") is not None:
+            return
+        from backend.services.capability_service import capability_task_lock
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        identity = test_harness_owner_identity(task)
+        needs_capability_fence = msg.capability_resume_outbox_id is not None
+        self._release_capability_resume_phase_fence(cleanup_state)
+        # The Harness service cancels through independent sessions.  Do not
+        # retain a read transaction that can block its Task writer gate.
+        await db.rollback()
+        context = self.test_harness_service.owner_stop_fence(
+            identity.task_id,
+            reason=reason,
+            expected_identity=identity,
+        )
+        await context.__aenter__()
+        cleanup_state["harness_owner_context"] = context
+        if needs_capability_fence:
+            phase_fence = capability_task_lock(identity.task_id)
+            await phase_fence.acquire()
+            cleanup_state["capability_phase_fence"] = phase_fence
+
+    @staticmethod
+    async def _release_queued_harness_owner_fence(cleanup_state: dict) -> None:
+        context = cleanup_state.get("harness_owner_context")
+        if context is None:
+            return
+        cleanup_state["harness_owner_context"] = None
+        await context.__aexit__(None, None, None)
 
     async def _restore_queued_message_skills(
         self,
@@ -20921,11 +21425,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         task_id,
                         task.session_id,
                     )
-                # 关键：不能设成 "pending"——否则主调度循环 (dequeue) 会把它当作
-                # 新任务抢走一个空闲 instance 从头执行 task 描述，导致同一 task 出现
-                # 两个 Claude session（一个回应聊天、一个重跑任务）。设成 "in_progress"
-                # 表示"已被 queue consumer 认领、待 resume"，dispatch loop 不会重复分配。
-                # 详见 PROGRESS.md task #707 双 session 竞争条件。
+                # Keep the old status until the final executing/G+1 claim.
+                # Publishing an intermediate in_progress identity would make
+                # the old durable Harness gate stop matching cross-process
+                # admission before this queue worker can install the final
+                # generation. failed/completed are already outside the normal
+                # pending dispatcher, so this does not reintroduce the legacy
+                # double-session race from task #707.
                 recovery_predicates = (
                     Task.id == task_id,
                     Task.status == recovery_status,
@@ -20963,6 +21469,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 # clone/compaction must leave this Task in its safe status;
                 # moving it to in_progress would make ack/reconcile reject it
                 # forever.
+                await self._enter_queued_harness_owner_fence(
+                    task,
+                    db,
+                    msg,
+                    cleanup_state,
+                    reason=(
+                        "Queued session recovery replaced the previous Task "
+                        "owner generation"
+                    ),
+                )
                 recovery_claim = await db.execute(
                     update(Task).where(*recovery_predicates).values(status=Task.status)
                 )
@@ -21012,7 +21528,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         "Task routing configuration synchronization is pending; "
                         "preserving the exact message for retry"
                     )
-                current.status = "in_progress"
+                current.status = recovery_status
                 current.session_id = recovered_session_id
                 current.context_window_usage = recovered_context_usage
                 current.completed_at = None
@@ -21026,12 +21542,6 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     raise QueuedMessagePrelaunchError(
                         "Queued task disappeared after recovery commit"
                     )
-                # 广播认领态（此分支是 failed/session 丢失的恢复路径）：不广播
-                # 的话前端要等 executing 广播才知道任务被认领（轮询窗口内分叉）
-                from backend.services.task_events import broadcast_status_change
-
-                await broadcast_status_change(task_id, "in_progress")
-
             # Fence startup reconciliation from this point through successful
             # spawn.  Refresh after acquiring because start() or another owner
             # may have changed the Task while we waited at the gate.
@@ -21296,6 +21806,23 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if msg.monitor_session_id:
                     broadcast_data["monitor_session_id"] = msg.monitor_session_id
 
+            await self._enter_queued_harness_owner_fence(
+                task,
+                db,
+                msg,
+                cleanup_state,
+                reason="Queued message started a new Task turn",
+            )
+            task = await db.get(Task, task_id, populate_existing=True)
+            if task is None:
+                raise QueuedMessagePrelaunchError(
+                    "Queued Task disappeared after Harness owner cleanup"
+                )
+            inst = await db.get(Instance, inst_id, populate_existing=True)
+            if inst is None:
+                raise QueuedMessagePrelaunchError(
+                    "Reserved Instance disappeared after Harness owner cleanup"
+                )
             status_before_launch = task.status
             retry_count_before_launch = task.retry_count
             turn_generation_before_launch = task.turn_generation
@@ -22593,6 +23120,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         # InstanceManager's terminal consumer needs this same lock to settle
         # the previous outbox and optionally admit a following capability.
         self._release_capability_resume_phase_fence(cleanup_state)
+        await self._release_queued_harness_owner_fence(cleanup_state)
 
         # Phase 2: wait for process to finish (no DB held)
         try:

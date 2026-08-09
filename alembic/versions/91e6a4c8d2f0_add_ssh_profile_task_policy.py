@@ -25,7 +25,8 @@ def upgrade() -> None:
         batch_op.add_column(sa.Column(
             "task_capabilities",
             sa.JSON(),
-            server_default="[]",
+            # MySQL 8.0.13+ accepts JSON defaults only as expressions.
+            server_default=sa.text("('[]')"),
             nullable=False,
         ))
 

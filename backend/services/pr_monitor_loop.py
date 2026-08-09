@@ -26,6 +26,9 @@ from backend.services.delivery_pr_policy import (
     frozen_delivery_pr_policy,
     legacy_pr_effect_is_forbidden,
 )
+from backend.services.test_harness_owner_fence import (
+    no_active_test_harness_owner_graph_predicate,
+)
 from backend.services.worker_task_termination import (
     no_active_worker_task_termination_predicate,
 )
@@ -852,6 +855,54 @@ def _repair_task_cas_predicates(wake: PRRepairWake, task: Task) -> tuple:
     )
 
 
+async def _fence_repair_developer_task_graph(
+    db: AsyncSession,
+    task: Task,
+) -> Task | None:
+    """Lock a fresh reusable Task only when its Harness graph is idle.
+
+    Recovery removes the ``pr_review_superseded`` metadata key before it
+    reuses the Developer Task.  The exact no-op UPDATE is both the portable
+    Task writer barrier and a correlated Harness graph CAS: a concurrent
+    Harness terminalizer either commits its metadata gate first (which this
+    fresh read preserves), or waits until this transaction commits.  An
+    already-active Run/Workspace/Browser graph keeps the repair wake durable
+    and unqueued until that graph becomes terminal.
+    """
+
+    if task.status not in {"completed", "failed", "cancelled", "conflict"}:
+        return None
+    guarded = await db.execute(
+        update(Task)
+        .where(
+            Task.id == task.id,
+            _exact_column_value(Task.incarnation_id, task.incarnation_id),
+            Task.status == task.status,
+            Task.retry_count == task.retry_count,
+            Task.turn_generation == task.turn_generation,
+            _exact_column_value(Task.worker_id, task.worker_id),
+            _exact_column_value(Task.session_id, task.session_id),
+            _exact_column_value(Task.started_at, task.started_at),
+            _exact_column_value(Task.completed_at, task.completed_at),
+            Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
+            no_active_test_harness_owner_graph_predicate(),
+        )
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if guarded.rowcount != 1:
+        return None
+    return (
+        await db.execute(
+            select(Task)
+            .where(Task.id == task.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+
+
 async def _cas_repair_terminal(
     db: AsyncSession,
     *,
@@ -1183,6 +1234,10 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
             ).order_by(PRRepairWake.id)
         )).scalars())
         for incomplete_id in incomplete_ids:
+            # Keep each recovery decision independently durable before the
+            # next iteration re-enters the canonical Repo -> Run -> Wake ->
+            # Task lock order below.
+            await db.commit()
             wake = await db.get(
                 PRRepairWake, incomplete_id, populate_existing=True
             )
@@ -1208,9 +1263,34 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                     run.pause_reason = wake.last_error
                     run.state_version += 1
                 continue
+            if run is None:
+                wake.status = "superseded"
+                wake.completed_at = now
+                continue
+            if repo is None:
+                wake.status = "shadow" if wake.status == "delivering" else "failed"
+                wake.last_error = "auto_repair_disabled"
+                if wake.status == "failed":
+                    wake.completed_at = now
+                run.status = "waiting_for_fix"
+                run.pause_reason = None
+                run.state_version += 1
+                continue
+            task_id = task.id
+            await db.rollback()
+            locked = await _lock_repair_effect_rows(
+                db,
+                wake_id=incomplete_id,
+                task_id=task_id,
+            )
+            if locked is None:
+                continue
+            repo, run, wake, task = locked
+            if wake.status not in {"delivering", "accepted"}:
+                await db.commit()
+                continue
             if (
-                run is None
-                or run.current_base_sha != wake.trigger_base_sha
+                run.current_base_sha != wake.trigger_base_sha
                 or run.current_head_sha != wake.trigger_head_sha
                 or run.current_review_id != wake.review_id
             ):
@@ -1230,10 +1310,15 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                 run.pause_reason = wake.last_error if run.status == "paused" else None
                 run.state_version += 1
                 continue
+            if task.status in {"in_progress", "executing"}:
+                continue
+            fenced_task = await _fence_repair_developer_task_graph(db, task)
+            if fenced_task is None:
+                await db.rollback()
+                continue
+            task = fenced_task
             restore_repair_developer_task(task)
             if await dispatcher.has_task_queue_work(task.id):
-                continue
-            if task.status in {"in_progress", "executing"}:
                 continue
             if wake.status == "accepted":
                 if not _repair_task_identity_matches(wake, task):
@@ -1279,6 +1364,7 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
         )).scalars())
         queued = 0
         for wake_id_candidate in wake_ids:
+            await db.commit()
             wake = await db.get(
                 PRRepairWake, wake_id_candidate, populate_existing=True
             )
@@ -1354,6 +1440,44 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                         run.status = "paused"
                         run.pause_reason = "repair_migration_not_authoritative"
                     continue
+            task_id = task.id
+            await db.rollback()
+            locked = await _lock_repair_effect_rows(
+                db,
+                wake_id=wake_id_candidate,
+                task_id=task_id,
+            )
+            if locked is None:
+                continue
+            repo, run, wake, task = locked
+            if (
+                wake.status != "pending"
+                or wake.developer_task_id != task.id
+                or run.developer_task_id != task.id
+                or run.current_base_sha != wake.trigger_base_sha
+                or run.current_head_sha != wake.trigger_head_sha
+                or run.current_review_id != wake.review_id
+                or run.status not in {"repair_pending", "repair_migrating"}
+                or not repo.enabled
+                or not repo.auto_repair
+                or task.worker_id is not None
+                or task.status
+                not in {"completed", "failed", "cancelled", "conflict"}
+                or task.pty_background_generation is not None
+                or not task.session_id
+                or not task.last_cwd
+            ):
+                await db.rollback()
+                continue
+            fenced_task = await _fence_repair_developer_task_graph(db, task)
+            if fenced_task is None:
+                await db.rollback()
+                continue
+            task = fenced_task
+            restore_repair_developer_task(task)
+            if run.status == "repair_migrating":
+                run.status = "repair_pending"
+                run.state_version += 1
             claimed = await db.execute(
                 update(PRRepairWake)
                 .where(

@@ -196,6 +196,32 @@ class Settings(BaseSettings):
     tmp_cleanup_interval_seconds: int = 3 * 3600
     tmp_cleanup_min_age_seconds: int = 6 * 3600
 
+    # --- Frontend Test Harness evidence ---
+    # Evidence is never stored in /tmp. Files are archived beneath this private
+    # Manager-owned root and referenced by relative storage keys in the DB.
+    test_harness_artifact_root: str = "~/.ccm/test-harness-artifacts"
+    test_harness_artifact_max_file_bytes: int = 20 * 1024 * 1024
+    test_harness_artifact_max_run_bytes: int = 256 * 1024 * 1024
+    test_harness_artifact_max_task_bytes: int = 2 * 1024 * 1024 * 1024
+    test_harness_artifact_max_total_bytes: int = 10 * 1024 * 1024 * 1024
+    test_harness_artifact_retention_days: int = 30
+    test_harness_artifact_cleanup_interval_seconds: int = 6 * 3600
+    browser_review_job_history_limit: int = 100
+
+    # --- Untrusted Git Test Harness sandbox ---
+    # Disabled by default. Capability is advertised only after the Docker
+    # daemon and the administrator-built image both pass an identity probe.
+    test_harness_sandbox_enabled: bool = False
+    test_harness_sandbox_docker_binary: str = "docker"
+    test_harness_sandbox_image: str = "ccm-test-harness-sandbox:local"
+    test_harness_sandbox_memory: str = "4g"
+    test_harness_sandbox_cpus: float = 2.0
+    test_harness_sandbox_pids_limit: int = 256
+    test_harness_sandbox_workspace_bytes: int = 3 * 1024 * 1024 * 1024
+    test_harness_sandbox_tmp_bytes: int = 512 * 1024 * 1024
+    test_harness_sandbox_preview_port: int = 4173
+    test_harness_sandbox_proxy_max_bytes: int = 1024 * 1024 * 1024
+
     # --- Backup service (auto-backup) ---
     backup_enabled: bool = False        # Set true to enable periodic DB backups
     backup_type: str = "local"          # local | s3 | oss

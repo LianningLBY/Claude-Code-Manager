@@ -258,6 +258,9 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
     # while this request waited for the Task -> grant lock order.
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to share this task")
+    from backend.api.tasks import _require_not_isolated_browser_child
+
+    await _require_not_isolated_browser_child(db, task, action="shared")
     blocked = _writable_share_block_reason(task)
     if blocked is not None:
         raise HTTPException(409, blocked)

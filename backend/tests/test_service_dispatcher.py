@@ -35,6 +35,9 @@ from backend.services.task_skill_overrides import (
 from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_POLICY_TAG,
 )
+from backend.services.test_harness_owner_fence import (
+    TEST_HARNESS_TERMINAL_GATE_KEY,
+)
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.plan import (
@@ -5469,6 +5472,66 @@ async def test_goal_achieved_after_multiple_turns(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_frontend_review_goal_evidence_gate_forces_another_turn(db_factory):
+    """A positive model verdict cannot bypass missing browser proof."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        inst = Instance(name="frontend-goal-evidence-worker")
+        db.add(inst)
+        task = _make_goal_task(db, goal_max_turns=3)
+        task.metadata_ = {
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 3,
+            },
+        }
+        db.add(task)
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id = inst.id
+        task_obj = task
+
+    mock_proc = MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.wait = AsyncMock(return_value=0)
+    d.instance_manager.processes = {inst_id: mock_proc}
+
+    from backend.services.goal_evaluator import GoalEvalResult
+    evidence = AsyncMock(side_effect=[
+        ("\nno proof", False, "需要真实浏览器截图"),
+        ("\nproof exists", True, "证据门禁已满足"),
+    ])
+    with (
+        patch(
+            "backend.services.goal_evaluator.GoalEvaluator.evaluate",
+            return_value=GoalEvalResult(achieved=True, reason="模型认为完成"),
+        ),
+        patch(
+            "backend.services.frontend_review_goal.collect_frontend_review_goal_evidence",
+            evidence,
+        ),
+    ):
+        await _claim_mode_lifecycle(db_factory, inst_id, task_obj)
+        await d._run_goal_lifecycle(
+            inst_id,
+            task_obj,
+            d._task_lifecycle_generation(task_obj),
+            "/repo",
+        )
+
+    assert evidence.await_count == 2
+    assert d.instance_manager.launch.await_count == 2
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_obj.id)
+        assert persisted.status == "completed"
+        assert persisted.goal_turns_used == 2
+        assert persisted.goal_last_reason == "模型认为完成"
+
+
+@pytest.mark.asyncio
 async def test_goal_max_turns_exceeded(db_factory):
     """Goal task fails when max turns exhausted."""
     d = _make_dispatcher(db_factory)
@@ -5918,6 +5981,66 @@ async def test_goal_initial_prompt_with_images(db_factory):
     prompt = d._build_goal_initial_prompt(task)
     assert "/uploads/a.png" in prompt
     assert "Read" in prompt
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_goal_initial_prompt_contains_browser_protocol(db_factory):
+    d = _make_dispatcher(db_factory)
+    task = Task(
+        title="frontend goal",
+        description="审查本地页面并修复",
+        mode="goal",
+        goal_condition="Browser Review evidence exists",
+        goal_max_turns=5,
+        provider="codex",
+        metadata_={
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 5,
+            },
+        },
+    )
+
+    prompt = d._build_goal_initial_prompt(task)
+
+    assert "<frontend_review_goal_protocol>" in prompt
+    assert "ccm_workspace_review.test_current_changes" in prompt
+
+
+def test_frontend_review_goal_activation_prompt_keeps_same_session_request():
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    task = Task(
+        id=91,
+        description="原始任务",
+        provider="codex",
+        goal_condition="必须有最新浏览器截图和报告",
+        goal_max_turns=5,
+        metadata_={
+            "frontend_review": {
+                "mode": "goal",
+                "profile": "standard",
+                "max_iterations": 5,
+            },
+        },
+    )
+
+    prompt = dispatcher._build_frontend_review_goal_activation_prompt(
+        task,
+        {
+            "message": "审查设置页窄屏并修复溢出",
+            "file_paths": ["/tmp/reference.png"],
+        },
+        secrets_block="<resolved-secret-reference>",
+    )
+
+    assert "当前 Task 中启动了新的循环前端审查" in prompt
+    assert "审查设置页窄屏并修复溢出" in prompt
+    assert "/tmp/reference.png" in prompt
+    assert "<resolved-secret-reference>" in prompt
+    assert "ccm_workspace_review.test_current_changes" in prompt
+    assert "check_current_changes_review" in prompt
+    assert "修改前端代码后必须再次调用" in prompt
 
 
 @pytest.mark.asyncio
@@ -10141,6 +10264,108 @@ async def test_queued_claim_binds_visible_source_and_task_pointer(
 
 
 @pytest.mark.asyncio
+async def test_queued_new_turn_commits_inside_exact_harness_owner_fence(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observed: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def owner_stop_fence(
+        fenced_task_id,
+        *,
+        reason,
+        expected_identity,
+    ):
+        assert fenced_task_id == task_id
+        assert reason == "Queued message started a new Task turn"
+        assert expected_identity.status == "completed"
+        assert expected_identity.turn_generation == 0
+        entered.set()
+        await release.wait()
+        try:
+            yield
+        finally:
+            async with db_factory() as db:
+                current = await db.get(Task, task_id)
+                observed["status"] = current.status
+                observed["turn_generation"] = current.turn_generation
+
+    d.test_harness_service = SimpleNamespace(
+        owner_stop_fence=owner_stop_fence
+    )
+    queued = asyncio.create_task(d._process_queued_message(task_id, msg))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    async with db_factory() as db:
+        blocked = await db.get(Task, task_id)
+        assert blocked.status == "completed"
+        assert blocked.turn_generation == 0
+    d.instance_manager.launch.assert_not_awaited()
+
+    release.set()
+    await asyncio.wait_for(queued, timeout=2)
+
+    assert observed == {"status": "executing", "turn_generation": 1}
+    d.instance_manager.launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_new_turn_preserves_old_generation_when_harness_cleanup_fails(
+    db_factory,
+    monkeypatch,
+):
+    d, id1, id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    @asynccontextmanager
+    async def failing_owner_stop_fence(*_args, **_kwargs):
+        raise RuntimeError("Browser child cleanup could not be proven")
+        yield  # pragma: no cover
+
+    d.test_harness_service = SimpleNamespace(
+        owner_stop_fence=failing_owner_stop_fence
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="Browser child cleanup could not be proven",
+    ):
+        await d._process_queued_message(task_id, msg)
+
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instances = {
+            instance.id: instance
+            for instance in (
+                await db.execute(
+                    select(Instance).where(Instance.id.in_((id1, id2)))
+                )
+            ).scalars()
+        }
+        assert task.status == "completed"
+        assert task.turn_generation == 0
+        assert task.instance_id is None
+        assert all(instance.status == "idle" for instance in instances.values())
+
+
+@pytest.mark.asyncio
 async def test_queued_cross_generation_alias_does_not_replace_visible_launch_source(
     db_factory,
     monkeypatch,
@@ -11656,6 +11881,83 @@ async def test_completion_publication_fence_rejects_late_background_arm(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["complete", "fail", "retry_exhausted"])
+async def test_temporary_frontend_review_goal_terminal_paths_restore_chat_mode(
+    db_factory,
+    operation,
+):
+    d = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name=f"frontend-review-terminal-{operation}")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="temporary frontend review goal",
+            status="executing",
+            instance_id=instance.id,
+            mode="goal",
+            goal_condition="temporary review condition",
+            goal_max_turns=5,
+            goal_turns_used=2,
+            goal_last_reason="browser passed",
+            retry_count=0,
+            max_retries=0,
+            metadata_={
+                "keep": "account-binding",
+                "frontend_review": {
+                    "mode": "goal",
+                    "profile": "standard",
+                    "max_iterations": 5,
+                },
+                "frontend_review_activation": {
+                    "message": "review and fix the frontend",
+                    "file_paths": [],
+                    "secret_ids": [],
+                    "restore": {
+                        "mode": "auto",
+                        "goal_condition": None,
+                        "goal_max_turns": 30,
+                        "goal_turns_used": 0,
+                        "goal_last_reason": None,
+                    },
+                },
+            },
+        )
+        db.add(task)
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id = task.id
+
+    if operation == "complete":
+        assert await d._complete_owned_task(generation)
+        expected_status = "completed"
+    elif operation == "fail":
+        assert await d._fail_owned_task(generation, "failed")
+        expected_status = "failed"
+    else:
+        assert await d._retry_or_fail_mode_task(generation, "exhausted") == "failed"
+        expected_status = "failed"
+
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == expected_status
+        assert current.mode == "auto"
+        assert current.goal_condition is None
+        assert current.goal_max_turns == 30
+        assert current.goal_turns_used == 0
+        assert current.goal_last_reason is None
+        assert current.metadata_["keep"] == "account-binding"
+        assert "frontend_review" not in current.metadata_
+        assert "frontend_review_activation" not in current.metadata_
+        terminal_gate = current.metadata_[TEST_HARNESS_TERMINAL_GATE_KEY]
+        assert terminal_gate["incarnation_id"] == current.incarnation_id
+        assert terminal_gate["retry_count"] == current.retry_count
+        assert terminal_gate["turn_generation"] == current.turn_generation
+        assert terminal_gate["status"] == "executing"
+
+
+@pytest.mark.asyncio
 async def test_auto_terminal_uses_generation_fenced_capability_publication(
     db_factory,
     monkeypatch,
@@ -12427,6 +12729,7 @@ async def test_sqlite_replay_finalizer_wins_transport_writer_race(tmp_path):
         LaunchSupersededError,
         _LaunchReservation,
     )
+    from backend.services.test_harness import TestHarnessService
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     finalizer_fenced = asyncio.Event()
@@ -12472,6 +12775,12 @@ async def test_sqlite_replay_finalizer_wins_transport_writer_race(tmp_path):
             turn_generation,
         ) = await _seed_transport_race_scope(factory, suffix="finalizer-wins")
         dispatcher = _make_dispatcher(held_factory)
+        # Keep the HeldFinalizerSession focused on the replay Task CAS. The
+        # exact Harness gate has its own durable transaction before this race
+        # and must not be mistaken for the pending-transition writer.
+        dispatcher.test_harness_service = TestHarnessService(
+            db_factory=factory
+        )
         async with factory() as db:
             task = await db.get(Task, task_id)
             generation = dispatcher._task_lifecycle_generation(task)
@@ -12865,7 +13174,12 @@ async def test_initial_command_skill_claim_uses_save_before_write_barrier(
     async with db_factory() as db:
         current = await db.get(Task, task_id)
         assert current.enabled_skills == {"saved": True}
-        assert current.metadata_ == {"keep": "saved"}
+        assert current.metadata_["keep"] == "saved"
+        terminal_gate = current.metadata_[TEST_HARNESS_TERMINAL_GATE_KEY]
+        assert terminal_gate["incarnation_id"] == current.incarnation_id
+        assert terminal_gate["retry_count"] == current.retry_count
+        assert terminal_gate["turn_generation"] == current.turn_generation
+        assert terminal_gate["status"] == "executing"
 
 
 @pytest.mark.asyncio
@@ -13968,6 +14282,14 @@ async def test_queued_owner_cas_race_retries_exact_message(
     async def launch_once(**_kwargs):
         launched.set()
 
+    @asynccontextmanager
+    async def owner_stop_fence(*_args, **_kwargs):
+        # This test targets the final queued owner CAS.  The production
+        # Harness fence performs its own Task UPDATE before that CAS, so use a
+        # no-write stand-in here; the exact fence/commit ordering is covered by
+        # test_queued_new_turn_commits_inside_exact_harness_owner_fence.
+        yield
+
     async def execute_with_owner_race(session, statement, *args, **kwargs):
         nonlocal injected
         table = getattr(statement, "table", None)
@@ -13981,6 +14303,9 @@ async def test_queued_owner_cas_race_retries_exact_message(
 
     d._process_queued_message = counted_process
     d.instance_manager.launch = AsyncMock(side_effect=launch_once)
+    d.test_harness_service = SimpleNamespace(
+        owner_stop_fence=owner_stop_fence
+    )
     q = d._get_task_queue(task_id)
     await q.put(msg)
     with (
@@ -16586,10 +16911,31 @@ async def test_lifecycle_backfills_agents_md(db_factory, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
+@pytest.mark.parametrize(
+    ("title", "description", "tags", "metadata"),
+    [
+        (
+            "PR Review",
+            "READ_REMOTE_BASE_SNAPSHOT",
+            ["pr-review"],
+            {},
+        ),
+        (
+            "Browser Review",
+            "USE_ONLY_BOUND_BROWSER_MCP",
+            None,
+            {"isolated_browser_agent": True},
+        ),
+    ],
+)
+async def test_isolated_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
     db_factory,
     tmp_path,
     monkeypatch,
+    title,
+    description,
+    tags,
+    metadata,
 ):
     """A stale CCM cwd/target must never make a review load host instructions."""
 
@@ -16623,12 +16969,13 @@ async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
     async with db_factory() as db:
         instance = Instance(name="review-worker")
         task = Task(
-            title="PR Review",
-            description="READ_REMOTE_BASE_SNAPSHOT",
+            title=title,
+            description=description,
             target_repo=str(host_checkout),
             last_cwd=str(host_checkout),
             provider="codex",
-            tags=["pr-review"],
+            tags=tags,
+            metadata_=metadata,
         )
         db.add_all([instance, task])
         await db.commit()
@@ -16654,7 +17001,7 @@ async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
     neutral_cwd = neutral_cwds[0]
     assert launch["cwd"] == str(neutral_cwd)
     assert launch["cwd"] != str(host_checkout)
-    assert launch["prompt"] == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
+    assert launch["prompt"] == f"任务:\n{description}"
     assert not (neutral_cwd / "CLAUDE.md").exists()
     assert not (neutral_cwd / "AGENTS.md").exists()
     ensure_agents.assert_not_called()

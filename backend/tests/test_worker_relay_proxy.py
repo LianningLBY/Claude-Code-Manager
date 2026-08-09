@@ -37,6 +37,7 @@ from backend.models.plan_agent import (
     PlanAgentWorkerDispatchReceipt,
 )
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessRun as HarnessRun
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
@@ -566,6 +567,259 @@ async def _reserve_worker_handoff(session_factory, task: Task):
         assert reserved is not None
         await db.commit()
         return reserved
+
+
+async def _add_unsettled_harness_graph(
+    session_factory,
+    task: Task,
+    *,
+    run_key: str,
+    run_status: str,
+    cleanup_status: str,
+) -> str:
+    """Inject the durable legacy state an upgraded Manager must drain."""
+
+    run_id = run_key * 32
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current is not None
+        db.add(
+            HarnessRun(
+                id=run_id,
+                task_id=current.id,
+                owner_task_incarnation_id=current.incarnation_id,
+                owner_task_retry_count=current.retry_count,
+                owner_task_turn_generation=current.turn_generation,
+                owner_task_status=current.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "preserve pre-existing owner graph"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint=run_key * 64,
+                root_run_id=run_id,
+                status=run_status,
+                stage=(
+                    "completed"
+                    if run_status == "completed"
+                    else "running"
+                ),
+                cleanup_status=cleanup_status,
+            )
+        )
+        await db.commit()
+    return run_id
+
+
+@pytest.mark.parametrize(
+    ("run_status", "cleanup_status"),
+    [
+        ("running", "pending"),
+        ("completed", "failed"),
+    ],
+)
+async def test_worker_handoff_reservation_rejects_unsettled_harness_graph(
+    session_factory,
+    run_status,
+    cleanup_status,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    run_id = ("a" if run_status == "running" else "b") * 32
+    handoff_id = f"{task.id:032x}"
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        db.add(
+            HarnessRun(
+                id=run_id,
+                task_id=current.id,
+                owner_task_incarnation_id=current.incarnation_id,
+                owner_task_retry_count=current.retry_count,
+                owner_task_turn_generation=current.turn_generation,
+                owner_task_status=current.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "preserve exact owner graph"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="c" * 64,
+                root_run_id=run_id,
+                status=run_status,
+                stage="completed" if run_status == "completed" else "running",
+                cleanup_status=cleanup_status,
+            )
+        )
+        source = LogEntry(
+            task_id=current.id,
+            event_type="user_message",
+            role="user",
+            content="must not cross harness cleanup",
+        )
+        db.add(source)
+        await db.commit()
+        await db.refresh(source)
+
+        observed = worker_relay_module.worker_task_generation(current)
+        assert observed is not None
+        request_payload = {
+            "message": source.content,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": current.retry_count,
+            "worker_turn_handoff_from_generation": current.turn_generation,
+        }
+        reserved = await worker_relay_module.reserve_worker_turn_handoff(
+            db,
+            observed,
+            handoff_id=handoff_id,
+            source_log_id=source.id,
+            request_payload=request_payload,
+            request_digest=worker_relay_module._handoff_payload_digest(
+                request_payload
+            ),
+        )
+
+        assert reserved is None
+        persisted = await db.get(Task, task.id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        assert persisted.worker_turn_handoff_id is None
+        assert persisted.turn_generation == task.turn_generation
+        assert receipt is None
+
+
+async def test_preexisting_harness_graph_blocks_handoff_replay_effects(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    replay = await relay._manager_worker_turn_handoff_request(reserved)
+    assert replay is not None
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key="d",
+        run_status="completed",
+        cleanup_status="failed",
+    )
+    post_client = SimpleNamespace(post=AsyncMock())
+    client_factory = Mock()
+    monkeypatch.setattr(
+        worker_relay_module.httpx,
+        "AsyncClient",
+        client_factory,
+    )
+
+    posted = await relay._post_worker_turn_handoff_request(
+        worker,
+        reserved,
+        replay,
+        client=post_client,
+    )
+    resumed = await relay._resume_worker_turn_handoff(worker, reserved)
+
+    assert posted is False
+    assert resumed is False
+    post_client.post.assert_not_awaited()
+    client_factory.assert_not_called()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert current.worker_turn_handoff_acknowledged is False
+    assert receipt.status == "prepared"
+
+
+async def test_preexisting_harness_graph_blocks_handoff_event_adoption(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key="e",
+        run_status="running",
+        cleanup_status="pending",
+    )
+
+    adopted = await relay._observe_or_adopt_event_generation(
+        worker.id,
+        task.id,
+        retry_count=task.retry_count,
+        turn_generation=task.turn_generation + 1,
+        worker_turn_handoff_id=reserved.worker_turn_handoff_id,
+    )
+
+    assert adopted is None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "completed"
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+
+
+async def test_preexisting_harness_graph_blocks_handoff_snapshot_recovery(
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key="f",
+        run_status="completed",
+        cleanup_status="failed",
+    )
+
+    async with session_factory() as db:
+        resulting = await worker_relay_module.apply_authoritative_worker_task(
+            db,
+            reserved,
+            _remote_task(
+                task,
+                status="completed",
+                turn_generation=task.turn_generation + 1,
+            ),
+            worker_turn_handoff_id=reserved.worker_turn_handoff_id,
+        )
+
+    assert resulting is None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "completed"
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
 
 
 async def _create_manager_termination_receipt(
@@ -9344,6 +9598,75 @@ async def test_worker_chat_commit_cancellation_arms_handoff_recovery_first(
     assert user_log.task_turn_generation == task.turn_generation + 1
 
 
+@pytest.mark.parametrize(
+    ("run_key", "run_status", "cleanup_status"),
+    [
+        ("7", "running", "pending"),
+        ("8", "completed", "failed"),
+    ],
+)
+async def test_worker_internal_handoff_rejects_unsettled_harness_graph(
+    client,
+    session_factory,
+    monkeypatch,
+    run_key,
+    run_status,
+    cleanup_status,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-local-session",
+    )
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key=run_key,
+        run_status=run_status,
+        cleanup_status=cleanup_status,
+    )
+    dispatcher = SimpleNamespace(
+        enqueue_worker_turn_handoff=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main_module, "dispatcher", dispatcher)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    handoff_id = run_key * 32
+    payload = {
+        "message": "must wait for exact Harness cleanup",
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": task.retry_count,
+        "worker_turn_handoff_from_generation": task.turn_generation,
+    }
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Test Harness" in response.text
+    dispatcher.enqueue_worker_turn_handoff.assert_not_awaited()
+    async with session_factory() as db:
+        logs = list(
+            (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task.id,
+                        LogEntry.event_type == "user_message",
+                    )
+                )
+            ).scalars()
+        )
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        current = await db.get(Task, task.id)
+    assert logs == []
+    assert receipt is None
+    assert current.turn_generation == task.turn_generation
+    assert current.status == task.status
+
+
 async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
     client,
     session_factory,
@@ -9375,6 +9698,8 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
     assert first.status_code == 200, first.text
     assert duplicate.status_code == 200, duplicate.text
     assert duplicate.json() == first.json()
+    assert first.json()["workspace_review_expected"] is False
+    assert first.json()["workspace_review_baseline_run_id"] is None
     async with session_factory() as db:
         logs = list((await db.execute(
             select(LogEntry).where(
@@ -9382,7 +9707,12 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
                 LogEntry.event_type == "user_message",
             )
         )).scalars())
+        durable_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            handoff_id,
+        )
     assert len(logs) == 1
+    assert durable_receipt.response == first.json()
     metadata = json.loads(logs[0].raw_json)["worker_turn_handoff"]
     assert metadata["id"] == handoff_id
     assert metadata["queue_payload"]["prompt"] == payload["message"]

@@ -1503,6 +1503,9 @@ class _TurnContext:
     goal_guard_tasks: set[asyncio.Task] = field(default_factory=set)
     non_retry_error: dict[str, Any] | None = None
     tools_disabled: bool = False
+    mcp_only: bool = False
+    allowed_mcp_tools: frozenset[tuple[str, str]] = frozenset()
+    active_mcp_item_ids: set[str] = field(default_factory=set)
     # Task-isolated turns may execute only the exact request-scoped MCP
     # servers admitted at thread/start.  Keep their names on the exact turn
     # generation so a later ambient/server-side route cannot masquerade as a
@@ -2159,12 +2162,12 @@ class CodexAppServer:
         turn_id = params.get("turnId")
         if turn_id:
             context = self._contexts_by_turn.get(str(turn_id))
-            if context is not None and context.tools_disabled:
+            if context is not None and (context.tools_disabled or context.mcp_only):
                 return context
         thread_id = params.get("threadId") or params.get("conversationId")
         if thread_id:
             context = self._contexts_by_thread.get(str(thread_id))
-            if context is not None and context.tools_disabled:
+            if context is not None and (context.tools_disabled or context.mcp_only):
                 return context
         return None
 
@@ -2210,6 +2213,7 @@ class CodexAppServer:
         if (
             (
                 not context.tools_disabled
+                and not context.mcp_only
                 and context.allowed_mcp_servers is None
             )
             or context.process.returncode is not None
@@ -2219,6 +2223,11 @@ class CodexAppServer:
         if context.tools_disabled:
             reason = (
                 "Codex PR review attempted a forbidden tool or autonomous "
+                f"capability: {source}"
+            )
+        elif context.mcp_only:
+            reason = (
+                "Codex MCP-only turn attempted a forbidden tool or autonomous "
                 f"capability: {source}"
             )
         else:
@@ -3082,7 +3091,7 @@ class CodexAppServer:
             and context.tool_policy_violation is None
             and context.non_retry_error is None
             and context.terminal_protocol_violation is None
-            and not context.tools_disabled
+            and not (context.tools_disabled or context.mcp_only)
         ):
             self._defer_terminal_turn_for_native_goal(context, params)
             return
@@ -3622,6 +3631,7 @@ class CodexAppServer:
         network_isolated: bool = False,
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
+        mcp_only: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -3678,6 +3688,11 @@ class CodexAppServer:
             "read-only",
         }:
             raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
+        if tools_disabled and mcp_only:
+            raise CodexRequiredMcpPreTurnError(
+                "Codex turn cannot be both tool-free and MCP-only"
+            )
+        restricted_tools = tools_disabled or mcp_only
         if tools_disabled:
             if os.name != "posix":
                 raise CodexRequiredMcpPreTurnError(
@@ -3707,6 +3722,38 @@ class CodexAppServer:
                 # thread instead of trusting an older thread's capabilities.
                 logger.info(
                     "Ignoring Codex PR-review resume thread %s; tool-free "
+                    "admission requires a fresh native thread",
+                    resume_session_id,
+                )
+                resume_session_id = None
+        if mcp_only:
+            if os.name != "posix":
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex MCP-only profile currently requires POSIX"
+                )
+            if sandbox_mode != "read-only" or not mcp_specs:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex MCP-only profile requires read-only admission and required MCP"
+                )
+            if any(not spec.required for spec in mcp_specs):
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex MCP-only profile requires every MCP server"
+                )
+            if any(not spec.enabled_tools for spec in mcp_specs):
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex MCP-only profile requires an explicit tool allow-list"
+                )
+            if skill_context.strip() or git_env:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex MCP-only profile forbids skill context and Git credentials"
+                )
+            if not disable_autonomous_features:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex MCP-only profile requires autonomous features to be disabled"
+                )
+            if resume_session_id:
+                logger.info(
+                    "Ignoring Codex Browser Agent resume thread %s; MCP-only "
                     "admission requires a fresh native thread",
                     resume_session_id,
                 )
@@ -3861,7 +3908,7 @@ class CodexAppServer:
             )
         tool_free_permission_profile = (
             f"{_TOOL_FREE_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
-            if tools_disabled
+            if restricted_tools
             else None
         )
         network_permission_profile = (
@@ -3911,13 +3958,22 @@ class CodexAppServer:
                     "Codex Task scratch boundary changed " + stage
                 ) from exc
             profile_id = (
-                task_permission_profile
-                if task_ssh_protected_paths
-                else network_permission_profile
+                tool_free_permission_profile
+                if restricted_tools
+                else (
+                    task_permission_profile
+                    if task_ssh_protected_paths
+                    else network_permission_profile
+                )
             )
             profile = thread_config.get("permissions", {}).get(profile_id)
             try:
-                if task_ssh_protected_paths:
+                if restricted_tools:
+                    if profile != _tool_free_permission_config():
+                        raise ValueError(
+                            "tool-restricted permission profile changed"
+                        )
+                elif task_ssh_protected_paths:
                     _audit_task_isolation_permission_config(
                         profile,
                         cwd=cwd,
@@ -3994,7 +4050,7 @@ class CodexAppServer:
                     },
                 },
             )
-        if disable_project_config or tools_disabled or network_isolated:
+        if disable_project_config or restricted_tools or network_isolated:
             _deep_merge_config(
                 thread_config,
                 codex_untrusted_project_config(cwd),
@@ -4111,7 +4167,7 @@ class CodexAppServer:
                     },
                 },
             )
-        if tools_disabled:
+        if restricted_tools:
             assert tool_free_permission_profile is not None
             # PR-review turns receive a complete backend-snapshotted prompt.
             # ``environments=[]`` below removes environment-backed tool specs.
@@ -4134,7 +4190,7 @@ class CodexAppServer:
                     },
                     "orchestrator": {
                         "skills": {"enabled": False},
-                        "mcp": {"enabled": False},
+                        "mcp": {"enabled": mcp_only},
                     },
                     "skills": {
                         "include_instructions": False,
@@ -4237,7 +4293,7 @@ class CodexAppServer:
                 ) from exc
             raise
 
-        if tools_disabled or network_isolated or task_ssh_protected_paths:
+        if restricted_tools or network_isolated or task_ssh_protected_paths:
             isolated_process = self._process
             if (
                 isolated_process is None
@@ -4308,7 +4364,11 @@ class CodexAppServer:
                     raise ValueError("ambient Codex instructions are configured")
 
         async def require_stable_isolated_ambient_state(phase: str) -> None:
-            if not (tools_disabled or network_isolated or task_ssh_protected_paths):
+            if not (
+                restricted_tools
+                or network_isolated
+                or task_ssh_protected_paths
+            ):
                 return
             if (
                 isolated_ambient_config_fingerprint is None
@@ -4349,7 +4409,7 @@ class CodexAppServer:
                     + phase
                 )
 
-        if tools_disabled or network_isolated or task_ssh_protected_paths:
+        if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:
                 effective_config = await read_effective_config()
                 require_no_ambient_instruction_config(effective_config)
@@ -4372,7 +4432,7 @@ class CodexAppServer:
                 inherited_mcp = _effective_mcp_inventory({
                     "config": effective_config,
                 })
-                if task_ssh_protected_paths:
+                if task_ssh_protected_paths or mcp_only:
                     collisions = sorted(
                         set(inherited_mcp) & set(explicit_mcp_servers)
                     )
@@ -4384,7 +4444,7 @@ class CodexAppServer:
                     name: {"enabled": False}
                     for name in inherited_mcp
                 }
-                if task_ssh_protected_paths:
+                if task_ssh_protected_paths or mcp_only:
                     isolated_mcp.update(explicit_mcp_servers)
                 thread_config["mcp_servers"] = isolated_mcp
 
@@ -4520,7 +4580,7 @@ class CodexAppServer:
         isolated_permission_profile_id: str | None = None
         isolated_expected_permission_profile: dict[str, Any] | None = None
         isolated_disabled_features: frozenset[str] | None = None
-        if tools_disabled:
+        if restricted_tools:
             isolated_permission_profile_id = tool_free_permission_profile
             isolated_expected_permission_profile = (
                 _tool_free_permission_config()
@@ -4611,7 +4671,7 @@ class CodexAppServer:
             # clears a sticky service tier inherited from a resumed thread.
             "serviceTier": rpc_service_tier,
         }
-        if tools_disabled:
+        if restricted_tools:
             # Clear config-level developer instructions. Project/user
             # instruction files are independently proven absent through
             # ``instructionSources`` in the thread response. Do not also set
@@ -4637,7 +4697,7 @@ class CodexAppServer:
             if resume_session_id
             else common
         )
-        if tools_disabled and not resume_session_id:
+        if restricted_tools and not resume_session_id:
             # These fields are gated by the experimentalApi capability that
             # CCM enables during initialization. Explicit empty values are
             # materially different from omission: omission selects the local
@@ -4743,7 +4803,7 @@ class CodexAppServer:
                     recovery_attempted=True,
                     detail="recovery resumed a different or missing thread",
                 )
-        if tools_disabled:
+        if restricted_tools:
             try:
                 _audit_tool_free_thread_response(
                     response,
@@ -4801,7 +4861,7 @@ class CodexAppServer:
                     f"{thread_method} response"
                 ) from exc
         isolated_instruction_sources: tuple[tuple[Any, ...], ...] | None = None
-        if tools_disabled or network_isolated or task_ssh_protected_paths:
+        if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:
                 isolated_instruction_sources = _instruction_sources_snapshot(
                     response,
@@ -4861,7 +4921,7 @@ class CodexAppServer:
                 and thread_status_type == "active"
                 and service_tier == CODEX_SERVICE_TIER_DEFAULT
                 and not disable_autonomous_features
-                and not tools_disabled
+                and not restricted_tools
             ):
                 try:
                     active_goal = await self._read_thread_goal(str(thread_id))
@@ -4984,9 +5044,15 @@ class CodexAppServer:
             task_id=task_id,
             client_user_message_id=client_user_message_id,
             tools_disabled=tools_disabled,
+            mcp_only=mcp_only,
+            allowed_mcp_tools=frozenset(
+                (spec.name, tool)
+                for spec in mcp_specs
+                for tool in spec.enabled_tools
+            ) if mcp_only else frozenset(),
             allowed_mcp_servers=(
                 frozenset(explicit_mcp_servers)
-                if task_ssh_protected_paths
+                if task_ssh_protected_paths or mcp_only
                 else None
             ),
             descendant_state_changed=asyncio.Event(),
@@ -5016,7 +5082,11 @@ class CodexAppServer:
         # Persist the native thread id through the same event path as exec.
         turn_process.feed({"type": "thread.started", "thread_id": thread_id})
         if (
-            (tools_disabled or bool(task_ssh_protected_paths))
+            (
+                restricted_tools
+                or network_isolated
+                or bool(task_ssh_protected_paths)
+            )
             and (
                 tool_free_skills_revision is None
                 or self._skills_revision != tool_free_skills_revision
@@ -5055,7 +5125,7 @@ class CodexAppServer:
         }
         if output_schema is not None:
             turn_params["outputSchema"] = output_schema
-        if tools_disabled:
+        if restricted_tools:
             # A turn-level cwd without an explicit empty environment causes
             # Codex to silently restore its default local environment. Repeat
             # both empty selections. Do not repeat the named permission
@@ -5097,7 +5167,7 @@ class CodexAppServer:
                     "Codex turn ownership preparation failed",
                 )
                 raise
-        if tools_disabled or network_isolated or task_ssh_protected_paths:
+        if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:
                 # The ownership callback is awaited and may commit durable
                 # launch state. Recheck once more before model input so an
@@ -5119,7 +5189,11 @@ class CodexAppServer:
                 )
                 raise
         if (
-            (tools_disabled or bool(task_ssh_protected_paths))
+            (
+                restricted_tools
+                or network_isolated
+                or bool(task_ssh_protected_paths)
+            )
             and (
                 tool_free_skills_revision is None
                 or self._skills_revision != tool_free_skills_revision
@@ -6476,7 +6550,7 @@ class CodexAppServer:
             # exact path inventory captured for every active tool-free turn.
             self._skills_revision += 1
             for context in list(self._contexts_by_thread.values()):
-                if context.tools_disabled:
+                if context.tools_disabled or context.mcp_only:
                     self._schedule_tool_free_violation(
                         context,
                         "skills inventory changed",
@@ -6511,7 +6585,7 @@ class CodexAppServer:
                                 else None
                             ),
                         )
-                        if lineage_context.tools_disabled:
+                        if lineage_context.tools_disabled or lineage_context.mcp_only:
                             self._schedule_tool_free_violation(
                                 lineage_context,
                                 f"native child thread {child_id}",
@@ -6824,7 +6898,7 @@ class CodexAppServer:
                         ),
                     )
                     return
-        if context.tools_disabled:
+        if context.tools_disabled or context.mcp_only:
             if method in {"item/started", "item/completed"}:
                 item = params.get("item")
                 item_type = (
@@ -6832,20 +6906,55 @@ class CodexAppServer:
                     if isinstance(item, dict)
                     else None
                 )
-                if item_type not in _TOOL_FREE_PASSIVE_ITEM_TYPES:
+                allowed_item_types = _TOOL_FREE_PASSIVE_ITEM_TYPES
+                if context.mcp_only:
+                    allowed_item_types = allowed_item_types | {"mcpToolCall"}
+                if item_type not in allowed_item_types:
                     self._schedule_tool_free_violation(
                         context,
                         f"{method} item type {item_type!r}",
                     )
                     return
+                if context.mcp_only and item_type == "mcpToolCall":
+                    assert isinstance(item, dict)
+                    identity = (item.get("server"), item.get("tool"))
+                    if identity not in context.allowed_mcp_tools:
+                        self._schedule_tool_free_violation(
+                            context,
+                            f"{method} unbound MCP tool {identity!r}",
+                        )
+                        return
+                    item_id = item.get("id")
+                    if not isinstance(item_id, str) or not item_id:
+                        self._schedule_tool_free_violation(
+                            context,
+                            f"{method} MCP item has no stable id",
+                        )
+                        return
+                    if method == "item/started":
+                        context.active_mcp_item_ids.add(item_id)
+                    else:
+                        context.active_mcp_item_ids.discard(item_id)
             elif method.startswith(
                 _TOOL_FREE_FORBIDDEN_NOTIFICATION_PREFIXES
             ):
-                self._schedule_tool_free_violation(
-                    context,
-                    f"notification {method}",
-                )
-                return
+                if context.mcp_only and method.startswith("item/mcpToolCall/"):
+                    item_id = params.get("itemId")
+                    if (
+                        not isinstance(item_id, str)
+                        or item_id not in context.active_mcp_item_ids
+                    ):
+                        self._schedule_tool_free_violation(
+                            context,
+                            f"notification {method} for unknown MCP item",
+                        )
+                        return
+                else:
+                    self._schedule_tool_free_violation(
+                        context,
+                        f"notification {method}",
+                    )
+                    return
             elif method not in _TOOL_FREE_PASSIVE_NOTIFICATION_METHODS:
                 # Treat new protocol surface as executable until explicitly
                 # audited and added to the passive allow-list.

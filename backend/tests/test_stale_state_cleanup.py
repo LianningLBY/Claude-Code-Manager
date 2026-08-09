@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2002,6 +2003,207 @@ async def test_safety_reset_fails_unclassified_task_and_releases_instance(db_fac
 
 
 @pytest.mark.asyncio
+async def test_safety_reset_preserves_owner_when_harness_cleanup_fails(
+    db_factory,
+):
+    """Fallback reset cannot bypass the exact Harness owner stop fence."""
+
+    d = _make_dispatcher(db_factory)
+    d.instance_manager.is_running = MagicMock(return_value=False)
+    d.instance_manager._instance_lifecycle_lock = MagicMock(
+        return_value=asyncio.Lock()
+    )
+    d.instance_manager.reconcile_dead_reverse_task_owner = AsyncMock()
+    async with db_factory() as db:
+        task = Task(title="harness-cleanup-failure", status="executing")
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="harness-cleanup-failure",
+            status="running",
+            pid=12345,
+            current_task_id=task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id, instance_id = task.id, instance.id
+
+    class FailingOwnerStopFence:
+        async def __aenter__(self):
+            raise RuntimeError("Browser child cleanup could not be proven")
+
+        async def __aexit__(self, _exc_type, _exc, _traceback):
+            return False
+
+    d.test_harness_service = MagicMock()
+    d.test_harness_service.owner_stop_fence.return_value = (
+        FailingOwnerStopFence()
+    )
+
+    await d._reset_instance_if_stale(instance_id, generation)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == "executing"
+        assert task.completed_at is None
+        assert task.error_message is None
+        assert instance.status == "running"
+        assert instance.pid == 12345
+        assert instance.current_task_id == task_id
+    d.test_harness_service.owner_stop_fence.assert_called_once()
+    d.instance_manager.reconcile_dead_reverse_task_owner.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_safety_reset_takes_harness_fence_before_instance_lifecycle(
+    db_factory,
+):
+    """A concurrent Harness stop cannot deadlock against stale reset."""
+
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_fence as real_owner_fence,
+    )
+
+    d = _make_dispatcher(db_factory)
+    d.instance_manager.is_running = MagicMock(return_value=False)
+    lifecycle_lock = asyncio.Lock()
+    d.instance_manager._instance_lifecycle_lock = MagicMock(
+        return_value=lifecycle_lock
+    )
+    d.instance_manager.reconcile_dead_reverse_task_owner = AsyncMock()
+    async with db_factory() as db:
+        task = Task(title="ordered-harness-reset", status="executing")
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="ordered-harness-reset",
+            status="running",
+            pid=12347,
+            current_task_id=task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task_id, instance_id = task.id, instance.id
+
+    @asynccontextmanager
+    async def owner_stop_fence(fenced_task_id, **_kwargs):
+        # Model the service's re-entry into the process-local owner fence while
+        # avoiding unrelated Harness graph I/O in this lock-order regression.
+        async with real_owner_fence(fenced_task_id):
+            yield
+
+    d.test_harness_service = MagicMock()
+    d.test_harness_service.owner_stop_fence.side_effect = owner_stop_fence
+
+    competing_owner_ready = asyncio.Event()
+    allow_competing_lifecycle = asyncio.Event()
+    competing_lifecycle_acquired = asyncio.Event()
+    stale_owner_attempted = asyncio.Event()
+    stale_reset: asyncio.Task | None = None
+
+    @asynccontextmanager
+    async def observed_owner_fence(fenced_task_id):
+        if asyncio.current_task() is stale_reset:
+            stale_owner_attempted.set()
+        async with real_owner_fence(fenced_task_id):
+            yield
+
+    async def competing_stop():
+        async with real_owner_fence(task_id):
+            competing_owner_ready.set()
+            await allow_competing_lifecycle.wait()
+            async with lifecycle_lock:
+                competing_lifecycle_acquired.set()
+
+    competitor = asyncio.create_task(competing_stop())
+    await asyncio.wait_for(competing_owner_ready.wait(), timeout=1)
+    try:
+        with patch(
+            "backend.services.test_harness_owner_fence.test_harness_owner_fence",
+            observed_owner_fence,
+        ):
+            stale_reset = asyncio.create_task(
+                d._reset_instance_if_stale(instance_id, generation)
+            )
+            await asyncio.wait_for(stale_owner_attempted.wait(), timeout=1)
+            # The stale reset is now waiting on the Harness fence and must not
+            # hold the Instance lifecycle lock.  A reverse-order regression
+            # makes these two tasks wait on one another and hits this timeout.
+            allow_competing_lifecycle.set()
+            await asyncio.wait_for(
+                competing_lifecycle_acquired.wait(),
+                timeout=1,
+            )
+            await asyncio.wait_for(competitor, timeout=1)
+            await asyncio.wait_for(stale_reset, timeout=2)
+    finally:
+        allow_competing_lifecycle.set()
+        for pending in (competitor, stale_reset):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(
+            *(pending for pending in (competitor, stale_reset) if pending is not None),
+            return_exceptions=True,
+        )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == "failed"
+        assert instance.status == "idle"
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_safety_reset_terminal_without_exact_harness_gate_preserves_owner(
+    db_factory,
+):
+    """A terminal status alone never proves Browser descendants were reaped."""
+
+    d = _make_dispatcher(db_factory)
+    d.instance_manager.is_running = MagicMock(return_value=False)
+    d.instance_manager._instance_lifecycle_lock = MagicMock(
+        return_value=asyncio.Lock()
+    )
+    async with db_factory() as db:
+        task = Task(title="terminal-without-harness-gate", status="executing")
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="terminal-without-harness-gate",
+            status="running",
+            pid=12346,
+            current_task_id=task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        generation = d._task_lifecycle_generation(task)
+        task.status = "failed"
+        task.completed_at = datetime.utcnow()
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+    await d._reset_instance_if_stale(instance_id, generation)
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == "failed"
+        assert instance.status == "running"
+        assert instance.pid == 12346
+        assert instance.current_task_id == task_id
+
+
+@pytest.mark.asyncio
 async def test_safety_reset_writes_task_before_instance(db_factory):
     """The fallback failure cannot invert the lifecycle DB lock order."""
 
@@ -2446,6 +2648,55 @@ async def test_lifecycle_resets_instance_on_exception(db_factory):
         inst = await db.get(Instance, inst_id)
         assert inst.status == "idle"
         assert inst.pid is None
+
+
+@pytest.mark.asyncio
+async def test_initial_lifecycle_preserves_claim_when_harness_cleanup_fails(
+    db_factory,
+):
+    """in_progress -> executing cannot bypass the old owner graph fence."""
+
+    d = _make_dispatcher(db_factory)
+
+    @asynccontextmanager
+    async def failing_owner_stop_fence(*_args, **_kwargs):
+        raise RuntimeError("Harness owner graph cleanup failed")
+        yield  # pragma: no cover
+
+    d.test_harness_service = MagicMock()
+    d.test_harness_service.owner_stop_fence.side_effect = (
+        failing_owner_stop_fence
+    )
+    async with db_factory() as db:
+        instance = Instance(
+            name="initial-harness-failure",
+            status="running",
+            pid=12347,
+        )
+        task = Task(
+            title="initial-harness-failure",
+            description="test",
+            target_repo="/repo",
+            status="in_progress",
+        )
+        db.add_all((instance, task))
+        await db.flush()
+        task.instance_id = instance.id
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id, task_snapshot = instance.id, task.id, task
+
+    await d._run_task_lifecycle(instance_id, task_snapshot)
+
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == "in_progress"
+        assert task.completed_at is None
+        assert instance.status == "running"
+        assert instance.pid == 12347
+        assert instance.current_task_id == task_id
 
 
 @pytest.mark.asyncio

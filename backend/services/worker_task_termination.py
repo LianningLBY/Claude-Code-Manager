@@ -2884,12 +2884,28 @@ async def _execute_owned_worker_receipt(
             _cancel_local_task_impl,
             _stop_task_session_local_impl,
         )
+        from backend.services.test_harness_owner_fence import (
+            TestHarnessOwnerIdentity,
+        )
+
+        if not fence.source_task_incarnation_id:
+            raise WorkerTaskTerminationConflict(
+                "Worker termination receipt has no durable Task incarnation"
+            )
+        expected_harness_owner = TestHarnessOwnerIdentity(
+            task_id=fence.task_id,
+            incarnation_id=fence.source_task_incarnation_id,
+            retry_count=fence.source_task_retry_count,
+            turn_generation=fence.source_task_turn_generation,
+            status=fence.source_task_status,
+        )
 
         current = await db.get(Task, fence.task_id, populate_existing=True)
         if fence.operation == "cancel":
             operation_result = await _cancel_local_task_impl(
                 fence.task_id,
                 db,
+                expected_identity=expected_harness_owner,
                 worker_termination_operation_id=fence.operation_id,
                 worker_termination_execution_token=fence.execution_token,
                 worker_termination_state_version=fence.state_version,
@@ -2923,6 +2939,7 @@ async def _execute_owned_worker_receipt(
             response = await _stop_task_session_local_impl(
                 fence.task_id,
                 db,
+                expected_identity=expected_harness_owner,
                 worker_termination_operation_id=fence.operation_id,
                 worker_supersede=(fence.operation == "supersede"),
                 worker_termination_execution_token=fence.execution_token,

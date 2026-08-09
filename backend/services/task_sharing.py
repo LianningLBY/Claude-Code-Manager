@@ -50,6 +50,12 @@ async def lock_task_share_authority(db: AsyncSession, task: Task) -> bool:
 
 
 def _writable_share_block_reason(task: Task) -> str | None:
+    metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+    if metadata.get("isolated_browser_agent") is True:
+        return (
+            "Isolated Browser Agent Tasks cannot be shared as writable chat "
+            "sessions; use their Harness owner"
+        )
     if task.mode == "delivery_loop" or task.delivery_run_id is not None:
         return (
             "Delivery-owned Tasks cannot be shared as writable remote chat "

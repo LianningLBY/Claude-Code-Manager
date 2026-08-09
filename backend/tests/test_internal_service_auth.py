@@ -34,7 +34,14 @@ def _internal_auth_state(monkeypatch):
 def _issue(audience: str, **claims) -> str:
     if claims.get("task_id") is not None:
         claims.setdefault("task_incarnation_id", TASK_INCARNATION)
-    if audience in {"ccm_ssh", "ccm_skills", "ccm_ask_user"}:
+    if audience in {
+        "ccm_ssh",
+        "ccm_skills",
+        "ccm_ask_user",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+        "ccm_browser_review",
+    }:
         claims.setdefault("task_retry_count", TASK_RETRY_COUNT)
         claims.setdefault("task_turn_generation", TASK_TURN_GENERATION)
         claims.setdefault("task_status", TASK_STATUS)
@@ -44,6 +51,25 @@ def _issue(audience: str, **claims) -> str:
         owner_id=f"{audience}-owner",
         **claims,
     )
+
+
+@pytest.mark.parametrize("configured", ["", "   ", "\t\n", None])
+def test_internal_service_tokens_require_nonblank_deployment_secret(
+    monkeypatch,
+    configured,
+):
+    monkeypatch.setattr(settings, "auth_token", configured)
+    token = auth.issue_internal_service_token(
+        audience="ccm_skills",
+        task_id=42,
+        task_incarnation_id=TASK_INCARNATION,
+        task_retry_count=TASK_RETRY_COUNT,
+        task_turn_generation=TASK_TURN_GENERATION,
+        task_status=TASK_STATUS,
+        owner_kind="test",
+        owner_id="blank-secret",
+    )
+    assert token == ""
 
 
 def test_ssh_credential_is_bound_to_task_method_and_route():
@@ -95,6 +121,75 @@ def test_skills_credential_cannot_use_the_general_task_update_route():
             path="/api/tasks/42",
         )
     assert exc.value.status_code == 403
+
+
+def test_browser_child_credential_is_bound_to_exact_job_routes():
+    job_id = "b" * 32
+    token = auth.issue_internal_service_token(
+        audience="ccm_browser_review",
+        task_id=42,
+        task_incarnation_id=TASK_INCARNATION,
+        task_retry_count=TASK_RETRY_COUNT,
+        task_turn_generation=TASK_TURN_GENERATION,
+        task_status=TASK_STATUS,
+        owner_kind="browser-review-job",
+        owner_id=job_id,
+    )
+    for method, path in (
+        ("GET", f"/api/browser-reviews/{job_id}/internal/context"),
+        ("POST", f"/api/browser-reviews/{job_id}/internal/events"),
+        (
+            "POST",
+            f"/api/browser-reviews/{job_id}/internal/operations/{'c' * 32}/permit",
+        ),
+        (
+            "POST",
+            f"/api/browser-reviews/{job_id}/internal/operations/{'c' * 32}/ack",
+        ),
+    ):
+        claims = auth.authenticate_internal_service_token(
+            token,
+            method=method,
+            path=path,
+        )
+        assert claims.owner_id == job_id
+
+    for method, path in (
+        ("GET", f"/api/browser-reviews/{'d' * 32}/internal/context"),
+        ("POST", f"/api/browser-reviews/{job_id}/cancel"),
+        ("GET", "/api/instances"),
+    ):
+        with pytest.raises(auth.InternalServiceTokenError) as exc:
+            auth.authenticate_internal_service_token(
+                token,
+                method=method,
+                path=path,
+            )
+        assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize(
+    "audience",
+    ("ccm_frontend_review", "ccm_workspace_review"),
+)
+def test_parent_browser_credentials_are_task_and_generation_scoped(audience):
+    token = _issue(audience, task_id=42)
+    auth.authenticate_internal_service_token(
+        token,
+        method="POST",
+        path="/api/tasks/42/test-runs/internal/start",
+    )
+    auth.authenticate_internal_service_token(
+        token,
+        method="GET",
+        path=f"/api/tasks/42/test-runs/{'e' * 32}/internal/status",
+    )
+    with pytest.raises(auth.InternalServiceTokenError):
+        auth.authenticate_internal_service_token(
+            token,
+            method="POST",
+            path="/api/tasks/43/test-runs/internal/start",
+        )
 
 
 @pytest.mark.parametrize(
@@ -251,7 +346,14 @@ def test_task_scoped_credential_requires_exact_incarnation():
 
 @pytest.mark.parametrize(
     "audience",
-    ("ccm_ssh", "ccm_skills", "ccm_ask_user"),
+    (
+        "ccm_ssh",
+        "ccm_skills",
+        "ccm_ask_user",
+        "ccm_frontend_review",
+        "ccm_workspace_review",
+        "ccm_browser_review",
+    ),
 )
 def test_main_task_credentials_require_exact_active_generation(audience):
     with pytest.raises(ValueError, match="exact active generation"):

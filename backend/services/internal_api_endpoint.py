@@ -1,9 +1,9 @@
 """Resolve the Manager-local API endpoint used by CCM child processes.
 
 ``uvicorn --port`` changes the listening socket without mutating Pydantic
-settings. Remembering the server tuple from an actual ASGI request keeps MCP
-servers and hooks on the same Manager when CLI-only host/port overrides are
-used.
+settings.  Remembering the server tuple from an actual ASGI request keeps MCP
+servers and hooks on the same Manager even when an operator starts Uvicorn
+with CLI-only host/port overrides.
 """
 
 from __future__ import annotations

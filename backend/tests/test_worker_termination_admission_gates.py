@@ -35,6 +35,9 @@ from backend.services.skill_context import (
     USER_SKILL_SNAPSHOTS_METADATA_KEY,
     WORKER_MANAGED_TASK_METADATA_KEY,
 )
+from backend.services.test_harness_owner_fence import (
+    test_harness_owner_identity as _test_harness_owner_identity,
+)
 from backend.services.worker_proxy import (
     WorkerProxy,
     WorkerTaskForwardAdmissionBlockedError,
@@ -536,6 +539,7 @@ async def test_lease_takeover_after_queue_abort_blocks_later_plan_stop(
         receipt.state_version = 2
         receipt.execution_token = old_token
         receipt.next_reconcile_at = datetime.utcnow() + timedelta(seconds=90)
+        expected_harness_owner = _test_harness_owner_identity(task)
         await db.commit()
         task_id = task.id
 
@@ -578,6 +582,7 @@ async def test_lease_takeover_after_queue_abort_blocks_later_plan_stop(
                 await tasks_api._cancel_local_task_impl(
                     task_id,
                     db,
+                    expected_identity=expected_harness_owner,
                     worker_termination_operation_id=operation_id,
                     worker_termination_execution_token=old_token,
                     worker_termination_state_version=2,

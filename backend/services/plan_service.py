@@ -557,6 +557,31 @@ async def fence_plan_target_task(
                 "Plan target has an active Worker termination receipt",
             )
         raise HTTPException(409, "Plan target is changing execution location")
+    from backend.models.test_harness import TestHarnessChildBinding
+    from backend.services.test_harness_children import (
+        browser_child_public_mutation_error,
+    )
+
+    browser_parent = await db.scalar(
+        select(TestHarnessChildBinding.id).where(
+            TestHarnessChildBinding.child_task_id == target_task_id
+        )
+    )
+    target = await db.get(Task, target_task_id, populate_existing=True)
+    browser_error = (
+        browser_child_public_mutation_error(
+            target,
+            has_binding=browser_parent is not None,
+        )
+        if target is not None
+        else None
+    )
+    if browser_error is not None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Isolated Browser Agent Tasks cannot own first-class Plans",
+        )
 
 
 async def fence_worker_plan_application_receipt(

@@ -186,6 +186,363 @@ async def test_update_task_rejects_valid_mode_change_without_mutation(
 
 
 @pytest.mark.asyncio
+async def test_update_task_rejects_immutable_browser_child_binding(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import TestHarnessChildBinding
+
+    async with session_factory() as db:
+        owner = Task(
+            title="Browser owner",
+            description="Own the isolated child",
+            status="completed",
+        )
+        db.add(owner)
+        await db.flush()
+        child = Task(
+            title="Immutable Browser child",
+            description="Frozen launch profile",
+            status="pending_activation",
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            enabled_skills={"browser-review": "immutable-job"},
+            metadata_={"isolated_browser_agent": True},
+            archived=True,
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            TestHarnessChildBinding(
+                id="e" * 32,
+                harness_run_id="f" * 32,
+                owner_task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                child_task_id=child.id,
+                child_task_incarnation_id=child.incarnation_id,
+                browser_review_job_id="immutable-job",
+                state="reserved",
+            )
+        )
+        await db.commit()
+        child_id = child.id
+
+    response = await client.put(
+        f"/api/tasks/{child_id}",
+        json={"title": "Mutated Browser child"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Harness owner" in response.text
+    async with session_factory() as db:
+        child = await db.get(Task, child_id)
+        assert child.title == "Immutable Browser child"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("graph_kind", ["harness", "workspace", "browser_child"])
+async def test_update_task_rejects_active_browser_owner_graph(
+    client,
+    session_factory,
+    graph_kind,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import (
+        TestHarnessChildBinding,
+        TestHarnessRun,
+    )
+    from backend.models.workspace_review import WorkspaceReviewRun
+
+    async with session_factory() as db:
+        owner = Task(
+            title="Frozen Browser graph owner",
+            description="active graph freezes public Task edits",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.flush()
+        identity = {
+            "owner_task_incarnation_id": owner.incarnation_id,
+            "owner_task_retry_count": owner.retry_count,
+            "owner_task_turn_generation": owner.turn_generation,
+            "owner_task_status": owner.status,
+        }
+        if graph_kind == "harness":
+            run_id = "1" * 32
+            db.add(
+                TestHarnessRun(
+                    id=run_id,
+                    task_id=owner.id,
+                    **identity,
+                    target_kind="fixed_url",
+                    target_spec={"url": "https://example.com"},
+                    test_plan={"objective": "freeze owner"},
+                    runtime_config={"provider": "codex"},
+                    request_fingerprint="a" * 64,
+                    root_run_id=run_id,
+                    status="running",
+                    stage="waiting_for_agent",
+                )
+            )
+        elif graph_kind == "workspace":
+            db.add(
+                WorkspaceReviewRun(
+                    id="2" * 32,
+                    task_id=owner.id,
+                    **identity,
+                    mode="review_only",
+                    profile="standard",
+                    goal="freeze owner",
+                    status="reviewing",
+                    stage="browser_agent_queued",
+                    workspace_path="/repo",
+                    git_head="b" * 40,
+                    workspace_fingerprint="c" * 64,
+                    preview_config={"kind": "http"},
+                    cleanup_status="pending",
+                )
+            )
+        else:
+            child = Task(
+                title="Frozen Browser child",
+                description="child",
+                status="pending_activation",
+                provider="codex",
+                model="gpt-5.6-sol",
+                archived=True,
+                metadata_={"isolated_browser_agent": True},
+            )
+            db.add(child)
+            await db.flush()
+            db.add(
+                TestHarnessChildBinding(
+                    id="3" * 32,
+                    harness_run_id="4" * 32,
+                    owner_task_id=owner.id,
+                    **identity,
+                    child_task_id=child.id,
+                    child_task_incarnation_id=child.incarnation_id,
+                    browser_review_job_id="5" * 32,
+                    state="ready",
+                )
+            )
+        await db.commit()
+        owner_id = owner.id
+
+    response = await client.put(
+        f"/api/tasks/{owner_id}",
+        json={"title": "must not change while Browser graph is active"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "active Test Harness" in response.text
+    async with session_factory() as db:
+        owner = await db.get(Task, owner_id)
+        assert owner.title == "Frozen Browser graph owner"
+
+
+@pytest.mark.asyncio
+async def test_update_task_final_writer_detects_late_harness_materialization(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """The final Task CAS, not only the API preflight, owns the graph fence."""
+
+    from backend.models.task import Task
+    from backend.models.test_harness import TestHarnessRun
+    from backend.services.task_queue import TaskQueue
+
+    created = await client.post(
+        "/api/tasks",
+        json={"title": "Owner before materialization", "description": "owner"},
+    )
+    assert created.status_code == 201, created.text
+    owner_id = created.json()["id"]
+    original_update = TaskQueue.update_task
+    inserted = False
+
+    async def materialize_before_final_writer(self, task_id, **kwargs):
+        nonlocal inserted
+        if task_id == owner_id and not inserted:
+            inserted = True
+            async with session_factory() as db:
+                owner = await db.get(Task, owner_id)
+                run_id = "6" * 32
+                db.add(
+                    TestHarnessRun(
+                        id=run_id,
+                        task_id=owner.id,
+                        owner_task_incarnation_id=owner.incarnation_id,
+                        owner_task_retry_count=owner.retry_count,
+                        owner_task_turn_generation=owner.turn_generation,
+                        owner_task_status=owner.status,
+                        target_kind="fixed_url",
+                        target_spec={"url": "https://example.com"},
+                        test_plan={"objective": "late materialization"},
+                        runtime_config={"provider": "codex"},
+                        request_fingerprint="d" * 64,
+                        root_run_id=run_id,
+                        status="running",
+                        stage="waiting_for_agent",
+                    )
+                )
+                await db.commit()
+        return await original_update(self, task_id, **kwargs)
+
+    monkeypatch.setattr(TaskQueue, "update_task", materialize_before_final_writer)
+    response = await client.put(
+        f"/api/tasks/{owner_id}",
+        json={"title": "late stale edit"},
+    )
+
+    assert response.status_code == 409, response.text
+    async with session_factory() as db:
+        owner = await db.get(Task, owner_id)
+        assert owner.title == "Owner before materialization"
+
+
+@pytest.mark.asyncio
+async def test_update_task_allows_edit_after_harness_graph_is_terminal(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import TestHarnessRun
+
+    async with session_factory() as db:
+        owner = Task(
+            title="Terminal graph owner",
+            description="owner",
+            status="completed",
+        )
+        db.add(owner)
+        await db.flush()
+        run_id = "7" * 32
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "historical evidence"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="e" * 64,
+                    root_run_id=run_id,
+                    status="completed",
+                    stage="completed",
+                    cleanup_status="completed",
+                )
+        )
+        await db.commit()
+        owner_id = owner.id
+
+    response = await client.put(
+        f"/api/tasks/{owner_id}",
+        json={"title": "Editable after graph terminal"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "Editable after graph terminal"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "suffix", "payload"),
+    [
+        ("DELETE", "", None),
+        ("POST", "/cancel", None),
+        ("POST", "/retry", None),
+        ("POST", "/stop-session", None),
+        ("POST", "/archive", None),
+        ("POST", "/chat", {"message": "escape owner lifecycle"}),
+        ("GET", "/fork-anchors", None),
+        ("POST", "/fork", {"anchor": {"type": "latest"}}),
+        ("GET", "/inject-capabilities", None),
+        ("POST", "/inject", {"message": "steer child"}),
+    ],
+)
+async def test_public_task_controls_reject_isolated_browser_marker(
+    client,
+    session_factory,
+    method,
+    suffix,
+    payload,
+):
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        child = Task(
+            title="Internal Browser child",
+            description="not a public Task lifecycle",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            session_id="browser-session-is-not-resumable",
+            last_cwd="/tmp/browser-child",
+            metadata_={"isolated_browser_agent": True},
+            archived=True,
+        )
+        db.add(child)
+        await db.commit()
+        child_id = child.id
+
+    response = await client.request(
+        method,
+        f"/api/tasks/{child_id}{suffix}",
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Harness owner" in response.text
+    async with session_factory() as db:
+        assert await db.get(Task, child_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_browser_child_cannot_be_shared_or_own_plan(client, session_factory):
+    from backend.models.task import Task
+    from backend.services import task_sharing
+
+    async with session_factory() as db:
+        child = Task(
+            title="Internal Browser child",
+            description="not shareable or plannable",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            session_id="browser-session-is-not-resumable",
+            metadata_={"isolated_browser_agent": True},
+            archived=True,
+        )
+        db.add(child)
+        await db.commit()
+        child_id = child.id
+
+    async with session_factory() as db:
+        with pytest.raises(ValueError, match="Browser Agent"):
+            await task_sharing.share_task(db, child_id, [])
+    related_plan = await client.post(
+        f"/api/tasks/{child_id}/plans",
+        json={"title": "forbidden", "input": "forbidden"},
+    )
+
+    assert related_plan.status_code == 409, related_plan.text
+    assert "Harness owner" in related_plan.text
+
+
+@pytest.mark.asyncio
 async def test_create_task_wakes_dispatcher_after_commit(client):
     """New work should not wait for the dispatcher's 2-second safety poll."""
     from backend.main import dispatcher
@@ -1567,6 +1924,97 @@ async def test_cancel_task(client):
 
 
 @pytest.mark.asyncio
+async def test_cancel_owner_cascades_to_durable_browser_child(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.test_harness import (
+        TestHarnessChildBinding,
+        TestHarnessRun,
+    )
+
+    create_resp = await client.post(
+        "/api/tasks",
+        json={"title": "Owner with browser run", "description": "d"},
+    )
+    task_id = create_resp.json()["id"]
+    run_id = "a" * 32
+    async with session_factory() as db:
+        owner = await db.get(Task, task_id)
+        assert owner is not None
+        child = Task(
+            title="Isolated Browser Agent",
+            description="black-box review",
+            status="pending_activation",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+            archived=True,
+            metadata_={
+                "isolated_browser_agent": True,
+                "test_harness_run_id": run_id,
+                "test_harness_parent_task_id": task_id,
+                "browser_review_job_id": "browser-cascade-job",
+            },
+        )
+        db.add(child)
+        await db.flush()
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=task_id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                agent_task_id=child.id,
+                browser_review_job_id="browser-cascade-job",
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Review the page"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="b" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="waiting_for_agent",
+            )
+        )
+        db.add(
+            TestHarnessChildBinding(
+                id="c" * 32,
+                harness_run_id=run_id,
+                owner_task_id=task_id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                child_task_id=child.id,
+                child_task_incarnation_id=child.incarnation_id,
+                browser_review_job_id="browser-cascade-job",
+                state="reserved",
+            )
+        )
+        await db.commit()
+        child_id = child.id
+
+    response = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelled"
+    async with session_factory() as db:
+        owner = await db.get(Task, task_id)
+        child = await db.get(Task, child_id)
+        run = await db.get(TestHarnessRun, run_id)
+        binding = await db.get(TestHarnessChildBinding, "c" * 32)
+        assert owner.status == "cancelled"
+        assert child.status == "cancelled"
+        assert run.status == "cancelled"
+        assert binding.state == "stopped"
+
+
+@pytest.mark.asyncio
 async def test_retry_task(client):
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
@@ -1577,6 +2025,78 @@ async def test_retry_task(client):
     assert cancelled.status_code == 200
     resp = await client.post(f"/api/tasks/{task_id}/retry")
     assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_retry_fences_and_cancels_concurrent_harness_owner(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A retry cannot strand a Run or child on the previous generation."""
+
+    from backend.models.task import Task
+    from backend.models.test_harness import TestHarnessRun
+    from backend.config import settings
+    from backend.services.test_harness import test_harness_service
+    from backend.services.test_harness_contracts import TestHarnessSpec
+
+    monkeypatch.setattr(settings, "auth_token", "harness-race-secret")
+    client.headers["Authorization"] = "Bearer harness-race-secret"
+
+    async with session_factory() as db:
+        owner = Task(
+            title="Retry Harness owner",
+            description="race retry against run materialization",
+            status="failed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.commit()
+        task_id = owner.id
+
+    entered_create = asyncio.Event()
+    release_create = asyncio.Event()
+    original_create = test_harness_service._create_run
+
+    async def delayed_create(**kwargs):
+        entered_create.set()
+        await release_create.wait()
+        return await original_create(**kwargs)
+
+    monkeypatch.setattr(test_harness_service, "_create_run", delayed_create)
+    start_request = asyncio.create_task(
+        test_harness_service.start_task_run(
+            task_id=task_id,
+            spec=TestHarnessSpec(
+                target_kind="fixed_url",
+                target={"url": "https://example.com"},
+                goal="Exercise retry owner fencing",
+            ),
+        )
+    )
+    await asyncio.wait_for(entered_create.wait(), timeout=1)
+
+    retry_request = asyncio.create_task(client.post(f"/api/tasks/{task_id}/retry"))
+    await asyncio.sleep(0)
+    assert not retry_request.done()
+
+    release_create.set()
+    run = await asyncio.wait_for(start_request, timeout=1)
+    response = await asyncio.wait_for(retry_request, timeout=2)
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "pending"
+    assert response.json()["retry_count"] == 1
+    async with session_factory() as db:
+        owner = await db.get(Task, task_id)
+        persisted_run = await db.get(TestHarnessRun, run.id)
+        assert owner is not None
+        assert owner.status == "pending"
+        assert owner.retry_count == 1
+        assert persisted_run is not None
+        assert persisted_run.status == "cancelled"
 
 
 @pytest.mark.asyncio
@@ -4455,6 +4975,47 @@ async def test_create_goal_task(client):
 
 
 @pytest.mark.asyncio
+async def test_create_frontend_review_goal_builds_internal_condition(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Frontend Review Goal",
+        "description": "审查 http://127.0.0.1:5173，修复后重新验证",
+        "target_repo": "/tmp",
+        "frontend_review": {
+            "mode": "goal",
+            "profile": "standard",
+            "max_iterations": 5,
+        },
+    })
+
+    assert resp.status_code == 201
+    data = resp.json()
+    assert data["mode"] == "goal"
+    assert data["goal_max_turns"] == 5
+    assert "Browser Review" in data["goal_condition"]
+    assert data["metadata_"]["frontend_review"] == {
+        "mode": "goal",
+        "profile": "standard",
+        "max_iterations": 5,
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_frontend_review_goal_rejects_excessive_iterations(client):
+    resp = await client.post("/api/tasks", json={
+        "title": "Unbounded Frontend Review Goal",
+        "description": "review it",
+        "target_repo": "/tmp",
+        "frontend_review": {
+            "mode": "goal",
+            "profile": "standard",
+            "max_iterations": 11,
+        },
+    })
+
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_create_goal_task_custom_max_turns(client):
     """Goal task with custom max_turns stores it correctly."""
     resp = await client.post("/api/tasks", json={
@@ -6435,6 +6996,33 @@ async def test_stop_session_no_process_reports_not_stopped(client, session_facto
     assert body["stopped"] is False
     assert "note" in body
     mock_stop.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stop_session_terminal_task_without_process_returns_error(
+    client,
+    session_factory,
+):
+    """A terminal Task with no queue/process preserves the public 400 contract."""
+    from backend.models.task import Task
+    from sqlalchemy import update
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Already done", "description": "d", "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="completed")
+        )
+        await db.commit()
+
+    resp = await client.post(f"/api/tasks/{task_id}/stop-session")
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "No running session found for this task"
 
 
 @pytest.mark.asyncio

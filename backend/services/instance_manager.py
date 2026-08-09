@@ -652,6 +652,34 @@ class _LaunchReservation:
 
 
 @dataclass(frozen=True)
+class _BrowserChildLaunchAdmission:
+    """Immutable Browser-child authority captured by launch preflight.
+
+    The durable binding is checked again at the final provider-effect
+    boundary.  Retaining the exact preflight identity prevents a concurrent
+    writer from replacing an otherwise self-consistent binding/Task profile
+    between those two checks.
+    """
+
+    binding_id: str
+    browser_review_job_id: str
+    harness_run_id: str
+    workspace_review_run_id: str | None
+    launch_profile_version: int
+    launch_config_digest: str
+    owner_task_id: int
+    owner_task_incarnation_id: str
+    owner_task_retry_count: int
+    owner_task_turn_generation: int
+    owner_task_status: str
+    child_task_id: int
+    child_task_incarnation_id: str
+    child_task_retry_count: int
+    child_task_turn_generation: int
+    claimed_instance_id: int
+
+
+@dataclass(frozen=True)
 class _SequentialTurnContinuation:
     """One-shot in-memory authority for the next turn of one live mode run."""
 
@@ -734,9 +762,18 @@ class _TaskLifecycleFence:
 class InstanceManager:
     """Manages multiple Claude Code subprocess instances."""
 
-    def __init__(self, db_factory, broadcaster: WebSocketBroadcaster):
+    def __init__(
+        self,
+        db_factory,
+        broadcaster: WebSocketBroadcaster,
+        test_harness_service=None,
+    ):
         self.db_factory = db_factory  # async_sessionmaker
         self.broadcaster = broadcaster
+        # Resolved lazily to avoid importing the Harness service during module
+        # initialization. Tests with an isolated database may inject their own
+        # service; production reuses the process-global service.
+        self.test_harness_service = test_harness_service
         # Wired by backend.main after Dispatcher construction. Keeping this
         # dependency explicit prevents background consumers (especially in
         # tests) from importing the process-global Dispatcher and enqueueing
@@ -1736,6 +1773,7 @@ class InstanceManager:
         source_log_id: int | None,
         actual_transport: str,
         sequential_turn_token: object | None = None,
+        browser_child_admission: _BrowserChildLaunchAdmission | None = None,
     ) -> bool:
         """Persist the final runtime route before its first provider effect.
 
@@ -1798,6 +1836,200 @@ class InstanceManager:
             )
 
         async with self.db_factory() as db:
+            browser_binding = None
+            browser_owner = None
+            if browser_child_admission is not None:
+                admission = browser_child_admission
+                if (
+                    admission.child_task_id != task_id
+                    or admission.child_task_retry_count != task_retry_count
+                    or admission.child_task_turn_generation
+                    != task_turn_generation
+                    or admission.claimed_instance_id != instance_id
+                    or admission.owner_task_id >= admission.child_task_id
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent lost its exact preflight launch identity"
+                    )
+                from backend.models.test_harness import (
+                    TestHarnessChildBinding,
+                    TestHarnessRun,
+                )
+                from backend.models.workspace_review import WorkspaceReviewRun
+                from backend.services.test_harness_children import (
+                    CHILD_RUNNING,
+                    browser_binding_owner_identity,
+                    browser_child_owner_error,
+                    require_browser_child_binding,
+                )
+                from backend.services.test_harness_contracts import (
+                    HARNESS_TERMINAL_STATUSES,
+                )
+                from backend.services.test_harness_owner_fence import (
+                    TestHarnessOwnerIdentity,
+                    lock_test_harness_owner,
+                )
+
+                expected_owner_identity = TestHarnessOwnerIdentity(
+                    task_id=admission.owner_task_id,
+                    incarnation_id=admission.owner_task_incarnation_id,
+                    retry_count=admission.owner_task_retry_count,
+                    turn_generation=admission.owner_task_turn_generation,
+                    status=admission.owner_task_status,
+                )
+                try:
+                    # Keep the same global order as Browser callbacks:
+                    # owner Task -> Run/Workspace -> binding -> child Task ->
+                    # Instance.  The owner no-op UPDATE is also SQLite's first
+                    # writer reservation, so a callback cannot deadlock by
+                    # holding the owner while this admission holds a binding.
+                    browser_owner = await lock_test_harness_owner(
+                        db,
+                        expected_owner_identity,
+                    )
+                except RuntimeError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+
+                harness_run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(TestHarnessRun.id == admission.harness_run_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    harness_run is None
+                    or harness_run.task_id != admission.owner_task_id
+                    or harness_run.browser_review_job_id
+                    != admission.browser_review_job_id
+                    or harness_run.workspace_review_run_id
+                    != admission.workspace_review_run_id
+                    or harness_run.status in HARNESS_TERMINAL_STATUSES
+                    or harness_run.status == "cancelling"
+                    or harness_run.owner_task_incarnation_id
+                    != admission.owner_task_incarnation_id
+                    or harness_run.owner_task_retry_count
+                    != admission.owner_task_retry_count
+                    or harness_run.owner_task_turn_generation
+                    != admission.owner_task_turn_generation
+                    or harness_run.owner_task_status
+                    != admission.owner_task_status
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent Harness run stopped or changed before "
+                        "provider admission"
+                    )
+
+                workspace_run = None
+                if admission.workspace_review_run_id is not None:
+                    workspace_run = (
+                        await db.execute(
+                            select(WorkspaceReviewRun)
+                            .where(
+                                WorkspaceReviewRun.id
+                                == admission.workspace_review_run_id
+                            )
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        workspace_run is None
+                        or workspace_run.task_id != admission.owner_task_id
+                        or workspace_run.harness_run_id
+                        != admission.harness_run_id
+                        or workspace_run.browser_review_job_id
+                        != admission.browser_review_job_id
+                        or workspace_run.status
+                        in {"completed", "failed", "cancelled", "cancelling"}
+                        or workspace_run.owner_task_incarnation_id
+                        != admission.owner_task_incarnation_id
+                        or workspace_run.owner_task_retry_count
+                        != admission.owner_task_retry_count
+                        or workspace_run.owner_task_turn_generation
+                        != admission.owner_task_turn_generation
+                        or workspace_run.owner_task_status
+                        != admission.owner_task_status
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent Workspace run stopped or changed "
+                            "before provider admission"
+                        )
+
+                # stop_binding publishes ``stopping`` here before terminating
+                # the child Task.  Its committed stop intent therefore makes
+                # this exact CAS miss.  If admission locked the row first, the
+                # provider boundary is the earlier winner and stop waits.
+                binding_fence = await db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(
+                        TestHarnessChildBinding.id == admission.binding_id,
+                        TestHarnessChildBinding.harness_run_id
+                        == admission.harness_run_id,
+                        TestHarnessChildBinding.workspace_review_run_id
+                        == admission.workspace_review_run_id,
+                        TestHarnessChildBinding.browser_review_job_id
+                        == admission.browser_review_job_id,
+                        TestHarnessChildBinding.launch_profile_version
+                        == admission.launch_profile_version,
+                        TestHarnessChildBinding.launch_config_digest
+                        == admission.launch_config_digest,
+                        TestHarnessChildBinding.owner_task_id
+                        == admission.owner_task_id,
+                        TestHarnessChildBinding.owner_task_incarnation_id
+                        == admission.owner_task_incarnation_id,
+                        TestHarnessChildBinding.owner_task_retry_count
+                        == admission.owner_task_retry_count,
+                        TestHarnessChildBinding.owner_task_turn_generation
+                        == admission.owner_task_turn_generation,
+                        TestHarnessChildBinding.owner_task_status
+                        == admission.owner_task_status,
+                        TestHarnessChildBinding.child_task_id
+                        == admission.child_task_id,
+                        TestHarnessChildBinding.child_task_incarnation_id
+                        == admission.child_task_incarnation_id,
+                        TestHarnessChildBinding.state == CHILD_RUNNING,
+                        TestHarnessChildBinding.claimed_retry_count
+                        == admission.child_task_retry_count,
+                        TestHarnessChildBinding.claimed_instance_id
+                        == admission.claimed_instance_id,
+                    )
+                    .values(state=CHILD_RUNNING)
+                )
+                if binding_fence.rowcount != 1:
+                    raise LaunchSupersededError(
+                        "Browser Agent binding stopped or changed before "
+                        "provider admission"
+                    )
+                browser_binding = (
+                    await db.execute(
+                        select(TestHarnessChildBinding)
+                        .where(
+                            TestHarnessChildBinding.id
+                            == admission.binding_id
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if browser_binding is None:
+                    raise LaunchSupersededError(
+                        "Browser Agent binding disappeared before provider "
+                        "admission"
+                    )
+                try:
+                    current_owner_identity = browser_binding_owner_identity(
+                        browser_binding
+                    )
+                except RuntimeError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+                if current_owner_identity != expected_owner_identity:
+                    raise LaunchSupersededError(
+                        "Browser Agent owner identity changed before provider "
+                        "admission"
+                    )
+
             task_identity_predicates = (
                 Task.id == task_id,
                 Task.instance_id == instance_id,
@@ -1834,6 +2066,32 @@ class InstanceManager:
                 raise LaunchSupersededError(
                     f"Task {task_id} lost its exact launch generation"
                 )
+
+            if browser_binding is not None:
+                try:
+                    require_browser_child_binding(browser_binding, task)
+                except RuntimeError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+                owner_error = browser_child_owner_error(
+                    browser_binding,
+                    browser_owner,
+                )
+                if owner_error is not None:
+                    raise LaunchSupersededError(owner_error)
+                if (
+                    browser_binding.state != CHILD_RUNNING
+                    or browser_binding.claimed_retry_count
+                    != task_retry_count
+                    or browser_binding.claimed_instance_id != instance_id
+                    or browser_binding.browser_review_job_id
+                    != browser_child_admission.browser_review_job_id
+                    or browser_binding.launch_config_digest
+                    != browser_child_admission.launch_config_digest
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent exact launch authority changed before "
+                        "provider admission"
+                    )
 
             instance = (
                 await db.execute(
@@ -2055,6 +2313,7 @@ class InstanceManager:
                 source_log_id=source_log_id,
                 actual_transport=actual_transport,
                 sequential_turn_token=sequential_turn_token,
+                browser_child_admission=browser_child_admission,
             )
             if on_launch_admitted is not None:
                 await on_launch_admitted()
@@ -2080,6 +2339,8 @@ class InstanceManager:
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
+        browser_review_task = False
+        browser_child_admission: _BrowserChildLaunchAdmission | None = None
         task_ssh_capabilities: set[str] = set()
         task_ssh_broker_only = False
         task_ssh_protected_path_values: tuple[str, ...] = ()
@@ -2173,6 +2434,168 @@ class InstanceManager:
                 )
 
                 pr_review_task = is_pr_sandbox_task(task)
+                from backend.models.test_harness import TestHarnessChildBinding
+                from backend.services.test_harness_children import (
+                    CHILD_RUNNING,
+                    browser_binding_owner_identity,
+                    browser_child_owner_error,
+                    require_browser_child_binding,
+                )
+                from backend.services.test_harness_owner_fence import (
+                    test_harness_owner_terminal_gate_matches,
+                )
+
+                browser_binding = await db.scalar(
+                    select(TestHarnessChildBinding).where(
+                        TestHarnessChildBinding.child_task_id == task.id
+                    )
+                )
+                isolated_browser_marker = bool(
+                    (task.metadata_ or {}).get("isolated_browser_agent") is True
+                )
+                if browser_binding is not None:
+                    try:
+                        require_browser_child_binding(browser_binding, task)
+                    except RuntimeError as exc:
+                        raise LaunchSupersededError(str(exc)) from exc
+                    browser_owner = await db.get(
+                        Task,
+                        browser_binding.owner_task_id,
+                    )
+                    owner_error = browser_child_owner_error(
+                        browser_binding,
+                        browser_owner,
+                    )
+                    if owner_error is not None:
+                        raise LaunchSupersededError(owner_error)
+                    owner_identity = browser_binding_owner_identity(
+                        browser_binding
+                    )
+                    if test_harness_owner_terminal_gate_matches(
+                        browser_owner,
+                        owner_identity,
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent owner is already terminalizing"
+                        )
+                    if (
+                        browser_binding.state != CHILD_RUNNING
+                        or browser_binding.claimed_retry_count
+                        != task.retry_count
+                        or browser_binding.claimed_instance_id != instance_id
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent launch does not own its exact queue claim"
+                        )
+                    task_browser_job_id = browser_binding.browser_review_job_id
+                else:
+                    task_browser_job_id = None
+                supplied_browser_job_id = (
+                    enabled_skills.get("browser-review")
+                    if isinstance(enabled_skills, dict)
+                    else None
+                )
+                browser_review_task = bool(browser_binding is not None)
+                if isolated_browser_marker and browser_binding is None:
+                    raise LaunchSupersededError(
+                        "Browser Agent launch has no durable isolation binding"
+                    )
+                if supplied_browser_job_id is not None and not browser_review_task:
+                    raise LaunchSupersededError(
+                        "Browser Agent MCP cannot launch without a durable binding"
+                    )
+                if browser_review_task and (
+                    provider != browser_binding.provider
+                    or model != browser_binding.model
+                    or effort_level != browser_binding.reasoning_effort
+                    or codex_service_tier
+                    != browser_binding.codex_service_tier
+                    or enable_workflows != task.enable_workflows
+                    or enabled_skills
+                    != {"browser-review": task_browser_job_id}
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent launch no longer matches its immutable "
+                        "execution profile"
+                    )
+                if browser_review_task and resume_session_id is not None:
+                    raise LaunchSupersededError(
+                        "Browser Agent Tasks must launch one fresh provider "
+                        "session and can never resume"
+                    )
+                if (
+                    browser_review_task
+                    and supplied_browser_job_id != task_browser_job_id
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent launch lost its exact bound MCP job"
+                    )
+                if browser_review_task and (
+                    not isinstance(settings.auth_token, str)
+                    or not settings.auth_token.strip()
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent launch requires AUTH_TOKEN-backed "
+                        "scoped authentication"
+                    )
+                if browser_review_task:
+                    if (
+                        not isinstance(browser_binding.id, str)
+                        or not isinstance(
+                            browser_binding.browser_review_job_id,
+                            str,
+                        )
+                        or not isinstance(
+                            browser_binding.harness_run_id,
+                            str,
+                        )
+                        or (
+                            browser_binding.workspace_review_run_id is not None
+                            and not isinstance(
+                                browser_binding.workspace_review_run_id,
+                                str,
+                            )
+                        )
+                        or type(browser_binding.launch_profile_version) is not int
+                        or not isinstance(
+                            browser_binding.launch_config_digest,
+                            str,
+                        )
+                        or not isinstance(
+                            browser_binding.child_task_incarnation_id,
+                            str,
+                        )
+                        or not isinstance(task.incarnation_id, str)
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent binding has incomplete launch identity"
+                        )
+                    browser_child_admission = _BrowserChildLaunchAdmission(
+                        binding_id=browser_binding.id,
+                        browser_review_job_id=(
+                            browser_binding.browser_review_job_id
+                        ),
+                        harness_run_id=browser_binding.harness_run_id,
+                        workspace_review_run_id=(
+                            browser_binding.workspace_review_run_id
+                        ),
+                        launch_profile_version=(
+                            browser_binding.launch_profile_version
+                        ),
+                        launch_config_digest=(
+                            browser_binding.launch_config_digest
+                        ),
+                        owner_task_id=owner_identity.task_id,
+                        owner_task_incarnation_id=owner_identity.incarnation_id,
+                        owner_task_retry_count=owner_identity.retry_count,
+                        owner_task_turn_generation=owner_identity.turn_generation,
+                        owner_task_status=owner_identity.status,
+                        child_task_id=task.id,
+                        child_task_incarnation_id=task.incarnation_id,
+                        child_task_retry_count=task.retry_count,
+                        child_task_turn_generation=task.turn_generation,
+                        claimed_instance_id=instance_id,
+                    )
                 if not pr_review_task:
                     from backend.services.task_agent_isolation import (
                         explicit_git_credential_paths,
@@ -2203,7 +2626,7 @@ class InstanceManager:
                     task_ssh_broker_only = task_ssh_runtime.broker_only
                     explicit_git_paths = (
                         ()
-                        if task_ssh_broker_only
+                        if task_ssh_broker_only or browser_review_task
                         else explicit_git_credential_paths(git_env)
                     )
                     # Every local Task must be unable to inspect Manager SSH,
@@ -2234,6 +2657,15 @@ class InstanceManager:
                                 ),
                             )
                         )
+                if browser_review_task:
+                    if task_ssh_broker_only or task_ssh_capabilities:
+                        raise LaunchSupersededError(
+                            "Browser Agent Tasks cannot inherit Task SSH grants"
+                        )
+                    # A fixed Browser child has no repository or credential
+                    # authority. Its only network path is the exact required
+                    # Browser MCP server admitted below.
+                    git_env = None
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -2283,7 +2715,7 @@ class InstanceManager:
                             )
                             if value
                         )
-                if pr_review_task or delivery_task:
+                if pr_review_task or browser_review_task or delivery_task:
                     # PR input is already snapshotted into the fixed prompt.
                     # No ambient skills or monitor capability may reintroduce
                     # filesystem/network tools.
@@ -2442,6 +2874,31 @@ class InstanceManager:
             and not pr_review_task
             and not delivery_task
         )
+        browser_review_job_id = (
+            enabled_skills.get("browser-review")
+            if isinstance(enabled_skills, dict)
+            else None
+        )
+        codex_browser_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and browser_review_task
+            and isinstance(browser_review_job_id, str)
+            and browser_review_job_id.strip()
+        )
+        if browser_review_task and not codex_browser_mcp_required and provider == "codex":
+            raise CodexRequiredMcpError(
+                "Codex Browser Agent lost its required bound Browser MCP"
+            )
+        codex_frontend_review_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and isinstance(settings.auth_token, str)
+            and bool(settings.auth_token.strip())
+            and not pr_review_task
+            and not codex_browser_mcp_required
+            and not delivery_task
+        )
         codex_sub_agent_mcp_required = bool(
             provider == "codex"
             and task_id is not None
@@ -2455,6 +2912,7 @@ class InstanceManager:
             and task_id is not None
             and bool(task_ssh_capabilities)
             and not pr_review_task
+            and not browser_review_task
             and not delivery_task
         )
         codex_task_isolation_required = bool(
@@ -2466,9 +2924,20 @@ class InstanceManager:
         )
         codex_mcp_required = (
             codex_main_mcp_required
+            or codex_browser_mcp_required
+            or codex_frontend_review_mcp_required
             or codex_sub_agent_mcp_required
             or codex_ssh_mcp_required
         )
+        if (
+            provider == "codex"
+            and browser_review_task
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexRequiredMcpError(
+                "Codex isolated review requires the app-server read-only "
+                "sandbox; exec fallback is disabled"
+            )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
         codex_exec_route = "direct-exec"
         if codex_main_mcp_required:
@@ -2484,18 +2953,62 @@ class InstanceManager:
                 task_turn_generation=task_turn_generation,
                 task_status=task_status,
             )
-        elif codex_sub_agent_mcp_required:
-            from backend.services.mcp_config import (
-                build_sub_agent_controller_mcp_server_specs,
-            )
+        else:
+            direct_specs: list["McpServerSpec"] = []
+            if codex_browser_mcp_required:
+                from backend.services.mcp_config import (
+                    build_browser_review_mcp_server_specs,
+                )
 
-            codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(
-                task_id,
-                task_incarnation_id=task_incarnation_id or "",
-                task_retry_count=task_retry_count,
-                task_turn_generation=task_turn_generation,
-                task_status=task_status,
-            )
+                direct_specs.extend(
+                    build_browser_review_mcp_server_specs(
+                        browser_review_job_id,
+                        task_id=task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
+                )
+            elif codex_frontend_review_mcp_required:
+                from backend.services.mcp_config import (
+                    build_frontend_review_mcp_server_specs,
+                    build_workspace_review_mcp_server_specs,
+                )
+
+                direct_specs.extend(
+                    build_frontend_review_mcp_server_specs(
+                        task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
+                )
+                direct_specs.extend(
+                    build_workspace_review_mcp_server_specs(
+                        task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
+                )
+            if codex_sub_agent_mcp_required:
+                from backend.services.mcp_config import (
+                    build_sub_agent_controller_mcp_server_specs,
+                )
+
+                direct_specs.extend(
+                    build_sub_agent_controller_mcp_server_specs(
+                        task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
+                )
+            codex_mcp_specs = tuple(direct_specs)
         if codex_ssh_mcp_required:
             from backend.services.mcp_config import (
                 build_task_ssh_mcp_server_specs,
@@ -2540,7 +3053,7 @@ class InstanceManager:
 
         if (
             provider == "codex"
-            and (pr_review_task or delivery_task)
+            and (pr_review_task or browser_review_task or delivery_task)
             and not settings.codex_app_server_enabled
         ):
             if delivery_task:
@@ -2549,7 +3062,7 @@ class InstanceManager:
                     "exec fallback is disabled"
                 )
             raise CodexRequiredMcpError(
-                "Codex PR review isolation requires the app-server read-only "
+                "Codex isolated review requires the app-server read-only "
                 "sandbox; exec fallback is disabled"
             )
 
@@ -2630,13 +3143,14 @@ class InstanceManager:
                         disable_project_config=(
                             cloudrouter_account is not None
                             or pr_review_task
+                            or browser_review_task
                             or delivery_task
                             or codex_task_isolation_required
                         ),
                         codex_service_tier=codex_service_tier,
                         sandbox_mode=(
                             "read-only"
-                            if pr_review_task
+                            if pr_review_task or browser_review_task
                             else "workspace-write"
                             if delivery_task or codex_task_isolation_required
                             else "danger-full-access"
@@ -2666,23 +3180,29 @@ class InstanceManager:
                         # Ordinary local Tasks get public egress only through
                         # Codex's managed proxy, whose thread response is
                         # audited before model input.
-                        task_ssh_disable_network=task_ssh_broker_only,
+                        task_ssh_disable_network=(
+                            browser_review_task or task_ssh_broker_only
+                        ),
                         task_managed_network_proxy=(
                             codex_task_isolation_required
+                            and not browser_review_task
                             and not task_ssh_broker_only
                         ),
                         disable_user_mcp=(
                             pr_review_task
+                            or browser_review_task
                             or delivery_task
                             or codex_task_isolation_required
                         ),
                         disable_autonomous_features=(
                             pr_review_task
+                            or browser_review_task
                             or delivery_task
                             or codex_task_isolation_required
                         ),
                         network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
+                        mcp_only=browser_review_task,
                         on_launch_admitted=admit_codex_app_server_transport,
                     )
                     logger.info(
@@ -2702,9 +3222,9 @@ class InstanceManager:
                             "Codex Delivery workspace/network isolation could "
                             "not be confirmed before turn/start"
                         ) from exc
-                    if pr_review_task:
+                    if pr_review_task or browser_review_task:
                         raise CodexRequiredMcpError(
-                            "Codex PR review read-only sandbox could not be "
+                            "Codex isolated review sandbox could not be "
                             "confirmed before turn/start"
                         ) from exc
                     if codex_service_tier == "priority":
@@ -2720,6 +3240,7 @@ class InstanceManager:
                     if (
                         (
                             codex_main_mcp_required
+                            or codex_frontend_review_mcp_required
                         )
                         and not codex_sub_agent_mcp_required
                     ):
@@ -2781,14 +3302,14 @@ class InstanceManager:
                         raise CodexRequiredMcpError(
                             "Codex Delivery isolation could not be guaranteed"
                         ) from exc
-                    if pr_review_task:
+                    if pr_review_task or browser_review_task:
                         logger.exception(
-                            "Codex PR review app-server failed; refusing "
+                            "Codex isolated review app-server failed; refusing "
                             "unsandboxed exec fallback task_id=%s",
                             task_id,
                         )
                         raise CodexRequiredMcpError(
-                            "Codex PR review isolation could not be guaranteed"
+                            "Codex isolated review boundary could not be guaranteed"
                         ) from exc
                     if codex_service_tier == "priority":
                         # exec --json does not expose an accepted/effective
@@ -2846,6 +3367,7 @@ class InstanceManager:
             provider == "claude"
             and self.pty_mode_enabled
             and not pr_review_task
+            and not browser_review_task
         ):
             return await self._launch_pty(
                 instance_id=instance_id,
@@ -2878,7 +3400,9 @@ class InstanceManager:
                 on_launch_admitted=admit_claude_pty_transport,
             )
 
-        if provider == "codex" and (pr_review_task or delivery_task):
+        if provider == "codex" and (
+            pr_review_task or browser_review_task or delivery_task
+        ):
             raise CodexRequiredMcpError(
                 "Codex isolated workflow execution forbids exec fallback"
             )
@@ -2896,10 +3420,14 @@ class InstanceManager:
             cwd=cwd,
             task_id=task_id,
             skill_context=task_skill_context,
-            codex_mcp_specs=(codex_mcp_specs if codex_mcp_required else ()),
+            codex_mcp_specs=(
+                codex_mcp_specs if codex_mcp_required else ()
+            ),
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
-            tools_disabled=pr_review_task,
+            tools_disabled=(
+                pr_review_task or (provider == "claude" and browser_review_task)
+            ),
             claude_isolation_settings_path=claude_isolation_settings_path,
         )
         if provider == "codex":
@@ -2910,7 +3438,7 @@ class InstanceManager:
                 task_id,
                 instance_id,
                 config_dir,
-                codex_main_mcp_required,
+                codex_mcp_required,
             )
 
         # Task-launched model processes must not inherit the deployment bearer
@@ -3548,6 +4076,7 @@ class InstanceManager:
         disable_autonomous_features: bool = False,
         network_isolated: bool = False,
         tools_disabled: bool = False,
+        mcp_only: bool = False,
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """Launch one turn on the persistent app-server for its CODEX_HOME."""
@@ -3585,6 +4114,7 @@ class InstanceManager:
             disable_autonomous_features=disable_autonomous_features,
             network_isolated=network_isolated,
             tools_disabled=tools_disabled,
+            mcp_only=mcp_only,
             on_turn_prepared=(
                 publish_launch_admission
                 if on_launch_admitted is not None
@@ -6470,12 +7000,17 @@ class InstanceManager:
     ) -> None:
         """Complete a background epoch only at its exact turn sentinel."""
 
+        completion_state = None
         async with self.pty_background_transition(task_id, session_id):
-            await self._finish_pty_autonomous_activity_locked(
+            completion_state = await self._finish_pty_autonomous_activity_locked(
                 task_id,
                 session_id,
                 generation,
                 event,
+            )
+        if completion_state is not None:
+            await self._try_complete_pty_background_generation(
+                completion_state
             )
 
     async def _finish_pty_autonomous_activity_locked(
@@ -6484,29 +7019,50 @@ class InstanceManager:
         session_id: str,
         generation: str | None,
         event: dict,
-    ) -> None:
+    ) -> _PtyBackgroundState | None:
         if generation is None:
-            return
+            return None
         state = self._pty_background_states.get((task_id, session_id))
         if state is None or state.generation != generation:
-            return
+            return None
         state.last_event_monotonic = time.monotonic()
         if not self._is_pty_autonomous_terminal(event):
-            return
+            return None
         state.terminal_seen = True
         state.pending_tools = 0
-        await self._try_complete_pty_background_generation_locked(state)
+        return state
 
     async def _try_complete_pty_background_generation(
         self,
         state: _PtyBackgroundState,
     ) -> bool:
-        async with self.pty_background_transition(
-            state.task_id, state.session_id
-        ):
-            return await self._try_complete_pty_background_generation_locked(
-                state
+        key = (state.task_id, state.session_id)
+        if (
+            self._pty_background_states.get(key) is not state
+            or state.pending_tools
+            or not state.terminal_seen
+            or await self.pty_background_activity_pending(
+                state.task_id,
+                state.session,
             )
+        ):
+            return False
+        async with self._test_harness_owner_terminal_context(
+            state.task_id,
+            reason="PTY background activity reached terminal completion",
+            expected_retry_count=state.task_retry_count,
+            expected_turn_generation=state.task_turn_generation,
+            expected_session_id=state.session_id,
+            expected_background_generation=state.generation,
+        ) as terminal_fenced:
+            if not terminal_fenced:
+                return False
+            async with self.pty_background_transition(
+                state.task_id, state.session_id
+            ):
+                return await self._try_complete_pty_background_generation_locked(
+                    state
+                )
 
     async def _try_complete_pty_background_generation_locked(
         self,
@@ -6777,9 +7333,9 @@ class InstanceManager:
                     return False
                 owner = owner_rows[0] if owner_rows else None
 
-        succeeded = False
         detached = owner is None
-        try:
+
+        async def stop_exact_background_owner() -> bool:
             if owner is not None:
                 attached = getattr(self._pty_backend, "_sessions", {})
                 attached_keys = (
@@ -6800,7 +7356,7 @@ class InstanceManager:
                     # those durable owners.
                     if not await self._stop_exact_detached_pty_session(state):
                         return False
-                succeeded = await self.stop(
+                return await self.stop(
                     owner.id,
                     expected_task_id=state.task_id,
                     expected_task_turn_generation=state.task_turn_generation,
@@ -6811,25 +7367,35 @@ class InstanceManager:
                     allow_delivery_effect_stop=True,
                     yield_to_worker_task_termination=True,
                 )
-            else:
-                succeeded = (
-                    await self.stop_detached_pty_background_generation(
-                        state.task_id,
-                        state.session_id,
-                        state.generation,
-                        expected_status=task_row.status,
-                        expected_retry_count=task_row.retry_count,
-                        expected_turn_generation=(
-                            task_row.turn_generation
-                        ),
-                        expected_instance_id=task_row.instance_id,
-                        expected_started_at=task_row.started_at,
-                        expected_completed_at=task_row.completed_at,
-                        terminal_status="failed",
-                        error_message=error,
-                        yield_to_worker_task_termination=True,
-                    )
-                )
+            return await self.stop_detached_pty_background_generation(
+                state.task_id,
+                state.session_id,
+                state.generation,
+                expected_status=task_row.status,
+                expected_retry_count=task_row.retry_count,
+                expected_turn_generation=task_row.turn_generation,
+                expected_instance_id=task_row.instance_id,
+                expected_started_at=task_row.started_at,
+                expected_completed_at=task_row.completed_at,
+                terminal_status="failed",
+                error_message=error,
+                yield_to_worker_task_termination=True,
+            )
+
+        succeeded = False
+        try:
+            async with self._test_harness_owner_terminal_context(
+                state.task_id,
+                reason="PTY background watchdog reached its hard timeout",
+                expected_retry_count=state.task_retry_count,
+                expected_turn_generation=state.task_turn_generation,
+                expected_instance_id=task_row.instance_id,
+                expected_session_id=state.session_id,
+                expected_background_generation=state.generation,
+            ) as terminal_fenced:
+                if not terminal_fenced:
+                    return False
+                succeeded = await stop_exact_background_owner()
         finally:
             if self._pty_background_states.get(key) is state:
                 state.watchdog_stopping = False
@@ -6962,20 +7528,135 @@ class InstanceManager:
                 )
 
     @asynccontextmanager
-    async def _chat_terminal_locks(self, task_id: int, instance_id: int):
-        """Acquire the shared capability -> Instance terminal lock order."""
+    async def _test_harness_owner_terminal_context(
+        self,
+        task_id: int,
+        *,
+        reason: str,
+        expected_retry_count: int,
+        expected_turn_generation: int,
+        expected_instance_id: int | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_session_id: str | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_background_generation: str | None | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+    ):
+        """Fence and drain one exact Task owner graph before a status write.
+
+        The Harness identity includes status.  Consequently a terminal writer
+        or a new-turn claim must keep this context open until its Task status /
+        generation change commits; otherwise a Run can materialize under the
+        old identity in the cleanup-to-commit gap.
+        """
+
+        from backend.services.test_harness import (
+            TestHarnessService,
+            test_harness_service as global_test_harness_service,
+        )
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        predicates = [
+            Task.id == task_id,
+            Task.retry_count == expected_retry_count,
+            Task.turn_generation == expected_turn_generation,
+            task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
+        ]
+        if expected_instance_id is not _EXPECTED_GENERATION_UNSET:
+            predicates.append(
+                Task.instance_id.is_(None)
+                if expected_instance_id is None
+                else Task.instance_id == expected_instance_id
+            )
+        if expected_session_id is not _EXPECTED_GENERATION_UNSET:
+            predicates.append(
+                Task.session_id.is_(None)
+                if expected_session_id is None
+                else Task.session_id == expected_session_id
+            )
+        if expected_background_generation is not _EXPECTED_GENERATION_UNSET:
+            predicates.append(
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
+            )
+        async with self.db_factory() as db:
+            task = (
+                await db.execute(select(Task).where(*predicates))
+            ).scalar_one_or_none()
+            if task is None:
+                yield False
+                return
+            identity = test_harness_owner_identity(task)
+
+        service = self.test_harness_service
+        if service is None:
+            service = (
+                global_test_harness_service
+                if global_test_harness_service.db_factory is self.db_factory
+                else TestHarnessService(db_factory=self.db_factory)
+            )
+            self.test_harness_service = service
+        async with service.owner_stop_fence(
+            task_id,
+            reason=reason,
+            expected_identity=identity,
+        ):
+            yield True
+
+    @asynccontextmanager
+    async def _chat_terminal_locks(
+        self,
+        task_id: int,
+        instance_id: int,
+        *,
+        expected_retry_count: int,
+        expected_turn_generation: int,
+        reason: str,
+    ):
+        """Acquire Harness -> capability -> Instance terminal lock order."""
 
         from backend.services.capability_service import capability_task_lock
 
-        async with capability_task_lock(task_id):
-            async with self._instance_lifecycle_lock(instance_id):
-                yield
+        async with self._test_harness_owner_terminal_context(
+            task_id,
+            reason=reason,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            expected_instance_id=instance_id,
+        ) as fenced:
+            if not fenced:
+                yield False
+                return
+            async with capability_task_lock(task_id):
+                async with self._instance_lifecycle_lock(instance_id):
+                    yield True
 
     @asynccontextmanager
-    async def _chat_terminal_db(self, task_id: int, instance_id: int):
+    async def _chat_terminal_db(
+        self,
+        task_id: int,
+        instance_id: int,
+        *,
+        expected_retry_count: int,
+        expected_turn_generation: int,
+        reason: str,
+    ):
         """Open one Task terminal transaction under the global lock order."""
 
-        async with self._chat_terminal_locks(task_id, instance_id):
+        async with self._chat_terminal_locks(
+            task_id,
+            instance_id,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            reason=reason,
+        ) as fenced:
+            if not fenced:
+                yield None
+                return
             async with self.db_factory() as db:
                 yield db
 
@@ -7465,7 +8146,15 @@ class InstanceManager:
             return True
 
         admission = None
-        async with self._chat_terminal_locks(task_id, instance_id):
+        async with self._chat_terminal_locks(
+            task_id,
+            instance_id,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            reason="PTY chat turn reached terminal bookkeeping",
+        ) as terminal_fenced:
+            if not terminal_fenced:
+                return None
             if instance_id in self._stopping or not owns_generation():
                 return None
 
@@ -7795,11 +8484,14 @@ class InstanceManager:
                     "--strict-mcp-config",
                     "--disable-slash-commands",
                     "--no-chrome",
-                    "--tools",
-                    ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
-                    "--allowedTools",
-                    ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
                 ])
+                if not tools_disabled:
+                    cmd.extend([
+                        "--tools",
+                        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                        "--allowedTools",
+                        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                    ])
             else:
                 cmd.append("--dangerously-skip-permissions")
             if resume_session_id:
@@ -7826,6 +8518,8 @@ class InstanceManager:
                     "--disable-slash-commands",
                     "--exclude-dynamic-system-prompt-sections",
                 ])
+                if mcp_config_path and Path(mcp_config_path).exists():
+                    cmd.extend(["--mcp-config", mcp_config_path])
                 return cmd
             from backend.services.skill_loader import (
                 discover_skills,
@@ -8079,7 +8773,26 @@ class InstanceManager:
             task_publication_generation: dict | None = None
             recovery_failure: ConsumerRecoveryUnsettledError | None = None
             try:
-                async with self.db_factory() as db:
+                recovery_db_context = (
+                    self._chat_terminal_db(
+                        task_id,
+                        instance_id,
+                        expected_retry_count=expected_retry_count,
+                        expected_turn_generation=expected_turn_generation,
+                        reason=(
+                            "Chat output bookkeeping failed before terminal "
+                            "settlement"
+                        ),
+                    )
+                    if task_id and chat_initiated
+                    else self.db_factory()
+                )
+                async with recovery_db_context as db:
+                    if db is None:
+                        raise RuntimeError(
+                            "Output consumer recovery lost its exact Harness "
+                            "owner generation"
+                        )
                     task_recovery = None
                     if task_id and chat_initiated:
                         # Recovery participates in the same global
@@ -9055,12 +9768,26 @@ class InstanceManager:
         failure_notice_data = None
         admission = None
         terminal_db_context = (
-            self._chat_terminal_db(task_id, instance_id)
+            self._chat_terminal_db(
+                task_id,
+                instance_id,
+                expected_retry_count=expected_retry_count,
+                expected_turn_generation=expected_turn_generation,
+                reason="Chat turn reached terminal bookkeeping",
+            )
             if task_id and chat_initiated
             else self.db_factory()
         )
         async with terminal_db_context as db:
             if task_id and chat_initiated:
+                if db is None:
+                    logger.info(
+                        "Discarding stale chat consumer for instance %s task %s "
+                        "before Harness terminal cleanup",
+                        instance_id,
+                        task_id,
+                    )
+                    return
                 if instance_id in self._stopping or not owns_instance_turn():
                     await db.rollback()
                     return
@@ -14156,6 +14883,29 @@ class InstanceManager:
                     record.pty_terminal_owner = None
                 return False
             await self._pty_backend.stop(instance_id)
+            # claude-pty normally completes its asyncio-compatible proxy from
+            # the consumer's on_exit callback. A forced Interrupt may cancel
+            # that consumer after the native Session has already reaped the
+            # Claude process, leaving proxy.wait() blocked forever even though
+            # there is no live child left. Bridge only from exact native death
+            # evidence; a still-live or unknown Session remains fail-closed.
+            if process.returncode is None:
+                native_session = getattr(process, "session", None)
+                native_dead = (
+                    native_session is not None
+                    and getattr(native_session, "is_alive", None) is False
+                )
+                complete_proxy = getattr(process, "complete", None)
+                if native_dead and callable(complete_proxy):
+                    native_process = getattr(native_session, "_process", None)
+                    native_exit_code = getattr(
+                        native_process, "exit_code", None
+                    )
+                    complete_proxy(
+                        native_exit_code
+                        if isinstance(native_exit_code, int)
+                        else 130
+                    )
             try:
                 await self._wait_process_tree(instance_id, process, 10.0)
             except asyncio.TimeoutError:

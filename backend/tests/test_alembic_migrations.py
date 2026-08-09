@@ -43,6 +43,7 @@ import backend.models.quick_phrase  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.ssh_profile  # noqa: F401
 import backend.models.task_ssh_grant  # noqa: F401
+import backend.models.task_ssh_effect  # noqa: F401
 import backend.models.plan_agent  # noqa: F401
 import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
@@ -63,6 +64,9 @@ SSH_PROFILES_REVISION = "73c4a9e1b2d0"
 TASK_SSH_GRANTS_REVISION = "84d5b0f2c3e1"
 TASK_SSH_POLICY_REVISION = "91e6a4c8d2f0"
 TASK_SSH_ROOTS_REVISION = "a6d9f2c4e8b1"
+MAIN_SSH_MERGE_REVISION = "f9b2c4d6e8a1"
+TASK_SCOPED_TOKEN_INCARNATION_REVISION = "b4e7c1a9d2f0"
+TASK_SSH_EFFECT_REVISION = "c2f8a6d4e1b9"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -73,7 +77,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = TASK_SSH_ROOTS_REVISION
+CURRENT_HEAD_REVISION = TASK_SSH_EFFECT_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -164,6 +168,40 @@ def _load_capability_resume_outbox_migration(module_suffix: str = "test"):
     )
     spec = importlib.util.spec_from_file_location(
         f"capability_resume_outbox_migration_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_task_incarnation_migration(module_suffix: str = "test"):
+    migration_path = (
+        PROJECT_ROOT
+        / "alembic"
+        / "versions"
+        / "b4e7c1a9d2f0_backfill_task_incarnations_for_scoped_tokens.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"task_incarnation_migration_{module_suffix}",
+        migration_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_task_ssh_effect_migration(module_suffix: str = "test"):
+    migration_path = (
+        PROJECT_ROOT
+        / "alembic"
+        / "versions"
+        / "c2f8a6d4e1b9_add_task_ssh_effect_receipts.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        f"task_ssh_effect_migration_{module_suffix}",
         migration_path,
     )
     assert spec is not None and spec.loader is not None
@@ -4668,7 +4706,7 @@ class TestFreshMigration:
 
         engine = create_engine(f"sqlite:///{db_path}")
         tables = _get_all_tables(engine)
-        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "ssh_profiles", "task_ssh_grants", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plan_agent_runtime_receipts", "plan_agent_worker_dispatch_receipts", "plan_agent_worker_import_receipts", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
+        expected_tables = {"instances", "projects", "project_todos", "tasks", "log_entries", "worktrees", "global_settings", "secrets", "tags", "discussions", "discussion_messages", "discussion_agents", "discussion_events", "quick_phrases", "sub_agent_sessions", "sub_agent_reports", "pr_reviews", "pr_reviewer_runs", "pr_findings", "pr_finding_actions", "pr_finding_rebuttals", "pr_monitor_runs", "pr_repair_wakes", "pr_merge_queue_actions", "monitored_repos", "workers", "worker_turn_handoff_receipts", "worker_task_termination_receipts", "ssh_profiles", "task_ssh_grants", "task_ssh_effect_receipts", "skill_lessons", "skill_usage", "feishu_user_binding", "org_members", "org_teams", "org_team_members", "task_shares", "project_shares", "shared_tasks_received", "user_skills", "users", "user_groups", "user_group_members", "team_task_shares", "team_project_shares", "plan_agent_runs", "plan_agent_steps", "plan_agent_runtime_receipts", "plan_agent_worker_dispatch_receipts", "plan_agent_worker_import_receipts", "plans", "plan_versions", "plan_input_requests", "plan_applications", "plan_application_receipts", "plan_application_attempts", "plan_legacy_task_links", "capability_invocations", "capability_executions", "capability_resume_outbox", "code_review_runs", "code_review_results", "delivery_runs", "delivery_cycles", "delivery_turns", "delivery_events", "delivery_actions", "delivery_transitions"}
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
         # Verify all columns from latest migration exist
@@ -6494,7 +6532,7 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_linear_head_after_task_ssh(self, tmp_path):
+    def test_migration_graph_has_one_head_after_main_ssh_merge(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
@@ -6502,6 +6540,22 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == TASK_SCOPED_TOKEN_INCARNATION_REVISION
+        )
+        assert (
+            script.get_revision(
+                TASK_SCOPED_TOKEN_INCARNATION_REVISION
+            ).down_revision
+            == MAIN_SSH_MERGE_REVISION
+        )
+        assert set(
+            script.get_revision(MAIN_SSH_MERGE_REVISION).down_revision
+        ) == {
+            TASK_SSH_ROOTS_REVISION,
+            WORKER_PLAN_IMPORT_RECEIPT_REVISION,
+        }
+        assert (
+            script.get_revision(TASK_SSH_ROOTS_REVISION).down_revision
             == TASK_SSH_POLICY_REVISION
         )
         assert (
@@ -6514,7 +6568,7 @@ class TestPublishedMigrationHistory:
         )
         assert (
             script.get_revision(SSH_PROFILES_REVISION).down_revision
-            == WORKER_PLAN_IMPORT_RECEIPT_REVISION
+            == MAIN_PLAN_MERGE_REVISION
         )
         assert (
             script.get_revision(WORKER_PLAN_IMPORT_RECEIPT_REVISION).down_revision
@@ -6616,7 +6670,10 @@ class TestPublishedMigrationHistory:
             ).scalar_one() == CURRENT_HEAD_REVISION
         engine.dispose()
 
-    def test_existing_managed_profiles_keep_task_access_on_upgrade(self, tmp_path):
+    def test_existing_external_key_profiles_stay_files_only_on_upgrade(
+        self,
+        tmp_path,
+    ):
         db_path = str(tmp_path / "ssh-policy.db")
         cfg = _alembic_cfg(db_path)
         _run_alembic(cfg, command.upgrade, TASK_SSH_GRANTS_REVISION)
@@ -6645,10 +6702,273 @@ class TestPublishedMigrationHistory:
                 SELECT task_access_enabled, task_capabilities, allowed_roots
                 FROM ssh_profiles WHERE name = 'existing'
             """)).one()
-        assert bool(row[0]) is True
-        assert json.loads(row[1]) == ["exec", "read", "write"]
+        assert bool(row[0]) is False
+        assert json.loads(row[1]) == []
         assert json.loads(row[2]) == ["/"]
         engine.dispose()
+
+    def test_scoped_token_migration_backfills_legacy_task_incarnation(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "task-token-incarnation.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, MAIN_SSH_MERGE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO tasks "
+                "(id, title, description, status, priority, target_branch, "
+                "merge_status, retry_count, max_retries, mode, incarnation_id, "
+                "created_at) VALUES "
+                "(73, 'legacy token task', 'd', 'pending', 0, 'main', "
+                "'pending', 0, 2, 'auto', NULL, '2026-08-08 00:00:00')"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            incarnation = conn.execute(text(
+                "SELECT incarnation_id FROM tasks WHERE id = 73"
+            )).scalar_one()
+            assert len(incarnation) == 32
+            assert set(incarnation) <= set("0123456789abcdef")
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("dialect_name", "expected_fragment", "forbidden_fragment"),
+        [
+            ("sqlite", "lower(hex(randomblob(16)))", "uuid()"),
+            ("postgresql", "clock_timestamp()::text", "uuid()"),
+            (
+                "mysql",
+                "lower(replace(uuid(), '-', ''))",
+                "random_bytes",
+            ),
+            (
+                "mariadb",
+                "lower(replace(uuid(), '-', ''))",
+                "random_bytes",
+            ),
+        ],
+    )
+    def test_task_incarnation_backfill_uses_portable_dialect_expression(
+        self,
+        monkeypatch,
+        dialect_name,
+        expected_fragment,
+        forbidden_fragment,
+    ):
+        module = _load_task_incarnation_migration(
+            f"dialect_{dialect_name}"
+        )
+        statements = []
+        monkeypatch.setattr(
+            module.op,
+            "get_bind",
+            lambda: SimpleNamespace(
+                dialect=SimpleNamespace(name=dialect_name)
+            ),
+        )
+        monkeypatch.setattr(module.op, "execute", statements.append)
+
+        module.upgrade()
+
+        assert len(statements) == 1
+        rendered = str(statements[0]).lower()
+        assert expected_fragment in rendered
+        assert forbidden_fragment not in rendered
+
+    def test_task_ssh_effect_receipt_migration_roundtrip(self, tmp_path):
+        db_path = str(tmp_path / "task-ssh-effect-receipt.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            TASK_SCOPED_TOKEN_INCARNATION_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_ssh_effect_receipts" not in _get_all_tables(engine)
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_SSH_EFFECT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert "task_ssh_effect_receipts" in _get_all_tables(engine)
+        assert inspector.get_foreign_keys("task_ssh_effect_receipts") == []
+        assert {
+            "effect_id",
+            "task_incarnation_id",
+            "task_retry_count",
+            "task_turn_generation",
+            "profile_revision",
+            "operation",
+            "request_digest",
+            "status",
+            "result_payload",
+            "result_compacted",
+        }.issubset(_get_table_columns(
+            engine,
+            "task_ssh_effect_receipts",
+        ))
+        assert {
+            "ix_task_ssh_effect_unknown_digest",
+            "ix_task_ssh_effect_generation_count",
+        }.issubset({
+            index["name"]
+            for index in inspector.get_indexes("task_ssh_effect_receipts")
+        })
+        with engine.connect() as conn:
+            trigger_names = set(conn.execute(text(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger' "
+                "AND name LIKE 'trg_task_ssh_effect_%'"
+            )).scalars())
+        from backend.models.task_ssh_effect import (
+            SQLITE_TASK_SSH_EFFECT_TRIGGER_NAMES,
+        )
+
+        assert trigger_names == set(SQLITE_TASK_SSH_EFFECT_TRIGGER_NAMES)
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_SCOPED_TOKEN_INCARNATION_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_ssh_effect_receipts" not in _get_all_tables(engine)
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_SSH_EFFECT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_ssh_effect_receipts" in _get_all_tables(engine)
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("status", "result_payload", "result_digest", "outcome_code"),
+        [
+            ("running", None, None, None),
+            ("completed", '{"ok":true}', "a" * 64, "success"),
+            (
+                "ambiguous",
+                None,
+                None,
+                "remote_outcome_unknown",
+            ),
+            (
+                "aborted",
+                None,
+                None,
+                "cancelled_before_execution",
+            ),
+        ],
+    )
+    def test_task_ssh_effect_downgrade_refuses_permanent_evidence(
+        self,
+        tmp_path,
+        status,
+        result_payload,
+        result_digest,
+        outcome_code,
+    ):
+        db_path = str(tmp_path / f"task-ssh-effect-{status}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_SSH_EFFECT_REVISION)
+        completed_at = (
+            None if status == "running" else "2026-08-09 00:00:01"
+        )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO task_ssh_effect_receipts (
+                    effect_id, task_id, task_incarnation_id,
+                    task_retry_count, task_turn_generation, task_status,
+                    profile_id, profile_revision, operation, request_digest,
+                    status, result_payload, result_digest, result_compacted,
+                    outcome_code, created_at, updated_at, completed_at
+                ) VALUES (
+                    :effect_id, 91, :incarnation_id,
+                    0, 0, 'pending',
+                    73, 1, 'execute', :request_digest,
+                    :status, :result_payload, :result_digest, false,
+                    :outcome_code, '2026-08-09 00:00:00',
+                    '2026-08-09 00:00:01', :completed_at
+                )
+            """), {
+                "effect_id": f"{len(status):032x}",
+                "incarnation_id": "b" * 32,
+                "request_digest": "c" * 64,
+                "status": status,
+                "result_payload": result_payload,
+                "result_digest": result_digest,
+                "outcome_code": outcome_code,
+                "completed_at": completed_at,
+            })
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="permanent.*evidence"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                TASK_SCOPED_TOKEN_INCARNATION_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT status FROM task_ssh_effect_receipts"
+            )).scalar_one() == status
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_SSH_EFFECT_REVISION
+        engine.dispose()
+
+    def test_task_ssh_effect_offline_downgrade_fails_closed(
+        self,
+        monkeypatch,
+    ):
+        module = _load_task_ssh_effect_migration("offline_downgrade")
+        monkeypatch.setattr(module.context, "is_offline_mode", lambda: True)
+        get_bind = MagicMock()
+        monkeypatch.setattr(module.op, "get_bind", get_bind)
+
+        with pytest.raises(RuntimeError, match="Offline.*refused"):
+            module._assert_downgrade_safe()
+
+        get_bind.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "dialect_name",
+        ["sqlite", "postgresql", "mysql", "mariadb"],
+    )
+    def test_task_ssh_effect_downgrade_gate_uses_supported_bind(
+        self,
+        monkeypatch,
+        dialect_name,
+    ):
+        module = _load_task_ssh_effect_migration(
+            f"downgrade_bind_{dialect_name}"
+        )
+        result = MagicMock()
+        result.scalar_one.return_value = 0
+        bind = SimpleNamespace(
+            dialect=SimpleNamespace(name=dialect_name),
+            execute=MagicMock(return_value=result),
+        )
+        monkeypatch.setattr(module.context, "is_offline_mode", lambda: False)
+        monkeypatch.setattr(module.op, "get_bind", lambda: bind)
+
+        module._assert_downgrade_safe()
+
+        statement = bind.execute.call_args.args[0]
+        assert str(statement).strip().lower() == (
+            "select count(*) from task_ssh_effect_receipts"
+        )
+        result.scalar_one.assert_called_once_with()
 
     @pytest.mark.parametrize(
         ("start_revision", "plan_schema_present", "snapshot_schema_present"),

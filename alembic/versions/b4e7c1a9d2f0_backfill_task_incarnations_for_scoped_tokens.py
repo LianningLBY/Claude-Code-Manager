@@ -24,7 +24,9 @@ def upgrade() -> None:
             "random()::text || ':' || clock_timestamp()::text)"
         )
     elif dialect in {"mysql", "mariadb"}:
-        expression = "lower(hex(random_bytes(16)))"
+        # UUID() is available on both MySQL and MariaDB. RANDOM_BYTES() is
+        # absent from supported MariaDB releases and some older MySQL builds.
+        expression = "lower(replace(uuid(), '-', ''))"
     else:
         raise RuntimeError(
             f"Task incarnation backfill does not support dialect {dialect!r}"

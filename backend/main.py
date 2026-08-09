@@ -78,6 +78,9 @@ from backend.services.plan_capability import (
 )
 from backend.services.delivery_controller import DeliveryController
 from backend.services.delivery_publisher import GitHubDeliveryPublisher
+from backend.services.task_ssh_effect_recovery import (
+    recover_interrupted_task_ssh_effects,
+)
 
 # Logging: surface INFO from our services AND claude_pty in the server log.
 # Without this, PTY delivery/turn diagnostics are invisible (learned the
@@ -972,6 +975,17 @@ async def _runtime_lifespan(app: FastAPI):
 
     if not deployment_start.skip_mutations:
         await init_db()
+    # A crash-left ``running`` SSH receipt is permanent unknown-outcome
+    # evidence and, on SQLite, an active authorization trigger permit. Settle
+    # it before *any* Task/Profile/share writer or Dispatcher runtime starts.
+    # Failure is intentionally fatal: continuing would either leave the Task
+    # frozen forever or reopen an effect whose remote outcome is unknown.
+    recovered_ssh_effects = await recover_interrupted_task_ssh_effects()
+    if recovered_ssh_effects:
+        logger.warning(
+            "Marked %d interrupted Task SSH effects ambiguous before runtime startup",
+            recovered_ssh_effects,
+        )
     # Do not seed a shared/default administrator credential.  The registration
     # endpoint promotes the first real user to super_admin, while AUTH_TOKEN
     # remains the bootstrap administrator path for single-token deployments.

@@ -88,6 +88,7 @@ import backend.models.plan_agent  # noqa: F401
 import backend.models.plan  # noqa: F401
 import backend.models.ssh_profile  # noqa: F401
 import backend.models.task_ssh_grant  # noqa: F401
+import backend.models.task_ssh_effect  # noqa: F401
 import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
@@ -162,6 +163,18 @@ async def client(app):
     transport = ASGITransport(app=real_app)
     async with AsyncClient(transport=transport, base_url="http://test") as c:
         yield c
+
+
+@pytest_asyncio.fixture
+async def worker_control_plane_auth(client, monkeypatch):
+    """Run Worker-specific suites as an authenticated deployment."""
+
+    from backend.config import settings
+
+    token = "worker-control-plane-test-token"
+    monkeypatch.setattr(settings, "auth_token", token)
+    client.headers["Authorization"] = f"Bearer {token}"
+    yield
 
 
 @pytest_asyncio.fixture

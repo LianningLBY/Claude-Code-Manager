@@ -111,6 +111,7 @@ class MigrationTaskGeneration:
     """Exact Manager-side Task generation owned by one migration attempt."""
 
     task_id: int
+    incarnation_id: str | None
     worker_id: int | None
     status: str
     retry_count: int
@@ -123,6 +124,7 @@ class MigrationTaskGeneration:
 def migration_task_generation(task: Task) -> MigrationTaskGeneration:
     return MigrationTaskGeneration(
         task_id=task.id,
+        incarnation_id=task.incarnation_id,
         worker_id=task.worker_id,
         status=task.status,
         retry_count=task.retry_count,
@@ -142,6 +144,7 @@ def migration_generation_predicates(
 ) -> tuple:
     return (
         Task.id == generation.task_id,
+        _nullable_eq(Task.incarnation_id, generation.incarnation_id),
         (
             Task.worker_id.is_(None)
             if generation.worker_id is None
@@ -1431,8 +1434,17 @@ class TaskMigrator:
             if requested_source_status in WORKER_ROUTING_SAFE_STATUSES
             else "cancelled"
         )
+        source_incarnation_id = task.incarnation_id
+        if (
+            not isinstance(source_incarnation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", source_incarnation_id) is None
+        ):
+            raise MigrationError(
+                "源 Task 缺少可验证的 immutable incarnation identity"
+            )
         payload = {
             "id": task.id,
+            "source_incarnation_id": source_incarnation_id,
             "worker_id": None,
             "source_status": source_status,
             "title": task.title,
@@ -1486,6 +1498,10 @@ class TaskMigrator:
             if not isinstance(created, dict):
                 raise MigrationError(
                     "目标 Worker 导入 task 未返回有效对象"
+                )
+            if created.get("incarnation_id") != source_incarnation_id:
+                raise MigrationError(
+                    "目标 Worker 未确认导入 task 的 exact incarnation identity"
                 )
             if created.get("status") != source_status:
                 raise MigrationError("目标 Worker 导入 task 未保持不可调度状态")

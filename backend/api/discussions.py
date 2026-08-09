@@ -1,5 +1,7 @@
+import asyncio
+
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
@@ -15,10 +17,18 @@ from backend.models.discussion import (
     DiscussionEvent,
     DiscussionMessage,
 )
+from backend.models.project import Project
 from backend.schemas.discussion import (
     DiscussionCreate,
     DiscussionOut,
     DiscussionSendMessage,
+)
+from backend.services.discussion_service import (
+    DISCUSSION_ACTIVE_STATUS,
+    DISCUSSION_CLOSED_STATUS,
+    DISCUSSION_CLOSING_STATUS,
+    DiscussionProcessCleanupError,
+    DiscussionSecurityError,
 )
 
 router = APIRouter(prefix="/api/discussions", tags=["discussions"])
@@ -112,6 +122,34 @@ async def create_discussion(
         raise HTTPException(403, "You need a Worker or Project access to create Discussions")
     if data.project_id is not None:
         await require_project_access(request, data.project_id, db)
+        # Access checks are read-only.  End that snapshot before taking the
+        # cross-process Project writer fence used by first-share admission.
+        await db.rollback()
+        from backend.services.project_share_admission import (
+            lock_project_share_authority,
+            project_has_active_share,
+        )
+
+        try:
+            await lock_project_share_authority(db, data.project_id)
+        except ValueError as exc:
+            await db.rollback()
+            raise HTTPException(404, "Project not found") from exc
+        try:
+            shared = await project_has_active_share(db, data.project_id)
+        except Exception as exc:
+            await db.rollback()
+            raise HTTPException(
+                503,
+                "Could not verify Project sharing state; Discussion creation "
+                "is disabled",
+            ) from exc
+        if shared:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Cannot create a provider-capable Discussion for a shared Project",
+            )
     disc = Discussion(
         title=data.title,
         project_id=data.project_id,
@@ -119,6 +157,7 @@ async def create_discussion(
         facilitator_model=data.facilitator_model,
         creator_user_id=get_current_user_id(request),
         agent_model=data.agent_model,
+        status="active",
     )
     db.add(disc)
     await db.commit()
@@ -177,7 +216,10 @@ async def send_broadcast_message(
     await _require_discussion_owner(request, disc)
 
     service = _get_service()
-    agents = await service.send_broadcast(db, discussion_id, data.message)
+    try:
+        agents = await service.send_broadcast(db, discussion_id, data.message)
+    except DiscussionSecurityError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {
         "ok": True,
         "agents": [
@@ -211,7 +253,10 @@ async def send_agent_chat(
         raise HTTPException(status_code=400, detail="Agent has no session to resume")
 
     service = _get_service()
-    await service.send_to_agent(db, agent_id, data.message)
+    try:
+        await service.send_to_agent(db, agent_id, data.message)
+    except DiscussionSecurityError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"ok": True}
 
 
@@ -232,7 +277,10 @@ async def trigger_agent(
         raise HTTPException(status_code=409, detail="Agent is already running")
 
     service = _get_service()
-    await service.trigger_agent(db, agent_id)
+    try:
+        await service.trigger_agent(db, agent_id)
+    except DiscussionSecurityError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {"ok": True}
 
 
@@ -266,6 +314,8 @@ async def resume_all_agents(
         try:
             await service.trigger_agent(db, agent.id)
             resumed += 1
+        except DiscussionSecurityError as exc:
+            raise HTTPException(409, str(exc)) from exc
         except Exception:
             pass
     return {"ok": True, "resumed": resumed}
@@ -285,7 +335,10 @@ async def add_agent(
         raise HTTPException(status_code=404, detail="Discussion not found")
 
     service = _get_service()
-    agent = await service.add_agent(db, discussion_id)
+    try:
+        agent = await service.add_agent(db, discussion_id)
+    except DiscussionSecurityError as exc:
+        raise HTTPException(409, str(exc)) from exc
     return {
         "ok": True,
         "agent": {
@@ -347,44 +400,141 @@ async def delete_discussion(
     if not disc:
         raise HTTPException(status_code=404, detail="Discussion not found")
     await _require_discussion_owner(request, disc)
+    project_id = disc.project_id
+
+    # Phase 1 publishes a durable, cross-process lease before any in-memory
+    # runtime lock is taken.  Holding SQLite's Project writer transaction while
+    # waiting for consumer finalization would deadlock those consumers on their
+    # own terminal DB writes, so commit ``closing`` first.  Both active and
+    # closing rows block first-share admission; provider launch accepts only
+    # active rows.
+    await db.rollback()
+    project_fenced = False
+    if project_id is not None:
+        from backend.services.project_share_admission import (
+            lock_project_share_authority,
+        )
+
+        try:
+            await lock_project_share_authority(db, project_id)
+            project_fenced = True
+        except ValueError as exc:
+            # Historical versions could delete the Project first and strand a
+            # Discussion whose non-FK logical project_id still names it.  A
+            # missing Project has no writer row left to lock, so fall back to
+            # the Discussion row itself.  If the Project still exists, failure
+            # to establish its shared writer fence remains a fail-closed 409.
+            await db.rollback()
+            project_still_exists = await db.get(Project, project_id)
+            await db.rollback()
+            if project_still_exists is not None:
+                raise HTTPException(
+                    409,
+                    "Could not establish the Discussion Project deletion fence; retry",
+                ) from exc
+    if not project_fenced:
+        fenced = await db.execute(
+            update(Discussion)
+            .where(
+                Discussion.id == discussion_id,
+                (
+                    Discussion.project_id.is_(None)
+                    if project_id is None
+                    else Discussion.project_id == project_id
+                ),
+            )
+            .values(id=Discussion.id)
+        )
+        if fenced.rowcount not in {0, 1}:
+            await db.rollback()
+            raise HTTPException(409, "Discussion deletion fence changed; retry")
+
+    current = (
+        await db.execute(
+            select(Discussion)
+            .where(Discussion.id == discussion_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if current is None:
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="Discussion not found")
+    if current.project_id != project_id:
+        await db.rollback()
+        raise HTTPException(409, "Discussion Project changed during deletion")
+    if current.status not in {
+        DISCUSSION_ACTIVE_STATUS,
+        DISCUSSION_CLOSING_STATUS,
+        DISCUSSION_CLOSED_STATUS,
+    }:
+        await db.rollback()
+        raise HTTPException(409, "Discussion has an invalid lifecycle status")
+    current.status = DISCUSSION_CLOSING_STATUS
+    await db.commit()
 
     service = _get_service()
-    async with service.deletion_barrier(discussion_id, db):
-        # Re-read the complete graph while launch admission remains fenced.
-        agents_result = await db.execute(
-            select(DiscussionAgent).where(
-                DiscussionAgent.discussion_id == discussion_id
+    try:
+        async with service.deletion_barrier(discussion_id, db):
+            # Re-read the complete graph while launch admission remains
+            # fenced by the durable closing lease plus Discussion/Agent locks.
+            agents_result = await db.execute(
+                select(DiscussionAgent).where(
+                    DiscussionAgent.discussion_id == discussion_id
+                )
             )
-        )
-        for agent in agents_result.scalars().all():
-            await db.delete(agent)
+            for agent in agents_result.scalars().all():
+                await db.delete(agent)
 
-        events_result = await db.execute(
-            select(DiscussionEvent).where(
-                DiscussionEvent.discussion_id == discussion_id
+            events_result = await db.execute(
+                select(DiscussionEvent).where(
+                    DiscussionEvent.discussion_id == discussion_id
+                )
             )
-        )
-        for event in events_result.scalars().all():
-            await db.delete(event)
+            for event in events_result.scalars().all():
+                await db.delete(event)
 
-        msgs_result = await db.execute(
-            select(DiscussionMessage).where(
-                DiscussionMessage.discussion_id == discussion_id
+            msgs_result = await db.execute(
+                select(DiscussionMessage).where(
+                    DiscussionMessage.discussion_id == discussion_id
+                )
             )
-        )
-        for message in msgs_result.scalars().all():
-            await db.delete(message)
+            for message in msgs_result.scalars().all():
+                await db.delete(message)
 
-        current = await db.get(
-            Discussion,
-            discussion_id,
-            populate_existing=True,
-        )
-        if current is None:
-            await db.rollback()
-            raise HTTPException(status_code=404, detail="Discussion not found")
-        await db.delete(current)
-        await db.commit()
+            current = await db.get(
+                Discussion,
+                discussion_id,
+                populate_existing=True,
+            )
+            if current is None:
+                await db.rollback()
+                raise HTTPException(status_code=404, detail="Discussion not found")
+            if current.status != DISCUSSION_CLOSING_STATUS:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Discussion deletion lease changed; retry",
+                )
+            await db.delete(current)
+            await db.commit()
+    except asyncio.CancelledError:
+        # Phase 1 is already committed.  Preserve closing so no provider or
+        # first-share admission can run; a later DELETE safely retries cleanup.
+        raise
+    except DiscussionProcessCleanupError as exc:
+        raise HTTPException(
+            409,
+            "Discussion cleanup is incomplete and remains closing; retry DELETE: "
+            f"{exc}",
+        ) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            503,
+            "Discussion deletion is incomplete and remains closing; retry DELETE",
+        ) from exc
     return {"ok": True}
 
 

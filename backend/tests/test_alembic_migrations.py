@@ -49,6 +49,7 @@ import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
 import backend.models.worker_task_termination  # noqa: F401
+import backend.models.discussion  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -67,6 +68,7 @@ TASK_SSH_ROOTS_REVISION = "a6d9f2c4e8b1"
 MAIN_SSH_MERGE_REVISION = "f9b2c4d6e8a1"
 TASK_SCOPED_TOKEN_INCARNATION_REVISION = "b4e7c1a9d2f0"
 TASK_SSH_EFFECT_REVISION = "c2f8a6d4e1b9"
+DISCUSSION_LEASE_REVISION = "d1a9c4e7b260"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -77,7 +79,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = TASK_SSH_EFFECT_REVISION
+CURRENT_HEAD_REVISION = DISCUSSION_LEASE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -6540,6 +6542,10 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == TASK_SSH_EFFECT_REVISION
+        )
+        assert (
+            script.get_revision(TASK_SSH_EFFECT_REVISION).down_revision
             == TASK_SCOPED_TOKEN_INCARNATION_REVISION
         )
         assert (
@@ -7069,6 +7075,121 @@ class TestPublishedMigrationHistory:
             plan_schema_present=False,
             snapshot_schema_present=True,
         )
+        engine.dispose()
+
+
+    def test_discussion_provider_lease_migration_roundtrip(self, tmp_path):
+        db_path = str(tmp_path / "discussion-provider-lease.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(cfg, command.upgrade, TASK_SSH_EFFECT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        before = inspect(engine)
+        assert "ix_discussions_project_status_id" not in {
+            index["name"] for index in before.get_indexes("discussions")
+        }
+        assert "ck_discussions_status" not in {
+            constraint["name"]
+            for constraint in before.get_check_constraints("discussions")
+        }
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO discussions (
+                    id, title, project_id, max_agents,
+                    facilitator_model, agent_model, status, created_at
+                ) VALUES
+                    (901, 'active lease', 71, 3, 'facilitator', 'agent',
+                     'active', '2026-08-09 00:00:00'),
+                    (902, 'closing lease', 71, 3, 'facilitator', 'agent',
+                     'closing', '2026-08-09 00:00:01'),
+                    (903, 'closed lease', 71, 3, 'facilitator', 'agent',
+                     'closed', '2026-08-09 00:00:02')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, DISCUSSION_LEASE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert "ix_discussions_project_status_id" in {
+            index["name"] for index in inspector.get_indexes("discussions")
+        }
+        assert "ck_discussions_status" in {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("discussions")
+        }
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT status FROM discussions ORDER BY id"
+            )).scalars().all() == ["active", "closing", "closed"]
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO discussions (
+                        title, max_agents, facilitator_model,
+                        agent_model, status, created_at
+                    ) VALUES (
+                        'invalid lease', 3, 'facilitator',
+                        'agent', 'paused', '2026-08-09 00:00:03'
+                    )
+                """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, TASK_SSH_EFFECT_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert "ix_discussions_project_status_id" not in {
+            index["name"] for index in inspector.get_indexes("discussions")
+        }
+        assert "ck_discussions_status" not in {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("discussions")
+        }
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT status FROM discussions ORDER BY id"
+            )).scalars().all() == ["active", "closing", "closed"]
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, DISCUSSION_LEASE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == DISCUSSION_LEASE_REVISION
+        engine.dispose()
+
+    def test_discussion_provider_lease_migration_refuses_unknown_status(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "discussion-provider-lease-unknown.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_SSH_EFFECT_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO discussions (
+                    id, title, max_agents, facilitator_model,
+                    agent_model, status, created_at
+                ) VALUES (
+                    904, 'unknown lease', 3, 'facilitator',
+                    'agent', 'paused', '2026-08-09 00:00:00'
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="unsupported historical status"):
+            _run_alembic(cfg, command.upgrade, DISCUSSION_LEASE_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT status FROM discussions WHERE id = 904"
+            )).scalar_one() == "paused"
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_SSH_EFFECT_REVISION
         engine.dispose()
 
 

@@ -51,6 +51,7 @@ prime_trusted_runtime()
 
 if TYPE_CHECKING:
     from backend.services.mcp_config import McpServerSpec
+    from backend.services.task_runtime_secrets import PrivateTaskTempDir
 
 logger = logging.getLogger(__name__)
 _EXPECTED_GENERATION_UNSET = object()
@@ -2083,6 +2084,11 @@ class InstanceManager:
         task_ssh_broker_only = False
         task_ssh_protected_path_values: tuple[str, ...] = ()
         task_git_credential_read_path_values: tuple[str, ...] = ()
+        task_git_metadata_read_path_values: tuple[str, ...] = ()
+        task_git_metadata_identity_fingerprint: tuple[
+            tuple[object, ...], ...
+        ] = ()
+        task_private_tmpdir = None
         delivery_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
@@ -2558,6 +2564,45 @@ class InstanceManager:
                 "profile; exec fallback is disabled"
             )
 
+        codex_filesystem_boundary_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and (codex_task_isolation_required or delivery_task)
+        )
+        if codex_filesystem_boundary_required:
+            from backend.services.task_agent_isolation import (
+                discover_linked_worktree_git_read_boundary,
+            )
+            from backend.services.task_runtime_secrets import (
+                create_private_task_temp_dir,
+            )
+
+            git_boundary = discover_linked_worktree_git_read_boundary(
+                cwd or os.getcwd()
+            )
+            task_git_metadata_read_path_values = (
+                git_boundary.read_paths if git_boundary is not None else ()
+            )
+            task_git_metadata_identity_fingerprint = (
+                git_boundary.identity_fingerprint
+                if git_boundary is not None
+                else ()
+            )
+            if (
+                task_incarnation_id is None
+                or task_retry_count is None
+                or task_turn_generation is None
+            ):
+                raise LaunchSupersededError(
+                    "Codex Task filesystem isolation lost its exact generation"
+                )
+            task_private_tmpdir = create_private_task_temp_dir(
+                task_id=task_id,
+                task_incarnation_id=task_incarnation_id,
+                retry_count=task_retry_count,
+                turn_generation=task_turn_generation,
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
@@ -2606,11 +2651,26 @@ class InstanceManager:
                             if codex_task_isolation_required
                             else ()
                         ),
-                        # Codex 0.144.6 exposes host loopback and abstract
-                        # AF_UNIX sockets whenever its direct network switch is
-                        # enabled. Keep every local Task network-closed until
-                        # a managed netns/proxy boundary can be proven.
-                        task_ssh_disable_network=True,
+                        task_git_read_paths=(
+                            task_git_metadata_read_path_values
+                            if codex_filesystem_boundary_required
+                            else ()
+                        ),
+                        task_git_boundary_fingerprint=(
+                            task_git_metadata_identity_fingerprint
+                            if codex_filesystem_boundary_required
+                            else ()
+                        ),
+                        task_private_tmpdir=task_private_tmpdir,
+                        # Durable SSH grants remain broker-only/network-off.
+                        # Ordinary local Tasks get public egress only through
+                        # Codex's managed proxy, whose thread response is
+                        # audited before model input.
+                        task_ssh_disable_network=task_ssh_broker_only,
+                        task_managed_network_proxy=(
+                            codex_task_isolation_required
+                            and not task_ssh_broker_only
+                        ),
                         disable_user_mcp=(
                             pr_review_task
                             or delivery_task
@@ -2776,6 +2836,11 @@ class InstanceManager:
                         instance_id,
                         config_dir,
                     )
+                finally:
+                    if task_private_tmpdir is not None:
+                        await asyncio.to_thread(
+                            task_private_tmpdir.cleanup_if_unbound
+                        )
 
         if (
             provider == "claude"
@@ -3475,7 +3540,11 @@ class InstanceManager:
         sandbox_mode: str = "danger-full-access",
         task_ssh_protected_paths: Sequence[str] = (),
         task_ssh_allowed_read_paths: Sequence[str] = (),
+        task_git_read_paths: Sequence[str] = (),
+        task_git_boundary_fingerprint: Sequence[tuple[object, ...]] = (),
+        task_private_tmpdir: "PrivateTaskTempDir | None" = None,
         task_ssh_disable_network: bool = False,
+        task_managed_network_proxy: bool = False,
         disable_autonomous_features: bool = False,
         network_isolated: bool = False,
         tools_disabled: bool = False,
@@ -3508,7 +3577,11 @@ class InstanceManager:
             sandbox_mode=sandbox_mode,
             task_ssh_protected_paths=task_ssh_protected_paths,
             task_ssh_allowed_read_paths=task_ssh_allowed_read_paths,
+            task_git_read_paths=task_git_read_paths,
+            task_git_boundary_fingerprint=task_git_boundary_fingerprint,
+            task_private_tmpdir=task_private_tmpdir,
             task_ssh_disable_network=task_ssh_disable_network,
+            task_managed_network_proxy=task_managed_network_proxy,
             disable_autonomous_features=disable_autonomous_features,
             network_isolated=network_isolated,
             tools_disabled=tools_disabled,
@@ -4904,6 +4977,110 @@ class InstanceManager:
         """Return live PTY background Tasks for same-process reconciliation."""
 
         return {state.task_id for state in self._pty_background_states.values()}
+
+    def project_share_runtime_block_reason(
+        self,
+        *,
+        project_id: int,
+        task_ids: set[int],
+        instance_ids: set[int],
+    ) -> str | None:
+        """Synchronously snapshot runtime evidence that vetoes Project share.
+
+        The caller already holds the durable Project -> Tasks -> Instances
+        writer fence. This method has no await point, so an in-process launch
+        reservation cannot appear halfway through the snapshot. A launch that
+        starts immediately afterwards must cross the Project writer fence and
+        will observe the newly committed share before its provider effect.
+        """
+
+        if (
+            type(project_id) is not int
+            or project_id <= 0
+            or any(type(value) is not int or value <= 0 for value in task_ids)
+            or any(
+                type(value) is not int or value <= 0
+                for value in instance_ids
+            )
+        ):
+            return "Could not verify local Agent runtime; Project sharing is disabled"
+
+        def related(instance_id: int, task_id: int | None = None) -> bool:
+            return bool(
+                instance_id in instance_ids
+                or task_id in task_ids
+                or self._container_tasks.get(instance_id) == project_id
+            )
+
+        for instance_id, reservation in self._launch_reservations.items():
+            if related(instance_id, reservation.task_id):
+                return (
+                    "A local Agent launch is in progress for this Project; "
+                    "wait for it to settle before sharing"
+                )
+
+        live_instance_ids = set(self.processes)
+        live_instance_ids.update(self._process_groups)
+        live_instance_ids.update(self._container_exec_processes)
+        live_instance_ids.update(self._tasks)
+        live_instance_ids.update(self._consumer_records)
+        live_instance_ids.update(self._pty_launch_barriers)
+        live_instance_ids.update(self._codex_exec_homes)
+        live_instance_ids.update(self._stopping)
+        for instance_id in live_instance_ids:
+            record = self._consumer_records.get(instance_id)
+            record_task_id = record.task_id if record is not None else None
+            params = self._launch_params.get(instance_id) or {}
+            params_task_id = params.get("task_id")
+            if related(instance_id, record_task_id) or related(
+                instance_id,
+                params_task_id if type(params_task_id) is int else None,
+            ):
+                return (
+                    "A local Agent runtime is still attached to this Project; "
+                    "stop it before sharing"
+                )
+
+        for (instance_id, _process), evidence in (
+            self._consumer_recovery_pending.items()
+        ):
+            if related(instance_id, evidence.task_id):
+                return (
+                    "A local Agent recovery is unresolved for this Project; "
+                    "wait for recovery before sharing"
+                )
+
+        for state in self._pty_background_states.values():
+            if state.task_id in task_ids:
+                return (
+                    "A local background Agent is still running for this Project; "
+                    "wait for it to settle before sharing"
+                )
+        for proof in self._pty_post_exit_generations.values():
+            if related(proof.instance_id, proof.task_id):
+                return (
+                    "A local Agent terminal handoff is unresolved for this "
+                    "Project; wait before sharing"
+                )
+        for continuation in self._sequential_turn_continuations.values():
+            if related(continuation.instance_id, continuation.task_id):
+                return (
+                    "A local Agent continuation remains admitted for this "
+                    "Project; wait before sharing"
+                )
+        for task_id, _session_id in self._pty_autonomous_activity_handoffs:
+            if task_id in task_ids:
+                return (
+                    "A local autonomous Agent handoff is unresolved for this "
+                    "Project; wait before sharing"
+                )
+        for permission in self._pty_permissions.values():
+            if permission.get("task_id") in task_ids:
+                return (
+                    "A local Agent permission request is still active for this "
+                    "Project; resolve it before sharing"
+                )
+        return None
 
     def pty_background_generation_for(
         self,
@@ -8335,6 +8512,13 @@ class InstanceManager:
         """
 
         if process.returncode is not None:
+            wait_runtime_cleanup = getattr(
+                process,
+                "wait_runtime_cleanup",
+                None,
+            )
+            if callable(wait_runtime_cleanup):
+                await wait_runtime_cleanup()
             return
         waiter = asyncio.create_task(process.wait())
         try:

@@ -61,6 +61,103 @@ class DiscussionSecurityError(RuntimeError):
     """A Discussion Agent could not prove its provider isolation boundary."""
 
 
+DISCUSSION_ACTIVE_STATUS = "active"
+DISCUSSION_CLOSING_STATUS = "closing"
+DISCUSSION_CLOSED_STATUS = "closed"
+DISCUSSION_SHARE_BLOCKING_STATUSES = (
+    DISCUSSION_ACTIVE_STATUS,
+    DISCUSSION_CLOSING_STATUS,
+)
+
+
+async def active_project_discussion_id(
+    db: AsyncSession,
+    project_id: int,
+) -> int | None:
+    """Return the first durable Discussion lease blocking Project sharing.
+
+    The caller must already hold the Project writer fence.  Creation and the
+    first phase of deletion take the same fence, so this read-only graph scan
+    is sufficient on SQLite as well as databases with real ``FOR UPDATE`` row
+    locks.  ``closing`` remains a lease until physical deletion: a cancelled
+    or failed cleanup must never expose a Project while an old child may live.
+    """
+
+    if type(project_id) is not int or project_id <= 0:
+        raise ValueError("project_id must be a positive integer")
+    return await db.scalar(
+        select(Discussion.id)
+        .where(
+            Discussion.project_id == project_id,
+            Discussion.status.in_(DISCUSSION_SHARE_BLOCKING_STATUSES),
+        )
+        .order_by(Discussion.id)
+        .limit(1)
+        .with_for_update()
+    )
+
+
+async def _lock_active_discussion_provider_lease(
+    db: AsyncSession,
+    *,
+    discussion_id: int,
+    project_id: int | None,
+) -> Discussion:
+    """Lock Project -> Discussion and prove one provider-capable lease."""
+
+    if type(discussion_id) is not int or discussion_id <= 0:
+        raise DiscussionSecurityError("Discussion identity is invalid")
+    if project_id is not None and (
+        type(project_id) is not int or project_id <= 0
+    ):
+        raise DiscussionSecurityError("Discussion Project identity is invalid")
+
+    if project_id is not None:
+        # Import lazily: project_share_admission intentionally imports the
+        # read-only graph helper above when evaluating first-share admission.
+        from backend.services.project_share_admission import (
+            lock_project_share_authority,
+            project_has_active_share,
+        )
+
+        try:
+            await lock_project_share_authority(db, project_id)
+            if await project_has_active_share(db, project_id):
+                raise DiscussionSecurityError(
+                    "Discussion Agent execution is disabled while Project "
+                    f"{project_id} is shared"
+                )
+        except DiscussionSecurityError:
+            raise
+        except Exception as exc:
+            raise DiscussionSecurityError(
+                "Discussion Project sharing state could not be verified"
+            ) from exc
+
+    project_predicate = (
+        Discussion.project_id.is_(None)
+        if project_id is None
+        else Discussion.project_id == project_id
+    )
+    discussion = (
+        await db.execute(
+            select(Discussion)
+            .where(
+                Discussion.id == discussion_id,
+                project_predicate,
+                Discussion.status == DISCUSSION_ACTIVE_STATUS,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if discussion is None:
+        raise DiscussionSecurityError(
+            "Discussion is no longer an active provider-capable lease"
+        )
+    return discussion
+
+
 @dataclass(frozen=True)
 class _DiscussionClaudeSecurityContext:
     discussion_id: int
@@ -70,6 +167,7 @@ class _DiscussionClaudeSecurityContext:
     resume_session_id: str | None
     repository_cwd: str | None
     binding: str
+    project_id: int | None = None
 
 
 async def _settle_despite_cancellation(awaitable):
@@ -176,26 +274,69 @@ class DiscussionService:
             return project.local_path
         return None
 
+    async def _require_provider_admission(
+        self,
+        db: AsyncSession,
+        discussion_id: int,
+    ) -> None:
+        """Preflight a public launch before taking Discussion/Agent locks.
+
+        The initial lookup is deliberately unlocked and followed by rollback:
+        it discovers the Project identity without inverting the required
+        Project -> Discussion lock order.  The authoritative helper then takes
+        the Project writer fence and revalidates the active Discussion row.
+        Its transaction can be released before the in-process lock because the
+        committed active lease remains visible to every first-share scan.
+        """
+
+        snapshot = await db.get(
+            Discussion,
+            discussion_id,
+            populate_existing=True,
+        )
+        if snapshot is None:
+            await db.rollback()
+            raise ValueError(f"Discussion {discussion_id} not found")
+        project_id = snapshot.project_id
+        await db.rollback()
+        try:
+            await _lock_active_discussion_provider_lease(
+                db,
+                discussion_id=discussion_id,
+                project_id=project_id,
+            )
+        finally:
+            # No state is mutated here.  Rollback releases the Project writer
+            # fence without holding a SQLite writer transaction across an
+            # asyncio Discussion lock or provider-account admission.
+            await db.rollback()
+
     async def _prepare_claude_security_context(
         self,
         context: _DiscussionClaudeSecurityContext,
     ) -> tuple[list[str], dict[str, str], str]:
         """Build one exact read-only Claude route immediately before spawn."""
 
+        if not str(settings.auth_token or "").strip():
+            raise DiscussionSecurityError(
+                "Discussion Agent security admission requires AUTH_TOKEN"
+            )
         try:
             async with self.db_factory() as db:
                 from backend.models.user import User
 
-                discussion = await db.get(Discussion, context.discussion_id)
+                discussion = await _lock_active_discussion_provider_lease(
+                    db,
+                    discussion_id=context.discussion_id,
+                    project_id=context.project_id,
+                )
                 creator = (
                     await db.get(User, discussion.creator_user_id)
-                    if discussion is not None
-                    and discussion.creator_user_id is not None
+                    if discussion.creator_user_id is not None
                     else None
                 )
                 if (
-                    discussion is None
-                    or discussion.creator_user_id is None
+                    discussion.creator_user_id is None
                     or creator is None
                     or not creator.is_active
                     or creator.role not in {"admin", "super_admin"}
@@ -277,6 +418,7 @@ class DiscussionService:
         discussion_id: int,
         user_message: str,
     ) -> list[DiscussionAgent]:
+        await self._require_provider_admission(db, discussion_id)
         async with self._get_lock(discussion_id):
             return await self._send_broadcast_locked(
                 db,
@@ -291,7 +433,7 @@ class DiscussionService:
         user_message: str,
     ) -> list[DiscussionAgent]:
         disc = await db.get(Discussion, discussion_id)
-        if not disc:
+        if not disc or disc.status != DISCUSSION_ACTIVE_STATUS:
             raise ValueError(f"Discussion {discussion_id} not found")
 
         user_msg = DiscussionMessage(
@@ -368,6 +510,7 @@ class DiscussionService:
         if not agent:
             raise ValueError(f"Agent {agent_id} not found")
         discussion_id = agent.discussion_id
+        await self._require_provider_admission(db, discussion_id)
         async with self._get_lock(discussion_id):
             agent = await db.get(
                 DiscussionAgent,
@@ -384,7 +527,7 @@ class DiscussionService:
                 discussion_id,
                 populate_existing=True,
             )
-            if not disc:
+            if not disc or disc.status != DISCUSSION_ACTIVE_STATUS:
                 raise ValueError(f"Discussion {discussion_id} not found")
 
             user_evt = DiscussionEvent(
@@ -428,6 +571,7 @@ class DiscussionService:
         if not agent:
             raise ValueError(f"Agent {agent_id} not found")
         discussion_id = agent.discussion_id
+        await self._require_provider_admission(db, discussion_id)
         async with self._get_lock(discussion_id):
             agent = await db.get(
                 DiscussionAgent,
@@ -444,7 +588,7 @@ class DiscussionService:
                 discussion_id,
                 populate_existing=True,
             )
-            if not disc:
+            if not disc or disc.status != DISCUSSION_ACTIVE_STATUS:
                 raise ValueError("Discussion not found")
 
             history = await self._get_history(db, discussion_id)
@@ -873,6 +1017,7 @@ Write in Chinese."""
         db: AsyncSession,
         discussion_id: int,
     ) -> DiscussionAgent:
+        await self._require_provider_admission(db, discussion_id)
         async with self._get_lock(discussion_id):
             return await self._add_agent_locked(db, discussion_id)
 
@@ -882,7 +1027,7 @@ Write in Chinese."""
         discussion_id: int,
     ) -> DiscussionAgent:
         disc = await db.get(Discussion, discussion_id)
-        if not disc:
+        if not disc or disc.status != DISCUSSION_ACTIVE_STATUS:
             raise ValueError(f"Discussion {discussion_id} not found")
 
         existing_agents = await db.execute(
@@ -946,6 +1091,29 @@ Write in Chinese."""
 
     async def _facilitator_advance(self, discussion_id: int) -> None:
         """Facilitator analyzes current state and decides next steps."""
+        try:
+            async with self.db_factory() as admission_db:
+                await self._require_provider_admission(
+                    admission_db,
+                    discussion_id,
+                )
+        except DiscussionSecurityError as exc:
+            logger.warning(
+                "Discussion %s facilitator admission rejected: %s",
+                discussion_id,
+                exc,
+            )
+            await self.broadcaster.broadcast(
+                f"discussion:{discussion_id}",
+                {
+                    "event_type": "facilitator_status",
+                    "status": "error",
+                    "error": str(exc),
+                },
+            )
+            return
+        except ValueError:
+            return
         lock = self._get_lock(discussion_id)
         if lock.locked():
             return
@@ -953,7 +1121,7 @@ Write in Chinese."""
         async with lock:
             async with self.db_factory() as db:
                 disc = await db.get(Discussion, discussion_id)
-                if not disc:
+                if not disc or disc.status != DISCUSSION_ACTIVE_STATUS:
                     return
 
                 agents = await db.execute(
@@ -1155,6 +1323,7 @@ Write in Chinese."""
                     resume_session_id=disc.facilitator_session_id,
                     repository_cwd=cwd,
                     binding=self._runtime_binding("discussion", disc),
+                    project_id=disc.project_id,
                 )
             )
             cmd.extend(["--max-turns", "5", "-p", prompt])
@@ -1478,6 +1647,7 @@ Guidelines:
                     resume_session_id=agent.session_id,
                     repository_cwd=cwd,
                     binding=self._runtime_binding("discussion-agent", agent),
+                    project_id=disc.project_id,
                 ),
             )
         )
@@ -1509,6 +1679,7 @@ Guidelines:
                     resume_session_id=agent.session_id,
                     repository_cwd=repository_cwd,
                     binding=self._runtime_binding("discussion-agent", agent),
+                    project_id=disc.project_id,
                 ),
             )
         )

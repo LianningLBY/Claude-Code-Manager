@@ -518,6 +518,8 @@ class TestEvaluateIntegration:
         monkeypatch,
     ):
         evaluator = GoalEvaluator()
+        claude_pool = MagicMock()
+        claude_pool.ensure_oauth_access_token = AsyncMock()
         monkeypatch.setattr(goal_evaluator_module.settings, "auth_token", "")
         with patch(
             "asyncio.create_subprocess_exec",
@@ -528,8 +530,33 @@ class TestEvaluateIntegration:
                     condition="cond",
                     conversation_summary="conv",
                     task_id=71,
+                    claude_pool=claude_pool,
                 )
         spawn.assert_not_awaited()
+        claude_pool.ensure_oauth_access_token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_security_admission_precedes_codex_app_server_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        evaluator = GoalEvaluator()
+        registry = MagicMock()
+        registry.start_turn = AsyncMock()
+        monkeypatch.setattr(goal_evaluator_module.settings, "auth_token", "")
+
+        with pytest.raises(GoalEvaluationError, match="AUTH_TOKEN"):
+            await evaluator.evaluate(
+                condition="cond",
+                conversation_summary="conv",
+                provider="codex",
+                codex_home=str(tmp_path / "codex-home"),
+                task_id=72,
+                codex_app_server_registry=registry,
+            )
+
+        registry.start_turn.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_claude_evaluator_is_zero_tool_and_scrubs_unknown_secret(

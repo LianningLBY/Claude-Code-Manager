@@ -52,6 +52,9 @@ from backend.services.worker_routing_config import (
 )
 
 
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+
 class FakeBroadcaster:
     def __init__(self):
         self.sent: list[tuple[str, dict]] = []
@@ -342,10 +345,6 @@ async def test_worker_relay_start_requires_completed_clean_shutdown(relay):
 
 
 async def _mk_worker(session_factory, **fields) -> Worker:
-    # A ready Worker is meaningful only behind an authenticated Manager
-    # control plane. Individual fail-closed tests explicitly clear this after
-    # constructing their durable fixture.
-    settings.auth_token = "manager-worker-test-token"
     fields.setdefault("name", "w1")
     fields.setdefault("status", "ready")
     fields.setdefault("private_ip", "10.0.0.9")
@@ -7907,6 +7906,7 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             imported_statuses.append(json["source_status"])
             remote.update({
                 "id": json["id"],
+                "incarnation_id": json["source_incarnation_id"],
                 "status": json["source_status"],
                 "retry_count": json["retry_count"],
                 "turn_generation": json["turn_generation"],

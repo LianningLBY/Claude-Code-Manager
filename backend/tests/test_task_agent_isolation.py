@@ -16,6 +16,7 @@ from backend.services.task_agent_isolation import (
     CLAUDE_SUB_AGENT_BUILTIN_TOOLS,
     CLAUDE_TASK_BUILTIN_TOOLS,
     TaskAgentIsolationError,
+    discover_linked_worktree_git_read_boundary,
     generate_claude_aux_isolation_settings,
     generate_claude_task_isolation_settings,
     generate_claude_zero_tool_isolation_settings,
@@ -37,6 +38,138 @@ from backend.services.task_ssh_access import (
     _protected_path_variants,
     manager_secret_protected_paths,
 )
+
+
+def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _linked_git_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git("init", "-q", cwd=repository)
+    _git("config", "user.name", "CCM Test", cwd=repository)
+    _git("config", "user.email", "ccm@example.invalid", cwd=repository)
+    (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    _git("add", "tracked.txt", cwd=repository)
+    _git("commit", "-qm", "baseline", cwd=repository)
+    linked = tmp_path / "linked"
+    _git(
+        "worktree",
+        "add",
+        "-qb",
+        "task-branch",
+        str(linked),
+        cwd=repository,
+    )
+    common = repository / ".git"
+    return repository, linked, common
+
+
+def test_linked_worktree_git_boundary_is_exact_read_only_projection(tmp_path):
+    repository, linked, common = _linked_git_fixture(tmp_path)
+    other = tmp_path / "other"
+    _git(
+        "worktree",
+        "add",
+        "-qb",
+        "other-branch",
+        str(other),
+        cwd=repository,
+    )
+
+    boundary = discover_linked_worktree_git_read_boundary(linked)
+
+    assert boundary is not None
+    git_dir = Path(boundary.git_dir)
+    assert Path(boundary.common_dir) == common
+    assert boundary.head_ref == "refs/heads/task-branch"
+    assert set(boundary.read_paths) == {
+        str(linked / ".git"),
+        str(git_dir / "HEAD"),
+        str(git_dir / "commondir"),
+        str(git_dir / "index"),
+        str(common / "objects"),
+        str(common / "refs" / "heads" / "task-branch"),
+    }
+    forbidden = {
+        common / "config",
+        common / "hooks",
+        common / "packed-refs",
+        common / "refs" / "heads" / "other-branch",
+    }
+    assert all(str(path) not in boundary.read_paths for path in forbidden)
+    assert str(common / "worktrees" / "other") not in boundary.read_paths
+
+
+def test_normal_git_directory_has_no_linked_read_projection(tmp_path):
+    repository, _linked, _common = _linked_git_fixture(tmp_path)
+
+    assert discover_linked_worktree_git_read_boundary(repository) is None
+
+
+def test_linked_worktree_git_boundary_rejects_pointer_symlink(tmp_path):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    pointer = linked / ".git"
+    saved = linked / ".git.saved"
+    pointer.rename(saved)
+    pointer.symlink_to(saved)
+
+    with pytest.raises(TaskAgentIsolationError, match="safe regular file"):
+        discover_linked_worktree_git_read_boundary(linked)
+
+
+def test_linked_worktree_git_boundary_rejects_wrong_backlink(tmp_path):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    initial = discover_linked_worktree_git_read_boundary(linked)
+    assert initial is not None
+    (Path(initial.git_dir) / "gitdir").write_text(
+        str(tmp_path / "other" / ".git"),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="backlink"):
+        discover_linked_worktree_git_read_boundary(linked)
+
+
+def test_linked_worktree_git_boundary_rejects_unsafe_head_ref(tmp_path):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    initial = discover_linked_worktree_git_read_boundary(linked)
+    assert initial is not None
+    (Path(initial.git_dir) / "HEAD").write_text(
+        "ref: refs/heads/../escape\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="safe local branch"):
+        discover_linked_worktree_git_read_boundary(linked)
+
+
+def test_linked_worktree_git_boundary_rejects_packed_only_branch(tmp_path):
+    repository, linked, _common = _linked_git_fixture(tmp_path)
+    _git("pack-refs", "--all", "--prune", cwd=repository)
+
+    with pytest.raises(TaskAgentIsolationError, match="exact loose ref"):
+        discover_linked_worktree_git_read_boundary(linked)
+
+
+def test_linked_worktree_git_boundary_rejects_symlink_index(tmp_path):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    initial = discover_linked_worktree_git_read_boundary(linked)
+    assert initial is not None
+    index = Path(initial.git_dir) / "index"
+    saved = Path(initial.git_dir) / "index.saved"
+    index.rename(saved)
+    index.symlink_to(saved)
+
+    with pytest.raises(TaskAgentIsolationError, match="index"):
+        discover_linked_worktree_git_read_boundary(linked)
 
 
 def _sandbox_loading_canary_result():

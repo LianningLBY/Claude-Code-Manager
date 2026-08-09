@@ -537,16 +537,24 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
         status_code = 201
         text = ""
 
-        def __init__(self, status, retry_count, turn_generation):
+        def __init__(
+            self,
+            status,
+            retry_count,
+            turn_generation,
+            incarnation_id,
+        ):
             self.status = status
             self.retry_count = retry_count
             self.turn_generation = turn_generation
+            self.incarnation_id = incarnation_id
 
         def json(self):
             return {
                 "status": self.status,
                 "retry_count": self.retry_count,
                 "turn_generation": self.turn_generation,
+                "incarnation_id": self.incarnation_id,
             }
 
         @staticmethod
@@ -566,6 +574,7 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
                 json["source_status"],
                 json["retry_count"],
                 json["turn_generation"],
+                json["source_incarnation_id"],
             )
 
     monkeypatch.setattr(
@@ -590,6 +599,7 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
     assert len(requests) == 1
     _url, _headers, payload = requests[0]
     assert payload["provider"] == "codex"
+    assert payload["source_incarnation_id"] == task.incarnation_id
     assert payload["source_status"] == "completed"
     assert payload["enabled_skills"] == {"sub-agent": True}
     assert payload["selected_user_skills"] == [81]
@@ -1271,6 +1281,31 @@ async def test_migration_finish_and_rollback_reject_turn_generation_only_aba(
     assert current.turn_generation == task.turn_generation + 1
 
 
+async def test_migration_claim_rejects_incarnation_only_aba(
+    db_factory,
+    session_factory,
+):
+    task = await _mk_task(session_factory, status="completed")
+    observed = migration_task_generation(task)
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(incarnation_id="f" * 32)
+        )
+        await db.commit()
+
+    migrator = _migrator(db_factory)
+    with pytest.raises(MigrationError, match="并发修改"):
+        await migrator._claim_migration(observed)
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current is not None
+    assert current.status == "completed"
+    assert current.incarnation_id == "f" * 32
+
+
 async def test_worker_sync_response_cannot_borrow_new_manager_generation(
     db_factory, session_factory, monkeypatch,
 ):
@@ -1504,10 +1539,17 @@ async def test_worker_task_import_is_one_inert_request(
         status_code = 201
         text = ""
 
-        def __init__(self, status, retry_count, turn_generation):
+        def __init__(
+            self,
+            status,
+            retry_count,
+            turn_generation,
+            incarnation_id,
+        ):
             self.status = status
             self.retry_count = retry_count
             self.turn_generation = turn_generation
+            self.incarnation_id = incarnation_id
 
         def json(self):
             return {
@@ -1515,6 +1557,7 @@ async def test_worker_task_import_is_one_inert_request(
                 "retry_count": self.retry_count,
                 "turn_generation": self.turn_generation,
                 "codex_service_tier": "priority",
+                "incarnation_id": self.incarnation_id,
             }
 
         @staticmethod
@@ -1534,6 +1577,7 @@ async def test_worker_task_import_is_one_inert_request(
                 json["source_status"],
                 json["retry_count"],
                 json["turn_generation"],
+                json["source_incarnation_id"],
             )
 
     monkeypatch.setattr(
@@ -1549,6 +1593,7 @@ async def test_worker_task_import_is_one_inert_request(
     url, _headers, payload = requests[0]
     assert url.endswith("/api/tasks/migration-import")
     assert payload["id"] == t.id
+    assert payload["source_incarnation_id"] == t.incarnation_id
     assert payload["source_status"] == "completed"
     assert payload["project_id"] == 17
     assert payload["retry_count"] == 2
@@ -1580,6 +1625,7 @@ async def test_worker_task_import_rejects_different_turn_confirmation(
                 "status": "completed",
                 "retry_count": task.retry_count,
                 "turn_generation": 22,
+                "incarnation_id": task.incarnation_id,
             }
 
         @staticmethod
@@ -1612,6 +1658,56 @@ async def test_worker_task_import_rejects_different_turn_confirmation(
         )
 
 
+async def test_worker_task_import_rejects_different_incarnation_confirmation(
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="completed")
+
+    class Response:
+        status_code = 201
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "status": "completed",
+                "retry_count": task.retry_count,
+                "turn_generation": task.turn_generation,
+                "incarnation_id": "0" * 32,
+            }
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            assert json["source_incarnation_id"] == task.incarnation_id
+            return Response()
+
+    monkeypatch.setattr(
+        task_migrator_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+    migrator = TaskMigrator(db_factory=None, relay=FakeRelay())
+
+    with pytest.raises(MigrationError, match="exact incarnation identity"):
+        await migrator._ensure_worker_task(
+            worker,
+            task,
+            worker_project_id=17,
+        )
+
+
 async def test_worker_task_import_rejects_different_retry_confirmation(
     session_factory,
     monkeypatch,
@@ -1634,6 +1730,7 @@ async def test_worker_task_import_rejects_different_retry_confirmation(
                 "status": "completed",
                 "retry_count": 3,
                 "turn_generation": 21,
+                "incarnation_id": task.incarnation_id,
             }
 
         @staticmethod

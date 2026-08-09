@@ -50,6 +50,7 @@ from backend.services.codex_pool import (
     is_rate_limited as is_codex_rate_limited,
 )
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.task_runtime_secrets import PrivateRuntimeTempDir
 from backend.services.plan_runtime_receipt import (
     PlanRuntimeReceiptError,
     RuntimeReceiptSnapshot,
@@ -322,6 +323,7 @@ class _RetainedProcess:
     process_group_id: int | None
     runtime_receipt: RuntimeReceiptSnapshot | None = None
     runtime_db_factory: Any | None = None
+    runtime_temp_dir: PrivateRuntimeTempDir | None = None
     cleanup_task: asyncio.Task[None] | None = None
 
 
@@ -494,6 +496,7 @@ def _register_process(
     provider_home: str | None,
     runtime_receipt: RuntimeReceiptSnapshot | None = None,
     runtime_db_factory=None,
+    runtime_temp_dir: PrivateRuntimeTempDir | None = None,
 ) -> tuple[int, _RetainedProcess]:
     process_group_id = None
     if os.name == "posix":
@@ -501,6 +504,9 @@ def _register_process(
             process.pid,
             context="plan agent",
         )
+    if runtime_temp_dir is not None:
+        runtime_temp_dir.assert_valid()
+        runtime_temp_dir.bind_to_runtime()
     retained = _RetainedProcess(
         process=process,
         task_id=task_id,
@@ -509,6 +515,7 @@ def _register_process(
         process_group_id=process_group_id,
         runtime_receipt=runtime_receipt,
         runtime_db_factory=runtime_db_factory,
+        runtime_temp_dir=runtime_temp_dir,
     )
     token = id(process)
     _PLAN_AGENT_PROCESSES[token] = retained
@@ -582,6 +589,8 @@ async def _terminate_process(
         await asyncio.sleep(min(0.05, remaining))
     if not parent_reaped:
         raise RuntimeError("process parent could not be proven reaped")
+    if retained.runtime_temp_dir is not None:
+        await asyncio.to_thread(retained.runtime_temp_dir.cleanup)
 
 
 async def _shielded_terminate(
@@ -694,6 +703,7 @@ async def _cleanup_codex_turn(retained: _RetainedCodexTurn) -> None:
             raise RuntimeError(
                 f"Codex Plan turn {retained.thread_id} did not terminate"
             ) from exc
+    await process.wait_runtime_cleanup()
     async with retained.app_server_guard(
         retained.provider_home
     ) as admitted_home:
@@ -1365,6 +1375,227 @@ class PlanAgentRunner:
             else:
                 yield home, cloudrouter_api
 
+    async def _prepare_provider_effect_boundary(
+        self,
+        *,
+        task_id: int,
+        provider: str,
+        cwd: str,
+        admitted_home: str | None,
+        runtime_receipt: RuntimeReceiptSnapshot | None,
+    ) -> tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[tuple[object, ...], ...],
+        PrivateRuntimeTempDir,
+    ]:
+        """Fence one exact Plan attempt before any native provider effect.
+
+        First-class Plan Runs deliberately use a negative in-memory runtime key,
+        but that key is not a Task identity.  The durable receipt coordinates
+        the Run, Step, generation, and retry attempt used for both admission and
+        private scratch.  When a Project exists, the transaction takes the same
+        Project writer fence as outbound sharing before it revalidates the
+        complete Plan owner graph.
+        """
+
+        if runtime_receipt is None:
+            raise PlanAgentError(
+                "Plan provider admission requires a durable runtime receipt",
+                provider=provider,
+            )
+
+        async def validate_graph(db, *, lock: bool) -> tuple[int | None, Task | None]:
+            receipt = await db.get(
+                PlanAgentRuntimeReceipt,
+                runtime_receipt.id,
+                with_for_update=lock,
+                populate_existing=True,
+            )
+            step = await db.get(
+                PlanAgentStep,
+                runtime_receipt.step_id,
+                with_for_update=lock,
+                populate_existing=True,
+            )
+            run = await db.get(
+                PlanAgentRun,
+                runtime_receipt.run_id,
+                with_for_update=lock,
+                populate_existing=True,
+            )
+            if (
+                receipt is None
+                or step is None
+                or run is None
+                or receipt.id != runtime_receipt.id
+                or receipt.run_id != run.id
+                or receipt.step_id != step.id
+                or receipt.run_generation != runtime_receipt.run_generation
+                or receipt.attempt_index != runtime_receipt.attempt_index
+                or receipt.runtime_token != runtime_receipt.runtime_token
+                or receipt.provider != provider
+                or receipt.status != "admitting"
+                or step.run_id != run.id
+                or step.provider != provider
+                or step.status != "running"
+                or step.generation != runtime_receipt.run_generation
+                or run.generation != runtime_receipt.run_generation
+            ):
+                raise PlanAgentError(
+                    "Plan runtime ownership changed before provider admission",
+                    provider=provider,
+                )
+
+            if run.plan_id is None:
+                parent_task = await db.get(
+                    Task,
+                    run.plan_task_id,
+                    with_for_update=lock,
+                    populate_existing=True,
+                )
+                if (
+                    parent_task is None
+                    or run.plan_task_id != task_id
+                    or task_id <= 0
+                    or run.status not in {"planning", "reviewing"}
+                    or parent_task.status not in {"in_progress", "executing"}
+                ):
+                    raise PlanAgentError(
+                        "Legacy Plan Task ownership changed before provider admission",
+                        provider=provider,
+                    )
+                return parent_task.project_id, parent_task
+
+            plan = await db.get(
+                Plan,
+                run.plan_id,
+                with_for_update=lock,
+                populate_existing=True,
+            )
+            target_task = (
+                await db.get(
+                    Task,
+                    plan.target_task_id,
+                    with_for_update=lock,
+                    populate_existing=True,
+                )
+                if plan is not None and plan.target_task_id is not None
+                else None
+            )
+            owner = (
+                await db.get(
+                    Instance,
+                    run.instance_id,
+                    with_for_update=lock,
+                    populate_existing=True,
+                )
+                if run.instance_id is not None
+                else None
+            )
+            if (
+                plan is None
+                or task_id != -run.id
+                or run.status != "running"
+                or run.worker_id is not None
+                or plan.worker_id is not None
+                or plan.active_run_id != run.id
+                or owner is None
+                or owner.current_plan_run_id != run.id
+                or owner.current_task_id is not None
+                or owner.pid is not None
+            ):
+                raise PlanAgentError(
+                    "Plan Run lost its exact local Instance owner before provider admission",
+                    provider=provider,
+                )
+            if plan.target_task_id is not None and (
+                target_task is None
+                or target_task.project_id != plan.project_id
+            ):
+                raise PlanAgentError(
+                    "Plan target Task changed Project before provider admission",
+                    provider=provider,
+                )
+            # A first-class Plan never inherits Task SSH authority.  It is an
+            # independent read-only principal even when it references a Task.
+            return plan.project_id, None
+
+        async with self.db_factory() as probe_db:
+            project_id, _parent_task = await validate_graph(
+                probe_db,
+                lock=False,
+            )
+            await probe_db.rollback()
+
+        from backend.services.project_share_admission import (
+            lock_project_share_authority,
+            project_has_active_share,
+        )
+        from backend.services.task_ssh_access import task_ssh_protected_paths
+
+        async with self.db_factory() as boundary_db:
+            if project_id is not None:
+                await lock_project_share_authority(boundary_db, project_id)
+            current_project_id, parent_task = await validate_graph(
+                boundary_db,
+                lock=True,
+            )
+            if current_project_id != project_id:
+                raise PlanAgentError(
+                    "Plan Project changed before provider admission",
+                    provider=provider,
+                )
+            if (
+                project_id is not None
+                and await project_has_active_share(boundary_db, project_id)
+            ):
+                raise PlanAgentError(
+                    f"Plan Agent execution is disabled while Project {project_id} is shared",
+                    provider=provider,
+                )
+            protected_paths = await task_ssh_protected_paths(
+                boundary_db,
+                task=parent_task,
+                working_directory=cwd,
+                extra_paths=(
+                    () if not admitted_home else (admitted_home,)
+                ),
+            )
+            await boundary_db.commit()
+
+        from backend.services.task_agent_isolation import (
+            discover_linked_worktree_git_read_boundary,
+        )
+        from backend.services.task_runtime_secrets import (
+            create_private_runtime_temp_dir,
+        )
+
+        git_boundary = discover_linked_worktree_git_read_boundary(cwd)
+        task_git_read_paths = (
+            git_boundary.read_paths if git_boundary is not None else ()
+        )
+        task_git_boundary_fingerprint = (
+            git_boundary.identity_fingerprint
+            if git_boundary is not None
+            else ()
+        )
+        runtime_temp_dir = create_private_runtime_temp_dir(
+            runtime_namespace="plan-run",
+            owner_id=runtime_receipt.run_id,
+            generation_components={
+                "step": runtime_receipt.step_id,
+                "run_generation": runtime_receipt.run_generation,
+                "attempt": runtime_receipt.attempt_index,
+            },
+        )
+        return (
+            tuple(protected_paths),
+            tuple(task_git_read_paths),
+            tuple(task_git_boundary_fingerprint),
+            runtime_temp_dir,
+        )
+
     async def _run_codex_turn(
         self,
         *,
@@ -1381,6 +1612,9 @@ class PlanAgentRunner:
         json_whitespace_limit: int | None = None,
         runtime_receipt=None,
         protected_paths: tuple[str, ...] = (),
+        task_git_read_paths: tuple[str, ...] = (),
+        task_git_boundary_fingerprint: tuple[tuple[object, ...], ...] = (),
+        runtime_temp_dir: PrivateRuntimeTempDir,
     ) -> tuple[bytes, bytes, int]:
         registry = self.instance_manager._ensure_codex_app_server_registry()
         process = None
@@ -1435,6 +1669,11 @@ class PlanAgentRunner:
                     codex_service_tier="default",
                     sandbox_mode="read-only",
                     task_ssh_protected_paths=protected_paths,
+                    task_git_read_paths=task_git_read_paths,
+                    task_git_boundary_fingerprint=(
+                        task_git_boundary_fingerprint
+                    ),
+                    task_private_tmpdir=runtime_temp_dir,
                     task_ssh_disable_network=True,
                     disable_autonomous_features=True,
                     output_schema=schema,
@@ -1584,31 +1823,34 @@ class PlanAgentRunner:
             delayed_cancellation = exc
             raise
         finally:
-            telemetry_stop.set()
-            if telemetry_task is not None:
-                await asyncio.gather(telemetry_task, return_exceptions=True)
-            if (
-                token is not None
-                and retained is not None
-                and _PLAN_AGENT_CODEX_TURNS.get(token) is retained
-            ):
-                await _shielded_cleanup_codex_turn(
-                    token,
-                    retained,
-                    delayed_cancellation=delayed_cancellation,
-                )
-            elif runtime_receipt is not None:
-                cleaned = await reconcile_runtime_receipt(
-                    self.db_factory,
-                    self.instance_manager,
-                    receipt_id=runtime_receipt.id,
-                    allow_transport_kill=False,
-                )
-                if not cleaned:
-                    raise PlanAgentCleanupError(
-                        "Codex Plan runtime launch cleanup could not be confirmed",
-                        provider="codex",
+            try:
+                telemetry_stop.set()
+                if telemetry_task is not None:
+                    await asyncio.gather(telemetry_task, return_exceptions=True)
+                if (
+                    token is not None
+                    and retained is not None
+                    and _PLAN_AGENT_CODEX_TURNS.get(token) is retained
+                ):
+                    await _shielded_cleanup_codex_turn(
+                        token,
+                        retained,
+                        delayed_cancellation=delayed_cancellation,
                     )
+                elif runtime_receipt is not None:
+                    cleaned = await reconcile_runtime_receipt(
+                        self.db_factory,
+                        self.instance_manager,
+                        receipt_id=runtime_receipt.id,
+                        allow_transport_kill=False,
+                    )
+                    if not cleaned:
+                        raise PlanAgentCleanupError(
+                            "Codex Plan runtime launch cleanup could not be confirmed",
+                            provider="codex",
+                        )
+            finally:
+                await asyncio.to_thread(runtime_temp_dir.cleanup_if_unbound)
 
     @staticmethod
     async def _wait_for_codex_delta_stall(
@@ -1794,29 +2036,34 @@ class PlanAgentRunner:
                     env.pop(key, None)
             if runtime_receipt is not None:
                 env.update(runtime_token_environment(runtime_receipt))
-
-            from backend.services.task_ssh_access import (
-                task_ssh_protected_paths,
+            (
+                protected_paths,
+                task_git_read_paths,
+                task_git_boundary_fingerprint,
+                runtime_temp_dir,
+            ) = await self._prepare_provider_effect_boundary(
+                task_id=task_id,
+                provider=provider,
+                cwd=cwd,
+                admitted_home=admitted_home,
+                runtime_receipt=runtime_receipt,
             )
-
-            async with self.db_factory() as isolation_db:
-                parent_task = await isolation_db.get(Task, task_id)
-                protected_paths = await task_ssh_protected_paths(
-                    isolation_db,
-                    task=parent_task,
-                    working_directory=cwd,
-                    extra_paths=(
-                        () if not admitted_home else (admitted_home,)
-                    ),
-                )
+            for temp_key in ("TMPDIR", "TMP", "TEMP"):
+                env[temp_key] = str(runtime_temp_dir.path)
 
             if provider == "codex":
                 if not settings.codex_app_server_enabled:
+                    await asyncio.to_thread(
+                        runtime_temp_dir.cleanup_if_unbound
+                    )
                     raise PlanRouteUnavailable(
                         "Codex Plan app-server transport is disabled",
                         provider=provider,
                     )
                 if not admitted_home:
+                    await asyncio.to_thread(
+                        runtime_temp_dir.cleanup_if_unbound
+                    )
                     raise PlanRouteUnavailable(
                         "Codex Plan requires an explicit CODEX_HOME route",
                         provider=provider,
@@ -1842,6 +2089,11 @@ class PlanAgentRunner:
                         ),
                         runtime_receipt=runtime_receipt,
                         protected_paths=protected_paths,
+                        task_git_read_paths=task_git_read_paths,
+                        task_git_boundary_fingerprint=(
+                            task_git_boundary_fingerprint
+                        ),
+                        runtime_temp_dir=runtime_temp_dir,
                     )
                 except CodexAppServerBusyError as exc:
                     raise PlanRouteUnavailable(
@@ -1899,13 +2151,17 @@ class PlanAgentRunner:
                 isolation_identifier,
                 protected_paths,
             )
-            await asyncio.to_thread(
-                validate_claude_task_isolation_settings,
-                isolation_path,
-                claude_binary=settings.claude_binary,
-                tools=CLAUDE_READ_ONLY_BUILTIN_TOOLS,
-                include_mcp_tools=False,
-            )
+            try:
+                await asyncio.to_thread(
+                    validate_claude_task_isolation_settings,
+                    isolation_path,
+                    claude_binary=settings.claude_binary,
+                    tools=CLAUDE_READ_ONLY_BUILTIN_TOOLS,
+                    include_mcp_tools=False,
+                )
+            except BaseException:
+                await asyncio.to_thread(runtime_temp_dir.cleanup_if_unbound)
+                raise
             command = _build_command(
                 provider=provider,
                 model=model,
@@ -1940,6 +2196,7 @@ class PlanAgentRunner:
                     runtime_db_factory=(
                         self.db_factory if runtime_receipt is not None else None
                     ),
+                    runtime_temp_dir=runtime_temp_dir,
                 )
                 if runtime_receipt is not None:
                     runtime_receipt = await bind_claude_process(
@@ -2023,6 +2280,8 @@ class PlanAgentRunner:
                     provider=provider,
                     stderr=str(exc),
                 ) from exc
+            finally:
+                await asyncio.to_thread(runtime_temp_dir.cleanup_if_unbound)
         raw = stdout.decode("utf-8", errors="replace")
         stderr_text = stderr.decode("utf-8", errors="replace")
         returncode = (

@@ -194,6 +194,9 @@ async def test_claude_task_distill_keeps_existing_json_result_path(monkeypatch):
 async def test_task_distill_requires_auth_before_provider_effect(monkeypatch):
     monkeypatch.setattr(skill_distill_module.settings, "auth_token", "")
     pool = MagicMock()
+    registry = MagicMock()
+    registry.start_turn = AsyncMock()
+    manager = _guard_manager(registry)
     with patch(
         "backend.services.skill_distill.asyncio.create_subprocess_exec",
         new_callable=AsyncMock,
@@ -204,11 +207,13 @@ async def test_task_distill_requires_auth_before_provider_effect(monkeypatch):
                 conversation="secret",
                 provider="codex",
                 codex_pool=pool,
-                instance_manager=_guard_manager(),
+                instance_manager=manager,
             )
     assert "AUTH_TOKEN" in exc.value.stderr
     spawn.assert_not_awaited()
-    pool.select.assert_not_called()
+    assert pool.mock_calls == []
+    assert manager.runtime_admission_calls == []
+    registry.start_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio

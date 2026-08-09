@@ -10,11 +10,14 @@ already consumes, so task status/retry/DB logic remains shared with exec mode.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import logging
 import os
 import re
 import signal
+import stat
 import time
 import uuid
 from collections import deque
@@ -31,6 +34,7 @@ from backend.services.codex_tier_proxy import (
 )
 from backend.services.mcp_config import McpServerSpec, render_codex_mcp_config
 from backend.services.process_safety import require_safe_process_group_id
+from backend.services.task_runtime_secrets import PrivateTaskTempDir
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +100,16 @@ def _format_process_exit(returncode: int | None) -> str:
 # version accidentally reintroduces one.  The response audit below proves that
 # this exact profile, rather than an inherited :read-only profile, was selected
 # before any model turn is admitted.
-_TOOL_FREE_PERMISSION_PROFILE = "ccm_pr_review_no_access_v1"
-_TASK_SSH_PERMISSION_PROFILE = "ccm_task_ssh_isolated_v1"
+_TOOL_FREE_PERMISSION_PROFILE_PREFIX = "ccm_pr_review_no_access_v1_"
+_TASK_SSH_PERMISSION_PROFILE_PREFIX = "ccm_task_ssh_isolated_v1_"
+_TASK_MANAGED_NETWORK_PERMISSION_PROFILE_PREFIX = (
+    "ccm_task_managed_network_v1_"
+)
+_CODEX_APP_SERVER_USER_AGENT_RE = re.compile(
+    r"\Aclaude_code_manager/([0-9]+)\.([0-9]+)\.([0-9]+) "
+    r"\("
+)
+_MANAGED_NETWORK_MIN_CODEX_VERSION = (0, 146, 0)
 _TASK_SHELL_ENV_EXCLUDES = (
     "AUTH_TOKEN",
     "CCM_*",
@@ -134,11 +146,14 @@ _TOOL_FREE_DISABLED_FEATURES = frozenset({
     "image_generation",
     "in_app_browser",
     "memories",
+    "mentions_v2",
     "multi_agent",
+    "network_proxy",
     "plugins",
     "plugin_sharing",
     "realtime_conversation",
     "remote_compaction_v2",
+    "remote_control",
     "remote_plugin",
     "request_permissions_tool",
     "shell_snapshot",
@@ -175,11 +190,14 @@ _NETWORK_ISOLATED_DISABLED_FEATURES = frozenset({
     "image_generation",
     "in_app_browser",
     "memories",
+    "mentions_v2",
     "multi_agent",
+    "network_proxy",
     "plugins",
     "plugin_sharing",
     "realtime_conversation",
     "remote_compaction_v2",
+    "remote_control",
     "remote_plugin",
     "request_permissions_tool",
     "shell_snapshot",
@@ -188,6 +206,11 @@ _NETWORK_ISOLATED_DISABLED_FEATURES = frozenset({
     "tool_call_mcp_elicitation",
     "tool_suggest",
     "workspace_dependencies",
+})
+_ISOLATED_LOCAL_FEATURES = frozenset({
+    "apply_patch_freeform",
+    "shell_tool",
+    "unified_exec",
 })
 _TOOL_FREE_PASSIVE_ITEM_TYPES = frozenset({
     "agentMessage",
@@ -382,6 +405,17 @@ def normalize_codex_home(codex_home: str | os.PathLike[str] | None = None) -> st
     return str(Path(configured).expanduser().resolve(strict=False))
 
 
+def _parse_codex_app_server_version(value: Any) -> tuple[int, int, int] | None:
+    """Parse the exact app-server generation's canonical initialize proof."""
+
+    if not isinstance(value, str):
+        return None
+    match = _CODEX_APP_SERVER_USER_AGENT_RE.match(value)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
 def normalize_codex_service_tier(service_tier: str | None) -> str:
     """Return CCM's canonical Codex service tier or reject unsafe input."""
 
@@ -415,7 +449,11 @@ def _require_idle_thread_status(
         )
 
 
-def _audit_tool_free_thread_response(response: Any) -> None:
+def _audit_tool_free_thread_response(
+    response: Any,
+    *,
+    permission_profile_id: str,
+) -> None:
     """Prove the deny-all runtime selected before sending model input."""
 
     if not isinstance(response, dict):
@@ -423,7 +461,7 @@ def _audit_tool_free_thread_response(response: Any) -> None:
     permission_profile = response.get("activePermissionProfile")
     if (
         not isinstance(permission_profile, dict)
-        or permission_profile.get("id") != _TOOL_FREE_PERMISSION_PROFILE
+        or permission_profile.get("id") != permission_profile_id
         or permission_profile.get("extends") is not None
     ):
         raise ValueError("deny-all permission profile was not selected")
@@ -440,12 +478,25 @@ def _audit_tool_free_thread_response(response: Any) -> None:
         )
 
 
+def _tool_free_permission_config() -> dict[str, Any]:
+    return {
+        "filesystem": {"/": "deny"},
+        "network": {
+            "enabled": False,
+            "allow_local_binding": False,
+        },
+    }
+
+
 def _task_ssh_permission_config(
     *,
     cwd: str,
     protected_paths: Sequence[str],
     allowed_read_paths: Sequence[str],
+    git_read_paths: Sequence[str],
+    private_tmpdir: str,
     disable_network: bool,
+    managed_network_proxy: bool,
     sandbox_mode: str,
 ) -> dict[str, Any]:
     """Build a request-local Codex profile that hides host credentials."""
@@ -467,6 +518,11 @@ def _task_ssh_permission_config(
         filesystem[workspace] = "read"
     else:
         raise ValueError("Task isolation requires a sandboxed Codex mode")
+    # A normal checkout keeps config, hooks, credentials, refs and objects in
+    # this writable directory. Linked worktrees use a regular pointer file;
+    # either way default-deny the entry and re-open only the discovery-proven
+    # read paths below.
+    filesystem[os.path.join(workspace, ".git")] = "deny"
     for value in protected_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))
         if path == "/":
@@ -482,23 +538,347 @@ def _task_ssh_permission_config(
         # denied parent alongside this exact file read entry prevents ambient
         # siblings or later-created credentials from becoming visible.
         filesystem[path] = "read"
+    for value in git_read_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if path == "/":
+            raise ValueError("Task linked Git read path cannot be filesystem root")
+        filesystem[path] = "read"
+    scratch = os.path.abspath(os.path.expanduser(str(private_tmpdir)))
+    if scratch == "/" or scratch == workspace:
+        raise ValueError("Task scratch write path must be an exact external leaf")
+    filesystem[scratch] = "write"
+    if disable_network == managed_network_proxy:
+        raise ValueError(
+            "Task isolation must select exactly one network boundary"
+        )
+    network: dict[str, Any]
+    if managed_network_proxy:
+        # Codex's managed proxy gives the sandbox public egress without
+        # exposing host loopback, AF_UNIX, UDP, SOCKS, or deployment-level
+        # upstream proxies. Keep every option explicit because omitted
+        # NetworkToml fields inherit permissive runtime defaults.
+        network = {
+            "enabled": True,
+            "enable_socks5": False,
+            "enable_socks5_udp": False,
+            "allow_upstream_proxy": False,
+            "dangerously_allow_non_loopback_proxy": False,
+            "dangerously_allow_all_unix_sockets": False,
+            "mode": "full",
+            "domains": {"*": "allow"},
+            "unix_sockets": {},
+            "allow_local_binding": False,
+        }
+    else:
+        network = {
+            "enabled": False,
+            "allow_local_binding": False,
+        }
+    return {
+        "filesystem": filesystem,
+        "network": network,
+    }
+
+
+def _audit_task_isolation_permission_config(
+    profile: Any,
+    *,
+    cwd: str,
+    protected_paths: Sequence[str],
+    allowed_read_paths: Sequence[str],
+    git_read_paths: Sequence[str],
+    private_tmpdir: str,
+    disable_network: bool,
+    managed_network_proxy: bool,
+    sandbox_mode: str,
+) -> None:
+    """Reject any widening of the request-local Task filesystem profile."""
+
+    expected = _task_ssh_permission_config(
+        cwd=cwd,
+        protected_paths=protected_paths,
+        allowed_read_paths=allowed_read_paths,
+        git_read_paths=git_read_paths,
+        private_tmpdir=private_tmpdir,
+        disable_network=disable_network,
+        managed_network_proxy=managed_network_proxy,
+        sandbox_mode=sandbox_mode,
+    )
+    if profile != expected:
+        raise ValueError("Task isolation permission profile changed before admission")
+    filesystem = expected["filesystem"]
+    scratch = os.path.abspath(private_tmpdir)
+    workspace = os.path.abspath(cwd)
+    write_paths = {
+        path for path, mode in filesystem.items() if mode == "write"
+    }
+    expected_writes = {scratch}
+    if sandbox_mode == "workspace-write":
+        expected_writes.add(workspace)
+    if write_paths != expected_writes:
+        raise ValueError("Task isolation contains an unexpected writable root")
+    if any(
+        filesystem.get(os.path.abspath(path)) != "read"
+        for path in git_read_paths
+    ):
+        raise ValueError("Task linked Git projection is not read-only")
+
+
+def _network_isolated_permission_config(
+    *,
+    cwd: str,
+    git_read_paths: Sequence[str],
+    private_tmpdir: str,
+) -> dict[str, Any]:
+    workspace = os.path.abspath(cwd)
+    scratch = os.path.abspath(private_tmpdir)
+    filesystem: dict[str, str] = {
+        ":root": "deny",
+        ":minimal": "read",
+        workspace: "write",
+        os.path.join(workspace, ".git"): "deny",
+    }
+    for value in git_read_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if path == "/":
+            raise ValueError("Delivery linked Git read path cannot be root")
+        filesystem[path] = "read"
+    if scratch in {"/", workspace}:
+        raise ValueError("Delivery scratch path must be an external leaf")
+    filesystem[scratch] = "write"
     return {
         "filesystem": filesystem,
         "network": {
-            # Codex 0.144.6's Linux direct-network sandbox admits host
-            # loopback and abstract AF_UNIX sockets. Until CCM can prove that
-            # a managed netns/proxy is active, every local Task stays
-            # network-closed (including ordinary Tasks without SSH grants).
             "enabled": False,
             "allow_local_binding": False,
         },
     }
 
 
+def _audit_network_isolated_permission_config(
+    profile: Any,
+    *,
+    cwd: str,
+    git_read_paths: Sequence[str],
+    private_tmpdir: str,
+) -> None:
+    expected = _network_isolated_permission_config(
+        cwd=cwd,
+        git_read_paths=git_read_paths,
+        private_tmpdir=private_tmpdir,
+    )
+    if profile != expected:
+        raise ValueError("Delivery filesystem profile changed before admission")
+    filesystem = expected["filesystem"]
+    if {
+        path for path, mode in filesystem.items() if mode == "write"
+    } != {os.path.abspath(cwd), os.path.abspath(private_tmpdir)}:
+        raise ValueError("Delivery contains an unexpected writable root")
+    if any(
+        filesystem.get(os.path.abspath(path)) != "read"
+        for path in git_read_paths
+    ):
+        raise ValueError("Delivery linked Git projection is not read-only")
+
+
+def _audit_isolated_request_config(
+    config: Any,
+    *,
+    expected_config: dict[str, Any],
+    permission_profile_id: str,
+    expected_permission_profile: dict[str, Any],
+    disabled_features: frozenset[str],
+    network_proxy_enabled: bool,
+) -> None:
+    """Prove the complete request-local isolation layer before thread/start."""
+
+    if not isinstance(config, dict) or config != expected_config:
+        raise ValueError("isolated request configuration changed before admission")
+    if config.get("web_search") != "disabled":
+        raise ValueError("isolated request did not disable web search")
+    if config.get("allow_login_shell") is not False:
+        raise ValueError("isolated request did not disable login shells")
+    features = config.get("features")
+    if not isinstance(features, dict):
+        raise ValueError("isolated feature configuration is malformed")
+    for feature in disabled_features - {"network_proxy"}:
+        if features.get(feature) is not False:
+            raise ValueError(f"isolated feature {feature!r} was not disabled")
+    if features.get("network_proxy") is not network_proxy_enabled:
+        raise ValueError("isolated network proxy decision changed")
+    if config.get("default_permissions") != permission_profile_id:
+        raise ValueError("isolated permission selector changed")
+    if config.get("permissions") != {
+        permission_profile_id: expected_permission_profile,
+    }:
+        raise ValueError("isolated permission table changed")
+    if config.get("tools") != {
+        "experimental_request_user_input": {"enabled": False},
+    }:
+        raise ValueError("isolated native tool configuration changed")
+    skills = config.get("skills")
+    if (
+        not isinstance(skills, dict)
+        or skills.get("include_instructions") is not False
+        or skills.get("bundled") != {"enabled": False}
+        or not isinstance(skills.get("config"), list)
+    ):
+        raise ValueError("isolated skills configuration changed")
+    agents = config.get("agents")
+    if agents != {"max_threads": 1, "max_depth": 1}:
+        raise ValueError("isolated agent fanout configuration changed")
+    if config.get("memories") != {
+        "generate_memories": False,
+        "use_memories": False,
+        "dedicated_tools": False,
+    }:
+        raise ValueError("isolated memories configuration changed")
+    multi_agent_v2 = features.get("multi_agent_v2")
+    if multi_agent_v2 != {
+        "enabled": False,
+        "max_concurrent_threads_per_session": 1,
+        "hide_spawn_agent_metadata": True,
+    }:
+        raise ValueError("isolated multi-agent v2 configuration changed")
+    if config.get("projects") != expected_config.get("projects"):
+        raise ValueError("isolated project trust configuration changed")
+    for key in ("mcp_servers", "orchestrator", "shell_environment_policy"):
+        if config.get(key) != expected_config.get(key):
+            raise ValueError(f"isolated {key} configuration changed")
+
+
+def _require_ambient_keys_overridden(
+    ambient: Any,
+    override: Any,
+    *,
+    path: str,
+) -> None:
+    """Reject ambient nested keys that would survive Codex's deep merge."""
+
+    if ambient is None or ambient == {} or ambient == []:
+        return
+    if not isinstance(ambient, dict) or not isinstance(override, dict):
+        # A request scalar/list replaces the entire ambient value.
+        if override is None:
+            raise ValueError(f"ambient {path} is not explicitly overridden")
+        return
+    for key, value in ambient.items():
+        if not isinstance(key, str) or key not in override:
+            raise ValueError(f"ambient {path}.{key!s} would survive deep merge")
+        _require_ambient_keys_overridden(
+            value,
+            override[key],
+            path=f"{path}.{key}",
+        )
+
+
+def _harden_ambient_feature_config(
+    effective_config: dict[str, Any],
+    thread_config: dict[str, Any],
+    *,
+    tools_disabled: bool,
+) -> frozenset[str]:
+    """Explicitly override every ambient feature key in the isolated layer."""
+
+    ambient = effective_config.get("features")
+    if ambient is None:
+        return frozenset()
+    if not isinstance(ambient, dict) or any(
+        not isinstance(name, str) or not name for name in ambient
+    ):
+        raise ValueError("ambient feature configuration is malformed")
+    request_features = thread_config.get("features")
+    if not isinstance(request_features, dict):
+        raise ValueError("isolated request feature configuration is malformed")
+    disabled: set[str] = set()
+    for name, value in ambient.items():
+        if name in request_features:
+            continue
+        if not tools_disabled and name in _ISOLATED_LOCAL_FEATURES:
+            if type(value) is not bool:
+                raise ValueError("ambient local feature is not a strict boolean")
+            request_features[name] = value
+            continue
+        # Unknown features are capabilities, not harmless metadata. A strict
+        # false override is schema-safe for feature flags; if a future Codex
+        # rejects it, thread/start fails closed before model input.
+        request_features[name] = False
+        disabled.add(name)
+    return frozenset(disabled)
+
+
+def _audit_ambient_isolation_merge_inputs(
+    effective_config: dict[str, Any],
+    thread_config: dict[str, Any],
+    *,
+    cwd: str,
+    permission_profile_id: str,
+    explicit_mcp_servers: frozenset[str],
+) -> None:
+    """Prove no ambient security key can widen the request via deep merge."""
+
+    for table in (
+        "features",
+        "tools",
+        "orchestrator",
+        "skills",
+        "agents",
+        "memories",
+        "hooks",
+        "shell_environment_policy",
+    ):
+        _require_ambient_keys_overridden(
+            effective_config.get(table),
+            thread_config.get(table),
+            path=table,
+        )
+    ambient_permissions = effective_config.get("permissions")
+    if ambient_permissions is not None and not isinstance(
+        ambient_permissions,
+        dict,
+    ):
+        raise ValueError("ambient permission profiles are malformed")
+    if isinstance(ambient_permissions, dict) and permission_profile_id in ambient_permissions:
+        raise ValueError("ambient config collides with the random permission profile")
+    if thread_config.get("default_permissions") != permission_profile_id:
+        raise ValueError("isolated permission selector changed")
+
+    ambient_mcp = _effective_mcp_inventory({"config": effective_config})
+    request_mcp = thread_config.get("mcp_servers")
+    if not isinstance(request_mcp, dict):
+        raise ValueError("isolated MCP override is malformed")
+    for name in ambient_mcp:
+        request = request_mcp.get(name)
+        if name in explicit_mcp_servers:
+            if not isinstance(request, dict):
+                raise ValueError("explicit CCM MCP override disappeared")
+        elif request != {"enabled": False}:
+            raise ValueError("ambient MCP server was not explicitly disabled")
+
+    projects = effective_config.get("projects")
+    if projects is not None and not isinstance(projects, dict):
+        raise ValueError("ambient project configuration is malformed")
+    trust_target = codex_project_trust_target(cwd)
+    if isinstance(projects, dict) and trust_target in projects:
+        request_projects = thread_config.get("projects")
+        request_target = (
+            request_projects.get(trust_target)
+            if isinstance(request_projects, dict)
+            else None
+        )
+        _require_ambient_keys_overridden(
+            projects[trust_target],
+            request_target,
+            path=f"projects.{trust_target}",
+        )
+
+
 def _audit_task_ssh_thread_response(
     response: Any,
     *,
+    permission_profile_id: str,
     disable_network: bool,
+    managed_network_proxy: bool,
     sandbox_mode: str,
     cwd: str,
 ) -> None:
@@ -509,7 +889,7 @@ def _audit_task_ssh_thread_response(
     permission_profile = response.get("activePermissionProfile")
     if (
         not isinstance(permission_profile, dict)
-        or permission_profile.get("id") != _TASK_SSH_PERMISSION_PROFILE
+        or permission_profile.get("id") != permission_profile_id
         or permission_profile.get("extends") is not None
     ):
         raise ValueError("Task isolation profile was not selected")
@@ -518,9 +898,9 @@ def _audit_task_ssh_thread_response(
         "workspace-write": "workspaceWrite",
         "read-only": "readOnly",
     }.get(sandbox_mode)
-    expected_network = (
-        sandbox_mode == "workspace-write" and not disable_network
-    )
+    if disable_network == managed_network_proxy:
+        raise ValueError("Task response audit lost its network boundary")
+    expected_network = managed_network_proxy
     if (
         not isinstance(sandbox, dict)
         or sandbox.get("type") != expected_type
@@ -582,6 +962,21 @@ def _effective_mcp_inventory(response: Any) -> dict[str, dict[str, Any]]:
 def _mcp_inventory_fingerprint(inventory: dict[str, dict[str, Any]]) -> str:
     return json.dumps(
         inventory,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _canonical_json_fingerprint(value: Any, *, label: str) -> str:
+    """Return a stable JSON fingerprint or reject non-protocol values."""
+
+    try:
+        normalized = json.loads(json.dumps(value, sort_keys=True))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is not JSON-safe") from exc
+    return json.dumps(
+        normalized,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
@@ -706,6 +1101,112 @@ def _canonical_path(path: str | os.PathLike[str]) -> Path:
         return Path(os.path.abspath(os.fspath(expanded)))
 
 
+def _instruction_sources_snapshot(
+    response: Any,
+    *,
+    cwd: str,
+) -> tuple[tuple[Any, ...], ...]:
+    """Fingerprint safe project instruction files, including symlink identity."""
+
+    sources = response.get("instructionSources") if isinstance(response, dict) else None
+    if not isinstance(sources, list):
+        raise ValueError("isolated thread did not report instruction sources")
+    project_root = _canonical_path(cwd)
+    allowed_names = {"AGENTS.md", "AGENTS.override.md", "CLAUDE.md"}
+    identities: list[tuple[Any, ...]] = []
+    for source in sources:
+        source_path = source.get("path") if isinstance(source, dict) else source
+        if not isinstance(source_path, str) or not source_path:
+            raise ValueError("isolated instruction source is malformed")
+        lexical = Path(source_path).expanduser()
+        if not lexical.is_absolute():
+            lexical = project_root / lexical
+        lexical = Path(os.path.abspath(os.fspath(lexical)))
+        try:
+            lexical.relative_to(project_root)
+        except ValueError as exc:
+            raise ValueError(
+                "isolated instruction source is outside its project"
+            ) from exc
+        canonical = _canonical_path(lexical)
+        try:
+            canonical.relative_to(project_root)
+        except ValueError as exc:
+            raise ValueError(
+                "isolated instruction source resolves outside its project"
+            ) from exc
+        if lexical.name not in allowed_names or canonical.name not in allowed_names:
+            raise ValueError("isolated thread loaded an unexpected instruction file")
+        lexical_stat_before = os.lstat(lexical)
+        if not (
+            stat.S_ISREG(lexical_stat_before.st_mode)
+            or stat.S_ISLNK(lexical_stat_before.st_mode)
+        ):
+            raise ValueError("isolated instruction source is not a file")
+        open_flags = os.O_RDONLY
+        if hasattr(os, "O_CLOEXEC"):
+            open_flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            open_flags |= os.O_NOFOLLOW
+        fd = os.open(canonical, open_flags)
+        try:
+            target_stat_before = os.fstat(fd)
+            if not stat.S_ISREG(target_stat_before.st_mode):
+                raise ValueError("isolated instruction target is not regular")
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            target_stat_after = os.fstat(fd)
+        finally:
+            os.close(fd)
+        lexical_stat_after = os.lstat(lexical)
+        if (
+            lexical_stat_before.st_dev,
+            lexical_stat_before.st_ino,
+            lexical_stat_before.st_mode,
+            lexical_stat_before.st_size,
+            lexical_stat_before.st_mtime_ns,
+        ) != (
+            lexical_stat_after.st_dev,
+            lexical_stat_after.st_ino,
+            lexical_stat_after.st_mode,
+            lexical_stat_after.st_size,
+            lexical_stat_after.st_mtime_ns,
+        ) or (
+            target_stat_before.st_dev,
+            target_stat_before.st_ino,
+            target_stat_before.st_mode,
+            target_stat_before.st_size,
+            target_stat_before.st_mtime_ns,
+        ) != (
+            target_stat_after.st_dev,
+            target_stat_after.st_ino,
+            target_stat_after.st_mode,
+            target_stat_after.st_size,
+            target_stat_after.st_mtime_ns,
+        ) or _canonical_path(lexical) != canonical:
+            raise ValueError("isolated instruction source changed while hashing")
+        identities.append((
+            str(lexical),
+            str(canonical),
+            lexical_stat_after.st_dev,
+            lexical_stat_after.st_ino,
+            lexical_stat_after.st_mode,
+            lexical_stat_after.st_size,
+            lexical_stat_after.st_mtime_ns,
+            target_stat_after.st_dev,
+            target_stat_after.st_ino,
+            target_stat_after.st_mode,
+            target_stat_after.st_size,
+            target_stat_after.st_mtime_ns,
+            digest.hexdigest(),
+        ))
+    return tuple(identities)
+
+
 def codex_project_trust_target(cwd: str | os.PathLike[str]) -> str:
     """Resolve the project key Codex 0.144.6 uses for trust decisions.
 
@@ -813,6 +1314,8 @@ class CodexTurnProcess:
         self.stderr = asyncio.StreamReader(limit=1024 * 1024)
         self._interrupt = interrupt
         self._done = asyncio.get_running_loop().create_future()
+        self._runtime_cleanup: Callable[[], None] | None = None
+        self._runtime_cleanup_task: asyncio.Future[None] | None = None
         # Lightweight per-turn stream telemetry. Auxiliary callers such as
         # the Plan pipeline can persist this before deleting a disposable
         # thread, and can distinguish slow initial reasoning from a response
@@ -861,9 +1364,88 @@ class CodexTurnProcess:
         self.stderr.feed_eof()
         if not self._done.done():
             self._done.set_result(returncode)
+        self._schedule_runtime_cleanup()
+
+    def set_runtime_cleanup(self, cleanup: Callable[[], None]) -> None:
+        """Bind one exact generation-owned filesystem cleanup callback."""
+
+        if self._runtime_cleanup is not None:
+            raise RuntimeError("Codex turn runtime cleanup is already configured")
+        if self.returncode is not None:
+            raise RuntimeError("Cannot bind runtime cleanup to a terminal turn")
+        self._runtime_cleanup = cleanup
+
+    def _schedule_runtime_cleanup(self) -> None:
+        cleanup = self._runtime_cleanup
+        if cleanup is None or self._runtime_cleanup_task is not None:
+            return
+        # Submit synchronously. ``create_task(asyncio.to_thread(...))`` can be
+        # cancelled before its first scheduling step when the event loop is
+        # shutting down, leaving a normal terminal turn's scratch directory
+        # behind. The default executor is drained by asyncio loop shutdown.
+        task = asyncio.get_running_loop().run_in_executor(None, cleanup)
+        self._runtime_cleanup_task = task
+
+        def _log_cleanup_failure(done: asyncio.Future[None]) -> None:
+            try:
+                error = done.exception()
+            except asyncio.CancelledError:
+                error = RuntimeError("Codex Task runtime cleanup was cancelled")
+            if error is not None:
+                logger.error(
+                    "Codex Task runtime cleanup failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_log_cleanup_failure)
+
+    async def wait_runtime_cleanup(self) -> None:
+        task = self._runtime_cleanup_task
+        if task is None:
+            return
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as exc:
+                # Cleanup belongs to the exact native generation. Delay
+                # caller cancellation until its executor job has settled.
+                cancellation = exc
+            except Exception:
+                # The completion callback records the failure. A private
+                # retained directory is safer than borrowing another turn's
+                # cleanup or reclassifying native process termination.
+                break
+        if task.done() and not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                pass
+        if cancellation is not None:
+            raise cancellation
 
     async def wait(self) -> int:
-        return await asyncio.shield(self._done)
+        cancellation: asyncio.CancelledError | None = None
+        if not self._done.done():
+            try:
+                returncode = await asyncio.shield(self._done)
+            except asyncio.CancelledError as exc:
+                # Preserve ordinary cancellation while the native turn is
+                # still live. If terminal won the race, however, its scratch
+                # cleanup is already part of this exact reap barrier.
+                if not self._done.done():
+                    raise
+                cancellation = exc
+                returncode = self._done.result()
+        else:
+            returncode = self._done.result()
+        try:
+            await self.wait_runtime_cleanup()
+        except asyncio.CancelledError as exc:
+            cancellation = exc
+        if cancellation is not None:
+            raise cancellation
+        return returncode
 
     def send_signal(self, sig: int) -> None:
         if sig in (signal.SIGINT, signal.SIGTERM, signal.SIGKILL):
@@ -970,7 +1552,10 @@ class CodexAppServer:
         self._process_group_process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
-        self._pending: dict[int, asyncio.Future] = {}
+        self._pending: dict[
+            int,
+            tuple[asyncio.subprocess.Process, asyncio.Future],
+        ] = {}
         self._thread_settings_waiters: dict[str, asyncio.Future] = {}
         self._contexts_by_thread: dict[str, _TurnContext] = {}
         self._contexts_by_turn: dict[str, _TurnContext] = {}
@@ -985,6 +1570,8 @@ class CodexAppServer:
         self._skills_revision = 0
         self._write_lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._runtime_version: tuple[int, int, int] | None = None
+        self._runtime_version_process: asyncio.subprocess.Process | None = None
         self._shutdown_requested = False
         # A shutdown intent is generation-bound.  ``_shutdown_requested`` is
         # published before the lifecycle lock to block new starts, but the
@@ -2849,6 +3436,17 @@ class CodexAppServer:
                 + (f": {blockers}" if blockers else "")
             )
 
+    def _managed_network_runtime_is_safe(self) -> bool:
+        """Require version proof from this exact live app-server generation."""
+
+        return bool(
+            self._process is not None
+            and self._process.returncode is None
+            and self._runtime_version_process is self._process
+            and self._runtime_version is not None
+            and self._runtime_version >= _MANAGED_NETWORK_MIN_CODEX_VERSION
+        )
+
     async def ensure_started(self) -> None:
         if self._shutdown_requested:
             raise CodexAppServerBusyError(
@@ -2897,6 +3495,8 @@ class CodexAppServer:
         self._observed_transport_exit = None
         self._finalized_transport_process = None
         self._skills_revision = 0
+        self._runtime_version = None
+        self._runtime_version_process = None
         # These facts belong to one app-server process generation.  Persisted
         # thread ownership is kept separately in ``_known_threads``.
         self._contexts_by_descendant.clear()
@@ -2958,7 +3558,7 @@ class CodexAppServer:
         self._reader_task = asyncio.create_task(self._read_loop(process))
         self._stderr_task = asyncio.create_task(self._stderr_loop(process))
         try:
-            await self._request(
+            initialize_response = await self._request(
                 "initialize",
                 {
                     "clientInfo": {
@@ -2969,6 +3569,12 @@ class CodexAppServer:
                     "capabilities": {"experimentalApi": True},
                 },
             )
+            self._runtime_version = _parse_codex_app_server_version(
+                initialize_response.get("userAgent")
+                if isinstance(initialize_response, dict)
+                else None
+            )
+            self._runtime_version_process = process
             await self._notify("initialized", {})
         except BaseException:
             # ``_start`` runs under the lifecycle lock, so use the locked
@@ -3007,7 +3613,11 @@ class CodexAppServer:
         sandbox_mode: str = "danger-full-access",
         task_ssh_protected_paths: Sequence[str] = (),
         task_ssh_allowed_read_paths: Sequence[str] = (),
+        task_git_read_paths: Sequence[str] = (),
+        task_git_boundary_fingerprint: Sequence[tuple[object, ...]] = (),
+        task_private_tmpdir: PrivateTaskTempDir | None = None,
         task_ssh_disable_network: bool = False,
+        task_managed_network_proxy: bool = False,
         disable_autonomous_features: bool = False,
         network_isolated: bool = False,
         output_schema: dict[str, Any] | None = None,
@@ -3019,6 +3629,49 @@ class CodexAppServer:
             Callable[[CodexTurnProcess, str], Awaitable[None]] | None
         ) = None,
     ) -> tuple[CodexTurnProcess, str]:
+        managed_runtime_prestarted = False
+        managed_network_process: asyncio.subprocess.Process | None = None
+        isolated_process: asyncio.subprocess.Process | None = None
+        if task_managed_network_proxy:
+            # ``initialize`` is the version proof for this exact transport
+            # generation. Complete it before constructing the network profile;
+            # no model input or thread RPC has happened at this boundary.
+            try:
+                await self.ensure_started()
+            except CodexAppServerBusyError:
+                raise
+            except Exception as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex managed-network runtime version could not be "
+                    "proven before thread admission"
+                ) from exc
+            managed_runtime_prestarted = True
+            if not self._managed_network_runtime_is_safe():
+                logger.warning(
+                    "Codex managed proxy disabled for unproven runtime "
+                    "version binary=%s version=%s; using network-off Task "
+                    "isolation",
+                    self.binary,
+                    self._runtime_version,
+                )
+                task_managed_network_proxy = False
+                task_ssh_disable_network = True
+            else:
+                managed_network_process = self._process
+
+        def require_managed_network_generation(stage: str) -> None:
+            """Keep managed networking on its proven transport generation."""
+
+            if not task_managed_network_proxy:
+                return
+            if (
+                managed_network_process is None
+                or self._process is not managed_network_process
+                or not self._managed_network_runtime_is_safe()
+            ):
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex managed-network runtime generation changed " + stage
+                )
         if sandbox_mode not in {
             "danger-full-access",
             "workspace-write",
@@ -3058,6 +3711,7 @@ class CodexAppServer:
                     resume_session_id,
                 )
                 resume_session_id = None
+        admitted_git_boundary = None
         if task_ssh_protected_paths:
             if tools_disabled:
                 raise CodexRequiredMcpPreTurnError(
@@ -3079,9 +3733,19 @@ class CodexAppServer:
                 raise CodexRequiredMcpPreTurnError(
                     "Task isolation requires workspace-write or read-only admission"
                 )
-            if sandbox_mode == "workspace-write" and not task_ssh_disable_network:
+            if task_managed_network_proxy:
+                if sandbox_mode != "workspace-write":
+                    raise CodexRequiredMcpPreTurnError(
+                        "Codex managed Task network requires workspace-write"
+                    )
+                if task_ssh_disable_network:
+                    raise CodexRequiredMcpPreTurnError(
+                        "Codex Task cannot enable and disable network together"
+                    )
+            elif sandbox_mode == "workspace-write" and not task_ssh_disable_network:
                 raise CodexRequiredMcpPreTurnError(
-                    "Codex Task isolation must disable host loopback and Unix-socket network access"
+                    "Codex Task isolation requires either managed public "
+                    "network or complete network denial"
                 )
             protected = {
                 os.path.abspath(os.path.expanduser(str(path)))
@@ -3096,9 +3760,45 @@ class CodexAppServer:
                     "Task Git credential read overrides must be exact and "
                     "must not duplicate deny entries"
                 )
-        elif task_ssh_disable_network:
+            from backend.services.task_agent_isolation import (
+                discover_linked_worktree_git_read_boundary,
+            )
+
+            git_boundary = discover_linked_worktree_git_read_boundary(cwd)
+            admitted_git_boundary = git_boundary
+            expected_git_paths = tuple(
+                sorted(git_boundary.read_paths if git_boundary else ())
+            )
+            supplied_git_paths = tuple(sorted({
+                os.path.abspath(os.path.expanduser(str(path)))
+                for path in task_git_read_paths
+            }))
+            if supplied_git_paths != expected_git_paths:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task linked-worktree Git projection was not exact"
+                )
+            expected_fingerprint = (
+                git_boundary.identity_fingerprint if git_boundary else ()
+            )
+            if tuple(task_git_boundary_fingerprint) != expected_fingerprint:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task linked-worktree identity snapshot was not exact"
+                )
+            if task_private_tmpdir is None:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task isolation requires a private generation TMPDIR"
+                )
+            task_private_tmpdir.assert_valid()
+        elif task_ssh_disable_network or task_managed_network_proxy:
             raise CodexRequiredMcpPreTurnError(
                 "Task network isolation requires protected filesystem paths"
+            )
+        elif (
+            (task_git_read_paths or task_private_tmpdir is not None)
+            and not network_isolated
+        ):
+            raise CodexRequiredMcpPreTurnError(
+                "Task Git/TMP isolation requires protected filesystem paths"
             )
         if network_isolated:
             if sandbox_mode != "workspace-write":
@@ -3119,11 +3819,128 @@ class CodexAppServer:
                 raise CodexRequiredMcpPreTurnError(
                     "Network-isolated execution cannot also use Task SSH"
                 )
+            from backend.services.task_agent_isolation import (
+                discover_linked_worktree_git_read_boundary,
+            )
+
+            git_boundary = discover_linked_worktree_git_read_boundary(cwd)
+            admitted_git_boundary = git_boundary
+            expected_git_paths = tuple(
+                sorted(git_boundary.read_paths if git_boundary else ())
+            )
+            supplied_git_paths = tuple(sorted({
+                os.path.abspath(os.path.expanduser(str(path)))
+                for path in task_git_read_paths
+            }))
+            if supplied_git_paths != expected_git_paths:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Delivery linked-worktree Git projection was not exact"
+                )
+            expected_fingerprint = (
+                git_boundary.identity_fingerprint if git_boundary else ()
+            )
+            if tuple(task_git_boundary_fingerprint) != expected_fingerprint:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Delivery linked-worktree identity snapshot was not exact"
+                )
+            if task_private_tmpdir is None:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Delivery requires a private generation TMPDIR"
+                )
+            task_private_tmpdir.assert_valid()
+            network_permission_config = _network_isolated_permission_config(
+                cwd=cwd,
+                git_read_paths=task_git_read_paths,
+                private_tmpdir=str(task_private_tmpdir.path),
+            )
+            _audit_network_isolated_permission_config(
+                network_permission_config,
+                cwd=cwd,
+                git_read_paths=task_git_read_paths,
+                private_tmpdir=str(task_private_tmpdir.path),
+            )
+        tool_free_permission_profile = (
+            f"{_TOOL_FREE_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
+            if tools_disabled
+            else None
+        )
         network_permission_profile = (
             f"{_NETWORK_ISOLATED_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
             if network_isolated
             else None
         )
+        task_permission_profile = (
+            f"{(
+                _TASK_MANAGED_NETWORK_PERMISSION_PROFILE_PREFIX
+                if task_managed_network_proxy
+                else _TASK_SSH_PERMISSION_PROFILE_PREFIX
+            )}{uuid.uuid4().hex}"
+            if task_ssh_protected_paths
+            else None
+        )
+
+        def require_stable_task_filesystem_boundary(stage: str) -> None:
+            if not task_ssh_protected_paths and not network_isolated:
+                return
+            from backend.services.task_agent_isolation import (
+                discover_linked_worktree_git_read_boundary,
+            )
+
+            current = discover_linked_worktree_git_read_boundary(cwd)
+            current_paths = tuple(sorted(current.read_paths if current else ()))
+            supplied_paths = tuple(sorted({
+                os.path.abspath(os.path.expanduser(str(path)))
+                for path in task_git_read_paths
+            }))
+            if current_paths != supplied_paths:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task linked-worktree boundary changed " + stage
+                )
+            if current != admitted_git_boundary:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task linked-worktree identity changed " + stage
+                )
+            if task_private_tmpdir is None:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task scratch boundary disappeared " + stage
+                )
+            try:
+                task_private_tmpdir.assert_valid()
+            except Exception as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task scratch boundary changed " + stage
+                ) from exc
+            profile_id = (
+                task_permission_profile
+                if task_ssh_protected_paths
+                else network_permission_profile
+            )
+            profile = thread_config.get("permissions", {}).get(profile_id)
+            try:
+                if task_ssh_protected_paths:
+                    _audit_task_isolation_permission_config(
+                        profile,
+                        cwd=cwd,
+                        protected_paths=task_ssh_protected_paths,
+                        allowed_read_paths=task_ssh_allowed_read_paths,
+                        git_read_paths=task_git_read_paths,
+                        private_tmpdir=str(task_private_tmpdir.path),
+                        disable_network=task_ssh_disable_network,
+                        managed_network_proxy=task_managed_network_proxy,
+                        sandbox_mode=sandbox_mode,
+                    )
+                else:
+                    _audit_network_isolated_permission_config(
+                        profile,
+                        cwd=cwd,
+                        git_read_paths=task_git_read_paths,
+                        private_tmpdir=str(task_private_tmpdir.path),
+                    )
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex Task permission profile changed " + stage
+                ) from exc
+
         service_tier = normalize_codex_service_tier(codex_service_tier)
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -3142,7 +3959,10 @@ class CodexAppServer:
         required_mcp = any(spec.required for spec in mcp_specs)
         required_context = bool(skill_context.strip())
         tool_free_skills_revision: int | None = None
-        task_ssh_mcp_fingerprint: str | None = None
+        isolated_ambient_config_fingerprint: str | None = None
+        isolated_skills_inventory_fingerprint: str | None = None
+        isolated_ambient_effective_config: dict[str, Any] | None = None
+        isolated_dynamic_disabled_features: frozenset[str] = frozenset()
         try:
             thread_config: dict[str, Any] = (
                 render_codex_mcp_config(mcp_specs) if mcp_specs else {}
@@ -3174,7 +3994,7 @@ class CodexAppServer:
                     },
                 },
             )
-        if disable_project_config:
+        if disable_project_config or tools_disabled or network_isolated:
             _deep_merge_config(
                 thread_config,
                 codex_untrusted_project_config(cwd),
@@ -3218,17 +4038,7 @@ class CodexAppServer:
                         network_permission_profile
                     ),
                     "permissions": {
-                        network_permission_profile: {
-                            "filesystem": {
-                                ":root": "deny",
-                                ":minimal": "read",
-                                os.path.abspath(cwd): "write",
-                            },
-                            "network": {
-                                "enabled": False,
-                                "allow_local_binding": False,
-                            },
-                        },
+                        network_permission_profile: network_permission_config,
                     },
                     "shell_environment_policy": {
                         "inherit": "core",
@@ -3245,6 +4055,10 @@ class CodexAppServer:
                             "GIT_CONFIG_GLOBAL": os.devnull,
                             "GIT_CONFIG_NOSYSTEM": "1",
                             "GH_PROMPT_DISABLED": "1",
+                            "GIT_OPTIONAL_LOCKS": "0",
+                            "TMPDIR": str(task_private_tmpdir.path),
+                            "TMP": str(task_private_tmpdir.path),
+                            "TEMP": str(task_private_tmpdir.path),
                         },
                     },
                 },
@@ -3298,6 +4112,7 @@ class CodexAppServer:
                 },
             )
         if tools_disabled:
+            assert tool_free_permission_profile is not None
             # PR-review turns receive a complete backend-snapshotted prompt.
             # ``environments=[]`` below removes environment-backed tool specs.
             # The named profile denies every filesystem path and all network,
@@ -3307,6 +4122,7 @@ class CodexAppServer:
                 thread_config,
                 {
                     "web_search": "disabled",
+                    "allow_login_shell": False,
                     "features": {
                         feature: False
                         for feature in _TOOL_FREE_DISABLED_FEATURES
@@ -3325,20 +4141,18 @@ class CodexAppServer:
                         "bundled": {"enabled": False},
                         "config": [],
                     },
-                    "default_permissions": _TOOL_FREE_PERMISSION_PROFILE,
+                    "default_permissions": tool_free_permission_profile,
                     "permissions": {
-                        _TOOL_FREE_PERMISSION_PROFILE: {
-                            "filesystem": {
-                                "/": "deny",
-                            },
-                            "network": {
-                                "enabled": False,
-                                "allow_local_binding": False,
-                            },
-                        },
+                        tool_free_permission_profile: (
+                            _tool_free_permission_config()
+                        ),
                     },
                     "shell_environment_policy": {
                         "inherit": "none",
+                        "ignore_default_excludes": False,
+                        "exclude": [],
+                        "include_only": [],
+                        "experimental_use_profile": False,
                         "set": {},
                     },
                     "project_doc_max_bytes": 0,
@@ -3346,6 +4160,29 @@ class CodexAppServer:
                 },
             )
         elif task_ssh_protected_paths:
+            assert task_private_tmpdir is not None
+            assert task_permission_profile is not None
+            task_permission_config = _task_ssh_permission_config(
+                cwd=cwd,
+                protected_paths=task_ssh_protected_paths,
+                allowed_read_paths=task_ssh_allowed_read_paths,
+                git_read_paths=task_git_read_paths,
+                private_tmpdir=str(task_private_tmpdir.path),
+                disable_network=task_ssh_disable_network,
+                managed_network_proxy=task_managed_network_proxy,
+                sandbox_mode=sandbox_mode,
+            )
+            _audit_task_isolation_permission_config(
+                task_permission_config,
+                cwd=cwd,
+                protected_paths=task_ssh_protected_paths,
+                allowed_read_paths=task_ssh_allowed_read_paths,
+                git_read_paths=task_git_read_paths,
+                private_tmpdir=str(task_private_tmpdir.path),
+                disable_network=task_ssh_disable_network,
+                managed_network_proxy=task_managed_network_proxy,
+                sandbox_mode=sandbox_mode,
+            )
             _deep_merge_config(
                 thread_config,
                 {
@@ -3354,7 +4191,7 @@ class CodexAppServer:
                     "features": {
                         feature: False
                         for feature in _NETWORK_ISOLATED_DISABLED_FEATURES
-                    },
+                    } | {"network_proxy": task_managed_network_proxy},
                     "tools": {
                         "experimental_request_user_input": {
                             "enabled": False,
@@ -3368,22 +4205,15 @@ class CodexAppServer:
                         "bundled": {"enabled": False},
                         "config": [],
                     },
-                    "default_permissions": _TASK_SSH_PERMISSION_PROFILE,
+                    "default_permissions": task_permission_profile,
                     "permissions": {
-                        _TASK_SSH_PERMISSION_PROFILE: (
-                            _task_ssh_permission_config(
-                                cwd=cwd,
-                                protected_paths=task_ssh_protected_paths,
-                                allowed_read_paths=task_ssh_allowed_read_paths,
-                                disable_network=task_ssh_disable_network,
-                                sandbox_mode=sandbox_mode,
-                            )
-                        ),
+                        task_permission_profile: task_permission_config,
                     },
                 },
             )
         try:
-            await self.ensure_started()
+            if not managed_runtime_prestarted:
+                await self.ensure_started()
         except CodexAppServerBusyError:
             # Preserve maintenance/draining semantics.  InstanceManager already
             # treats this as unsafe to replay through exec.
@@ -3407,6 +4237,35 @@ class CodexAppServer:
                 ) from exc
             raise
 
+        if tools_disabled or network_isolated or task_ssh_protected_paths:
+            isolated_process = self._process
+            if (
+                isolated_process is None
+                or isolated_process.returncode is not None
+            ):
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated runtime generation was not captured"
+                )
+            if (
+                task_managed_network_proxy
+                and isolated_process is not managed_network_process
+            ):
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex managed-network runtime generation changed "
+                    "during startup"
+                )
+
+        def require_isolated_runtime_generation(stage: str) -> None:
+            if isolated_process is None:
+                return
+            if (
+                self._process is not isolated_process
+                or isolated_process.returncode is not None
+            ):
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated runtime generation changed " + stage
+                )
+
         async def read_effective_config() -> dict[str, Any]:
             response = await self._request(
                 "config/read",
@@ -3427,6 +4286,15 @@ class CodexAppServer:
                 "config": await read_effective_config(),
             })
 
+        async def read_skills_inventory() -> Any:
+            return await self._request(
+                "skills/list",
+                {
+                    "cwds": [os.path.abspath(cwd)],
+                    "forceReload": True,
+                },
+            )
+
         def require_no_ambient_instruction_config(
             effective_config: dict[str, Any],
         ) -> None:
@@ -3435,170 +4303,121 @@ class CodexAppServer:
                 "instructions",
                 "model_instructions_file",
             ):
-                if effective_config.get(instruction_key) not in {None, ""}:
+                value = effective_config.get(instruction_key)
+                if value is not None and value != "":
                     raise ValueError("ambient Codex instructions are configured")
 
-        async def require_stable_task_ssh_mcp_inventory(phase: str) -> None:
-            if task_ssh_mcp_fingerprint is None:
+        async def require_stable_isolated_ambient_state(phase: str) -> None:
+            if not (tools_disabled or network_isolated or task_ssh_protected_paths):
+                return
+            if (
+                isolated_ambient_config_fingerprint is None
+                or isolated_skills_inventory_fingerprint is None
+                or tool_free_skills_revision is None
+            ):
                 raise CodexRequiredMcpPreTurnError(
-                    "Codex Task MCP inventory was not captured"
+                    "Codex isolated ambient state was not captured"
                 )
             try:
                 effective_config = await read_effective_config()
                 require_no_ambient_instruction_config(effective_config)
-                current = _effective_mcp_inventory({
-                    "config": effective_config,
-                })
+                current_config_fingerprint = _canonical_json_fingerprint(
+                    effective_config,
+                    label="effective Codex configuration",
+                )
+                current_skills = await read_skills_inventory()
+                _tool_free_disabled_skill_config(current_skills, cwd=cwd)
+                current_skills_fingerprint = _canonical_json_fingerprint(
+                    current_skills,
+                    label="Codex skills inventory",
+                )
             except Exception as exc:
                 raise CodexRequiredMcpPreTurnError(
-                    "Codex Task isolation could not re-audit ambient MCP "
+                    "Codex isolated execution could not re-audit ambient "
+                    "configuration and skills "
                     f"{phase}"
                 ) from exc
-            if _mcp_inventory_fingerprint(current) != task_ssh_mcp_fingerprint:
+            if (
+                current_config_fingerprint
+                != isolated_ambient_config_fingerprint
+                or current_skills_fingerprint
+                != isolated_skills_inventory_fingerprint
+                or self._skills_revision != tool_free_skills_revision
+            ):
                 raise CodexRequiredMcpPreTurnError(
-                    "Codex Task ambient MCP inventory changed " + phase
+                    "Codex isolated ambient configuration or skills changed "
+                    + phase
                 )
 
-        if task_ssh_protected_paths:
+        if tools_disabled or network_isolated or task_ssh_protected_paths:
             try:
                 effective_config = await read_effective_config()
                 require_no_ambient_instruction_config(effective_config)
+                isolated_ambient_effective_config = copy.deepcopy(
+                    effective_config
+                )
+                isolated_dynamic_disabled_features = (
+                    _harden_ambient_feature_config(
+                        effective_config,
+                        thread_config,
+                        tools_disabled=tools_disabled,
+                    )
+                )
+                isolated_ambient_config_fingerprint = (
+                    _canonical_json_fingerprint(
+                        effective_config,
+                        label="effective Codex configuration",
+                    )
+                )
                 inherited_mcp = _effective_mcp_inventory({
                     "config": effective_config,
                 })
-                collisions = sorted(
-                    set(inherited_mcp) & set(explicit_mcp_servers)
-                )
-                if collisions:
-                    raise ValueError(
-                        "ambient MCP collides with an explicit CCM server"
+                if task_ssh_protected_paths:
+                    collisions = sorted(
+                        set(inherited_mcp) & set(explicit_mcp_servers)
                     )
-                task_ssh_mcp_fingerprint = _mcp_inventory_fingerprint(
-                    inherited_mcp
-                )
+                    if collisions:
+                        raise ValueError(
+                            "ambient MCP collides with an explicit CCM server"
+                        )
                 isolated_mcp = {
                     name: {"enabled": False}
                     for name in inherited_mcp
                 }
-                isolated_mcp.update(explicit_mcp_servers)
+                if task_ssh_protected_paths:
+                    isolated_mcp.update(explicit_mcp_servers)
                 thread_config["mcp_servers"] = isolated_mcp
-                skills_inventory = await self._request(
-                    "skills/list",
-                    {
-                        "cwds": [os.path.abspath(cwd)],
-                        "forceReload": True,
-                    },
+
+                skills_inventory = await read_skills_inventory()
+                disabled_skills = _tool_free_disabled_skill_config(
+                    skills_inventory,
+                    cwd=cwd,
                 )
-                thread_config["skills"]["config"] = (
-                    _tool_free_disabled_skill_config(
+                isolated_skills_inventory_fingerprint = (
+                    _canonical_json_fingerprint(
                         skills_inventory,
-                        cwd=cwd,
+                        label="Codex skills inventory",
                     )
                 )
+                thread_config["skills"]["config"] = disabled_skills
                 tool_free_skills_revision = self._skills_revision
             except Exception as exc:
-                raise CodexRequiredMcpPreTurnError(
-                    "Codex Task isolation could not audit and disable ambient MCP"
-                ) from exc
-        elif network_isolated:
-            try:
-                effective = await self._request(
-                    "config/read",
-                    {
-                        "cwd": os.path.abspath(cwd),
-                        "includeLayers": False,
-                    },
-                )
-                effective_config = (
-                    effective.get("config")
-                    if isinstance(effective, dict)
-                    else None
-                )
-                if not isinstance(effective_config, dict):
-                    raise ValueError("effective Codex configuration is malformed")
-                inherited_mcp = effective_config.get("mcp_servers", {})
-                if not isinstance(inherited_mcp, dict) or any(
-                    not isinstance(name, str) or not name
-                    for name in inherited_mcp
-                ):
-                    raise ValueError(
-                        "effective MCP server configuration is malformed"
+                if task_ssh_protected_paths:
+                    message = (
+                        "Codex Task isolation could not audit and disable "
+                        "ambient MCP/config/skills"
                     )
-                # Codex merges nested tables across config layers. An empty
-                # request-local table does not erase account-level servers,
-                # so explicitly disable every effective inherited name. The
-                # common no-MCP case remains the required literal ``{}``.
-                thread_config["mcp_servers"] = {
-                    name: {"enabled": False}
-                    for name in inherited_mcp
-                }
-            except Exception as exc:
-                raise CodexRequiredMcpPreTurnError(
-                    "Codex network-isolated profile could not audit inherited "
-                    "MCP servers"
-                ) from exc
-        if tools_disabled:
-            try:
-                effective = await self._request(
-                    "config/read",
-                    {
-                        "cwd": os.path.abspath(cwd),
-                        "includeLayers": False,
-                    },
-                )
-                effective_config = (
-                    effective.get("config")
-                    if isinstance(effective, dict)
-                    else None
-                )
-                if not isinstance(effective_config, dict):
-                    raise ValueError("effective Codex configuration is malformed")
-                for instruction_key in (
-                    "developer_instructions",
-                    "instructions",
-                    "model_instructions_file",
-                ):
-                    if effective_config.get(instruction_key) not in {
-                        None,
-                        "",
-                    }:
-                        raise ValueError(
-                            "ambient Codex instructions are configured"
-                        )
-                inherited_mcp = effective_config.get("mcp_servers", {})
-                if not isinstance(inherited_mcp, dict) or any(
-                    not isinstance(name, str) or not name
-                    for name in inherited_mcp
-                ):
-                    raise ValueError(
-                        "effective MCP server configuration is malformed"
+                elif network_isolated:
+                    message = (
+                        "Codex network-isolated profile could not audit "
+                        "inherited MCP/config/skills"
                     )
-                # An empty higher-level table does not erase lower config
-                # layers in Codex. Disable every effective inherited server
-                # explicitly; this was verified against CLI 0.144.6.
-                thread_config["mcp_servers"] = {
-                    name: {"enabled": False}
-                    for name in inherited_mcp
-                }
-                skills_inventory = await self._request(
-                    "skills/list",
-                    {
-                        "cwds": [os.path.abspath(cwd)],
-                        "forceReload": True,
-                    },
-                )
-                thread_config["skills"]["config"] = (
-                    _tool_free_disabled_skill_config(
-                        skills_inventory,
-                        cwd=cwd,
+                else:
+                    message = (
+                        "Codex tool-free profile could not audit ambient "
+                        "instructions and inherited MCP/config/skills"
                     )
-                )
-                tool_free_skills_revision = self._skills_revision
-            except Exception as exc:
-                raise CodexRequiredMcpPreTurnError(
-                    "Codex tool-free profile could not audit ambient "
-                    "instructions and inherited MCP servers"
-                ) from exc
+                raise CodexRequiredMcpPreTurnError(message) from exc
         actual_tier_proxy = self._actual_tier_proxy
         if (
             service_tier == CODEX_SERVICE_TIER_PRIORITY
@@ -3618,7 +4437,7 @@ class CodexAppServer:
                 service_tier=service_tier,
             )
         launch_started = time.perf_counter()
-        if git_env or task_ssh_protected_paths:
+        if git_env or task_ssh_protected_paths or network_isolated:
             # Per-project git credentials must remain thread-scoped.  A global
             # app-server environment would leak one project's identity into
             # every other concurrently running task.
@@ -3628,7 +4447,7 @@ class CodexAppServer:
 
             core_shell_environment = (
                 task_model_tool_environment(os.environ)
-                if task_ssh_protected_paths
+                if task_ssh_protected_paths or network_isolated
                 else {}
             )
             shell_environment = dict(core_shell_environment)
@@ -3653,25 +4472,133 @@ class CodexAppServer:
                     "GH_PROMPT_DISABLED": "1",
                 })
             if task_ssh_protected_paths:
+                assert task_private_tmpdir is not None
                 shell_environment.update({
                     "SSH_AUTH_SOCK": "",
                     "SSH_AGENT_PID": "",
                     "SSH_ASKPASS": "",
+                    "TMPDIR": str(task_private_tmpdir.path),
+                    "TMP": str(task_private_tmpdir.path),
+                    "TEMP": str(task_private_tmpdir.path),
+                    # Status/diff must not refresh the exact read-only index.
+                    # Git write operations still fail at the filesystem
+                    # boundary even if model code unsets this convenience.
+                    "GIT_OPTIONAL_LOCKS": "0",
                 })
                 if task_ssh_disable_network:
                     shell_environment["CCM_TASK_SSH_GUARD"] = "1"
+            elif network_isolated:
+                assert task_private_tmpdir is not None
+                shell_environment.update({
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "GCM_INTERACTIVE": "never",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GH_PROMPT_DISABLED": "1",
+                    "GIT_OPTIONAL_LOCKS": "0",
+                    "SSH_AUTH_SOCK": "",
+                    "SSH_AGENT_PID": "",
+                    "SSH_ASKPASS": "",
+                    "TMPDIR": str(task_private_tmpdir.path),
+                    "TMP": str(task_private_tmpdir.path),
+                    "TEMP": str(task_private_tmpdir.path),
+                })
             # Every Task starts from Codex's minimal core environment. Exact
             # project Git variables are reintroduced through ``set``; Manager
             # Git/GitHub/SSH and provider credentials can never leak from the
             # long-lived app-server process into a model shell.
             thread_config["shell_environment_policy"] = {
-                "inherit": (
-                    "none" if task_ssh_protected_paths else "core"
-                ),
+                "inherit": "none",
                 "ignore_default_excludes": False,
                 "exclude": list(_TASK_SHELL_ENV_EXCLUDES),
+                "include_only": [],
+                "experimental_use_profile": False,
                 "set": shell_environment,
             }
+
+        isolated_expected_config: dict[str, Any] | None = None
+        isolated_permission_profile_id: str | None = None
+        isolated_expected_permission_profile: dict[str, Any] | None = None
+        isolated_disabled_features: frozenset[str] | None = None
+        if tools_disabled:
+            isolated_permission_profile_id = tool_free_permission_profile
+            isolated_expected_permission_profile = (
+                _tool_free_permission_config()
+            )
+            isolated_disabled_features = _TOOL_FREE_DISABLED_FEATURES
+        elif network_isolated:
+            isolated_permission_profile_id = network_permission_profile
+            isolated_expected_permission_profile = (
+                _network_isolated_permission_config(
+                    cwd=cwd,
+                    git_read_paths=task_git_read_paths,
+                    private_tmpdir=str(task_private_tmpdir.path),
+                )
+            )
+            isolated_disabled_features = _NETWORK_ISOLATED_DISABLED_FEATURES
+        elif task_ssh_protected_paths:
+            isolated_permission_profile_id = task_permission_profile
+            isolated_expected_permission_profile = _task_ssh_permission_config(
+                cwd=cwd,
+                protected_paths=task_ssh_protected_paths,
+                allowed_read_paths=task_ssh_allowed_read_paths,
+                git_read_paths=task_git_read_paths,
+                private_tmpdir=str(task_private_tmpdir.path),
+                disable_network=task_ssh_disable_network,
+                managed_network_proxy=task_managed_network_proxy,
+                sandbox_mode=sandbox_mode,
+            )
+            isolated_disabled_features = _NETWORK_ISOLATED_DISABLED_FEATURES
+        if isolated_permission_profile_id is not None:
+            if isolated_ambient_effective_config is None:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated ambient merge inputs were not captured"
+                )
+            try:
+                _audit_ambient_isolation_merge_inputs(
+                    isolated_ambient_effective_config,
+                    thread_config,
+                    cwd=cwd,
+                    permission_profile_id=isolated_permission_profile_id,
+                    explicit_mcp_servers=frozenset(explicit_mcp_servers),
+                )
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated ambient configuration could not be "
+                    "safely overridden"
+                ) from exc
+            isolated_disabled_features = (
+                isolated_disabled_features
+                | isolated_dynamic_disabled_features
+            )
+            isolated_expected_config = copy.deepcopy(thread_config)
+
+        def audit_isolated_thread_config() -> None:
+            if isolated_permission_profile_id is None:
+                return
+            assert isolated_expected_config is not None
+            assert isolated_expected_permission_profile is not None
+            assert isolated_disabled_features is not None
+            try:
+                _audit_isolated_request_config(
+                    thread_config,
+                    expected_config=isolated_expected_config,
+                    permission_profile_id=isolated_permission_profile_id,
+                    expected_permission_profile=(
+                        isolated_expected_permission_profile
+                    ),
+                    disabled_features=isolated_disabled_features,
+                    network_proxy_enabled=bool(
+                        task_ssh_protected_paths
+                        and task_managed_network_proxy
+                    ),
+                )
+            except (TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated request configuration failed local audit"
+                ) from exc
+
+        audit_isolated_thread_config()
 
         common: dict[str, Any] = {
             "cwd": os.path.abspath(cwd),
@@ -3721,8 +4648,17 @@ class CodexAppServer:
                 "selectedCapabilityRoots": [],
                 "dynamicTools": [],
             })
+        audit_isolated_thread_config()
+        require_stable_task_filesystem_boundary("before thread admission")
+        await require_stable_isolated_ambient_state("before thread admission")
+        require_isolated_runtime_generation("before thread admission")
+        require_managed_network_generation("before thread admission")
         try:
-            response = await self._request(thread_method, thread_params)
+            response = await self._request(
+                thread_method,
+                thread_params,
+                expected_process=isolated_process,
+            )
         except Exception as exc:
             if required_mcp or required_context:
                 raise CodexRequiredMcpPreTurnError(
@@ -3777,7 +4713,14 @@ class CodexAppServer:
             )
             try:
                 await self.recycle_thread_runtime(thread_id)
-                response = await self._request(thread_method, thread_params)
+                require_managed_network_generation(
+                    "during terminal thread recovery"
+                )
+                response = await self._request(
+                    thread_method,
+                    thread_params,
+                    expected_process=isolated_process,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -3802,7 +4745,10 @@ class CodexAppServer:
                 )
         if tools_disabled:
             try:
-                _audit_tool_free_thread_response(response)
+                _audit_tool_free_thread_response(
+                    response,
+                    permission_profile_id=str(tool_free_permission_profile),
+                )
                 # Drain notifications already queued behind thread/start. A
                 # changed inventory invalidates the exact path deny-list and
                 # must fail before turn/start sends model input.
@@ -3835,7 +4781,9 @@ class CodexAppServer:
             try:
                 _audit_task_ssh_thread_response(
                     response,
+                    permission_profile_id=str(task_permission_profile),
                     disable_network=task_ssh_disable_network,
+                    managed_network_proxy=task_managed_network_proxy,
                     sandbox_mode=sandbox_mode,
                     cwd=cwd,
                 )
@@ -3852,6 +4800,40 @@ class CodexAppServer:
                     "Codex Task isolation profile was not proven by the "
                     f"{thread_method} response"
                 ) from exc
+        isolated_instruction_sources: tuple[tuple[Any, ...], ...] | None = None
+        if tools_disabled or network_isolated or task_ssh_protected_paths:
+            try:
+                isolated_instruction_sources = _instruction_sources_snapshot(
+                    response,
+                    cwd=cwd,
+                )
+                if tools_disabled and isolated_instruction_sources:
+                    raise ValueError(
+                        "tool-free execution loaded project instructions"
+                    )
+            except (OSError, TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated instruction sources were not proven by "
+                    f"the {thread_method} response"
+                ) from exc
+
+        def require_stable_instruction_sources(stage: str) -> None:
+            if isolated_instruction_sources is None:
+                return
+            try:
+                current = _instruction_sources_snapshot(response, cwd=cwd)
+            except (OSError, TypeError, ValueError) as exc:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated instruction sources could not be re-audited "
+                    + stage
+                ) from exc
+            if current != isolated_instruction_sources:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex isolated instruction sources changed " + stage
+                )
+        require_stable_task_filesystem_boundary("after thread admission")
+        require_isolated_runtime_generation("after thread admission")
+        require_managed_network_generation("after thread admission")
         self._known_threads.add(thread_id)
         if on_thread_started is not None:
             # A caller that owns durable lifecycle state can bind the exact
@@ -3859,13 +4841,13 @@ class CodexAppServer:
             # particular, Monitor uses this hook to survive a process crash
             # between thread/start and turn/start without guessing a rollout.
             await on_thread_started(thread_id)
-        if task_ssh_protected_paths:
-            # Re-read after thread/start and any durable thread-id binding.
-            # A project/user config change in that window may have introduced
-            # a host-side MCP process that the turn sandbox cannot contain.
-            await require_stable_task_ssh_mcp_inventory(
-                "before turn ownership"
-            )
+        # Re-read after thread/start and any durable thread-id binding. Codex
+        # deep-merges ambient config into the request-local layer, so any
+        # config or skills change invalidates the local isolation proof.
+        await require_stable_isolated_ambient_state("before turn ownership")
+        require_isolated_runtime_generation("before turn ownership")
+        require_managed_network_generation("before turn ownership")
+        require_stable_instruction_sources("before turn ownership")
         # A native Goal can continue after an older CCM version detached its
         # process adapter. Standard chat may recover that exact Goal by
         # preparing a new CCM owner and steering the pending user input into
@@ -3975,6 +4957,25 @@ class CodexAppServer:
             _interrupt,
             thread_id=thread_id,
         )
+        if task_private_tmpdir is not None:
+            task_private_tmpdir.bind_to_runtime()
+            turn_process.set_runtime_cleanup(task_private_tmpdir.cleanup)
+
+        async def finish_prepared_turn(
+            returncode: int,
+            stderr: str,
+            *,
+            termination_kind: str | None = None,
+        ) -> None:
+            """Settle this prepared adapter and its exact scratch barrier."""
+
+            turn_process.finish(
+                returncode,
+                stderr,
+                termination_kind=termination_kind,
+            )
+            await turn_process.wait_runtime_cleanup()
+
         client_user_message_id = uuid.uuid4().hex
         context = _TurnContext(
             thread_id=thread_id,
@@ -4025,7 +5026,7 @@ class CodexAppServer:
             # boundary before publishing durable launch ownership.
             reason = "Codex isolated skills inventory changed before turn/start"
             self._detach_turn_context(context)
-            turn_process.finish(1, reason)
+            await finish_prepared_turn(1, reason)
             raise CodexRequiredMcpPreTurnError(reason)
 
         model_prompt = prompt
@@ -4091,24 +5092,30 @@ class CodexAppServer:
                 await on_turn_prepared(turn_process, thread_id)
             except BaseException:
                 self._detach_turn_context(context)
-                turn_process.finish(
+                await finish_prepared_turn(
                     1,
                     "Codex turn ownership preparation failed",
                 )
                 raise
-        if task_ssh_protected_paths:
+        if tools_disabled or network_isolated or task_ssh_protected_paths:
             try:
                 # The ownership callback is awaited and may commit durable
                 # launch state. Recheck once more before model input so an
                 # inventory change during that await still fails closed.
-                await require_stable_task_ssh_mcp_inventory(
+                require_isolated_runtime_generation(
+                    "while publishing launch ownership"
+                )
+                require_managed_network_generation(
+                    "while publishing launch ownership"
+                )
+                await require_stable_isolated_ambient_state(
                     "while publishing launch ownership"
                 )
             except BaseException:
                 self._detach_turn_context(context)
-                turn_process.finish(
+                await finish_prepared_turn(
                     1,
-                    "Codex Task ambient MCP inventory changed before turn/start",
+                    "Codex isolated ambient state changed before turn/start",
                 )
                 raise
         if (
@@ -4127,8 +5134,22 @@ class CodexAppServer:
                 "launch ownership"
             )
             self._detach_turn_context(context)
-            turn_process.finish(1, reason)
+            await finish_prepared_turn(1, reason)
             raise CodexRequiredMcpPreTurnError(reason)
+        try:
+            require_stable_task_filesystem_boundary(
+                "while publishing launch ownership"
+            )
+            require_stable_instruction_sources(
+                "while publishing launch ownership"
+            )
+        except BaseException:
+            self._detach_turn_context(context)
+            await finish_prepared_turn(
+                1,
+                "Codex Task Git/TMP boundary changed before turn/start",
+            )
+            raise
         if adopt_active_goal:
             self._mark_following_native_goal(context)
             adoption = asyncio.create_task(
@@ -4152,7 +5173,7 @@ class CodexAppServer:
                 adopted_turn_id = adoption.result()
             except BaseException:
                 self._detach_turn_context(context)
-                turn_process.finish(
+                await finish_prepared_turn(
                     1,
                     "Codex active native Goal adoption failed",
                 )
@@ -4195,7 +5216,11 @@ class CodexAppServer:
             )
             return turn_process, thread_id
 
-        turn_request = asyncio.create_task(self._request("turn/start", turn_params))
+        turn_request = asyncio.create_task(self._request(
+            "turn/start",
+            turn_params,
+            expected_process=isolated_process,
+        ))
         turn_cancelled = False
         while not turn_request.done():
             try:
@@ -4224,7 +5249,10 @@ class CodexAppServer:
             raise _UnconfirmedTurnStartFailure(turn_process, reason) from exc
         except BaseException as exc:
             self._detach_turn_context(context)
-            turn_process.finish(1, "Codex app-server rejected turn/start")
+            await finish_prepared_turn(
+                1,
+                "Codex app-server rejected turn/start",
+            )
             if (
                 (required_mcp or required_context)
                 and isinstance(exc, CodexAppServerRequestError)
@@ -4250,7 +5278,10 @@ class CodexAppServer:
         turn_id = turn.get("id") if isinstance(turn, dict) else None
         if not turn_id:
             self._detach_turn_context(context)
-            turn_process.finish(1, "Codex app-server turn/start returned no turn id")
+            await finish_prepared_turn(
+                1,
+                "Codex app-server turn/start returned no turn id",
+            )
             message = "turn/start returned no turn id"
             if required_mcp or required_context:
                 raise CodexRequiredMcpError(
@@ -5125,25 +6156,47 @@ class CodexAppServer:
         return response.get("turnId") == expected_turn_id
 
     async def _request(
-        self, method: str, params: dict[str, Any] | None,
+        self,
+        method: str,
+        params: dict[str, Any] | None,
+        *,
+        expected_process: asyncio.subprocess.Process | None = None,
     ) -> dict[str, Any]:
-        if not self.is_alive or not self._process or not self._process.stdin:
+        process = self._process
+        if expected_process is not None and process is not expected_process:
+            raise CodexAppServerError(
+                "app-server process generation changed before request"
+            )
+        if (
+            process is None
+            or process.returncode is not None
+            or process.stdin is None
+        ):
             raise CodexAppServerError("app-server is not running")
         self._request_id += 1
         request_id = self._request_id
         future = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = future
+        self._pending[request_id] = (process, future)
         try:
             message: dict[str, Any] = {"id": request_id, "method": method}
             if params is not None:
                 message["params"] = params
-            await self._write(message)
+            await self._write(message, expected_process=process)
             response = await asyncio.wait_for(future, timeout=self.request_timeout)
         finally:
             # Cancellation can happen while waiting for the shared write lock
             # or draining stdin, before the response wait is entered. Never
             # leave that future permanently registered.
-            self._pending.pop(request_id, None)
+            pending = self._pending.get(request_id)
+            if pending is not None and pending[1] is future:
+                self._pending.pop(request_id, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                # A process finalizer can fail this future while the request
+                # is still queued on the write lock. Retrieve that exact
+                # exception before propagating the generation-write failure.
+                future.exception()
         if "error" in response:
             error = response.get("error") or {}
             raise CodexAppServerRequestError(
@@ -5155,13 +6208,29 @@ class CodexAppServer:
     async def _notify(self, method: str, params: dict[str, Any]) -> None:
         await self._write({"method": method, "params": params})
 
-    async def _write(self, message: dict[str, Any]) -> None:
-        if not self._process or not self._process.stdin:
-            raise CodexAppServerError("app-server stdin is unavailable")
+    async def _write(
+        self,
+        message: dict[str, Any],
+        *,
+        expected_process: asyncio.subprocess.Process | None = None,
+    ) -> None:
         payload = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
         async with self._write_lock:
-            self._process.stdin.write(payload.encode("utf-8") + b"\n")
-            await self._process.stdin.drain()
+            process = self._process
+            if (
+                expected_process is not None
+                and (
+                    process is not expected_process
+                    or expected_process.returncode is not None
+                )
+            ):
+                raise CodexAppServerError(
+                    "app-server process generation changed before request write"
+                )
+            if process is None or process.stdin is None:
+                raise CodexAppServerError("app-server stdin is unavailable")
+            process.stdin.write(payload.encode("utf-8") + b"\n")
+            await process.stdin.drain()
 
     def _finalize_transport_exit(
         self,
@@ -5209,10 +6278,14 @@ class CodexAppServer:
                 _format_process_exit(returncode),
                 f"; stderr tail:\n{detail}" if detail else "",
             )
-        for future in list(self._pending.values()):
+        for request_id, (pending_process, future) in list(
+            self._pending.items()
+        ):
+            if pending_process is not process:
+                continue
+            self._pending.pop(request_id, None)
             if not future.done():
                 future.set_exception(error)
-        self._pending.clear()
         for future in list(self._thread_settings_waiters.values()):
             if not future.done():
                 future.set_exception(error)
@@ -5269,8 +6342,12 @@ class CodexAppServer:
                     continue
                 request_id = message.get("id")
                 if request_id is not None and ("result" in message or "error" in message):
-                    future = self._pending.pop(request_id, None)
-                    if future and not future.done():
+                    pending = self._pending.get(request_id)
+                    if pending is None or pending[0] is not process:
+                        continue
+                    self._pending.pop(request_id, None)
+                    future = pending[1]
+                    if not future.done():
                         future.set_result(message)
                     continue
                 if request_id is not None and message.get("method"):

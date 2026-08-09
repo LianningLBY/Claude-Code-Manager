@@ -1062,6 +1062,46 @@ describe('TaskForm Delivery Loop mode', () => {
 
     expect(api.uploadImages).not.toHaveBeenCalled();
   });
+
+  it('drops a previously selected SSH grant before Delivery admission', async () => {
+    vi.mocked(api.listSSHProfiles).mockResolvedValueOnce([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      enabled: true,
+      revision: 1,
+      task_access_enabled: true,
+      task_capabilities: ['read'],
+      allowed_roots: ['/srv/app'],
+      has_key: true,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await userEvent.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await userEvent.click(await screen.findByLabelText('Grant production-box'));
+
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    fireEvent.change(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      { target: { value: 'Keep Delivery isolated from SSH grants' } },
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/does not accept.*SSH grants/i)).not.toBeInTheDocument();
+  });
 });
 
 describe('TaskForm SSH grants', () => {

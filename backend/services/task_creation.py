@@ -15,6 +15,9 @@ from backend.services.auto_capability_policy import (
 from backend.services.codex_models import validate_codex_service_tier
 
 
+SOURCE_TASK_INCARNATION_METADATA_KEY = "ccm_source_task_incarnation_id"
+
+
 async def purge_task_access_grants(db: AsyncSession, task_id: int) -> None:
     """Remove every ACL row whose authority is one exact Task id.
 
@@ -115,6 +118,9 @@ async def stage_task_record(
                 "source Task incarnation requires an internal explicit id"
             )
         prepared["incarnation_id"] = source_incarnation_id
+        metadata = dict(prepared.get("metadata_") or {})
+        metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = source_incarnation_id
+        prepared["metadata_"] = metadata
     else:
         prepared["incarnation_id"] = secrets.token_hex(16)
     validate_task_service_tier_configuration(

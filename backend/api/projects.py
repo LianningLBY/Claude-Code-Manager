@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.config import settings
 from backend.database import get_db, async_session
 from backend.services.agent_docs import inject_agents_md
+from backend.models.discussion import Discussion
 from backend.models.project import Project
 from backend.api.deps import (
     get_current_user_id,
@@ -290,19 +291,52 @@ async def update_project(
 @router.delete("/{project_id}")
 async def delete_project(project_id: int, request: Request, db: AsyncSession = Depends(get_db)):
     from backend.api.deps import require_admin
+    from backend.services.project_share_admission import (
+        ProjectShareAdmissionError,
+        lock_project_share_authority,
+    )
+
     require_admin(request)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
     await db.rollback()
-    locked = await db.execute(
-        update(Project)
-        .where(Project.id == project_id)
-        .values(id=Project.id)
-    )
-    if locked.rowcount != 1:
-        raise HTTPException(404, "Project not found")
-    project = await db.get(Project, project_id, populate_existing=True)
+    try:
+        project = await lock_project_share_authority(db, project_id)
+    except ProjectShareAdmissionError as exc:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Could not establish the Project deletion fence; retry",
+        ) from exc
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(404, "Project not found") from exc
+
+    discussion = (
+        await db.execute(
+            select(Discussion.id, Discussion.status)
+            .where(Discussion.project_id == project_id)
+            .order_by(Discussion.id)
+            .limit(1)
+            .with_for_update()
+        )
+    ).first()
+    if discussion is not None:
+        discussion_id, discussion_status = discussion
+        if discussion_status in {"active", "closing"}:
+            detail = (
+                "Cannot delete a Project with an active or closing Discussion "
+                f"{discussion_id}"
+            )
+        else:
+            detail = (
+                f"Delete Discussion {discussion_id} before deleting its Project"
+            )
+        raise HTTPException(
+            409,
+            detail,
+        )
     run_id = await _delivery_run_reference(
         db,
         project_id=project_id,

@@ -30,6 +30,7 @@ from backend.services.process_safety import require_safe_process_group_id
 from backend.services.task_agent_isolation import (
     TaskAgentIsolationError,
     generate_claude_zero_tool_isolation_settings,
+    require_task_security_boundary_configured,
     scrub_task_model_environment,
     validate_claude_zero_tool_isolation_settings,
 )
@@ -651,6 +652,7 @@ class GoalEvaluator:
     ) -> GoalEvalResult:
         provider = (provider or "claude").lower()
         try:
+            require_task_security_boundary_configured()
             protected_paths = manager_secret_protected_paths()
         except (TaskAgentIsolationError, TaskSSHAccessError) as exc:
             raise GoalEvaluationError(

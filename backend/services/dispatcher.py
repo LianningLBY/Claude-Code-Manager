@@ -4882,6 +4882,47 @@ class GlobalDispatcher:
             await db.rollback()
             return None
         await db.commit()
+        try:
+            from backend.services.project_share_admission import (
+                require_unshared_project_plan_claim,
+            )
+
+            await require_unshared_project_plan_claim(
+                self.db_factory,
+                run_id=run.id,
+                generation=claimed_generation,
+                instance_id=instance.id,
+            )
+        except BaseException as exc:
+            # Ownership is already durable. Converge this exact generation
+            # through the normal Run -> Instance cleanup path before exposing
+            # the slot again; a share veto must never strand a permanent
+            # ``running`` claim.
+            cleanup, cleanup_cancellation = await _settle_despite_cancellation(
+                self._cleanup_plan_run_owner(
+                    instance_id=instance.id,
+                    run_id=run.id,
+                    generation=claimed_generation,
+                    terminal_error=(
+                        "Plan Project admission failed before provider effect: "
+                        f"{str(exc) or type(exc).__name__}"
+                    ),
+                )
+            )
+            retry_needed = cleanup.result()
+            if retry_needed:
+                self._request_plan_runtime_recovery()
+            if isinstance(exc, asyncio.CancelledError):
+                raise exc
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
+            logger.warning(
+                "Rejected Plan Run %s generation %s after Project admission: %s",
+                run.id,
+                claimed_generation,
+                exc,
+            )
+            return None
         return run.id, claimed_generation
 
     async def _cleanup_plan_run_owner(
@@ -4890,6 +4931,7 @@ class GlobalDispatcher:
         instance_id: int,
         run_id: int,
         generation: int,
+        terminal_error: str | None = None,
     ) -> bool:
         """Release an exact PlanRun owner; return whether cold retry is needed."""
 
@@ -4941,7 +4983,11 @@ class GlobalDispatcher:
                     # safe to replay silently; preserve an explicit terminal.
                     run.status = "failed"
                     run.current_stage = "failed"
-                    run.error = "Plan Run lifecycle ended without a durable outcome"
+                    run.error = (
+                        terminal_error[:4000]
+                        if terminal_error
+                        else "Plan Run lifecycle ended without a durable outcome"
+                    )
                     run.finished_at = datetime.utcnow()
                     if run.plan_id is not None:
                         plan = await db.get(Plan, run.plan_id, with_for_update=True)
@@ -14003,6 +14049,52 @@ class GlobalDispatcher:
             MONITOR_FAILURE_BACKOFF_MAX,
         )
 
+    def project_share_auxiliary_runtime_block_reason(
+        self,
+        *,
+        project_id: int,
+        task_ids: set[int],
+        session_ids: set[int],
+    ) -> str | None:
+        """Synchronously snapshot Monitor/Sub-Agent runtime ownership maps."""
+
+        if (
+            type(project_id) is not int
+            or project_id <= 0
+            or any(type(value) is not int or value <= 0 for value in task_ids)
+            or any(type(value) is not int or value <= 0 for value in session_ids)
+        ):
+            return (
+                "Could not verify auxiliary Agent runtime; Project sharing "
+                "is disabled"
+            )
+
+        runtime_maps = (
+            self._monitor_tasks,
+            self._monitor_processes,
+            self._monitor_config_dirs,
+            self._monitor_log_fhs,
+            self._monitor_turn_handles,
+            self._sub_agent_tasks,
+            self._sub_agent_processes,
+            self._sub_agent_config_dirs,
+            self._sub_agent_log_fhs,
+            self._sub_agent_codex_processes,
+            self._sub_agent_codex_homes,
+            self._sub_agent_codex_threads,
+        )
+        if any(set(runtime_map) & session_ids for runtime_map in runtime_maps):
+            return (
+                "A local Monitor/Sub-Agent runtime is still attached to this "
+                "Project; stop it before sharing"
+            )
+        if self._monitor_active_turns & session_ids:
+            return (
+                "A local Monitor turn is still active for this Project; wait "
+                "for it to settle before sharing"
+            )
+        return None
+
     async def _release_interrupted_monitor_turn(
         self,
         monitor_session_id: int,
@@ -14165,6 +14257,49 @@ class GlobalDispatcher:
                     "status": "failed",
                     **relay_generation,
                 },
+            )
+
+    async def _reject_monitor_turn_project_admission(
+        self,
+        monitor_session_id: int,
+        generation: int,
+        error: BaseException,
+    ) -> None:
+        """Terminalize an exact pre-provider Monitor claim after a share veto."""
+
+        from backend.models.monitor_session import MonitorSession
+
+        now = datetime.utcnow()
+        async with self.db_factory() as db:
+            rejected = await db.execute(
+                update(MonitorSession)
+                .where(
+                    MonitorSession.id == monitor_session_id,
+                    MonitorSession.agent_type == "monitor",
+                    MonitorSession.source == "ccm",
+                    MonitorSession.remote_id.is_(None),
+                    MonitorSession.status == "running",
+                    MonitorSession.active_turn_generation == generation,
+                )
+                .values(
+                    status="failed",
+                    active_turn_generation=None,
+                    turn_started_at=None,
+                    next_check_at=None,
+                    completed_at=now,
+                    last_error=(
+                        "Monitor Project admission failed before provider "
+                        f"effect: {str(error) or type(error).__name__}"
+                    )[:2000],
+                )
+            )
+            await db.commit()
+        if rejected.rowcount != 1:
+            logger.info(
+                "Monitor %s generation %s changed while Project veto was "
+                "being terminalized",
+                monitor_session_id,
+                generation,
             )
 
     async def _claim_due_monitor_turn(
@@ -14367,6 +14502,37 @@ class GlobalDispatcher:
                 }
                 commit, cancellation = await _settle_despite_cancellation(db.commit())
                 commit.result()
+            try:
+                from backend.services.project_share_admission import (
+                    require_unshared_project_auxiliary_effect,
+                )
+
+                await require_unshared_project_auxiliary_effect(
+                    self.db_factory,
+                    session_id=monitor_session_id,
+                    agent_type="monitor",
+                    active_turn_generation=int(snapshot["generation"]),
+                )
+            except BaseException as exc:
+                cleanup, cleanup_cancellation = await _settle_despite_cancellation(
+                    self._reject_monitor_turn_project_admission(
+                        monitor_session_id,
+                        int(snapshot["generation"]),
+                        exc,
+                    )
+                )
+                cleanup.result()
+                if isinstance(exc, asyncio.CancelledError):
+                    raise exc
+                if cleanup_cancellation is not None:
+                    raise cleanup_cancellation
+                logger.warning(
+                    "Rejected Monitor %s generation %s at Project admission: %s",
+                    monitor_session_id,
+                    snapshot["generation"],
+                    exc,
+                )
+                return None
             if cancellation is not None:
                 cleanup, _ = await _settle_despite_cancellation(
                     self._release_interrupted_monitor_turn(
@@ -14542,7 +14708,7 @@ class GlobalDispatcher:
                 *,
                 thread_id: str | None,
                 home: str | None,
-            ) -> tuple[tuple[str, ...], bool]:
+            ) -> tuple[tuple[str, ...], int, int]:
                 """Lock Task -> Monitor for one exact launch generation."""
 
                 task_guard = await db.execute(
@@ -14619,12 +14785,8 @@ class GlobalDispatcher:
 
                 from backend.services.task_ssh_access import (
                     task_ssh_protected_paths,
-                    task_ssh_runtime_policy,
                 )
 
-                direct_network_disabled = (
-                    await task_ssh_runtime_policy(db, current_task)
-                ).broker_only
                 protected_paths = await task_ssh_protected_paths(
                     db,
                     task=current_task,
@@ -14632,11 +14794,20 @@ class GlobalDispatcher:
                     extra_paths=(admitted_home,),
                     include_direct_git_credentials=True,
                 )
-                return protected_paths, direct_network_disabled
+                return (
+                    protected_paths,
+                    int(current_task.retry_count),
+                    int(current_task.turn_generation),
+                )
 
-            async with self.db_factory() as db:
-                protected_paths, direct_network_disabled = (
-                    await guard_current_generation(
+            task_private_tmpdir = None
+            try:
+                async with self.db_factory() as db:
+                    (
+                        protected_paths,
+                        task_retry_count,
+                        task_turn_generation,
+                    ) = await guard_current_generation(
                         db,
                         thread_id=(
                             None
@@ -14649,154 +14820,205 @@ class GlobalDispatcher:
                             else str(persisted_home)
                         ),
                     )
-                )
 
-                async def bind_started_thread(thread_id: str) -> None:
-                    """Durably bind thread/start before turn/start admission."""
+                    from backend.services.task_agent_isolation import (
+                        discover_linked_worktree_git_read_boundary,
+                    )
+                    from backend.services.task_runtime_secrets import (
+                        create_private_task_temp_dir,
+                    )
 
-                    nonlocal handle
-                    if persisted_thread is not None and thread_id != str(
-                        persisted_thread
+                    git_boundary = discover_linked_worktree_git_read_boundary(
+                        cwd
+                    )
+                    task_git_read_paths = (
+                        git_boundary.read_paths
+                        if git_boundary is not None
+                        else ()
+                    )
+                    task_git_boundary_fingerprint = (
+                        git_boundary.identity_fingerprint
+                        if git_boundary is not None
+                        else ()
+                    )
+                    task_private_tmpdir = create_private_task_temp_dir(
+                        task_id=task_id,
+                        task_incarnation_id=task_incarnation_id,
+                        retry_count=task_retry_count,
+                        turn_generation=task_turn_generation,
+                    )
+
+                    async def bind_started_thread(thread_id: str) -> None:
+                        """Durably bind thread/start before turn/start admission."""
+
+                        nonlocal handle
+                        if persisted_thread is not None and thread_id != str(
+                            persisted_thread
+                        ):
+                            raise RuntimeError(
+                                "Codex thread/resume returned a different Monitor "
+                                "thread identity"
+                            )
+                        handle = _MonitorTurnHandle(
+                            session_id=monitor_session_id,
+                            generation=generation,
+                            provider="codex",
+                            process=None,
+                            codex_home=admitted_home,
+                            codex_thread_id=thread_id,
+                            codex_account_id=account_id,
+                            codex_created_thread=persisted_thread is None,
+                            codex_identity_committed=(persisted_thread is not None),
+                        )
+                        # Publish even the pre-turn identity synchronously. If
+                        # its DB commit fails, this is the only exact evidence
+                        # needed to compensate the newly created rollout.
+                        self._monitor_turn_handles[monitor_session_id] = handle
+
+                        bound = await db.execute(
+                            update(MonitorSession)
+                            .where(
+                                MonitorSession.id == monitor_session_id,
+                                MonitorSession.task_id == task_id,
+                                MonitorSession.agent_type == "monitor",
+                                MonitorSession.source == "ccm",
+                                MonitorSession.status == "running",
+                                MonitorSession.remote_id.is_(None),
+                                MonitorSession.provider == "codex",
+                                MonitorSession.active_turn_generation
+                                == generation,
+                                (
+                                    MonitorSession.codex_thread_id.is_(None)
+                                    if persisted_thread is None
+                                    else MonitorSession.codex_thread_id
+                                    == str(persisted_thread)
+                                ),
+                                (
+                                    MonitorSession.codex_home.is_(None)
+                                    if persisted_home is None
+                                    else MonitorSession.codex_home
+                                    == str(persisted_home)
+                                ),
+                            )
+                            .values(
+                                codex_thread_id=thread_id,
+                                codex_home=admitted_home,
+                                codex_account_id=account_id,
+                                codex_cleanup_pending=False,
+                                codex_cleanup_error=None,
+                            )
+                        )
+                        if bound.rowcount != 1:
+                            await db.rollback()
+                            raise RuntimeError(
+                                "Codex Monitor lost its generation before runtime "
+                                "identity could be persisted"
+                            )
+                        commit, cancellation = await _settle_despite_cancellation(
+                            db.commit()
+                        )
+                        commit.result()
+                        handle.codex_identity_committed = True
+                        if cancellation is not None:
+                            raise cancellation
+
+                        # Re-establish the Task -> Monitor write barrier after
+                        # the identity commit. It remains held while turn/start
+                        # is on the wire, so terminalization and an immediate
+                        # callback cannot race ahead of adapter publication.
+                        await guard_current_generation(
+                            db,
+                            thread_id=thread_id,
+                            home=admitted_home,
+                        )
+
+                    async def publish_prepared_turn(
+                        prepared_process: object,
+                        thread_id: str,
+                    ) -> None:
+                        nonlocal process
+                        if (
+                            handle is None
+                            or not handle.codex_identity_committed
+                            or handle.codex_thread_id != thread_id
+                            or self._monitor_turn_handles.get(monitor_session_id)
+                            is not handle
+                        ):
+                            raise RuntimeError(
+                                "Codex Monitor turn reached admission without a "
+                                "durable exact owner"
+                            )
+                        process = prepared_process
+                        handle.process = prepared_process
+
+                    returned_process, thread_id = await registry.start_turn(
+                        codex_home=admitted_home,
+                        prompt=prompt,
+                        cwd=cwd,
+                        model=model,
+                        effort=(None if effort is None else str(effort)),
+                        codex_service_tier=tier,
+                        resume_session_id=(
+                            None
+                            if persisted_thread is None
+                            else str(persisted_thread)
+                        ),
+                        git_env=None,
+                        task_id=task_id,
+                        mcp_specs=build_monitor_agent_mcp_server_specs(
+                            monitor_session_id,
+                            task_id,
+                            turn_generation=generation,
+                            task_incarnation_id=task_incarnation_id,
+                        ),
+                        disable_project_config=True,
+                        disable_user_mcp=True,
+                        sandbox_mode="read-only",
+                        disable_autonomous_features=True,
+                        task_ssh_protected_paths=protected_paths,
+                        task_git_read_paths=task_git_read_paths,
+                        task_git_boundary_fingerprint=(
+                            task_git_boundary_fingerprint
+                        ),
+                        task_private_tmpdir=task_private_tmpdir,
+                        # Monitor is always a read-only observer and never
+                        # receives outbound network authority from its parent.
+                        task_ssh_disable_network=True,
+                        on_thread_started=bind_started_thread,
+                        on_turn_prepared=publish_prepared_turn,
+                    )
+                    if (
+                        handle is None
+                        or process is None
+                        or returned_process is not process
+                        or handle.process is not returned_process
+                        or handle.codex_thread_id != thread_id
                     ):
                         raise RuntimeError(
-                            "Codex thread/resume returned a different Monitor "
-                            "thread identity"
+                            "Codex app-server did not publish the prepared Monitor "
+                            "turn through its ownership barrier"
                         )
-                    handle = _MonitorTurnHandle(
-                        session_id=monitor_session_id,
-                        generation=generation,
-                        provider="codex",
-                        process=None,
-                        codex_home=admitted_home,
-                        codex_thread_id=thread_id,
-                        codex_account_id=account_id,
-                        codex_created_thread=persisted_thread is None,
-                        codex_identity_committed=(persisted_thread is not None),
-                    )
-                    # Publish even the pre-turn identity synchronously. If its
-                    # DB commit fails, this is the only exact evidence needed
-                    # to compensate the newly created rollout.
-                    self._monitor_turn_handles[monitor_session_id] = handle
 
-                    bound = await db.execute(
-                        update(MonitorSession)
-                        .where(
-                            MonitorSession.id == monitor_session_id,
-                            MonitorSession.task_id == task_id,
-                            MonitorSession.agent_type == "monitor",
-                            MonitorSession.source == "ccm",
-                            MonitorSession.status == "running",
-                            MonitorSession.remote_id.is_(None),
-                            MonitorSession.provider == "codex",
-                            MonitorSession.active_turn_generation == generation,
-                            (
-                                MonitorSession.codex_thread_id.is_(None)
-                                if persisted_thread is None
-                                else MonitorSession.codex_thread_id
-                                == str(persisted_thread)
-                            ),
-                            (
-                                MonitorSession.codex_home.is_(None)
-                                if persisted_home is None
-                                else MonitorSession.codex_home == str(persisted_home)
-                            ),
-                        )
-                        .values(
-                            codex_thread_id=thread_id,
-                            codex_home=admitted_home,
-                            codex_account_id=account_id,
-                            codex_cleanup_pending=False,
-                            codex_cleanup_error=None,
-                        )
-                    )
-                    if bound.rowcount != 1:
-                        await db.rollback()
-                        raise RuntimeError(
-                            "Codex Monitor lost its generation before runtime "
-                            "identity could be persisted"
-                        )
                     commit, cancellation = await _settle_despite_cancellation(
                         db.commit()
                     )
                     commit.result()
-                    handle.codex_identity_committed = True
-                    if cancellation is not None:
-                        raise cancellation
-
-                    # Re-establish the Task -> Monitor write barrier after the
-                    # identity commit. It remains held while turn/start is on
-                    # the wire, so terminalization and an immediate callback
-                    # cannot race ahead of adapter publication.
-                    await guard_current_generation(
-                        db,
-                        thread_id=thread_id,
-                        home=admitted_home,
-                    )
-
-                async def publish_prepared_turn(
-                    prepared_process: object,
-                    thread_id: str,
-                ) -> None:
-                    nonlocal process
-                    if (
-                        handle is None
-                        or not handle.codex_identity_committed
-                        or handle.codex_thread_id != thread_id
-                        or self._monitor_turn_handles.get(monitor_session_id)
-                        is not handle
-                    ):
-                        raise RuntimeError(
-                            "Codex Monitor turn reached admission without a "
-                            "durable exact owner"
+                if cancellation is not None:
+                    raise cancellation
+                assert handle is not None
+                return handle
+            finally:
+                if task_private_tmpdir is not None:
+                    cleanup, cleanup_cancellation = (
+                        await _settle_despite_cancellation(
+                            asyncio.to_thread(
+                                task_private_tmpdir.cleanup_if_unbound
+                            )
                         )
-                    process = prepared_process
-                    handle.process = prepared_process
-
-                returned_process, thread_id = await registry.start_turn(
-                    codex_home=admitted_home,
-                    prompt=prompt,
-                    cwd=cwd,
-                    model=model,
-                    effort=(None if effort is None else str(effort)),
-                    codex_service_tier=tier,
-                    resume_session_id=(
-                        None if persisted_thread is None else str(persisted_thread)
-                    ),
-                    git_env=None,
-                    task_id=task_id,
-                    mcp_specs=build_monitor_agent_mcp_server_specs(
-                        monitor_session_id,
-                        task_id,
-                        turn_generation=generation,
-                        task_incarnation_id=task_incarnation_id,
-                    ),
-                    disable_project_config=True,
-                    disable_user_mcp=True,
-                    sandbox_mode="read-only",
-                    disable_autonomous_features=True,
-                    task_ssh_protected_paths=protected_paths,
-                    task_ssh_disable_network=True,
-                    on_thread_started=bind_started_thread,
-                    on_turn_prepared=publish_prepared_turn,
-                )
-                if (
-                    handle is None
-                    or process is None
-                    or returned_process is not process
-                    or handle.process is not returned_process
-                    or handle.codex_thread_id != thread_id
-                ):
-                    raise RuntimeError(
-                        "Codex app-server did not publish the prepared Monitor "
-                        "turn through its ownership barrier"
                     )
-
-                commit, cancellation = await _settle_despite_cancellation(db.commit())
-                commit.result()
-            if cancellation is not None:
-                raise cancellation
-            assert handle is not None
-            return handle
+                    cleanup.result()
+                    if cleanup_cancellation is not None:
+                        raise cleanup_cancellation
 
         try:
             async with get_task_operation_lock(task_id):
@@ -14936,6 +15158,16 @@ class GlobalDispatcher:
         generation = int(snapshot["generation"])
         task_id = int(snapshot["task_id"])
         task_incarnation_id = str(snapshot["task_incarnation_id"] or "")
+        from backend.services.project_share_admission import (
+            require_unshared_project_auxiliary_effect,
+        )
+
+        await require_unshared_project_auxiliary_effect(
+            self.db_factory,
+            session_id=monitor_session_id,
+            agent_type="monitor",
+            active_turn_generation=generation,
+        )
         prompt = self._build_monitor_agent_prompt(
             description=str(snapshot["description"]),
             context=(None if snapshot["context"] is None else str(snapshot["context"])),
@@ -15398,8 +15630,11 @@ class GlobalDispatcher:
             cmd.extend(["--model", settings.default_model])
 
         from backend.services.task_agent_isolation import (
+            require_task_security_boundary_configured,
             scrub_task_model_environment,
         )
+
+        require_task_security_boundary_configured()
 
         env = scrub_task_model_environment(
             os.environ,
@@ -15615,6 +15850,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task.codex_service_tier,
                 )
                 task_metadata = dict(task.metadata_ or {})
+
+            from backend.services.project_share_admission import (
+                require_unshared_project_auxiliary_effect,
+            )
+
+            await require_unshared_project_auxiliary_effect(
+                self.db_factory,
+                session_id=session_id,
+                agent_type="sub_agent",
+            )
 
             prompt = self._build_sub_agent_prompt(
                 description=sa_prompt_text or sa_description,
@@ -15883,8 +16128,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             cmd.extend(["--model", settings.default_model])
 
         from backend.services.task_agent_isolation import (
+            require_task_security_boundary_configured,
             scrub_task_model_environment,
         )
+
+        require_task_security_boundary_configured()
 
         env = scrub_task_model_environment(
             os.environ,
@@ -16045,6 +16293,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 )
                 process = None
                 thread_id = None
+                task_private_tmpdir = None
                 try:
                     async with self.db_factory() as db:
                         task_predicates = [
@@ -16121,6 +16370,32 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             extra_paths=(admitted_home,),
                             include_direct_git_credentials=True,
                         )
+                        from backend.services.task_agent_isolation import (
+                            discover_linked_worktree_git_read_boundary,
+                        )
+                        from backend.services.task_runtime_secrets import (
+                            create_private_task_temp_dir,
+                        )
+
+                        git_boundary = (
+                            discover_linked_worktree_git_read_boundary(cwd)
+                        )
+                        task_git_read_paths = (
+                            git_boundary.read_paths
+                            if git_boundary is not None
+                            else ()
+                        )
+                        task_git_boundary_fingerprint = (
+                            git_boundary.identity_fingerprint
+                            if git_boundary is not None
+                            else ()
+                        )
+                        task_private_tmpdir = create_private_task_temp_dir(
+                            task_id=task_id,
+                            task_incarnation_id=task_incarnation_id,
+                            retry_count=int(current_task.retry_count),
+                            turn_generation=int(current_task.turn_generation),
+                        )
 
                         # Keep the Task→SubAgent DB barrier until start_turn has
                         # registered the native turn.  A concurrent Worker stage
@@ -16144,7 +16419,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             disable_user_mcp=True,
                             sandbox_mode="workspace-write",
                             task_ssh_protected_paths=protected_paths,
-                            task_ssh_disable_network=True,
+                            task_git_read_paths=task_git_read_paths,
+                            task_git_boundary_fingerprint=(
+                                task_git_boundary_fingerprint
+                            ),
+                            task_private_tmpdir=task_private_tmpdir,
+                            task_ssh_disable_network=direct_network_disabled,
                             disable_autonomous_features=True,
                         )
                         # Registration is synchronous and deliberately occurs
@@ -16184,6 +16464,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 admitted_home,
                             )
                     raise
+                finally:
+                    if task_private_tmpdir is not None:
+                        cleanup, cleanup_cancellation = (
+                            await _settle_despite_cancellation(
+                                asyncio.to_thread(
+                                    task_private_tmpdir.cleanup_if_unbound
+                                )
+                            )
+                        )
+                        cleanup.result()
+                        if cleanup_cancellation is not None:
+                            raise cleanup_cancellation
                 return process, thread_id, admitted_home
 
         # Preserve the global lock order used by ordinary task launches:

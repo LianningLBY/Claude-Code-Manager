@@ -442,6 +442,12 @@ class TaskResponse(BaseModel):
         return self
 
 
+class TaskMigrationImportResponse(TaskResponse):
+    """Internal migration acknowledgement with the immutable identity fence."""
+
+    incarnation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+
+
 class TaskTerminationSnapshot(TaskResponse):
     """Internal-only Worker snapshot with the opaque PTY generation fence."""
 

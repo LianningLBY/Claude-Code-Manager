@@ -13,6 +13,11 @@ from backend.models.task import Task
 from backend.models.project import Project
 from backend.models.task_share import TaskShare, ProjectShare
 from backend.services.pr_review_runtime import is_pr_sandbox_task
+from backend.services.project_share_admission import (
+    lock_project_share_authority,
+    project_has_active_share,
+    require_project_agents_quiescent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -244,15 +249,22 @@ async def share_project(
     db: AsyncSession,
     project_id: int,
     targets: list[dict],
+    *,
+    instance_manager=None,
+    dispatcher=None,
 ) -> list[dict]:
     """Share a project (and all its current tasks) with members."""
-    project = (
-        await db.execute(
-            select(Project).where(Project.id == project_id).with_for_update()
+    project = await lock_project_share_authority(db, project_id)
+    # Only the visibility transition needs a bare-Agent veto. Once any Team
+    # or Feishu share is active, adding/retrying another recipient remains
+    # idempotent and must not reject a future legitimately isolated runtime.
+    if not await project_has_active_share(db, project_id):
+        await require_project_agents_quiescent(
+            db,
+            project,
+            instance_manager=instance_manager,
+            dispatcher=dispatcher,
         )
-    ).scalar_one_or_none()
-    if not project:
-        raise ValueError(f"Project {project_id} not found")
     await db.execute(
         select(Task.id)
         .where(Task.project_id == project_id)

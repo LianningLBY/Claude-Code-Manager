@@ -7,7 +7,10 @@ import pytest
 from sqlalchemy import select
 
 from backend.config import settings
+from backend.models.instance import Instance
+from backend.models.plan import Plan
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.project import Project
 from backend.models.task import Task
 from backend.schemas.plan import PlanModelRoute, PlanPipelineConfig
 from backend.services.codex_app_server import CodexTurnProcess
@@ -28,6 +31,25 @@ from backend.services.plan_agent_runner import (
     _validate_structured,
     _validate_structured_v2,
 )
+from backend.services.plan_runtime_receipt import prepare_runtime_attempt
+from backend.services.task_runtime_secrets import (
+    create_private_runtime_temp_dir,
+)
+
+
+TASK_INCARNATION = "b" * 32
+
+
+def _plan_runtime_tmp(owner_id: int, *, attempt: int = 1):
+    return create_private_runtime_temp_dir(
+        runtime_namespace="plan-run",
+        owner_id=owner_id,
+        generation_components={
+            "step": owner_id,
+            "run_generation": 1,
+            "attempt": attempt,
+        },
+    )
 
 
 def test_claude_plan_command_is_read_only():
@@ -314,6 +336,208 @@ async def test_pipeline_rejects_unknown_planner_provider(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_first_class_plan_target_project_drift_fails_provider_gate(
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        project = Project(name="provider-gate-project", status="ready")
+        instance = Instance(
+            name="provider-gate-instance",
+            status="running",
+        )
+        db.add_all([project, instance])
+        await db.flush()
+        target = Task(
+            title="provider gate target",
+            status="pending",
+            project_id=project.id,
+            provider="codex",
+            incarnation_id="9" * 32,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Plan(
+            title="corrupt target Project",
+            initial_request="must fail closed",
+            target_task_id=target.id,
+            project_id=None,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="standalone",
+            status="running",
+            generation=1,
+            instance_id=instance.id,
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=1,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        instance.current_plan_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        step_id = step.id
+
+    receipt = await prepare_runtime_attempt(db_factory, step_id)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+
+    with pytest.raises(
+        PlanAgentError,
+        match="target Task changed Project",
+    ):
+        await runner._prepare_provider_effect_boundary(
+            task_id=-run_id,
+            provider="codex",
+            cwd=str(tmp_path),
+            admitted_home="/private/codex-home",
+            runtime_receipt=receipt,
+        )
+
+
+@pytest.mark.asyncio
+async def test_projectless_plan_target_passes_provider_gate(
+    db_factory,
+    tmp_path,
+):
+    async with db_factory() as db:
+        instance = Instance(name="projectless-provider-gate", status="running")
+        db.add(instance)
+        await db.flush()
+        target = Task(
+            title="projectless target",
+            status="pending",
+            project_id=None,
+            provider="codex",
+            incarnation_id="8" * 32,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Plan(
+            title="projectless Plan",
+            initial_request="admit without a Project",
+            target_task_id=target.id,
+            project_id=None,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="standalone",
+            status="running",
+            generation=1,
+            instance_id=instance.id,
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=1,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        instance.current_plan_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        step_id = step.id
+
+    receipt = await prepare_runtime_attempt(db_factory, step_id)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+
+    boundary = await runner._prepare_provider_effect_boundary(
+        task_id=-run_id,
+        provider="codex",
+        cwd=str(tmp_path),
+        admitted_home="/private/codex-home",
+        runtime_receipt=receipt,
+    )
+
+    assert "/private/codex-home" in boundary[0]
+    boundary[-1].cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("app_server_enabled", "admitted_home", "message"),
+    [
+        (False, "/private/codex-home", "transport is disabled"),
+        (True, None, "explicit CODEX_HOME"),
+    ],
+)
+async def test_codex_plan_preflight_failure_cleans_private_tmpdir(
+    db_factory,
+    monkeypatch,
+    app_server_enabled,
+    admitted_home,
+    message,
+):
+    runtime_temp_dir = _plan_runtime_tmp(706)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield admitted_home, None
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        app_server_enabled,
+    )
+
+    with pytest.raises(PlanRouteUnavailable, match=message):
+        await runner._run_process_attempt(
+            task_id=706,
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort="medium",
+            cwd="/tmp",
+            prompt="must not run",
+            schema=PLANNER_SCHEMA,
+            timeout=2,
+            home=admitted_home,
+            step_id=706,
+            step_type="planner",
+            runtime_receipt=None,
+        )
+
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
 async def test_cancelled_pipeline_marks_active_step_cancelled(db_factory):
     pipeline = PlanPipelineConfig.model_validate({
         "version": 1,
@@ -441,6 +665,7 @@ async def test_codex_plan_uses_disposable_read_only_app_server_thread(
         prompt="plan safely",
         schema=PLANNER_SCHEMA,
         timeout=10,
+        runtime_temp_dir=_plan_runtime_tmp(7),
     )
 
     assert returncode == 0
@@ -458,8 +683,56 @@ async def test_codex_plan_uses_disposable_read_only_app_server_thread(
     assert kwargs["disable_project_config"] is True
     assert kwargs["disable_user_mcp"] is True
     assert kwargs["disable_autonomous_features"] is True
+    assert kwargs["task_ssh_disable_network"] is True
+    assert kwargs["task_git_read_paths"] == ()
+    assert kwargs["task_git_boundary_fingerprint"] == ()
+    assert kwargs["task_private_tmpdir"].cleaned is True
     assert kwargs["output_schema"] == PLANNER_SCHEMA
     assert kwargs["resume_session_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_codex_plan_cleans_private_tmpdir_when_thread_admission_fails(
+    db_factory,
+):
+    captured_tmpdir = None
+
+    async def fail_start(**kwargs):
+        nonlocal captured_tmpdir
+        captured_tmpdir = kwargs["task_private_tmpdir"]
+        raise RuntimeError("thread admission failed")
+
+    registry = MagicMock()
+    registry.start_turn = AsyncMock(side_effect=fail_start)
+
+    class Manager:
+        @asynccontextmanager
+        async def codex_home_app_server_guard(self, home):
+            yield home
+
+        def _ensure_codex_app_server_registry(self):
+            return registry
+
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=Manager(),
+    )
+
+    with pytest.raises(RuntimeError, match="thread admission failed"):
+        await runner._run_codex_turn(
+            task_id=704,
+            home="/canonical/default-codex-home",
+            model="gpt-5.6-sol",
+            effort="medium",
+            cwd="/tmp",
+            prompt="must not run",
+            schema=PLANNER_SCHEMA,
+            timeout=2,
+            runtime_temp_dir=_plan_runtime_tmp(704),
+        )
+
+    assert captured_tmpdir is not None
+    assert captured_tmpdir.cleaned is True
 
 
 def test_structured_json_whitespace_guard_ignores_string_content_and_escapes():
@@ -527,7 +800,7 @@ async def test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned(
         ),
     ):
         await runner._run_codex_turn(
-            task_id=-703,
+            task_id=703,
             home="/canonical/default-codex-home",
             model="gpt-5.6-sol",
             effort="medium",
@@ -536,6 +809,7 @@ async def test_codex_plan_json_whitespace_runaway_is_interrupted_and_cleaned(
             schema=PLANNER_SCHEMA_V2,
             timeout=2,
             json_whitespace_limit=16,
+            runtime_temp_dir=_plan_runtime_tmp(703),
         )
 
     assert interrupted.is_set()
@@ -603,7 +877,7 @@ async def test_codex_reviewer_delta_stall_is_persisted_and_cleaned(
         ),
     ):
         await runner._run_codex_turn(
-            task_id=-701,
+            task_id=701,
             home="/canonical/default-codex-home",
             model="gpt-5.6-sol",
             effort="xhigh",
@@ -613,6 +887,7 @@ async def test_codex_reviewer_delta_stall_is_persisted_and_cleaned(
             timeout=2,
             step_id=step_id,
             delta_idle_timeout=0.05,
+            runtime_temp_dir=_plan_runtime_tmp(701),
         )
 
     registry.delete_thread.assert_awaited_once_with(
@@ -668,7 +943,7 @@ async def test_codex_delta_idle_watchdog_allows_long_initial_reasoning(
         instance_manager=Manager(),
     )
     stdout, _stderr, returncode = await runner._run_codex_turn(
-        task_id=-702,
+        task_id=702,
         home="/canonical/default-codex-home",
         model="gpt-5.6-sol",
         effort="xhigh",
@@ -677,6 +952,7 @@ async def test_codex_delta_idle_watchdog_allows_long_initial_reasoning(
         schema=REVIEWER_SCHEMA_V2,
         timeout=2,
         delta_idle_timeout=0.05,
+        runtime_temp_dir=_plan_runtime_tmp(702),
     )
     await completion
 

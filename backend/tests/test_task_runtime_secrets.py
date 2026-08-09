@@ -5,13 +5,209 @@ import stat
 import pytest
 
 from backend.config import settings
+from backend.services import task_runtime_secrets
 from backend.services.task_runtime_secrets import (
     TaskRuntimeSecretError,
+    create_private_task_temp_dir,
     create_private_output,
+    create_private_runtime_temp_dir,
     remove_private_file,
     remove_private_scope,
     write_private_json,
 )
+
+
+def _new_task_temp(**overrides):
+    values = {
+        "task_id": 41,
+        "task_incarnation_id": "a" * 32,
+        "retry_count": 0,
+        "turn_generation": 1,
+    }
+    values.update(overrides)
+    return create_private_task_temp_dir(**values)
+
+
+def test_task_temp_is_short_private_and_generation_unique():
+    first = _new_task_temp()
+    second = _new_task_temp(turn_generation=2)
+    try:
+        assert first.path != second.path
+        assert len(os.fsencode(first.path)) <= 60
+        assert stat.S_IMODE(first.path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(first.path.stat().st_mode) == 0o700
+        first.assert_valid()
+        second.assert_valid()
+    finally:
+        first.cleanup()
+        second.cleanup()
+
+
+def test_generic_runtime_temp_uses_positive_owner_and_durable_generation():
+    first = create_private_runtime_temp_dir(
+        runtime_namespace="plan-run",
+        owner_id=73,
+        generation_components={
+            "run_generation": 4,
+            "version": "b" * 32,
+        },
+    )
+    second = create_private_runtime_temp_dir(
+        runtime_namespace="plan-run",
+        owner_id=73,
+        generation_components={
+            "run_generation": 5,
+            "version": "b" * 32,
+        },
+    )
+    try:
+        assert first.path != second.path
+        assert len(os.fsencode(first.path)) <= 60
+        assert stat.S_IMODE(first.path.stat().st_mode) == 0o700
+        first.assert_valid()
+        second.assert_valid()
+    finally:
+        first.cleanup()
+        second.cleanup()
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {
+            "runtime_namespace": "plan-run",
+            "owner_id": -1,
+            "generation_components": {"generation": 1},
+        },
+        {
+            "runtime_namespace": "Plan",
+            "owner_id": 1,
+            "generation_components": {"generation": 1},
+        },
+        {
+            "runtime_namespace": "plan-run",
+            "owner_id": 1,
+            "generation_components": {},
+        },
+        {
+            "runtime_namespace": "plan-run",
+            "owner_id": 1,
+            "generation_components": {"generation": True},
+        },
+        {
+            "runtime_namespace": "plan-run",
+            "owner_id": 1,
+            "generation_components": {"generation": "../../escape"},
+        },
+    ],
+)
+def test_generic_runtime_temp_rejects_ambiguous_identity(kwargs):
+    with pytest.raises(ValueError):
+        create_private_runtime_temp_dir(**kwargs)
+
+
+def test_task_temp_cleanup_restores_leaf_and_child_chmod_zero():
+    scratch = _new_task_temp()
+    child = scratch.path / "nested"
+    child.mkdir()
+    payload = child / "payload"
+    payload.write_text("private", encoding="utf-8")
+    child.chmod(0o000)
+    scratch.path.chmod(0o000)
+
+    scratch.cleanup()
+
+    assert scratch.cleaned
+    assert not scratch.path.exists()
+
+
+def test_task_temp_cleanup_unlinks_symlink_without_following_target(tmp_path):
+    scratch = _new_task_temp()
+    target = tmp_path / "outside"
+    target.mkdir()
+    marker = target / "keep"
+    marker.write_text("unchanged", encoding="utf-8")
+    (scratch.path / "outside-link").symlink_to(
+        target,
+        target_is_directory=True,
+    )
+
+    scratch.cleanup()
+
+    assert marker.read_text(encoding="utf-8") == "unchanged"
+    assert not scratch.path.exists()
+
+
+def test_task_temp_cleanup_refuses_replacement_symlink(tmp_path):
+    scratch = _new_task_temp()
+    original = scratch.path
+    target = tmp_path / "outside"
+    target.mkdir()
+    original.rmdir()
+    original.symlink_to(target, target_is_directory=True)
+    try:
+        with pytest.raises(TaskRuntimeSecretError, match="identity changed"):
+            scratch.cleanup()
+        assert target.is_dir()
+    finally:
+        original.unlink()
+
+
+def test_task_temp_bound_runtime_owns_cleanup():
+    scratch = _new_task_temp()
+    scratch.bind_to_runtime()
+
+    assert scratch.cleanup_if_unbound() is False
+    assert scratch.path.is_dir()
+
+    scratch.cleanup()
+    assert not scratch.path.exists()
+
+
+def test_task_temp_cleanup_depth_limit_is_bounded(monkeypatch):
+    scratch = _new_task_temp()
+    current = scratch.path
+    for index in range(4):
+        current = current / f"d{index}"
+        current.mkdir()
+    monkeypatch.setattr(
+        task_runtime_secrets,
+        "_TASK_TEMP_MAX_CLEANUP_DEPTH",
+        1,
+    )
+    with pytest.raises(TaskRuntimeSecretError, match="depth limit"):
+        scratch.cleanup()
+    assert scratch.path.exists()
+
+    monkeypatch.setattr(
+        task_runtime_secrets,
+        "_TASK_TEMP_MAX_CLEANUP_DEPTH",
+        128,
+    )
+    scratch.cleanup()
+    assert not scratch.path.exists()
+
+
+def test_task_temp_cleanup_entry_limit_is_bounded(monkeypatch):
+    scratch = _new_task_temp()
+    for index in range(4):
+        (scratch.path / f"f{index}").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(
+        task_runtime_secrets,
+        "_TASK_TEMP_MAX_CLEANUP_ENTRIES",
+        2,
+    )
+    with pytest.raises(TaskRuntimeSecretError, match="entry limit"):
+        scratch.cleanup()
+    assert scratch.path.exists()
+
+    monkeypatch.setattr(
+        task_runtime_secrets,
+        "_TASK_TEMP_MAX_CLEANUP_ENTRIES",
+        10_000,
+    )
+    scratch.cleanup()
+    assert not scratch.path.exists()
 
 
 def test_private_runtime_json_has_private_directory_and_file_modes(

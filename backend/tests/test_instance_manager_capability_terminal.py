@@ -102,6 +102,7 @@ def _process(*, pid: int, returncode: int):
     process.stdout.readline = readline
     process.stderr.read = read_stderr
     process.wait = AsyncMock(return_value=returncode)
+    process.wait_runtime_cleanup = AsyncMock(return_value=None)
     return process
 
 

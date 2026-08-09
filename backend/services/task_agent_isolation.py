@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -11,6 +12,7 @@ import shlex
 import stat
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping
 
@@ -65,6 +67,402 @@ CLAUDE_READ_ONLY_BUILTIN_TOOLS = (
 
 class TaskAgentIsolationError(RuntimeError):
     """The provider could not prove the required Task isolation boundary."""
+
+
+@dataclass(frozen=True)
+class LinkedWorktreeGitReadBoundary:
+    """Exact read-only metadata needed by Git in one linked worktree.
+
+    The common object store is necessarily shared, but config, hooks, packed
+    refs, credentials, other branch refs, and every other worktree gitdir stay
+    outside this set.  No shared Git path is ever writable by the model.
+    """
+
+    git_dir: str
+    common_dir: str
+    head_ref: str | None
+    read_paths: tuple[str, ...]
+    identity_fingerprint: tuple[tuple[object, ...], ...]
+
+
+@dataclass(frozen=True)
+class _StableGitControlFile:
+    text: str
+    identity: tuple[object, ...]
+
+
+def _read_stable_git_control_file(
+    path: Path,
+    *,
+    label: str,
+    maximum_bytes: int = 4096,
+) -> _StableGitControlFile:
+    try:
+        path_info = path.lstat()
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            f"Linked worktree {label} is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(path_info.st_mode)
+        or not stat.S_ISREG(path_info.st_mode)
+        or path_info.st_uid != os.geteuid()
+        or path_info.st_size < 1
+        or path_info.st_size > maximum_bytes
+    ):
+        raise TaskAgentIsolationError(
+            f"Linked worktree {label} is not a safe regular file"
+        )
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            f"Linked worktree {label} could not be opened safely"
+        ) from exc
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            opened.st_dev != path_info.st_dev
+            or opened.st_ino != path_info.st_ino
+            or opened.st_size != path_info.st_size
+        ):
+            raise TaskAgentIsolationError(
+                f"Linked worktree {label} changed while opening"
+            )
+        payload = os.read(descriptor, maximum_bytes + 1)
+        if len(payload) != opened.st_size or os.read(descriptor, 1):
+            raise TaskAgentIsolationError(
+                f"Linked worktree {label} changed while reading"
+            )
+        finished = os.fstat(descriptor)
+        if (
+            finished.st_dev != opened.st_dev
+            or finished.st_ino != opened.st_ino
+            or finished.st_size != opened.st_size
+            or finished.st_mtime_ns != opened.st_mtime_ns
+        ):
+            raise TaskAgentIsolationError(
+                f"Linked worktree {label} changed while reading"
+            )
+    finally:
+        os.close(descriptor)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeError as exc:
+        raise TaskAgentIsolationError(
+            f"Linked worktree {label} is not UTF-8"
+        ) from exc
+    return _StableGitControlFile(
+        text=text,
+        identity=(
+            str(path),
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_mode,
+            opened.st_uid,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+            hashlib.sha256(payload).hexdigest(),
+        ),
+    )
+
+
+def _git_path_identity(path: Path) -> tuple[object, ...]:
+    """Snapshot one path without following links, including absence."""
+
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return (str(path), "missing")
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            "Linked worktree identity boundary is unavailable"
+        ) from exc
+    return (
+        str(path),
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_uid,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        "",
+    )
+
+
+def _require_real_git_directory(path: Path, *, label: str) -> Path:
+    try:
+        lexical = Path(os.path.abspath(path))
+        resolved = lexical.resolve(strict=True)
+        info = lexical.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise TaskAgentIsolationError(
+            f"Linked worktree {label} is unavailable"
+        ) from exc
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or lexical != resolved
+    ):
+        raise TaskAgentIsolationError(
+            f"Linked worktree {label} must be a service-owned real directory"
+        )
+    return resolved
+
+
+def _safe_linked_head_ref(value: str) -> bool:
+    if (
+        not value.startswith("refs/heads/")
+        or len(value) > 512
+        or "@{" in value
+        or "//" in value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    parts = value.split("/")
+    return all(
+        part
+        and part not in {".", ".."}
+        and not part.startswith(".")
+        and not part.endswith(".")
+        and not part.endswith(".lock")
+        for part in parts
+    )
+
+
+def discover_linked_worktree_git_read_boundary(
+    working_directory: str | os.PathLike[str],
+) -> LinkedWorktreeGitReadBoundary | None:
+    """Prove the exact read-only Git projection for one linked worktree.
+
+    A normal checkout's ``.git`` directory is deliberately unsupported: its
+    config, hooks and writable object/ref database live together.  A linked
+    worktree gives CCM a separate pointer and per-worktree control files, so
+    status/diff/log can be restored with exact read mounts while every Git
+    write (including commit) remains denied.
+    """
+
+    try:
+        workspace = Path(working_directory).expanduser().resolve(strict=True)
+        workspace_info = workspace.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise TaskAgentIsolationError(
+            "Task workspace is unavailable for linked Git discovery"
+        ) from exc
+    if not stat.S_ISDIR(workspace_info.st_mode):
+        raise TaskAgentIsolationError("Task workspace is not a directory")
+    pointer_path = workspace / ".git"
+    try:
+        pointer_info = pointer_path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            "Task Git entry is unavailable"
+        ) from exc
+    if stat.S_ISDIR(pointer_info.st_mode) and not stat.S_ISLNK(pointer_info.st_mode):
+        return None
+    identity_fingerprint: list[tuple[object, ...]] = []
+    pointer_snapshot = _read_stable_git_control_file(
+        pointer_path,
+        label=".git pointer",
+    )
+    pointer = pointer_snapshot.text
+    identity_fingerprint.append(pointer_snapshot.identity)
+    if "\x00" in pointer or not pointer.startswith("gitdir:"):
+        raise TaskAgentIsolationError("Task .git pointer is malformed")
+    raw_git_dir = pointer[len("gitdir:"):].strip()
+    if not raw_git_dir or "\n" in raw_git_dir or "\r" in raw_git_dir:
+        raise TaskAgentIsolationError("Task .git pointer is malformed")
+    git_dir_path = Path(raw_git_dir).expanduser()
+    if not git_dir_path.is_absolute():
+        git_dir_path = workspace / git_dir_path
+    git_dir = _require_real_git_directory(
+        git_dir_path,
+        label="per-worktree gitdir",
+    )
+    if git_dir.parent.name != "worktrees":
+        raise TaskAgentIsolationError(
+            "Task .git pointer does not target linked-worktree metadata"
+        )
+
+    commondir_path = git_dir / "commondir"
+    commondir_snapshot = _read_stable_git_control_file(
+        commondir_path,
+        label="commondir",
+    )
+    commondir_value = commondir_snapshot.text.strip()
+    identity_fingerprint.append(commondir_snapshot.identity)
+    if not commondir_value or "\n" in commondir_value or "\r" in commondir_value:
+        raise TaskAgentIsolationError("Linked worktree commondir is malformed")
+    common_candidate = Path(commondir_value).expanduser()
+    if not common_candidate.is_absolute():
+        common_candidate = git_dir / common_candidate
+    common_dir = _require_real_git_directory(
+        common_candidate,
+        label="common gitdir",
+    )
+    if git_dir.parent.parent != common_dir:
+        raise TaskAgentIsolationError(
+            "Linked worktree gitdir is outside its common metadata root"
+        )
+
+    backlink_path = git_dir / "gitdir"
+    backlink_snapshot = _read_stable_git_control_file(
+        backlink_path,
+        label="gitdir backlink",
+    )
+    backlink = backlink_snapshot.text.strip()
+    identity_fingerprint.append(backlink_snapshot.identity)
+    backlink_candidate = Path(backlink).expanduser()
+    if not backlink_candidate.is_absolute():
+        backlink_candidate = git_dir / backlink_candidate
+    try:
+        backlink_resolved = backlink_candidate.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise TaskAgentIsolationError(
+            "Linked worktree gitdir backlink is unavailable"
+        ) from exc
+    if backlink_resolved != pointer_path:
+        raise TaskAgentIsolationError(
+            "Linked worktree gitdir backlink targets another workspace"
+        )
+
+    head_path = git_dir / "HEAD"
+    head_snapshot = _read_stable_git_control_file(
+        head_path,
+        label="HEAD",
+    )
+    head_value = head_snapshot.text.strip()
+    identity_fingerprint.append(head_snapshot.identity)
+    head_ref: str | None = None
+    read_paths = {
+        str(pointer_path),
+        str(head_path),
+        str(commondir_path),
+        str(git_dir / "index"),
+    }
+    if head_value.startswith("ref:"):
+        head_ref = head_value[len("ref:"):].strip()
+        if not _safe_linked_head_ref(head_ref):
+            raise TaskAgentIsolationError(
+                "Linked worktree HEAD is not a safe local branch ref"
+            )
+        ref_path = common_dir.joinpath(*head_ref.split("/"))
+        try:
+            ref_info = ref_path.lstat()
+        except FileNotFoundError:
+            # An unborn branch is safe only when no packed ref database can
+            # silently supply a different shared branch value.
+            if (common_dir / "packed-refs").exists():
+                raise TaskAgentIsolationError(
+                    "Linked worktree branch is not an exact loose ref"
+                )
+            identity_fingerprint.append(_git_path_identity(ref_path))
+        except OSError as exc:
+            raise TaskAgentIsolationError(
+                "Linked worktree branch ref is unavailable"
+            ) from exc
+        else:
+            if (
+                stat.S_ISLNK(ref_info.st_mode)
+                or not stat.S_ISREG(ref_info.st_mode)
+                or ref_info.st_uid != os.geteuid()
+                or ref_path.resolve(strict=True) != ref_path
+            ):
+                raise TaskAgentIsolationError(
+                    "Linked worktree branch ref is not a safe regular file"
+                )
+            ref_snapshot = _read_stable_git_control_file(
+                ref_path,
+                label="branch ref",
+            )
+            if re.fullmatch(
+                r"(?:[0-9a-f]{40}|[0-9a-f]{64})\n?",
+                ref_snapshot.text,
+            ) is None:
+                raise TaskAgentIsolationError(
+                    "Linked worktree branch ref is malformed"
+                )
+            identity_fingerprint.append(ref_snapshot.identity)
+        read_paths.add(str(ref_path))
+    elif re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head_value) is None:
+        raise TaskAgentIsolationError("Linked worktree HEAD is malformed")
+
+    object_dir = _require_real_git_directory(
+        common_dir / "objects",
+        label="object database",
+    )
+    read_paths.add(str(object_dir))
+    identity_fingerprint.extend((
+        _git_path_identity(workspace),
+        _git_path_identity(git_dir),
+        _git_path_identity(common_dir),
+        _git_path_identity(object_dir),
+        _git_path_identity(common_dir / "packed-refs"),
+    ))
+    index_path = git_dir / "index"
+    try:
+        index_info = index_path.lstat()
+    except FileNotFoundError:
+        identity_fingerprint.append(_git_path_identity(index_path))
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            "Linked worktree index is unavailable"
+        ) from exc
+    else:
+        if (
+            stat.S_ISLNK(index_info.st_mode)
+            or not stat.S_ISREG(index_info.st_mode)
+            or index_info.st_uid != os.geteuid()
+            or index_path.resolve(strict=True) != index_path
+        ):
+            raise TaskAgentIsolationError(
+                "Linked worktree index is not a safe regular file"
+            )
+        identity_fingerprint.append(_git_path_identity(index_path))
+    shallow_path = common_dir / "shallow"
+    try:
+        shallow_info = shallow_path.lstat()
+    except FileNotFoundError:
+        identity_fingerprint.append(_git_path_identity(shallow_path))
+    except OSError as exc:
+        raise TaskAgentIsolationError(
+            "Linked worktree shallow boundary is unavailable"
+        ) from exc
+    else:
+        if (
+            stat.S_ISLNK(shallow_info.st_mode)
+            or not stat.S_ISREG(shallow_info.st_mode)
+            or shallow_info.st_uid != os.geteuid()
+            or shallow_path.resolve(strict=True) != shallow_path
+        ):
+            raise TaskAgentIsolationError(
+                "Linked worktree shallow boundary is unsafe"
+            )
+        read_paths.add(str(shallow_path))
+        shallow_snapshot = _read_stable_git_control_file(
+            shallow_path,
+            label="shallow boundary",
+            maximum_bytes=1024 * 1024,
+        )
+        identity_fingerprint.append(shallow_snapshot.identity)
+    return LinkedWorktreeGitReadBoundary(
+        git_dir=str(git_dir),
+        common_dir=str(common_dir),
+        head_ref=head_ref,
+        read_paths=tuple(sorted(read_paths)),
+        identity_fingerprint=tuple(sorted(identity_fingerprint, key=str)),
+    )
 
 
 def explicit_git_credential_paths(

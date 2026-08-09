@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import uuid
 from contextlib import AsyncExitStack
@@ -24,6 +25,7 @@ from backend.schemas.task import (
     TaskCreate,
     InternalTaskSkillsUpdate,
     TaskMigrationImport,
+    TaskMigrationImportResponse,
     TaskResponse,
     TaskRoutingExpectation,
     TaskTerminationRequest,
@@ -40,7 +42,9 @@ from backend.services.task_queue import (
     task_delete_fence,
 )
 from backend.services.task_creation import (
+    SOURCE_TASK_INCARNATION_METADATA_KEY,
     prepare_task_create_values,
+    purge_task_access_grants,
     stage_task_record,
     validate_task_service_tier_configuration,
 )
@@ -201,6 +205,60 @@ def _require_not_delivery_owned_task(task: Task, *, action: str) -> None:
             f"Delivery-owned Tasks cannot be manually {action}; use Delivery Run"
             f"{suffix} controls so the Plan/Code/Review/PR evidence stays fenced",
         )
+
+
+def _require_migration_import_eligible(
+    task: Task,
+    body: TaskMigrationImport,
+) -> str | None:
+    """Validate one exact destination row before a Worker import refresh."""
+
+    _require_not_delivery_owned_task(task, action="migration-imported")
+    if task.mode == "plan" or task.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            "Existing Plan carriers are immutable and cannot be "
+            "migration-imported",
+        )
+    if task.mode != body.mode:
+        raise HTTPException(
+            409,
+            "Migration import cannot change an existing Task mode",
+        )
+    if task.capability_policy is not None:
+        raise HTTPException(
+            409,
+            "Destination Task has an immutable local Auto capability policy "
+            "and cannot be migration-imported",
+        )
+    bound_source_incarnation = (task.metadata_ or {}).get(
+        SOURCE_TASK_INCARNATION_METADATA_KEY
+    )
+    if body.source_incarnation_id is None and (
+        not isinstance(task.incarnation_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", task.incarnation_id) is None
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task has no verifiable incarnation identity",
+        )
+    if bound_source_incarnation is not None and (
+        not isinstance(bound_source_incarnation, str)
+        or bound_source_incarnation != task.incarnation_id
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task has a corrupt source incarnation binding",
+        )
+    if (
+        bound_source_incarnation is not None
+        and body.source_incarnation_id != bound_source_incarnation
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task is bound to a different source incarnation",
+        )
+    return bound_source_incarnation
 
 
 def _require_no_pending_worker_turn_handoff(task: Task) -> None:
@@ -1205,7 +1263,11 @@ async def create_task(
     return task
 
 
-@router.post("/migration-import", response_model=TaskResponse, status_code=201)
+@router.post(
+    "/migration-import",
+    response_model=TaskMigrationImportResponse,
+    status_code=201,
+)
 async def import_migrated_task(
     request: Request,
     body: TaskMigrationImport,
@@ -1236,31 +1298,14 @@ async def import_migrated_task(
 
     existing = await db.get(Task, body.id)
     if existing is not None:
-        _require_not_delivery_owned_task(existing, action="migration-imported")
-        if existing.mode == "plan" or existing.canonical_plan_id is not None:
-            raise HTTPException(
-                409,
-                "Existing Plan carriers are immutable and cannot be "
-                "migration-imported",
-            )
-        if existing.mode != body.mode:
-            raise HTTPException(
-                409,
-                "Migration import cannot change an existing Task mode",
-            )
-        # Migration import may refresh an inert Worker copy, but it must never
-        # repurpose a same-id local Auto Task that carries immutable capability
-        # authority.  The wire schema deliberately omits the policy, so merely
-        # excluding that field from the UPDATE would retain it on the imported
-        # Worker mirror and bypass the local-only scope boundary.
-        if existing.capability_policy is not None:
-            raise HTTPException(
-                409,
-                "Destination Task has an immutable local Auto capability "
-                "policy and cannot be migration-imported",
-            )
+        _require_migration_import_eligible(existing, body)
 
     data = body.model_dump()
+    # ``source_incarnation_id`` is a transport-only name.  New imports map it
+    # inside ``stage_task_record``; the UPDATE path must perform the same
+    # mapping explicitly because it writes Task columns directly.  An omitted
+    # source fence deliberately preserves the destination row's incarnation.
+    source_incarnation_id = data.pop("source_incarnation_id", None)
     source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
     ssh_grants = data.pop("ssh_grants", None)
@@ -1285,6 +1330,18 @@ async def import_migrated_task(
     migration_metadata = {
         WORKER_MANAGED_TASK_METADATA_KEY: True,
     }
+    if existing is not None:
+        existing_binding = (existing.metadata_ or {}).get(
+            SOURCE_TASK_INCARNATION_METADATA_KEY
+        )
+        if existing_binding is not None:
+            migration_metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = (
+                existing_binding
+            )
+    if source_incarnation_id is not None:
+        migration_metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = (
+            source_incarnation_id
+        )
     if user_skill_snapshots is not None:
         migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
     data["metadata_"] = migration_metadata
@@ -1321,9 +1378,13 @@ async def import_migrated_task(
     if existing is None:
         # The first visible state is already inert.  In particular there is no
         # pending commit and no dispatcher.wake() between create and cancel.
-        return await queue.create(**data)
+        return await queue.create(
+            source_incarnation_id=source_incarnation_id,
+            **data,
+        )
 
     old_status = existing.status
+    observed_incarnation_id = existing.incarnation_id
     existing_generation = _task_generation_fence(body.id, existing)
     if old_status in ("in_progress", "executing", "migrating"):
         raise HTTPException(
@@ -1332,20 +1393,66 @@ async def import_migrated_task(
         )
 
     values = {key: value for key, value in data.items() if key != "id"}
+    if source_incarnation_id is not None:
+        values["incarnation_id"] = source_incarnation_id
     # End every validation read before competing with receipt admission.  The
     # no-op/write CAS below must be the first statement of a fresh transaction
     # so a receipt that committed through another SQLite WAL connection cannot
     # turn this into BUSY_SNAPSHOT or be overwritten by the stale import.
     await db.rollback()
     async with get_task_operation_lock(body.id):
+        fence_predicates = (
+            *existing_generation,
+            (
+                Task.incarnation_id.is_(None)
+                if observed_incarnation_id is None
+                else Task.incarnation_id == observed_incarnation_id
+            ),
+            Task.mode != "delivery_loop",
+            Task.delivery_run_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        writer_fence = await db.execute(
+            sa_update(Task)
+            .where(*fence_predicates)
+            .values(id=Task.id)
+            .execution_options(synchronize_session=False)
+        )
+        if writer_fence.rowcount != 1:
+            await db.rollback()
+            if await active_worker_task_termination_receipt(db, body.id):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Destination task has an active Worker termination receipt",
+                )
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task changed during migration import",
+            )
+        db.expire_all()
+        locked_existing = await db.get(
+            Task,
+            body.id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if locked_existing is None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task disappeared during migration import",
+            )
+        try:
+            _require_migration_import_eligible(locked_existing, body)
+        except HTTPException:
+            await db.rollback()
+            raise
+
         result = await db.execute(
             sa_update(Task)
-            .where(
-                *existing_generation,
-                Task.mode != "delivery_loop",
-                Task.delivery_run_id.is_(None),
-                no_active_worker_task_termination_predicate(),
-            )
+            .where(*fence_predicates)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -1362,6 +1469,7 @@ async def import_migrated_task(
                 409,
                 "Destination task changed during migration import",
             )
+        await purge_task_access_grants(db, body.id)
         db.expire_all()
         task = await db.get(Task, body.id)
         if task is None:
@@ -1371,6 +1479,7 @@ async def import_migrated_task(
                 "Destination task disappeared during migration import",
             )
         publication_generation = _task_generation_fence(body.id, task)
+        resulting_incarnation_id = task.incarnation_id
         await db.commit()
 
         if old_status != source_status:
@@ -1383,6 +1492,11 @@ async def import_migrated_task(
                 sa_update(Task)
                 .where(
                     *publication_generation,
+                    (
+                        Task.incarnation_id.is_(None)
+                        if resulting_incarnation_id is None
+                        else Task.incarnation_id == resulting_incarnation_id
+                    ),
                     no_active_worker_task_termination_predicate(),
                 )
                 .values(status=source_status)

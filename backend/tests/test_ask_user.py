@@ -6,6 +6,8 @@
 """
 import asyncio
 import json
+import os
+import socket
 import subprocess
 import sys
 import threading
@@ -347,14 +349,19 @@ def test_inject_hook_carries_cli_timeout(tmp_path):
 _HOOK_SCRIPT = Path(__file__).resolve().parents[1] / "hooks" / "ask_user_hook.py"
 
 
-def _run_hook_against(response_body: dict) -> subprocess.CompletedProcess:
+def _run_hook_against(
+    response_body: dict,
+    *,
+    status: int = 200,
+    scoped_token: bool = False,
+) -> subprocess.CompletedProcess:
     """跑真实 hook 脚本，stub 后端返回给定 /wait 响应。"""
 
     class _Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             body = json.dumps(response_body).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -371,11 +378,20 @@ def _run_hook_against(response_body: dict) -> subprocess.CompletedProcess:
             "session_id": "sid-hook-test",
             "tool_input": {"questions": [{"question": "?"}]},
         })
+        env = os.environ.copy()
+        if scoped_token:
+            env["CCM_ASK_USER_TOKEN"] = "scoped-hook-test-token"
+        else:
+            env.pop("CCM_ASK_USER_TOKEN", None)
         return subprocess.run(
             [sys.executable, str(_HOOK_SCRIPT),
              "--api-base", f"http://127.0.0.1:{srv.server_address[1]}",
              "--timeout", "10"],
-            input=payload, capture_output=True, text=True, timeout=30,
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
         )
     finally:
         srv.shutdown()
@@ -410,6 +426,81 @@ def test_hook_script_stale_generation_revocation_denies_not_fail_open():
     reason = out["hookSpecificOutput"]["permissionDecisionReason"]
     assert "Task generation changed" in reason
     assert "best judgment" in reason
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 410])
+def test_hook_script_scoped_http_rejection_denies_not_fail_open(status):
+    cp = _run_hook_against(
+        {"detail": "Internal hook Task generation is stale"},
+        status=status,
+        scoped_token=True,
+    )
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "generation is stale" in reason
+    assert "best judgment" in reason
+
+
+def test_hook_script_structured_stale_http_response_denies_without_token():
+    cp = _run_hook_against(
+        {"answered": False, "revoked": True, "reason": "Generation revoked."},
+        status=422,
+    )
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Generation revoked" in out["hookSpecificOutput"][
+        "permissionDecisionReason"
+    ]
+
+
+def test_hook_script_scoped_server_error_denies_not_fail_open():
+    cp = _run_hook_against(
+        {"detail": "temporary failure"},
+        status=503,
+        scoped_token=True,
+    )
+    assert cp.returncode == 0
+    out = json.loads(cp.stdout)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "best judgment" in out["hookSpecificOutput"][
+        "permissionDecisionReason"
+    ]
+
+
+def test_hook_script_true_network_unreachable_still_fails_open():
+    payload = json.dumps({
+        "tool_name": "AskUserQuestion",
+        "session_id": "sid-unreachable-test",
+        "tool_input": {"questions": [{"question": "?"}]},
+    })
+    env = os.environ.copy()
+    env["CCM_ASK_USER_TOKEN"] = "scoped-unreachable-test-token"
+    with socket.socket() as probe:
+        # Keep the port bound but deliberately not listening so another test
+        # process cannot claim it between discovery and the hook connection.
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        cp = subprocess.run(
+            [
+                sys.executable,
+                str(_HOOK_SCRIPT),
+                "--api-base",
+                f"http://127.0.0.1:{port}",
+                "--timeout",
+                "2",
+            ],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+    assert cp.returncode == 0
+    assert cp.stdout.strip() == ""
+    assert "CCM unreachable" in cp.stderr
 
 
 def test_hook_script_no_session_fails_open():

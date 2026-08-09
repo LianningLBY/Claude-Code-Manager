@@ -12,12 +12,19 @@ import pytest
 from sqlalchemy import func, select
 
 from backend.models.discussion import Discussion, DiscussionAgent, DiscussionEvent
+from backend.models.project import Project
+from backend.models.team_share import TeamProjectShare
 from backend.models.user import User
 from backend.services import discussion_service
 from backend.services.discussion_service import (
     DiscussionProcessCleanupError,
     DiscussionSecurityError,
     DiscussionService,
+)
+from backend.services.project_share_admission import (
+    ProjectShareAdmissionError,
+    lock_project_share_authority,
+    require_project_agents_quiescent,
 )
 
 
@@ -50,6 +57,34 @@ async def _wait_for_process(
             return process
         await asyncio.sleep(0.01)
     raise AssertionError("discussion subprocess was not registered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["active", "closing"])
+async def test_active_and_closing_discussions_veto_first_project_share(
+    db_factory,
+    status,
+):
+    async with db_factory() as db:
+        project = Project(name=f"discussion-share-lease-{status}", status="ready")
+        db.add(project)
+        await db.flush()
+        db.add(Discussion(
+            title=f"{status} provider lease",
+            project_id=project.id,
+            status=status,
+        ))
+        await db.commit()
+        project_id = project.id
+
+    async with db_factory() as db:
+        project = await lock_project_share_authority(db, project_id)
+        with pytest.raises(
+            ProjectShareAdmissionError,
+            match="active or closing Project Discussion",
+        ):
+            await require_project_agents_quiescent(db, project)
+        await db.rollback()
 
 
 @pytest.mark.asyncio
@@ -275,6 +310,7 @@ async def test_shutdown_cancels_and_reaps_facilitator(monkeypatch):
                 id=11,
                 facilitator_model="model",
                 facilitator_session_id=None,
+                project_id=None,
             ),
             "prompt",
         )
@@ -604,6 +640,75 @@ async def test_auth_disabled_discussion_rejected_before_provider_effect(
 
 
 @pytest.mark.asyncio
+async def test_preclaimed_agent_becomes_visible_error_when_final_share_gate_vetoes(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(discussion_service.settings, "auth_token", "configured")
+    async with db_factory() as db:
+        project = Project(name="discussion-final-share-gate", status="ready")
+        db.add(project)
+        await db.flush()
+        discussion = Discussion(
+            title="final share gate",
+            project_id=project.id,
+            status="active",
+        )
+        db.add(discussion)
+        await db.flush()
+        agent = DiscussionAgent(
+            discussion_id=discussion.id,
+            role_name="reviewer",
+            system_prompt="review",
+            status="running",
+            pid=None,
+        )
+        db.add(agent)
+        db.add(TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=993,
+            shared_by=0,
+        ))
+        await db.commit()
+        project_id = project.id
+        discussion_id = discussion.id
+        agent_id = agent.id
+
+    spawn = AsyncMock()
+    monkeypatch.setattr(
+        discussion_service.asyncio,
+        "create_subprocess_exec",
+        spawn,
+    )
+    service = DiscussionService(db_factory, _Broadcaster())
+
+    with pytest.raises(DiscussionSecurityError, match="shared"):
+        await service._run_and_consume(
+            agent_id,
+            discussion_id,
+            ["-p", "review"],
+            {},
+            security_context=discussion_service._DiscussionClaudeSecurityContext(
+                discussion_id=discussion_id,
+                namespace="discussion-agent",
+                identifier=agent_id,
+                model="model",
+                resume_session_id=None,
+                repository_cwd=None,
+                binding="preclaimed-final-share-gate",
+                project_id=project_id,
+            ),
+        )
+
+    spawn.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(DiscussionAgent, agent_id)
+        assert current.status == "error"
+        assert current.pid is None
+
+
+@pytest.mark.asyncio
 async def test_stop_agent_waits_for_consumer_finalization(db_factory):
     async with db_factory() as db:
         discussion = Discussion(title="delete fence")
@@ -696,7 +801,7 @@ async def test_delete_barrier_blocks_stale_agent_launch(db_factory):
     result = await asyncio.gather(triggering, return_exceptions=True)
 
     assert len(result) == 1
-    assert isinstance(result[0], ValueError)
+    assert isinstance(result[0], DiscussionSecurityError)
     assert launches == []
 
 

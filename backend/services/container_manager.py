@@ -1319,18 +1319,20 @@ class ContainerManager:
 
 
 async def is_shared_project(project_id: int | None, db_factory) -> bool:
-    """Check if a project has been shared to any user."""
+    """Check unified Team/Feishu visibility behind a Project writer fence."""
     if not project_id:
         return False
-    from sqlalchemy import select
-    from backend.models.team_share import TeamProjectShare
+    from backend.services.project_share_admission import (
+        lock_project_share_authority,
+        project_has_active_share,
+    )
+
     async with db_factory() as db:
-        result = await db.execute(
-            select(TeamProjectShare.id).where(
-                TeamProjectShare.project_id == project_id
-            ).limit(1)
-        )
-        return result.scalar_one_or_none() is not None
+        # The lock pairs with the 0 -> >0 share transition fence. If sharing
+        # won first, launch observes the committed grant; if launch already
+        # published its reservation, the share path returns 409 instead.
+        await lock_project_share_authority(db, project_id)
+        return await project_has_active_share(db, project_id)
 
 
 async def build_sandbox_image():

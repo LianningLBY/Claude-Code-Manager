@@ -4,7 +4,6 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
-from backend.config import settings
 from backend.database import get_db
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
@@ -183,7 +182,9 @@ async def create_instance(
     # Without it two simultaneous API/dispatcher admissions can both observe a
     # free slot and exceed the configured hard cap.
     async with instance_capacity_lock:
-        cap = settings.max_concurrent_instances
+        from backend.main import dispatcher
+
+        cap = dispatcher.max_concurrent_instances
         if cap > 0:
             live_count = await db.scalar(
                 select(func.count(Instance.id)).where(

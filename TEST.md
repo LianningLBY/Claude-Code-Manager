@@ -1040,9 +1040,12 @@ python -m pytest \
 
 | 步骤 | 谁 | 做什么 |
 |------|-----|--------|
-| 1 | 人 | 一次性创建 10 个任务 |
-| 2 | 人 | 观察同时 executing 的任务数量 |
-| 3 | AI | 查 DB `SELECT COUNT(*) FROM instances WHERE status='running'`，确认不超过 MAX_CONCURRENT_INSTANCES |
+| 1 | 人 | 在管理员 Settings 将本地并发上限改为 3 |
+| 2 | 人 | 一次性创建 10 个本地任务，确认同时 executing 的任务不超过 3 |
+| 3 | 人 | 运行中把上限降为 1，确认已有任务不中断且新任务等待 |
+| 4 | 人 | 把上限升为 4，确认无需重启即可继续领取等待任务 |
+| 5 | AI | 调 `GET /api/settings/capacity` 并查 running Instance，核对 effective/active/pending 状态 |
+| 6 | 人 | 点击“恢复环境默认值”，确认重新使用 `MAX_CONCURRENT_INSTANCES` |
 
 ### 测试 7：前端 UI 状态
 

@@ -153,6 +153,16 @@ export interface RuntimeSettings {
   context_compact_threshold: number;
 }
 
+export interface CapacitySettings {
+  max_concurrent_instances: number;
+  configured_override: number | null;
+  env_default: number;
+  min_idle_instances: number;
+  active_instances: number;
+  live_instances: number;
+  pending_tasks: number;
+}
+
 export interface GlobalSettings {
   git_author_name: string | null;
   git_author_email: string | null;
@@ -1652,6 +1662,12 @@ export const api = {
   getRuntimeSettings: () => request<RuntimeSettings>('/api/settings/runtime'),
   updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
     request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(data) }),
+  getCapacitySettings: () => request<CapacitySettings>('/api/settings/capacity'),
+  updateCapacitySettings: (maxConcurrentInstances: number | null) =>
+    request<CapacitySettings>('/api/settings/capacity', {
+      method: 'PUT',
+      body: JSON.stringify({ max_concurrent_instances: maxConcurrentInstances }),
+    }),
   getGitSettings: () => request<GlobalSettings>('/api/settings/git'),
   updateGitSettings: (data: Partial<GlobalSettings>) =>
     request<GlobalSettings>('/api/settings/git', { method: 'PUT', body: JSON.stringify(data) }),

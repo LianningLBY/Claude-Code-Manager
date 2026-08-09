@@ -519,7 +519,7 @@ All APIs (except health, login, github webhook) require `Authorization: Bearer <
 | `VERIFICATION_CODE_RESEND_COOLDOWN_SECONDS` | `60` | Min interval between two sends for same email (seconds) |
 | `VERIFICATION_CODE_SMTP_CONCURRENCY` | `4` | Max concurrent SMTP deliveries per process |
 | `WORKSPACE_DIR` | `~/Projects` | Project clone target directory |
-| `MAX_CONCURRENT_INSTANCES` | `5` | Max concurrent workers |
+| `MAX_CONCURRENT_INSTANCES` | `8` | Default local Task/Plan concurrency limit; administrators can override it live in Settings without restarting |
 | `AUTO_START_DISPATCHER` | `true` | Auto-start scheduler on startup |
 | `TASK_TIMEOUT_SECONDS` | `1800` | Max execution time per task (seconds) |
 | `SERVICE_NAME` | (Auto-detect) | systemd service name, used for one-click update restart |

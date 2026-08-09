@@ -957,6 +957,9 @@ class GlobalDispatcher:
         # row before either reaches `_launching_instances.add()`.
         self._instance_claim_lock = asyncio.Lock()
         self._instance_claim_owners: dict[int, tuple[object, asyncio.Task | None]] = {}
+        # None follows the process environment. A persisted DB override is
+        # loaded before start() and may be replaced live by the admin API.
+        self._max_concurrent_instances_override: int | None = None
         # Startup reconciliation and queued-chat Phase 1 share this gate.
         # A queued turn may do slow account/session preparation after reserving
         # an idle slot; start() must either observe that spawned generation or
@@ -1072,6 +1075,40 @@ class GlobalDispatcher:
     @property
     def is_running(self) -> bool:
         return self._running
+
+    @property
+    def max_concurrent_instances(self) -> int:
+        # Some narrow tests construct a Dispatcher via ``__new__`` to isolate
+        # capacity helpers; treat the absent field like the normal env fallback.
+        override = getattr(self, "_max_concurrent_instances_override", None)
+        return (
+            override
+            if override is not None
+            else settings.max_concurrent_instances
+        )
+
+    def configure_capacity_override(self, override: int | None) -> None:
+        """Load the durable override before execution runtimes start."""
+
+        if self._running:
+            raise RuntimeError(
+                "running Dispatcher capacity must be updated asynchronously"
+            )
+        self._max_concurrent_instances_override = override
+
+    async def apply_capacity_override(self, override: int | None) -> None:
+        """Apply a persisted capacity override without interrupting active work."""
+
+        # Serialize both slot creation and idle->launch reservations across the
+        # value switch. A creator/claimer therefore observes either the old or
+        # new complete policy, never a half-applied update.
+        async with instance_capacity_lock:
+            async with self._instance_claim_lock:
+                self._max_concurrent_instances_override = override
+
+        if self._running:
+            await self._ensure_instances()
+            self.wake()
 
     async def stop_plan_agent_lifecycle(
         self,
@@ -2344,7 +2381,7 @@ class GlobalDispatcher:
                 for iid, task in self._running_tasks.items()
                 if type(iid) is int and not task.done()
             } | self._launching_instances
-            cap = settings.max_concurrent_instances
+            cap = self.max_concurrent_instances
             if cap > 0:
                 occupied_iids = (
                     set(
@@ -4557,7 +4594,7 @@ class GlobalDispatcher:
                 live_count = sum(
                     1 for instance in existing if instance_occupies_slot(instance)
                 )
-                needed = settings.max_concurrent_instances - live_count
+                needed = self.max_concurrent_instances - live_count
                 if needed <= 0:
                     return
                 base = 0
@@ -4598,7 +4635,7 @@ class GlobalDispatcher:
                     return
                 # Terminal error/stopped rows hold no process and must not consume
                 # the live concurrency cap.
-                cap = settings.max_concurrent_instances
+                cap = self.max_concurrent_instances
                 if cap > 0 and live_count + needed > cap:
                     needed = max(0, cap - live_count)
                 if needed <= 0:

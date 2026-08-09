@@ -83,15 +83,16 @@ def main() -> None:
         return
 
     if not data.get("answered"):
-        if data.get("timed_out"):
-            # 超时不再放行：PTY 下原生 AskUserQuestion 会弹无人应答的交互框，
-            # 冻死整个 turn。deny + 引导模型自行决策继续（-p 模式同样适用）。
+        if data.get("timed_out") or data.get("revoked"):
+            # 超时/代次撤销都不再放行：PTY 下原生 AskUserQuestion 会弹无人
+            # 应答的交互框，冻死整个 turn。deny + 引导模型自行决策继续。
+            detail = data.get("reason") or "No user response within the waiting window."
             print(json.dumps({
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
                     "permissionDecision": "deny",
                     "permissionDecisionReason": (
-                        "No user response within the waiting window. Do not call "
+                        f"{detail} Do not call "
                         "AskUserQuestion again for this decision. Proceed with your "
                         "best judgment, state the assumption you chose, and let the "
                         "user correct it later."

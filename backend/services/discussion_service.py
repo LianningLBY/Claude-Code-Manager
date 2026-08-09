@@ -34,7 +34,6 @@ from backend.services.task_agent_isolation import (
     CLAUDE_READ_ONLY_BUILTIN_TOOLS,
     TaskAgentIsolationError,
     generate_claude_read_only_isolation_settings,
-    require_task_security_boundary_configured,
     scrub_task_model_environment,
     validate_claude_task_isolation_settings,
 )
@@ -184,7 +183,6 @@ class DiscussionService:
         """Build one exact read-only Claude route immediately before spawn."""
 
         try:
-            require_task_security_boundary_configured()
             async with self.db_factory() as db:
                 from backend.models.user import User
 

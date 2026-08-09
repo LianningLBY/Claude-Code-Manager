@@ -68,8 +68,9 @@ class _SSHProfileConnectionFields(BaseModel):
 
 
 class SSHProfileCreate(_SSHProfileConnectionFields):
-    key_path: str | None = Field(default=None, min_length=1, max_length=1000)
-    key_upload_token: str | None = Field(default=None, min_length=1, max_length=128)
+    model_config = ConfigDict(extra="forbid")
+
+    key_upload_token: str = Field(min_length=1, max_length=128)
     host_key_value: str = Field(min_length=1, max_length=16384)
     enabled: bool = True
     task_access_enabled: bool = False
@@ -90,19 +91,19 @@ class SSHProfileCreate(_SSHProfileConnectionFields):
         return normalize_allowed_roots(value)
 
     @model_validator(mode="after")
-    def exactly_one_key_source(self):
-        if bool(self.key_path) == bool(self.key_upload_token):
-            raise ValueError("provide exactly one of key_path or key_upload_token")
+    def validate_task_policy(self):
         _validate_task_policy(self.task_access_enabled, self.task_capabilities)
         return self
 
 
 class SSHProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_revision: int = Field(ge=1)
     name: str | None = Field(default=None, min_length=1, max_length=100)
     host: str | None = Field(default=None, min_length=1, max_length=253)
     port: int | None = Field(default=None, ge=1, le=65535)
     username: str | None = Field(default=None, min_length=1, max_length=255)
-    key_path: str | None = Field(default=None, max_length=1000)
     key_upload_token: str | None = Field(default=None, min_length=1, max_length=128)
     host_key_value: str | None = Field(default=None, min_length=1, max_length=16384)
     enabled: bool | None = None
@@ -152,20 +153,6 @@ class SSHProfileUpdate(BaseModel):
         if not normalized:
             raise ValueError("value must not be blank")
         return normalized
-
-    @field_validator("key_path")
-    @classmethod
-    def blank_key_path_keeps_existing(cls, value: str | None) -> str | None:
-        if value is None or not value.strip():
-            return None
-        return value.strip()
-
-    @model_validator(mode="after")
-    def one_key_source_at_most(self):
-        if self.key_path and self.key_upload_token:
-            raise ValueError("provide only one of key_path or key_upload_token")
-        return self
-
 
 class SSHHostKeyProbeRequest(BaseModel):
     host: str = Field(min_length=1, max_length=253)

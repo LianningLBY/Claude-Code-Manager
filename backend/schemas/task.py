@@ -51,6 +51,13 @@ def _normalize_attention_tag(value: object) -> object:
 class TaskCreate(BaseModel):
     # Internal Manager→Worker forwarding only: Manager allocates the global ID.
     id: int | None = None
+    # Internal Manager→Worker identity fence. Worker mirrors reuse the exact
+    # logical incarnation so every later remote mutation can reject Task-id
+    # ABA. Public callers cannot combine this with an explicit id.
+    source_incarnation_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
     # None = 本机执行；有值 = 创建后由 Dispatcher 转发到该 Worker
     worker_id: int | None = None
     # TaskMigrator 在目标机重建 task 时带上（跨机 --resume 续聊）

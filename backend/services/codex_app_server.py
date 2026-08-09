@@ -450,15 +450,22 @@ def _task_ssh_permission_config(
 ) -> dict[str, Any]:
     """Build a request-local Codex profile that hides host credentials."""
 
-    filesystem: dict[str, str] = {"/": "read"}
+    # ``network.enabled=true`` also enables AF_UNIX on Linux; Codex 0.144.6's
+    # network unix-socket deny is not enforced there. A root-readable profile
+    # would therefore let an ordinary networked Task rediscover Manager or
+    # provider sockets. Default-deny the host filesystem, admit only Codex's
+    # fixed executable/runtime roots, then grant the exact workspace and any
+    # explicitly authorized Git credential files.
+    filesystem: dict[str, str] = {
+        ":root": "deny",
+        ":minimal": "read",
+    }
+    workspace = os.path.abspath(cwd)
     if sandbox_mode == "workspace-write":
-        for writable in {
-            os.path.abspath(cwd),
-            os.path.abspath(os.environ.get("TMPDIR") or "/tmp"),
-            "/tmp",
-        }:
-            filesystem[writable] = "write"
-    elif sandbox_mode != "read-only":
+        filesystem[workspace] = "write"
+    elif sandbox_mode == "read-only":
+        filesystem[workspace] = "read"
+    else:
         raise ValueError("Task isolation requires a sandboxed Codex mode")
     for value in protected_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))
@@ -478,10 +485,11 @@ def _task_ssh_permission_config(
     return {
         "filesystem": filesystem,
         "network": {
-            # Preserve Codex's read-only default (no network). Workspace
-            # Tasks retain normal network unless an SSH grant requires the
-            # broker-only network boundary.
-            "enabled": sandbox_mode == "workspace-write" and not disable_network,
+            # Codex 0.144.6's Linux direct-network sandbox admits host
+            # loopback and abstract AF_UNIX sockets. Until CCM can prove that
+            # a managed netns/proxy is active, every local Task stays
+            # network-closed (including ordinary Tasks without SSH grants).
+            "enabled": False,
             "allow_local_binding": False,
         },
     }
@@ -3073,7 +3081,7 @@ class CodexAppServer:
                 )
             if sandbox_mode == "workspace-write" and not task_ssh_disable_network:
                 raise CodexRequiredMcpPreTurnError(
-                    "Codex Task isolation must disable host Unix-socket network access"
+                    "Codex Task isolation must disable host loopback and Unix-socket network access"
                 )
             protected = {
                 os.path.abspath(os.path.expanduser(str(path)))

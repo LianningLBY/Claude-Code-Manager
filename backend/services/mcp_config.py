@@ -8,11 +8,15 @@ without changing either provider's runtime task-launch path.
 import json
 import math
 import re
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping, Sequence, cast
+
+from backend.services.trusted_runtime import (
+    RUNNING_PYTHON,
+    materialize_trusted_python_asset,
+)
 
 
 _CCM_ROOT = str(Path(__file__).resolve().parent.parent.parent)
@@ -21,7 +25,7 @@ _CCM_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 # container system Python, and Windows ``Scripts/python.exe``; constructing a
 # repository-relative ``.venv/bin/python3`` path breaks Windows-hosted bind
 # mounts even though the backend itself has all required packages.
-_VENV_PYTHON = sys.executable
+_VENV_PYTHON = RUNNING_PYTHON
 _MCP_STARTUP_TIMEOUT_SEC = 10.0
 _MCP_TOOL_TIMEOUT_SEC = 60.0
 _TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -60,15 +64,16 @@ CCM_SUB_AGENT_CONTROLLER_TOOLS = (
 )
 CCM_SSH_TOOLS = (
     "list_connections",
+    "new_effect_id",
     "run_command",
     "list_directory",
     "read_file",
     "write_file",
 )
 CCM_SSH_CAPABILITY_TOOLS = {
-    "exec": ("run_command",),
+    "exec": ("new_effect_id", "run_command"),
     "read": ("list_directory", "read_file"),
-    "write": ("write_file",),
+    "write": ("new_effect_id", "write_file"),
 }
 
 
@@ -107,37 +112,67 @@ def _ccm_server_spec(
     enabled_tools: tuple[str, ...],
     api_base: str | None,
     task_id: int | None = None,
+    task_incarnation_id: str | None = None,
+    task_retry_count: int | None = None,
+    task_turn_generation: int | None = None,
+    task_status: str | None = None,
     monitor_session_id: int | None = None,
     sub_agent_session_id: int | None = None,
     credential_owner_kind: str,
     credential_owner_id: str | int,
+    trusted_runtime_asset: str | None = None,
+    runtime_namespace: str | None = None,
+    runtime_identifier: int | None = None,
 ) -> McpServerSpec:
     from backend.services.internal_service_auth import (
         INTERNAL_TOKEN_ENV,
         issue_internal_service_token,
     )
 
+    if task_id is not None and not re.fullmatch(
+        r"[0-9a-f]{32}", task_incarnation_id or ""
+    ):
+        raise ValueError("Task-scoped MCP requires a durable Task incarnation")
     resolved_api_base = _api_base(api_base)
+    del module  # A Task MCP may never import a live backend module.
+    if trusted_runtime_asset is None:
+        raise ValueError("Task-scoped MCP requires a frozen trusted entrypoint")
+    if runtime_namespace is None or runtime_identifier is None:
+        raise ValueError(
+            "Trusted MCP entrypoint requires a private runtime scope"
+        )
+    entrypoint = materialize_trusted_python_asset(
+        trusted_runtime_asset,
+        namespace=runtime_namespace,
+        identifier=runtime_identifier,
+    )
     args = [
-        # Claude Code does not consistently honor ``cwd`` for stdio MCP
-        # entries. Safe-path mode plus an explicit PYTHONPATH pins imports to
-        # the running Manager checkout instead of the Task repository.
-        "-P",
-        "-m",
-        module,
+        # Isolated mode ignores cwd/PYTHONPATH/user-site import injection while
+        # preserving the running venv's installed FastMCP/httpx dependencies.
+        "-I",
+        str(entrypoint),
         *context_args,
         "--api-base",
         resolved_api_base,
     ]
+    server_env = {
+        "PYTHONPATH": "",
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    server_cwd = None
     scoped_token = issue_internal_service_token(
         audience=name,
         task_id=task_id,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
         monitor_session_id=monitor_session_id,
         sub_agent_session_id=sub_agent_session_id,
         owner_kind=credential_owner_kind,
         owner_id=credential_owner_id,
     )
-    server_env = {"PYTHONPATH": _CCM_ROOT}
     if scoped_token:
         server_env[INTERNAL_TOKEN_ENV] = scoped_token
 
@@ -145,7 +180,7 @@ def _ccm_server_spec(
         name=name,
         command=_VENV_PYTHON,
         args=tuple(args),
-        cwd=_CCM_ROOT,
+        cwd=server_cwd,
         env=server_env,
         required=True,
         enabled_tools=enabled_tools,
@@ -165,6 +200,10 @@ def build_mcp_server_specs(
     *,
     provider: str = "claude",
     codex_monitor_enabled: bool = False,
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
 ) -> tuple[McpServerSpec, ...]:
     """Build the main task's CCM MCP server specs.
 
@@ -196,8 +235,15 @@ def build_mcp_server_specs(
             enabled_tools=enabled_tools,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
             credential_owner_kind="task-turn",
             credential_owner_id=task_id,
+            trusted_runtime_asset="ccm_skills_http_server",
+            runtime_namespace="task",
+            runtime_identifier=task_id,
         ),
     )
 
@@ -207,14 +253,33 @@ def build_task_ssh_mcp_server_specs(
     api_base: str | None = None,
     *,
     capabilities: Sequence[str] = ("exec", "read", "write"),
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
 ) -> tuple[McpServerSpec, ...]:
     """Build the required, Task-scoped SSH capability server."""
 
+    if not re.fullmatch(r"[0-9a-f]{32}", task_incarnation_id):
+        raise ValueError("Task SSH MCP requires a durable Task incarnation")
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for value in (task_retry_count, task_turn_generation)
+    ):
+        raise ValueError("Task SSH MCP requires an exact non-negative generation")
+    if task_status not in {"in_progress", "executing"}:
+        raise ValueError("Task SSH MCP requires an exact active Task status")
     enabled_tools = ["list_connections"]
     selected = set(capabilities) & set(CCM_SSH_CAPABILITY_TOOLS)
     for capability in ("exec", "read", "write"):
         if capability in selected:
-            enabled_tools.extend(CCM_SSH_CAPABILITY_TOOLS[capability])
+            enabled_tools.extend(
+                tool
+                for tool in CCM_SSH_CAPABILITY_TOOLS[capability]
+                if tool not in enabled_tools
+            )
     context_args = ["--task-id", str(task_id)]
     for capability in sorted(selected):
         context_args.extend(("--capability", capability))
@@ -226,8 +291,15 @@ def build_task_ssh_mcp_server_specs(
             enabled_tools=tuple(enabled_tools),
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
             credential_owner_kind="task-turn",
             credential_owner_id=task_id,
+            trusted_runtime_asset="ccm_ssh_server",
+            runtime_namespace="task",
+            runtime_identifier=task_id,
         ),
     )
 
@@ -237,6 +309,8 @@ def build_monitor_agent_mcp_server_specs(
     task_id: int,
     api_base: str | None = None,
     turn_generation: int | None = None,
+    *,
+    task_incarnation_id: str,
 ) -> tuple[McpServerSpec, ...]:
     """Build MCP callback specs for one monitor agent."""
 
@@ -258,6 +332,7 @@ def build_monitor_agent_mcp_server_specs(
             enabled_tools=CCM_MONITOR_AGENT_TOOLS,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             monitor_session_id=monitor_session_id,
             credential_owner_kind="monitor-turn",
             credential_owner_id=(
@@ -265,6 +340,9 @@ def build_monitor_agent_mcp_server_specs(
                 if turn_generation is not None
                 else f"{monitor_session_id}:legacy"
             ),
+            trusted_runtime_asset="ccm_monitor_agent_server",
+            runtime_namespace="monitor",
+            runtime_identifier=monitor_session_id,
         ),
     )
 
@@ -272,6 +350,11 @@ def build_monitor_agent_mcp_server_specs(
 def build_sub_agent_controller_mcp_server_specs(
     task_id: int,
     api_base: str | None = None,
+    *,
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
 ) -> tuple[McpServerSpec, ...]:
     """Expose only the tools a Codex parent needs for the Sub-Agent skill."""
 
@@ -283,8 +366,15 @@ def build_sub_agent_controller_mcp_server_specs(
             enabled_tools=CCM_SUB_AGENT_CONTROLLER_TOOLS,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
             credential_owner_kind="task-turn",
             credential_owner_id=task_id,
+            trusted_runtime_asset="ccm_skills_http_server",
+            runtime_namespace="task",
+            runtime_identifier=task_id,
         ),
     )
 
@@ -293,6 +383,8 @@ def build_sub_agent_mcp_server_specs(
     session_id: int,
     task_id: int,
     api_base: str | None = None,
+    *,
+    task_incarnation_id: str,
 ) -> tuple[McpServerSpec, ...]:
     """Build MCP callback specs for one sub-agent."""
 
@@ -309,9 +401,13 @@ def build_sub_agent_mcp_server_specs(
             enabled_tools=CCM_SUB_AGENT_TOOLS,
             api_base=api_base,
             task_id=task_id,
+            task_incarnation_id=task_incarnation_id,
             sub_agent_session_id=session_id,
             credential_owner_kind="sub-agent",
             credential_owner_id=session_id,
+            trusted_runtime_asset="ccm_sub_agent_server",
+            runtime_namespace="sub-agent",
+            runtime_identifier=session_id,
         ),
     )
 
@@ -483,18 +579,34 @@ def generate_mcp_config(
     api_base: str | None = None,
     *,
     task_ssh_capabilities: Sequence[str] = (),
+    task_incarnation_id: str,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_status: str,
 ) -> Path:
     """为指定 task 生成 MCP config JSON 文件。
 
     ccm_skills server 始终包含（提供 $help 等默认命令）。
     Returns: 临时文件路径，进程结束后由调用方清理。
     """
-    specs = build_mcp_server_specs(task_id, enabled_skills, api_base)
+    specs = build_mcp_server_specs(
+        task_id,
+        enabled_skills,
+        api_base,
+        task_incarnation_id=task_incarnation_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        task_status=task_status,
+    )
     if task_ssh_capabilities:
         specs += build_task_ssh_mcp_server_specs(
             task_id,
             api_base,
             capabilities=task_ssh_capabilities,
+            task_incarnation_id=task_incarnation_id or "",
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            task_status=task_status,
         )
     return _write_claude_mcp_config(
         specs,
@@ -519,6 +631,8 @@ def generate_monitor_agent_mcp_config(
     task_id: int,
     api_base: str | None = None,
     turn_generation: int | None = None,
+    *,
+    task_incarnation_id: str,
 ) -> Path:
     """为 monitor 子 agent 生成专用 MCP config。
 
@@ -533,6 +647,7 @@ def generate_monitor_agent_mcp_config(
         task_id,
         api_base,
         turn_generation,
+        task_incarnation_id=task_incarnation_id,
     )
     return _write_claude_mcp_config(
         specs,
@@ -580,14 +695,23 @@ def cleanup_monitor_agent_mcp_config(
 
 
 def generate_sub_agent_mcp_config(
-    session_id: int, task_id: int, api_base: str | None = None
+    session_id: int,
+    task_id: int,
+    api_base: str | None = None,
+    *,
+    task_incarnation_id: str,
 ) -> Path:
     """为 sub-agent 子进程生成专用 MCP config。
 
     Returns:
         配置文件路径，调用方负责清理。
     """
-    specs = build_sub_agent_mcp_server_specs(session_id, task_id, api_base)
+    specs = build_sub_agent_mcp_server_specs(
+        session_id,
+        task_id,
+        api_base,
+        task_incarnation_id=task_incarnation_id,
+    )
     return _write_claude_mcp_config(
         specs,
         namespace="sub-agent",

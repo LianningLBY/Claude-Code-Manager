@@ -225,7 +225,6 @@ export interface SSHProfileInput {
   host: string;
   port: number;
   username: string;
-  key_path?: string;
   key_upload_token?: string;
   host_key_value: string;
   enabled: boolean;
@@ -2233,13 +2232,19 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ grants }),
     }),
-  updateSSHProfile: (id: number, data: Partial<SSHProfileInput>) =>
+  updateSSHProfile: (
+    id: number,
+    data: Partial<SSHProfileInput> & { expected_revision: number },
+  ) =>
     request<SSHProfile>(`/api/ssh-profiles/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
-  deleteSSHProfile: (id: number) =>
-    request<{ ok: boolean }>(`/api/ssh-profiles/${id}`, { method: 'DELETE' }),
+  deleteSSHProfile: (id: number, expectedRevision: number) =>
+    request<{ ok: boolean }>(
+      `/api/ssh-profiles/${id}?expected_revision=${expectedRevision}`,
+      { method: 'DELETE' },
+    ),
   probeSSHHostKey: (data: { host: string; port: number; timeout_seconds?: number }) =>
     request<SSHHostKeyProbe>('/api/ssh-profiles/probe-host-key', {
       method: 'POST',

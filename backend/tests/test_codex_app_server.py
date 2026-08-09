@@ -414,7 +414,8 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network(monkeypatch)
     }
     assert config["default_permissions"] == "ccm_task_ssh_isolated_v1"
     profile = config["permissions"]["ccm_task_ssh_isolated_v1"]
-    assert profile["filesystem"]["/"] == "read"
+    assert profile["filesystem"][":root"] == "deny"
+    assert profile["filesystem"][":minimal"] == "read"
     assert profile["filesystem"]["/workspace/project"] == "write"
     assert profile["filesystem"]["/Users/operator/.ssh"] == "deny"
     assert (
@@ -584,7 +585,7 @@ async def test_auxiliary_credential_profile_preserves_read_only_sandbox():
         disable_user_mcp=True,
         sandbox_mode="read-only",
         task_ssh_protected_paths=("/Users/operator/.ssh",),
-        task_ssh_disable_network=False,
+        task_ssh_disable_network=True,
         disable_autonomous_features=True,
     )
 
@@ -593,7 +594,9 @@ async def test_auxiliary_credential_profile_preserves_read_only_sandbox():
         "ccm_task_ssh_isolated_v1"
     ]
     assert profile["filesystem"] == {
-        "/": "read",
+        ":root": "deny",
+        ":minimal": "read",
+        "/workspace/project": "read",
         "/Users/operator/.ssh": "deny",
     }
     assert profile["network"] == {

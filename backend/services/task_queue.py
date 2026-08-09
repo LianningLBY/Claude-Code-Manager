@@ -456,6 +456,7 @@ class TaskQueue:
         task_id: int,
         *,
         operation_lock_held: bool = False,
+        expected_incarnation_id: str | None = None,
         **kwargs,
     ) -> Task | None:
         """Update one Task only while no durable termination owns it.
@@ -477,6 +478,7 @@ class TaskQueue:
                 return await self.update_task(
                     task_id,
                     operation_lock_held=True,
+                    expected_incarnation_id=expected_incarnation_id,
                     **kwargs,
                 )
 
@@ -511,6 +513,11 @@ class TaskQueue:
                 Task.id == task_id,
                 *(
                     ()
+                    if expected_incarnation_id is None
+                    else (Task.incarnation_id == expected_incarnation_id,)
+                ),
+                *(
+                    ()
                     if waiting_capability_safe
                     else (Task.status != "waiting_capability",)
                 ),
@@ -539,7 +546,14 @@ class TaskQueue:
             return None
         await self.db.commit()
         self.db.expire_all()
-        return await self.db.get(Task, task_id)
+        if expected_incarnation_id is None:
+            return await self.db.get(Task, task_id)
+        return await self.db.scalar(
+            select(Task).where(
+                Task.id == task_id,
+                Task.incarnation_id == expected_incarnation_id,
+            )
+        )
 
     async def delete(
         self,
@@ -589,6 +603,7 @@ class TaskQueue:
         task = await self.get(task_id)
         if not task:
             return False
+        observed_incarnation_id = task.incarnation_id
         (
             observed_status,
             observed_worker_id,
@@ -1387,6 +1402,13 @@ class TaskQueue:
         )
 
         revoke_internal_service_owner("task-turn", task_id)
+        if observed_incarnation_id:
+            from backend.services.ask_user import ask_user_registry
+
+            ask_user_registry.discard_for_task(
+                task_id,
+                observed_incarnation_id,
+            )
         return True
 
     async def dequeue(

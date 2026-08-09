@@ -369,11 +369,13 @@ dispatcher.deployment_task_start_fence = (
 )
 
 # 分布式 Worker（可选，WORKER_ENABLED=true 且装了 boto3 才启用）
+from backend.services.worker_provisioner import worker_control_plane_enabled
+
 worker_provisioner = None
 worker_relay = None
 worker_proxy = None
 task_migrator = None
-if settings.worker_enabled:
+if settings.worker_enabled and worker_control_plane_enabled():
     try:
         from backend.services.cloud_provider import get_cloud_provider
         from backend.services.worker_provisioner import WorkerProvisioner
@@ -395,6 +397,10 @@ if settings.worker_enabled:
         )
     except Exception:
         logger.exception("Worker provisioner init failed — workers disabled")
+elif settings.worker_enabled:
+    logger.error(
+        "Worker control plane disabled because AUTH_TOKEN is not configured"
+    )
 
 # The same runtime also runs on a Worker where Manager-side Worker support may
 # be disabled.  It must still recover locally accepted/executing receipts and
@@ -572,6 +578,11 @@ async def _ensure_claude_warmup():
 
 async def _recover_worker_relays():
     """Manager 重启后为 ready worker 上的活跃 task 重建中继 + 补缺失日志。"""
+    if not worker_control_plane_enabled():
+        logger.warning(
+            "Worker relay recovery skipped because AUTH_TOKEN is not configured"
+        )
+        return
     from backend.models.worker import Worker
     try:
         async with async_session() as db:
@@ -596,6 +607,12 @@ async def _recover_stale_worker_lifecycles():
     forever; move them to ``error`` while preserving instance ids and account
     credentials for an idempotent operator retry.
     """
+    if not worker_control_plane_enabled():
+        logger.warning(
+            "Worker lifecycle recovery skipped because AUTH_TOKEN is not configured"
+        )
+        return
+
     from backend.models.worker import Worker
 
     stale_statuses = (

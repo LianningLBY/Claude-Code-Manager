@@ -38,6 +38,21 @@ from backend.services.ssh_executor import (
 
 logger = logging.getLogger(__name__)
 
+
+def worker_control_plane_enabled() -> bool:
+    """Return whether Worker cloud/SSH effects have an authenticated plane."""
+
+    return isinstance(settings.auth_token, str) and bool(settings.auth_token.strip())
+
+
+def require_worker_control_plane_enabled() -> None:
+    """Fail before any Worker DB lifecycle mutation or external effect."""
+
+    if not worker_control_plane_enabled():
+        raise RuntimeError(
+            "Worker control plane requires AUTH_TOKEN to be configured"
+        )
+
 # rsync 部署时排除。.gitignore 经 --filter 自动生效（.venv/node_modules/db 等），
 # 这里只列 .gitignore 之外必须排除的。.git 不带：worktree 的 .git 是指向
 # Manager 本地路径的指针文件（rsync 过去即悬空），且 .git 目录体积大——
@@ -299,6 +314,7 @@ class WorkerProvisioner:
         debug logs.  This is intentionally used for Codex login rather than
         duplicating the transaction/rollback logic from ``api/codex_pool.py``.
         """
+        require_worker_control_plane_enabled()
         if not path.startswith("/api/") or any(c in path for c in "\r\n"):
             raise ValueError("invalid Worker API path")
         method = method.upper()
@@ -351,6 +367,7 @@ class WorkerProvisioner:
         on_status=None,
     ) -> str | None:
         """Start and await one Worker-local Codex pool login transaction."""
+        require_worker_control_plane_enabled()
         email = str(account.get("email") or "").strip()
         if not email:
             raise ValueError("Codex account email is required")
@@ -474,6 +491,7 @@ class WorkerProvisioner:
         already exists: the remote allocator intentionally does not de-dup by
         email and would create codex-2, codex-3, ... on every retry.
         """
+        require_worker_control_plane_enabled()
         persisted_id = str(account.get("account_id") or "").strip()
         if not persisted_id:
             email = str(account.get("email") or "").strip()
@@ -635,6 +653,7 @@ class WorkerProvisioner:
         worker_id: int,
         accounts: list[dict] | None = None,
     ):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._create_worker_locked(worker_id, accounts)
 
@@ -861,7 +880,7 @@ if [ ! -f /swapfile ]; then
   echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
 fi
 sudo apt-get update -qq
-sudo apt-get install -y -qq git curl rsync python3-venv > /dev/null
+sudo apt-get install -y -qq git curl rsync python3-venv bubblewrap socat > /dev/null
 if ! command -v node >/dev/null; then
   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - > /dev/null
   sudo apt-get install -y -qq nodejs > /dev/null
@@ -1241,6 +1260,7 @@ sudo systemctl restart ccm-worker
     # ------------------------------------------------------------------
 
     async def stop_worker(self, worker_id: int):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._stop_worker_locked(worker_id)
 
@@ -1285,6 +1305,7 @@ sudo systemctl restart ccm-worker
             )
 
     async def start_worker(self, worker_id: int):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._start_worker_locked(worker_id)
 
@@ -1326,6 +1347,7 @@ sudo systemctl restart ccm-worker
             )
 
     async def destroy_worker(self, worker_id: int):
+        require_worker_control_plane_enabled()
         async with self._lifecycle_lock(worker_id):
             await self._destroy_worker_locked(worker_id)
 
@@ -1373,6 +1395,11 @@ sudo systemctl restart ccm-worker
     # ------------------------------------------------------------------
 
     async def health_check_loop(self, interval: int = 30):
+        if not worker_control_plane_enabled():
+            logger.warning(
+                "Worker health checks disabled because AUTH_TOKEN is not configured"
+            )
+            return
         fail_counts: dict[int, int] = {}
         while True:
             try:
@@ -1382,6 +1409,7 @@ sudo systemctl restart ccm-worker
             await asyncio.sleep(interval)
 
     async def _health_check_once(self, fail_counts: dict[int, int]):
+        require_worker_control_plane_enabled()
         async with self.db_factory() as db:
             result = await db.execute(
                 select(Worker).where(Worker.status.in_(["ready", "error"]))

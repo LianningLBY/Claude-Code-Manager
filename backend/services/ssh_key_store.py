@@ -108,6 +108,26 @@ class SSHManagedKeyStore:
         self._ensure_private_directory(self.pending_dir)
         self._ensure_private_directory(self.managed_dir)
 
+    def is_task_managed_path(self, key_path: str | os.PathLike[str]) -> bool:
+        """Return whether a key lives in the stable Task-denied key root.
+
+        Task sandboxes protect the configured managed root as a whole.  A
+        Profile that points elsewhere could be created after a long-lived
+        sandbox snapshot and turn an arbitrary host path into a newly named
+        credential.  Keep Files-only Profiles compatible with external paths,
+        but require Task-eligible keys to be direct managed-store files.
+        """
+
+        try:
+            candidate = Path(
+                os.path.abspath(
+                    os.path.expandvars(os.path.expanduser(os.fspath(key_path)))
+                )
+            )
+        except (TypeError, ValueError, OSError):
+            return False
+        return candidate.parent == self.managed_dir
+
     @staticmethod
     def _validate_token(upload_token: str) -> str:
         if not isinstance(upload_token, str) or _UPLOAD_TOKEN_RE.fullmatch(upload_token) is None:

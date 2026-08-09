@@ -27,6 +27,12 @@ _TOKEN_TTL_SECONDS = 24 * 60 * 60
 _CLOCK_SKEW_SECONDS = 30
 _MAX_TOKEN_LENGTH = 4096
 _SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+_ACTIVE_TASK_STATUSES = frozenset({"in_progress", "executing"})
+_GENERATION_BOUND_TASK_AUDIENCES = frozenset({
+    "ccm_ssh",
+    "ccm_skills",
+    "ccm_ask_user",
+})
 
 
 class InternalServiceTokenError(ValueError):
@@ -44,6 +50,10 @@ class InternalServiceClaims:
     token_id: str
     expires_at: int
     task_id: int | None = None
+    task_incarnation_id: str | None = None
+    task_retry_count: int | None = None
+    task_turn_generation: int | None = None
+    task_status: str | None = None
     monitor_session_id: int | None = None
     sub_agent_session_id: int | None = None
     owner_kind: str | None = None
@@ -84,11 +94,32 @@ def _positive_int(value: Any, field: str, *, optional: bool = True) -> int | Non
     return value
 
 
+def _non_negative_int(
+    value: Any,
+    field: str,
+    *,
+    optional: bool = True,
+) -> int | None:
+    if value is None and optional:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise InternalServiceTokenError(401, f"Invalid internal {field}")
+    return value
+
+
 def _safe_segment(value: Any, field: str, *, optional: bool = True) -> str | None:
     if value is None and optional:
         return None
     if not isinstance(value, str) or not _SEGMENT_RE.fullmatch(value):
         raise InternalServiceTokenError(401, f"Invalid internal {field}")
+    return value
+
+
+def _task_incarnation(value: Any, *, optional: bool = True) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+        raise InternalServiceTokenError(401, "Invalid internal task incarnation")
     return value
 
 
@@ -122,6 +153,10 @@ def issue_internal_service_token(
     *,
     audience: str,
     task_id: int | None = None,
+    task_incarnation_id: str | None = None,
+    task_retry_count: int | None = None,
+    task_turn_generation: int | None = None,
+    task_status: str | None = None,
     monitor_session_id: int | None = None,
     sub_agent_session_id: int | None = None,
     owner_kind: str,
@@ -137,6 +172,42 @@ def issue_internal_service_token(
     owner_kind = _safe_segment(owner_kind, "owner kind", optional=False) or ""
     owner_id_value = _safe_segment(str(owner_id), "owner id", optional=False) or ""
     task_id = _positive_int(task_id, "task id")
+    task_incarnation_id = _task_incarnation(task_incarnation_id)
+    if task_id is not None and task_incarnation_id is None:
+        raise ValueError("Task-scoped credential requires a Task incarnation")
+    if task_incarnation_id is not None and task_id is None:
+        raise ValueError("Task incarnation requires a task id")
+    task_retry_count = _non_negative_int(
+        task_retry_count,
+        "Task retry count",
+    )
+    task_turn_generation = _non_negative_int(
+        task_turn_generation,
+        "Task turn generation",
+    )
+    task_status = _safe_segment(task_status, "Task status")
+    task_generation_claims = (
+        task_retry_count,
+        task_turn_generation,
+        task_status,
+    )
+    if any(value is not None for value in task_generation_claims) and (
+        task_id is None
+        or any(value is None for value in task_generation_claims)
+    ):
+        raise ValueError(
+            "Task generation credential requires task id, retry count, "
+            "turn generation, and status"
+        )
+    if audience in _GENERATION_BOUND_TASK_AUDIENCES:
+        if any(value is None for value in task_generation_claims):
+            raise ValueError(
+                f"{audience} credential requires an exact active generation"
+            )
+        if task_status not in _ACTIVE_TASK_STATUSES:
+            raise ValueError(
+                f"{audience} credential requires an active Task status"
+            )
     monitor_session_id = _positive_int(
         monitor_session_id,
         "monitor session id",
@@ -160,6 +231,14 @@ def issue_internal_service_token(
         owner_id_value,
         audience,
         str(task_id or ""),
+        str(task_incarnation_id or ""),
+        str(task_retry_count if task_retry_count is not None else ""),
+        str(
+            task_turn_generation
+            if task_turn_generation is not None
+            else ""
+        ),
+        str(task_status or ""),
         str(monitor_session_id or ""),
         str(sub_agent_session_id or ""),
         str(ttl_seconds),
@@ -188,6 +267,10 @@ def issue_internal_service_token(
     }
     for key, value in (
         ("task_id", task_id),
+        ("task_incarnation_id", task_incarnation_id),
+        ("task_retry_count", task_retry_count),
+        ("task_turn_generation", task_turn_generation),
+        ("task_status", task_status),
         ("monitor_session_id", monitor_session_id),
         ("sub_agent_session_id", sub_agent_session_id),
     ):
@@ -286,6 +369,21 @@ def _decode_claims(token: str) -> InternalServiceClaims:
         token_id=_safe_segment(payload.get("jti"), "token id", optional=False) or "",
         expires_at=expires_at,
         task_id=_positive_int(payload.get("task_id"), "task id"),
+        task_incarnation_id=_task_incarnation(
+            payload.get("task_incarnation_id")
+        ),
+        task_retry_count=_non_negative_int(
+            payload.get("task_retry_count"),
+            "Task retry count",
+        ),
+        task_turn_generation=_non_negative_int(
+            payload.get("task_turn_generation"),
+            "Task turn generation",
+        ),
+        task_status=_safe_segment(
+            payload.get("task_status"),
+            "Task status",
+        ),
         monitor_session_id=_positive_int(
             payload.get("monitor_session_id"),
             "monitor session id",
@@ -297,6 +395,32 @@ def _decode_claims(token: str) -> InternalServiceClaims:
         owner_kind=_safe_segment(payload.get("owner_kind"), "owner kind"),
         owner_id=_safe_segment(payload.get("owner_id"), "owner id"),
     )
+    if claims.task_incarnation_id is not None and claims.task_id is None:
+        raise InternalServiceTokenError(
+            401,
+            "Invalid internal task incarnation binding",
+        )
+    task_generation_claims = (
+        claims.task_retry_count,
+        claims.task_turn_generation,
+        claims.task_status,
+    )
+    if any(value is not None for value in task_generation_claims) and (
+        claims.task_id is None
+        or any(value is None for value in task_generation_claims)
+    ):
+        raise InternalServiceTokenError(
+            401,
+            "Invalid internal Task generation binding",
+        )
+    if claims.audience in _GENERATION_BOUND_TASK_AUDIENCES and (
+        any(value is None for value in task_generation_claims)
+        or claims.task_status not in _ACTIVE_TASK_STATUSES
+    ):
+        raise InternalServiceTokenError(
+            401,
+            "Invalid internal active Task generation binding",
+        )
     with _revocation_lock:
         _cleanup_revocations(now)
         if claims.token_id in _revoked_tokens:
@@ -327,6 +451,8 @@ def _route_allowed(claims: InternalServiceClaims, method: str, path: str) -> boo
     if claims.audience == "ccm_skills" and task_id is not None:
         task_path = f"/api/tasks/{task_id}"
         if path == task_path and method == "GET":
+            return True
+        if path == f"{task_path}/internal/skill-tools" and method == "POST":
             return True
         if path == f"{task_path}/internal/enabled-skills" and method == "PUT":
             return True

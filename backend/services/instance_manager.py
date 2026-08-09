@@ -284,6 +284,33 @@ class LiveAttachmentInjectionUnsupportedError(RuntimeError):
     """The active transport cannot safely access Manager upload paths."""
 
 
+class SharedProjectAgentLaunchDisabledError(RuntimeError):
+    """Agent execution is disabled for Projects visible to other users."""
+
+
+async def _require_unshared_project_agent_launch(
+    project_id: int | None,
+    db_factory,
+) -> None:
+    """Fail closed unless a Task's Project is proven to be unshared."""
+
+    if project_id is None:
+        return
+    from backend.services.container_manager import is_shared_project
+
+    try:
+        shared = await is_shared_project(project_id, db_factory)
+    except Exception as exc:
+        raise SharedProjectAgentLaunchDisabledError(
+            f"Could not verify sharing state for Project {project_id}; "
+            "Agent launch is disabled"
+        ) from exc
+    if shared:
+        raise SharedProjectAgentLaunchDisabledError(
+            f"Agent launch is disabled while Project {project_id} is shared"
+        )
+
+
 def _terminal_failure_log_entry(
     *,
     instance_id: int,
@@ -1992,11 +2019,6 @@ class InstanceManager:
         that loop-task chat history can be grouped by iteration in the frontend.
         """
         provider = (provider or "claude").lower()
-        from backend.services.task_agent_isolation import (
-            require_task_security_boundary_configured,
-        )
-
-        require_task_security_boundary_configured()
         launch_boundary_attempted = False
         launch_boundary_completed = False
 
@@ -2017,6 +2039,13 @@ class InstanceManager:
                 raise RuntimeError("Launch admission callback is already running")
             launch_boundary_attempted = True
             selected_actual_transport = actual_transport
+            # Sharing may be enabled after the initial Task snapshot. Recheck
+            # at the last common boundary for Claude PTY/direct and Codex
+            # app-server/direct routes; an unavailable check is also a veto.
+            await _require_unshared_project_agent_launch(
+                task_project_id,
+                self.db_factory,
+            )
             await self._persist_actual_turn_transport(
                 instance_id=instance_id,
                 task_id=task_id,
@@ -2046,6 +2075,7 @@ class InstanceManager:
         task_retry_count: int | None = None
         task_status: str | None = None
         task_incarnation_id: str | None = None
+        task_project_id: int | None = None
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
@@ -2091,6 +2121,11 @@ class InstanceManager:
                         f"Task {task_id} disappeared before launch"
                     )
                 task_incarnation_id = task.incarnation_id
+                task_project_id = task.project_id
+                await _require_unshared_project_agent_launch(
+                    task_project_id,
+                    self.db_factory,
+                )
                 from backend.services.task_agent_isolation import (
                     prepare_task_working_directory,
                 )
@@ -2371,6 +2406,9 @@ class InstanceManager:
                 audience="ccm_ask_user",
                 task_id=task_id,
                 task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
                 owner_kind="task-turn",
                 owner_id=task_id,
             )
@@ -2390,58 +2428,6 @@ class InstanceManager:
             })
             if task_ssh_broker_only:
                 git_env["CCM_TASK_SSH_GUARD"] = "1"
-
-        # Check if shared project → prepare Docker container wrapper for PTY
-        _container_project_id = None
-        _container_wrapper = None
-        _container_exec_spec = None
-        if provider == "claude" and task_id:
-            try:
-                from backend.services.container_manager import is_shared_project, ContainerManager
-                async with self.db_factory() as _db:
-                    from backend.models.task import Task as _Task
-                    _t = await _db.get(_Task, task_id)
-                    if _t and _t.project_id:
-                        if await is_shared_project(_t.project_id, self.db_factory) and ContainerManager.is_docker_available():
-                            _container_project_id = _t.project_id
-                            if not hasattr(self, '_container_mgr'):
-                                self._container_mgr = ContainerManager()
-                            project_path = cwd or os.getcwd()
-                            # Get project git credentials for container isolation
-                            from backend.models.project import Project as _Project
-                            _proj = await _db.get(_Project, _t.project_id)
-                            container_name = await self._container_mgr.ensure_container(
-                                _container_project_id, project_path, config_dir,
-                                api_account_root=(
-                                    str(cloudrouter_account.root)
-                                    if cloudrouter_account is not None
-                                    else None
-                                ),
-                                git_credential_type=_proj.git_credential_type if _proj else None,
-                                git_ssh_key_path=_proj.git_ssh_key_path if _proj else None,
-                                git_https_username=_proj.git_https_username if _proj else None,
-                                git_https_token=_proj.git_https_token if _proj else None,
-                            )
-                            (
-                                _container_wrapper,
-                                _container_exec_spec,
-                            ) = self._container_mgr.create_pty_wrapper(
-                                _container_project_id,
-                                instance_id,
-                            )
-                            self._container_tasks[instance_id] = _container_project_id
-            except Exception as exc:
-                # Shared Projects must never escape their isolation boundary
-                # because the container's private /tmp is pressured, busy, or
-                # unverifiable.  The container supervisor independently
-                # repeats this gate immediately before child creation.
-                from backend.services.container_manager import (
-                    ContainerTmpPressureError,
-                )
-
-                if isinstance(exc, ContainerTmpPressureError):
-                    raise
-                logger.debug("Container setup failed, falling back to bare process")
 
         codex_main_mcp_required = bool(
             provider == "codex"
@@ -2488,6 +2474,9 @@ class InstanceManager:
                 provider=provider,
                 codex_monitor_enabled=codex_monitor_enabled,
                 task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
             )
         elif codex_sub_agent_mcp_required:
             from backend.services.mcp_config import (
@@ -2497,6 +2486,9 @@ class InstanceManager:
             codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(
                 task_id,
                 task_incarnation_id=task_incarnation_id or "",
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
             )
         if codex_ssh_mcp_required:
             from backend.services.mcp_config import (
@@ -2614,12 +2606,10 @@ class InstanceManager:
                             if codex_task_isolation_required
                             else ()
                         ),
-                        # Codex 0.144.6's network-enabled permission profile
-                        # also admits arbitrary host Unix sockets. Clearing
-                        # SSH_AUTH_SOCK cannot prevent rediscovery of an
-                        # ambient ssh-agent/secret-service socket, so every
-                        # ordinary Codex Task stays network-closed until Codex
-                        # exposes a separately auditable Unix-socket policy.
+                        # Codex 0.144.6 exposes host loopback and abstract
+                        # AF_UNIX sockets whenever its direct network switch is
+                        # enabled. Keep every local Task network-closed until
+                        # a managed netns/proxy boundary can be proven.
                         task_ssh_disable_network=True,
                         disable_user_mcp=(
                             pr_review_task
@@ -2792,12 +2782,6 @@ class InstanceManager:
             and self.pty_mode_enabled
             and not pr_review_task
         ):
-            if _container_wrapper is not None:
-                # Shared Projects already execute in their dedicated,
-                # read-only-root container and cannot receive managed Task
-                # SSH grants. Host-only settings/MCP paths are not visible
-                # inside that container, so retain its existing PTY boundary.
-                claude_isolation_settings_path = None
             return await self._launch_pty(
                 instance_id=instance_id,
                 prompt=prompt,
@@ -2814,8 +2798,8 @@ class InstanceManager:
                 enable_workflows=enable_workflows,
                 enabled_skills=enabled_skills,
                 mcp_config_path=str(mcp_config_path) if mcp_config_path else None,
-                claude_binary_override=_container_wrapper,
-                container_exec_spec=_container_exec_spec,
+                claude_binary_override=None,
+                container_exec_spec=None,
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 skill_context=task_skill_context,
@@ -2915,149 +2899,32 @@ class InstanceManager:
         if thinking_budget and thinking_budget > 0 and provider == "claude":
             env["MAX_THINKING_TOKENS"] = str(thinking_budget)
 
-        # Check if this task's project is shared → run in Docker container
-        use_container = False
-        container_project_id = None
-        if task_id and provider == "claude":
-            try:
-                from backend.services.container_manager import is_shared_project, ContainerManager
-                async with self.db_factory() as _db:
-                    from backend.models.task import Task as _Task
-                    _task = await _db.get(_Task, task_id)
-                    if _task and _task.project_id:
-                        _shared = await is_shared_project(_task.project_id, self.db_factory)
-                        if _shared and ContainerManager.is_docker_available():
-                            use_container = True
-                            container_project_id = _task.project_id
-            except Exception:
-                logger.debug("Container check failed, falling back to bare process")
-
-        if use_container and container_project_id:
-            from backend.services.container_manager import (
-                ContainerExecSpawnCleanupError,
-                ContainerManager,
-            )
-            if not hasattr(self, '_container_mgr'):
-                self._container_mgr = ContainerManager()
-            project_path = cwd or os.getcwd()
-            # Get project git credentials
-            _git_creds = {}
-            try:
-                async with self.db_factory() as _db2:
-                    from backend.models.project import Project as _Proj
-                    _p = await _db2.get(_Proj, container_project_id)
-                    if _p:
-                        _git_creds = {
-                            "git_credential_type": _p.git_credential_type,
-                            "git_ssh_key_path": _p.git_ssh_key_path,
-                            "git_https_username": _p.git_https_username,
-                            "git_https_token": _p.git_https_token,
-                        }
-            except Exception:
-                pass
-            await self._container_mgr.ensure_container(
-                container_project_id,
-                project_path,
-                config_dir,
-                api_account_root=(
-                    str(cloudrouter_account.root)
-                    if cloudrouter_account is not None
-                    else None
-                ),
-                **_git_creds,
-            )
-            try:
-                container_env = env
-                if provider == "claude" and config_dir:
-                    container_env = dict(env)
-                    container_env["CLAUDE_CONFIG_DIR"] = "/home/sandbox/.claude"
-                await admit_external_launch("claude_exec")
-                process = await self._container_mgr.exec_command(
-                    container_project_id,
-                    cmd,
-                    env=container_env,
-                    cwd="/workspace",
+        if provider == "codex":
+            # Hold the per-home gate through process creation and tracking.
+            # Maintenance can then either see this active exec or reserve
+            # the home first; it can never edit auth.json in the gap.
+            home_lock = self._codex_home_lock(config_dir)
+            async with home_lock:
+                # The dispatcher snapshot is only a routing hint.  This
+                # lock-local predicate is the authoritative barrier for
+                # two fresh tasks that selected the same home, or for an
+                # ephemeral exec that won admission after selection.
+                self._assert_codex_app_server_home_available(
+                    config_dir,
+                    replacing_exec_instance_id=instance_id,
                 )
-            except ContainerExecSpawnCleanupError as exc:
-                # exec_command was cancelled after docker(1) may have asked
-                # the daemon to create the inner command, and exact cleanup
-                # could not be proven.  Install the hidden spawn outcome under
-                # this Instance before surfacing the failure so stop/shutdown
-                # can retry it; never release the slot as idle.
-                process = exc.process
-                self.processes[instance_id] = process
-                self._container_tasks[instance_id] = container_project_id
-                self._container_exec_processes[instance_id] = process
-                if os.name == "posix":
-                    self._process_groups[instance_id] = process
-                try:
-                    async with self.db_factory() as db:
-                        await db.execute(
-                            update(Instance)
-                            .where(Instance.id == instance_id)
-                            .values(
-                                status="error",
-                                pid=getattr(process, "pid", None),
-                                current_task_id=task_id,
-                            )
-                        )
-                        await db.commit()
-                except Exception:
-                    logger.exception(
-                        "Failed to persist unresolved container spawn "
-                        "for instance %s",
-                        instance_id,
-                    )
-                raise
-            self._container_tasks[instance_id] = container_project_id
-            self._container_exec_processes[instance_id] = process
-            if os.name == "posix":
-                self._process_groups[instance_id] = process
-        else:
-            if provider == "codex":
-                # Hold the per-home gate through process creation and tracking.
-                # Maintenance can then either see this active exec or reserve
-                # the home first; it can never edit auth.json in the gap.
-                home_lock = self._codex_home_lock(config_dir)
-                async with home_lock:
-                    # The dispatcher snapshot is only a routing hint.  This
-                    # lock-local predicate is the authoritative barrier for
-                    # two fresh tasks that selected the same home, or for an
-                    # ephemeral exec that won admission after selection.
-                    self._assert_codex_app_server_home_available(
+                # app-server keeps threads and MCP clients resident in
+                # memory.  Before an exec generation enters the same home,
+                # stop an idle transport or reject an active one.  Holding
+                # the home lock through spawn + ownership registration
+                # closes the reverse race with a concurrent app-server
+                # launch.
+                registry = self._codex_app_server
+                if registry is not None:
+                    await registry.shutdown_home(
                         config_dir,
-                        replacing_exec_instance_id=instance_id,
+                        require_idle=True,
                     )
-                    # app-server keeps threads and MCP clients resident in
-                    # memory.  Before an exec generation enters the same home,
-                    # stop an idle transport or reject an active one.  Holding
-                    # the home lock through spawn + ownership registration
-                    # closes the reverse race with a concurrent app-server
-                    # launch.
-                    registry = self._codex_app_server
-                    if registry is not None:
-                        await registry.shutdown_home(
-                            config_dir,
-                            require_idle=True,
-                        )
-                    spawn_kwargs = {
-                        "stdout": asyncio.subprocess.PIPE,
-                        "stderr": asyncio.subprocess.PIPE,
-                        "cwd": cwd or os.getcwd(),
-                        "env": env,
-                        "limit": 10 * 1024 * 1024,
-                    }
-                    if os.name == "posix":
-                        spawn_kwargs["start_new_session"] = True
-                    await admit_external_launch("codex_exec")
-                    process = await self._spawn_managed_direct_process(
-                        instance_id,
-                        task_id,
-                        cmd,
-                        spawn_kwargs,
-                        codex_home=config_dir,
-                    )
-            else:
                 spawn_kwargs = {
                     "stdout": asyncio.subprocess.PIPE,
                     "stderr": asyncio.subprocess.PIPE,
@@ -3067,13 +2934,31 @@ class InstanceManager:
                 }
                 if os.name == "posix":
                     spawn_kwargs["start_new_session"] = True
-                await admit_external_launch("claude_exec")
+                await admit_external_launch("codex_exec")
                 process = await self._spawn_managed_direct_process(
                     instance_id,
                     task_id,
                     cmd,
                     spawn_kwargs,
+                    codex_home=config_dir,
                 )
+        else:
+            spawn_kwargs = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "cwd": cwd or os.getcwd(),
+                "env": env,
+                "limit": 10 * 1024 * 1024,
+            }
+            if os.name == "posix":
+                spawn_kwargs["start_new_session"] = True
+            await admit_external_launch("claude_exec")
+            process = await self._spawn_managed_direct_process(
+                instance_id,
+                task_id,
+                cmd,
+                spawn_kwargs,
+            )
 
         if provider != "codex":
             self.processes[instance_id] = process

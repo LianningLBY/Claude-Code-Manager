@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
 from backend.api.deps import (
+    internal_task_incarnation_id,
     require_internal_service,
+    require_internal_task_incarnation,
     require_task_access,
     require_task_control,
 )
@@ -231,11 +233,24 @@ async def create_monitor_session(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_control(request, task, db)
+    expected_incarnation_id = task.incarnation_id
     # Codex Worker and shared Tasks must fail before a proxy/network side
     # effect. Claude Worker routing remains unchanged.
     _require_monitor_capability(task)
     if task.worker_id is not None:
+        if internal_task_incarnation_id(request, task_id) is not None:
+            raise HTTPException(
+                409,
+                "Scoped Monitor tools must execute on the Task's owning Worker",
+            )
         # Worker task：monitor 子进程依赖 task 所在机器的文件系统（ps/tail/signal
         # file），必须在 worker 上跑。本地镜像行由 relay 的 monitor_session_created
         # 事件落库（带 remote_id），这里直接透传 worker 响应。
@@ -247,6 +262,7 @@ async def create_monitor_session(
         return await worker_proxy.proxy_to_worker(
             task, "POST", f"/api/tasks/{task_id}/monitor-sessions",
             body=body.model_dump(),
+            require_task_incarnation_fence=True,
         )
 
     async with _monitor_admission_lock(task_id):
@@ -256,10 +272,12 @@ async def create_monitor_session(
             # same-process cap checks ordered, while this no-op Task UPDATE
             # also serializes cancellation and other backend processes.
             await db.rollback()
+            await require_internal_task_incarnation(request, task_id, db)
             guarded = await db.execute(
                 update(Task)
                 .where(
                     Task.id == task_id,
+                    Task.incarnation_id == expected_incarnation_id,
                     Task.worker_id.is_(None),
                     Task.status.in_(("in_progress", "executing")),
                     task_retry_not_superseded_predicate(),
@@ -270,9 +288,15 @@ async def create_monitor_session(
             if not guarded.rowcount:
                 await db.rollback()
                 db.expire_all()
-                task = await db.get(Task, task_id)
+                await require_internal_task_incarnation(request, task_id, db)
+                task = await db.scalar(
+                    select(Task).where(
+                        Task.id == task_id,
+                        Task.incarnation_id == expected_incarnation_id,
+                    )
+                )
                 if task is None:
-                    raise HTTPException(404, "Task not found")
+                    raise HTTPException(409, "Task incarnation changed")
                 if await active_worker_task_termination_receipt(db, task_id):
                     raise HTTPException(
                         409,
@@ -280,6 +304,12 @@ async def create_monitor_session(
                     )
                 _require_monitor_capability(task)
                 if task.worker_id is not None:
+                    if internal_task_incarnation_id(request, task_id) is not None:
+                        raise HTTPException(
+                            409,
+                            "Scoped Monitor tools must execute on the Task's "
+                            "owning Worker",
+                        )
                     from backend.main import worker_proxy
                     if worker_proxy is None:
                         raise HTTPException(503, "Worker 功能未启用")
@@ -290,15 +320,21 @@ async def create_monitor_session(
                         "POST",
                         f"/api/tasks/{task_id}/monitor-sessions",
                         body=body.model_dump(),
+                        require_task_incarnation_fence=True,
                     )
                 raise HTTPException(
                     400,
                     "Cannot create monitor for inactive task",
                 )
             db.expire_all()
-            task = await db.get(Task, task_id)
+            task = await db.scalar(
+                select(Task).where(
+                    Task.id == task_id,
+                    Task.incarnation_id == expected_incarnation_id,
+                )
+            )
             if task is None:
-                raise HTTPException(404, "Task not found")
+                raise HTTPException(409, "Task incarnation changed")
             _require_monitor_capability(task)
             relay_generation = _task_relay_generation(task)
             skills = task.enabled_skills or {}
@@ -375,6 +411,13 @@ async def list_monitor_sessions(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_access(request, task, db)
     result = await db.execute(
         select(MonitorSession)
@@ -394,6 +437,13 @@ async def get_monitor_session(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if scoped_task is not None:
+        task = scoped_task
     await require_task_access(request, task, db)
     ms = await db.get(MonitorSession, session_id)
     if not ms or ms.task_id != task_id:
@@ -408,11 +458,16 @@ async def delete_monitor_session(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
+    scoped_task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     ms = await db.get(MonitorSession, session_id)
     if not ms or ms.task_id != task_id:
         raise HTTPException(404, "Monitor session not found")
-
-    task = await db.get(Task, task_id)
+    task = scoped_task or await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, db)
@@ -426,6 +481,7 @@ async def delete_monitor_session(
             raise HTTPException(409, "该 monitor 缺少 worker 侧 id（remote_id），无法远程删除")
         result = await worker_proxy.proxy_to_worker(
             task, "DELETE", f"/api/tasks/{task_id}/monitor-sessions/{ms.remote_id}",
+            require_task_incarnation_fence=True,
         )
         await db.execute(
             update(MonitorSession)
@@ -530,6 +586,12 @@ async def create_monitor_check(
 ):
     """Sub-agent reports a status check via MCP tool."""
     require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     import json as _json
     from backend.main import dispatcher
     from backend.models.log_entry import LogEntry
@@ -729,6 +791,12 @@ async def complete_monitor_session(
 ):
     """Sub-agent marks itself as complete."""
     require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
     from backend.main import dispatcher
 
     relay_generation = await _read_task_relay_generation(db, task_id)

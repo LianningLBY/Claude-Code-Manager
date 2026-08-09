@@ -23,6 +23,9 @@ from backend.services.task_queue import (
     task_is_pr_review_superseded,
     task_retry_not_superseded_predicate,
 )
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2364,6 +2367,15 @@ async def create_pr_review_task(
     db.add(review)
     await db.flush()
 
+    from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
+
+    delivery_policy = await frozen_delivery_pr_policy(db, review)
+    frozen_auto_merge = (
+        delivery_policy.auto_merge
+        if delivery_policy is not None
+        else bool(repo.auto_merge)
+    )
+
     provider = (repo.provider or "claude").lower()
     task = await stage_task_record(
         db,
@@ -2375,7 +2387,7 @@ async def create_pr_review_task(
             "pr_review_id": review.id,
             "pr_base_sha": base_sha,
             "pr_head_sha": head_sha,
-            "pr_auto_merge": bool(repo.auto_merge),
+            "pr_auto_merge": frozen_auto_merge,
             "pr_action_nonce": action_nonce,
         },
         provider=provider,
@@ -2632,8 +2644,36 @@ async def check_and_update_review(
     terminal_task_retry_count: int | None = None,
     background_handoff_pending: Callable[[], bool] | None = None,
     db_factory=None,
+    operation_lock_held: bool = False,
 ):
     """Verify one exact Task result and reconcile its durable publication."""
+
+    if not operation_lock_held:
+        lock_task_id = (
+            terminal_task_id
+            if type(terminal_task_id) is int
+            else await db.scalar(
+                select(PRReview.task_id).where(PRReview.id == pr_review_id)
+            )
+        )
+        if type(lock_task_id) is int:
+            # Publishing status blocks new public termination admission. Keep
+            # the process-wide Task lock through every GitHub mutation as the
+            # companion fence for internal recovery/destroy receipt creators.
+            await db.rollback()
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            async with get_task_operation_lock(lock_task_id):
+                return await check_and_update_review(
+                    db,
+                    pr_review_id,
+                    repo_full_name,
+                    terminal_task_id=terminal_task_id,
+                    terminal_task_retry_count=terminal_task_retry_count,
+                    background_handoff_pending=background_handoff_pending,
+                    db_factory=db_factory,
+                    operation_lock_held=True,
+                )
 
     lock = pr_review_action_lock(pr_review_id)
     async with lock:
@@ -2680,7 +2720,7 @@ async def _locked_task_generation_exists(
     ):
         return False
     result = await db.execute(
-        select(Task.id)
+        update(Task)
         .where(
             Task.id == task_id,
             Task.status == "completed",
@@ -2688,10 +2728,12 @@ async def _locked_task_generation_exists(
             Task.started_at == started_at,
             Task.pty_background_generation.is_(None),
             task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
         )
-        .with_for_update()
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
     )
-    return result.scalar_one_or_none() == task_id
+    return result.rowcount == 1
 
 
 async def _commit_exact_review_update(
@@ -2767,6 +2809,7 @@ async def _publication_is_current(
     task_started_at: datetime,
     nonce: str,
     lease_token: str,
+    expected_delivery_id: str | None,
     lease_lost: asyncio.Event | None = None,
 ) -> bool:
     """Fresh guard used immediately before each GitHub mutation."""
@@ -2786,6 +2829,7 @@ async def _publication_is_current(
                 PRReview.publishing_lease_token == lease_token,
                 PRReview.publishing_lease_expires_at
                 > db_now + _PUBLICATION_MUTATION_GUARD,
+                PRReview.delivery_id == expected_delivery_id,
             )
         )
         if review_result.scalar_one_or_none() != review_id:
@@ -3007,6 +3051,7 @@ async def _resume_publishing_review_under_lease(
     pr_number = review.pr_number
     base_sha = review.base_sha
     head_sha = review.head_sha
+    delivery_id = review.delivery_id
     repo = await db.get(
         MonitoredRepo,
         repo_id,
@@ -3029,8 +3074,24 @@ async def _resume_publishing_review_under_lease(
         if task is not None
         else None
     )
+    from backend.services.delivery_pr_policy import (
+        DeliveryPRPolicyError,
+        frozen_delivery_pr_policy,
+    )
+
+    try:
+        delivery_policy = await frozen_delivery_pr_policy(
+            db,
+            review,
+            monitor_run_id=review.monitor_run_id,
+        )
+        delivery_policy_error = None
+    except DeliveryPRPolicyError as exc:
+        delivery_policy = None
+        delivery_policy_error = str(exc)
     valid = (
-        repo is not None
+        delivery_policy_error is None
+        and repo is not None
         and repo.repo_full_name == repo_full_name
         and task is not None
         and task_id == task.id
@@ -3049,6 +3110,13 @@ async def _resume_publishing_review_under_lease(
         and nonce is not None
         and type(frozen_auto_merge) is bool
         and (
+            delivery_policy is None
+            or (
+                frozen_auto_merge is False
+                and action != "approved_merged"
+            )
+        )
+        and (
             action == "review_comments"
             or (action == "approved_merged" and frozen_auto_merge)
             or (action == "lgtm_comment" and not frozen_auto_merge)
@@ -3065,7 +3133,12 @@ async def _resume_publishing_review_under_lease(
             task_id=task_id,
             retry_count=retry_count,
             task_started_at=task_started_at,
-            summary="Durable PR publication state is invalid",
+            summary=(
+                "Delivery PR publication policy is invalid: "
+                f"{delivery_policy_error}"
+                if delivery_policy_error is not None
+                else "Durable PR publication state is invalid"
+            ),
             lease_token=lease_token,
         )
         return
@@ -3090,6 +3163,7 @@ async def _resume_publishing_review_under_lease(
             task_started_at=task_started_at,
             nonce=nonce,
             lease_token=lease_token,
+            expected_delivery_id=delivery_id,
             lease_lost=lease_lost,
         )
 
@@ -3512,6 +3586,7 @@ async def recover_superseding_pr_reviews(
                                         db,
                                         reason="Superseded by new push",
                                         operation_locks_held=True,
+                                        allow_delivery_effect_stop=True,
                                     )
                                 )
                         except TaskTerminationConflict:
@@ -3534,6 +3609,9 @@ async def recover_superseding_pr_reviews(
                                     ),
                                     expected_retry_count=(
                                         terminated.retry_count
+                                    ),
+                                    expected_turn_generation=(
+                                        terminated.turn_generation
                                     ),
                                     expected_instance_id=(
                                         terminated.instance_id
@@ -3747,6 +3825,7 @@ async def recover_incomplete_pr_reviews(
                 else Task.completed_at == task.completed_at
             ),
             Task.pty_background_generation.is_(None),
+            no_active_worker_task_termination_predicate(),
         ]
         task_guard = await db.execute(
             update(Task)
@@ -3878,6 +3957,7 @@ async def recover_incomplete_pr_reviews(
                         else None
                     ),
                     db_factory=db_factory,
+                    operation_lock_held=(original_status == "reviewing"),
                 )
                 refreshed = await db.get(
                     PRReview,

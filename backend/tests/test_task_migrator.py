@@ -9,6 +9,10 @@ from sqlalchemy import update
 
 import backend.main as main_module
 import backend.services.task_migrator as task_migrator_module
+from backend.models.capability import (
+    CapabilityInvocation,
+    CapabilityResumeOutbox,
+)
 from backend.models.task import Task
 from backend.models.plan import Plan
 from backend.models.plan_agent import PlanAgentRun
@@ -19,7 +23,16 @@ from backend.services.task_migrator import (
     TaskMigrator,
     migration_task_generation,
 )
-from backend.services.worker_proxy import WorkerProxy, get_task_operation_lock
+from backend.services.pr_review_runtime import PRE_PR_CODE_REVIEW_TAG
+from backend.services.worker_proxy import (
+    WorkerProxy,
+    capture_worker_destroy_lifecycle_claim,
+    get_task_operation_lock,
+)
+from backend.services.worker_relay import (
+    LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY,
+    WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY,
+)
 
 
 class FakeRelay:
@@ -55,6 +68,56 @@ async def _mk_task(session_factory, **fields) -> Task:
         await db.commit()
         await db.refresh(t)
         return t
+
+
+async def _mk_active_resume_outbox(session_factory, task_id: int) -> int:
+    digest = "d" * 64
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        invocation = CapabilityInvocation(
+            task_id=task.id,
+            capability_key="plan",
+            source="human_request",
+            purpose="advisory",
+            status="failed",
+            state_version=2,
+            idempotency_key=f"migration-outbox-{task.id}",
+            input_payload={},
+            input_hash=digest,
+            subject_kind="task_generation",
+            subject_ref={"task_id": task.id},
+            subject_hash=digest,
+            executor_kind="fake",
+            executor_config={},
+            executor_config_hash=digest,
+            policy_snapshot={},
+            policy_hash=digest,
+            resume_policy="attach_only",
+            max_attempts=1,
+            active_task_id=None,
+            error_code="settled",
+        )
+        db.add(invocation)
+        await db.flush()
+        outbox = CapabilityResumeOutbox(
+            task_id=task.id,
+            invocation_id=invocation.id,
+            active_task_id=task.id,
+            active_invocation_id=invocation.id,
+            status="pending",
+            state_version=1,
+            request_task_incarnation_id=task.incarnation_id,
+            request_task_retry_count=task.retry_count,
+            from_turn_generation=task.turn_generation,
+            request_task_session_id=task.session_id,
+            request_source_log_id=201,
+            request_output_log_id=202,
+            request_terminal_log_id=203,
+        )
+        db.add(outbox)
+        await db.commit()
+        return outbox.id
 
 
 def _migrator(db_factory, relay=None) -> TaskMigrator:
@@ -101,6 +164,182 @@ async def test_migrate_local_to_worker(db_factory, session_factory, monkeypatch)
     assert (w.id, t.id) in relay.subscribed
     m._move_session.assert_called_once()
     m._ensure_worker_task.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("tags", "metadata"),
+    [
+        ([PRE_PR_CODE_REVIEW_TAG], {}),
+        (
+            [],
+            {
+                "code_review_run_id": 11,
+                "capability_invocation_id": 12,
+                "capability_execution_id": 13,
+            },
+        ),
+    ],
+)
+async def test_pre_pr_review_task_cannot_migrate_out_of_sandbox(
+    db_factory,
+    session_factory,
+    tags,
+    metadata,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        tags=tags,
+        metadata_=metadata,
+    )
+    migrator = _migrator(db_factory)
+
+    with pytest.raises(MigrationError, match="Automated PR workflow"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+
+
+async def test_auto_capability_policy_rejects_migration_before_side_effects(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        capability_policy={
+            "version": 1,
+            "max_invocations": 1,
+            "capabilities": {"plan": 1},
+        },
+    )
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="immutable and local-only"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+async def test_waiting_capability_rejects_migration_before_side_effects(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="waiting_capability")
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="waiting.*capability"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+async def test_active_capability_resume_outbox_rejects_migration(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory)
+    await _mk_active_resume_outbox(session_factory, task.id)
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="active capability resume outbox"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+async def test_capability_resume_outbox_wins_before_migration_claim(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory)
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+
+    async def admit_resume_before_claim(_worker_id):
+        await _mk_active_resume_outbox(session_factory, task.id)
+        return worker
+
+    migrator._get_worker = AsyncMock(side_effect=admit_resume_before_claim)
+
+    with pytest.raises(MigrationError, match="active capability resume outbox"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_awaited_once_with(worker.id)
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+
+
+@pytest.mark.parametrize("source_is_worker", [False, True])
+async def test_plan_task_rejects_migration_before_side_effects(
+    db_factory,
+    session_factory,
+    source_is_worker,
+):
+    source = (
+        await _mk_worker(session_factory, name="source", private_ip="10.0.0.8")
+        if source_is_worker
+        else None
+    )
+    target = await _mk_worker(
+        session_factory,
+        name="target",
+        private_ip="10.0.0.9",
+    )
+    task = await _mk_task(
+        session_factory,
+        mode="plan",
+        plan_approved=True,
+        plan_content="# Legacy approved Plan",
+        worker_id=source.id if source is not None else None,
+    )
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="Plan Tasks cannot be migrated"):
+        await migrator.migrate(task.id, target.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    assert relay.subscribed == []
+    assert relay.unsubscribed == []
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.worker_id == (source.id if source is not None else None)
+        assert current.status == "completed"
 
 
 @pytest.mark.parametrize(
@@ -298,11 +537,17 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
         status_code = 201
         text = ""
 
-        def __init__(self, status):
+        def __init__(self, status, retry_count, turn_generation):
             self.status = status
+            self.retry_count = retry_count
+            self.turn_generation = turn_generation
 
         def json(self):
-            return {"status": self.status}
+            return {
+                "status": self.status,
+                "retry_count": self.retry_count,
+                "turn_generation": self.turn_generation,
+            }
 
         @staticmethod
         def raise_for_status():
@@ -317,7 +562,11 @@ async def test_coordinated_migration_imports_and_commits_final_skill_tuple(
 
         async def post(self, url, *, headers, json):
             requests.append((url, headers, json))
-            return Response(json["source_status"])
+            return Response(
+                json["source_status"],
+                json["retry_count"],
+                json["turn_generation"],
+            )
 
     monkeypatch.setattr(
         task_migrator_module.httpx,
@@ -482,6 +731,152 @@ async def test_migrate_rejects_in_progress(db_factory, session_factory):
         await m.migrate(t.id, w.id)
 
 
+async def test_migrate_rejects_local_merging_before_side_effects(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="merging")
+    migrator = _migrator(db_factory)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="merging"):
+        await migrator.migrate(task.id, worker.id)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id is None
+    assert current.status == "merging"
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", "executing", "merging", "migrating"])
+async def test_migrate_rejects_non_inert_worker_source_before_side_effects(
+    db_factory,
+    session_factory,
+    status,
+):
+    source = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status=status,
+    )
+    migrator = _migrator(db_factory)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="inert"):
+        await migrator.migrate(task.id, None)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == source.id
+    assert current.status == status
+
+
+@pytest.mark.parametrize(
+    "marker_key",
+    [
+        WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY,
+        LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY,
+    ],
+)
+async def test_migrate_rejects_worker_execution_quarantine_before_side_effects(
+    db_factory,
+    session_factory,
+    marker_key,
+):
+    source = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status="completed",
+        metadata_={marker_key: {"malformed": "still fail closed"}},
+    )
+    migrator = _migrator(db_factory)
+    migrator._get_worker = AsyncMock()
+
+    with pytest.raises(MigrationError, match="quarantined"):
+        await migrator.migrate(task.id, None)
+
+    migrator._get_worker.assert_not_awaited()
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == source.id
+    assert current.status == "completed"
+
+
+async def test_migration_rechecks_worker_quarantine_after_claim(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    """A marker written during Worker validation blocks every copy/import."""
+
+    source = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=source.id,
+        status="completed",
+        metadata_={"manager": "owned"},
+    )
+    migrator = _migrator(db_factory)
+    real_get_worker = migrator._get_worker
+
+    async def quarantine_while_validating(worker_id):
+        worker = await real_get_worker(worker_id)
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(
+                    metadata_={
+                        "manager": "owned",
+                        WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY: {
+                            "operation": "stop-session",
+                        },
+                    }
+                )
+            )
+            await db.commit()
+        return worker
+
+    monkeypatch.setattr(
+        migrator,
+        "_get_worker",
+        quarantine_while_validating,
+    )
+
+    with pytest.raises(MigrationError, match="became quarantined"):
+        await migrator.migrate(task.id, None)
+
+    migrator._sync_task_fields_from_worker.assert_not_awaited()
+    migrator._sync_workspace.assert_not_awaited()
+    migrator._move_session.assert_not_awaited()
+    migrator._move_codex_session.assert_not_awaited()
+    migrator._ensure_worker_task.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.worker_id == source.id
+    assert current.status == "completed"
+    assert WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in current.metadata_
+
+
 async def test_migration_claim_cas_preserves_concurrent_dispatcher_claim(
     db_factory, session_factory, monkeypatch,
 ):
@@ -551,6 +946,50 @@ async def test_migration_claim_rejects_same_status_retry_aba(
     migrator._sync_workspace.assert_not_called()
 
 
+async def test_migration_claim_rejects_turn_generation_only_aba(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    """An unchanged status/retry tuple cannot hide a newly admitted turn."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        status="pending",
+        turn_generation=7,
+    )
+    migrator = _migrator(db_factory)
+    real_get_worker = migrator._get_worker
+
+    async def advance_turn_while_validating(worker_id):
+        current_worker = await real_get_worker(worker_id)
+        async with session_factory() as db:
+            await db.execute(
+                update(Task)
+                .where(Task.id == task.id)
+                .values(turn_generation=Task.turn_generation + 1)
+            )
+            await db.commit()
+        return current_worker
+
+    monkeypatch.setattr(
+        migrator,
+        "_get_worker",
+        advance_turn_while_validating,
+    )
+
+    with pytest.raises(MigrationError, match="并发修改"):
+        await migrator.migrate(task.id, worker.id)
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "pending"
+    assert current.retry_count == task.retry_count
+    assert current.turn_generation == task.turn_generation + 1
+    migrator._sync_workspace.assert_not_called()
+
+
 async def test_migration_and_worker_proxy_share_operation_lock(
     db_factory, session_factory, monkeypatch,
 ):
@@ -595,6 +1034,51 @@ async def test_migrate_rejects_unready_target(db_factory, session_factory):
     m = _migrator(db_factory)
     with pytest.raises(MigrationError, match="不可用"):
         await m.migrate(t.id, w.id)
+
+
+async def test_migration_finish_rejects_target_destroying_after_remote_create(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    """Destroy and the final pointer cut arbitrate on the target Worker row."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, status="completed")
+    relay = FakeRelay()
+    migrator = _migrator(db_factory, relay)
+    proxy = AsyncMock()
+    proxy.ensure_worker_project.return_value = 9
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    async def destroy_after_remote_task_created(*_args, **_kwargs):
+        async with session_factory() as db:
+            claimed = await db.execute(
+                update(Worker)
+                .where(
+                    Worker.id == worker.id,
+                    Worker.status == "ready",
+                )
+                .values(status="destroying")
+            )
+            assert claimed.rowcount == 1
+            await db.commit()
+
+    migrator._ensure_worker_task = AsyncMock(
+        side_effect=destroy_after_remote_task_created
+    )
+
+    with pytest.raises(MigrationError, match="不再 ready"):
+        await migrator.migrate(task.id, worker.id)
+
+    async with session_factory() as db:
+        current_task = await db.get(Task, task.id)
+        current_worker = await db.get(Worker, worker.id)
+    assert current_task.status == "completed"
+    assert current_task.worker_id is None
+    assert current_worker.status == "destroying"
+    assert (worker.id, task.id) in relay.subscribed
+    assert (worker.id, task.id) in relay.unsubscribed
 
 
 async def test_migrate_rejects_unready_source(db_factory, session_factory):
@@ -745,6 +1229,48 @@ async def test_migration_rollback_rejects_same_status_generation_aba(
     assert current.worker_id is None
 
 
+async def test_migration_finish_and_rollback_reject_turn_generation_only_aba(
+    db_factory,
+    session_factory,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        turn_generation=11,
+    )
+    migrator = _migrator(db_factory)
+    claimed = await migrator._claim_migration(
+        migration_task_generation(task)
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(turn_generation=Task.turn_generation + 1)
+        )
+        await db.commit()
+
+    restored = await migrator._restore_migration_claim(
+        claimed,
+        "completed",
+    )
+    assert restored is False
+    with pytest.raises(MigrationError, match="generation"):
+        await migrator._finish_migration(
+            claimed=claimed,
+            target_worker_id=None,
+            restored_status="completed",
+            provider="claude",
+            local_codex_target_home=None,
+        )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "migrating"
+    assert current.retry_count == task.retry_count
+    assert current.turn_generation == task.turn_generation + 1
+
+
 async def test_worker_sync_response_cannot_borrow_new_manager_generation(
     db_factory, session_factory, monkeypatch,
 ):
@@ -775,6 +1301,7 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
                 "id": task.id,
                 "status": "completed",
                 "retry_count": task.retry_count,
+                "turn_generation": task.turn_generation,
                 "session_id": "stale-worker-session",
             }
 
@@ -815,6 +1342,79 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
     assert current.session_id == "old-session"
 
 
+@pytest.mark.parametrize(
+    "remote_turn_generation",
+    [None, 13],
+    ids=["missing", "different"],
+)
+async def test_worker_sync_requires_exact_remote_turn_generation(
+    db_factory,
+    session_factory,
+    monkeypatch,
+    remote_turn_generation,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        turn_generation=12,
+        session_id="manager-session",
+    )
+    migrator = TaskMigrator(
+        db_factory=db_factory,
+        relay=FakeRelay(),
+        broadcaster=None,
+    )
+    claimed = await migrator._claim_migration(
+        migration_task_generation(task)
+    )
+
+    class Response:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            payload = {
+                "id": task.id,
+                "status": "completed",
+                "retry_count": task.retry_count,
+                "session_id": "remote-session",
+            }
+            if remote_turn_generation is not None:
+                payload["turn_generation"] = remote_turn_generation
+            return payload
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def get(self, *_args, **_kwargs):
+            return Response()
+
+    monkeypatch.setattr(
+        task_migrator_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+
+    with pytest.raises(MigrationError, match="源 Worker task generation"):
+        await migrator._sync_task_fields_from_worker(
+            worker,
+            claimed,
+            expected_remote_status="completed",
+        )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "migrating"
+    assert current.turn_generation == 12
+    assert current.session_id == "manager-session"
+
+
 async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
     db_factory,
     session_factory,
@@ -848,6 +1448,7 @@ async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
                 "id": task.id,
                 "status": "completed",
                 "retry_count": task.retry_count,
+                "turn_generation": task.turn_generation,
                 "session_id": None,
                 "last_cwd": None,
                 "target_repo": "",
@@ -903,12 +1504,16 @@ async def test_worker_task_import_is_one_inert_request(
         status_code = 201
         text = ""
 
-        def __init__(self, status):
+        def __init__(self, status, retry_count, turn_generation):
             self.status = status
+            self.retry_count = retry_count
+            self.turn_generation = turn_generation
 
         def json(self):
             return {
                 "status": self.status,
+                "retry_count": self.retry_count,
+                "turn_generation": self.turn_generation,
                 "codex_service_tier": "priority",
             }
 
@@ -925,7 +1530,11 @@ async def test_worker_task_import_is_one_inert_request(
 
         async def post(self, url, *, headers, json):
             requests.append((url, headers, json))
-            return Response(json["source_status"])
+            return Response(
+                json["source_status"],
+                json["retry_count"],
+                json["turn_generation"],
+            )
 
     monkeypatch.setattr(
         task_migrator_module.httpx,
@@ -943,10 +1552,119 @@ async def test_worker_task_import_is_one_inert_request(
     assert payload["source_status"] == "completed"
     assert payload["project_id"] == 17
     assert payload["retry_count"] == 2
+    assert payload["turn_generation"] == t.turn_generation
     assert payload["selected_user_skills"] is None
     assert payload["user_skill_snapshots"] == []
     assert payload["codex_service_tier"] == "priority"
     assert payload["attention_tag"] == "迁移结束后关注"
+
+
+async def test_worker_task_import_rejects_different_turn_confirmation(
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        turn_generation=21,
+    )
+
+    class Response:
+        status_code = 201
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "status": "completed",
+                "retry_count": task.retry_count,
+                "turn_generation": 22,
+            }
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            assert json["turn_generation"] == 21
+            return Response()
+
+    monkeypatch.setattr(
+        task_migrator_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+    migrator = TaskMigrator(db_factory=None, relay=FakeRelay())
+
+    with pytest.raises(MigrationError, match="exact turn generation"):
+        await migrator._ensure_worker_task(
+            worker,
+            task,
+            worker_project_id=17,
+        )
+
+
+async def test_worker_task_import_rejects_different_retry_confirmation(
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        retry_count=4,
+        turn_generation=21,
+    )
+
+    class Response:
+        status_code = 201
+        text = ""
+
+        @staticmethod
+        def json():
+            return {
+                "status": "completed",
+                "retry_count": 3,
+                "turn_generation": 21,
+            }
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def post(self, _url, *, headers, json):
+            assert json["retry_count"] == 4
+            assert json["turn_generation"] == 21
+            return Response()
+
+    monkeypatch.setattr(
+        task_migrator_module.httpx,
+        "AsyncClient",
+        lambda **_kwargs: Client(),
+    )
+    migrator = TaskMigrator(db_factory=None, relay=FakeRelay())
+
+    with pytest.raises(MigrationError, match="exact retry generation"):
+        await migrator._ensure_worker_task(
+            worker,
+            task,
+            worker_project_id=17,
+        )
 
 
 async def test_put_worker_id_triggers_migration(client, session_factory, monkeypatch):
@@ -989,7 +1707,7 @@ async def test_put_without_worker_id_unchanged(client, session_factory, monkeypa
 
 async def test_destroy_migrates_tasks_back(db_factory, session_factory, monkeypatch):
     from backend.api.workers import _migrate_back_then_destroy
-    w = await _mk_worker(session_factory)
+    w = await _mk_worker(session_factory, status="destroying")
     t1 = await _mk_task(session_factory, worker_id=w.id)
     t2 = await _mk_task(session_factory, worker_id=w.id)
 
@@ -1008,7 +1726,13 @@ async def test_destroy_migrates_tasks_back(db_factory, session_factory, monkeypa
     monkeypatch.setattr(main_module, "task_migrator", migrator)
     monkeypatch.setattr(main_module, "worker_relay", relay)
 
-    await _migrate_back_then_destroy(prov, w.id, db_factory=db_factory)
+    destroy_claim = capture_worker_destroy_lifecycle_claim(w)
+    await _migrate_back_then_destroy(
+        prov,
+        w.id,
+        destroy_claim,
+        db_factory=db_factory,
+    )
 
     async with session_factory() as db:
         a = await db.get(Task, t1.id)

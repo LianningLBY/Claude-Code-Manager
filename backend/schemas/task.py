@@ -11,8 +11,12 @@ from pydantic import (
 )
 
 from backend.config import settings
+from backend.schemas.capability import AutoCapabilityPolicy
 from backend.schemas.plan import PlanPipelineConfig
 from backend.schemas.task_ssh_grant import TaskSSHGrantInput
+
+
+TaskMode = Literal["auto", "plan", "loop", "goal"]
 
 
 class UserSkillSnapshotPayload(BaseModel):
@@ -45,7 +49,7 @@ def _normalize_attention_tag(value: object) -> object:
 
 
 class TaskCreate(BaseModel):
-    # Manager→Worker 转发时指定 ID（task ID 全局由 Manager 分配，见设计文档 §2）
+    # Internal Manager→Worker forwarding only: Manager allocates the global ID.
     id: int | None = None
     # None = 本机执行；有值 = 创建后由 Dispatcher 转发到该 Worker
     worker_id: int | None = None
@@ -59,7 +63,16 @@ class TaskCreate(BaseModel):
     target_branch: str = "main"
     priority: int = 0
     max_retries: int = 2
-    mode: str = "auto"  # "auto", "plan", "loop", or "goal"
+    mode: TaskMode = "auto"
+    # Explicit opt-in for model-requested Plan/Review. ``None`` is the only
+    # disabled state; a non-NULL policy is immutable for this Task incarnation.
+    capability_policy: AutoCapabilityPolicy | None = None
+    # Reserved for the Delivery Controller.  They are declared explicitly so
+    # a public caller cannot smuggle ownership hints through Pydantic's legacy
+    # extra-field compatibility.  ``None`` remains harmless for clients that
+    # serialize the read model back into a create form.
+    delivery_run_id: int | None = Field(default=None, exclude=True)
+    delivery_role: str | None = Field(default=None, exclude=True)
     todo_file_path: str | None = None  # required when mode="loop"
     max_iterations: int = 50  # loop only: max iterations before auto-abort
     must_complete: bool = False  # loop only: reject done until all items finished
@@ -114,6 +127,20 @@ class TaskCreate(BaseModel):
 
     @model_validator(mode='after')
     def validate_mode_fields(self):
+        if self.delivery_run_id is not None or self.delivery_role is not None:
+            raise ValueError(
+                "delivery_run_id and delivery_role are reserved for the "
+                "Delivery Controller"
+            )
+        if self.capability_policy is not None:
+            if self.mode != "auto":
+                raise ValueError("capability_policy requires mode=auto")
+            if self.worker_id is not None:
+                raise ValueError("capability_policy is local-task only")
+            if self.id is not None:
+                raise ValueError(
+                    "Manager-forwarded Worker Tasks cannot use capability_policy"
+                )
         if self.mode not in ('loop',) and not self.description:
             raise ValueError('description is required for non-loop tasks')
         if self.mode == 'loop' and not self.todo_file_path:
@@ -131,9 +158,17 @@ class TaskMigrationImport(TaskCreate):
     """
 
     id: int
+    # Auto capability history and resume state are Manager-local.  Inheriting
+    # TaskCreate must never make the migration transport accept this field.
+    capability_policy: None = None
+    # Accept the reserved wire value so the internal endpoint can reject it
+    # with a lifecycle conflict (409) instead of letting schema validation
+    # disguise an attempted Delivery ownership migration as malformed input.
+    mode: Literal["auto", "plan", "loop", "goal", "delivery_loop"] = "auto"
     # Keep Manager and destination Worker retry generations monotonic. This is
     # intentionally internal-only; public task creation always starts at zero.
     retry_count: int = Field(default=0, ge=0)
+    turn_generation: int = Field(default=0, ge=0)
     # Migration may preserve an already-inert source state without ever
     # exposing a dispatchable ``pending`` row on the destination Worker.
     source_status: Literal[
@@ -150,6 +185,7 @@ class TaskTerminationRequest(BaseModel):
 
     expected_status: str
     expected_retry_count: int = Field(ge=0)
+    expected_turn_generation: int = Field(ge=0)
     expected_instance_id: int | None = None
     expected_started_at: datetime | None = None
     expected_completed_at: datetime | None = None
@@ -242,7 +278,13 @@ class TaskUpdate(BaseModel):
     max_retries: int | None = None
     max_iterations: int | None = None
     must_complete: bool | None = None
-    mode: str | None = None
+    mode: TaskMode | None = None
+    # Reserve the wire name so old Pydantic extra-field behavior cannot turn a
+    # policy mutation into a misleading 200 response. Policies are create-only.
+    capability_policy: AutoCapabilityPolicy | None = Field(
+        default=None,
+        exclude=True,
+    )
     goal_condition: str | None = None
     goal_max_turns: int | None = None
     goal_evaluator_model: str | None = None
@@ -263,10 +305,26 @@ class TaskUpdate(BaseModel):
         # not become a database NULL or inherit a deployment default.
         return _normalize_task_provider(value)
 
+    @field_validator("mode", mode="before")
+    @classmethod
+    def reject_mode_mutation(cls, value: object) -> object:
+        # Mode selects a lifecycle state machine and is therefore part of the
+        # Task's creation identity.  Changing it after dequeue can race a
+        # detached dispatcher snapshot and turn a Plan into an ordinary coding
+        # launch (or vice versa).  Keep the field on the wire so old clients
+        # receive an explicit validation error instead of a misleading 200.
+        raise ValueError("mode is immutable after Task creation")
+
     @field_validator("attention_tag", mode="before")
     @classmethod
     def normalize_attention_tag(cls, value: object) -> object:
         return _normalize_attention_tag(value)
+
+    @model_validator(mode="after")
+    def reject_capability_policy_mutation(self):
+        if "capability_policy" in self.model_fields_set:
+            raise ValueError("capability_policy is immutable after Task creation")
+        return self
 
 
 class InternalTaskSkillsUpdate(BaseModel):
@@ -292,8 +350,17 @@ class TaskResponse(BaseModel):
     merge_status: str
     instance_id: int | None
     retry_count: int
+    turn_generation: int
     max_retries: int
     mode: str
+    capability_policy: AutoCapabilityPolicy | None = None
+    delivery_run_id: int | None = None
+    delivery_role: str | None = None
+    # Read-only DeliveryRun projection.  A Delivery-owned Task remains a
+    # scheduler shell; the Run is the authority for its user-facing lifecycle.
+    delivery_phase: str | None = None
+    delivery_activity: str | None = None
+    delivery_outcome: str | None = None
     todo_file_path: str | None
     loop_progress: str | None
     max_iterations: int

@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TasksPage } from './TasksPage';
@@ -50,7 +50,9 @@ vi.mock('../hooks/useTaskReorder', () => ({
     optimistic: Record<string, unknown>[],
   ) => optimistic,
   useTaskReorder: () => ({
-    itemProps: () => ({}),
+    itemProps: () => ({ draggable: true, 'data-reorder-source': 'true' }),
+    dropTargetProps: () => ({ 'data-reorder-target': 'true' }),
+    targetProps: () => ({ 'data-reorder-target': 'true' }),
     draggingId: null,
     overIndex: null,
   }),
@@ -125,8 +127,12 @@ vi.mock('../components/ProjectSelect', () => ({
   ProjectSelect: () => null,
 }));
 vi.mock('../components/Tasks/TaskBadges', () => ({
-  PluginsBadge: () => null,
-  SubAgentsBadge: () => null,
+  PluginsBadge: ({ task }: { task: { id: number } }) => (
+    <span data-testid={`plugins-badge-${task.id}`}>Plugins</span>
+  ),
+  SubAgentsBadge: ({ task }: { task: { id: number } }) => (
+    <span data-testid={`sub-agents-badge-${task.id}`}>Sub-agents</span>
+  ),
 }));
 vi.mock('../components/TeamShareModal', () => ({
   TeamShareModal: () => null,
@@ -313,6 +319,58 @@ describe('TasksPage realtime reconciliation', () => {
     );
 
     expect(await screen.findByText('等待任务结束')).toBeInTheDocument();
+  });
+
+  it('keeps Delivery rows read-only in the split sidebar', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1440,
+    });
+    vi.mocked(api.listTasks).mockResolvedValue([{
+      ...task,
+      mode: 'delivery_loop',
+      delivery_run_id: 42,
+      delivery_activity: 'waiting',
+      status: 'in_progress',
+    }] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={task.id}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    const row = await screen.findByTestId('task-sidebar-row-7');
+    expect(row).toHaveAttribute('data-reorder-target', 'true');
+    expect(row).not.toHaveAttribute('data-reorder-source');
+    expect(row).not.toHaveAttribute('draggable');
+    expect(within(row).queryByTestId('plugins-badge-7')).not.toBeInTheDocument();
+    expect(within(row).queryByTitle('Share')).not.toBeInTheDocument();
+    expect(within(row).queryByTitle('Archive')).not.toBeInTheDocument();
+    expect(within(row).getByTitle('Star')).toBeInTheDocument();
+    expect(screen.getByTestId('task-sidebar-status-7')).toHaveClass('bg-indigo-400');
+  });
+
+  it('offers the Delivery Waiting filter with its indigo status color', async () => {
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(api.countTasks).toHaveBeenCalled());
+    await userEvent.click(screen.getByRole('button', { name: /Filter/ }));
+    const deliveryFilter = screen.getByRole('button', { name: /Delivery Waiting/ });
+    expect(deliveryFilter.querySelector('.bg-indigo-500')).not.toBeNull();
+    await userEvent.click(deliveryFilter);
+
+    await waitFor(() => {
+      expect(vi.mocked(api.listTasks).mock.calls.some((call) => (
+        call[0] === 'delivery_waiting'
+      ))).toBe(true);
+    });
   });
 
   it('immediately reconciles add, edit, and clear into active search results', async () => {

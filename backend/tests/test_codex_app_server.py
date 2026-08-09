@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import shutil
 import signal
 import tomllib
 from pathlib import Path
@@ -96,6 +97,35 @@ def _tool_free_thread_response(
         "sandbox": {
             "type": "readOnly",
             "networkAccess": False,
+        },
+    }
+
+
+def _network_isolated_thread_response(
+    cwd: str,
+    *,
+    thread_id: str = "thread-delivery-test",
+    permission_profile: str = "ccm_delivery_workspace_v1_test",
+    network_access: bool = False,
+    writable_roots: list[str] | None = None,
+) -> dict:
+    return {
+        "thread": {
+            "id": thread_id,
+            "status": {"type": "idle"},
+        },
+        "serviceTier": "default",
+        "cwd": cwd,
+        "activePermissionProfile": {
+            "id": permission_profile,
+            "extends": None,
+        },
+        "sandbox": {
+            "type": "workspaceWrite",
+            "writableRoots": writable_roots or [],
+            "networkAccess": network_access,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
         },
     }
 
@@ -990,6 +1020,491 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
 
 
 @pytest.mark.asyncio
+async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
+    tmp_path,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "config/read":
+            return {"config": {"mcp_servers": {}}}
+        if method == "thread/start":
+            return _network_isolated_thread_response(
+                workspace,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-delivery-isolated"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="implement only inside the managed worktree",
+        cwd=workspace,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=909,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        disable_autonomous_features=True,
+        network_isolated=True,
+    )
+
+    config_call, thread_call, turn_call = server._request.await_args_list
+    assert config_call.args == (
+        "config/read",
+        {"cwd": workspace, "includeLayers": False},
+    )
+    assert thread_call.args[0] == "thread/start"
+    thread_params = thread_call.args[1]
+    # A legacy workspace-write override would replace the restricted-read
+    # profile with full host read access.
+    assert "sandbox" not in thread_params
+    config = thread_params["config"]
+    assert config["mcp_servers"] == {}
+    assert config["web_search"] == "disabled"
+    assert config["allow_login_shell"] is False
+    permission_profile = config["default_permissions"]
+    assert permission_profile.startswith("ccm_delivery_workspace_v1_")
+    assert len(permission_profile) == len("ccm_delivery_workspace_v1_") + 32
+    assert config["permissions"] == {
+        permission_profile: {
+            "filesystem": {
+                ":root": "deny",
+                ":minimal": "read",
+                workspace: "write",
+            },
+            "network": {
+                "enabled": False,
+                "allow_local_binding": False,
+            },
+        },
+    }
+    for feature in (
+        "apps",
+        "browser_use",
+        "computer_use",
+        "enable_fanout",
+        "enable_mcp_apps",
+        "goals",
+        "hooks",
+        "image_generation",
+        "memories",
+        "multi_agent",
+        "plugins",
+        "realtime_conversation",
+        "remote_compaction_v2",
+        "remote_plugin",
+        "shell_snapshot",
+        "standalone_web_search",
+        "tool_call_mcp_elicitation",
+        "workspace_dependencies",
+    ):
+        assert config["features"][feature] is False
+    # The Developer still has the ordinary local coding tools; they must not
+    # accidentally be disabled by the remote-capability deny-list.
+    assert "shell_tool" not in config["features"]
+    assert "unified_exec" not in config["features"]
+    assert config["orchestrator"] == {
+        "skills": {"enabled": False},
+        "mcp": {"enabled": False},
+    }
+    assert config["skills"] == {
+        "include_instructions": False,
+        "bundled": {"enabled": False},
+        "config": [],
+    }
+    assert config["tools"]["experimental_request_user_input"] == {
+        "enabled": False,
+    }
+    shell_policy = config["shell_environment_policy"]
+    assert shell_policy["inherit"] == "core"
+    assert shell_policy["ignore_default_excludes"] is False
+    assert shell_policy["exclude"] == [
+        "GIT_*",
+        "GH_*",
+        "GITHUB_*",
+        "SSH_*",
+    ]
+    assert shell_policy["set"] == {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GH_PROMPT_DISABLED": "1",
+    }
+    assert not any(
+        "TOKEN" in name or "SECRET" in name or name.endswith("_KEY")
+        for name in shell_policy["set"]
+    )
+    assert turn_call.args[0] == "turn/start"
+    # TurnStartParams in Codex 0.144.6 has no permission-profile selector.
+    # Omitting the legacy sandboxPolicy preserves the exact audited thread
+    # profile rather than widening reads for this turn.
+    assert "sandboxPolicy" not in turn_call.args[1]
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
+    tmp_path,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    profile_ids: list[str] = []
+
+    async def request(method, params):
+        if method == "config/read":
+            return {"config": {"mcp_servers": {}}}
+        if method == "thread/start":
+            profile_id = params["config"]["default_permissions"]
+            profile_ids.append(profile_id)
+            assert set(params["config"]["permissions"]) == {profile_id}
+            return _network_isolated_thread_response(
+                workspace,
+                thread_id=f"thread-delivery-{len(profile_ids)}",
+                permission_profile=profile_id,
+            )
+        if method == "turn/start":
+            return {"turn": {"id": f"turn-delivery-{len(profile_ids)}"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    random_suffixes = ["a" * 32, "b" * 32]
+    # start_turn also generates a client message ID after selecting the
+    # permission profile, so provide one unrelated UUID between profile IDs.
+    generated = [
+        SimpleNamespace(hex=random_suffixes[0]),
+        SimpleNamespace(hex="1" * 32),
+        SimpleNamespace(hex=random_suffixes[1]),
+        SimpleNamespace(hex="2" * 32),
+    ]
+
+    with patch(
+        "backend.services.codex_app_server.uuid.uuid4",
+        side_effect=generated,
+    ):
+        for task_id in (912, 913):
+            await server.start_turn(
+                prompt="implement only inside the managed worktree",
+                cwd=workspace,
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                disable_project_config=True,
+                disable_user_mcp=True,
+                sandbox_mode="workspace-write",
+                disable_autonomous_features=True,
+                network_isolated=True,
+            )
+
+    assert profile_ids == [
+        f"ccm_delivery_workspace_v1_{suffix}"
+        for suffix in random_suffixes
+    ]
+    assert len(set(profile_ids)) == 2
+    assert "ccm_delivery_workspace_v1" not in profile_ids
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_disables_inherited_mcp_by_name(
+    tmp_path,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "config/read":
+            return {
+                "config": {
+                    "mcp_servers": {
+                        "github": {"command": "/usr/bin/credential-helper"},
+                        "user-app": {"url": "https://example.invalid/mcp"},
+                    },
+                },
+            }
+        if method == "thread/start":
+            return _network_isolated_thread_response(
+                workspace,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-delivery-no-mcp"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="implement locally",
+        cwd=workspace,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=910,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        disable_autonomous_features=True,
+        network_isolated=True,
+    )
+
+    thread_config = server._request.await_args_list[1].args[1]["config"]
+    profile_id = thread_config["default_permissions"]
+    assert set(thread_config["permissions"]) == {profile_id}
+    assert thread_config["mcp_servers"] == {
+        "github": {"enabled": False},
+        "user-app": {"enabled": False},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_overrides", "message"),
+    [
+        ({"network_access": True}, "network-isolated profile"),
+        (
+            {"writable_roots": ["/outside-delivery-worktree"]},
+            "network-isolated profile",
+        ),
+        (
+            {"permission_profile": "attacker-controlled-profile"},
+            "network-isolated profile",
+        ),
+    ],
+)
+async def test_network_isolated_delivery_fails_before_turn_without_sandbox_proof(
+    tmp_path,
+    response_overrides,
+    message,
+):
+    workspace = str(tmp_path.resolve())
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "config/read":
+            return {"config": {"mcp_servers": {}}}
+        if method == "thread/start":
+            response_kwargs = dict(response_overrides)
+            response_kwargs.setdefault(
+                "permission_profile",
+                params["config"]["default_permissions"],
+            )
+            return _network_isolated_thread_response(
+                workspace,
+                **response_kwargs,
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    with pytest.raises(CodexRequiredMcpPreTurnError, match=message):
+        await server.start_turn(
+            prompt="must not reach the model",
+            cwd=workspace,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=911,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            disable_autonomous_features=True,
+            network_isolated=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "thread/start",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("CCM_RUN_REAL_CODEX_SANDBOX_TESTS") != "1"
+    or shutil.which("codex") is None,
+    reason="opt-in real Codex app-server sandbox probe",
+)
+async def test_real_codex_delivery_permission_profile_blocks_host_reads(
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise the pinned app-server without sending a model request."""
+
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside-secret.txt"
+    codex_home.mkdir()
+    workspace.mkdir()
+    outside.write_text("host-secret", encoding="utf-8")
+    (workspace / "inside.txt").write_text("inside-ok", encoding="utf-8")
+    (workspace / ".git").write_text(
+        f"gitdir: {tmp_path / 'git-metadata'}\n",
+        encoding="utf-8",
+    )
+    profile = "ccm_delivery_workspace_v1"
+    monkeypatch.setenv("GH_TOKEN", "must-not-enter-delivery-shell")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-enter-delivery-shell")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/must-not-enter-delivery-shell")
+    profile_config = {
+        "allow_login_shell": False,
+        "default_permissions": profile,
+        "permissions": {
+            profile: {
+                "filesystem": {
+                    ":root": "deny",
+                    ":minimal": "read",
+                    str(workspace.resolve()): "write",
+                },
+                "network": {
+                    "enabled": False,
+                    "allow_local_binding": False,
+                },
+            },
+        },
+        "shell_environment_policy": {
+            "inherit": "core",
+            "ignore_default_excludes": False,
+            "exclude": ["GIT_*", "GH_*", "GITHUB_*", "SSH_*"],
+        },
+    }
+    # command/exec resolves named profiles from the account config. The
+    # thread/start request below independently proves that the same shape is
+    # accepted as the request-local profile used by production.
+    (codex_home / "config.toml").write_text(
+        "\n".join([
+            f'default_permissions = "{profile}"',
+            "allow_login_shell = false",
+            "",
+            f"[permissions.{profile}.filesystem]",
+            '":root" = "deny"',
+            '":minimal" = "read"',
+            f'{json.dumps(str(workspace.resolve()))} = "write"',
+            "",
+            f"[permissions.{profile}.network]",
+            "enabled = false",
+            "allow_local_binding = false",
+            "",
+            "[shell_environment_policy]",
+            'inherit = "core"',
+            "ignore_default_excludes = false",
+            'exclude = ["GIT_*", "GH_*", "GITHUB_*", "SSH_*"]',
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    server = CodexAppServer(
+        shutil.which("codex") or "codex",
+        codex_home=codex_home,
+    )
+    try:
+        await server.ensure_started()
+        thread_response = await server._request(
+            "thread/start",
+            {
+                "cwd": str(workspace.resolve()),
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "config": profile_config,
+            },
+        )
+        assert thread_response["activePermissionProfile"] == {
+            "id": profile,
+            "extends": None,
+        }
+        assert thread_response["sandbox"] == {
+            "type": "workspaceWrite",
+            "writableRoots": [],
+            "networkAccess": False,
+            "excludeTmpdirEnvVar": True,
+            "excludeSlashTmp": True,
+        }
+
+        outside_result = await server._request(
+            "command/exec",
+            {
+                "command": ["/bin/cat", str(outside.resolve())],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert outside_result["exitCode"] != 0
+        assert "host-secret" not in outside_result["stdout"]
+
+        env_result = await server._request(
+            "command/exec",
+            {
+                "command": ["/usr/bin/env"],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert env_result["exitCode"] == 0
+        assert "GH_TOKEN=" not in env_result["stdout"]
+        assert "GITHUB_TOKEN=" not in env_result["stdout"]
+        assert "SSH_AUTH_SOCK=" not in env_result["stdout"]
+
+        inside_result = await server._request(
+            "command/exec",
+            {
+                "command": [
+                    "/bin/sh",
+                    "-c",
+                    "cat inside.txt && printf written > created.txt",
+                ],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert inside_result == {
+            "exitCode": 0,
+            "stdout": "inside-ok",
+            "stderr": "",
+        }
+        assert (workspace / "created.txt").read_text(encoding="utf-8") == (
+            "written"
+        )
+
+        git_result = await server._request(
+            "command/exec",
+            {
+                "command": [
+                    "/bin/sh",
+                    "-c",
+                    "printf overwritten > .git",
+                ],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile,
+                "timeoutMs": 5_000,
+            },
+        )
+        assert git_result["exitCode"] != 0
+        assert (workspace / ".git").read_text(encoding="utf-8").startswith(
+            "gitdir: "
+        )
+    finally:
+        await server.shutdown(reason="real Delivery sandbox probe complete")
+
+
+@pytest.mark.asyncio
 async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -1520,6 +2035,111 @@ async def test_turn_owner_hook_failure_prevents_model_admission():
         "thread/start"
     ]
     assert not server.has_active_thread("thread-owner-hook-failure")
+
+
+@pytest.mark.asyncio
+async def test_turn_owner_hook_runs_after_final_tool_free_preflight():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "config": {"mcp_servers": {}},
+            "origins": {},
+        },
+        {
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [],
+                "errors": [],
+            }],
+        },
+        _tool_free_thread_response("thread-final-preflight"),
+    ])
+    prepared = AsyncMock()
+
+    async def invalidate_inventory(_thread_id):
+        server._handle_notification("skills/changed", {})
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="skills inventory changed before turn/start",
+    ):
+        await server.start_turn(
+            prompt="must not start after stale preflight",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=905,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+            on_thread_started=invalidate_inventory,
+            on_turn_prepared=prepared,
+        )
+
+    prepared.assert_not_awaited()
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+    assert not server.has_active_thread("thread-final-preflight")
+
+
+@pytest.mark.asyncio
+async def test_turn_owner_hook_skills_change_fails_closed_before_model_input():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "config": {"mcp_servers": {}},
+            "origins": {},
+        },
+        {
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [],
+                "errors": [],
+            }],
+        },
+        _tool_free_thread_response("thread-owner-toctou"),
+    ])
+    prepared = AsyncMock(
+        side_effect=lambda *_args: server._handle_notification(
+            "skills/changed",
+            {},
+        )
+    )
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed while publishing launch ownership",
+    ):
+        await server.start_turn(
+            prompt="must remain tool-free",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=906,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+            on_turn_prepared=prepared,
+        )
+
+    prepared.assert_awaited_once()
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+    assert not server.has_active_thread("thread-owner-toctou")
 
 
 @pytest.mark.asyncio
@@ -4324,6 +4944,9 @@ async def test_notifications_stream_delta_and_finish_process():
     assert lines[2] == {
         "type": "turn.completed",
         "turn_id": "turn-1",
+        "status": "completed",
+        "success": True,
+        "error": None,
         "usage": {
             "input_tokens": 100,
             "cached_input_tokens": 80,
@@ -5513,6 +6136,589 @@ async def test_context_window_error_keeps_structured_codex_error_info():
 
 
 @pytest.mark.asyncio
+async def test_interrupted_terminal_has_explicit_failure_semantics():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-1"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="stop",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=298,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-1",
+        "turn": {
+            "id": "turn-1",
+            "status": "interrupted",
+            "error": None,
+        },
+    })
+
+    terminal = json.loads((await process.stdout.readline()).decode())
+    assert terminal == {
+        "type": "turn.completed",
+        "usage": {},
+        "turn_id": "turn-1",
+        "status": "interrupted",
+        "success": False,
+        "error": {"message": "Codex turn was interrupted"},
+    }
+    assert await process.wait() == 130
+    assert process.termination_kind == "user_interrupt"
+
+
+async def _start_terminal_validation_turn():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-terminal-validation",
+                "status": {"type": "idle"},
+            }
+        },
+        {"turn": {"id": "turn-terminal-validation"}},
+    ])
+    process, thread_id = await server.start_turn(
+        prompt="validate the native terminal",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+    assert json.loads((await process.stdout.readline()).decode()) == {
+        "type": "thread.started",
+        "thread_id": thread_id,
+    }
+    return server, process, thread_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "terminal",
+    [
+        pytest.param(
+            {"turnId": "turn-terminal-validation"},
+            id="missing-turn",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": "not-an-object",
+            },
+            id="non-object-turn",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"status": "completed"},
+            },
+            id="missing-turn-id",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"id": 301, "status": "completed"},
+            },
+            id="non-string-turn-id",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"id": "   ", "status": "completed"},
+            },
+            id="empty-turn-id",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {"id": " padded-id ", "status": "completed"},
+            },
+            id="whitespace-corrupt-turn-id",
+        ),
+        pytest.param(
+            {"turn": {"id": "turn-terminal-validation"}},
+            id="missing-status",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": {"message": "native error"},
+                }
+            },
+            id="completed-with-error",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": None,
+                },
+                "error": {"message": "root-level native error"},
+            },
+            id="completed-with-root-error",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "success": False,
+                }
+            },
+            id="completed-with-false-success",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "failed",
+                    "success": True,
+                }
+            },
+            id="failed-with-true-success",
+        ),
+        pytest.param(
+            {
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "success": True,
+                },
+                "success": False,
+            },
+            id="conflicting-root-and-turn-success",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-terminal-validation",
+                "turn": {
+                    "id": "turn-conflicting",
+                    "status": "completed",
+                }
+            },
+            id="conflicting-turn-id",
+        ),
+        pytest.param(
+            {
+                "status": "failed",
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": None,
+                },
+            },
+            id="conflicting-root-status",
+        ),
+        pytest.param(
+            {
+                "turnId": "turn-other",
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "completed",
+                    "error": None,
+                },
+            },
+            id="conflicting-root-turn-id",
+        ),
+        pytest.param(
+            {
+                "error": {"message": "different"},
+                "turn": {
+                    "id": "turn-terminal-validation",
+                    "status": "failed",
+                    "error": {"message": "failed"},
+                },
+            },
+            id="conflicting-root-error",
+        ),
+    ],
+)
+async def test_malformed_turn_terminal_fails_exact_adapter_without_deferral(
+    terminal,
+):
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    context.following_native_goal = True
+    context.descendant_thread_ids.add("thread-terminal-child")
+    context.active_descendant_thread_ids.add("thread-terminal-child")
+    server._contexts_by_descendant["thread-terminal-child"] = context
+
+    server._handle_notification(
+        "turn/completed",
+        {"threadId": thread_id, **terminal},
+    )
+
+    failure = json.loads((await process.stdout.readline()).decode())
+    assert failure["type"] == "turn.failed"
+    assert failure["status"] == "failed"
+    assert failure["success"] is False
+    assert failure["terminal"] is True
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    raw_turn = terminal.get("turn")
+    raw_turn_id = raw_turn.get("id") if isinstance(raw_turn, dict) else None
+    if (
+        not isinstance(raw_turn_id, str)
+        or not raw_turn_id.strip()
+        or raw_turn_id != raw_turn_id.strip()
+    ):
+        assert "turn_id" not in failure
+    assert await process.wait() == 1
+    assert context.pending_goal_terminal_notification is None
+    assert context.deferred_terminal_notification is None
+    assert context.descendant_guard_task is None
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert server._contexts_by_descendant == {}
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_terminal_retains_owner_until_exact_interrupt_finishes():
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    runtime = server._runtime_state_for(thread_id)
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-terminal-validation")
+    release_interrupt = asyncio.Event()
+
+    async def interrupt_exact(candidate):
+        assert candidate is context
+        assert server._contexts_by_thread[thread_id] is context
+        assert runtime.status_type == "active"
+        assert runtime.active_turn_ids == {"turn-terminal-validation"}
+        await release_interrupt.wait()
+
+    server._interrupt_turn_context = AsyncMock(side_effect=interrupt_exact)
+    server.shutdown = AsyncMock()
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-delayed-unrelated",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    await asyncio.sleep(0)
+    assert process.returncode is None
+    assert server._contexts_by_thread[thread_id] is context
+    assert runtime.status_type == "active"
+    assert runtime.active_turn_ids == {"turn-terminal-validation"}
+
+    release_interrupt.set()
+    await guard
+    failure = json.loads((await process.stdout.readline()).decode())
+    assert failure["type"] == "turn.failed"
+    assert failure["turn_id"] == "turn-terminal-validation"
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    assert await process.wait() == 1
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert runtime.status_type == "idle"
+    assert runtime.active_turn_ids == set()
+    server.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_terminal_shutdowns_transport_before_detaching_owner():
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    runtime = server._runtime_state_for(thread_id)
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-terminal-validation")
+    server._interrupt_turn_context = AsyncMock(
+        side_effect=CodexAppServerError("interrupt outcome unknown")
+    )
+
+    async def shutdown_transport(**kwargs):
+        assert "uncorrelated terminal" in kwargs["reason"]
+        assert process.returncode is None
+        assert server._contexts_by_thread[thread_id] is context
+        assert runtime.status_type == "active"
+
+    server.shutdown = AsyncMock(side_effect=shutdown_transport)
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-delayed-unrelated",
+            "status": "completed",
+            "error": None,
+        },
+    })
+
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    await guard
+    server.shutdown.assert_awaited_once()
+    assert await process.wait() == 1
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert runtime.status_type == "idle"
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_terminal_keeps_owner_when_transport_shutdown_is_unknown():
+    server, process, thread_id = await _start_terminal_validation_turn()
+    context = server._contexts_by_thread[thread_id]
+    runtime = server._runtime_state_for(thread_id)
+    runtime.status_type = "active"
+    runtime.active_turn_ids.add("turn-terminal-validation")
+    server._interrupt_turn_context = AsyncMock(
+        side_effect=CodexAppServerError("interrupt outcome unknown")
+    )
+    server.shutdown = AsyncMock(
+        side_effect=CodexAppServerError("transport survived shutdown")
+    )
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-delayed-unrelated",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    await guard
+
+    assert process.returncode is None
+    assert server._contexts_by_thread[thread_id] is context
+    assert server._contexts_by_turn["turn-terminal-validation"] is context
+    assert runtime.status_type == "active"
+    assert runtime.active_turn_ids == {"turn-terminal-validation"}
+
+    # Test cleanup only; production deliberately retains this fail-closed
+    # owner until a later transport reconciliation proves termination.
+    process.finish(1, "test cleanup")
+    server._detach_turn_context(context)
+
+
+@pytest.mark.asyncio
+async def test_peer_turn_identity_never_falls_back_to_another_active_thread():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-a", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-a"}},
+        {"thread": {"id": "thread-b", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-b"}},
+    ])
+    process_a, _ = await server.start_turn(
+        prompt="a",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+    await process_a.stdout.readline()
+    process_b, _ = await server.start_turn(
+        prompt="b",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=302,
+    )
+    await process_b.stdout.readline()
+    context_a = server._contexts_by_thread["thread-a"]
+    context_b = server._contexts_by_thread["thread-b"]
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-a",
+        "turn": {"id": "turn-b", "status": "completed", "error": None},
+    })
+
+    assert process_a.returncode is None
+    assert process_b.returncode is None
+    assert context_a.malformed_terminal_guard_task is None
+    assert context_b.malformed_terminal_guard_task is None
+    assert server._contexts_by_thread == {
+        "thread-a": context_a,
+        "thread-b": context_b,
+    }
+
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-a",
+        "turn": {"id": "turn-a", "status": "completed", "error": None},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-b",
+        "turn": {"id": "turn-b", "status": "completed", "error": None},
+    })
+    assert await process_a.wait() == 0
+    assert await process_b.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_valid_explicit_completed_terminal_still_succeeds():
+    server, process, thread_id = await _start_terminal_validation_turn()
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-terminal-validation",
+            "status": "completed",
+            "success": True,
+            "error": None,
+        },
+    })
+
+    terminal = json.loads((await process.stdout.readline()).decode())
+    assert terminal == {
+        "type": "turn.completed",
+        "usage": {},
+        "turn_id": "turn-terminal-validation",
+        "status": "completed",
+        "success": True,
+        "error": None,
+    }
+    assert await process.wait() == 0
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_response_first_malformed_terminal_cannot_resurrect_context():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-response-first-malformed",
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "turn/start":
+            server._handle_notification("turn/completed", {
+                "threadId": "thread-response-first-malformed",
+                "turn": {
+                    "id": "turn-native-malformed",
+                    "status": "completed",
+                    "error": {"message": "must not be successful"},
+                    "items": [{
+                        "id": "input-response-first-malformed",
+                        "type": "userMessage",
+                        "clientId": params["clientUserMessageId"],
+                    }],
+                },
+            })
+            return {"turn": {"id": "turn-submission-malformed"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="fail closed before admission returns",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    failure = next(row for row in rows if row["type"] == "turn.failed")
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    assert failure["turn_id"] == "turn-native-malformed"
+    assert await process.wait() == 1
+    assert thread_id == "thread-response-first-malformed"
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_response_first_uncorrelated_terminal_interrupts_admitted_identity():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    release_interrupt = asyncio.Event()
+
+    async def interrupt_after_admission(context):
+        await release_interrupt.wait()
+        assert context.turn_id == "turn-submission-after-unknown"
+
+    server._interrupt_turn_context = AsyncMock(side_effect=interrupt_after_admission)
+    server.shutdown = AsyncMock()
+
+    async def request(method, params):
+        if method == "thread/start":
+            return {
+                "thread": {
+                    "id": "thread-response-first-unknown",
+                    "status": {"type": "idle"},
+                }
+            }
+        if method == "turn/start":
+            server._handle_notification("turn/completed", {
+                "threadId": "thread-response-first-unknown",
+                "turn": {
+                    "id": "turn-unrelated-before-response",
+                    "status": "completed",
+                    "error": None,
+                },
+            })
+            return {"turn": {"id": "turn-submission-after-unknown"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="retain admission while terminal identity is unknown",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="medium",
+        resume_session_id=None,
+        git_env=None,
+        task_id=301,
+    )
+    context = server._contexts_by_thread[thread_id]
+    guard = context.malformed_terminal_guard_task
+    assert guard is not None
+    assert context.turn_id == "turn-submission-after-unknown"
+    assert process.returncode is None
+
+    release_interrupt.set()
+    await guard
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    failure = next(row for row in rows if row["type"] == "turn.failed")
+    assert failure["turn_id"] == "turn-submission-after-unknown"
+    assert failure["error"]["code"] == "ccm_malformed_turn_terminal"
+    assert await process.wait() == 1
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    server.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     (
         "will_retry",
@@ -5602,6 +6808,14 @@ async def test_error_notification_respects_will_retry(
     completed = json.loads((await process.stdout.readline()).decode())
     assert completed["type"] == "turn.completed"
     assert completed["turn_id"] == "turn-1"
+    if will_retry:
+        assert completed["status"] == "completed"
+        assert completed["success"] is True
+        assert completed["error"] is None
+    else:
+        assert completed["status"] == "failed"
+        assert completed["success"] is False
+        assert completed["error"] == error
     assert await process.wait() == expected_exit_code
     assert process.termination_kind == expected_termination_kind
 

@@ -164,7 +164,7 @@ describe('PlansPage', () => {
       all: 70,
       waiting_user: 4,
       awaiting_review: 5,
-      'planner,reviewer,queued,running': 6,
+      'planner,reviewer,queued,running,cancelling': 6,
       approved: 7,
       applied: 8,
       failed: 9,
@@ -190,7 +190,7 @@ describe('PlansPage', () => {
     const base = { kind: 'standalone', project_id: 3, q: 'architecture', archived_only: true };
     await waitFor(() => {
       expect(api.countPlans).toHaveBeenCalledWith(base);
-      for (const display_state of ['waiting_user', 'awaiting_review', 'planner,reviewer,queued,running', 'approved', 'applied', 'failed', 'rejected,cancelled']) {
+      for (const display_state of ['waiting_user', 'awaiting_review', 'planner,reviewer,queued,running,cancelling', 'approved', 'applied', 'failed', 'rejected,cancelled']) {
         expect(api.countPlans).toHaveBeenCalledWith({ ...base, display_state });
       }
     });
@@ -198,14 +198,14 @@ describe('PlansPage', () => {
 
   it('uses the selected status for the catalog and pagination total without changing preview counts', async () => {
     vi.mocked(api.countPlans).mockImplementation(async (params = {}) => ({
-      total: params.display_state === 'planner,reviewer,queued,running' ? 23 : 61,
+      total: params.display_state === 'planner,reviewer,queued,running,cancelling' ? 23 : 61,
     }));
     render(<StatefulPlansPage />);
     await screen.findByRole('button', { name: 'Running 23' });
 
     await userEvent.click(screen.getByRole('button', { name: 'Running 23' }));
     await waitFor(() => expect(api.listPlans).toHaveBeenCalledWith(expect.objectContaining({
-      display_state: 'planner,reviewer,queued,running',
+      display_state: 'planner,reviewer,queued,running,cancelling',
       limit: 20,
       offset: 0,
     })));

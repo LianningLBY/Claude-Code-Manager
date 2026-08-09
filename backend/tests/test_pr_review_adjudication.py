@@ -15,13 +15,18 @@ from backend.models.pr_monitor import (
     PRReviewerRun,
 )
 from backend.models.task import Task
+from backend.models.worker import Worker
 from backend.services.pr_review_adjudication import (
     complete_adjudication,
+    fail_adjudication,
     parse_adjudication_output,
     reconcile_fixed_finding_resolutions,
     reconcile_rebuttal_resolutions,
 )
 from backend.services.pr_monitor_loop import record_gate_pass
+from backend.tests.worker_termination_helpers import (
+    persist_active_manager_receipt,
+)
 
 
 BASE = "a" * 40
@@ -37,6 +42,137 @@ def _output(fingerprint: str, verdict: str = "accepted") -> str:
         "PR_REBUTTAL_ADJUDICATION_END\n"
         "PR_REVIEW_RESULT: rebuttal_adjudicated"
     )
+
+
+async def _receipt_owned_adjudication_fixture(
+    db_session,
+    *,
+    task_status: str,
+):
+    worker = Worker(
+        name=f"{task_status} adjudication receipt worker",
+        status="ready",
+        private_ip="10.0.0.92",
+        auth_token=f"{task_status}-receipt-token",
+    )
+    repo = MonitoredRepo(
+        repo_full_name=f"owner/{task_status}-receipt-adjudication",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+    )
+    developer = Task(
+        title="Developer",
+        description="change",
+        status="completed",
+    )
+    db_session.add_all([worker, repo, developer])
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=93,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        developer_task_id=developer.id,
+        status="adjudicating",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=93,
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="receipt adjudication",
+        pr_author="alice",
+        pr_url=(
+            "https://github.com/owner/receipt-adjudication/pull/93"
+        ),
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    reviewer = PRReviewerRun(
+        pr_review_id=review.id,
+        role="senior_engineer",
+        provider="codex",
+        status="changes_required",
+        prompt_policy_hash="1" * 64,
+        guide_pack_hash="2" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    finding = PRFinding(
+        pr_review_id=review.id,
+        reviewer_run_id=reviewer.id,
+        fingerprint="f" * 64,
+        role="senior_engineer",
+        severity="high",
+        category="correctness",
+        path="app.py",
+        line=3,
+        title="missing receipt fence",
+        evidence="guard missing",
+        impact="unsafe",
+        required_fix="add guard",
+        test="exercise receipt race",
+        base_sha=BASE,
+        head_sha=HEAD,
+        thread_nonce="3" * 48,
+        thread_status="published_inline",
+        github_comment_id=123,
+    )
+    db_session.add(finding)
+    await db_session.flush()
+    started_at = datetime.utcnow() - timedelta(seconds=1)
+    adjudicator = Task(
+        title="receipt-owned Adjudicator",
+        description="judge",
+        status=task_status,
+        worker_id=worker.id,
+        retry_count=0,
+        started_at=started_at,
+        completed_at=datetime.utcnow(),
+        metadata_={"pr_review_id": review.id},
+        tags=["pr-review"],
+    )
+    db_session.add(adjudicator)
+    await db_session.flush()
+    rebuttal = PRFindingRebuttal(
+        finding_id=finding.id,
+        pr_review_id=review.id,
+        monitor_run_id=run.id,
+        developer_task_id=developer.id,
+        task_id=adjudicator.id,
+        attempt=1,
+        base_sha=BASE,
+        head_sha=HEAD,
+        evidence="Concrete exact code evidence.",
+        evidence_hash="4" * 64,
+        status="adjudicating",
+        resolution_nonce="5" * 48,
+    )
+    db_session.add(rebuttal)
+    if task_status == "completed":
+        db_session.add(
+            LogEntry(
+                task_id=adjudicator.id,
+                task_retry_count=0,
+                event_type="result",
+                role="assistant",
+                content=_output(finding.fingerprint),
+                timestamp=datetime.utcnow(),
+                is_error=False,
+            )
+        )
+    await db_session.commit()
+    return {
+        "task": adjudicator.id,
+        "rebuttal": rebuttal.id,
+        "finding": finding.id,
+        "run": run.id,
+    }
 
 
 async def _accepted_resolution_fixture(
@@ -223,6 +359,77 @@ async def _fixed_resolution_fixture(
     db_session.add(finding)
     await db_session.commit()
     return repo, run, old_review, current_review, finding
+
+
+@pytest.mark.asyncio
+async def test_completed_adjudication_yields_to_manager_termination_receipt(
+    db_session,
+    db_factory,
+):
+    ids = await _receipt_owned_adjudication_fixture(
+        db_session,
+        task_status="completed",
+    )
+    await persist_active_manager_receipt(db_factory, ids["task"])
+
+    await complete_adjudication(
+        db_session,
+        adjudication_id=ids["rebuttal"],
+        task_id=ids["task"],
+        retry_count=0,
+    )
+
+    rebuttal = await db_session.get(
+        PRFindingRebuttal,
+        ids["rebuttal"],
+        populate_existing=True,
+    )
+    finding = await db_session.get(
+        PRFinding,
+        ids["finding"],
+        populate_existing=True,
+    )
+    run = await db_session.get(
+        PRMonitorRun,
+        ids["run"],
+        populate_existing=True,
+    )
+    assert rebuttal.status == "adjudicating"
+    assert finding.status == "open"
+    assert run.status == "adjudicating"
+
+
+@pytest.mark.asyncio
+async def test_failed_adjudication_yields_to_manager_termination_receipt(
+    db_session,
+    db_factory,
+):
+    ids = await _receipt_owned_adjudication_fixture(
+        db_session,
+        task_status="failed",
+    )
+    await persist_active_manager_receipt(db_factory, ids["task"])
+
+    await fail_adjudication(
+        db_session,
+        adjudication_id=ids["rebuttal"],
+        task_id=ids["task"],
+        error="must remain receipt-owned",
+    )
+
+    rebuttal = await db_session.get(
+        PRFindingRebuttal,
+        ids["rebuttal"],
+        populate_existing=True,
+    )
+    run = await db_session.get(
+        PRMonitorRun,
+        ids["run"],
+        populate_existing=True,
+    )
+    assert rebuttal.status == "adjudicating"
+    assert rebuttal.error_message is None
+    assert run.status == "adjudicating"
 
 
 @pytest.mark.asyncio

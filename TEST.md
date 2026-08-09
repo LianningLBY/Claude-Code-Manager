@@ -175,6 +175,11 @@ Task 为载体的用例只验证 contract 期 legacy API；新产品路径以 `t
 | `test_approved_plan_is_applied_only_with_selected_user_message` | 只有显式 `plan_task_ids` 才把已批准方案与真实 user message 同 turn 入队，并以 Manager-local log id 一次性审计 |
 | `test_standalone_plan_creates_one_idempotent_execution_task` | standalone approve 后创建新的 auto Task，重复调用返回同一执行 Task |
 | `test_execution_task_materializer_is_directly_callable_and_idempotent` | Auto/内部调用方可直接经 `plan_service` 物化 exact Version，重放返回同一 Task/Application，且 Plan 审计 metadata 不可覆盖 |
+| `test_execution_materialization_rolls_back_inline_approval_on_failure` / `test_execution_materialization_rejects_active_refresh_run` / `test_execution_materialization_loses_cleanly_to_concurrent_plan_writer` | standalone 物化以 Plan/Version 行锁 + `lock_version` 条件写入建立跨进程 fence；Refresh/new Run 不得并发穿透，SQLite WAL 旧读快照必须收敛为确定的 409 CAS 冲突，Task staging 失败会同时回滚 approval、Application 与 fence |
+| `test_alembic_migrations.py::TestPlanRuntimeReceiptMigration` | `8d2f5b7a1c90` 只回填可证明 terminal 的旧 Step；升级拒绝 active/malformed legacy runtime，降级拒绝 non-clean/malformed receipt 与 active cancellation，并覆盖 upgrade→downgrade→upgrade |
+| `test_worker_plan_cancellation.py` / `test_worker_plan_recovery.py` | Worker Plan 取消绑定 exact Run/Plan/digest/protocol；cancel-before-import 永久 tombstone、normal/fork import receipt gate、同 ID foreign Run 隔离、ACK 丢失保留 durable `cancelling`、post-commit/reap repeated cancellation shield、旧 lifecycle reap 失败后的恢复重试、completed/failed 终态胜者真实导入，以及 raw JSON bool/重复/跨 Run 子图/Worker owner 篡改拒绝 |
+| `test_worker_plan_recovery.py` | `prepared` 才可重排，`remote_possible` 只做 exact audit；重启持续重放 durable cancel、ACK 再丢失继续退避，malformed audit 在任何 answer replay 前 fail closed |
+| `test_alembic_migrations.py::TestWorkerPlanImportReceiptMigration` | `d3c8a7f1e620` 回填永久 import identity；覆盖 old-writer two-valued Run gate、PG/SQLite writer fence、MySQL 8.0.16+/InnoDB/enforced CHECK/partial DDL replay/双 downgrade gate，以及 tombstone、historical graph、NULL/nonpositive identity 的不安全 downgrade 拒绝 |
 | `test_claude_plan_command_is_read_only` / `test_codex_plan_uses_disposable_read_only_app_server_thread` | Claude 禁 Bash/MCP/子 agent；Codex 复用 App Server 但使用 disposable read-only thread、空 MCP/禁 autonomous features，终态删除 thread |
 | `test_pipeline_revises_then_persists_audited_approval` | Planner → Reviewer revise → Planner → approve 的 run/step、模型与 feedback 全量审计 |
 | `test_interactive_planner_accepts_all_known_questions_without_count_limit` | 模型侧 question schema 使用非关键字 `is_required`，校验边界精确映射回领域/API 的 `required`，且不限制有效问题数 |
@@ -1217,6 +1222,73 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 |----------|----------|------|
 | `frontend/src/components/Chat/ChatView.test.tsx` | `copies a user message without its sender prefix` | 用户消息保留 `[发送者]` 的界面显示，但复制时只写入消息正文 |
 
+## Delivery Loop V1
+
+```bash
+# Run/Controller/worktree/publisher/PR Monitor 的本地 Git、故障注入与状态机回归
+uv run pytest -q backend/tests/test_delivery_*.py
+
+# 真实 Codex 0.144.6 app-server 隔离探针（显式 opt-in）
+CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
+  backend/tests/test_codex_app_server.py::test_real_codex_delivery_permission_profile_blocks_host_reads
+```
+
+真实探针只调用 `initialize` / `thread/start` / `command/exec`，不调用
+`turn/start`，因此不发送模型请求。它使用临时 `CODEX_HOME` 和 workspace，验证
+宿主文件不可读、GitHub/SSH 凭据环境变量不进入 shell、workspace 可写，
+且 linked-worktree `.git` pointer 不可覆盖。需要已安装项目锁定的
+`codex-cli 0.144.6`；缺少 CLI 时用例会跳过。
+
+真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
+一次性 canary 仓库执行；V1 的成功终点必须是 `ready_to_merge`，不得自动
+merge 或 deploy。
+
+## Auto Capability policy、terminal admission 与 durable resume
+
+```bash
+uv run pytest -q backend/tests/test_auto_capability_policy.py \
+  backend/tests/test_agent_capability_admission.py \
+  backend/tests/test_agent_capability_production_adapters.py \
+  backend/tests/test_capability_result.py \
+  backend/tests/test_capability_resume.py \
+  backend/tests/test_capability_resume_outbox_schema.py \
+  backend/tests/test_instance_manager_capability_terminal.py
+uv run pytest -q backend/tests/test_api_tasks.py -k waiting_capability
+uv run pytest -q backend/tests/test_service_dispatcher.py \
+  -k 'capability_resume or initial_capability or background_capability_retry or auto_terminal'
+uv run pytest -q backend/tests/test_api_capabilities.py \
+  -k 'public_mutation_rejects_agent_resume_invocation'
+cd frontend && npx vitest run \
+  src/components/Chat/ChatView.test.tsx \
+  src/components/Tasks/TaskForm.test.tsx \
+  src/components/Tasks/TaskList.test.tsx \
+  src/components/Tasks/taskStatus.test.ts
+```
+
+| 测试 | 覆盖 |
+|------|------|
+| `test_policy_rejects_ambiguous_or_unbounded_shapes` | V1 静态 Plan/Review 白名单、严格整数、总预算/分类预算、未知字段与硬上限 |
+| `test_task_policy_is_create_only_and_local_auto_only` | policy 只在本机普通 Auto Task 创建时冻结；PUT、Worker 与非 Auto 明确拒绝 |
+| `test_default_policy_is_real_sql_null` | 默认关闭持久化为 SQL `NULL`，不落 JSON `null` |
+| `test_project_worker_resolution_rejects_policy_before_task_write` | Project 解析出远端 Worker 后仍在任何 Task 副作用前 fail closed |
+| `test_clone_requires_explicit_policy_opt_in` | clone 不继承源 Task 的自动能力授权 |
+| `test_auto_capability_switch_is_independent_and_fail_closed` | `AUTO_CAPABILITY_ENABLED` 独立默认关闭，且 Capability Core 关闭时有效值仍为 false |
+| `test_agent_capability_admission.py` | 只接受当前 exact source/output/terminal 的严格 terminal action，并在 provider 提供时校验 native turn；原子消费总预算与分类预算，失败请求不退预算 |
+| `test_agent_capability_production_adapters.py` | Agent Plan/Review 请求进入真实 executor，原 Task 保持 `waiting_capability`，结果 identity 反向验证 |
+| `test_capability_result.py` | completed Execution、结果类型/id/hash 与 Plan/Review 权威聚合必须完整反向匹配 |
+| `test_capability_resume.py` | `pending → ready → claiming → claimed → launched → completed` outbox、lease、G+1 重放、崩溃恢复与 provider boundary |
+| `test_capability_resume_outbox_schema.py` | SQLite/PostgreSQL/MySQL migration preflight、约束、partial schema crash replay 与 downgrade writer gate |
+| `test_instance_manager_capability_terminal.py` | Claude/Codex 终态先 settle 旧 resume，再按同一 exact generation 接纳连续 Capability |
+| `test_waiting_capability_*` | stop/cancel 先静止 queue consumer 与 executor，再终态化 Invocation/outbox/Task；claimed/launched 分界 fail closed |
+| `test_initial_capability_*` / `test_background_capability_retry_*` | PTY autonomous tail、exact state、marker 清除与 termination receipt 竞态下不提前 admission、不重复 ledger |
+| `test_capability_resume_releases_fence_before_terminal_consumer` | Phase 1 持 capability fence，Phase 2 在等待 output consumer 前释放，防止 G+1 自锁 |
+| `test_public_mutation_rejects_agent_resume_invocation` | 人工 advisory consume/cancel 不能改写 Agent/Controller-owned resume 状态机 |
+| 前端 Chat/TaskForm/TaskList/taskStatus | policy 总预算与分类预算配置、`waiting_capability` 状态/等待提示和旧 turn 事件隔离 |
+
+两项开关仍默认关闭；开启后也只有创建时显式冻结了 `capability_policy` 的本地
+普通 Auto Task 可由模型请求 Plan/Review。Worker、Shared、Delivery、Plan、Loop、
+Goal 与迁移导入继续 fail closed。
+
 ## 开发规范
 
 ### Claude Code 开发时必须遵守：
@@ -1253,6 +1325,7 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 | `backend/services/container_manager.py`（容器 `/tmp`） | `backend/tests/test_container_manager.py` |
 | `backend/api/files.py`（SSH 下载临时文件） | `backend/tests/test_api_files.py` |
 | `backend/services/task_artifact_contract.py` + `backend/api/task_artifacts.py` + Task 产物提示/Worker capability | `backend/tests/test_api_task_artifacts.py` + `backend/tests/test_service_dispatcher.py` + `backend/tests/test_api_system.py`（跨 Task namespace、旧 Worker fail-closed、伪造 tag、非法项目根） |
+| `backend/services/auto_capability_policy.py` + Task policy schemas/API | `backend/tests/test_auto_capability_policy.py` + `backend/tests/test_api_system.py` |
 | `backend/services/token_manager_service.py` | `backend/tests/test_service_token_manager.py` |
 | `backend/schemas/task.py` (datetime serialization) | `backend/tests/test_task_schema.py` |
 | `backend/api/chat.py` (timestamp Z suffix) | `backend/tests/test_chat_timestamp.py` |
@@ -1283,6 +1356,13 @@ uv run python -m pytest backend/tests/test_api_workers.py -v
 覆盖：API 状态守卫（409/503/404）、双击防护（同步置过渡态）、provisioner 状态机
 （收养/创建/stop/start/destroy/retry，cloud+SSH 全替身）、健康检查降级与自动恢复
 （bootstrap 失败不被洗白）、.deploy_commit 版本回退。
+
+Plan/Worker 销毁门禁重点覆盖：
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_destroy_finds_dispatch_receipt_by_frozen_worker_identity` | destroy 直接按 receipt 冻结的 Worker identity 查证；Run/Plan 改绑、脱离或 Run 丢失都不能隐藏 uncertain remote boundary |
+| `test_destroy_rejects_forged_cleaned_worker_plan_runtime` / `test_destroy_rejects_cleaned_runtime_with_wrong_generation` | terminal Run 逐 Step/generation/attempt 审计 runtime aggregate，伪造 `cleaned` shape 或错代 receipt 仍 fail closed |
 
 ### 真机冒烟（收养一台已有 EC2 跑完整 bootstrap）
 

@@ -337,12 +337,26 @@ export interface SystemConfig {
   codex_service_tier_options?: CodexServiceTier[];
   codex_model_service_tiers: Record<string, CodexServiceTier[]>;
   versioned_plan_worker_protocol?: number;
+  plan_cascade_protocol?: number;
   /** Manager/Worker capability fences; absent on older deployments. */
   pr_review_snapshot_context_version?: number;
   pr_review_terminal_chat_version?: number;
   task_artifact_scope_version?: number;
   /** Absent when the UI is connected to an older Manager/Worker. */
   plan_pipeline_defaults?: PlanPipelineConfig;
+  /** Side-effecting mode stays hidden unless both server feature gates are on. */
+  capability_core_enabled?: boolean;
+  /** Model-requested Plan/Review is independently opt-in and defaults off. */
+  auto_capability_enabled?: boolean;
+  delivery_loop_enabled?: boolean;
+}
+
+export type AutoCapabilityKey = 'plan' | 'code_review';
+
+export interface AutoCapabilityPolicy {
+  version: 1;
+  max_invocations: number;
+  capabilities: Partial<Record<AutoCapabilityKey, number>>;
 }
 
 export interface TaskRoutingExpectation {
@@ -366,8 +380,15 @@ export interface Task {
   merge_status: string;
   instance_id: number | null;
   retry_count: number;
+  turn_generation: number;
   max_retries: number;
   mode: string;
+  capability_policy?: AutoCapabilityPolicy | null;
+  delivery_run_id?: number | null;
+  delivery_role?: string | null;
+  delivery_phase?: string | null;
+  delivery_activity?: string | null;
+  delivery_outcome?: string | null;
   todo_file_path: string | null;
   loop_progress: string | null;
   max_iterations: number;
@@ -457,6 +478,8 @@ export interface Instance {
   pid: number | null;
   status: string;
   current_task_id: number | null;
+  current_task_retry_count: number | null;
+  current_task_turn_generation: number | null;
   current_plan_run_id: number | null;
   worktree_path: string | null;
   provider: string;
@@ -498,6 +521,10 @@ export interface ChatMessage {
   loop_iteration: number | null;
   /** Exact Task retry generation that persisted this history row. */
   task_retry_count?: number | null;
+  /** Exact logical Task turn that produced this row/live stream item. */
+  task_turn_generation?: number | null;
+  /** Provider-native turn id, when the transport exposes one. */
+  native_turn_id?: string | null;
   timestamp: string | null;
   image_urls: string[] | null;
   attachments: FileAttachment[] | null;
@@ -652,7 +679,7 @@ export interface PlanRun {
   id: number;
   plan_id: number;
   run_type: string;
-  status: 'queued' | 'running' | 'waiting_user' | 'completed' | 'failed' | 'cancelled';
+  status: 'queued' | 'running' | 'waiting_user' | 'cancelling' | 'completed' | 'failed' | 'cancelled';
   current_stage: string;
   base_version_id: number | null;
   source_run_id: number | null;
@@ -704,6 +731,8 @@ export interface PlanResource {
   updated_at: string;
   display_state: string;
   legacy: boolean;
+  ownership: 'standard' | 'capability';
+  read_only: boolean;
   latest_run_status: string | null;
   latest_run_error: string | null;
   pipeline_config: PlanPipelineConfig;
@@ -773,6 +802,9 @@ export interface LogEntry {
   id: number;
   instance_id: number;
   task_id: number | null;
+  task_retry_count: number | null;
+  task_turn_generation: number | null;
+  native_turn_id: string | null;
   event_type: string;
   role: string | null;
   content: string | null;
@@ -920,6 +952,7 @@ export interface MonitoredRepo {
   id: number;
   repo_full_name: string;
   project_id: number | null;
+  worker_id: number | null;
   enabled: boolean;
   auto_merge: boolean;
   webhook_secret: string;
@@ -938,6 +971,80 @@ export interface MonitoredRepo {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** Returned only by create/rotate; webhook_secret is the one-time raw value. */
+export type MonitoredRepoSecretResponse = MonitoredRepo & { webhook_secret: string };
+
+export type DeliveryPhase =
+  | 'planning'
+  | 'coding'
+  | 'pre_review'
+  | 'publishing'
+  | 'monitoring'
+  | 'done';
+
+export type DeliveryActivity = 'ready' | 'running' | 'waiting' | 'paused' | 'terminal';
+
+export interface DeliveryRun {
+  id: number;
+  created_by: number | null;
+  project_id: number;
+  monitored_repo_id: number | null;
+  source_todo_id: number | null;
+  developer_task_id: number | null;
+  pr_monitor_run_id: number | null;
+  worktree_id: number | null;
+  title: string;
+  requirements: string;
+  requirements_hash: string;
+  policy_hash: string;
+  base_branch: string;
+  delivery_branch: string;
+  workspace_path: string | null;
+  base_sha: string | null;
+  head_sha: string | null;
+  head_tree_sha: string | null;
+  patch_sha256: string | null;
+  head_generation: number;
+  pr_number: number | null;
+  pr_url: string | null;
+  phase: DeliveryPhase;
+  activity: DeliveryActivity;
+  outcome: 'success' | 'failed' | 'cancelled' | 'superseded' | null;
+  wait_reason: string | null;
+  pause_reason: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  state_version: number;
+  current_cycle_id: number | null;
+  cycle_count: number;
+  turn_count: number;
+  max_cycles: number;
+  no_progress_count: number;
+  max_no_progress: number;
+  next_reconcile_at: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  allowed_actions: Array<'pause' | 'resume' | 'cancel'>;
+}
+
+export interface DeliveryRunCreate {
+  idempotency_key: string;
+  project_id: number;
+  monitored_repo_id: number;
+  title: string;
+  requirements: string;
+  source_todo_id?: number;
+  base_branch?: string;
+  provider?: 'codex';
+  model?: string;
+  codex_service_tier?: CodexServiceTier;
+  effort_level?: string;
+  timeout_hours?: number | null;
+  max_cycles?: number;
+  max_no_progress?: number;
 }
 
 export interface RequiredCheckPolicy {
@@ -1578,7 +1685,7 @@ export const api = {
     request<ProjectTodo[]>(`/api/projects/${projectId}/todos${includeArchived ? '?include_archived=true' : ''}`),
   createProjectTodo: (projectId: number, data: { title: string; prompt: string }) =>
     request<ProjectTodo>(`/api/projects/${projectId}/todos`, { method: 'POST', body: JSON.stringify(data) }),
-  updateProjectTodo: (projectId: number, todoId: number, data: Partial<Pick<ProjectTodo, 'title' | 'prompt' | 'status' | 'sort_order' | 'created_task_id'>>) =>
+  updateProjectTodo: (projectId: number, todoId: number, data: Partial<Pick<ProjectTodo, 'title' | 'prompt' | 'status' | 'sort_order'>>) =>
     request<ProjectTodo>(`/api/projects/${projectId}/todos/${todoId}`, { method: 'PATCH', body: JSON.stringify(data) }),
   deleteProjectTodo: (projectId: number, todoId: number) =>
     request<{ ok: boolean }>(`/api/projects/${projectId}/todos/${todoId}`, { method: 'DELETE' }),
@@ -1752,8 +1859,24 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; capability_policy?: AutoCapabilityPolicy; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
+  createTaskFromProjectTodo: (
+    projectId: number,
+    todoId: number,
+    data: {
+      title: string;
+      prompt: string;
+      provider?: 'claude' | 'codex';
+      model?: string;
+      codex_service_tier?: CodexServiceTier;
+      effort_level?: string;
+      timeout_hours?: number | null;
+    },
+  ) => request<Task>(`/api/projects/${projectId}/todos/${todoId}/task`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  }),
   updateTask: (id: number, data: { worker_id?: number; title?: string; description?: string; priority?: number; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; provider?: string; model?: string; effort_level?: string; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; system_prompt_mode?: string | null; timeout_hours?: number | null; sort_order?: number | null; attention_tag?: string | null }) =>
     request<Task>(`/api/tasks/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteTask: (id: number) =>
@@ -1929,6 +2052,7 @@ export const api = {
   stopInstance: (
     id: number,
     expectedTaskId: number,
+    expectedTaskTurnGeneration: number,
     expectedPid: number | null,
     expectedStartedAt: string | null,
   ) =>
@@ -1936,6 +2060,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         expected_task_id: expectedTaskId,
+        expected_task_turn_generation: expectedTaskTurnGeneration,
         expected_pid: expectedPid,
         expected_started_at: expectedStartedAt,
       }),
@@ -2235,11 +2360,40 @@ export const api = {
   getSubAgentSummary: (taskId: number) =>
     request<SubAgentSummary>(`/api/tasks/${taskId}/sub-agents/summary`),
 
+  // Autonomous Delivery Loop. Creation is intentionally separate from the
+  // ordinary Task endpoint so the controller-owned Task cannot be claimed
+  // before its Run, cycle, and policy snapshot are committed.
+  createDeliveryRun: (data: DeliveryRunCreate) =>
+    request<DeliveryRun>('/api/delivery-runs', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listDeliveryRuns: (projectId?: number) =>
+    request<DeliveryRun[]>(
+      `/api/delivery-runs${projectId ? `?project_id=${projectId}` : ''}`,
+    ),
+  getDeliveryRun: (runId: number) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}`),
+  pauseDeliveryRun: (runId: number, reason: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/pause`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+  resumeDeliveryRun: (runId: number, reason?: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/resume`, {
+      method: 'POST', body: JSON.stringify({ reason: reason || null }),
+    }),
+  cancelDeliveryRun: (runId: number, reason: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/cancel`, {
+      method: 'POST', body: JSON.stringify({ reason }),
+    }),
+
   // PR Monitor
   getMonitoredRepos: () =>
     request<MonitoredRepo[]>('/api/pr-monitor/repos'),
+  getMonitoredRepo: (id: number) =>
+    request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`),
   createMonitoredRepo: (data: { repo_full_name: string; project_id?: number; worker_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string; review_effort?: string; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[] }) =>
-    request<MonitoredRepo>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
+    request<MonitoredRepoSecretResponse>('/api/pr-monitor/repos', { method: 'POST', body: JSON.stringify(data) }),
   updateMonitoredRepo: (id: number, data: { project_id?: number; auto_merge?: boolean; auto_repair?: boolean; max_repair_attempts?: number; merge_queue_mode?: 'manual' | 'shadow' | 'auto'; provider?: string; review_model?: string | null; review_effort?: string | null; review_mode?: 'single' | 'panel'; wait_for_ci?: boolean; required_checks?: RequiredCheckPolicy[]; default_branch?: string; allowed_authors?: string[]; enabled?: boolean }) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   deleteMonitoredRepo: (id: number) =>
@@ -2247,7 +2401,7 @@ export const api = {
   toggleMonitoredRepo: (id: number) =>
     request<MonitoredRepo>(`/api/pr-monitor/repos/${id}/toggle`, { method: 'POST' }),
   regenerateSecret: (id: number) =>
-    request<MonitoredRepo>(`/api/pr-monitor/repos/${id}/regenerate-secret`, { method: 'POST' }),
+    request<MonitoredRepoSecretResponse>(`/api/pr-monitor/repos/${id}/regenerate-secret`, { method: 'POST' }),
   getRepoReviews: (repoId: number, page = 1, size = 20) =>
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>

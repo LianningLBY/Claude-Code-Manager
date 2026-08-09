@@ -47,6 +47,7 @@ export function PlanCatalog({ plans, projects, selectedPlanId, onSelectPlan, onN
               <span className="text-xs text-gray-500">#{plan.id}</span>
               {plan.current_version && <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] text-indigo-300">v{plan.current_version.version_number}</span>}
               <span className={`rounded-full border px-2 py-0.5 text-[10px] ${planDisplayStateClassName(plan.display_state)}`}>{planDisplayStateLabel(plan.display_state)}</span>
+              {plan.read_only && <span className="rounded-full border border-indigo-500/40 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300">Capability · read-only</span>}
               {appliedOlder && <span className="rounded-full bg-teal-500/15 px-2 py-0.5 text-[10px] text-teal-300">earlier Version applied</span>}
             </div>
             <div className="mt-1 truncate text-sm font-semibold text-gray-100">{plan.title}</div>
@@ -55,7 +56,7 @@ export function PlanCatalog({ plans, projects, selectedPlanId, onSelectPlan, onN
           </button>
           <div className="flex shrink-0 items-center gap-1 pr-3">
             {plan.target_task_id != null && <button type="button" onClick={() => onNavigateTask(plan.target_task_id!)} aria-label={`Open related Task #${plan.target_task_id}`} title={`Open related Task #${plan.target_task_id}`} className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs text-gray-500 transition-colors hover:bg-indigo-500/15 hover:text-indigo-300"><ListTodo size={15} /><span className="hidden lg:inline">Task #{plan.target_task_id}</span></button>}
-            {plan.active_run_id == null && <button type="button" onClick={() => void setArchived()} disabled={updating} aria-label={archiveLabel} title={archived ? 'Restore' : 'Archive'} className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs text-gray-500 transition-colors hover:bg-gray-700/70 hover:text-gray-200 disabled:pointer-events-none disabled:opacity-40">{archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}<span className="hidden lg:inline">{archived ? 'Restore' : 'Archive'}</span></button>}
+            {!plan.read_only && plan.active_run_id == null && <button type="button" onClick={() => void setArchived()} disabled={updating} aria-label={archiveLabel} title={archived ? 'Restore' : 'Archive'} className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-2 text-xs text-gray-500 transition-colors hover:bg-gray-700/70 hover:text-gray-200 disabled:pointer-events-none disabled:opacity-40">{archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}<span className="hidden lg:inline">{archived ? 'Restore' : 'Archive'}</span></button>}
             <ChevronRight size={15} aria-hidden="true" className={`shrink-0 ${selected ? 'text-indigo-300' : 'text-gray-600'}`} />
           </div>
         </div>;

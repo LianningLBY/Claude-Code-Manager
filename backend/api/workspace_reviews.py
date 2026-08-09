@@ -10,9 +10,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.api.deps import (
     require_admin,
     require_internal_service,
+    require_internal_task_incarnation,
     require_task_access,
     require_task_control,
 )
+from backend.config import settings
 from backend.database import get_db
 from backend.models.project import Project
 from backend.models.task import Task
@@ -36,6 +38,10 @@ from backend.services.test_harness_contracts import (
     DEFAULT_BROWSER_CHANNEL,
     TestHarnessContractError,
     TestHarnessSpec,
+)
+from backend.services.test_harness_owner_fence import (
+    TestHarnessOwnerIdentity,
+    test_harness_owner_identity,
 )
 
 
@@ -67,7 +73,12 @@ async def _task_or_404(task_id: int, db: AsyncSession) -> Task:
     return task
 
 
-async def _start_review(task_id: int, body: WorkspaceReviewStart) -> dict[str, Any]:
+async def _start_review(
+    task_id: int,
+    body: WorkspaceReviewStart,
+    *,
+    owner_identity: TestHarnessOwnerIdentity | None = None,
+) -> dict[str, Any]:
     if body.mode != "review_only":
         raise HTTPException(
             status_code=422,
@@ -76,6 +87,7 @@ async def _start_review(task_id: int, body: WorkspaceReviewStart) -> dict[str, A
     try:
         harness_run = await test_harness_service.start_task_run(
             task_id=task_id,
+            owner_identity=owner_identity,
             spec=TestHarnessSpec(
                 target_kind="current_workspace",
                 target={},
@@ -170,7 +182,11 @@ async def start_workspace_review(
             status_code=409,
             detail="等待当前 Task 回合结束后再从界面启动测试；执行中的 Agent 可直接调用测试工具",
         )
-    return await _start_review(task_id, body)
+    return await _start_review(
+        task_id,
+        body,
+        owner_identity=test_harness_owner_identity(task),
+    )
 
 
 @router.post(
@@ -184,13 +200,34 @@ async def start_workspace_review_internal(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     require_internal_service(request)
-    task = await _task_or_404(task_id, db)
+    if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace Review requires AUTH_TOKEN to be configured",
+        )
+    task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
+    if task is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Scoped Workspace Review credential required",
+        )
     if task.status not in {"in_progress", "executing"}:
         raise HTTPException(
             status_code=409,
             detail="Workspace Review tool requires its parent Task to be running",
         )
-    return await _start_review(task_id, body)
+    owner_identity = test_harness_owner_identity(task)
+    await db.commit()
+    return await _start_review(
+        task_id,
+        body,
+        owner_identity=owner_identity,
+    )
 
 
 @router.get("/{task_id}/workspace-reviews")
@@ -244,10 +281,33 @@ async def get_workspace_review_internal(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     require_internal_service(request)
-    run = await db.get(WorkspaceReviewRun, run_id)
-    if run is None or run.task_id != task_id:
+    task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
+    if task is None:
+        raise HTTPException(403, "Scoped Workspace Review credential required")
+    identity = test_harness_owner_identity(task)
+    run = await db.scalar(
+        select(WorkspaceReviewRun)
+        .where(
+            WorkspaceReviewRun.id == run_id,
+            WorkspaceReviewRun.task_id == task_id,
+            WorkspaceReviewRun.owner_task_incarnation_id == identity.incarnation_id,
+            WorkspaceReviewRun.owner_task_retry_count == identity.retry_count,
+            WorkspaceReviewRun.owner_task_turn_generation
+            == identity.turn_generation,
+            WorkspaceReviewRun.owner_task_status == identity.status,
+        )
+        .with_for_update()
+    )
+    if run is None:
         raise HTTPException(status_code=404, detail="Workspace Review not found")
-    return workspace_review_run_dict(run)
+    payload = workspace_review_run_dict(run)
+    await db.rollback()
+    return payload
 
 
 @router.post("/{task_id}/workspace-reviews/{run_id}/cancel")
@@ -276,9 +336,37 @@ async def cancel_workspace_review_internal(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     require_internal_service(request)
-    run = await db.get(WorkspaceReviewRun, run_id)
-    if run is None or run.task_id != task_id:
+    task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
+    if task is None:
+        raise HTTPException(403, "Scoped Workspace Review credential required")
+    identity = test_harness_owner_identity(task)
+    run = await db.scalar(
+        select(WorkspaceReviewRun)
+        .where(
+            WorkspaceReviewRun.id == run_id,
+            WorkspaceReviewRun.task_id == task_id,
+            WorkspaceReviewRun.owner_task_incarnation_id == identity.incarnation_id,
+            WorkspaceReviewRun.owner_task_retry_count == identity.retry_count,
+            WorkspaceReviewRun.owner_task_turn_generation
+            == identity.turn_generation,
+            WorkspaceReviewRun.owner_task_status == identity.status,
+        )
+        .with_for_update()
+    )
+    if run is None:
         raise HTTPException(status_code=404, detail="Workspace Review not found")
-    cancelled = await workspace_review_manager.cancel(run_id)
+    await db.rollback()
+    try:
+        cancelled = await workspace_review_manager.cancel(
+            run_id,
+            expected_identity=identity,
+        )
+    except WorkspaceReviewError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     assert cancelled is not None
     return workspace_review_run_dict(cancelled)

@@ -58,6 +58,7 @@ def upgrade() -> None:
             name="uq_test_harness_run_idempotency",
         ),
         sa.UniqueConstraint("workspace_review_run_id"),
+        mysql_engine="InnoDB",
     )
     for column in (
         "task_id",
@@ -98,6 +99,7 @@ def upgrade() -> None:
         sa.UniqueConstraint(
             "run_id", "ordinal", name="uq_test_harness_attempt_ordinal"
         ),
+        mysql_engine="InnoDB",
     )
     for column in ("run_id", "status", "agent_task_id"):
         op.create_index(
@@ -123,6 +125,7 @@ def upgrade() -> None:
         sa.UniqueConstraint(
             "run_id", "source_key", name="uq_test_harness_event_source"
         ),
+        mysql_engine="InnoDB",
     )
     op.create_index("ix_test_harness_events_run_id", "test_harness_events", ["run_id"])
 
@@ -141,6 +144,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("run_id", "name", name="uq_test_harness_evidence_name"),
+        mysql_engine="InnoDB",
     )
     for column in ("run_id", "attempt_id", "kind"):
         op.create_index(
@@ -167,6 +171,7 @@ def upgrade() -> None:
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("run_id", "fingerprint", name="uq_test_harness_finding"),
+        mysql_engine="InnoDB",
     )
     for column in ("run_id", "fingerprint", "severity"):
         op.create_index(

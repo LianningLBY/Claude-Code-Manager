@@ -35,6 +35,9 @@ from backend.services.task_skill_overrides import (
 from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_POLICY_TAG,
 )
+from backend.services.test_harness_owner_fence import (
+    TEST_HARNESS_TERMINAL_GATE_KEY,
+)
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.plan import (
@@ -5111,13 +5114,15 @@ async def test_goal_turn_passes_pool_config_dir(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
+@pytest.mark.parametrize("service_tier", ["default", "priority"])
+async def test_codex_goal_evaluator_uses_audited_app_server_route(
     db_factory,
+    service_tier,
 ):
-    """A hidden Fast evaluator must never enter the Standard exec path."""
+    """No hidden evaluator may enter the unaudited direct-exec path."""
 
     d = _make_dispatcher(db_factory)
-    codex_home = "/codex/fast-account"
+    codex_home = f"/codex/{service_tier}-account"
     d._resolve_resume_config_dir = AsyncMock(return_value=codex_home)
     registry = MagicMock(name="fast-goal-registry")
     d.instance_manager._ensure_codex_app_server_registry = MagicMock(
@@ -5133,7 +5138,7 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
 
     @asynccontextmanager
     async def forbidden_exec_guard(_home):
-        raise AssertionError("Fast goal evaluator entered codex exec")
+        raise AssertionError("Goal evaluator entered codex exec")
         yield  # pragma: no cover
 
     @asynccontextmanager
@@ -5157,11 +5162,11 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
     d.codex_pool = pool
 
     async with db_factory() as db:
-        inst = Instance(name="fast-goal-worker")
+        inst = Instance(name=f"{service_tier}-goal-worker")
         task = _make_goal_task(db)
         task.provider = "codex"
         task.model = "gpt-5.4"
-        task.codex_service_tier = "priority"
+        task.codex_service_tier = service_tier
         db.add_all([inst, task])
         await db.commit()
         await db.refresh(inst)
@@ -5173,6 +5178,8 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
     d.instance_manager.processes = {inst_id: process}
 
     from backend.services.goal_evaluator import GoalEvalResult
+
+    _, expected_evaluator_model, _ = d._goal_evaluator_runtime_config(task_obj)
 
     with patch(
         "backend.services.goal_evaluator.GoalEvaluator.evaluate",
@@ -5188,18 +5195,18 @@ async def test_codex_fast_goal_evaluator_uses_priority_app_server_route(
         )
 
     eval_kwargs = evaluate.await_args.kwargs
-    assert eval_kwargs["model"] == "gpt-5.4"
+    assert eval_kwargs["model"] == expected_evaluator_model
     assert eval_kwargs["codex_home"] == codex_home
-    assert eval_kwargs["codex_service_tier"] == "priority"
+    assert eval_kwargs["codex_service_tier"] == service_tier
     assert eval_kwargs["codex_app_server_registry"] is registry
     assert app_server_homes == [codex_home]
     assert runtime_admissions == [
-        ("codex", codex_home, "gpt-5.4", "priority"),
+        ("codex", codex_home, expected_evaluator_model, service_tier),
     ]
     pool.supports_model_for_home.assert_called_with(
         codex_home,
-        "gpt-5.4",
-        service_tier="priority",
+        expected_evaluator_model,
+        service_tier=service_tier,
     )
 
 
@@ -10257,6 +10264,108 @@ async def test_queued_claim_binds_visible_source_and_task_pointer(
 
 
 @pytest.mark.asyncio
+async def test_queued_new_turn_commits_inside_exact_harness_owner_fence(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    observed: dict[str, object] = {}
+
+    @asynccontextmanager
+    async def owner_stop_fence(
+        fenced_task_id,
+        *,
+        reason,
+        expected_identity,
+    ):
+        assert fenced_task_id == task_id
+        assert reason == "Queued message started a new Task turn"
+        assert expected_identity.status == "completed"
+        assert expected_identity.turn_generation == 0
+        entered.set()
+        await release.wait()
+        try:
+            yield
+        finally:
+            async with db_factory() as db:
+                current = await db.get(Task, task_id)
+                observed["status"] = current.status
+                observed["turn_generation"] = current.turn_generation
+
+    d.test_harness_service = SimpleNamespace(
+        owner_stop_fence=owner_stop_fence
+    )
+    queued = asyncio.create_task(d._process_queued_message(task_id, msg))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    async with db_factory() as db:
+        blocked = await db.get(Task, task_id)
+        assert blocked.status == "completed"
+        assert blocked.turn_generation == 0
+    d.instance_manager.launch.assert_not_awaited()
+
+    release.set()
+    await asyncio.wait_for(queued, timeout=2)
+
+    assert observed == {"status": "executing", "turn_generation": 1}
+    d.instance_manager.launch.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_new_turn_preserves_old_generation_when_harness_cleanup_fails(
+    db_factory,
+    monkeypatch,
+):
+    d, id1, id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        await db.commit()
+
+    @asynccontextmanager
+    async def failing_owner_stop_fence(*_args, **_kwargs):
+        raise RuntimeError("Browser child cleanup could not be proven")
+        yield  # pragma: no cover
+
+    d.test_harness_service = SimpleNamespace(
+        owner_stop_fence=failing_owner_stop_fence
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="Browser child cleanup could not be proven",
+    ):
+        await d._process_queued_message(task_id, msg)
+
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instances = {
+            instance.id: instance
+            for instance in (
+                await db.execute(
+                    select(Instance).where(Instance.id.in_((id1, id2)))
+                )
+            ).scalars()
+        }
+        assert task.status == "completed"
+        assert task.turn_generation == 0
+        assert task.instance_id is None
+        assert all(instance.status == "idle" for instance in instances.values())
+
+
+@pytest.mark.asyncio
 async def test_queued_cross_generation_alias_does_not_replace_visible_launch_source(
     db_factory,
     monkeypatch,
@@ -11838,7 +11947,14 @@ async def test_temporary_frontend_review_goal_terminal_paths_restore_chat_mode(
         assert current.goal_max_turns == 30
         assert current.goal_turns_used == 0
         assert current.goal_last_reason is None
-        assert current.metadata_ == {"keep": "account-binding"}
+        assert current.metadata_["keep"] == "account-binding"
+        assert "frontend_review" not in current.metadata_
+        assert "frontend_review_activation" not in current.metadata_
+        terminal_gate = current.metadata_[TEST_HARNESS_TERMINAL_GATE_KEY]
+        assert terminal_gate["incarnation_id"] == current.incarnation_id
+        assert terminal_gate["retry_count"] == current.retry_count
+        assert terminal_gate["turn_generation"] == current.turn_generation
+        assert terminal_gate["status"] == "executing"
 
 
 @pytest.mark.asyncio
@@ -12613,6 +12729,7 @@ async def test_sqlite_replay_finalizer_wins_transport_writer_race(tmp_path):
         LaunchSupersededError,
         _LaunchReservation,
     )
+    from backend.services.test_harness import TestHarnessService
     from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
     finalizer_fenced = asyncio.Event()
@@ -12658,6 +12775,12 @@ async def test_sqlite_replay_finalizer_wins_transport_writer_race(tmp_path):
             turn_generation,
         ) = await _seed_transport_race_scope(factory, suffix="finalizer-wins")
         dispatcher = _make_dispatcher(held_factory)
+        # Keep the HeldFinalizerSession focused on the replay Task CAS. The
+        # exact Harness gate has its own durable transaction before this race
+        # and must not be mistaken for the pending-transition writer.
+        dispatcher.test_harness_service = TestHarnessService(
+            db_factory=factory
+        )
         async with factory() as db:
             task = await db.get(Task, task_id)
             generation = dispatcher._task_lifecycle_generation(task)
@@ -13051,7 +13174,12 @@ async def test_initial_command_skill_claim_uses_save_before_write_barrier(
     async with db_factory() as db:
         current = await db.get(Task, task_id)
         assert current.enabled_skills == {"saved": True}
-        assert current.metadata_ == {"keep": "saved"}
+        assert current.metadata_["keep"] == "saved"
+        terminal_gate = current.metadata_[TEST_HARNESS_TERMINAL_GATE_KEY]
+        assert terminal_gate["incarnation_id"] == current.incarnation_id
+        assert terminal_gate["retry_count"] == current.retry_count
+        assert terminal_gate["turn_generation"] == current.turn_generation
+        assert terminal_gate["status"] == "executing"
 
 
 @pytest.mark.asyncio
@@ -14154,6 +14282,14 @@ async def test_queued_owner_cas_race_retries_exact_message(
     async def launch_once(**_kwargs):
         launched.set()
 
+    @asynccontextmanager
+    async def owner_stop_fence(*_args, **_kwargs):
+        # This test targets the final queued owner CAS.  The production
+        # Harness fence performs its own Task UPDATE before that CAS, so use a
+        # no-write stand-in here; the exact fence/commit ordering is covered by
+        # test_queued_new_turn_commits_inside_exact_harness_owner_fence.
+        yield
+
     async def execute_with_owner_race(session, statement, *args, **kwargs):
         nonlocal injected
         table = getattr(statement, "table", None)
@@ -14167,6 +14303,9 @@ async def test_queued_owner_cas_race_retries_exact_message(
 
     d._process_queued_message = counted_process
     d.instance_manager.launch = AsyncMock(side_effect=launch_once)
+    d.test_harness_service = SimpleNamespace(
+        owner_stop_fence=owner_stop_fence
+    )
     q = d._get_task_queue(task_id)
     await q.put(msg)
     with (
@@ -16772,10 +16911,31 @@ async def test_lifecycle_backfills_agents_md(db_factory, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
+@pytest.mark.parametrize(
+    ("title", "description", "tags", "metadata"),
+    [
+        (
+            "PR Review",
+            "READ_REMOTE_BASE_SNAPSHOT",
+            ["pr-review"],
+            {},
+        ),
+        (
+            "Browser Review",
+            "USE_ONLY_BOUND_BROWSER_MCP",
+            None,
+            {"isolated_browser_agent": True},
+        ),
+    ],
+)
+async def test_isolated_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
     db_factory,
     tmp_path,
     monkeypatch,
+    title,
+    description,
+    tags,
+    metadata,
 ):
     """A stale CCM cwd/target must never make a review load host instructions."""
 
@@ -16809,12 +16969,13 @@ async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
     async with db_factory() as db:
         instance = Instance(name="review-worker")
         task = Task(
-            title="PR Review",
-            description="READ_REMOTE_BASE_SNAPSHOT",
+            title=title,
+            description=description,
             target_repo=str(host_checkout),
             last_cwd=str(host_checkout),
             provider="codex",
-            tags=["pr-review"],
+            tags=tags,
+            metadata_=metadata,
         )
         db.add_all([instance, task])
         await db.commit()
@@ -16840,7 +17001,7 @@ async def test_pr_review_lifecycle_uses_neutral_cwd_and_skips_agent_docs(
     neutral_cwd = neutral_cwds[0]
     assert launch["cwd"] == str(neutral_cwd)
     assert launch["cwd"] != str(host_checkout)
-    assert launch["prompt"] == "任务:\nREAD_REMOTE_BASE_SNAPSHOT"
+    assert launch["prompt"] == f"任务:\n{description}"
     assert not (neutral_cwd / "CLAUDE.md").exists()
     assert not (neutral_cwd / "AGENTS.md").exists()
     ensure_agents.assert_not_called()

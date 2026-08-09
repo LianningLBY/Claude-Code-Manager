@@ -7,15 +7,17 @@ from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from httpx import ASGITransport, AsyncClient
 
 from backend.api import workspace_reviews
+from backend.config import settings
 from backend.database import get_db
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.workspace_review import workspace_review_run_dict
+from backend.services.internal_service_auth import InternalServiceClaims
 
 
 @pytest_asyncio.fixture
@@ -198,3 +200,138 @@ async def test_workspace_review_public_start_waits_for_idle_task(
     )
     assert response.status_code == 409
     assert "执行中的 Agent 可直接调用测试工具" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_internal_workspace_routes_revalidate_exact_parent_generation(
+    monkeypatch,
+    db_factory,
+):
+    monkeypatch.setattr(settings, "auth_token", "workspace-internal-secret")
+    async with db_factory() as db:
+        task = Task(
+            title="Internal Workspace owner",
+            status="executing",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(task)
+        await db.flush()
+        run = WorkspaceReviewRun(
+            id="f" * 32,
+            task_id=task.id,
+            owner_task_incarnation_id=task.incarnation_id,
+            owner_task_retry_count=task.retry_count,
+            owner_task_turn_generation=task.turn_generation,
+            owner_task_status=task.status,
+            mode="review_only",
+            profile="standard",
+            goal="Review exact generation",
+            status="queued",
+            stage="queued",
+            workspace_path="/workspace/project",
+            git_head="a" * 40,
+            workspace_fingerprint="b" * 64,
+            preview_config={"commands": []},
+            cleanup_status="pending",
+        )
+        db.add(run)
+        await db.commit()
+        task_id = task.id
+        run_id = run.id
+        claims = InternalServiceClaims(
+            audience="ccm_workspace_review",
+            token_id="workspace-internal-token",
+            expires_at=4_000_000_000,
+            task_id=task.id,
+            task_incarnation_id=task.incarnation_id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            task_status=task.status,
+            owner_kind="task",
+            owner_id=task.id,
+        )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="internal_service",
+            internal_service_claims=claims,
+        )
+    )
+    captured: dict[str, object] = {}
+
+    class FakeHarnessService:
+        async def start_task_run(self, *, task_id, owner_identity, **_kwargs):
+            captured["start_identity"] = owner_identity
+            return SimpleNamespace(id="h" * 32)
+
+        async def get_run(self, _run_id):
+            async with db_factory() as db:
+                current = await db.get(WorkspaceReviewRun, run_id)
+                return {"workspace_review": workspace_review_run_dict(current)}
+
+    class FakeWorkspaceManager:
+        async def cancel(self, requested_run_id, *, expected_identity):
+            assert requested_run_id == run_id
+            captured["stop_identity"] = expected_identity
+            async with db_factory() as db:
+                current = await db.get(WorkspaceReviewRun, run_id)
+                current.status = "cancelled"
+                current.stage = "cancelled"
+                await db.commit()
+                return current
+
+    monkeypatch.setattr(
+        workspace_reviews,
+        "test_harness_service",
+        FakeHarnessService(),
+    )
+    monkeypatch.setattr(
+        workspace_reviews,
+        "workspace_review_manager",
+        FakeWorkspaceManager(),
+    )
+    body = workspace_reviews.WorkspaceReviewStart(
+        goal="Review exact generation",
+    )
+    async with db_factory() as db:
+        started = await workspace_reviews.start_workspace_review_internal(
+            task_id,
+            body,
+            request,
+            db,
+        )
+    assert started["id"] == run_id
+    assert captured["start_identity"].incarnation_id == claims.task_incarnation_id
+
+    async with db_factory() as db:
+        status_payload = await workspace_reviews.get_workspace_review_internal(
+            task_id,
+            run_id,
+            request,
+            db,
+        )
+    assert status_payload["id"] == run_id
+
+    async with db_factory() as db:
+        stopped = await workspace_reviews.cancel_workspace_review_internal(
+            task_id,
+            run_id,
+            request,
+            db,
+        )
+    assert stopped["status"] == "cancelled"
+    assert captured["stop_identity"].turn_generation == claims.task_turn_generation
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.retry_count += 1
+        await db.commit()
+    async with db_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            await workspace_reviews.get_workspace_review_internal(
+                task_id,
+                run_id,
+                request,
+                db,
+            )
+    assert caught.value.status_code == 403

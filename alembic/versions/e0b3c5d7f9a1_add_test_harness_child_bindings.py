@@ -42,6 +42,7 @@ def upgrade() -> None:
         sa.UniqueConstraint("child_task_id"),
         sa.UniqueConstraint("harness_run_id"),
         sa.UniqueConstraint("workspace_review_run_id"),
+        mysql_engine="InnoDB",
     )
     for name, column in (
         ("ix_test_harness_child_bindings_harness_run_id", "harness_run_id"),

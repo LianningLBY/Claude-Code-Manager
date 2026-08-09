@@ -13,6 +13,7 @@ from pydantic import (
 from backend.config import settings
 from backend.schemas.capability import AutoCapabilityPolicy
 from backend.schemas.plan import PlanPipelineConfig
+from backend.schemas.task_ssh_grant import TaskSSHGrantInput
 
 
 TaskMode = Literal["auto", "plan", "loop", "goal"]
@@ -58,6 +59,13 @@ def _normalize_attention_tag(value: object) -> object:
 class TaskCreate(BaseModel):
     # Internal Manager→Worker forwarding only: Manager allocates the global ID.
     id: int | None = None
+    # Internal Manager→Worker identity fence. Worker mirrors reuse the exact
+    # logical incarnation so every later remote mutation can reject Task-id
+    # ABA. Public callers cannot combine this with an explicit id.
+    source_incarnation_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
     # None = 本机执行；有值 = 创建后由 Dispatcher 转发到该 Worker
     worker_id: int | None = None
     # TaskMigrator 在目标机重建 task 时带上（跨机 --resume 续聊）
@@ -109,6 +117,7 @@ class TaskCreate(BaseModel):
     file_paths: list[str] | None = None
     attachments: list[dict] | None = None  # [{url, name, is_image}, ...]
     secret_ids: list[int] | None = None
+    ssh_grants: list[TaskSSHGrantInput] | None = Field(default=None, max_length=50)
     clone_from_task_id: int | None = None
     # Internal/Plan endpoints use these fields to preserve independent Plan
     # relationships across Manager→Worker copies. Public creation validates the
@@ -337,6 +346,14 @@ class TaskUpdate(BaseModel):
         return self
 
 
+class InternalTaskSkillsUpdate(BaseModel):
+    """Narrow payload accepted from the Task-scoped skills MCP server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled_skills: dict
+
+
 class TaskResponse(BaseModel):
     id: int
     worker_id: int | None = None
@@ -435,6 +452,12 @@ class TaskResponse(BaseModel):
         from backend.services.command_registry import ensure_default_skills
         self.enabled_skills = ensure_default_skills(self.enabled_skills)
         return self
+
+
+class TaskMigrationImportResponse(TaskResponse):
+    """Internal migration acknowledgement with the immutable identity fence."""
+
+    incarnation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 class TaskTerminationSnapshot(TaskResponse):

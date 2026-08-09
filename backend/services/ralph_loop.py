@@ -38,10 +38,25 @@ class RalphLoop:
         db_factory,
         instance_manager: InstanceManager,
         broadcaster: WebSocketBroadcaster,
+        *,
+        test_harness_service=None,
     ):
+        if test_harness_service is None:
+            from backend.database import async_session
+            from backend.services.test_harness import (
+                TestHarnessService,
+                test_harness_service as default_test_harness_service,
+            )
+
+            test_harness_service = (
+                default_test_harness_service
+                if db_factory is async_session
+                else TestHarnessService(db_factory=db_factory)
+            )
         self.db_factory = db_factory
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
+        self.test_harness_service = test_harness_service
         self._loops: dict[int, asyncio.Task] = {}
         self._plan_lifecycles: dict[int, tuple[int, asyncio.Task]] = {}
         self._shutting_down = False
@@ -274,6 +289,134 @@ class RalphLoop:
         task.turn_source_log_id = source.id
         return source.id
 
+    async def _test_harness_terminal_context(
+        self,
+        task_id: int,
+        instance_id: int,
+        generation: TaskGenerationFence,
+        *,
+        reason: str,
+        allow_background_handoff: bool = False,
+    ):
+        """Return the exact Harness owner fence, or ``None`` when stale.
+
+        This lookup is deliberately read-only. ``owner_stop_fence`` performs
+        the first writer operation and durably closes Harness admission before
+        a Ralph terminalizer may touch the Task or its Instance lifecycle.
+        """
+
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        async with self.db_factory() as db:
+            current = (
+                await db.execute(
+                    select(Task).where(
+                        Task.id == task_id,
+                        Task.status.in_(("in_progress", "executing")),
+                        Task.instance_id == instance_id,
+                        Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                )
+            ).scalar_one_or_none()
+            if current is None:
+                return None
+            current_generation = task_generation_fence(current)
+            if allow_background_handoff:
+                same_generation = bool(
+                    current_generation[:4] == generation[:4]
+                    and current_generation[-1] == generation[-1]
+                )
+            else:
+                same_generation = current_generation == generation
+            if not same_generation:
+                return None
+            identity = test_harness_owner_identity(current)
+
+        return self.test_harness_service.owner_stop_fence(
+            task_id,
+            reason=reason,
+            expected_identity=identity,
+        )
+
+    async def _defer_isolated_browser_claim(
+        self,
+        instance_id: int,
+        task: Task,
+    ) -> bool | None:
+        """Give a proven Browser child back to Dispatcher.
+
+        ``None`` means this is an ordinary Task, ``True`` means the exact
+        Browser claim was atomically restored to ready/pending, and ``False``
+        means Browser ownership was indicated but could not be proven.  The
+        latter is intentionally fail-closed: Ralph must retain the durable
+        claim evidence instead of launching or generically failing the child.
+        """
+
+        from backend.models.test_harness import TestHarnessChildBinding
+        from backend.services.test_harness_children import (
+            CHILD_RUNNING,
+            browser_binding_owner_identity,
+            browser_child_binding_error,
+            browser_child_owner_error,
+        )
+
+        metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+        marker_present = metadata.get("isolated_browser_agent") is True
+        try:
+            async with self.db_factory() as db:
+                current = await db.get(Task, task.id, populate_existing=True)
+                binding = await db.scalar(
+                    select(TestHarnessChildBinding).where(
+                        TestHarnessChildBinding.child_task_id == task.id
+                    )
+                )
+                if binding is None and not marker_present:
+                    return None
+                if (
+                    current is None
+                    or binding is None
+                    or not marker_present
+                    or current.status not in ("in_progress", "executing")
+                    or current.instance_id != instance_id
+                    or task_generation_fence(current)
+                    != task_generation_fence(task)
+                    or binding.state != CHILD_RUNNING
+                    or binding.claimed_retry_count != current.retry_count
+                    or binding.claimed_instance_id != instance_id
+                    or browser_child_binding_error(binding, current) is not None
+                ):
+                    await db.rollback()
+                    return False
+                try:
+                    owner_identity = browser_binding_owner_identity(binding)
+                except RuntimeError:
+                    await db.rollback()
+                    return False
+                owner = await db.get(Task, owner_identity.task_id)
+                if browser_child_owner_error(binding, owner) is not None:
+                    await db.rollback()
+                    return False
+
+                return await TaskQueue(db).defer(
+                    task.id,
+                    "Ralph yielded isolated Browser child to Dispatcher",
+                    instance_id=instance_id,
+                    generation_fence=task_generation_fence(current),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not validate Browser child %s claimed by Ralph instance %s",
+                task.id,
+                instance_id,
+            )
+            return False
+
     async def _settle_automatic_failure(
         self,
         instance_id: int,
@@ -285,12 +428,50 @@ class RalphLoop:
     ) -> tuple[str, TaskGenerationFence] | None:
         """Defer only a proven pre-provider rejection; otherwise fail closed."""
 
+        generation = generation or task_generation_fence(task)
+        terminal_context = await self._test_harness_terminal_context(
+            task.id,
+            instance_id,
+            generation,
+            reason=reason,
+            allow_background_handoff=True,
+        )
+        if terminal_context is None:
+            return None
+        try:
+            async with terminal_context:
+                return await self._settle_automatic_failure_under_harness_fence(
+                    instance_id,
+                    task,
+                    reason,
+                    defer_if_preflight=defer_if_preflight,
+                    generation=generation,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before settling Ralph task %s",
+                task.id,
+            )
+            return None
+
+    async def _settle_automatic_failure_under_harness_fence(
+        self,
+        instance_id: int,
+        task: Task,
+        reason: str,
+        *,
+        defer_if_preflight: bool,
+        generation: TaskGenerationFence,
+    ) -> tuple[str, TaskGenerationFence] | None:
+        """Settle one exact claim while its Harness owner fence is held."""
+
         from backend.services.terminal_arbitration import (
             source_alias_original_log_id,
             source_shape_is_canonical,
         )
 
-        generation = generation or task_generation_fence(task)
         predicates = [
             Task.id == task.id,
             Task.status.in_(("in_progress", "executing")),
@@ -311,8 +492,48 @@ class RalphLoop:
                 .values(turn_source_log_id=Task.turn_source_log_id)
             )
             if guarded.rowcount != 1:
+                # A PTY idle callback may have changed only the detached
+                # background marker after the caller captured its foreground
+                # fence. Adopt that marker while rejecting every true ABA.
                 await db.rollback()
-                return None
+                current = (
+                    await db.execute(
+                        select(Task).where(
+                            Task.id == task.id,
+                            Task.status.in_(("in_progress", "executing")),
+                            Task.instance_id == instance_id,
+                            Task.worker_id.is_(None),
+                            Task.shared_from_id.is_(None),
+                            no_active_worker_task_termination_predicate(),
+                        )
+                    )
+                ).scalar_one_or_none()
+                if (
+                    current is None
+                    or task_generation_fence(current)[:4] != generation[:4]
+                    or task_generation_fence(current)[-1] != generation[-1]
+                ):
+                    await db.rollback()
+                    return None
+                generation = task_generation_fence(current)
+                await db.rollback()
+                predicates = [
+                    Task.id == task.id,
+                    Task.status.in_(("in_progress", "executing")),
+                    Task.instance_id == instance_id,
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                    no_active_worker_task_termination_predicate(),
+                ]
+                append_task_generation_predicates(predicates, generation)
+                guarded = await db.execute(
+                    update(Task)
+                    .where(*predicates)
+                    .values(turn_source_log_id=Task.turn_source_log_id)
+                )
+                if guarded.rowcount != 1:
+                    await db.rollback()
+                    return None
             current = (
                 await db.execute(
                     select(Task).where(*predicates).with_for_update()
@@ -460,8 +681,42 @@ class RalphLoop:
         the DB-normalized post-commit snapshot used for publication.
         """
 
+        terminal_context = await self._test_harness_terminal_context(
+            task_id,
+            instance_id,
+            foreground_generation,
+            reason="Ralph task completed",
+            allow_background_handoff=True,
+        )
+        if terminal_context is None:
+            return None
+        try:
+            async with terminal_context:
+                return await self._mark_completed_under_harness_fence(
+                    task_id,
+                    instance_id,
+                    foreground_generation,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before completing Ralph task %s",
+                task_id,
+            )
+            return None
+
+    async def _mark_completed_under_harness_fence(
+        self,
+        task_id: int,
+        instance_id: int,
+        foreground_generation: TaskGenerationFence,
+    ) -> TaskGenerationFence | None:
+        """Complete one exact Ralph generation under its owner fence."""
+
         async with self.db_factory() as db:
-            completed = await TaskQueue(db).mark_completed(
+            completed = await self._mark_completed_generation(
+                db,
                 task_id,
                 instance_id=instance_id,
                 generation_fence=foreground_generation,
@@ -487,7 +742,8 @@ class RalphLoop:
                     await db.rollback()
                     return None
                 adopted_generation = task_generation_fence(current)
-                completed = await TaskQueue(db).mark_completed(
+                completed = await self._mark_completed_generation(
+                    db,
                     task_id,
                     instance_id=instance_id,
                     generation_fence=adopted_generation,
@@ -517,6 +773,37 @@ class RalphLoop:
             resulting_generation = task_generation_fence(current)
             await db.commit()
             return resulting_generation
+
+    @staticmethod
+    async def _mark_completed_generation(
+        db: AsyncSession,
+        task_id: int,
+        *,
+        instance_id: int,
+        generation_fence: TaskGenerationFence,
+    ) -> bool:
+        """Commit completion only for the exact local Ralph owner."""
+
+        predicates = [
+            Task.id == task_id,
+            Task.status.in_(("in_progress", "executing")),
+            Task.instance_id == instance_id,
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        ]
+        append_task_generation_predicates(predicates, generation_fence)
+        completed = await db.execute(
+            update(Task)
+            .where(*predicates)
+            .values(
+                status="completed",
+                completed_at=datetime.utcnow(),
+                error_message=None,
+            )
+        )
+        await db.commit()
+        return bool(completed.rowcount)
 
     async def _broadcast_generation_event(
         self,
@@ -720,6 +1007,59 @@ class RalphLoop:
     ) -> bool:
         """Fail only the exact instance generation whose cleanup failed."""
 
+        if generation_fence is None:
+            return False
+        terminal_context = await self._test_harness_terminal_context(
+            task_id,
+            instance_id,
+            generation_fence,
+            reason=reason,
+            allow_background_handoff=True,
+        )
+        if terminal_context is None:
+            return False
+        try:
+            async with terminal_context:
+                lifecycle_lock = (
+                    self.instance_manager._instance_lifecycle_lock(instance_id)
+                )
+                async with lifecycle_lock:
+                    return await self._record_cancel_cleanup_failure_under_harness_fence(
+                        instance_id,
+                        task_id,
+                        reason,
+                        instance_snapshot=instance_snapshot,
+                        generation_fence=generation_fence,
+                        task_statuses=task_statuses,
+                        broadcast_event=broadcast_event,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before failing Ralph task %s",
+                task_id,
+            )
+            return False
+
+    async def _record_cancel_cleanup_failure_under_harness_fence(
+        self,
+        instance_id: int,
+        task_id: int,
+        reason: str,
+        *,
+        instance_snapshot: tuple[
+            str,
+            int | None,
+            int | None,
+            datetime | None,
+        ],
+        generation_fence: TaskGenerationFence,
+        task_statuses: tuple[str, ...] = ("in_progress", "executing"),
+        broadcast_event: bool = True,
+    ) -> bool:
+        """Persist cleanup failure after owner graph and lifecycle fencing."""
+
         message = reason[:500]
         (
             expected_status,
@@ -739,6 +1079,8 @@ class RalphLoop:
                 Task.id == task_id,
                 Task.status.in_(task_statuses),
                 Task.instance_id == instance_id,
+                Task.worker_id.is_(None),
+                Task.shared_from_id.is_(None),
                 no_active_worker_task_termination_predicate(),
             ]
             append_task_generation_predicates(
@@ -875,7 +1217,6 @@ class RalphLoop:
 
         task_id = task.id
         observed_generation = task_generation_fence(task)
-        current_generation = observed_generation
         instance_snapshot: tuple[
             str,
             int | None,
@@ -919,64 +1260,112 @@ class RalphLoop:
                 process_owned = bool(
                     instance and instance.current_task_id == task_id
                 )
-
-            manager_running = self.instance_manager.is_running(instance_id)
-            if process_owned:
-                if not manager_running:
-                    raise RuntimeError(
-                        "Ralph could not prove that the persisted process "
-                        "generation was reaped"
-                    )
-                stop_reason = (
-                    "Ralph loop stopped after provider admission; the exact "
-                    "turn outcome is uncertain"
-                )
-                stopped = await self.instance_manager.stop(
-                    instance_id,
-                    expected_task_id=task_id,
-                    expected_task_turn_generation=current_generation[-1],
-                    expected_pid=instance_snapshot[1],
-                    expected_started_at=instance_snapshot[3],
-                    task_status="failed",
-                    task_error_message=stop_reason,
-                    terminal_consumer_timeout=30.0,
-                    consumer_cancel_timeout=10.0,
-                )
-                if not stopped:
-                    raise RuntimeError(
-                        "Ralph process cleanup did not settle the owned generation"
-                    )
-
-                # InstanceManager.stop owns the atomic process/consumer cleanup
-                # and claim release. Never inspect or mutate the task after its
-                # successful commit: it may already have been claimed again on
-                # this same reusable instance by a newer generation.
-                return
-
-            if manager_running:
-                raise RuntimeError(
-                    "Instance has a managed generation that is not owned by "
-                    f"Ralph task {task_id}"
-                )
         except Exception as exc:
             logger.exception(
-                "Failed to stop Ralph-owned process for task %s on instance %s",
+                "Failed to inspect Ralph-owned process for task %s on instance %s",
                 task_id,
                 instance_id,
             )
+            return
+
+        manager_running = self.instance_manager.is_running(instance_id)
+        if process_owned:
+            stop_reason = (
+                "Ralph loop stopped after provider admission; the exact "
+                "turn outcome is uncertain"
+            )
+            terminal_context = await self._test_harness_terminal_context(
+                task_id,
+                instance_id,
+                current_generation,
+                reason=stop_reason,
+                allow_background_handoff=True,
+            )
+            if terminal_context is None:
+                return
             try:
-                if instance_snapshot is not None:
-                    await self._record_cancel_cleanup_failure(
-                        instance_id,
-                        task_id,
-                        "Ralph loop stopped but process cleanup could not be "
-                        f"confirmed: {exc}",
-                        instance_snapshot=instance_snapshot,
-                        generation_fence=current_generation,
-                    )
+                async with terminal_context:
+                    try:
+                        if not manager_running:
+                            raise RuntimeError(
+                                "Ralph could not prove that the persisted process "
+                                "generation was reaped"
+                            )
+                        stopped = await self.instance_manager.stop(
+                            instance_id,
+                            expected_task_id=task_id,
+                            expected_task_turn_generation=current_generation[-1],
+                            expected_pid=instance_snapshot[1],
+                            expected_started_at=instance_snapshot[3],
+                            task_status="failed",
+                            task_error_message=stop_reason,
+                            terminal_consumer_timeout=30.0,
+                            consumer_cancel_timeout=10.0,
+                        )
+                        if not stopped:
+                            raise RuntimeError(
+                                "Ralph process cleanup did not settle the owned "
+                                "generation"
+                            )
+                    except Exception as exc:
+                        logger.exception(
+                            "Failed to stop Ralph-owned process for task %s on "
+                            "instance %s",
+                            task_id,
+                            instance_id,
+                        )
+                        lifecycle_lock = (
+                            self.instance_manager._instance_lifecycle_lock(
+                                instance_id
+                            )
+                        )
+                        async with lifecycle_lock:
+                            await self._record_cancel_cleanup_failure_under_harness_fence(
+                                instance_id,
+                                task_id,
+                                "Ralph loop stopped but process cleanup could not be "
+                                f"confirmed: {exc}",
+                                instance_snapshot=instance_snapshot,
+                                generation_fence=current_generation,
+                            )
+                    # InstanceManager.stop owns the atomic process/consumer
+                    # cleanup and claim release. Never inspect or mutate the
+                    # Task after a successful commit: the slot may be reused.
+                    return
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception(
-                    "Failed to preserve cancelled Ralph claim for task %s",
+                    "Could not prove Test Harness cleanup before stopping Ralph "
+                    "task %s",
+                    task_id,
+                )
+                return
+
+        if manager_running:
+            if instance_snapshot is not None:
+                await self._record_cancel_cleanup_failure(
+                    instance_id,
+                    task_id,
+                    "Ralph loop stopped while the Instance had a different "
+                    "managed generation",
+                    instance_snapshot=instance_snapshot,
+                    generation_fence=current_generation,
+                )
+            return
+
+        browser_handoff = await self._defer_isolated_browser_claim(
+            instance_id,
+            current,
+        )
+        if browser_handoff is not None:
+            if browser_handoff:
+                from backend.main import dispatcher
+
+                dispatcher.wake()
+            else:
+                logger.error(
+                    "Ralph cancellation retained unproven Browser child claim %s",
                     task_id,
                 )
             return
@@ -1046,6 +1435,40 @@ class RalphLoop:
         task_id = task.id
         reason = f"Ralph loop failed: {exc}"[:500]
         observed_generation = task_generation_fence(task)
+        terminal_context = await self._test_harness_terminal_context(
+            task_id,
+            instance_id,
+            observed_generation,
+            reason=reason,
+            allow_background_handoff=True,
+        )
+        if terminal_context is None:
+            return
+        try:
+            async with terminal_context:
+                await self._fail_unexpected_claim_under_harness_fence(
+                    instance_id,
+                    task_id,
+                    reason,
+                    observed_generation,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not prove Test Harness cleanup before failing Ralph task %s",
+                task_id,
+            )
+
+    async def _fail_unexpected_claim_under_harness_fence(
+        self,
+        instance_id: int,
+        task_id: int,
+        reason: str,
+        observed_generation: TaskGenerationFence,
+    ) -> None:
+        """Fail and reap one claim while its Harness owner fence is held."""
+
         instance_snapshot: tuple[
             str,
             int | None,
@@ -1067,6 +1490,8 @@ class RalphLoop:
                 current is None
                 or current.status not in ("in_progress", "executing")
                 or current.instance_id != instance_id
+                or current.worker_id is not None
+                or current.shared_from_id is not None
                 or task_generation_fence(current)[:4]
                 != observed_generation[:4]
                 or task_generation_fence(current)[-1]
@@ -1096,6 +1521,8 @@ class RalphLoop:
                 Task.id == task_id,
                 Task.status.in_(("in_progress", "executing")),
                 Task.instance_id == instance_id,
+                Task.worker_id.is_(None),
+                Task.shared_from_id.is_(None),
                 Task.retry_count == expected_retry_count,
                 Task.turn_generation == expected_turn_generation,
                 (
@@ -1204,16 +1631,20 @@ class RalphLoop:
                     cleanup_error.__traceback__,
                 ),
             )
-            await self._record_cancel_cleanup_failure(
-                instance_id,
-                task_id,
-                f"{reason}; process cleanup could not be confirmed: "
-                f"{cleanup_error}",
-                instance_snapshot=instance_snapshot,
-                generation_fence=failed_generation,
-                task_statuses=("failed",),
-                broadcast_event=False,
+            lifecycle_lock = self.instance_manager._instance_lifecycle_lock(
+                instance_id
             )
+            async with lifecycle_lock:
+                await self._record_cancel_cleanup_failure_under_harness_fence(
+                    instance_id,
+                    task_id,
+                    f"{reason}; process cleanup could not be confirmed: "
+                    f"{cleanup_error}",
+                    instance_snapshot=instance_snapshot,
+                    generation_fence=failed_generation,
+                    task_statuses=("failed",),
+                    broadcast_event=False,
+                )
 
         await self._broadcast_generation_event(
             task_id,
@@ -1232,6 +1663,7 @@ class RalphLoop:
 
     async def _loop(self, instance_id: int):
         logger.info(f"Ralph loop running for instance {instance_id}")
+        dispatcher_only_ids: set[int] = set()
         while True:
             task = None
             try:
@@ -1241,7 +1673,10 @@ class RalphLoop:
                     async with dispatcher.task_start_guard():
                         async with self.db_factory() as db:
                             queue = TaskQueue(db)
-                            task = await queue.dequeue(instance_id=instance_id)
+                            task = await queue.dequeue(
+                                exclude_ids=dispatcher_only_ids,
+                                instance_id=instance_id,
+                            )
                 except TaskStartPausedError:
                     await dispatcher.wait_until_resumed()
                     continue
@@ -1249,6 +1684,23 @@ class RalphLoop:
                 if not task:
                     await asyncio.sleep(5)
                     continue
+
+                browser_handoff = await self._defer_isolated_browser_claim(
+                    instance_id,
+                    task,
+                )
+                if browser_handoff is True:
+                    dispatcher_only_ids.add(task.id)
+                    dispatcher.wake()
+                    continue
+                if browser_handoff is False:
+                    logger.error(
+                        "Ralph retained unproven Browser child claim %s on "
+                        "instance %s and stopped its producer",
+                        task.id,
+                        instance_id,
+                    )
+                    return
 
                 logger.info(f"Instance {instance_id} picked task {task.id}: {task.title}")
 

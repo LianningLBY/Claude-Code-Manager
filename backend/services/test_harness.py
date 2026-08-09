@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 
 from backend.config import settings
 from backend.database import async_session
+from backend.models.instance import Instance
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.task_ssh_grant import TaskSSHGrant
 from backend.models.test_harness import (
     TestHarnessAttempt,
     TestHarnessChildBinding,
@@ -43,6 +45,14 @@ from backend.services.test_harness_targets import (
     untrusted_git_target_capability,
 )
 from backend.services.test_harness_runtime import resolve_harness_runtime
+from backend.services.test_harness_execution_context import (
+    TestHarnessExecutionContextError,
+    execution_context_from_runtime,
+    freeze_harness_execution_context,
+    frozen_git_project,
+    public_harness_runtime,
+    runtime_with_execution_context,
+)
 from backend.services.test_harness_artifacts import (
     OpenedHarnessArtifact,
     TestHarnessArtifactError,
@@ -50,10 +60,13 @@ from backend.services.test_harness_artifacts import (
     test_harness_artifact_store,
 )
 from backend.services.test_harness_owner_fence import (
+    TEST_HARNESS_TERMINAL_GATE_KEY,
     TestHarnessOwnerIdentity,
+    install_test_harness_owner_terminal_gate,
     lock_test_harness_owner,
     test_harness_owner_fence,
     test_harness_owner_identity,
+    test_harness_owner_locality_error,
 )
 
 
@@ -61,6 +74,12 @@ logger = logging.getLogger(__name__)
 
 _WORKSPACE_TERMINAL = frozenset({"completed", "failed", "cancelled"})
 _BROWSER_TERMINAL = frozenset({"completed", "failed", "cancelled"})
+_PUBLIC_TERMINAL_OWNER_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "conflict"}
+)
+_TERMINAL_GATE_RUN_IDS_KEY = "cleanup_harness_run_ids"
+_TERMINAL_GATE_WORKSPACE_IDS_KEY = "cleanup_workspace_run_ids"
+_TERMINAL_GATE_BINDING_IDS_KEY = "cleanup_browser_binding_ids"
 ARCHIVE_STAGING = "staging"
 ARCHIVE_ARCHIVING = "archiving"
 ARCHIVE_COMPLETE = "complete"
@@ -98,6 +117,67 @@ _FRONTEND_PATH_SUFFIXES = {
     ".woff",
     ".woff2",
 }
+
+
+def _owner_has_in_process_runtime_evidence(task_id: int) -> bool:
+    """Snapshot hidden launch/background evidence while admission has no await."""
+
+    try:
+        from backend.main import instance_manager
+    except Exception:  # pragma: no cover - startup import failures are fatal elsewhere.
+        return True
+    if instance_manager is None:
+        return False
+    reservations = getattr(instance_manager, "_launch_reservations", {})
+    if isinstance(reservations, dict) and any(
+        getattr(reservation, "task_id", None) == task_id
+        for reservation in reservations.values()
+    ):
+        return True
+    active_background_ids = getattr(
+        instance_manager,
+        "active_pty_background_task_ids",
+        None,
+    )
+    if callable(active_background_ids) and task_id in active_background_ids():
+        return True
+    return False
+
+
+async def _require_terminal_owner_runtime_idle(
+    db,
+    owner: Task,
+) -> None:
+    """Do not start post-turn Browser work before the exact runtime is reaped."""
+
+    if owner.status not in _PUBLIC_TERMINAL_OWNER_STATUSES:
+        return
+    if owner.instance_id is not None:
+        raise TestHarnessBusyError(
+            "Harness owner Task is terminal but its Instance claim has not "
+            "settled"
+        )
+    if owner.pty_background_generation is not None:
+        raise TestHarnessBusyError(
+            "Harness owner Task is terminal but its PTY background generation "
+            "has not settled"
+        )
+    reverse_instance = await db.scalar(
+        select(Instance.id)
+        .where(Instance.current_task_id == owner.id)
+        .with_for_update()
+        .limit(1)
+    )
+    if reverse_instance is not None:
+        raise TestHarnessBusyError(
+            "Harness owner Task is terminal but a reverse Instance owner has "
+            "not settled"
+        )
+    if _owner_has_in_process_runtime_evidence(owner.id):
+        raise TestHarnessBusyError(
+            "Harness owner Task is terminal but an in-process launch or PTY "
+            "runtime has not settled"
+        )
 _CONTENT_TYPES = {
     ".png": "image/png",
     ".md": "text/markdown; charset=utf-8",
@@ -222,12 +302,14 @@ class TestHarnessService:
         task_id: int,
         spec: TestHarnessSpec,
         owner_user_id: int | None = None,
+        owner_identity: TestHarnessOwnerIdentity | None = None,
     ) -> TestHarnessRun:
         async with test_harness_owner_fence(task_id):
             return await self._start_task_run_under_owner_fence(
                 task_id=task_id,
                 spec=spec,
                 owner_user_id=owner_user_id,
+                owner_identity=owner_identity,
             )
 
     async def _start_task_run_under_owner_fence(
@@ -236,6 +318,7 @@ class TestHarnessService:
         task_id: int,
         spec: TestHarnessSpec,
         owner_user_id: int | None = None,
+        owner_identity: TestHarnessOwnerIdentity | None = None,
     ) -> TestHarnessRun:
         normalized = spec.normalized()
         async with self.db_factory() as db:
@@ -255,7 +338,15 @@ class TestHarnessService:
                 raise TestHarnessError(
                     "Isolated Browser Agent Tasks cannot own nested Test Harness runs"
                 )
-            owner_identity = test_harness_owner_identity(task)
+            current_owner_identity = test_harness_owner_identity(task)
+            if (
+                owner_identity is not None
+                and owner_identity != current_owner_identity
+            ):
+                raise TestHarnessError(
+                    "Harness owner Task generation changed before admission"
+                )
+            owner_identity = owner_identity or current_owner_identity
             project = await db.get(Project, task.project_id) if task.project_id else None
             runtime = self._runtime_for_task(task, normalized)
             plan = compile_test_plan(
@@ -342,12 +433,6 @@ class TestHarnessService:
         owner_identity: TestHarnessOwnerIdentity | None = None,
     ) -> tuple[TestHarnessRun, bool]:
         scope = f"task:{task_id}" if task_id is not None else f"admin:{owner_user_id or 0}"
-        fingerprint = request_fingerprint(
-            target_kind=spec.target_kind,
-            target=spec.target,
-            test_plan=plan,
-            runtime=runtime,
-        )
         async with self._lock:
             async with self.db_factory() as db:
                 owner: Task | None = None
@@ -364,6 +449,65 @@ class TestHarnessService:
                         owner = await lock_test_harness_owner(db, owner_identity)
                     except RuntimeError as exc:
                         raise TestHarnessError(str(exc)) from exc
+                    locality_error = test_harness_owner_locality_error(owner)
+                    if locality_error is not None:
+                        raise TestHarnessError(locality_error)
+                    if owner.project_id != project_id:
+                        raise TestHarnessError(
+                            "Harness owner Task project changed during admission"
+                        )
+                    # Runtime-bearing Task fields do not advance the logical
+                    # turn generation. Freeze them from the fresh row after
+                    # the owner writer barrier so a concurrent config update
+                    # cannot leave a Run with stale routing evidence.
+                    runtime = self._runtime_for_task(owner, spec)
+                    project = None
+                    if owner.project_id is not None:
+                        # Project sharing and SSH admission use Project→Task
+                        # locks. We already own Task, so taking a Project row
+                        # lock here would invert that global order. A single
+                        # MVCC row read is coherent; the canonical copy below
+                        # makes any later Project mutation irrelevant to this
+                        # Run and its idempotency fingerprint.
+                        project = (
+                            await db.execute(
+                                select(Project)
+                                .where(Project.id == owner.project_id)
+                                .execution_options(populate_existing=True)
+                            )
+                        ).scalar_one_or_none()
+                    try:
+                        execution_context = freeze_harness_execution_context(
+                            task=owner,
+                            project=project,
+                            target_kind=spec.target_kind,
+                        )
+                    except TestHarnessExecutionContextError as exc:
+                        raise TestHarnessError(str(exc)) from exc
+                    runtime = runtime_with_execution_context(
+                        runtime,
+                        execution_context,
+                    )
+                    await _require_terminal_owner_runtime_idle(db, owner)
+                    if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+                        raise TestHarnessError(
+                            "Test Harness requires a configured AUTH_TOKEN"
+                        )
+                    ssh_grant = await db.scalar(
+                        select(TaskSSHGrant.id).where(
+                            TaskSSHGrant.task_id == owner.id
+                        )
+                    )
+                    if ssh_grant is not None:
+                        raise TestHarnessError(
+                            "Tasks with managed SSH grants cannot start Test Harness runs"
+                        )
+                fingerprint = request_fingerprint(
+                    target_kind=spec.target_kind,
+                    target=spec.target,
+                    test_plan=plan,
+                    runtime=runtime,
+                )
                 if spec.idempotency_key:
                     existing = await db.scalar(
                         select(TestHarnessRun).where(
@@ -394,7 +538,12 @@ class TestHarnessService:
                     active = await db.scalar(
                         select(TestHarnessRun.id).where(
                             TestHarnessRun.task_id == task_id,
-                            TestHarnessRun.status.not_in(HARNESS_TERMINAL_STATUSES),
+                            or_(
+                                TestHarnessRun.status.not_in(
+                                    HARNESS_TERMINAL_STATUSES
+                                ),
+                                TestHarnessRun.cleanup_status != "completed",
+                            ),
                         )
                     )
                     if active is not None:
@@ -501,14 +650,13 @@ class TestHarnessService:
         run = await self.get_run_model(run_id)
         if run is None or run.task_id is None:
             raise TestHarnessError("Harness run has no owning Task")
-        async with self.db_factory() as db:
-            task = await db.get(Task, run.task_id)
-            project = await db.get(Project, task.project_id) if task and task.project_id else None
-            if task is None:
-                raise TestHarnessError("Harness owner Task disappeared")
-            preview_config = project.preview_config if project is not None else None
-        if preview_config is None:
-            raise TestHarnessError("Project has no confirmed Preview configuration")
+        try:
+            execution_context = execution_context_from_runtime(
+                run.runtime_config,
+                target_kind="current_workspace",
+            )
+        except TestHarnessExecutionContextError as exc:
+            raise TestHarnessError(str(exc)) from exc
 
         from backend.services.workspace_review import workspace_review_manager
 
@@ -532,8 +680,10 @@ class TestHarnessService:
             max_steps=spec.max_steps,
             max_actions=spec.max_actions,
             harness_run_id=run_id,
+            workspace_override=Path(execution_context["workspace_path"]),
+            preview_config_override=execution_context["preview_config"],
             test_plan=test_plan,
-            runtime_config=run.runtime_config,
+            runtime_config=public_harness_runtime(run.runtime_config),
             owner_identity=TestHarnessOwnerIdentity(
                 task_id=run.task_id,
                 incarnation_id=run.owner_task_incarnation_id,
@@ -541,21 +691,6 @@ class TestHarnessService:
                 turn_generation=run.owner_task_turn_generation,
                 status=run.owner_task_status,
             ),
-        )
-        await self._update_run(
-            run_id,
-            values={
-                "workspace_review_run_id": workspace_run.id,
-                "source_git_head": workspace_run.git_head,
-                "source_fingerprint": workspace_run.workspace_fingerprint,
-                "status": "preparing_environment",
-                "stage": "fingerprinted",
-                "started_at": workspace_run.started_at or datetime.utcnow(),
-            },
-            event_type="lifecycle",
-            title="已锁定测试目标",
-            detail=f"Commit {workspace_run.git_head[:12]}，工作区指纹 {workspace_run.workspace_fingerprint[:12]}。",
-            source_key=f"workspace:{workspace_run.id}:linked",
         )
         if await_completion:
             await self._watch_workspace_run(
@@ -818,9 +953,20 @@ class TestHarnessService:
     async def _cleanup_git_target(self, run_id: str) -> str | None:
         try:
             await asyncio.shield(self.sandbox_manager.cleanup(run_id))
-            return None
         except BaseException as exc:
             return _safe_error(exc)
+        async with self.db_factory() as db:
+            lease = await db.scalar(
+                select(TestHarnessSandboxLease).where(
+                    TestHarnessSandboxLease.run_id == run_id
+                )
+            )
+        if lease is not None and lease.cleanup_status != "completed":
+            return (
+                lease.cleanup_error
+                or "Sandbox cleanup returned without a durable completion receipt"
+            )
+        return None
 
     async def _run_git_target_pipeline(self, run_id: str) -> None:
         """Own target preparation, black-box execution and exact cleanup."""
@@ -838,24 +984,84 @@ class TestHarnessService:
                 title="正在解析精确 Git 目标",
                 source_key="sandbox:resolving-target",
             )
-            async with self.db_factory() as db:
-                run = await db.get(TestHarnessRun, run_id)
-                if run is None or run.task_id is None:
-                    raise TestHarnessError("Harness run has no owning Task")
-                task = await db.get(Task, run.task_id)
-                project = (
-                    await db.get(Project, task.project_id)
-                    if task is not None and task.project_id
-                    else None
+            async with self.db_factory() as lookup:
+                run_snapshot = await lookup.get(TestHarnessRun, run_id)
+                if (
+                    run_snapshot is None
+                    or run_snapshot.task_id is None
+                    or run_snapshot.owner_task_incarnation_id is None
+                    or run_snapshot.owner_task_retry_count is None
+                    or run_snapshot.owner_task_turn_generation is None
+                    or run_snapshot.owner_task_status is None
+                ):
+                    raise TestHarnessError(
+                        "Harness Run has no active durable owner generation"
+                    )
+                owner_identity = TestHarnessOwnerIdentity(
+                    task_id=run_snapshot.task_id,
+                    incarnation_id=run_snapshot.owner_task_incarnation_id,
+                    retry_count=run_snapshot.owner_task_retry_count,
+                    turn_generation=run_snapshot.owner_task_turn_generation,
+                    status=run_snapshot.owner_task_status,
                 )
-                if task is None:
-                    raise TestHarnessError("Harness owner Task disappeared")
+
+            async with self.db_factory() as db:
+                try:
+                    task = await lock_test_harness_owner(db, owner_identity)
+                except RuntimeError as exc:
+                    raise TestHarnessError(str(exc)) from exc
+                locality_error = test_harness_owner_locality_error(task)
+                if locality_error is not None:
+                    raise TestHarnessError(locality_error)
+                run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(
+                            TestHarnessRun.id == run_id,
+                            TestHarnessRun.task_id == owner_identity.task_id,
+                            TestHarnessRun.owner_task_incarnation_id
+                            == owner_identity.incarnation_id,
+                            TestHarnessRun.owner_task_retry_count
+                            == owner_identity.retry_count,
+                            TestHarnessRun.owner_task_turn_generation
+                            == owner_identity.turn_generation,
+                            TestHarnessRun.owner_task_status
+                            == owner_identity.status,
+                            TestHarnessRun.status.not_in(
+                                HARNESS_TERMINAL_STATUSES
+                            ),
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if run is None:
+                    raise TestHarnessError(
+                        "Harness Run ended or changed owner before Git target preparation"
+                    )
+                try:
+                    execution_context = execution_context_from_runtime(
+                        run.runtime_config,
+                        target_kind=run.target_kind,
+                    )
+                except TestHarnessExecutionContextError as exc:
+                    raise TestHarnessError(str(exc)) from exc
+                if (
+                    run.project_id is None
+                    or task.project_id != run.project_id
+                    or execution_context.get("project_id") != run.project_id
+                ):
+                    raise TestHarnessError(
+                        "Harness owner Task Project changed before Git target preparation"
+                    )
+                project = frozen_git_project(execution_context)
                 kind = run.target_kind
                 target = {
                     key: value
                     for key, value in run.target_spec.items()
                     if key != "kind"
                 }
+                await db.commit()
 
             async def record_target_progress(
                 stage: str,
@@ -1890,6 +2096,16 @@ class TestHarnessService:
                 run = await db.get(TestHarnessRun, run_id)
                 if run is None:
                     return
+                proposed_status = values.get("status")
+                cleanup_only = set(values).issubset(
+                    {"cleanup_status", "cleanup_error"}
+                )
+                if run.status in HARNESS_TERMINAL_STATUSES:
+                    if not cleanup_only and proposed_status != run.status:
+                        return
+                elif run.status == "cancelling":
+                    if not cleanup_only and proposed_status != "cancelled":
+                        return
                 for key, value in values.items():
                     setattr(run, key, value)
                 await self._append_event(
@@ -1991,54 +2207,185 @@ class TestHarnessService:
         run_id: str,
         *,
         stop_agent_task: Callable[[int], Awaitable[None]] | None = None,
+        expected_identity: TestHarnessOwnerIdentity | None = None,
     ) -> TestHarnessRun | None:
         run = await self.get_run_model(run_id)
-        if run is None or run.status in HARNESS_TERMINAL_STATUSES:
+        if run is None:
+            return None
+        if run.task_id is None:
+            if expected_identity is not None:
+                raise TestHarnessError(
+                    "Standalone Harness Run cannot use a Task generation fence"
+                )
+            return await self._cancel_under_owner_fence(
+                run_id,
+                stop_agent_task=stop_agent_task,
+            )
+        if expected_identity is not None and (
+            expected_identity.task_id != run.task_id
+            or run.owner_task_incarnation_id != expected_identity.incarnation_id
+            or run.owner_task_retry_count != expected_identity.retry_count
+            or run.owner_task_turn_generation != expected_identity.turn_generation
+            or run.owner_task_status != expected_identity.status
+        ):
+            raise TestHarnessError(
+                "Harness Run belongs to a different owner generation"
+            )
+        async with test_harness_owner_fence(run.task_id):
+            return await self._cancel_under_owner_fence(
+                run_id,
+                stop_agent_task=stop_agent_task,
+                expected_identity=expected_identity,
+            )
+
+    async def _cancel_under_owner_fence(
+        self,
+        run_id: str,
+        *,
+        stop_agent_task: Callable[[int], Awaitable[None]] | None = None,
+        expected_identity: TestHarnessOwnerIdentity | None = None,
+    ) -> TestHarnessRun | None:
+        if expected_identity is not None:
+            async with self._db_lock:
+                async with self.db_factory() as db:
+                    try:
+                        await lock_test_harness_owner(db, expected_identity)
+                    except RuntimeError as exc:
+                        raise TestHarnessError(str(exc)) from exc
+                    run = (
+                        await db.execute(
+                            select(TestHarnessRun)
+                            .where(
+                                TestHarnessRun.id == run_id,
+                                TestHarnessRun.task_id
+                                == expected_identity.task_id,
+                                TestHarnessRun.owner_task_incarnation_id
+                                == expected_identity.incarnation_id,
+                                TestHarnessRun.owner_task_retry_count
+                                == expected_identity.retry_count,
+                                TestHarnessRun.owner_task_turn_generation
+                                == expected_identity.turn_generation,
+                                TestHarnessRun.owner_task_status
+                                == expected_identity.status,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if run is None:
+                        raise TestHarnessError(
+                            "Harness Run owner generation changed before cancellation"
+                        )
+                    if run.status in HARNESS_TERMINAL_STATUSES:
+                        await db.rollback()
+                    else:
+                        run.status = "cancelling"
+                        run.stage = "cancelling"
+                        await self._append_event(
+                            db,
+                            run,
+                            event_type="lifecycle",
+                            title="正在停止测试运行",
+                            stage="cancelling",
+                            source_key="harness:cancelling",
+                        )
+                        await db.commit()
+            run = await self.get_run_model(run_id)
+        else:
+            run = await self.get_run_model(run_id)
+        if run is None:
             return run
-        await self._update_run(
-            run_id,
-            values={"status": "cancelling", "stage": "cancelling"},
-            event_type="lifecycle",
-            title="正在停止测试运行",
-            source_key="harness:cancelling",
-        )
-        cleanup_status = "completed"
-        cleanup_error: str | None = None
+        if run.status in HARNESS_TERMINAL_STATUSES:
+            if run.cleanup_status == "completed":
+                return run
+            if run.workspace_review_run_id:
+                cleanup_status, cleanup_error = (
+                    await self._cancel_workspace_for_harness(run_id)
+                )
+                await self._update_run(
+                    run_id,
+                    values={
+                        "cleanup_status": cleanup_status,
+                        "cleanup_error": cleanup_error,
+                    },
+                    event_type="cleanup",
+                    title=(
+                        "隔离预览已清理"
+                        if cleanup_status == "completed"
+                        else "隔离预览清理仍未完成"
+                    ),
+                    detail=cleanup_error,
+                    source_key=(
+                        f"harness:cleanup-retry:{cleanup_status}:"
+                        f"{cleanup_error or 'ok'}"
+                    )[:200],
+                )
+                return await self.get_run_model(run_id)
+            pipeline = self._pipelines.get(run_id)
+            if pipeline is not None and not pipeline.done():
+                pipeline.cancel()
+                await asyncio.gather(pipeline, return_exceptions=True)
+            cleanup_status, cleanup_error = (
+                await self._cancel_direct_run_resources(
+                    run,
+                    stop_agent_task=stop_agent_task,
+                )
+            )
+            if run.target_kind in {"pull_request", "git_ref"}:
+                sandbox_error = await self._cleanup_git_target(run_id)
+                if sandbox_error is not None:
+                    cleanup_status = "failed"
+                    cleanup_error = sandbox_error
+            await self._update_run(
+                run_id,
+                values={
+                    "cleanup_status": cleanup_status,
+                    "cleanup_error": cleanup_error,
+                },
+                event_type="cleanup",
+                title=(
+                    "测试运行资源已清理"
+                    if cleanup_status == "completed"
+                    else "测试运行资源清理仍未完成"
+                ),
+                detail=cleanup_error,
+                source_key=(
+                    f"harness:cleanup-retry:{cleanup_status}:"
+                    f"{cleanup_error or 'ok'}"
+                )[:200],
+            )
+            return await self.get_run_model(run_id)
+        if expected_identity is None:
+            await self._update_run(
+                run_id,
+                values={"status": "cancelling", "stage": "cancelling"},
+                event_type="lifecycle",
+                title="正在停止测试运行",
+                source_key="harness:cancelling",
+            )
         if run.workspace_review_run_id:
             cleanup_status, cleanup_error = (
                 await self._cancel_workspace_for_harness(run_id)
             )
         else:
-            stopped_binding = await self.child_service.stop_for_harness_run(
-                run_id,
-                reason="Harness run was cancelled",
-            )
-            if (
-                not stopped_binding
-                and run.agent_task_id is not None
-                and run.agent_task_id != run.task_id
-            ):
-                if stop_agent_task is not None:
-                    await stop_agent_task(run.agent_task_id)
-                else:
-                    await self._stop_agent_task(run.agent_task_id)
-            if run.browser_review_job_id:
-                from backend.services.browser_review_jobs import browser_review_job_manager
-
-                cancelled_job = await browser_review_job_manager.cancel(
-                    run.browser_review_job_id
+            pipeline = self._pipelines.get(run_id)
+            if pipeline is not None and not pipeline.done():
+                pipeline.cancel()
+                await asyncio.gather(pipeline, return_exceptions=True)
+            cleanup_status, cleanup_error = (
+                await self._cancel_direct_run_resources(
+                    run,
+                    stop_agent_task=stop_agent_task,
                 )
-                if cancelled_job is None:
-                    cleanup_status = "unconfirmed"
-                    cleanup_error = (
-                        "Browser Review job disappeared before cleanup was proven"
-                    )
-                else:
-                    await self.sync_browser_job(cancelled_job)
+            )
         pipeline = self._pipelines.get(run_id)
         if pipeline is not None and not pipeline.done():
             pipeline.cancel()
             await asyncio.gather(pipeline, return_exceptions=True)
+        if run.target_kind in {"pull_request", "git_ref"}:
+            sandbox_error = await self._cleanup_git_target(run_id)
+            if sandbox_error is not None:
+                cleanup_status = "failed"
+                cleanup_error = sandbox_error
         current = await self.get_run_model(run_id)
         if current is not None and current.status not in HARNESS_TERMINAL_STATUSES:
             await self._mark_cancelled(
@@ -2046,7 +2393,86 @@ class TestHarnessService:
                 cleanup_status=cleanup_status,
                 cleanup_error=cleanup_error,
             )
+        elif current is not None and (
+            current.cleanup_status != cleanup_status
+            or current.cleanup_error != cleanup_error
+        ):
+            await self._update_run(
+                run_id,
+                values={
+                    "cleanup_status": cleanup_status,
+                    "cleanup_error": cleanup_error,
+                },
+                event_type="cleanup",
+                title=(
+                    "测试运行资源已清理"
+                    if cleanup_status == "completed"
+                    else "测试运行资源清理仍未完成"
+                ),
+                detail=cleanup_error,
+                source_key=(
+                    f"harness:cleanup-final:{cleanup_status}:"
+                    f"{cleanup_error or 'ok'}"
+                )[:200],
+            )
         return await self.get_run_model(run_id)
+
+    async def _cancel_direct_run_resources(
+        self,
+        run: TestHarnessRun,
+        *,
+        stop_agent_task: Callable[[int], Awaitable[None]] | None = None,
+    ) -> tuple[str, str | None]:
+        """Reap non-Workspace Browser resources and return durable proof state."""
+
+        errors: list[str] = []
+        stopped_binding = False
+        stopped_agent = False
+        try:
+            stopped_binding = await self.child_service.stop_for_harness_run(
+                run.id,
+                reason="Harness run was cancelled",
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            errors.append(_safe_error(exc))
+        if (
+            not stopped_binding
+            and run.agent_task_id is not None
+            and run.agent_task_id != run.task_id
+        ):
+            try:
+                if stop_agent_task is not None:
+                    await stop_agent_task(run.agent_task_id)
+                else:
+                    await self._stop_agent_task(run.agent_task_id)
+                stopped_agent = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.append(_safe_error(exc))
+        if run.browser_review_job_id:
+            from backend.services.browser_review_jobs import browser_review_job_manager
+
+            try:
+                cancelled_job = await browser_review_job_manager.cancel(
+                    run.browser_review_job_id
+                )
+                if cancelled_job is None:
+                    if not stopped_binding and not stopped_agent:
+                        errors.append(
+                            "Browser Review job disappeared before cleanup was proven"
+                        )
+                else:
+                    await self.sync_browser_job(cancelled_job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.append(_safe_error(exc))
+        if errors:
+            return "failed", "; ".join(dict.fromkeys(errors))[:4000]
+        return "completed", None
 
     async def cancel_for_task(self, task_id: int, *, reason: str) -> int:
         """Cascade an explicit owner stop/delete to all active Harness runs."""
@@ -2055,14 +2481,353 @@ class TestHarnessService:
             async with self._lock:
                 return await self._cancel_for_task_unlocked(task_id, reason=reason)
 
-    @asynccontextmanager
-    async def owner_stop_fence(self, task_id: int, *, reason: str):
-        """Prevent a new run from racing an explicit owner terminalization."""
+    @staticmethod
+    def _terminal_gate_graph_ids(
+        gate: dict[str, Any],
+        key: str,
+    ) -> set[str]:
+        raw = gate.get(key)
+        if not isinstance(raw, list):
+            return set()
+        return {
+            value
+            for value in raw
+            if isinstance(value, str)
+            and len(value) == 32
+            and value.isalnum()
+        }
 
+    async def _capture_terminal_cleanup_graph(
+        self,
+        db,
+        owner: Task,
+        identity: TestHarnessOwnerIdentity,
+    ) -> tuple[set[str], set[str], set[str]]:
+        """Persist the exact graph this terminal gate is responsible for."""
+
+        metadata = dict(owner.metadata_ or {})
+        raw_gate = metadata.get(TEST_HARNESS_TERMINAL_GATE_KEY)
+        gate = dict(raw_gate) if isinstance(raw_gate, dict) else {}
+        run_ids = self._terminal_gate_graph_ids(
+            gate,
+            _TERMINAL_GATE_RUN_IDS_KEY,
+        )
+        workspace_ids = self._terminal_gate_graph_ids(
+            gate,
+            _TERMINAL_GATE_WORKSPACE_IDS_KEY,
+        )
+        binding_ids = self._terminal_gate_graph_ids(
+            gate,
+            _TERMINAL_GATE_BINDING_IDS_KEY,
+        )
+        run_ids.update(
+            (
+                await db.execute(
+                    select(TestHarnessRun.id).where(
+                        TestHarnessRun.task_id == identity.task_id,
+                        TestHarnessRun.owner_task_incarnation_id
+                        == identity.incarnation_id,
+                        TestHarnessRun.owner_task_retry_count
+                        == identity.retry_count,
+                        TestHarnessRun.owner_task_turn_generation
+                        == identity.turn_generation,
+                        TestHarnessRun.owner_task_status == identity.status,
+                        or_(
+                            TestHarnessRun.status.not_in(
+                                HARNESS_TERMINAL_STATUSES
+                            ),
+                            TestHarnessRun.cleanup_status != "completed",
+                        ),
+                    )
+                )
+            ).scalars()
+        )
+        workspace_ids.update(
+            (
+                await db.execute(
+                    select(WorkspaceReviewRun.id).where(
+                        WorkspaceReviewRun.task_id == identity.task_id,
+                        WorkspaceReviewRun.owner_task_incarnation_id
+                        == identity.incarnation_id,
+                        WorkspaceReviewRun.owner_task_retry_count
+                        == identity.retry_count,
+                        WorkspaceReviewRun.owner_task_turn_generation
+                        == identity.turn_generation,
+                        WorkspaceReviewRun.owner_task_status == identity.status,
+                        or_(
+                            WorkspaceReviewRun.status.not_in(
+                                _WORKSPACE_TERMINAL
+                            ),
+                            WorkspaceReviewRun.cleanup_status != "completed",
+                        ),
+                    )
+                )
+            ).scalars()
+        )
+        binding_ids.update(
+            (
+                await db.execute(
+                    select(TestHarnessChildBinding.id).where(
+                        TestHarnessChildBinding.owner_task_id
+                        == identity.task_id,
+                        TestHarnessChildBinding.owner_task_incarnation_id
+                        == identity.incarnation_id,
+                        TestHarnessChildBinding.owner_task_retry_count
+                        == identity.retry_count,
+                        TestHarnessChildBinding.owner_task_turn_generation
+                        == identity.turn_generation,
+                        TestHarnessChildBinding.owner_task_status
+                        == identity.status,
+                        TestHarnessChildBinding.state.not_in(
+                            ("stopped", "completed")
+                        ),
+                    )
+                )
+            ).scalars()
+        )
+        gate[_TERMINAL_GATE_RUN_IDS_KEY] = sorted(run_ids)
+        gate[_TERMINAL_GATE_WORKSPACE_IDS_KEY] = sorted(workspace_ids)
+        gate[_TERMINAL_GATE_BINDING_IDS_KEY] = sorted(binding_ids)
+        metadata[TEST_HARNESS_TERMINAL_GATE_KEY] = gate
+        owner.metadata_ = metadata
+        return run_ids, workspace_ids, binding_ids
+
+    async def _require_terminal_cleanup_proof(
+        self,
+        db,
+        identity: TestHarnessOwnerIdentity,
+        *,
+        run_ids: set[str],
+        workspace_ids: set[str],
+        binding_ids: set[str],
+    ) -> None:
+        run_rows = []
+        if run_ids:
+            run_rows = list(
+                (
+                    await db.execute(
+                        select(TestHarnessRun).where(
+                            TestHarnessRun.id.in_(run_ids),
+                            TestHarnessRun.task_id == identity.task_id,
+                            TestHarnessRun.owner_task_incarnation_id
+                            == identity.incarnation_id,
+                            TestHarnessRun.owner_task_retry_count
+                            == identity.retry_count,
+                            TestHarnessRun.owner_task_turn_generation
+                            == identity.turn_generation,
+                            TestHarnessRun.owner_task_status == identity.status,
+                        )
+                    )
+                ).scalars()
+            )
+        workspace_rows = []
+        if workspace_ids:
+            workspace_rows = list(
+                (
+                    await db.execute(
+                        select(WorkspaceReviewRun).where(
+                            WorkspaceReviewRun.id.in_(workspace_ids),
+                            WorkspaceReviewRun.task_id == identity.task_id,
+                            WorkspaceReviewRun.owner_task_incarnation_id
+                            == identity.incarnation_id,
+                            WorkspaceReviewRun.owner_task_retry_count
+                            == identity.retry_count,
+                            WorkspaceReviewRun.owner_task_turn_generation
+                            == identity.turn_generation,
+                            WorkspaceReviewRun.owner_task_status
+                            == identity.status,
+                        )
+                    )
+                ).scalars()
+            )
+        binding_rows = []
+        if binding_ids:
+            binding_rows = list(
+                (
+                    await db.execute(
+                        select(TestHarnessChildBinding).where(
+                            TestHarnessChildBinding.id.in_(binding_ids),
+                            TestHarnessChildBinding.owner_task_id
+                            == identity.task_id,
+                            TestHarnessChildBinding.owner_task_incarnation_id
+                            == identity.incarnation_id,
+                            TestHarnessChildBinding.owner_task_retry_count
+                            == identity.retry_count,
+                            TestHarnessChildBinding.owner_task_turn_generation
+                            == identity.turn_generation,
+                            TestHarnessChildBinding.owner_task_status
+                            == identity.status,
+                        )
+                    )
+                ).scalars()
+            )
+        proven_runs = {
+            row.id
+            for row in run_rows
+            if row.status in HARNESS_TERMINAL_STATUSES
+            and row.cleanup_status == "completed"
+        }
+        proven_workspaces = {
+            row.id
+            for row in workspace_rows
+            if row.status in _WORKSPACE_TERMINAL
+            and row.cleanup_status == "completed"
+        }
+        proven_bindings = {
+            row.id
+            for row in binding_rows
+            if row.state in {"stopped", "completed"}
+        }
+        if (
+            proven_runs != run_ids
+            or proven_workspaces != workspace_ids
+            or proven_bindings != binding_ids
+        ):
+            raise TestHarnessError(
+                "Harness owner graph did not reach a proven terminal and "
+                "cleanup-complete state"
+            )
+
+    @asynccontextmanager
+    async def owner_stop_fence(
+        self,
+        task_id: int,
+        *,
+        reason: str,
+        expected_identity: TestHarnessOwnerIdentity | None = None,
+    ):
+        """Drain the owner graph and fence a terminal Task writer.
+
+        ``expected_identity`` installs a durable, generation-scoped admission
+        gate before cleanup.  That is required by natural Dispatcher terminal
+        paths: a different Manager process may otherwise commit a late Run
+        after this process has completed its stop scan.
+        """
+
+        if expected_identity is not None:
+            # Once the exact durable gate is committed, every materializer
+            # takes its own Task writer fence and rejects this generation.  Do
+            # not retain the process-local lock across the caller's terminal
+            # work: that work may need to cancel and join a Dispatcher worker
+            # whose own finalizer re-enters this cleanup path.
+            async with test_harness_owner_fence(task_id):
+                async with self._lock:
+                    await self._drain_owner_graph_for_stop(
+                        task_id,
+                        reason=reason,
+                        expected_identity=expected_identity,
+                    )
+            yield
+            return
+
+        # Legacy callers have no durable generation gate, so their terminal
+        # mutation must remain inside the in-process admission fence.
         async with test_harness_owner_fence(task_id):
             async with self._lock:
-                await self._cancel_for_task_unlocked(task_id, reason=reason)
+                await self._drain_owner_graph_for_stop(
+                    task_id,
+                    reason=reason,
+                    expected_identity=None,
+                )
                 yield
+
+    async def _drain_owner_graph_for_stop(
+        self,
+        task_id: int,
+        *,
+        reason: str,
+        expected_identity: TestHarnessOwnerIdentity | None,
+    ) -> None:
+        """Install the exact gate, drain its graph, and verify cleanup."""
+
+        run_ids: set[str] = set()
+        workspace_ids: set[str] = set()
+        binding_ids: set[str] = set()
+        if expected_identity is not None:
+            if expected_identity.task_id != task_id:
+                raise TestHarnessError(
+                    "Harness terminal owner identity does not match Task"
+                )
+            async with self.db_factory() as db:
+                try:
+                    owner = await install_test_harness_owner_terminal_gate(
+                        db,
+                        expected_identity,
+                        reason=reason,
+                    )
+                except RuntimeError as exc:
+                    raise TestHarnessError(str(exc)) from exc
+                (
+                    run_ids,
+                    workspace_ids,
+                    binding_ids,
+                ) = await self._capture_terminal_cleanup_graph(
+                    db,
+                    owner,
+                    expected_identity,
+                )
+                # The gate must be independently durable before process I/O.
+                # The graph IDs share its commit so a crash cannot forget a
+                # terminal Run whose cleanup still needs a retry.
+                await db.commit()
+            for run_id in sorted(run_ids):
+                await self.cancel(run_id)
+            linked_workspace_ids: set[str] = set()
+            if run_ids:
+                async with self.db_factory() as db:
+                    linked_workspace_ids = {
+                        value
+                        for value in (
+                            await db.execute(
+                                select(
+                                    TestHarnessRun.workspace_review_run_id
+                                ).where(TestHarnessRun.id.in_(run_ids))
+                            )
+                        ).scalars()
+                        if isinstance(value, str)
+                    }
+            standalone_workspace_ids = workspace_ids - linked_workspace_ids
+            if standalone_workspace_ids:
+                from backend.services.workspace_review import (
+                    workspace_review_manager,
+                )
+
+                for workspace_id in sorted(standalone_workspace_ids):
+                    try:
+                        await workspace_review_manager.cancel(workspace_id)
+                    except Exception as exc:
+                        raise TestHarnessError(str(exc)) from exc
+        await self._cancel_for_task_unlocked(task_id, reason=reason)
+        if expected_identity is None:
+            return
+        async with self.db_factory() as db:
+            try:
+                owner = await install_test_harness_owner_terminal_gate(
+                    db,
+                    expected_identity,
+                    reason=reason,
+                )
+            except RuntimeError as exc:
+                raise TestHarnessError(str(exc)) from exc
+            (
+                run_ids,
+                workspace_ids,
+                binding_ids,
+            ) = await self._capture_terminal_cleanup_graph(
+                db,
+                owner,
+                expected_identity,
+            )
+            await db.commit()
+        async with self.db_factory() as db:
+            await self._require_terminal_cleanup_proof(
+                db,
+                expected_identity,
+                run_ids=run_ids,
+                workspace_ids=workspace_ids,
+                binding_ids=binding_ids,
+            )
+            await db.rollback()
 
     async def _cancel_for_task_unlocked(self, task_id: int, *, reason: str) -> int:
         """Cancel owner runs while the global run-admission lock is held."""
@@ -2074,7 +2839,9 @@ class TestHarnessService:
                         select(TestHarnessRun.id)
                         .where(
                             TestHarnessRun.task_id == task_id,
-                            TestHarnessRun.status.not_in(HARNESS_TERMINAL_STATUSES),
+                            TestHarnessRun.status.not_in(
+                                HARNESS_TERMINAL_STATUSES
+                            ),
                         )
                         .order_by(TestHarnessRun.created_at.desc())
                     )
@@ -2196,7 +2963,7 @@ class TestHarnessService:
             "target": run.target_spec,
             "resolved_target": run.resolved_target,
             "test_plan": run.test_plan,
-            "runtime": run.runtime_config,
+            "runtime": public_harness_runtime(run.runtime_config),
             "request_fingerprint": run.request_fingerprint,
             "parent_run_id": run.parent_run_id,
             "root_run_id": run.root_run_id,
@@ -2384,7 +3151,13 @@ class TestHarnessService:
             "candidate_verdict": candidate.verdict,
         }
 
-    async def repeat(self, run_id: str, *, owner_user_id: int | None = None) -> TestHarnessRun:
+    async def repeat(
+        self,
+        run_id: str,
+        *,
+        owner_user_id: int | None = None,
+        owner_identity: TestHarnessOwnerIdentity | None = None,
+    ) -> TestHarnessRun:
         source = await self.get_run_model(run_id)
         if source is None or source.task_id is None:
             raise TestHarnessError("Test run not found")
@@ -2420,6 +3193,7 @@ class TestHarnessService:
             task_id=source.task_id,
             spec=spec,
             owner_user_id=owner_user_id,
+            owner_identity=owner_identity,
         )
 
     async def cleanup_evidence(self, *, required_free_bytes: int = 0) -> int:

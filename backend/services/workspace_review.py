@@ -27,13 +27,19 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
+from backend.config import settings
 from backend.database import async_session
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task import Task
-from backend.models.test_harness import TestHarnessChildBinding
+from backend.models.task_ssh_grant import TaskSSHGrant
+from backend.models.test_harness import (
+    TestHarnessChildBinding,
+    TestHarnessEvent,
+    TestHarnessRun,
+)
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.process_safety import require_safe_process_group_id
@@ -44,6 +50,12 @@ from backend.services.test_harness_owner_fence import (
     lock_test_harness_owner,
     test_harness_owner_fence,
     test_harness_owner_identity,
+    test_harness_owner_locality_error,
+)
+from backend.services.test_harness_execution_context import (
+    TestHarnessExecutionContextError,
+    execution_context_from_runtime,
+    public_harness_runtime,
 )
 from backend.services.test_harness_runtime import resolve_harness_runtime
 
@@ -729,7 +741,7 @@ class WorkspacePreviewManager:
         snapshot: WorkspaceSnapshot,
         config: dict[str, Any],
     ) -> PreviewHandle:
-        async with self._lock:
+        async with test_harness_owner_fence(task_id), self._lock:
             if any(handle.task_id == task_id for handle in self._handles.values()):
                 raise WorkspaceReviewBusyError("This Task already has an active workspace preview")
             temp_dir = Path(tempfile.mkdtemp(prefix="ccm-workspace-preview-"))
@@ -826,21 +838,32 @@ class WorkspacePreviewManager:
                 await asyncio.sleep(0.5)
         raise WorkspaceReviewError(f"preview did not become ready: {last_error}")
 
-    async def stop(self, run_id: str) -> None:
+    async def stop(self, run_id: str) -> bool:
+        """Reap one exact preview and retain its handle until cleanup succeeds."""
+
         async with self._lock:
-            handle = self._handles.pop(run_id, None)
-        if handle is None:
-            return
-        for process in reversed(handle.processes):
-            await _terminate_process(process)
-        try:
-            root = Path(tempfile.gettempdir()).resolve(strict=True)
-            target = handle.temp_dir.resolve(strict=True)
-            target.relative_to(root)
-            if target.name.startswith("ccm-workspace-preview-"):
-                shutil.rmtree(target)
-        except FileNotFoundError:
-            pass
+            handle = self._handles.get(run_id)
+            if handle is None:
+                return False
+            # Keep the exact handle published throughout process and filesystem
+            # cleanup. A failure or cancellation is retryable; removing it
+            # early would let a later stop mistake lost proof for success.
+            for process in reversed(handle.processes):
+                await _terminate_process(process)
+            try:
+                root = Path(tempfile.gettempdir()).resolve(strict=True)
+                target = handle.temp_dir.resolve(strict=True)
+                target.relative_to(root)
+                if target.name.startswith("ccm-workspace-preview-"):
+                    shutil.rmtree(target)
+            except FileNotFoundError:
+                pass
+            if self._handles.get(run_id) is not handle:
+                raise WorkspaceReviewError(
+                    "Workspace preview cleanup lost its exact handle"
+                )
+            self._handles.pop(run_id)
+            return True
 
     async def shutdown(self) -> None:
         async with self._lock:
@@ -902,6 +925,9 @@ def _safe_workspace_override(value: Path) -> Path:
 
 def workspace_review_capability(task: Task, project: Project | None) -> dict[str, Any]:
     try:
+        locality_error = test_harness_owner_locality_error(task)
+        if locality_error is not None:
+            raise WorkspaceReviewError(locality_error)
         workspace = _task_workspace(task, project)
         # Worktrees use a regular .git file; ordinary repositories use a dir.
         if not (workspace / ".git").exists():
@@ -1108,27 +1134,106 @@ class WorkspaceReviewManager:
                     task = await lock_test_harness_owner(db, expected_owner)
                 except RuntimeError as exc:
                     raise WorkspaceReviewError(str(exc)) from exc
+                locality_error = test_harness_owner_locality_error(task)
+                if locality_error is not None:
+                    raise WorkspaceReviewError(locality_error)
+                if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+                    raise WorkspaceReviewError(
+                        "Workspace Review requires a configured AUTH_TOKEN"
+                    )
+                ssh_grant = await db.scalar(
+                    select(TaskSSHGrant.id).where(TaskSSHGrant.task_id == task.id)
+                )
+                if ssh_grant is not None:
+                    raise WorkspaceReviewError(
+                        "Tasks with managed SSH grants cannot start Workspace Reviews"
+                    )
+                harness_run = None
+                harness_execution_context: dict[str, Any] | None = None
+                if harness_run_id is not None:
+                    harness_run = (
+                        await db.execute(
+                            select(TestHarnessRun)
+                            .where(TestHarnessRun.id == harness_run_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        harness_run is None
+                        or harness_run.task_id != task_id
+                        or harness_run.status in _TERMINAL
+                        or harness_run.status == "cancelling"
+                        or harness_run.owner_task_incarnation_id
+                        != expected_owner.incarnation_id
+                        or harness_run.owner_task_retry_count
+                        != expected_owner.retry_count
+                        or harness_run.owner_task_turn_generation
+                        != expected_owner.turn_generation
+                        or harness_run.owner_task_status != expected_owner.status
+                        or harness_run.workspace_review_run_id is not None
+                    ):
+                        raise WorkspaceReviewError(
+                            "Harness Run ended, changed generation, or was already linked"
+                        )
+                    try:
+                        harness_execution_context = execution_context_from_runtime(
+                            harness_run.runtime_config,
+                            target_kind="current_workspace",
+                        )
+                    except TestHarnessExecutionContextError as exc:
+                        raise WorkspaceReviewError(str(exc)) from exc
+                    if (
+                        harness_run.project_id != task.project_id
+                        or harness_execution_context.get("project_id")
+                        != harness_run.project_id
+                    ):
+                        raise WorkspaceReviewError(
+                            "Harness owner Task Project changed before Workspace Review admission"
+                        )
                 active = await db.scalar(
                     select(WorkspaceReviewRun.id).where(
                         WorkspaceReviewRun.task_id == task_id,
-                        WorkspaceReviewRun.status.not_in(_TERMINAL),
+                        or_(
+                            WorkspaceReviewRun.status.not_in(_TERMINAL),
+                            WorkspaceReviewRun.cleanup_status != "completed",
+                        ),
                     )
                 )
                 if active is not None:
                     raise WorkspaceReviewBusyError(
                         "This Task already has an active workspace review"
                     )
-                project = await db.get(Project, task.project_id) if task.project_id else None
-                workspace = (
-                    _safe_workspace_override(workspace_override)
-                    if workspace_override is not None
-                    else _task_workspace(task, project)
-                )
-                configured_preview = (
-                    preview_config_override
-                    if preview_config_override is not None
-                    else (project.preview_config if project is not None else None)
-                )
+                project = None
+                if harness_execution_context is None:
+                    project = (
+                        await db.get(Project, task.project_id)
+                        if task.project_id
+                        else None
+                    )
+                    workspace = (
+                        _safe_workspace_override(workspace_override)
+                        if workspace_override is not None
+                        else _task_workspace(task, project)
+                    )
+                    configured_preview = (
+                        preview_config_override
+                        if preview_config_override is not None
+                        else (
+                            project.preview_config
+                            if project is not None
+                            else None
+                        )
+                    )
+                else:
+                    # A Harness-linked Workspace Review consumes only the
+                    # route/config frozen in the owning Run. Caller overrides
+                    # and mutable Task/Project fields are not authorities.
+                    workspace = _safe_workspace_override(
+                        Path(harness_execution_context["workspace_path"])
+                    )
+                    configured_preview = harness_execution_context[
+                        "preview_config"
+                    ]
                 if configured_preview is None:
                     raise PreviewConfigurationError(
                         "Project Preview 尚未确认；请先在 Task 的测试入口确认启动配置"
@@ -1136,9 +1241,13 @@ class WorkspaceReviewManager:
                 config = validate_preview_config(configured_preview, workspace)
                 snapshot = await capture_workspace_snapshot(workspace, config)
                 selected_runtime = (
-                    dict(runtime_config)
-                    if runtime_config is not None
-                    else resolve_harness_runtime(task)
+                    public_harness_runtime(harness_run.runtime_config)
+                    if harness_run is not None
+                    else (
+                        dict(runtime_config)
+                        if runtime_config is not None
+                        else resolve_harness_runtime(task)
+                    )
                 )
                 run = WorkspaceReviewRun(
                     id=uuid.uuid4().hex,
@@ -1147,7 +1256,11 @@ class WorkspaceReviewManager:
                     owner_task_retry_count=task.retry_count,
                     owner_task_turn_generation=task.turn_generation,
                     owner_task_status=task.status,
-                    project_id=task.project_id,
+                    project_id=(
+                        harness_run.project_id
+                        if harness_run is not None
+                        else task.project_id
+                    ),
                     harness_run_id=harness_run_id,
                     mode=mode,
                     profile=profile,
@@ -1161,6 +1274,28 @@ class WorkspaceReviewManager:
                     cleanup_status="pending",
                 )
                 db.add(run)
+                if harness_run is not None:
+                    harness_run.workspace_review_run_id = run.id
+                    harness_run.source_git_head = run.git_head
+                    harness_run.source_fingerprint = run.workspace_fingerprint
+                    harness_run.status = "preparing_environment"
+                    harness_run.stage = "fingerprinted"
+                    harness_run.started_at = run.started_at or datetime.utcnow()
+                    harness_run.event_sequence += 1
+                    db.add(
+                        TestHarnessEvent(
+                            run_id=harness_run.id,
+                            sequence=harness_run.event_sequence,
+                            event_type="lifecycle",
+                            stage="fingerprinted",
+                            title="已锁定测试目标",
+                            detail=(
+                                f"Commit {run.git_head[:12]}，工作区指纹 "
+                                f"{run.workspace_fingerprint[:12]}。"
+                            ),
+                            source_key=f"workspace:{run.id}:linked",
+                        )
+                    )
                 await db.commit()
                 await db.refresh(run)
             pipeline = asyncio.create_task(
@@ -1187,6 +1322,16 @@ class WorkspaceReviewManager:
             run = await db.get(WorkspaceReviewRun, run_id)
             if run is None:
                 return
+            proposed_status = values.get("status")
+            cleanup_only = set(values).issubset(
+                {"cleanup_status", "cleanup_error"}
+            )
+            if run.status in _TERMINAL:
+                if not cleanup_only and proposed_status != run.status:
+                    return
+            elif run.status == "cancelling":
+                if not cleanup_only and proposed_status != "cancelled":
+                    return
             for key, value in values.items():
                 setattr(run, key, value)
             await db.commit()
@@ -1200,7 +1345,6 @@ class WorkspaceReviewManager:
         provider: str,
         tier: str,
         effort: str,
-        target_repo: Path,
         test_plan: dict[str, Any] | None,
     ) -> tuple[Any, Task, Any]:
         """Commit prepare -> reserve -> attach -> activate under owner fence."""
@@ -1215,6 +1359,7 @@ class WorkspaceReviewManager:
                     current_run is None
                     or current_run.task_id != owner_task_id
                     or current_run.status in _TERMINAL
+                    or current_run.status == "cancelling"
                     or owner is None
                 ):
                     raise WorkspaceReviewError(
@@ -1249,7 +1394,6 @@ class WorkspaceReviewManager:
                         "priority": 0,
                         "max_retries": 0,
                         "mode": "auto",
-                        "target_repo": str(target_repo),
                         "provider": provider,
                         "model": options.model,
                         "codex_service_tier": tier,
@@ -1266,6 +1410,10 @@ class WorkspaceReviewManager:
                     owner_task_id=owner_task_id,
                 )
                 await self.child_service.activate(binding.id)
+                # The real child service writes these fields atomically during
+                # reserve/activate.  Keep this conditional projection for
+                # alternate service implementations while refusing to revive
+                # a concurrently cancelling/terminal Workspace Run.
                 await self._update(
                     run_id,
                     agent_task_id=child.id,
@@ -1371,7 +1519,6 @@ class WorkspaceReviewManager:
                 provider=provider,
                 tier=tier,
                 effort=effort,
-                target_repo=handle.temp_dir,
                 test_plan=test_plan,
             )
             job_id = job.id
@@ -1472,7 +1619,14 @@ class WorkspaceReviewManager:
                     logger.exception("Could not fail Browser Review job %s", job_id)
         finally:
             try:
-                await asyncio.shield(self.preview_manager.stop(run_id))
+                cleanup_confirmed = await asyncio.shield(
+                    self.preview_manager.stop(run_id)
+                )
+                if handle is not None and cleanup_confirmed is False:
+                    raise WorkspaceReviewError(
+                        "Workspace preview handle disappeared before cleanup "
+                        "was proven"
+                    )
             except Exception as exc:
                 await self._update(
                     run_id,
@@ -1577,41 +1731,137 @@ class WorkspaceReviewManager:
         except Exception:
             logger.exception("Could not broadcast workspace review report")
 
-    async def cancel(self, run_id: str) -> WorkspaceReviewRun | None:
+    async def cancel(
+        self,
+        run_id: str,
+        *,
+        expected_identity: TestHarnessOwnerIdentity | None = None,
+    ) -> WorkspaceReviewRun | None:
+        async with async_session() as lookup:
+            snapshot = await lookup.get(WorkspaceReviewRun, run_id)
+            owner_task_id = snapshot.task_id if snapshot is not None else None
+        if owner_task_id is None:
+            return None
+        if expected_identity is not None and (
+            expected_identity.task_id != owner_task_id
+            or snapshot is None
+            or snapshot.owner_task_incarnation_id
+            != expected_identity.incarnation_id
+            or snapshot.owner_task_retry_count != expected_identity.retry_count
+            or snapshot.owner_task_turn_generation
+            != expected_identity.turn_generation
+            or snapshot.owner_task_status != expected_identity.status
+        ):
+            raise WorkspaceReviewError(
+                "Workspace Review belongs to a different owner generation"
+            )
+        async with test_harness_owner_fence(owner_task_id):
+            return await self._cancel_under_owner_fence(
+                run_id,
+                expected_identity=expected_identity,
+            )
+
+    async def _cancel_under_owner_fence(
+        self,
+        run_id: str,
+        *,
+        expected_identity: TestHarnessOwnerIdentity | None = None,
+    ) -> WorkspaceReviewRun | None:
         async with async_session() as db:
-            run = await db.get(WorkspaceReviewRun, run_id)
-            if run is None or run.status in _TERMINAL:
+            if expected_identity is not None:
+                try:
+                    await lock_test_harness_owner(db, expected_identity)
+                except RuntimeError as exc:
+                    raise WorkspaceReviewError(str(exc)) from exc
+                run = (
+                    await db.execute(
+                        select(WorkspaceReviewRun)
+                        .where(
+                            WorkspaceReviewRun.id == run_id,
+                            WorkspaceReviewRun.task_id
+                            == expected_identity.task_id,
+                            WorkspaceReviewRun.owner_task_incarnation_id
+                            == expected_identity.incarnation_id,
+                            WorkspaceReviewRun.owner_task_retry_count
+                            == expected_identity.retry_count,
+                            WorkspaceReviewRun.owner_task_turn_generation
+                            == expected_identity.turn_generation,
+                            WorkspaceReviewRun.owner_task_status
+                            == expected_identity.status,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if run is None:
+                    raise WorkspaceReviewError(
+                        "Workspace Review owner generation changed before cancellation"
+                    )
+            else:
+                run = await db.get(WorkspaceReviewRun, run_id)
+            if run is None:
                 return run
-            run.status = "cancelling"
-            run.stage = "cancelling"
-            await db.commit()
+            if run.status in _TERMINAL:
+                if run.cleanup_status == "completed":
+                    return run
+            else:
+                run.status = "cancelling"
+                run.stage = "cancelling"
+                await db.commit()
         pipeline = self._pipelines.get(run_id)
         await self.child_service.stop_for_workspace_run(
             run_id,
             reason="Workspace review was cancelled",
         )
-        if pipeline is not None and not pipeline.done():
+        pipeline_was_active = pipeline is not None and not pipeline.done()
+        if pipeline_was_active:
             pipeline.cancel()
             await asyncio.gather(pipeline, return_exceptions=True)
-        else:
-            cleanup_error: str | None = None
+        async with async_session() as db:
+            current = await db.get(WorkspaceReviewRun, run_id)
+        if current is None:
+            raise WorkspaceReviewError(
+                "Workspace Review disappeared before cleanup was proven"
+            )
+        if current.cleanup_status == "completed":
+            return current
+
+        cleanup_error = current.cleanup_error
+        if not pipeline_was_active:
             try:
-                await self.preview_manager.stop(run_id)
+                cleanup_confirmed = await self.preview_manager.stop(run_id)
             except Exception as exc:
                 cleanup_error = str(exc)[:4000]
+            else:
+                if cleanup_confirmed is False:
+                    cleanup_error = (
+                        "Workspace preview handle is unavailable; cleanup "
+                        "cannot be proven"
+                    )
+                else:
+                    cleanup_error = None
             async with async_session() as db:
                 current = await db.get(WorkspaceReviewRun, run_id)
                 if current is not None:
-                    current.status = "cancelled"
-                    current.stage = "cancelled"
-                    current.completed_at = current.completed_at or datetime.utcnow()
+                    if current.status not in _TERMINAL:
+                        current.status = "cancelled"
+                        current.stage = "cancelled"
+                        current.completed_at = (
+                            current.completed_at or datetime.utcnow()
+                        )
                     current.cleanup_status = (
                         "completed" if cleanup_error is None else "failed"
                     )
                     current.cleanup_error = cleanup_error
                     await db.commit()
+        if cleanup_error is not None:
+            raise WorkspaceReviewError(cleanup_error)
         async with async_session() as db:
-            return await db.get(WorkspaceReviewRun, run_id)
+            final = await db.get(WorkspaceReviewRun, run_id)
+        if final is None or final.cleanup_status != "completed":
+            raise WorkspaceReviewError(
+                "Workspace preview cleanup did not reach a proven terminal state"
+            )
+        return final
 
     async def shutdown(self) -> None:
         pipelines = [task for task in self._pipelines.values() if not task.done()]

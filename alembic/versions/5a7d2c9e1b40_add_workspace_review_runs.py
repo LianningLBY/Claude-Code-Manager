@@ -47,6 +47,7 @@ def upgrade() -> None:
         sa.Column("started_at", sa.DateTime(), nullable=True),
         sa.Column("completed_at", sa.DateTime(), nullable=True),
         sa.PrimaryKeyConstraint("id"),
+        mysql_engine="InnoDB",
     )
     op.create_index("ix_workspace_review_runs_task_id", "workspace_review_runs", ["task_id"])
     op.create_index("ix_workspace_review_runs_project_id", "workspace_review_runs", ["project_id"])

@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import Any
 
 import httpx
 from mcp.server.fastmcp import FastMCP
 
-from backend.services.test_harness_contracts import DEFAULT_BROWSER_CHANNEL
-
-
 _TASK_ID = 0
 _API_BASE = "http://localhost:8000"
 _AUTH_TOKEN = ""
+DEFAULT_BROWSER_CHANNEL = "chromium"
 
 mcp = FastMCP(
     "ccm_workspace_review",
@@ -40,7 +39,7 @@ def _url(path: str) -> str:
 
 
 async def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient(timeout=45, trust_env=False) as client:
         response = await client.request(
             method,
             _url(path),
@@ -205,14 +204,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--task-id", type=int, required=True)
     parser.add_argument("--api-base", default="http://localhost:8000")
-    parser.add_argument("--auth-token", default="")
     args = parser.parse_args()
     if args.task_id <= 0:
         parser.error("--task-id must be positive")
     global _TASK_ID, _API_BASE, _AUTH_TOKEN
     _TASK_ID = args.task_id
     _API_BASE = args.api_base.rstrip("/")
-    _AUTH_TOKEN = args.auth_token
+    _AUTH_TOKEN = os.environ.get("CCM_INTERNAL_SERVICE_TOKEN", "")
+    if not _AUTH_TOKEN:
+        parser.error("CCM_INTERNAL_SERVICE_TOKEN is required")
     mcp.run(transport="stdio")
 
 

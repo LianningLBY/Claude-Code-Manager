@@ -10,6 +10,7 @@ vi.mock('../../api/client', () => ({
     ]),
     listTags: vi.fn().mockResolvedValue([]),
     listSecrets: vi.fn().mockResolvedValue([]),
+    listSSHProfiles: vi.fn().mockResolvedValue([]),
     listTasks: vi.fn().mockResolvedValue([]),
     config: vi.fn().mockResolvedValue({
       default_provider: 'claude',
@@ -693,7 +694,6 @@ describe('TaskForm persisted defaults', () => {
     });
   });
 });
-
 describe('TaskForm frontend review entry location', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1075,5 +1075,115 @@ describe('TaskForm Delivery Loop mode', () => {
     });
 
     expect(api.uploadImages).not.toHaveBeenCalled();
+  });
+
+  it('drops a previously selected SSH grant before Delivery admission', async () => {
+    vi.mocked(api.listSSHProfiles).mockResolvedValueOnce([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      enabled: true,
+      revision: 1,
+      task_access_enabled: true,
+      task_capabilities: ['read'],
+      allowed_roots: ['/srv/app'],
+      has_key: true,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await userEvent.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await userEvent.click(await screen.findByLabelText('Grant production-box'));
+
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    fireEvent.change(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      { target: { value: 'Keep Delivery isolated from SSH grants' } },
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/does not accept.*SSH grants/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('TaskForm SSH grants', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.listSSHProfiles).mockResolvedValue([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      key_path_hint: '…/id_ed25519',
+      public_key_fingerprint: 'SHA256:client-key',
+      host_key_type: 'ssh-ed25519',
+      host_key_fingerprint: 'SHA256:server-key',
+      revision: 1,
+      enabled: true,
+      task_access_enabled: true,
+      task_capabilities: ['read', 'exec', 'write'],
+      allowed_roots: ['/'],
+      created_by: 1,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+  });
+
+  it('submits the selected profile and least-privilege capabilities atomically', async () => {
+    const user = userEvent.setup();
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await user.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'inspect production logs',
+    );
+    await user.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await user.click(await screen.findByLabelText('Grant production-box'));
+    await user.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ssh_grants: [{ profile_id: 41, capabilities: ['read'] }],
+      }),
+    ));
+  });
+
+  it('clears Manager-local SSH grants when switching to a Worker project', async () => {
+    vi.mocked(api.listProjects).mockResolvedValueOnce([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+      { id: 2, name: 'worker-project', worker_id: 9, git_url: '', has_remote: false, local_path: '/workspace/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [] },
+    ] as Awaited<ReturnType<typeof api.listProjects>>);
+    const user = userEvent.setup();
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await user.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await user.click(await screen.findByLabelText('Grant production-box'));
+
+    await user.click(screen.getByText('test-project'));
+    await user.click(await screen.findByText('worker-project'));
+    expect(screen.getByRole('button', { name: /^SSH access/ })).toBeDisabled();
+    await user.type(screen.getByPlaceholderText(/Prompt \/ Description/), 'remote task');
+    await user.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls.at(-1)?.[0]).not.toHaveProperty('ssh_grants');
   });
 });

@@ -1,13 +1,18 @@
 """Security regressions for HTTP authentication and WebSocket channel ACLs."""
 
+import asyncio
+import json
+
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.api.auth import create_jwt, decode_jwt
 from backend.config import settings
 from backend.models.discussion import Discussion
+from backend.models.log_entry import LogEntry
 from backend.models.plan import Plan
 from backend.models.project import Project
 from backend.models.task import Task
@@ -469,12 +474,16 @@ async def test_ask_user_pending_submit_follow_task_acl_and_validate_answers(
             description="d",
             created_by=owner_id,
             session_id="owned-session",
+            incarnation_id="1" * 32,
+            status="executing",
         )
         other = Task(
             title="other",
             description="d",
             created_by=other_id,
             session_id="other-session",
+            incarnation_id="2" * 32,
+            status="executing",
         )
         db.add_all([owned, other])
         await db.commit()
@@ -490,11 +499,19 @@ async def test_ask_user_pending_submit_follow_task_acl_and_validate_answers(
     }]
     owned_pending = ask_user_registry.create(
         task_id=owned_id,
+        task_incarnation_id="1" * 32,
+        task_retry_count=0,
+        task_turn_generation=0,
+        task_status="executing",
         session_id="owned-session",
         questions=question,
     )
     other_pending = ask_user_registry.create(
         task_id=other_id,
+        task_incarnation_id="2" * 32,
+        task_retry_count=0,
+        task_turn_generation=0,
+        task_status="executing",
         session_id="other-session",
         questions=question,
     )
@@ -540,6 +557,256 @@ async def test_ask_user_pending_submit_follow_task_acl_and_validate_answers(
     finally:
         ask_user_registry.discard(owned_pending.request_id)
         ask_user_registry.discard(other_pending.request_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_ask_user_answers_commit_exactly_one_audit(
+    secured_client,
+):
+    from backend.services.ask_user import AskUserRevocation, ask_user_registry
+
+    client, session_factory = secured_client
+    owner_id, owner_token = await _create_user(
+        session_factory,
+        email="ask-race-owner@example.com",
+        role="member",
+    )
+    incarnation = "a" * 32
+    async with session_factory() as db:
+        task = Task(
+            title="ask-race",
+            description="d",
+            created_by=owner_id,
+            session_id="ask-race-session",
+            incarnation_id=incarnation,
+            status="executing",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    pending = ask_user_registry.create(
+        task_id=task_id,
+        task_incarnation_id=incarnation,
+        task_retry_count=0,
+        task_turn_generation=0,
+        task_status="executing",
+        session_id="ask-race-session",
+        questions=[{"header": "Choice", "question": "A or B?"}],
+    )
+    headers = {"Authorization": f"Bearer {owner_token}"}
+    url = f"/api/tasks/{task_id}/ask-user/{pending.request_id}"
+    try:
+        first, second = await asyncio.gather(
+            client.post(
+                url,
+                headers=headers,
+                json={"answers": [{"labels": ["A"]}]},
+            ),
+            client.post(
+                url,
+                headers=headers,
+                json={"answers": [{"labels": ["B"]}]},
+            ),
+        )
+        assert sorted((first.status_code, second.status_code)) == [200, 410]
+        winning_answers = await pending.future
+        assert winning_answers in ([{"labels": ["A"]}], [{"labels": ["B"]}])
+
+        async with session_factory() as db:
+            audits = list((await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                )
+            )).scalars())
+        assert len(audits) == 1
+        assert audits[0].content in {"已回答: Choice → A", "已回答: Choice → B"}
+    finally:
+        ask_user_registry.discard(pending.request_id)
+
+
+@pytest.mark.asyncio
+async def test_ask_user_transition_after_audit_commit_revokes_old_future(
+    secured_client,
+    monkeypatch,
+):
+    from backend.api import ask_user as ask_user_api
+    from backend.services.ask_user import AskUserRevocation, ask_user_registry
+
+    client, session_factory = secured_client
+    owner_id, owner_token = await _create_user(
+        session_factory,
+        email="ask-final-fence-owner@example.com",
+        role="member",
+    )
+    incarnation = "f" * 32
+    async with session_factory() as db:
+        task = Task(
+            title="ask-final-fence",
+            description="d",
+            created_by=owner_id,
+            session_id="ask-final-fence-session",
+            incarnation_id=incarnation,
+            retry_count=3,
+            turn_generation=8,
+            status="executing",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    pending = ask_user_registry.create(
+        task_id=task_id,
+        task_incarnation_id=incarnation,
+        task_retry_count=3,
+        task_turn_generation=8,
+        task_status="executing",
+        session_id="ask-final-fence-session",
+        questions=[{"header": "Fence", "question": "old turn?"}],
+    )
+    original_settle = ask_user_api._settle_despite_cancellation
+    settle_calls = 0
+
+    async def transition_after_first_commit(awaitable):
+        nonlocal settle_calls
+        settle_calls += 1
+        operation, cancellation = await original_settle(awaitable)
+        if settle_calls == 1:
+            operation.result()
+            # Win exactly after the durable answer audit releases its first
+            # writer fence and before submit acquires the final wake fence.
+            async with session_factory() as transition_db:
+                transitioned = await transition_db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.incarnation_id == incarnation,
+                        Task.retry_count == 3,
+                        Task.turn_generation == 8,
+                        Task.status == "executing",
+                    )
+                    .values(turn_generation=9)
+                )
+                assert transitioned.rowcount == 1
+                await transition_db.commit()
+        return operation, cancellation
+
+    monkeypatch.setattr(
+        ask_user_api,
+        "_settle_despite_cancellation",
+        transition_after_first_commit,
+    )
+    try:
+        response = await client.post(
+            f"/api/tasks/{task_id}/ask-user/{pending.request_id}",
+            headers={"Authorization": f"Bearer {owner_token}"},
+            json={"answers": [{"labels": ["stale"]}]},
+        )
+        assert response.status_code == 410
+        assert settle_calls == 2
+        assert ask_user_registry.get(pending.request_id) is None
+        assert isinstance(await pending.future, AskUserRevocation)
+
+        async with session_factory() as db:
+            current_task = await db.get(Task, task_id)
+            audits = list((await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "system_event",
+                )
+            )).scalars())
+        assert current_task is not None
+        assert current_task.turn_generation == 9
+        assert len(audits) == 1
+        assert json.loads(audits[0].raw_json)["task_turn_generation"] == 8
+    finally:
+        ask_user_registry.discard(pending.request_id)
+
+
+@pytest.mark.asyncio
+async def test_ask_user_old_turn_and_terminal_pending_are_revoked(
+    secured_client,
+):
+    from backend.services.ask_user import AskUserRevocation, ask_user_registry
+
+    client, session_factory = secured_client
+    owner_id, owner_token = await _create_user(
+        session_factory,
+        email="ask-generation-owner@example.com",
+        role="member",
+    )
+    incarnation = "b" * 32
+    async with session_factory() as db:
+        task = Task(
+            title="ask-generation",
+            description="d",
+            created_by=owner_id,
+            session_id="ask-generation-session",
+            incarnation_id=incarnation,
+            retry_count=1,
+            turn_generation=2,
+            status="executing",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    old_turn = ask_user_registry.create(
+        task_id=task_id,
+        task_incarnation_id=incarnation,
+        task_retry_count=1,
+        task_turn_generation=2,
+        task_status="executing",
+        session_id="ask-generation-session",
+        questions=[{"header": "Old", "question": "old turn?"}],
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(turn_generation=3)
+        )
+        await db.commit()
+
+    headers = {"Authorization": f"Bearer {owner_token}"}
+    listed = await client.get(
+        f"/api/tasks/{task_id}/ask-user/pending",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    assert listed.json() == {"pending": []}
+    assert ask_user_registry.get(old_turn.request_id) is None
+    assert isinstance(await old_turn.future, AskUserRevocation)
+
+    terminal = ask_user_registry.create(
+        task_id=task_id,
+        task_incarnation_id=incarnation,
+        task_retry_count=1,
+        task_turn_generation=3,
+        task_status="executing",
+        session_id="ask-generation-session",
+        questions=[{"header": "Terminal", "question": "too late?"}],
+    )
+    async with session_factory() as db:
+        await db.execute(
+            update(Task)
+            .where(Task.id == task_id)
+            .values(status="completed")
+        )
+        await db.commit()
+
+    submitted = await client.post(
+        f"/api/tasks/{task_id}/ask-user/{terminal.request_id}",
+        headers=headers,
+        json={"answers": [{"labels": ["Yes"]}]},
+    )
+    assert submitted.status_code == 410
+    assert ask_user_registry.get(terminal.request_id) is None
+    assert isinstance(await terminal.future, AskUserRevocation)
 
 
 class _IdentityWebSocket:

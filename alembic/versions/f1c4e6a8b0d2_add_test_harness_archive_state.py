@@ -39,7 +39,8 @@ def upgrade() -> None:
         sa.Column(
             "archive_manifest",
             sa.JSON(),
-            server_default="{}",
+            # MySQL 8.0.13+ accepts JSON defaults only as expressions.
+            server_default=sa.text("('{}')"),
             nullable=False,
         ),
     )

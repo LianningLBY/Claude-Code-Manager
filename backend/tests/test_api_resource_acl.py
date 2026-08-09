@@ -782,6 +782,38 @@ async def test_discussion_events_require_discussion_owner(secured_client):
 
 
 @pytest.mark.asyncio
+async def test_discussion_agent_workloads_are_admin_only(secured_client):
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="discussion-workload-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        await _add_worker(
+            db,
+            name="discussion-member-worker",
+            owner_user_id=member_id,
+        )
+        await db.commit()
+
+    member_create = await client.post(
+        "/api/discussions",
+        headers=_headers(member_token),
+        json={"title": "must not launch"},
+    )
+    admin_create = await client.post(
+        "/api/discussions",
+        headers={"Authorization": "Bearer security-service-token"},
+        json={"title": "admin discussion"},
+    )
+
+    assert member_create.status_code == 403
+    assert member_create.json()["detail"] == "Admin only"
+    assert admin_create.status_code == 201
+
+
+@pytest.mark.asyncio
 async def test_host_files_and_global_git_credentials_are_admin_only(
     secured_client,
     tmp_path,

@@ -25,6 +25,7 @@ def _normalize_api_base(value: str) -> str:
         or not parsed.netloc
         or parsed.username is not None
         or parsed.password is not None
+        or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
     ):
@@ -38,7 +39,11 @@ def observe_asgi_server(server: Any) -> None:
     if not isinstance(server, (tuple, list)) or len(server) < 2:
         return
     host, port = server[0], server[1]
-    if not isinstance(host, str) or type(port) is not int or not (1 <= port <= 65535):
+    if (
+        not isinstance(host, str)
+        or type(port) is not int
+        or not (1 <= port <= 65535)
+    ):
         return
     host = host.strip()
     if not host:
@@ -61,7 +66,7 @@ def resolve_internal_api_base(explicit: str | None = None) -> str:
 
     from backend.config import settings
 
-    configured = getattr(settings, "internal_api_base_url", "").strip()
+    configured = settings.internal_api_base_url.strip()
     if configured:
         return _normalize_api_base(configured)
     with _lock:
@@ -69,7 +74,11 @@ def resolve_internal_api_base(explicit: str | None = None) -> str:
     if observed:
         return observed
 
-    host = settings.host if settings.host not in {"0.0.0.0", "::", "[::]"} else "127.0.0.1"
+    host = (
+        settings.host
+        if settings.host not in {"0.0.0.0", "::", "[::]"}
+        else "127.0.0.1"
+    )
     if ":" in host and not host.startswith("["):
         host = f"[{host}]"
     return f"http://{host}:{settings.port}"

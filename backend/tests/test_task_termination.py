@@ -2414,8 +2414,6 @@ async def test_queued_chat_drops_when_supersede_wins_final_launch_claim(
     """A message admitted after abort cannot launch past the terminal marker."""
 
     from pathlib import Path
-    from types import SimpleNamespace
-
     from sqlalchemy import update
 
     from backend.services.dispatcher import GlobalDispatcher, QueuedMessage
@@ -2428,7 +2426,11 @@ async def test_queued_chat_drops_when_supersede_wins_final_launch_claim(
             session_id="existing-session",
             metadata_={"pr_review_id": 41},
         )
-        db.add(task)
+        instance = Instance(
+            name="queued-supersede-slot",
+            status="idle",
+        )
+        db.add_all([task, instance])
         await db.commit()
         task_id = task.id
 
@@ -2442,11 +2444,15 @@ async def test_queued_chat_drops_when_supersede_wins_final_launch_claim(
         instance_manager,
         broadcaster,
     )
+    reserve_idle_instance = dispatcher._reserve_idle_instance
 
     async def supersede_during_slot_reservation(db):
         # This is the post-abort/new-enqueue race: all Python prechecks saw the
         # old row, then synchronize commits the marker immediately before the
         # consumer's final atomic Task claim.
+        reserved = await reserve_idle_instance(db)
+        assert reserved[0] is not None
+        assert reserved[1] is not None
         await db.execute(
             update(Task)
             .where(Task.id == task_id)
@@ -2458,7 +2464,7 @@ async def test_queued_chat_drops_when_supersede_wins_final_launch_claim(
             )
         )
         await db.commit()
-        return SimpleNamespace(id=901), object()
+        return reserved
 
     dispatcher._reserve_idle_instance = AsyncMock(
         side_effect=supersede_during_slot_reservation

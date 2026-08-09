@@ -53,6 +53,10 @@ from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
     no_active_worker_task_termination_predicate,
 )
+from backend.services.test_harness_owner_fence import (
+    has_active_test_harness_owner_graph,
+    no_active_test_harness_owner_graph_predicate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1228,19 +1232,26 @@ async def send_chat_message(
         is_error=False,
     )
     # This no-op write is the final cross-process admission barrier.  Manager
-    # and Worker termination receipt staging both lock the same Task row before
-    # publishing ``active_task_id``.  Whichever transaction wins is therefore
-    # observed here; a receipt can never be crossed by a newly durable message.
+    # and Worker termination receipt staging plus local Harness admission all
+    # lock the same Task row. Whichever transaction wins is therefore observed
+    # here; neither boundary can be crossed by a newly durable message/receipt.
     message_gate = await db.execute(
         sa_update(Task)
         .where(
             Task.id == task_id,
             no_active_worker_task_termination_predicate(),
+            no_active_test_harness_owner_graph_predicate(),
         )
         .values(status=Task.status)
     )
     if message_gate.rowcount != 1:
         await db.rollback()
+        if await has_active_test_harness_owner_graph(db, task_id):
+            raise HTTPException(
+                409,
+                "Task owns an active Test Harness, Workspace Review, or "
+                "Browser Agent graph",
+            )
         raise HTTPException(
             409,
             "Task has an active Worker termination receipt",
@@ -1264,6 +1275,10 @@ async def send_chat_message(
         "applied_plan_version_ids": [
             version.id for _plan, version in approved_versions
         ],
+        "workspace_review_expected": review_routing_prompt is not None,
+        "workspace_review_baseline_run_id": (
+            workspace_review_baseline_run_id
+        ),
     }
     if application_receipt_key is not None:
         response["plan_application_receipt_key"] = application_receipt_key
@@ -1544,10 +1559,6 @@ async def send_chat_message(
                 version_id=version.id,
                 user_log_id=user_log.id,
             )
-    response["workspace_review_expected"] = review_routing_prompt is not None
-    response["workspace_review_baseline_run_id"] = (
-        workspace_review_baseline_run_id
-    )
     return response
 
 
@@ -1746,6 +1757,11 @@ async def start_frontend_review_goal(
 
         if dispatcher is None:
             raise HTTPException(503, "Dispatcher is unavailable")
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        expected_harness_owner = test_harness_owner_identity(current)
         try:
             async with dispatcher.task_start_guard(
                 require_idle_task_id=task_id,
@@ -1755,6 +1771,7 @@ async def start_frontend_review_goal(
                     task_id,
                     queue,
                     db,
+                    expected_identity=expected_harness_owner,
                     task_updates=task_updates,
                     commit=False,
                 )
@@ -4200,6 +4217,7 @@ async def distill_task(
                 codex_account_id=(task.metadata_ or {}).get(
                     "codex_account_id"
                 ),
+                task_id=task.id,
                 instance_manager=instance_manager,
                 cloudrouter_store=cloudrouter_store,
             )

@@ -28,6 +28,7 @@ from backend.models.pr_monitor import (
 )
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessRun as HarnessRun
 from backend.services.delivery_controller import (
     CapabilitySnapshot,
     CoreDeliveryCapabilityGateway,
@@ -737,6 +738,50 @@ async def _complete_code(db_factory, workspace, run_id, head, tree):
         await db.commit()
 
 
+async def _add_active_harness_run(
+    db_factory,
+    task_id: int,
+    *,
+    run_id: str,
+) -> None:
+    """Persist the graph shape admitted by the public terminal-Task API."""
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id, populate_existing=True)
+        assert task is not None
+        assert task.status in {"completed", "failed", "cancelled", "conflict"}
+        db.add(
+            HarnessRun(
+                id=run_id,
+                task_id=task.id,
+                owner_task_incarnation_id=task.incarnation_id,
+                owner_task_retry_count=task.retry_count,
+                owner_task_turn_generation=task.turn_generation,
+                owner_task_status=task.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Verify the terminal Delivery output"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="8" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="waiting_for_browser",
+            )
+        )
+        await db.commit()
+
+
+async def _complete_harness_run(db_factory, run_id: str) -> None:
+    async with db_factory() as db:
+        run = await db.get(HarnessRun, run_id, populate_existing=True)
+        assert run is not None
+        run.status = "completed"
+        run.stage = "completed"
+        run.cleanup_status = "completed"
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+
+
 async def _finish_code_with_dispatcher(
     dispatcher: GlobalDispatcher,
     db_factory,
@@ -806,6 +851,175 @@ async def _to_monitoring(controller, db_factory, workspace, run_id):
         run = await db.get(DeliveryRun, run_id, populate_existing=True)
         assert (run.phase, run.activity) == ("monitoring", "waiting")
         return run.pr_monitor_run_id
+
+
+@pytest.mark.asyncio
+async def test_code_dispatch_waits_for_terminal_task_harness_graph(
+    db_session,
+    db_factory,
+):
+    run, _repo = await _scope(db_session)
+    workspace = FakeWorkspace()
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+    )
+    assert await controller.reconcile_run(run.id)  # create Plan invocation
+    assert await controller.reconcile_run(run.id)  # consume Plan
+    async with db_factory() as db:
+        task = await db.get(Task, run.developer_task_id)
+        task.status = "completed"
+        task.completed_at = datetime.utcnow()
+        await db.commit()
+    harness_run_id = "1" * 32
+    await _add_active_harness_run(
+        db_factory,
+        run.developer_task_id,
+        run_id=harness_run_id,
+    )
+
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        waiting = await db.get(DeliveryRun, run.id, populate_existing=True)
+        task = await db.get(Task, run.developer_task_id, populate_existing=True)
+        turn = await db.scalar(
+            select(DeliveryTurn.id).where(DeliveryTurn.run_id == run.id)
+        )
+        harness = await db.get(HarnessRun, harness_run_id)
+        assert (waiting.phase, waiting.activity) == ("coding", "ready")
+        assert task.status == "completed"
+        assert turn is None
+        assert harness.status == "running"
+
+    await _complete_harness_run(db_factory, harness_run_id)
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        dispatched = await db.get(DeliveryRun, run.id, populate_existing=True)
+        task = await db.get(Task, run.developer_task_id, populate_existing=True)
+        turn = await db.scalar(
+            select(DeliveryTurn).where(DeliveryTurn.active_run_id == run.id)
+        )
+        assert (dispatched.phase, dispatched.activity) == ("coding", "running")
+        assert task.status == "pending"
+        assert turn is not None and turn.status == "queued"
+
+
+@pytest.mark.asyncio
+async def test_completed_turn_waits_for_terminal_task_harness_graph(
+    db_session,
+    db_factory,
+):
+    run, _repo = await _scope(db_session)
+    workspace = FakeWorkspace()
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+    )
+    await _to_coding_pending(controller, run.id)
+    await _complete_code(db_factory, workspace, run.id, HEAD_ONE, TREE_ONE)
+    harness_run_id = "2" * 32
+    await _add_active_harness_run(
+        db_factory,
+        run.developer_task_id,
+        run_id=harness_run_id,
+    )
+
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        waiting = await db.get(DeliveryRun, run.id, populate_existing=True)
+        task = await db.get(Task, run.developer_task_id, populate_existing=True)
+        turn = await db.scalar(
+            select(DeliveryTurn).where(DeliveryTurn.active_run_id == run.id)
+        )
+        harness = await db.get(HarnessRun, harness_run_id)
+        assert (waiting.phase, waiting.activity) == ("coding", "running")
+        assert task.status == "completed"
+        assert turn is not None and turn.status in {
+            "queued",
+            "dispatching",
+            "running",
+        }
+        assert harness.status == "running"
+
+    await _complete_harness_run(db_factory, harness_run_id)
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        finalized = await db.get(DeliveryRun, run.id, populate_existing=True)
+        task = await db.get(Task, run.developer_task_id, populate_existing=True)
+        turn = await db.scalar(
+            select(DeliveryTurn).where(DeliveryTurn.run_id == run.id)
+        )
+        assert (finalized.phase, finalized.activity) == ("pre_review", "ready")
+        assert task.status == "delivery_waiting"
+        assert turn is not None and turn.status == "completed"
+        assert turn.active_run_id is None
+
+
+@pytest.mark.asyncio
+async def test_fail_run_waits_for_terminal_task_harness_graph(
+    db_session,
+    db_factory,
+):
+    run, _repo = await _scope(db_session)
+    controller = _controller(
+        db_factory,
+        FakeWorkspace(),
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, run.developer_task_id)
+        task.status = "completed"
+        task.completed_at = datetime.utcnow()
+        await db.commit()
+    harness_run_id = "3" * 32
+    await _add_active_harness_run(
+        db_factory,
+        run.developer_task_id,
+        run_id=harness_run_id,
+    )
+    lease = await controller._claim_run(run.id)
+    assert lease is not None
+
+    assert not await controller._fail_run(
+        lease,
+        code="delivery_test_failure",
+        message="terminal failure must wait for frontend validation",
+    )
+    async with db_factory() as db:
+        waiting = await db.get(DeliveryRun, run.id, populate_existing=True)
+        task = await db.get(Task, run.developer_task_id, populate_existing=True)
+        harness = await db.get(HarnessRun, harness_run_id)
+        assert (waiting.phase, waiting.activity, waiting.outcome) == (
+            "planning",
+            "ready",
+            None,
+        )
+        assert task.status == "completed"
+        assert harness.status == "running"
+
+    await _complete_harness_run(db_factory, harness_run_id)
+    assert await controller._fail_run(
+        lease,
+        code="delivery_test_failure",
+        message="terminal failure must wait for frontend validation",
+    )
+    async with db_factory() as db:
+        failed = await db.get(DeliveryRun, run.id, populate_existing=True)
+        task = await db.get(Task, run.developer_task_id, populate_existing=True)
+        assert (failed.phase, failed.activity, failed.outcome) == (
+            "done",
+            "terminal",
+            "failed",
+        )
+        assert task.status == "failed"
+        assert task.error_message == (
+            "terminal failure must wait for frontend validation"
+        )
 
 
 @pytest.mark.asyncio

@@ -1311,7 +1311,35 @@ def _script_env(
     # stub uv: alembic hangs so the test can kill the script mid-migration
     uv = bin_dir / "uv"
     uv.write_text('#!/bin/bash\nif [[ "$*" == *alembic* ]]; then sleep 30; fi\nexit 0\n')
-    for f in (systemctl, sudo, uv):
+    bwrap = bin_dir / "bwrap"
+    bwrap.write_text("#!/bin/bash\nexit 0\n")
+    socat = bin_dir / "socat"
+    socat.write_text("#!/bin/bash\nexit 0\n")
+    npm_root = tmp_path / "npm-root"
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/bash\n"
+        'if [ "$*" = "root -g" ]; then\n'
+        f"  printf '%s\\n' '{npm_root}'\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    for arch in ("x64", "arm64"):
+        apply_seccomp = (
+            npm_root
+            / "@anthropic-ai"
+            / "sandbox-runtime"
+            / "vendor"
+            / "seccomp"
+            / arch
+            / "apply-seccomp"
+        )
+        apply_seccomp.parent.mkdir(parents=True, exist_ok=True)
+        apply_seccomp.write_text("#!/bin/bash\nexit 0\n")
+        apply_seccomp.chmod(
+            apply_seccomp.stat().st_mode | stat.S_IEXEC
+        )
+    for f in (systemctl, sudo, uv, bwrap, socat, npm):
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
 
     env = os.environ.copy()

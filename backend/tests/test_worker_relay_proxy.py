@@ -20,6 +20,7 @@ import backend.services.task_events as task_events_module
 import backend.services.worker_proxy as worker_proxy_module
 import backend.services.worker_relay as worker_relay_module
 import backend.services.worker_task_termination as worker_termination_module
+from backend.config import settings
 from backend.models.log_entry import LogEntry
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
@@ -36,6 +37,7 @@ from backend.models.plan_agent import (
     PlanAgentWorkerDispatchReceipt,
 )
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessRun as HarnessRun
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
@@ -49,6 +51,9 @@ from backend.services.worker_relay import WorkerRelay
 from backend.services.worker_routing_config import (
     WORKER_ROUTING_PENDING_KEY,
 )
+
+
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
 
 
 class FakeBroadcaster:
@@ -68,6 +73,59 @@ def broadcaster():
 def relay(db_factory, broadcaster):
     r = WorkerRelay(db_factory=db_factory, broadcaster=broadcaster)
     return r
+
+
+def test_worker_proxy_network_boundaries_require_manager_auth(monkeypatch):
+    worker = SimpleNamespace(
+        auth_token="worker-token",
+        private_ip="10.0.0.8",
+        ssh_user="ubuntu",
+        ssh_key_path="/unused/key",
+        cloud_instance_id="i-auth-gate",
+    )
+    monkeypatch.setattr(settings, "auth_token", "")
+
+    with pytest.raises(HTTPException) as headers_error:
+        WorkerProxy._headers(worker)
+    with pytest.raises(HTTPException) as ssh_error:
+        WorkerProxy._ssh(worker)
+
+    assert headers_error.value.status_code == 503
+    assert ssh_error.value.status_code == 503
+    assert "AUTH_TOKEN" in headers_error.value.detail
+
+
+def test_worker_proxy_rejects_missing_worker_credential(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "manager-token")
+    worker = SimpleNamespace(auth_token="   ")
+
+    with pytest.raises(HTTPException) as exc_info:
+        WorkerProxy._headers(worker)
+
+    assert exc_info.value.status_code == 503
+    assert "Worker authentication" in exc_info.value.detail
+
+
+@pytest.mark.asyncio
+async def test_worker_relay_refuses_network_without_manager_auth(
+    relay,
+    monkeypatch,
+):
+    worker = SimpleNamespace(
+        id=81,
+        private_ip="10.0.0.81",
+        ccm_port=8002,
+        auth_token="worker-token",
+    )
+    connect = AsyncMock()
+    monkeypatch.setattr(settings, "auth_token", "")
+    monkeypatch.setattr(worker_relay_module.websockets, "connect", connect)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await relay.ensure_connection(worker)
+
+    assert exc_info.value.status_code == 503
+    connect.assert_not_awaited()
 
 
 async def test_concurrent_worker_connection_admission_creates_one_transport(
@@ -511,6 +569,259 @@ async def _reserve_worker_handoff(session_factory, task: Task):
         return reserved
 
 
+async def _add_unsettled_harness_graph(
+    session_factory,
+    task: Task,
+    *,
+    run_key: str,
+    run_status: str,
+    cleanup_status: str,
+) -> str:
+    """Inject the durable legacy state an upgraded Manager must drain."""
+
+    run_id = run_key * 32
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current is not None
+        db.add(
+            HarnessRun(
+                id=run_id,
+                task_id=current.id,
+                owner_task_incarnation_id=current.incarnation_id,
+                owner_task_retry_count=current.retry_count,
+                owner_task_turn_generation=current.turn_generation,
+                owner_task_status=current.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "preserve pre-existing owner graph"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint=run_key * 64,
+                root_run_id=run_id,
+                status=run_status,
+                stage=(
+                    "completed"
+                    if run_status == "completed"
+                    else "running"
+                ),
+                cleanup_status=cleanup_status,
+            )
+        )
+        await db.commit()
+    return run_id
+
+
+@pytest.mark.parametrize(
+    ("run_status", "cleanup_status"),
+    [
+        ("running", "pending"),
+        ("completed", "failed"),
+    ],
+)
+async def test_worker_handoff_reservation_rejects_unsettled_harness_graph(
+    session_factory,
+    run_status,
+    cleanup_status,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    run_id = ("a" if run_status == "running" else "b") * 32
+    handoff_id = f"{task.id:032x}"
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        db.add(
+            HarnessRun(
+                id=run_id,
+                task_id=current.id,
+                owner_task_incarnation_id=current.incarnation_id,
+                owner_task_retry_count=current.retry_count,
+                owner_task_turn_generation=current.turn_generation,
+                owner_task_status=current.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "preserve exact owner graph"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="c" * 64,
+                root_run_id=run_id,
+                status=run_status,
+                stage="completed" if run_status == "completed" else "running",
+                cleanup_status=cleanup_status,
+            )
+        )
+        source = LogEntry(
+            task_id=current.id,
+            event_type="user_message",
+            role="user",
+            content="must not cross harness cleanup",
+        )
+        db.add(source)
+        await db.commit()
+        await db.refresh(source)
+
+        observed = worker_relay_module.worker_task_generation(current)
+        assert observed is not None
+        request_payload = {
+            "message": source.content,
+            "worker_turn_handoff_id": handoff_id,
+            "worker_turn_handoff_retry_count": current.retry_count,
+            "worker_turn_handoff_from_generation": current.turn_generation,
+        }
+        reserved = await worker_relay_module.reserve_worker_turn_handoff(
+            db,
+            observed,
+            handoff_id=handoff_id,
+            source_log_id=source.id,
+            request_payload=request_payload,
+            request_digest=worker_relay_module._handoff_payload_digest(
+                request_payload
+            ),
+        )
+
+        assert reserved is None
+        persisted = await db.get(Task, task.id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        assert persisted.worker_turn_handoff_id is None
+        assert persisted.turn_generation == task.turn_generation
+        assert receipt is None
+
+
+async def test_preexisting_harness_graph_blocks_handoff_replay_effects(
+    relay,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    replay = await relay._manager_worker_turn_handoff_request(reserved)
+    assert replay is not None
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key="d",
+        run_status="completed",
+        cleanup_status="failed",
+    )
+    post_client = SimpleNamespace(post=AsyncMock())
+    client_factory = Mock()
+    monkeypatch.setattr(
+        worker_relay_module.httpx,
+        "AsyncClient",
+        client_factory,
+    )
+
+    posted = await relay._post_worker_turn_handoff_request(
+        worker,
+        reserved,
+        replay,
+        client=post_client,
+    )
+    resumed = await relay._resume_worker_turn_handoff(worker, reserved)
+
+    assert posted is False
+    assert resumed is False
+    post_client.post.assert_not_awaited()
+    client_factory.assert_not_called()
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            reserved.worker_turn_handoff_id,
+        )
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+    assert current.worker_turn_handoff_acknowledged is False
+    assert receipt.status == "prepared"
+
+
+async def test_preexisting_harness_graph_blocks_handoff_event_adoption(
+    relay,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key="e",
+        run_status="running",
+        cleanup_status="pending",
+    )
+
+    adopted = await relay._observe_or_adopt_event_generation(
+        worker.id,
+        task.id,
+        retry_count=task.retry_count,
+        turn_generation=task.turn_generation + 1,
+        worker_turn_handoff_id=reserved.worker_turn_handoff_id,
+    )
+
+    assert adopted is None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "completed"
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+
+
+async def test_preexisting_harness_graph_blocks_handoff_snapshot_recovery(
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        retry_count=3,
+        turn_generation=10,
+    )
+    reserved = await _reserve_worker_handoff(session_factory, task)
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key="f",
+        run_status="completed",
+        cleanup_status="failed",
+    )
+
+    async with session_factory() as db:
+        resulting = await worker_relay_module.apply_authoritative_worker_task(
+            db,
+            reserved,
+            _remote_task(
+                task,
+                status="completed",
+                turn_generation=task.turn_generation + 1,
+            ),
+            worker_turn_handoff_id=reserved.worker_turn_handoff_id,
+        )
+
+    assert resulting is None
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "completed"
+    assert current.turn_generation == task.turn_generation
+    assert current.worker_turn_handoff_id == reserved.worker_turn_handoff_id
+
+
 async def _create_manager_termination_receipt(
     session_factory,
     task_id: int,
@@ -948,6 +1259,7 @@ def test_worker_proxy_ssh_is_scoped_to_cloud_instance(monkeypatch):
         ssh_user="ubuntu",
         ssh_key_path="/tmp/worker-key",
         cloud_instance_id="i-worker-proxy",
+        auth_token="worker-token",
     )
 
     proxy._ssh(worker)
@@ -5280,6 +5592,40 @@ async def test_dispatch_worker_tasks_forwards(db_factory, session_factory, broad
     assert resulting.status == "executing"
 
 
+async def test_dispatch_worker_tasks_without_auth_keeps_pending_and_never_posts(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(settings, "auth_token", "")
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.turn_generation == task.turn_generation
+        assert current.started_at == task.started_at
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
 async def test_dispatch_worker_tasks_fail_closes_unproven_plan_before_post(
     db_factory,
     session_factory,
@@ -5636,6 +5982,71 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
         and event.get("status") == "failed"
         for channel, event in broadcaster.sent
     )
+
+
+async def test_dispatch_worker_plan_without_auth_keeps_queued_without_receipt(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Unauthenticated Worker Plan",
+            initial_request="Plan it",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+            priority=0,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan it",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(settings, "auth_token", "   ")
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+
+    async with session_factory() as db:
+        current = await db.get(PlanAgentRun, run_id)
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentWorkerDispatchReceipt).where(
+                        PlanAgentWorkerDispatchReceipt.run_id == run_id
+                    )
+                )
+            ).scalars()
+        )
+        assert current.status == "queued"
+        assert current.last_execution_started_at is None
+        assert receipts == []
+    proxy.run_versioned_plan_until_pause.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
 
 
 async def test_dispatch_worker_claim_rejects_same_worker_pending_retry_aba(
@@ -7749,6 +8160,7 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             imported_statuses.append(json["source_status"])
             remote.update({
                 "id": json["id"],
+                "incarnation_id": json["source_incarnation_id"],
                 "status": json["source_status"],
                 "retry_count": json["retry_count"],
                 "turn_generation": json["turn_generation"],
@@ -9186,6 +9598,75 @@ async def test_worker_chat_commit_cancellation_arms_handoff_recovery_first(
     assert user_log.task_turn_generation == task.turn_generation + 1
 
 
+@pytest.mark.parametrize(
+    ("run_key", "run_status", "cleanup_status"),
+    [
+        ("7", "running", "pending"),
+        ("8", "completed", "failed"),
+    ],
+)
+async def test_worker_internal_handoff_rejects_unsettled_harness_graph(
+    client,
+    session_factory,
+    monkeypatch,
+    run_key,
+    run_status,
+    cleanup_status,
+):
+    task = await _mk_task(
+        session_factory,
+        status="completed",
+        retry_count=2,
+        turn_generation=8,
+        session_id="worker-local-session",
+    )
+    await _add_unsettled_harness_graph(
+        session_factory,
+        task,
+        run_key=run_key,
+        run_status=run_status,
+        cleanup_status=cleanup_status,
+    )
+    dispatcher = SimpleNamespace(
+        enqueue_worker_turn_handoff=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(main_module, "dispatcher", dispatcher)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    handoff_id = run_key * 32
+    payload = {
+        "message": "must wait for exact Harness cleanup",
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": task.retry_count,
+        "worker_turn_handoff_from_generation": task.turn_generation,
+    }
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/chat",
+        json=payload,
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Test Harness" in response.text
+    dispatcher.enqueue_worker_turn_handoff.assert_not_awaited()
+    async with session_factory() as db:
+        logs = list(
+            (
+                await db.execute(
+                    select(LogEntry).where(
+                        LogEntry.task_id == task.id,
+                        LogEntry.event_type == "user_message",
+                    )
+                )
+            ).scalars()
+        )
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        current = await db.get(Task, task.id)
+    assert logs == []
+    assert receipt is None
+    assert current.turn_generation == task.turn_generation
+    assert current.status == task.status
+
+
 async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
     client,
     session_factory,
@@ -9217,6 +9698,8 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
     assert first.status_code == 200, first.text
     assert duplicate.status_code == 200, duplicate.text
     assert duplicate.json() == first.json()
+    assert first.json()["workspace_review_expected"] is False
+    assert first.json()["workspace_review_baseline_run_id"] is None
     async with session_factory() as db:
         logs = list((await db.execute(
             select(LogEntry).where(
@@ -9224,7 +9707,12 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
                 LogEntry.event_type == "user_message",
             )
         )).scalars())
+        durable_receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            handoff_id,
+        )
     assert len(logs) == 1
+    assert durable_receipt.response == first.json()
     metadata = json.loads(logs[0].raw_json)["worker_turn_handoff"]
     assert metadata["id"] == handoff_id
     assert metadata["queue_payload"]["prompt"] == payload["message"]

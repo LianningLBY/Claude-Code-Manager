@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 
 from backend.api import test_harness as test_harness_api
+from backend.config import settings
 from backend.database import get_db
 from backend.models.task import Task
-from backend.models.test_harness import TestHarnessEvidence as EvidenceModel
+from backend.models.test_harness import (
+    TestHarnessEvidence as EvidenceModel,
+    TestHarnessRun as RunModel,
+)
 from backend.services.test_harness import TestHarnessService as HarnessService
 from backend.services.test_harness_artifacts import (
     TestHarnessArtifactStore as ArtifactStore,
 )
-from backend.services.test_harness_contracts import TestHarnessSpec as HarnessSpec
+from backend.services.test_harness_contracts import (
+    TestHarnessSpec as HarnessSpec,
+    compile_test_plan,
+)
+from backend.services.internal_service_auth import InternalServiceClaims
 
 
 @pytest.mark.asyncio
@@ -56,6 +66,12 @@ async def test_task_test_run_api_persists_lists_and_cancels_fixed_url(
 
     start_browser = AsyncMock(side_effect=_attach_marker)
     monkeypatch.setattr(service, "start_fixed_url_browser", start_browser)
+    cancel_resources = AsyncMock(return_value=("completed", None))
+    monkeypatch.setattr(
+        service,
+        "_cancel_direct_run_resources",
+        cancel_resources,
+    )
     monkeypatch.setattr(test_harness_api, "test_harness_service", service)
 
     app = FastAPI()
@@ -130,6 +146,7 @@ async def test_task_test_run_api_persists_lists_and_cancels_fixed_url(
         )
         assert cancelled.status_code == 200, cancelled.text
         assert cancelled.json()["status"] == "cancelled"
+        cancel_resources.assert_awaited_once()
 
         repeated = await client.post(
             f"/api/tasks/{task_id}/test-runs/{run_id}/repeat"
@@ -195,8 +212,273 @@ async def test_public_test_run_waits_for_parent_task_terminal(db_factory):
             },
         )
 
-    assert response.status_code == 409
-    assert "Agent 可直接调用测试工具" in response.json()["detail"]
+        assert response.status_code == 409
+        assert "Agent 可直接调用测试工具" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_fields", "message"),
+    [
+        ({"worker_id": 61}, "Worker-authoritative"),
+        ({"shared_from_id": 62}, "Shared shadow"),
+    ],
+)
+async def test_capabilities_disable_manager_targets_for_remote_authority(
+    monkeypatch,
+    db_factory,
+    owner_fields,
+    message,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="Remote-authoritative Harness capabilities",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            **owner_fields,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    async def allow_access(*_args):
+        return None
+
+    async def sandbox_capability(*, project):
+        assert project is None
+        return SimpleNamespace(
+            available=True,
+            reason=None,
+            sandbox=SimpleNamespace(as_dict=lambda: {"available": True}),
+        )
+
+    monkeypatch.setattr(test_harness_api, "require_task_access", allow_access)
+    monkeypatch.setattr(
+        test_harness_api,
+        "untrusted_git_target_capability",
+        sandbox_capability,
+    )
+    async with db_factory() as db:
+        payload = await test_harness_api.get_test_harness_capabilities(
+            task_id,
+            SimpleNamespace(),
+            db,
+        )
+    assert payload["available"] is False
+    assert set(payload["targets"].values()) == {False}
+    for target in ("current_workspace", "fixed_url", "pull_request", "git_ref"):
+        assert message in payload["target_reasons"][target]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["start", "repeat"])
+async def test_public_start_and_repeat_reject_terminal_owner_with_live_instance(
+    monkeypatch,
+    db_factory,
+    operation,
+):
+    from backend.models.instance import Instance
+
+    monkeypatch.setattr(settings, "auth_token", "public-harness-secret")
+    async with db_factory() as db:
+        task = Task(
+            title="Terminal owner awaiting runtime reap",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(task)
+        await db.flush()
+        db.add(
+            Instance(
+                name="late terminal owner",
+                status="running",
+                current_task_id=task.id,
+            )
+        )
+        run_id = "8" * 32
+        db.add(
+            RunModel(
+                id=run_id,
+                task_id=task.id,
+                owner_task_incarnation_id=task.incarnation_id,
+                owner_task_retry_count=task.retry_count,
+                owner_task_turn_generation=task.turn_generation,
+                owner_task_status=task.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan=compile_test_plan(
+                    goal="repeat after runtime reap",
+                    profile="standard",
+                    allow_actions=False,
+                    viewport_width=1440,
+                    viewport_height=900,
+                    max_steps=20,
+                    max_actions=0,
+                ),
+                runtime_config={
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "reasoning_effort": "high",
+                    "codex_service_tier": "default",
+                    "profile": "standard",
+                    "allow_actions": False,
+                    "browser_channel": "chromium",
+                    "max_steps": 20,
+                    "max_actions": 0,
+                },
+                request_fingerprint="f" * 64,
+                root_run_id=run_id,
+                status="completed",
+                stage="completed",
+            )
+        )
+        await db.commit()
+        task_id = task.id
+
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    service.start_fixed_url_browser = AsyncMock(return_value=object())
+    monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def _admin(request: Request, call_next):
+        request.state.user_role = "admin"
+        request.state.auth_type = "token"
+        return await call_next(request)
+
+    async def _get_db():
+        async with db_factory() as db:
+            yield db
+
+    app.include_router(test_harness_api.router)
+    app.dependency_overrides[get_db] = _get_db
+    path = (
+        f"/api/tasks/{task_id}/test-runs"
+        if operation == "start"
+        else f"/api/tasks/{task_id}/test-runs/{run_id}/repeat"
+    )
+    body = (
+        {
+            "target_kind": "fixed_url",
+            "target": {"url": "https://example.com"},
+            "goal": "wait for runtime reap",
+        }
+        if operation == "start"
+        else None
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as client:
+        response = await client.post(path, json=body)
+
+    assert response.status_code == 409, response.text
+    assert "reverse Instance owner" in response.text
+    service.start_fixed_url_browser.assert_not_awaited()
+    async with db_factory() as db:
+        runs = list(
+            (
+                await db.execute(
+                    select(RunModel.id).where(RunModel.task_id == task_id)
+                )
+            ).scalars()
+        )
+        assert runs == [run_id]
+
+
+@pytest.mark.asyncio
+async def test_internal_test_run_routes_revalidate_exact_parent_generation(
+    monkeypatch,
+    db_factory,
+):
+    monkeypatch.setattr(settings, "auth_token", "internal-harness-secret")
+    async with db_factory() as db:
+        task = Task(
+            title="Internal Harness owner",
+            status="executing",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        claims = InternalServiceClaims(
+            audience="ccm_frontend_review",
+            token_id="internal-harness-token",
+            expires_at=4_000_000_000,
+            task_id=task.id,
+            task_incarnation_id=task.incarnation_id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            task_status=task.status,
+            owner_kind="task",
+            owner_id=task.id,
+        )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="internal_service",
+            internal_service_claims=claims,
+        )
+    )
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    service.start_fixed_url_browser = AsyncMock(return_value=object())
+    monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+    body = test_harness_api.TestHarnessRunStart(
+        target_kind="fixed_url",
+        target={"url": "https://example.com"},
+        goal="Review exact generation",
+        allow_actions=False,
+        max_actions=0,
+    )
+    async with db_factory() as db:
+        started = await test_harness_api.start_test_harness_run_internal(
+            task_id,
+            body,
+            request,
+            db,
+        )
+    run_id = started["id"]
+    async with db_factory() as db:
+        durable_run = await db.get(RunModel, run_id)
+        assert durable_run.owner_task_retry_count == claims.task_retry_count
+        assert (
+            durable_run.owner_task_turn_generation
+            == claims.task_turn_generation
+        )
+
+    async with db_factory() as db:
+        status_payload = await test_harness_api.get_test_harness_run_internal(
+            task_id,
+            run_id,
+            request,
+            db,
+        )
+    assert status_payload["id"] == run_id
+
+    async with db_factory() as db:
+        stopped = await test_harness_api.cancel_test_harness_run_internal(
+            task_id,
+            run_id,
+            request,
+            db,
+        )
+    assert stopped["status"] == "cancelled"
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.turn_generation += 1
+        await db.commit()
+    async with db_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            await test_harness_api.get_test_harness_run_internal(
+                task_id,
+                run_id,
+                request,
+                db,
+            )
+    assert getattr(caught.value, "status_code", None) == 403
 
 
 @pytest.mark.asyncio
@@ -391,3 +673,76 @@ async def test_task_can_save_and_use_browser_runtime_independent_from_parent(
             "codex_service_tier": "default",
         }
     start_browser.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_merges_fresh_metadata_after_terminal_gate_commit(
+    monkeypatch,
+    db_factory,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="Browser config terminal-gate race",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort_level="high",
+            metadata_={"keep": "account-binding"},
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    gate_installed = False
+
+    async def install_gate_after_optimistic_read(_request, _task, _db):
+        nonlocal gate_installed
+        assert not gate_installed
+        gate_installed = True
+        async with db_factory() as writer:
+            current = await writer.get(Task, task_id)
+            assert current is not None
+            current.metadata_ = {
+                **(current.metadata_ or {}),
+                "test_harness_terminal_generation": {
+                    "incarnation_id": current.incarnation_id,
+                    "retry_count": current.retry_count,
+                    "turn_generation": current.turn_generation,
+                    "status": current.status,
+                    "reason": "terminal writer won after route read",
+                },
+            }
+            await writer.commit()
+
+    monkeypatch.setattr(
+        test_harness_api,
+        "require_task_control",
+        install_gate_after_optimistic_read,
+    )
+    body = test_harness_api.TestHarnessRuntimeConfigUpdate(
+        inherit_task=False,
+        provider="claude",
+        model="claude-opus-5",
+        reasoning_effort="max",
+        codex_service_tier="default",
+    )
+    async with db_factory() as route_db:
+        payload = await test_harness_api.update_test_harness_runtime_config(
+            task_id,
+            body,
+            SimpleNamespace(),
+            route_db,
+        )
+    assert payload["provider"] == "claude"
+    assert gate_installed is True
+
+    async with db_factory() as db:
+        persisted = await db.get(Task, task_id)
+        assert persisted is not None
+        assert persisted.metadata_["keep"] == "account-binding"
+        assert persisted.metadata_["test_harness_terminal_generation"][
+            "reason"
+        ] == "terminal writer won after route read"
+        assert persisted.metadata_["test_harness_runtime"]["model"] == (
+            "claude-opus-5"
+        )

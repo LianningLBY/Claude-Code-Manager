@@ -29,6 +29,7 @@ import websockets
 from fastapi import HTTPException
 from sqlalchemy import exists, func, or_, select, update
 
+from backend.config import settings
 from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
 from backend.models.task import Task
@@ -47,6 +48,9 @@ from backend.services.pr_review_runtime import (
     is_pr_review_task,
 )
 from backend.services.task_queue import PR_REVIEW_SUPERSEDED_METADATA_KEY
+from backend.services.test_harness_owner_fence import (
+    no_active_test_harness_owner_graph_predicate,
+)
 
 _TASK_STATUSES = frozenset(
     {
@@ -459,7 +463,10 @@ async def _acquire_worker_turn_handoff_effect_fence(
         return None
     fenced = await db.execute(
         update(Task)
-        .where(*_worker_task_generation_write_predicates(current))
+        .where(
+            *_worker_task_generation_write_predicates(current),
+            no_active_test_harness_owner_graph_predicate(),
+        )
         .values(status=Task.status)
     )
     if fenced.rowcount != 1:
@@ -754,7 +761,10 @@ async def reserve_worker_turn_handoff(
         return None
     changed = await db.execute(
         update(Task)
-        .where(*_worker_task_generation_write_predicates(observed))
+        .where(
+            *_worker_task_generation_write_predicates(observed),
+            no_active_test_harness_owner_graph_predicate(),
+        )
         .values(
             worker_turn_handoff_id=handoff_id,
             worker_turn_handoff_worker_id=observed.worker_id,
@@ -1177,13 +1187,19 @@ async def apply_authoritative_worker_task(
             metadata.pop(WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY)
         metadata.update(merged_metadata_updates)
         values["metadata_"] = metadata
+    adoption_predicates = (
+        (no_active_test_harness_owner_graph_predicate(),)
+        if adopting_handoff
+        else ()
+    )
     changed = await db.execute(
         update(Task)
         .where(
             *_worker_task_generation_write_predicates(
                 observed,
                 worker_termination_operation_id=worker_termination_operation_id,
-            )
+            ),
+            *adoption_predicates,
         )
         .values(**values)
     )
@@ -1594,7 +1610,28 @@ class WorkerRelay:
     def _api(worker: Worker, path: str) -> str:
         return f"http://{worker.private_ip}:{worker.ccm_port}{path}"
 
-    def _headers(self, worker: Worker) -> dict:
+    @staticmethod
+    def _require_authenticated_control_plane(worker: Worker) -> None:
+        if (
+            not isinstance(settings.auth_token, str)
+            or not settings.auth_token.strip()
+        ):
+            raise HTTPException(
+                503,
+                "AUTH_TOKEN must be configured before Worker relay operations",
+            )
+        if (
+            not isinstance(worker.auth_token, str)
+            or not worker.auth_token.strip()
+        ):
+            raise HTTPException(
+                503,
+                "Worker relay authentication credential is unavailable",
+            )
+
+    @classmethod
+    def _headers(cls, worker: Worker) -> dict:
+        cls._require_authenticated_control_plane(worker)
         return {"Authorization": f"Bearer {worker.auth_token}"}
 
     def _connection_lock(self, worker_id: int) -> asyncio.Lock:
@@ -2481,7 +2518,10 @@ class WorkerRelay:
             # overwritten by this session's stale ORM snapshot.
             adopted = await db.execute(
                 update(Task)
-                .where(*_worker_task_generation_write_predicates(observed))
+                .where(
+                    *_worker_task_generation_write_predicates(observed),
+                    no_active_test_harness_owner_graph_predicate(),
+                )
                 .values(
                     turn_generation=turn_generation,
                     turn_source_log_id=None,

@@ -15,6 +15,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,6 +32,7 @@ class TestHarnessRun(Base):
             "idempotency_key",
             name="uq_test_harness_run_idempotency",
         ),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -93,6 +95,7 @@ class TestHarnessAttempt(Base):
     __tablename__ = "test_harness_attempts"
     __table_args__ = (
         UniqueConstraint("run_id", "ordinal", name="uq_test_harness_attempt_ordinal"),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -128,7 +131,7 @@ class TestHarnessAttempt(Base):
         JSON,
         nullable=False,
         default=dict,
-        server_default="{}",
+        server_default=text("('{}')"),
     )
     archive_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -146,6 +149,7 @@ class TestHarnessEvent(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_test_harness_event_sequence"),
         UniqueConstraint("run_id", "source_key", name="uq_test_harness_event_source"),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -166,6 +170,7 @@ class TestHarnessEvidence(Base):
     __tablename__ = "test_harness_evidence"
     __table_args__ = (
         UniqueConstraint("run_id", "name", name="uq_test_harness_evidence_name"),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -187,6 +192,7 @@ class TestHarnessFinding(Base):
     __tablename__ = "test_harness_findings"
     __table_args__ = (
         UniqueConstraint("run_id", "fingerprint", name="uq_test_harness_finding"),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -211,6 +217,7 @@ class TestHarnessSandboxLease(Base):
     """Durable identity for one ephemeral untrusted-code environment."""
 
     __tablename__ = "test_harness_sandbox_leases"
+    __table_args__ = {"mysql_engine": "InnoDB"}
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     run_id: Mapped[str] = mapped_column(String(32), nullable=False, unique=True, index=True)
@@ -240,6 +247,7 @@ class TestHarnessChildBinding(Base):
             "harness_run_id IS NOT NULL OR workspace_review_run_id IS NOT NULL",
             name="ck_test_harness_child_binding_owner",
         ),
+        {"mysql_engine": "InnoDB"},
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -298,3 +306,67 @@ class TestHarnessChildBinding(Base):
     activated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class BrowserReviewOperationReceipt(Base):
+    """At-most-once permit/ACK receipt for one interactive browser action."""
+
+    __tablename__ = "browser_review_operation_receipts"
+    __table_args__ = (
+        UniqueConstraint(
+            "browser_review_job_id",
+            "operation_id",
+            name="uq_browser_review_operation_job_id",
+        ),
+        CheckConstraint(
+            "status IN ('permitted', 'completed', 'uncertain', 'aborted')",
+            name="ck_browser_review_operation_status",
+        ),
+        {"mysql_engine": "InnoDB"},
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    browser_review_job_id: Mapped[str] = mapped_column(
+        String(32), nullable=False, index=True
+    )
+    operation_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    binding_id: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    harness_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    workspace_review_run_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
+    owner_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    owner_task_incarnation_id: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    owner_task_retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    owner_task_turn_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    owner_task_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    child_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    child_task_incarnation_id: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    child_task_retry_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    child_task_turn_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False
+    )
+    child_task_status: Mapped[str] = mapped_column(String(24), nullable=False)
+    action_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    request_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_nonce_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="permitted", index=True
+    )
+    ack_digest: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    result_data: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=datetime.utcnow
+    )
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )

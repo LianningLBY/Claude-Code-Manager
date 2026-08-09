@@ -24,6 +24,7 @@ from backend.database import async_session
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.test_harness import (
+    BrowserReviewOperationReceipt,
     TestHarnessChildBinding,
     TestHarnessRun,
 )
@@ -82,6 +83,73 @@ class TestHarnessChildError(RuntimeError):
 
 class TestHarnessChildRecoveryError(TestHarnessChildError):
     """Startup could not prove that every interrupted child was stopped."""
+
+
+async def mark_permitted_browser_operations_uncertain(
+    db: AsyncSession,
+    binding: TestHarnessChildBinding,
+    child: Task,
+    *,
+    reason: str,
+) -> int:
+    """Quarantine unacknowledged browser effects before a reap receipt.
+
+    A durable permit proves that the child was allowed to perform an external
+    browser action.  Exact process reap cannot prove whether that action ran,
+    so every missing ACK becomes ``uncertain`` in the same transaction that
+    terminalizes the child binding.  Identity drift is corruption and fails
+    closed instead of silently rewriting unrelated receipts.
+    """
+
+    receipts = list(
+        (
+            await db.execute(
+                select(BrowserReviewOperationReceipt)
+                .where(
+                    BrowserReviewOperationReceipt.binding_id == binding.id,
+                    BrowserReviewOperationReceipt.status == "permitted",
+                )
+                .order_by(BrowserReviewOperationReceipt.id)
+                .with_for_update()
+            )
+        ).scalars()
+    )
+    for receipt in receipts:
+        if (
+            receipt.browser_review_job_id != binding.browser_review_job_id
+            or receipt.harness_run_id != binding.harness_run_id
+            or receipt.workspace_review_run_id
+            != binding.workspace_review_run_id
+            or receipt.owner_task_id != binding.owner_task_id
+            or receipt.owner_task_incarnation_id
+            != binding.owner_task_incarnation_id
+            or receipt.owner_task_retry_count
+            != binding.owner_task_retry_count
+            or receipt.owner_task_turn_generation
+            != binding.owner_task_turn_generation
+            or receipt.owner_task_status != binding.owner_task_status
+            or receipt.child_task_id != binding.child_task_id
+            or receipt.child_task_incarnation_id
+            != binding.child_task_incarnation_id
+            or receipt.child_task_retry_count != binding.claimed_retry_count
+            or receipt.child_task_retry_count != child.retry_count
+            or receipt.child_task_turn_generation != child.turn_generation
+            or receipt.child_task_status not in {"in_progress", "executing"}
+        ):
+            raise TestHarnessChildError(
+                "Browser operation permit identity changed before child reap"
+            )
+    if not receipts:
+        return 0
+    now = datetime.utcnow()
+    message = reason.strip()[:4000] or (
+        "Browser child exited before the permitted operation was acknowledged"
+    )
+    for receipt in receipts:
+        receipt.status = "uncertain"
+        receipt.error = receipt.error or message
+        receipt.acknowledged_at = receipt.acknowledged_at or now
+    return len(receipts)
 
 
 TaskStopper = Callable[[int], Awaitable[None]]
@@ -168,6 +236,12 @@ def browser_child_binding_error(
         return "Browser child cannot belong to a Delivery Run"
     if task.tags not in (None, {}):
         return "Browser child cannot carry workflow classification tags"
+    if (
+        task.target_repo not in (None, "")
+        or task.target_branch not in (None, "", "main")
+        or task.project_id is not None
+    ):
+        return "Browser child cannot inherit a repository working directory"
     unknown_metadata = set(metadata) - BROWSER_CHILD_ALLOWED_METADATA_KEYS
     if unknown_metadata:
         return "Browser child contains metadata outside its immutable allowlist"
@@ -351,6 +425,19 @@ class TestHarnessChildService:
             raise TestHarnessChildError(
                 "Browser child must be reserved without a resumable session"
             )
+        if (
+            values.get("target_repo") is not None
+            or values.get("target_branch") is not None
+            or values.get("project_id") is not None
+        ):
+            raise TestHarnessChildError(
+                "Browser child cannot inherit an untrusted repository cwd"
+            )
+        values.update(
+            target_repo="",
+            target_branch="main",
+            project_id=None,
+        )
         if values.get("capability_policy") is not None:
             raise TestHarnessChildError(
                 "Browser child cannot request autonomous capabilities"
@@ -480,6 +567,14 @@ class TestHarnessChildService:
                     "Workspace review ended, disappeared, or changed owner while reserving child"
                 )
             child = await stage_task_record(db, **values)
+            # SQLAlchemy client defaults substitute the ordinary Task values
+            # (``""`` / ``"main"``) even when callers provide ``None``.
+            # Clear them after INSERT and before freezing the launch digest so
+            # Browser children cannot inherit repository instruction discovery.
+            child.target_repo = ""
+            child.target_branch = "main"
+            child.project_id = None
+            await db.flush()
             if child.id <= owner_task_id:
                 raise TestHarnessChildError(
                     "Browser child Task does not follow its owner lock identity"
@@ -671,11 +766,29 @@ class TestHarnessChildService:
             ).scalar_one_or_none()
             if binding is None:
                 return
+            if binding.state in CHILD_TERMINAL_STATES:
+                return
+            if binding.state != CHILD_RESERVED:
+                raise TestHarnessChildError(
+                    "Browser child reservation can only abort before activation"
+                )
             child = await db.get(Task, binding.child_task_id)
-            if child is not None and child.status == "pending_activation":
-                child.status = "cancelled"
-                child.completed_at = datetime.utcnow()
-                child.error_message = error
+            if child is None or child.status != "pending_activation":
+                raise TestHarnessChildError(
+                    "Browser child escaped its reservation before abort"
+                )
+            owner = await db.scalar(
+                select(Instance.id).where(
+                    Instance.current_task_id == binding.child_task_id
+                )
+            )
+            if owner is not None:
+                raise TestHarnessChildError(
+                    "Reserved Browser child unexpectedly owns an Instance"
+                )
+            child.status = "cancelled"
+            child.completed_at = datetime.utcnow()
+            child.error_message = error
             binding.state = CHILD_STOPPED
             binding.stop_requested_at = binding.stop_requested_at or datetime.utcnow()
             binding.completed_at = datetime.utcnow()
@@ -688,8 +801,13 @@ class TestHarnessChildService:
         *,
         task_status: str | None = None,
         error: str | None = None,
-    ) -> None:
-        """Persist natural Task completion independently of the job watcher."""
+    ) -> bool:
+        """Observe the durable reap receipt written by lifecycle cleanup.
+
+        A terminal Task row is not process evidence.  The Browser watcher may
+        therefore only consume an already-terminal binding; it must never
+        manufacture that receipt from Task status alone.
+        """
 
         async with self.db_factory() as db:
             binding = await db.scalar(
@@ -697,20 +815,11 @@ class TestHarnessChildService:
                     TestHarnessChildBinding.child_task_id == child_task_id
                 )
             )
-            if binding is None or binding.state in CHILD_TERMINAL_STATES:
-                return
-            if task_status is None:
-                child = await db.get(Task, child_task_id)
-                task_status = child.status if child is not None else None
-                error = error or (child.error_message if child is not None else None)
-            if task_status not in TASK_TERMINAL_STATUSES:
-                return
-            binding.state = (
-                CHILD_STOPPED if task_status == "cancelled" else CHILD_COMPLETED
+            return bool(
+                binding is not None
+                and binding.state in CHILD_TERMINAL_STATES
+                and binding.completed_at is not None
             )
-            binding.completed_at = datetime.utcnow()
-            binding.error = error
-            await db.commit()
 
     async def stop_for_harness_run(self, run_id: str, *, reason: str) -> bool:
         binding_id = await self._binding_id(harness_run_id=run_id)
@@ -756,6 +865,8 @@ class TestHarnessChildService:
     async def _stop_binding_impl(self, binding_id: str, *, reason: str) -> None:
         child_task_id: int
         job_id: str
+        child_incarnation_id: str
+        expected_generation: Any
         async with self.db_factory() as db:
             binding = (
                 await db.execute(
@@ -768,10 +879,58 @@ class TestHarnessChildService:
                 raise TestHarnessChildError("Browser child binding disappeared")
             if binding.state in CHILD_TERMINAL_STATES:
                 return
+            child = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == binding.child_task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                child is None
+                or not child.incarnation_id
+                or child.incarnation_id != binding.child_task_incarnation_id
+            ):
+                raise TestHarnessChildError(
+                    "Browser child Task incarnation disappeared before stop"
+                )
+            has_claim = (
+                binding.claimed_retry_count is not None
+                or binding.claimed_instance_id is not None
+            )
+            if binding.state in {CHILD_RUNNING, CHILD_STOPPING} or (
+                binding.state == CHILD_STOP_FAILED and has_claim
+            ):
+                if (
+                    binding.claimed_retry_count != child.retry_count
+                    or binding.claimed_instance_id != child.instance_id
+                    or binding.claimed_instance_id is None
+                ):
+                    raise TestHarnessChildError(
+                        "Browser child claim changed before stop"
+                    )
+            elif binding.state in {CHILD_RESERVED, CHILD_READY} or (
+                binding.state == CHILD_STOP_FAILED and not has_claim
+            ):
+                if (
+                    binding.claimed_retry_count is not None
+                    or binding.claimed_instance_id is not None
+                ):
+                    raise TestHarnessChildError(
+                        "Unlaunched Browser child contains a stale claim"
+                    )
+            else:
+                raise TestHarnessChildError(
+                    f"Browser child cannot stop from state {binding.state}"
+                )
+            from backend.services.task_termination import local_task_generation
+
+            expected_generation = local_task_generation(child)
             binding.state = CHILD_STOPPING
             binding.stop_requested_at = binding.stop_requested_at or datetime.utcnow()
             binding.error = reason[:4000]
             child_task_id = binding.child_task_id
+            child_incarnation_id = child.incarnation_id
             job_id = binding.browser_review_job_id
             await db.commit()
 
@@ -779,9 +938,16 @@ class TestHarnessChildService:
             from backend.services.browser_review_jobs import browser_review_job_manager
 
             await browser_review_job_manager.mark_cancelling(job_id)
-            await self._stop_task(child_task_id)
+            await self._stop_task(
+                child_task_id,
+                expected_generation=expected_generation,
+            )
             await browser_review_job_manager.cancel(job_id)
-            await self._verify_child_terminal(child_task_id)
+            await self._verify_child_terminal(
+                child_task_id,
+                expected_generation=expected_generation,
+                expected_incarnation_id=child_incarnation_id,
+            )
         except BaseException as exc:
             async with self.db_factory() as db:
                 binding = await db.get(TestHarnessChildBinding, binding_id)
@@ -795,10 +961,73 @@ class TestHarnessChildService:
             ) from exc
 
         async with self.db_factory() as db:
-            binding = await db.get(TestHarnessChildBinding, binding_id)
+            binding = (
+                await db.execute(
+                    select(TestHarnessChildBinding)
+                    .where(TestHarnessChildBinding.id == binding_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if binding is None:
                 raise TestHarnessChildError("Browser child binding disappeared after stop")
+            if binding.state in CHILD_TERMINAL_STATES:
+                child = await db.get(Task, child_task_id)
+                if child is None or child.incarnation_id != child_incarnation_id:
+                    raise TestHarnessChildError(
+                        "Browser child disappeared before operation receipt cleanup"
+                    )
+                await mark_permitted_browser_operations_uncertain(
+                    db,
+                    binding,
+                    child,
+                    reason=(
+                        "Browser child was reaped before a permitted operation "
+                        "was acknowledged"
+                    ),
+                )
+                await db.commit()
+                return
+            if binding.state != CHILD_STOPPING:
+                raise TestHarnessChildError(
+                    "Browser child stop receipt lost its stopping state"
+                )
             child = await db.get(Task, child_task_id)
+            if child is None or child.incarnation_id != child_incarnation_id:
+                raise TestHarnessChildError(
+                    "Browser child incarnation changed before stop receipt"
+                )
+            from backend.services.task_termination import (
+                local_task_generation,
+                normalize_local_task_generation,
+            )
+
+            expected = normalize_local_task_generation(expected_generation)
+            current = normalize_local_task_generation(local_task_generation(child))
+            if (
+                current.retry_count != expected.retry_count
+                or current.turn_generation != expected.turn_generation
+                or current.instance_id != expected.instance_id
+                or current.started_at != expected.started_at
+            ):
+                raise TestHarnessChildError(
+                    "Browser child generation changed before stop receipt"
+                )
+            owner = await db.scalar(
+                select(Instance.id).where(Instance.current_task_id == child_task_id)
+            )
+            if owner is not None:
+                raise TestHarnessChildError(
+                    f"Browser child still owns Instance {owner} before stop receipt"
+                )
+            await mark_permitted_browser_operations_uncertain(
+                db,
+                binding,
+                child,
+                reason=(
+                    "Browser child was stopped before a permitted operation "
+                    "was acknowledged"
+                ),
+            )
             binding.state = (
                 CHILD_COMPLETED
                 if child is not None and child.status != "cancelled"
@@ -931,14 +1160,36 @@ class TestHarnessChildService:
                 select(TestHarnessChildBinding.id).where(*predicates)
             )
 
-    async def _stop_task(self, task_id: int) -> None:
+    async def _stop_task(
+        self,
+        task_id: int,
+        *,
+        expected_generation: Any,
+    ) -> None:
         if self._task_stopper is not None:
             await self._task_stopper(task_id)
             return
+        from backend.services.task_termination import (
+            local_task_generation,
+            normalize_local_task_generation,
+        )
+
         async with self.db_factory() as db:
             task = await db.get(Task, task_id)
-            if task is None or task.status in TASK_TERMINAL_STATUSES:
-                return
+            if task is None:
+                raise TestHarnessChildError("Browser child Task disappeared")
+            expected = normalize_local_task_generation(expected_generation)
+            current = normalize_local_task_generation(local_task_generation(task))
+            same_execution = (
+                current.retry_count == expected.retry_count
+                and current.turn_generation == expected.turn_generation
+                and current.instance_id == expected.instance_id
+                and current.started_at == expected.started_at
+            )
+            if not same_execution:
+                raise TestHarnessChildError(
+                    "Browser child execution generation changed before stop"
+                )
             if task.status == "pending_activation":
                 owner = await db.scalar(
                     select(Instance.id).where(Instance.current_task_id == task_id)
@@ -952,6 +1203,42 @@ class TestHarnessChildService:
                 task.error_message = "Browser Agent stopped before activation"
                 await db.commit()
                 return
+            terminal_status = task.status if task.status in TASK_TERMINAL_STATUSES else None
+            if terminal_status is not None:
+                owner_row = (
+                    await db.execute(
+                        select(
+                            Instance.id,
+                            Instance.pid,
+                            Instance.started_at,
+                        ).where(Instance.current_task_id == task_id)
+                    )
+                ).one_or_none()
+                await db.rollback()
+                if owner_row is None:
+                    return
+                if owner_row.id != expected.instance_id:
+                    raise TestHarnessChildError(
+                        "Browser child reverse Instance generation changed"
+                    )
+                from backend.main import instance_manager
+
+                stop_status = (
+                    terminal_status
+                    if terminal_status in {"completed", "failed", "cancelled"}
+                    else "cancelled"
+                )
+                await instance_manager.stop(
+                    owner_row.id,
+                    expected_task_id=task_id,
+                    expected_task_turn_generation=expected.turn_generation,
+                    expected_pid=owner_row.pid,
+                    expected_started_at=owner_row.started_at,
+                    task_status=stop_status,
+                    terminal_consumer_timeout=30.0,
+                    consumer_cancel_timeout=10.0,
+                )
+                return
         from backend.api.tasks import _cancel_local_task_under_cancellation_lease
         from backend.main import dispatcher
 
@@ -959,10 +1246,36 @@ class TestHarnessChildService:
             async with dispatcher.task_queue_cancellation_lease(task_id):
                 await _cancel_local_task_under_cancellation_lease(task_id, db)
 
-    async def _verify_child_terminal(self, task_id: int) -> None:
+    async def _verify_child_terminal(
+        self,
+        task_id: int,
+        *,
+        expected_generation: Any,
+        expected_incarnation_id: str,
+    ) -> None:
+        from backend.services.task_termination import (
+            local_task_generation,
+            normalize_local_task_generation,
+        )
+
         async with self.db_factory() as db:
             child = await db.get(Task, task_id)
-            if child is not None and child.status not in TASK_TERMINAL_STATUSES:
+            if child is None or child.incarnation_id != expected_incarnation_id:
+                raise TestHarnessChildError(
+                    "Browser child incarnation changed during cancellation"
+                )
+            expected = normalize_local_task_generation(expected_generation)
+            current = normalize_local_task_generation(local_task_generation(child))
+            if (
+                current.retry_count != expected.retry_count
+                or current.turn_generation != expected.turn_generation
+                or current.instance_id != expected.instance_id
+                or current.started_at != expected.started_at
+            ):
+                raise TestHarnessChildError(
+                    "Browser child generation changed during cancellation"
+                )
+            if child.status not in TASK_TERMINAL_STATUSES:
                 raise TestHarnessChildError(
                     f"Browser child remained {child.status} after cancellation"
                 )
@@ -977,6 +1290,77 @@ class TestHarnessChildService:
     async def _stop_lock(self, binding_id: str) -> asyncio.Lock:
         async with self._locks_guard:
             return self._stop_locks.setdefault(binding_id, asyncio.Lock())
+
+
+async def finalize_reaped_browser_child_binding(
+    db: AsyncSession,
+    task: Task,
+    *,
+    instance_id: int,
+) -> bool:
+    """Write the Browser binding receipt after exact runtime reap proof.
+
+    The caller must hold the exact Instance lifecycle lock, must already have
+    observed ``InstanceManager.is_running(instance_id) is False``, and must
+    clear the reverse Instance owner in this same transaction.  Persisting the
+    binding terminal state here makes that proof recoverable after restart.
+    """
+
+    binding = (
+        await db.execute(
+            select(TestHarnessChildBinding)
+            .where(TestHarnessChildBinding.child_task_id == task.id)
+            .with_for_update()
+        )
+    ).scalar_one_or_none()
+    if binding is None:
+        return False
+    if binding.state in CHILD_TERMINAL_STATES:
+        await mark_permitted_browser_operations_uncertain(
+            db,
+            binding,
+            task,
+            reason=(
+                "Browser child was reaped before a permitted operation "
+                "was acknowledged"
+            ),
+        )
+        return True
+    if task.status not in TASK_TERMINAL_STATUSES:
+        raise TestHarnessChildError(
+            "Browser child reap receipt requires a terminal Task generation"
+        )
+    if (
+        binding.state not in {CHILD_RUNNING, CHILD_STOPPING}
+        or binding.child_task_incarnation_id != task.incarnation_id
+        or binding.claimed_retry_count != task.retry_count
+        or binding.claimed_instance_id != instance_id
+        or task.instance_id != instance_id
+    ):
+        raise TestHarnessChildError(
+            "Browser child claim changed before its exact reap receipt"
+        )
+    remaining_owner = await db.scalar(
+        select(Instance.id).where(Instance.current_task_id == task.id)
+    )
+    if remaining_owner is not None:
+        raise TestHarnessChildError(
+            f"Browser child still owns Instance {remaining_owner}"
+        )
+    await mark_permitted_browser_operations_uncertain(
+        db,
+        binding,
+        task,
+        reason=(
+            "Browser child exited before a permitted operation was acknowledged"
+        ),
+    )
+    binding.state = (
+        CHILD_STOPPED if task.status == "cancelled" else CHILD_COMPLETED
+    )
+    binding.completed_at = datetime.utcnow()
+    binding.error = task.error_message
+    return True
 
 
 async def _finish_despite_cancellation(awaitable: Awaitable[None]) -> None:

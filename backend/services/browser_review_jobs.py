@@ -600,6 +600,31 @@ class BrowserReviewJobManager:
                     if not job._read_report() and isinstance(assistant_report, str):
                         report_value = assistant_report.strip()
                         self._write_artifact_text(job, "report.md", report_value)
+                    try:
+                        from backend.services.test_harness_children import (
+                            test_harness_child_service,
+                        )
+
+                        reaped = await test_harness_child_service.mark_terminal_by_child(
+                            job.task_id,
+                            task_status=status,
+                            error=str(snapshot.get("error") or "") or None,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not read Browser child reap receipt for Task %s",
+                            job.task_id,
+                        )
+                        reaped = False
+                    if not reaped:
+                        # Dispatcher finalization clears the exact reverse
+                        # Instance owner only after the process group, output
+                        # consumer and descendants are gone, then writes the
+                        # durable binding receipt in that same transaction.
+                        job.status = "running"
+                        job.stage = "finalizing_agent_cleanup"
+                        await asyncio.sleep(self._poll_interval)
+                        continue
                     if status == "completed":
                         job.status = "completed"
                         job.stage = "completed"
@@ -614,24 +639,6 @@ class BrowserReviewJobManager:
                             or f"Browser Review Task ended with status {status}"
                         )
                     job.completed_at = _now()
-                    try:
-                        from backend.services.test_harness_children import (
-                            test_harness_child_service,
-                        )
-
-                        await test_harness_child_service.mark_terminal_by_child(
-                            job.task_id,
-                            task_status=status,
-                            error=job.error,
-                        )
-                    except Exception:
-                        # The Task itself is already terminal. Startup recovery
-                        # will reconcile the durable binding if this auxiliary
-                        # projection cannot be committed right now.
-                        logger.exception(
-                            "Could not finalize Browser child binding for Task %s",
-                            job.task_id,
-                        )
                     return
                 await asyncio.sleep(self._poll_interval)
         except asyncio.CancelledError:

@@ -8,9 +8,12 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from backend.config import settings
 from backend.database import Base
+from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.test_harness import (
+    BrowserReviewOperationReceipt,
     TestHarnessChildBinding as ChildBindingModel,
     TestHarnessRun as RunModel,
 )
@@ -24,10 +27,13 @@ from backend.services.test_harness_children import (
     TestHarnessChildError as ChildError,
     TestHarnessChildService as ChildService,
     browser_child_ssh_grant_error,
+    finalize_reaped_browser_child_binding,
 )
 from backend.services.test_harness_owner_fence import (
+    install_test_harness_owner_terminal_gate,
     lock_test_harness_owner as durable_owner_lock,
     test_harness_owner_fence as owner_fence,
+    test_harness_owner_identity as owner_identity_for_test,
 )
 from backend.services.test_harness import (
     TestHarnessError as HarnessError,
@@ -103,9 +109,63 @@ def _cancelling_stopper(db_factory, calls: list[int] | None = None):
             }:
                 task.status = "cancelled"
                 task.completed_at = datetime.utcnow()
-                await db.commit()
+            owners = list(
+                (
+                    await db.execute(
+                        select(Instance).where(
+                            Instance.current_task_id == task_id
+                        )
+                    )
+                ).scalars()
+            )
+            for owner in owners:
+                owner.status = "idle"
+                owner.current_task_id = None
+                owner.pid = None
+            await db.commit()
 
     return stop
+
+
+async def _add_permitted_operation(
+    db_factory,
+    *,
+    binding_id: str,
+    operation_id: str,
+) -> str:
+    receipt_id = uuid.uuid4().hex
+    async with db_factory() as db:
+        binding = await db.get(ChildBindingModel, binding_id)
+        assert binding is not None
+        child = await db.get(Task, binding.child_task_id)
+        assert child is not None
+        db.add(
+            BrowserReviewOperationReceipt(
+                id=receipt_id,
+                browser_review_job_id=binding.browser_review_job_id,
+                operation_id=operation_id,
+                binding_id=binding.id,
+                harness_run_id=binding.harness_run_id,
+                workspace_review_run_id=binding.workspace_review_run_id,
+                owner_task_id=binding.owner_task_id,
+                owner_task_incarnation_id=binding.owner_task_incarnation_id,
+                owner_task_retry_count=binding.owner_task_retry_count,
+                owner_task_turn_generation=binding.owner_task_turn_generation,
+                owner_task_status=binding.owner_task_status,
+                child_task_id=child.id,
+                child_task_incarnation_id=child.incarnation_id,
+                child_task_retry_count=child.retry_count,
+                child_task_turn_generation=child.turn_generation,
+                child_task_status=child.status,
+                action_kind="click",
+                request_digest="a" * 64,
+                execution_nonce_digest="b" * 64,
+                status="permitted",
+                result_data={},
+            )
+        )
+        await db.commit()
+    return receipt_id
 
 
 @pytest.mark.asyncio
@@ -125,6 +185,233 @@ async def test_owner_fence_context_is_not_reentrant_in_spawned_task():
         assert not child_entered.is_set()
     await asyncio.wait_for(operation, timeout=1)
     assert child_entered.is_set()
+
+
+@pytest.mark.asyncio
+async def test_terminal_gate_blocks_exact_active_generation_but_not_new_status(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_token", "harness-secret")
+    async with db_factory() as db:
+        owner = Task(
+            title="terminal gate owner",
+            description="owner",
+            status="executing",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.commit()
+        owner_id = owner.id
+        active_identity = owner_identity_for_test(owner)
+    async with db_factory() as db:
+        await install_test_harness_owner_terminal_gate(
+            db,
+            active_identity,
+            reason="natural completion",
+        )
+        await db.commit()
+
+    service = HarnessService(db_factory=db_factory)
+    spec = HarnessSpec(
+        target_kind="fixed_url",
+        target={"url": "https://example.com"},
+        goal="Review",
+    )
+    with pytest.raises(HarnessError, match="terminalizing"):
+        await service.start_task_run(
+            task_id=owner_id,
+            spec=spec,
+            owner_identity=active_identity,
+        )
+
+    async with db_factory() as db:
+        owner = await db.get(Task, owner_id)
+        owner.status = "completed"
+        await db.commit()
+        completed_identity = owner_identity_for_test(owner)
+    run = await service.start_task_run(
+        task_id=owner_id,
+        spec=spec,
+        owner_identity=completed_identity,
+    )
+    assert run.owner_task_status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("runtime_evidence", ["reverse_instance", "pty_background"])
+async def test_terminal_owner_must_be_runtime_idle_before_public_harness_start(
+    db_factory,
+    monkeypatch,
+    runtime_evidence,
+):
+    monkeypatch.setattr(settings, "auth_token", "harness-secret")
+    async with db_factory() as db:
+        owner = Task(
+            title="terminal owner with live runtime",
+            description="owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        if runtime_evidence == "pty_background":
+            owner.pty_background_generation = "unreaped-terminal-turn"
+        db.add(owner)
+        await db.flush()
+        if runtime_evidence == "reverse_instance":
+            db.add(
+                Instance(
+                    name="terminal owner reverse runtime",
+                    status="running",
+                    current_task_id=owner.id,
+                )
+            )
+        await db.commit()
+        owner_id = owner.id
+        identity = owner_identity_for_test(owner)
+
+    service = HarnessService(db_factory=db_factory)
+    with pytest.raises(HarnessError, match="terminal.*not settled"):
+        await service.start_task_run(
+            task_id=owner_id,
+            spec=HarnessSpec(
+                target_kind="fixed_url",
+                target={"url": "https://example.com"},
+                goal="must wait for runtime reap",
+            ),
+            owner_identity=identity,
+        )
+    async with db_factory() as db:
+        assert await db.scalar(select(func.count(RunModel.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_active_internal_owner_can_start_harness_with_exact_instance(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_token", "harness-secret")
+    async with db_factory() as db:
+        owner = Task(
+            title="active internal harness owner",
+            description="owner",
+            status="executing",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.flush()
+        instance = Instance(
+            name="active exact runtime",
+            status="running",
+            current_task_id=owner.id,
+        )
+        db.add(instance)
+        await db.flush()
+        owner.instance_id = instance.id
+        await db.commit()
+        owner_id = owner.id
+        identity = owner_identity_for_test(owner)
+
+    service = HarnessService(db_factory=db_factory)
+    run = await service.start_task_run(
+        task_id=owner_id,
+        spec=HarnessSpec(
+            target_kind="fixed_url",
+            target={"url": "https://example.com"},
+            goal="internal active owner",
+        ),
+        owner_identity=identity,
+    )
+    assert run.owner_task_status == "executing"
+
+
+@pytest.mark.asyncio
+async def test_public_start_identity_cannot_rebind_after_retry(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_token", "harness-secret")
+    async with db_factory() as db:
+        owner = Task(
+            title="start race owner",
+            description="owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.commit()
+        owner_id = owner.id
+        expected = owner_identity_for_test(owner)
+
+    service = HarnessService(db_factory=db_factory)
+    reached_create = asyncio.Event()
+    resume_create = asyncio.Event()
+    original_create = service._create_run
+
+    async def paused_create(**kwargs):
+        reached_create.set()
+        await resume_create.wait()
+        return await original_create(**kwargs)
+
+    monkeypatch.setattr(service, "_create_run", paused_create)
+    operation = asyncio.create_task(
+        service.start_task_run(
+            task_id=owner_id,
+            spec=HarnessSpec(
+                target_kind="fixed_url",
+                target={"url": "https://example.com"},
+                goal="Review",
+            ),
+            owner_identity=expected,
+        )
+    )
+    await asyncio.wait_for(reached_create.wait(), timeout=1)
+    async with db_factory() as db:
+        owner = await db.get(Task, owner_id)
+        owner.retry_count += 1
+        owner.turn_generation += 1
+        owner.status = "pending"
+        await db.commit()
+    resume_create.set()
+    with pytest.raises(HarnessError, match="generation changed"):
+        await asyncio.wait_for(operation, timeout=1)
+    async with db_factory() as db:
+        assert await db.scalar(select(func.count(RunModel.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_repeat_identity_cannot_rebind_after_retry(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "auth_token", "harness-secret")
+    owner_id, source_id = await _owner_and_run(db_factory, suffix="repeat-race")
+    async with db_factory() as db:
+        source = await db.get(RunModel, source_id)
+        source.status = "completed"
+        source.stage = "completed"
+        source.completed_at = datetime.utcnow()
+        owner = await db.get(Task, owner_id)
+        expected = owner_identity_for_test(owner)
+        await db.commit()
+    async with db_factory() as db:
+        owner = await db.get(Task, owner_id)
+        owner.retry_count += 1
+        owner.turn_generation += 1
+        owner.status = "pending"
+        await db.commit()
+
+    service = HarnessService(db_factory=db_factory)
+    with pytest.raises(HarnessError, match="generation changed"):
+        await service.repeat(
+            source_id,
+            owner_identity=expected,
+        )
+    async with db_factory() as db:
+        assert await db.scalar(select(func.count(RunModel.id))) == 1
 
 
 @pytest.mark.asyncio
@@ -201,6 +488,7 @@ async def test_isolated_pending_task_without_binding_is_never_claimed(db_factory
         ("tags", {"pr-review": True}),
         ("session_id", "must-not-resume"),
         ("last_cwd", "/tmp/must-not-resume"),
+        ("target_repo", "/tmp/untrusted-preview"),
         ("enabled_skills", {"browser-review": "wrong-job"}),
         ("metadata_", {"isolated_browser_agent": False}),
         ("launch_config_digest", "0" * 64),
@@ -267,6 +555,7 @@ async def test_browser_child_allows_only_runtime_account_metadata(db_factory):
     [
         {"session_id": "existing-session"},
         {"last_cwd": "/tmp/existing-session"},
+        {"target_repo": "/tmp/untrusted-preview"},
         {"capability_policy": {"plan": {"max_invocations": 1}}},
         {"worker_id": 7},
         {"shared_from_id": 8},
@@ -346,6 +635,24 @@ async def test_concurrent_stop_is_idempotent_and_proves_terminal_child(db_factor
         child_values=_child_values("job-stop-race"),
     )
     await service.activate(binding.id)
+    async with db_factory() as db:
+        instance = Instance(name="Browser stop receipt", status="idle")
+        db.add(instance)
+        await db.commit()
+        instance_id = instance.id
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue(instance_id=instance_id)
+        assert claimed is not None and claimed.id == child.id
+        instance = await db.get(Instance, instance_id)
+        instance.status = "running"
+        instance.current_task_id = child.id
+        instance.started_at = claimed.started_at
+        await db.commit()
+    receipt_id = await _add_permitted_operation(
+        db_factory,
+        binding_id=binding.id,
+        operation_id="1" * 32,
+    )
 
     await asyncio.gather(
         service.stop_binding(binding.id, reason="first stop"),
@@ -356,9 +663,12 @@ async def test_concurrent_stop_is_idempotent_and_proves_terminal_child(db_factor
     async with db_factory() as db:
         durable = await db.get(ChildBindingModel, binding.id)
         stopped = await db.get(Task, child.id)
+        receipt = await db.get(BrowserReviewOperationReceipt, receipt_id)
         assert durable.state == CHILD_STOPPED
         assert durable.completed_at is not None
         assert stopped.status == "cancelled"
+        assert receipt.status == "uncertain"
+        assert receipt.acknowledged_at is not None
 
 
 @pytest.mark.asyncio
@@ -463,7 +773,7 @@ async def test_startup_recovery_stops_reserved_and_legacy_children(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_natural_completion_projects_to_binding(db_factory):
+async def test_natural_completion_waits_for_exact_reap_receipt(db_factory):
     owner_id, run_id = await _owner_and_run(db_factory)
     service = ChildService(db_factory=db_factory)
     child, binding = await service.reserve_child(
@@ -474,11 +784,56 @@ async def test_natural_completion_projects_to_binding(db_factory):
     )
     await service.activate(binding.id)
     async with db_factory() as db:
-        claimed = await TaskQueue(db).dequeue()
+        instance = Instance(name="Browser natural receipt", status="idle")
+        db.add(instance)
+        await db.commit()
+        instance_id = instance.id
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue(instance_id=instance_id)
         assert claimed is not None
+        instance = await db.get(Instance, instance_id)
+        instance.status = "running"
+        instance.current_task_id = child.id
+        instance.started_at = claimed.started_at
+        await db.commit()
+    receipt_id = await _add_permitted_operation(
+        db_factory,
+        binding_id=binding.id,
+        operation_id="2" * 32,
+    )
+    async with db_factory() as db:
         assert await TaskQueue(db).mark_completed(child.id)
         durable = await db.get(ChildBindingModel, binding.id)
+        assert durable.state == CHILD_RUNNING
+    assert not await service.mark_terminal_by_child(
+        child.id,
+        task_status="completed",
+    )
+
+    async with db_factory() as db:
+        instance = await db.get(Instance, instance_id)
+        instance.status = "idle"
+        instance.current_task_id = None
+        instance.pid = None
+        await db.flush()
+        completed = await db.get(Task, child.id)
+        assert completed is not None
+        assert await finalize_reaped_browser_child_binding(
+            db,
+            completed,
+            instance_id=instance_id,
+        )
+        await db.commit()
+        durable = await db.get(ChildBindingModel, binding.id)
+        receipt = await db.get(BrowserReviewOperationReceipt, receipt_id)
         assert durable.state == CHILD_COMPLETED
+        assert durable.completed_at is not None
+        assert receipt.status == "uncertain"
+        assert receipt.acknowledged_at is not None
+    assert await service.mark_terminal_by_child(
+        child.id,
+        task_status="completed",
+    )
 
 
 @pytest.mark.asyncio

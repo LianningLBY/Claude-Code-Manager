@@ -73,6 +73,9 @@ from backend.services.delivery_workspace import (
     DeliveryWorkspaceManager,
     DeliveryWorkspaceSnapshot,
 )
+from backend.services.test_harness_owner_fence import (
+    no_active_test_harness_owner_graph_predicate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -592,6 +595,72 @@ class DeliveryController:
             and historical.pid is None
             and historical.status != "running"
         )
+
+    @staticmethod
+    async def _fence_developer_task_graph_locked(
+        db: AsyncSession,
+        task: Task,
+    ) -> bool:
+        """Win the Task writer race only when its Harness graph is idle.
+
+        Delivery reuses one developer Task across cycles.  A terminal Task is
+        also a valid owner for a user-started Test Harness run, so changing its
+        status without this CAS would strand the Run/Workspace/Browser graph
+        on an owner identity that can no longer be cancelled or reconciled.
+
+        Harness admission writes the exact owner Task before inserting its
+        graph.  This no-op UPDATE is therefore the portable first-writer gate:
+        PostgreSQL/MySQL take the row lock and SQLite WAL takes the writer
+        reservation.  The correlated graph predicate then gives either the
+        Harness admission or this Delivery transition one deterministic
+        winner without performing cross-session cleanup while Delivery locks
+        are held.
+        """
+
+        predicates = [
+            Task.id == task.id,
+            (
+                Task.incarnation_id.is_(None)
+                if task.incarnation_id is None
+                else Task.incarnation_id == task.incarnation_id
+            ),
+            Task.status == task.status,
+            Task.retry_count == task.retry_count,
+            Task.turn_generation == task.turn_generation,
+            (
+                Task.instance_id.is_(None)
+                if task.instance_id is None
+                else Task.instance_id == task.instance_id
+            ),
+            (
+                Task.started_at.is_(None)
+                if task.started_at is None
+                else Task.started_at == task.started_at
+            ),
+            (
+                Task.completed_at.is_(None)
+                if task.completed_at is None
+                else Task.completed_at == task.completed_at
+            ),
+            (
+                Task.pty_background_generation.is_(None)
+                if task.pty_background_generation is None
+                else Task.pty_background_generation == task.pty_background_generation
+            ),
+            Task.delivery_run_id == task.delivery_run_id,
+            Task.delivery_role == task.delivery_role,
+            Task.mode == task.mode,
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
+            no_active_test_harness_owner_graph_predicate(),
+        ]
+        fenced = await db.execute(
+            update(Task)
+            .where(*predicates)
+            .values(status=task.status)
+            .execution_options(synchronize_session=False)
+        )
+        return fenced.rowcount == 1
 
     async def _terminal_task_generation_settled(
         self,
@@ -1416,6 +1485,9 @@ class DeliveryController:
             if not await self._developer_task_settled_locked(db, task):
                 await db.rollback()
                 return False
+            if not await self._fence_developer_task_graph_locked(db, task):
+                await db.rollback()
+                return False
             generation = run.turn_count + 1
             checkpoint = {
                 "previous_status": task.status,
@@ -1796,6 +1868,9 @@ class DeliveryController:
             if not await self._developer_task_settled_locked(db, task):
                 await db.rollback()
                 return False
+            if not await self._fence_developer_task_graph_locked(db, task):
+                await db.rollback()
+                return False
             if snapshot.worktree_path != run.workspace_path:
                 raise DeliverySubjectChanged("Developer completed in another workspace")
             if run.base_sha != snapshot.base_sha:
@@ -2058,6 +2133,12 @@ class DeliveryController:
                             "Developer Task changed before Review budget failure"
                         )
                     if not await self._developer_task_settled_locked(db, task):
+                        await db.rollback()
+                        return False
+                    if not await self._fence_developer_task_graph_locked(
+                        db,
+                        task,
+                    ):
                         await db.rollback()
                         return False
                     complete_cycle(cycle, status="failed")
@@ -3140,6 +3221,9 @@ class DeliveryController:
                 if not await self._developer_task_settled_locked(db, task):
                     await db.rollback()
                     return False
+                if not await self._fence_developer_task_graph_locked(db, task):
+                    await db.rollback()
+                    return False
                 await apply_run_event(
                     db,
                     run=run,
@@ -3201,6 +3285,12 @@ class DeliveryController:
                             "Developer Task changed before Monitor budget failure"
                         )
                     if not await self._developer_task_settled_locked(db, task):
+                        await db.rollback()
+                        return False
+                    if not await self._fence_developer_task_graph_locked(
+                        db,
+                        task,
+                    ):
                         await db.rollback()
                         return False
                     await apply_run_event(
@@ -3336,6 +3426,9 @@ class DeliveryController:
             if not await self._developer_task_settled_locked(db, task):
                 await db.rollback()
                 return
+            if not await self._fence_developer_task_graph_locked(db, task):
+                await db.rollback()
+                return
             message = (
                 review.review_summary or "PR reviewer failed without a summary"
             )[:2000]
@@ -3417,6 +3510,9 @@ class DeliveryController:
                 await db.rollback()
                 return False
             if not await self._developer_task_settled_locked(db, task):
+                await db.rollback()
+                return False
+            if not await self._fence_developer_task_graph_locked(db, task):
                 await db.rollback()
                 return False
             if run.current_cycle_id is not None:

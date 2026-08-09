@@ -27,6 +27,8 @@ from backend.api.uploads import router as uploads_router
 from backend.api.secrets import router as secrets_router
 from backend.api.tags import router as tags_router
 from backend.api.files import router as files_router
+from backend.api.ssh_profiles import router as ssh_profiles_router
+from backend.api.task_ssh import router as task_ssh_router
 from backend.api.task_artifacts import router as task_artifacts_router
 from backend.api.pool import router as pool_router
 from backend.api.codex_pool import (
@@ -83,6 +85,9 @@ from backend.services.plan_capability import (
 )
 from backend.services.delivery_controller import DeliveryController
 from backend.services.delivery_publisher import GitHubDeliveryPublisher
+from backend.services.task_ssh_effect_recovery import (
+    recover_interrupted_task_ssh_effects,
+)
 
 # Logging: surface INFO from our services AND claude_pty in the server log.
 # Without this, PTY delivery/turn diagnostics are invisible (learned the
@@ -371,11 +376,13 @@ dispatcher.deployment_task_start_fence = (
 )
 
 # 分布式 Worker（可选，WORKER_ENABLED=true 且装了 boto3 才启用）
+from backend.services.worker_provisioner import worker_control_plane_enabled
+
 worker_provisioner = None
 worker_relay = None
 worker_proxy = None
 task_migrator = None
-if settings.worker_enabled:
+if settings.worker_enabled and worker_control_plane_enabled():
     try:
         from backend.services.cloud_provider import get_cloud_provider
         from backend.services.worker_provisioner import WorkerProvisioner
@@ -397,6 +404,10 @@ if settings.worker_enabled:
         )
     except Exception:
         logger.exception("Worker provisioner init failed — workers disabled")
+elif settings.worker_enabled:
+    logger.error(
+        "Worker control plane disabled because AUTH_TOKEN is not configured"
+    )
 
 # The same runtime also runs on a Worker where Manager-side Worker support may
 # be disabled.  It must still recover locally accepted/executing receipts and
@@ -574,6 +585,11 @@ async def _ensure_claude_warmup():
 
 async def _recover_worker_relays():
     """Manager 重启后为 ready worker 上的活跃 task 重建中继 + 补缺失日志。"""
+    if not worker_control_plane_enabled():
+        logger.warning(
+            "Worker relay recovery skipped because AUTH_TOKEN is not configured"
+        )
+        return
     from backend.models.worker import Worker
     try:
         async with async_session() as db:
@@ -598,6 +614,12 @@ async def _recover_stale_worker_lifecycles():
     forever; move them to ``error`` while preserving instance ids and account
     credentials for an idempotent operator retry.
     """
+    if not worker_control_plane_enabled():
+        logger.warning(
+            "Worker lifecycle recovery skipped because AUTH_TOKEN is not configured"
+        )
+        return
+
     from backend.models.worker import Worker
 
     stale_statuses = (
@@ -999,6 +1021,17 @@ async def _runtime_lifespan(app: FastAPI):
 
     if not deployment_start.skip_mutations:
         await init_db()
+    # A crash-left ``running`` SSH receipt is permanent unknown-outcome
+    # evidence and, on SQLite, an active authorization trigger permit. Settle
+    # it before *any* Task/Profile/share writer or Dispatcher runtime starts.
+    # Failure is intentionally fatal: continuing would either leave the Task
+    # frozen forever or reopen an effect whose remote outcome is unknown.
+    recovered_ssh_effects = await recover_interrupted_task_ssh_effects()
+    if recovered_ssh_effects:
+        logger.warning(
+            "Marked %d interrupted Task SSH effects ambiguous before runtime startup",
+            recovered_ssh_effects,
+        )
     # Do not seed a shared/default administrator credential.  The registration
     # endpoint promotes the first real user to super_admin, while AUTH_TOKEN
     # remains the bootstrap administrator path for single-token deployments.
@@ -1181,6 +1214,8 @@ app.include_router(uploads_router)
 app.include_router(secrets_router)
 app.include_router(tags_router)
 app.include_router(files_router)
+app.include_router(ssh_profiles_router)
+app.include_router(task_ssh_router)
 app.include_router(task_artifacts_router)
 app.include_router(pool_router)
 app.include_router(codex_pool_router)

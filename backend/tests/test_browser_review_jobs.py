@@ -158,6 +158,35 @@ async def test_agent_job_tracks_task_and_browser_events(monkeypatch, tmp_path):
     async def read_task(_task_id: int):
         return dict(task_state)
 
+    async def read_archive_owners():
+        return set()
+
+    class ReapedChildService:
+        async def mark_terminal_by_child(
+            self,
+            child_task_id,
+            *,
+            task_status=None,
+            error=None,
+        ):
+            assert child_task_id == 73
+            assert task_status == "completed"
+            assert error is None
+            return True
+
+    from backend.services import test_harness_children
+
+    monkeypatch.setattr(
+        browser_review_jobs_module,
+        "_read_incomplete_archive_job_ids",
+        read_archive_owners,
+    )
+    monkeypatch.setattr(
+        test_harness_children,
+        "test_harness_child_service",
+        ReapedChildService(),
+    )
+
     manager = BrowserReviewJobManager(
         task_reader=read_task,
         poll_interval=0.01,

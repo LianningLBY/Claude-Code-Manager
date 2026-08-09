@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
@@ -32,6 +33,7 @@ from backend.services.codex_models import clamp_codex_effort
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.trusted_runtime import prime_trusted_runtime
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
@@ -43,8 +45,13 @@ from backend.services.worker_task_termination import (
 )
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
+# Freeze standalone Task hook/MCP entrypoints while the Manager runtime itself
+# is loading, before any writable Agent checkout can influence later launches.
+prime_trusted_runtime()
+
 if TYPE_CHECKING:
     from backend.services.mcp_config import McpServerSpec
+    from backend.services.task_runtime_secrets import PrivateTaskTempDir
 
 logger = logging.getLogger(__name__)
 _EXPECTED_GENERATION_UNSET = object()
@@ -68,6 +75,19 @@ _CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
     "APEXROUTER_API_KEY",
     "APEXROUTER_CODEX_API_KEY",
 )
+_TASK_SSH_GIT_IDENTITY_ENV_KEYS = frozenset({
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+})
+_TASK_SSH_SAFE_GIT_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GH_PROMPT_DISABLED": "1",
+}
 _ACTUAL_TURN_TRANSPORTS = frozenset(
     {"claude_pty", "claude_exec", "codex_app_server", "codex_exec"}
 )
@@ -263,6 +283,33 @@ class ConsumerRecoveryUnsettledError(RuntimeError):
 
 class LiveAttachmentInjectionUnsupportedError(RuntimeError):
     """The active transport cannot safely access Manager upload paths."""
+
+
+class SharedProjectAgentLaunchDisabledError(RuntimeError):
+    """Agent execution is disabled for Projects visible to other users."""
+
+
+async def _require_unshared_project_agent_launch(
+    project_id: int | None,
+    db_factory,
+) -> None:
+    """Fail closed unless a Task's Project is proven to be unshared."""
+
+    if project_id is None:
+        return
+    from backend.services.container_manager import is_shared_project
+
+    try:
+        shared = await is_shared_project(project_id, db_factory)
+    except Exception as exc:
+        raise SharedProjectAgentLaunchDisabledError(
+            f"Could not verify sharing state for Project {project_id}; "
+            "Agent launch is disabled"
+        ) from exc
+    if shared:
+        raise SharedProjectAgentLaunchDisabledError(
+            f"Agent launch is disabled while Project {project_id} is shared"
+        )
 
 
 def _terminal_failure_log_entry(
@@ -566,6 +613,10 @@ class _OutputConsumerRecord:
     # A matching stop may take over this quiescent wait immediately instead of
     # burning the generic 30-second terminal-consumer timeout.
     pty_background_waiting: bool = False
+    # Claude stream-json may emit the final assistant body once as an
+    # ``assistant`` envelope and again in the terminal ``result`` envelope.
+    # Keep terminal metadata but suppress only that exact repeated body.
+    last_claude_assistant_text: str | None = None
 
 
 @dataclass
@@ -598,6 +649,34 @@ class _LaunchReservation:
     task_id: int | None
     task_turn_generation: int | None
     previous_process: asyncio.subprocess.Process | None
+
+
+@dataclass(frozen=True)
+class _BrowserChildLaunchAdmission:
+    """Immutable Browser-child authority captured by launch preflight.
+
+    The durable binding is checked again at the final provider-effect
+    boundary.  Retaining the exact preflight identity prevents a concurrent
+    writer from replacing an otherwise self-consistent binding/Task profile
+    between those two checks.
+    """
+
+    binding_id: str
+    browser_review_job_id: str
+    harness_run_id: str
+    workspace_review_run_id: str | None
+    launch_profile_version: int
+    launch_config_digest: str
+    owner_task_id: int
+    owner_task_incarnation_id: str
+    owner_task_retry_count: int
+    owner_task_turn_generation: int
+    owner_task_status: str
+    child_task_id: int
+    child_task_incarnation_id: str
+    child_task_retry_count: int
+    child_task_turn_generation: int
+    claimed_instance_id: int
 
 
 @dataclass(frozen=True)
@@ -683,9 +762,18 @@ class _TaskLifecycleFence:
 class InstanceManager:
     """Manages multiple Claude Code subprocess instances."""
 
-    def __init__(self, db_factory, broadcaster: WebSocketBroadcaster):
+    def __init__(
+        self,
+        db_factory,
+        broadcaster: WebSocketBroadcaster,
+        test_harness_service=None,
+    ):
         self.db_factory = db_factory  # async_sessionmaker
         self.broadcaster = broadcaster
+        # Resolved lazily to avoid importing the Harness service during module
+        # initialization. Tests with an isolated database may inject their own
+        # service; production reuses the process-global service.
+        self.test_harness_service = test_harness_service
         # Wired by backend.main after Dispatcher construction. Keeping this
         # dependency explicit prevents background consumers (especially in
         # tests) from importing the process-global Dispatcher and enqueueing
@@ -1685,6 +1773,7 @@ class InstanceManager:
         source_log_id: int | None,
         actual_transport: str,
         sequential_turn_token: object | None = None,
+        browser_child_admission: _BrowserChildLaunchAdmission | None = None,
     ) -> bool:
         """Persist the final runtime route before its first provider effect.
 
@@ -1747,6 +1836,200 @@ class InstanceManager:
             )
 
         async with self.db_factory() as db:
+            browser_binding = None
+            browser_owner = None
+            if browser_child_admission is not None:
+                admission = browser_child_admission
+                if (
+                    admission.child_task_id != task_id
+                    or admission.child_task_retry_count != task_retry_count
+                    or admission.child_task_turn_generation
+                    != task_turn_generation
+                    or admission.claimed_instance_id != instance_id
+                    or admission.owner_task_id >= admission.child_task_id
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent lost its exact preflight launch identity"
+                    )
+                from backend.models.test_harness import (
+                    TestHarnessChildBinding,
+                    TestHarnessRun,
+                )
+                from backend.models.workspace_review import WorkspaceReviewRun
+                from backend.services.test_harness_children import (
+                    CHILD_RUNNING,
+                    browser_binding_owner_identity,
+                    browser_child_owner_error,
+                    require_browser_child_binding,
+                )
+                from backend.services.test_harness_contracts import (
+                    HARNESS_TERMINAL_STATUSES,
+                )
+                from backend.services.test_harness_owner_fence import (
+                    TestHarnessOwnerIdentity,
+                    lock_test_harness_owner,
+                )
+
+                expected_owner_identity = TestHarnessOwnerIdentity(
+                    task_id=admission.owner_task_id,
+                    incarnation_id=admission.owner_task_incarnation_id,
+                    retry_count=admission.owner_task_retry_count,
+                    turn_generation=admission.owner_task_turn_generation,
+                    status=admission.owner_task_status,
+                )
+                try:
+                    # Keep the same global order as Browser callbacks:
+                    # owner Task -> Run/Workspace -> binding -> child Task ->
+                    # Instance.  The owner no-op UPDATE is also SQLite's first
+                    # writer reservation, so a callback cannot deadlock by
+                    # holding the owner while this admission holds a binding.
+                    browser_owner = await lock_test_harness_owner(
+                        db,
+                        expected_owner_identity,
+                    )
+                except RuntimeError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+
+                harness_run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(TestHarnessRun.id == admission.harness_run_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if (
+                    harness_run is None
+                    or harness_run.task_id != admission.owner_task_id
+                    or harness_run.browser_review_job_id
+                    != admission.browser_review_job_id
+                    or harness_run.workspace_review_run_id
+                    != admission.workspace_review_run_id
+                    or harness_run.status in HARNESS_TERMINAL_STATUSES
+                    or harness_run.status == "cancelling"
+                    or harness_run.owner_task_incarnation_id
+                    != admission.owner_task_incarnation_id
+                    or harness_run.owner_task_retry_count
+                    != admission.owner_task_retry_count
+                    or harness_run.owner_task_turn_generation
+                    != admission.owner_task_turn_generation
+                    or harness_run.owner_task_status
+                    != admission.owner_task_status
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent Harness run stopped or changed before "
+                        "provider admission"
+                    )
+
+                workspace_run = None
+                if admission.workspace_review_run_id is not None:
+                    workspace_run = (
+                        await db.execute(
+                            select(WorkspaceReviewRun)
+                            .where(
+                                WorkspaceReviewRun.id
+                                == admission.workspace_review_run_id
+                            )
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        workspace_run is None
+                        or workspace_run.task_id != admission.owner_task_id
+                        or workspace_run.harness_run_id
+                        != admission.harness_run_id
+                        or workspace_run.browser_review_job_id
+                        != admission.browser_review_job_id
+                        or workspace_run.status
+                        in {"completed", "failed", "cancelled", "cancelling"}
+                        or workspace_run.owner_task_incarnation_id
+                        != admission.owner_task_incarnation_id
+                        or workspace_run.owner_task_retry_count
+                        != admission.owner_task_retry_count
+                        or workspace_run.owner_task_turn_generation
+                        != admission.owner_task_turn_generation
+                        or workspace_run.owner_task_status
+                        != admission.owner_task_status
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent Workspace run stopped or changed "
+                            "before provider admission"
+                        )
+
+                # stop_binding publishes ``stopping`` here before terminating
+                # the child Task.  Its committed stop intent therefore makes
+                # this exact CAS miss.  If admission locked the row first, the
+                # provider boundary is the earlier winner and stop waits.
+                binding_fence = await db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(
+                        TestHarnessChildBinding.id == admission.binding_id,
+                        TestHarnessChildBinding.harness_run_id
+                        == admission.harness_run_id,
+                        TestHarnessChildBinding.workspace_review_run_id
+                        == admission.workspace_review_run_id,
+                        TestHarnessChildBinding.browser_review_job_id
+                        == admission.browser_review_job_id,
+                        TestHarnessChildBinding.launch_profile_version
+                        == admission.launch_profile_version,
+                        TestHarnessChildBinding.launch_config_digest
+                        == admission.launch_config_digest,
+                        TestHarnessChildBinding.owner_task_id
+                        == admission.owner_task_id,
+                        TestHarnessChildBinding.owner_task_incarnation_id
+                        == admission.owner_task_incarnation_id,
+                        TestHarnessChildBinding.owner_task_retry_count
+                        == admission.owner_task_retry_count,
+                        TestHarnessChildBinding.owner_task_turn_generation
+                        == admission.owner_task_turn_generation,
+                        TestHarnessChildBinding.owner_task_status
+                        == admission.owner_task_status,
+                        TestHarnessChildBinding.child_task_id
+                        == admission.child_task_id,
+                        TestHarnessChildBinding.child_task_incarnation_id
+                        == admission.child_task_incarnation_id,
+                        TestHarnessChildBinding.state == CHILD_RUNNING,
+                        TestHarnessChildBinding.claimed_retry_count
+                        == admission.child_task_retry_count,
+                        TestHarnessChildBinding.claimed_instance_id
+                        == admission.claimed_instance_id,
+                    )
+                    .values(state=CHILD_RUNNING)
+                )
+                if binding_fence.rowcount != 1:
+                    raise LaunchSupersededError(
+                        "Browser Agent binding stopped or changed before "
+                        "provider admission"
+                    )
+                browser_binding = (
+                    await db.execute(
+                        select(TestHarnessChildBinding)
+                        .where(
+                            TestHarnessChildBinding.id
+                            == admission.binding_id
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if browser_binding is None:
+                    raise LaunchSupersededError(
+                        "Browser Agent binding disappeared before provider "
+                        "admission"
+                    )
+                try:
+                    current_owner_identity = browser_binding_owner_identity(
+                        browser_binding
+                    )
+                except RuntimeError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+                if current_owner_identity != expected_owner_identity:
+                    raise LaunchSupersededError(
+                        "Browser Agent owner identity changed before provider "
+                        "admission"
+                    )
+
             task_identity_predicates = (
                 Task.id == task_id,
                 Task.instance_id == instance_id,
@@ -1783,6 +2066,32 @@ class InstanceManager:
                 raise LaunchSupersededError(
                     f"Task {task_id} lost its exact launch generation"
                 )
+
+            if browser_binding is not None:
+                try:
+                    require_browser_child_binding(browser_binding, task)
+                except RuntimeError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+                owner_error = browser_child_owner_error(
+                    browser_binding,
+                    browser_owner,
+                )
+                if owner_error is not None:
+                    raise LaunchSupersededError(owner_error)
+                if (
+                    browser_binding.state != CHILD_RUNNING
+                    or browser_binding.claimed_retry_count
+                    != task_retry_count
+                    or browser_binding.claimed_instance_id != instance_id
+                    or browser_binding.browser_review_job_id
+                    != browser_child_admission.browser_review_job_id
+                    or browser_binding.launch_config_digest
+                    != browser_child_admission.launch_config_digest
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent exact launch authority changed before "
+                        "provider admission"
+                    )
 
             instance = (
                 await db.execute(
@@ -1989,6 +2298,13 @@ class InstanceManager:
                 raise RuntimeError("Launch admission callback is already running")
             launch_boundary_attempted = True
             selected_actual_transport = actual_transport
+            # Sharing may be enabled after the initial Task snapshot. Recheck
+            # at the last common boundary for Claude PTY/direct and Codex
+            # app-server/direct routes; an unavailable check is also a veto.
+            await _require_unshared_project_agent_launch(
+                task_project_id,
+                self.db_factory,
+            )
             await self._persist_actual_turn_transport(
                 instance_id=instance_id,
                 task_id=task_id,
@@ -1997,6 +2313,7 @@ class InstanceManager:
                 source_log_id=source_log_id,
                 actual_transport=actual_transport,
                 sequential_turn_token=sequential_turn_token,
+                browser_child_admission=browser_child_admission,
             )
             if on_launch_admitted is not None:
                 await on_launch_admitted()
@@ -2016,10 +2333,23 @@ class InstanceManager:
         # files, containers, or a real agent process; a post-spawn rowcount
         # check remains below as defense against cross-process DB mutation.
         task_retry_count: int | None = None
+        task_status: str | None = None
+        task_incarnation_id: str | None = None
+        task_project_id: int | None = None
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
         browser_review_task = False
+        browser_child_admission: _BrowserChildLaunchAdmission | None = None
+        task_ssh_capabilities: set[str] = set()
+        task_ssh_broker_only = False
+        task_ssh_protected_path_values: tuple[str, ...] = ()
+        task_git_credential_read_path_values: tuple[str, ...] = ()
+        task_git_metadata_read_path_values: tuple[str, ...] = ()
+        task_git_metadata_identity_fingerprint: tuple[
+            tuple[object, ...], ...
+        ] = ()
+        task_private_tmpdir = None
         delivery_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
@@ -2041,6 +2371,7 @@ class InstanceManager:
                         select(
                             Task.retry_count,
                             Task.turn_generation,
+                            Task.status,
                         ).where(*generation_predicates)
                     )
                 ).first()
@@ -2050,11 +2381,30 @@ class InstanceManager:
                     )
                 task_retry_count = generation_row[0]
                 task_turn_generation = generation_row[1]
+                task_status = generation_row[2]
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise LaunchSupersededError(
                         f"Task {task_id} disappeared before launch"
                     )
+                task_incarnation_id = task.incarnation_id
+                task_project_id = task.project_id
+                await _require_unshared_project_agent_launch(
+                    task_project_id,
+                    self.db_factory,
+                )
+                from backend.services.task_agent_isolation import (
+                    prepare_task_working_directory,
+                )
+
+                cwd = prepare_task_working_directory(
+                    task_id,
+                    task_incarnation_id or "",
+                    cwd,
+                    has_explicit_workspace=bool(
+                        task.project_id is not None or task.target_repo
+                    ),
+                )
                 delivery_task = await _require_delivery_workspace_launch_boundary(
                     db,
                     task,
@@ -2087,8 +2437,12 @@ class InstanceManager:
                 from backend.models.test_harness import TestHarnessChildBinding
                 from backend.services.test_harness_children import (
                     CHILD_RUNNING,
+                    browser_binding_owner_identity,
                     browser_child_owner_error,
                     require_browser_child_binding,
+                )
+                from backend.services.test_harness_owner_fence import (
+                    test_harness_owner_terminal_gate_matches,
                 )
 
                 browser_binding = await db.scalar(
@@ -2114,6 +2468,16 @@ class InstanceManager:
                     )
                     if owner_error is not None:
                         raise LaunchSupersededError(owner_error)
+                    owner_identity = browser_binding_owner_identity(
+                        browser_binding
+                    )
+                    if test_harness_owner_terminal_gate_matches(
+                        browser_owner,
+                        owner_identity,
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent owner is already terminalizing"
+                        )
                     if (
                         browser_binding.state != CHILD_RUNNING
                         or browser_binding.claimed_retry_count
@@ -2135,6 +2499,10 @@ class InstanceManager:
                 if isolated_browser_marker and browser_binding is None:
                     raise LaunchSupersededError(
                         "Browser Agent launch has no durable isolation binding"
+                    )
+                if supplied_browser_job_id is not None and not browser_review_task:
+                    raise LaunchSupersededError(
+                        "Browser Agent MCP cannot launch without a durable binding"
                     )
                 if browser_review_task and (
                     provider != browser_binding.provider
@@ -2162,6 +2530,142 @@ class InstanceManager:
                     raise LaunchSupersededError(
                         "Browser Agent launch lost its exact bound MCP job"
                     )
+                if browser_review_task and (
+                    not isinstance(settings.auth_token, str)
+                    or not settings.auth_token.strip()
+                ):
+                    raise LaunchSupersededError(
+                        "Browser Agent launch requires AUTH_TOKEN-backed "
+                        "scoped authentication"
+                    )
+                if browser_review_task:
+                    if (
+                        not isinstance(browser_binding.id, str)
+                        or not isinstance(
+                            browser_binding.browser_review_job_id,
+                            str,
+                        )
+                        or not isinstance(
+                            browser_binding.harness_run_id,
+                            str,
+                        )
+                        or (
+                            browser_binding.workspace_review_run_id is not None
+                            and not isinstance(
+                                browser_binding.workspace_review_run_id,
+                                str,
+                            )
+                        )
+                        or type(browser_binding.launch_profile_version) is not int
+                        or not isinstance(
+                            browser_binding.launch_config_digest,
+                            str,
+                        )
+                        or not isinstance(
+                            browser_binding.child_task_incarnation_id,
+                            str,
+                        )
+                        or not isinstance(task.incarnation_id, str)
+                    ):
+                        raise LaunchSupersededError(
+                            "Browser Agent binding has incomplete launch identity"
+                        )
+                    browser_child_admission = _BrowserChildLaunchAdmission(
+                        binding_id=browser_binding.id,
+                        browser_review_job_id=(
+                            browser_binding.browser_review_job_id
+                        ),
+                        harness_run_id=browser_binding.harness_run_id,
+                        workspace_review_run_id=(
+                            browser_binding.workspace_review_run_id
+                        ),
+                        launch_profile_version=(
+                            browser_binding.launch_profile_version
+                        ),
+                        launch_config_digest=(
+                            browser_binding.launch_config_digest
+                        ),
+                        owner_task_id=owner_identity.task_id,
+                        owner_task_incarnation_id=owner_identity.incarnation_id,
+                        owner_task_retry_count=owner_identity.retry_count,
+                        owner_task_turn_generation=owner_identity.turn_generation,
+                        owner_task_status=owner_identity.status,
+                        child_task_id=task.id,
+                        child_task_incarnation_id=task.incarnation_id,
+                        child_task_retry_count=task.retry_count,
+                        child_task_turn_generation=task.turn_generation,
+                        claimed_instance_id=instance_id,
+                    )
+                if not pr_review_task:
+                    from backend.services.task_agent_isolation import (
+                        explicit_git_credential_paths,
+                    )
+                    from backend.services.task_ssh_access import (
+                        task_git_non_overridable_paths,
+                        task_ssh_policy_context,
+                        task_ssh_protected_paths,
+                        task_ssh_runtime_policy,
+                    )
+
+                    task_ssh_runtime = await task_ssh_runtime_policy(
+                        db,
+                        task,
+                    )
+                    if delivery_task and task_ssh_runtime.broker_only:
+                        # Delivery Developer turns have a frozen networkless
+                        # policy.  A durable SSH grant is conflicting ambient
+                        # authority even when its Profile is stale/disabled;
+                        # never make it disappear merely because Delivery
+                        # intentionally omits the ccm_ssh MCP server.
+                        raise LaunchSupersededError(
+                            "Delivery Developer Task has a durable SSH grant"
+                        )
+                    task_ssh_capabilities = set(
+                        task_ssh_runtime.capabilities
+                    )
+                    task_ssh_broker_only = task_ssh_runtime.broker_only
+                    explicit_git_paths = (
+                        ()
+                        if task_ssh_broker_only or browser_review_task
+                        else explicit_git_credential_paths(git_env)
+                    )
+                    # Every local Task must be unable to inspect Manager SSH,
+                    # provider-account, and scoped runtime credentials. A Task
+                    # with grants additionally loses direct network access and
+                    # reaches SSH only through the broker MCP.
+                    task_ssh_protected_path_values = (
+                        await task_ssh_protected_paths(
+                            db,
+                            task=task,
+                            working_directory=cwd,
+                            include_direct_git_credentials=True,
+                            allowed_credential_paths=explicit_git_paths,
+                        )
+                    )
+                    if not task_ssh_broker_only:
+                        from backend.services.task_agent_isolation import (
+                            require_git_credentials_outside_protected_paths,
+                        )
+
+                        task_git_credential_read_path_values = (
+                            require_git_credentials_outside_protected_paths(
+                                git_env,
+                                task_ssh_protected_path_values,
+                                allowed_read_paths=explicit_git_paths,
+                                non_overridable_paths=task_git_non_overridable_paths(
+                                    *((config_dir,) if config_dir else ()),
+                                ),
+                            )
+                        )
+                if browser_review_task:
+                    if task_ssh_broker_only or task_ssh_capabilities:
+                        raise LaunchSupersededError(
+                            "Browser Agent Tasks cannot inherit Task SSH grants"
+                        )
+                    # A fixed Browser child has no repository or credential
+                    # authority. Its only network path is the exact required
+                    # Browser MCP server admitted below.
+                    git_env = None
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -2188,6 +2692,29 @@ class InstanceManager:
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
                     )
+                if task_ssh_broker_only:
+                    # A managed-SSH Task has no direct network authority. Keep
+                    # only non-secret commit identity from Dispatcher git_env;
+                    # project/global SSH keys and HTTPS askpass helpers remain
+                    # Manager-side and are never exposed to the model process.
+                    git_env = {
+                        key: value
+                        for key, value in (git_env or {}).items()
+                        if key.upper() in _TASK_SSH_GIT_IDENTITY_ENV_KEYS
+                    }
+                    git_env.update(_TASK_SSH_SAFE_GIT_ENV)
+                    if task_ssh_capabilities:
+                        ssh_policy = task_ssh_policy_context(
+                            task_ssh_capabilities
+                        )
+                        task_skill_context = "\n\n".join(
+                            value
+                            for value in (
+                                task_skill_context.strip(),
+                                ssh_policy,
+                            )
+                            if value
+                        )
                 if pr_review_task or browser_review_task or delivery_task:
                     # PR input is already snapshotted into the fixed prompt.
                     # No ambient skills or monitor capability may reintroduce
@@ -2236,6 +2763,16 @@ class InstanceManager:
                 logger.warning("Could not enforce 0700 on CODEX_HOME %s", config_dir)
             self._config_dirs[instance_id] = config_dir
 
+        if task_id is not None and config_dir:
+            from backend.services.task_ssh_access import (
+                _protected_path_variants,
+            )
+
+            task_ssh_protected_path_values = tuple(sorted({
+                *task_ssh_protected_path_values,
+                *_protected_path_variants(config_dir),
+            }))
+
         # New turn → clear per-turn flags.
         self._transient_seen.discard(instance_id)
         self._pty_rate_limit_seen.discard(instance_id)
@@ -2243,67 +2780,92 @@ class InstanceManager:
         self._effective_exit_codes.pop(instance_id, None)
 
         mcp_config_path = None
+        claude_isolation_settings_path = None
         if provider == "claude" and task_id and not pr_review_task:
             from backend.services.mcp_config import generate_mcp_config
-            mcp_config_path = generate_mcp_config(task_id, enabled_skills or {})
+            mcp_config_path = generate_mcp_config(
+                task_id,
+                enabled_skills or {},
+                task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
+            )
 
-        # ask_user：把 AskUserQuestion 拦截 hook 注入本次使用的 config_dir（-p 与 PTY 统一）。
-        # config_dir 为空时落到默认 ~/.claude。失败不阻断 launch。
-        if provider == "claude" and not pr_review_task:
+            from backend.services.task_agent_isolation import (
+                CLAUDE_TASK_BUILTIN_TOOLS,
+                generate_claude_task_isolation_settings,
+                validate_claude_task_isolation_settings,
+            )
+
+            claude_isolation_settings_path = (
+                generate_claude_task_isolation_settings(
+                    task_id,
+                    task_ssh_protected_path_values,
+                    allowed_read_paths=task_git_credential_read_path_values,
+                    ssh_capabilities=task_ssh_capabilities,
+                    disable_direct_network=task_ssh_broker_only,
+                )
+            )
+            await asyncio.to_thread(
+                validate_claude_task_isolation_settings,
+                claude_isolation_settings_path,
+                claude_binary=settings.claude_binary,
+                tools=CLAUDE_TASK_BUILTIN_TOOLS,
+            )
+
+        # Prompt-only Claude launches have no Task-scoped exact settings file;
+        # retain the legacy account-level AskUser compatibility hook for them.
+        if provider == "claude" and not pr_review_task and task_id is None:
             from backend.services.ask_user_settings import ensure_ask_user_hook
-            ensure_ask_user_hook(config_dir or os.path.expanduser("~/.claude"))
-
-        # Check if shared project → prepare Docker container wrapper for PTY
-        _container_project_id = None
-        _container_wrapper = None
-        _container_exec_spec = None
-        if provider == "claude" and task_id:
-            try:
-                from backend.services.container_manager import is_shared_project, ContainerManager
-                async with self.db_factory() as _db:
-                    from backend.models.task import Task as _Task
-                    _t = await _db.get(_Task, task_id)
-                    if _t and _t.project_id:
-                        if await is_shared_project(_t.project_id, self.db_factory) and ContainerManager.is_docker_available():
-                            _container_project_id = _t.project_id
-                            if not hasattr(self, '_container_mgr'):
-                                self._container_mgr = ContainerManager()
-                            project_path = cwd or os.getcwd()
-                            # Get project git credentials for container isolation
-                            from backend.models.project import Project as _Project
-                            _proj = await _db.get(_Project, _t.project_id)
-                            container_name = await self._container_mgr.ensure_container(
-                                _container_project_id, project_path, config_dir,
-                                api_account_root=(
-                                    str(cloudrouter_account.root)
-                                    if cloudrouter_account is not None
-                                    else None
-                                ),
-                                git_credential_type=_proj.git_credential_type if _proj else None,
-                                git_ssh_key_path=_proj.git_ssh_key_path if _proj else None,
-                                git_https_username=_proj.git_https_username if _proj else None,
-                                git_https_token=_proj.git_https_token if _proj else None,
-                            )
-                            (
-                                _container_wrapper,
-                                _container_exec_spec,
-                            ) = self._container_mgr.create_pty_wrapper(
-                                _container_project_id,
-                                instance_id,
-                            )
-                            self._container_tasks[instance_id] = _container_project_id
-            except Exception as exc:
-                # Shared Projects must never escape their isolation boundary
-                # because the container's private /tmp is pressured, busy, or
-                # unverifiable.  The container supervisor independently
-                # repeats this gate immediately before child creation.
-                from backend.services.container_manager import (
-                    ContainerTmpPressureError,
+            hooks_ready = ensure_ask_user_hook(
+                config_dir or os.path.expanduser("~/.claude"),
+                ssh_guard=bool(task_ssh_capabilities),
+                ssh_protected_paths=task_ssh_protected_path_values,
+            )
+            if task_ssh_capabilities and not hooks_ready:
+                raise RuntimeError(
+                    "Task SSH guard could not be installed for Claude"
                 )
 
-                if isinstance(exc, ContainerTmpPressureError):
-                    raise
-                logger.debug("Container setup failed, falling back to bare process")
+        if (
+            provider == "claude"
+            and task_id is not None
+            and not pr_review_task
+            and settings.ask_user_enabled
+        ):
+            from backend.services.internal_service_auth import (
+                ASK_USER_TOKEN_ENV,
+                issue_internal_service_token,
+            )
+
+            ask_user_token = issue_internal_service_token(
+                audience="ccm_ask_user",
+                task_id=task_id,
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
+                owner_kind="task-turn",
+                owner_id=task_id,
+            )
+            if ask_user_token:
+                git_env = dict(git_env or {})
+                git_env[ASK_USER_TOKEN_ENV] = ask_user_token
+
+        if task_id is not None and not pr_review_task and not delivery_task:
+            # These variables are inherited by Claude PTY, Claude direct, and
+            # Codex shell environments. Empty agent coordinates prevent any
+            # Task (granted or not) from reaching a service-level SSH agent.
+            git_env = dict(git_env or {})
+            git_env.update({
+                "SSH_AUTH_SOCK": "",
+                "SSH_AGENT_PID": "",
+                "SSH_ASKPASS": "",
+            })
+            if task_ssh_broker_only:
+                git_env["CCM_TASK_SSH_GUARD"] = "1"
 
         codex_main_mcp_required = bool(
             provider == "codex"
@@ -2320,6 +2882,7 @@ class InstanceManager:
         codex_browser_mcp_required = bool(
             provider == "codex"
             and task_id is not None
+            and browser_review_task
             and isinstance(browser_review_job_id, str)
             and browser_review_job_id.strip()
         )
@@ -2330,6 +2893,8 @@ class InstanceManager:
         codex_frontend_review_mcp_required = bool(
             provider == "codex"
             and task_id is not None
+            and isinstance(settings.auth_token, str)
+            and bool(settings.auth_token.strip())
             and not pr_review_task
             and not codex_browser_mcp_required
             and not delivery_task
@@ -2342,12 +2907,37 @@ class InstanceManager:
             and not pr_review_task
             and not delivery_task
         )
+        codex_ssh_mcp_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and bool(task_ssh_capabilities)
+            and not pr_review_task
+            and not browser_review_task
+            and not delivery_task
+        )
+        codex_task_isolation_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and not pr_review_task
+            and not delivery_task
+            and task_ssh_protected_path_values
+        )
         codex_mcp_required = (
             codex_main_mcp_required
             or codex_browser_mcp_required
             or codex_frontend_review_mcp_required
             or codex_sub_agent_mcp_required
+            or codex_ssh_mcp_required
         )
+        if (
+            provider == "codex"
+            and browser_review_task
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexRequiredMcpError(
+                "Codex isolated review requires the app-server read-only "
+                "sandbox; exec fallback is disabled"
+            )
         codex_mcp_specs: tuple["McpServerSpec", ...] = ()
         codex_exec_route = "direct-exec"
         if codex_main_mcp_required:
@@ -2358,6 +2948,10 @@ class InstanceManager:
                 enabled_skills or {},
                 provider=provider,
                 codex_monitor_enabled=codex_monitor_enabled,
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
             )
         else:
             direct_specs: list["McpServerSpec"] = []
@@ -2367,7 +2961,14 @@ class InstanceManager:
                 )
 
                 direct_specs.extend(
-                    build_browser_review_mcp_server_specs(browser_review_job_id)
+                    build_browser_review_mcp_server_specs(
+                        browser_review_job_id,
+                        task_id=task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
                 )
             elif codex_frontend_review_mcp_required:
                 from backend.services.mcp_config import (
@@ -2376,10 +2977,22 @@ class InstanceManager:
                 )
 
                 direct_specs.extend(
-                    build_frontend_review_mcp_server_specs(task_id)
+                    build_frontend_review_mcp_server_specs(
+                        task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
                 )
                 direct_specs.extend(
-                    build_workspace_review_mcp_server_specs(task_id)
+                    build_workspace_review_mcp_server_specs(
+                        task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
                 )
             if codex_sub_agent_mcp_required:
                 from backend.services.mcp_config import (
@@ -2387,9 +3000,28 @@ class InstanceManager:
                 )
 
                 direct_specs.extend(
-                    build_sub_agent_controller_mcp_server_specs(task_id)
+                    build_sub_agent_controller_mcp_server_specs(
+                        task_id,
+                        task_incarnation_id=task_incarnation_id or "",
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        task_status=task_status,
+                    )
                 )
             codex_mcp_specs = tuple(direct_specs)
+        if codex_ssh_mcp_required:
+            from backend.services.mcp_config import (
+                build_task_ssh_mcp_server_specs,
+            )
+
+            codex_mcp_specs += build_task_ssh_mcp_server_specs(
+                task_id,
+                capabilities=tuple(sorted(task_ssh_capabilities)),
+                task_incarnation_id=task_incarnation_id or "",
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
+            )
 
         if (
             provider == "codex"
@@ -2434,6 +3066,56 @@ class InstanceManager:
                 "sandbox; exec fallback is disabled"
             )
 
+        if (
+            provider == "codex"
+            and codex_task_isolation_required
+            and not settings.codex_app_server_enabled
+        ):
+            raise CodexRequiredMcpError(
+                "Codex Task credential protection requires the app-server "
+                "isolated permission "
+                "profile; exec fallback is disabled"
+            )
+
+        codex_filesystem_boundary_required = bool(
+            provider == "codex"
+            and task_id is not None
+            and (codex_task_isolation_required or delivery_task)
+        )
+        if codex_filesystem_boundary_required:
+            from backend.services.task_agent_isolation import (
+                discover_linked_worktree_git_read_boundary,
+            )
+            from backend.services.task_runtime_secrets import (
+                create_private_task_temp_dir,
+            )
+
+            git_boundary = discover_linked_worktree_git_read_boundary(
+                cwd or os.getcwd()
+            )
+            task_git_metadata_read_path_values = (
+                git_boundary.read_paths if git_boundary is not None else ()
+            )
+            task_git_metadata_identity_fingerprint = (
+                git_boundary.identity_fingerprint
+                if git_boundary is not None
+                else ()
+            )
+            if (
+                task_incarnation_id is None
+                or task_retry_count is None
+                or task_turn_generation is None
+            ):
+                raise LaunchSupersededError(
+                    "Codex Task filesystem isolation lost its exact generation"
+                )
+            task_private_tmpdir = create_private_task_temp_dir(
+                task_id=task_id,
+                task_incarnation_id=task_incarnation_id,
+                retry_count=task_retry_count,
+                turn_generation=task_turn_generation,
+            )
+
         if provider == "codex" and settings.codex_app_server_enabled:
             async with self.codex_home_app_server_guard(config_dir):
                 try:
@@ -2463,20 +3145,60 @@ class InstanceManager:
                             or pr_review_task
                             or browser_review_task
                             or delivery_task
+                            or codex_task_isolation_required
                         ),
                         codex_service_tier=codex_service_tier,
                         sandbox_mode=(
                             "read-only"
                             if pr_review_task or browser_review_task
                             else "workspace-write"
-                            if delivery_task
+                            if delivery_task or codex_task_isolation_required
                             else "danger-full-access"
                         ),
+                        task_ssh_protected_paths=(
+                            task_ssh_protected_path_values
+                            if codex_task_isolation_required
+                            else ()
+                        ),
+                        task_ssh_allowed_read_paths=(
+                            task_git_credential_read_path_values
+                            if codex_task_isolation_required
+                            else ()
+                        ),
+                        task_git_read_paths=(
+                            task_git_metadata_read_path_values
+                            if codex_filesystem_boundary_required
+                            else ()
+                        ),
+                        task_git_boundary_fingerprint=(
+                            task_git_metadata_identity_fingerprint
+                            if codex_filesystem_boundary_required
+                            else ()
+                        ),
+                        task_private_tmpdir=task_private_tmpdir,
+                        # Durable SSH grants remain broker-only/network-off.
+                        # Ordinary local Tasks get public egress only through
+                        # Codex's managed proxy, whose thread response is
+                        # audited before model input.
+                        task_ssh_disable_network=(
+                            browser_review_task or task_ssh_broker_only
+                        ),
+                        task_managed_network_proxy=(
+                            codex_task_isolation_required
+                            and not browser_review_task
+                            and not task_ssh_broker_only
+                        ),
                         disable_user_mcp=(
-                            pr_review_task or browser_review_task or delivery_task
+                            pr_review_task
+                            or browser_review_task
+                            or delivery_task
+                            or codex_task_isolation_required
                         ),
                         disable_autonomous_features=(
-                            pr_review_task or browser_review_task or delivery_task
+                            pr_review_task
+                            or browser_review_task
+                            or delivery_task
+                            or codex_task_isolation_required
                         ),
                         network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
@@ -2510,10 +3232,14 @@ class InstanceManager:
                             "Codex Fast could not be confirmed before "
                             "turn/start; exec fallback is disabled for Fast"
                         ) from exc
+                    if codex_task_isolation_required:
+                        raise CodexRequiredMcpError(
+                            "Codex Task credential isolation could not be confirmed "
+                            "before turn/start"
+                        ) from exc
                     if (
                         (
                             codex_main_mcp_required
-                            or codex_browser_mcp_required
                             or codex_frontend_review_mcp_required
                         )
                         and not codex_sub_agent_mcp_required
@@ -2595,7 +3321,7 @@ class InstanceManager:
                             "Codex Fast could not be confirmed before "
                             "turn/start; refusing unverified exec fallback"
                         ) from exc
-                    if codex_mcp_required:
+                    if codex_mcp_required or codex_task_isolation_required:
                         # Once required ccm_skills was selected, every unknown
                         # app-server failure must fail closed instead of
                         # silently replaying without tools.
@@ -2607,9 +3333,17 @@ class InstanceManager:
                             instance_id,
                             config_dir,
                         )
+                        required_server = (
+                            "ccm_skills"
+                            if (
+                                codex_main_mcp_required
+                                or codex_sub_agent_mcp_required
+                            )
+                            else "ccm_ssh"
+                        )
                         raise CodexRequiredMcpError(
                             "Codex app-server failed before required "
-                            "ccm_skills could be guaranteed"
+                            f"{required_server} could be guaranteed"
                         ) from exc
                     # App-server is an experimental Codex surface.  A CLI upgrade
                     # must not take all Codex tasks down; retain the proven exec
@@ -2623,6 +3357,11 @@ class InstanceManager:
                         instance_id,
                         config_dir,
                     )
+                finally:
+                    if task_private_tmpdir is not None:
+                        await asyncio.to_thread(
+                            task_private_tmpdir.cleanup_if_unbound
+                        )
 
         if (
             provider == "claude"
@@ -2646,8 +3385,8 @@ class InstanceManager:
                 enable_workflows=enable_workflows,
                 enabled_skills=enabled_skills,
                 mcp_config_path=str(mcp_config_path) if mcp_config_path else None,
-                claude_binary_override=_container_wrapper,
-                container_exec_spec=_container_exec_spec,
+                claude_binary_override=None,
+                container_exec_spec=None,
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 skill_context=task_skill_context,
@@ -2655,6 +3394,9 @@ class InstanceManager:
                 source_log_id=source_log_id,
                 current_message=current_message,
                 queue_timestamp=queue_timestamp,
+                claude_isolation_settings_path=(
+                    claude_isolation_settings_path
+                ),
                 on_launch_admitted=admit_claude_pty_transport,
             )
 
@@ -2686,6 +3428,7 @@ class InstanceManager:
             tools_disabled=(
                 pr_review_task or (provider == "claude" and browser_review_task)
             ),
+            claude_isolation_settings_path=claude_isolation_settings_path,
         )
         if provider == "codex":
             logger.info(
@@ -2698,13 +3441,31 @@ class InstanceManager:
                 codex_mcp_required,
             )
 
-        # Must unset CLAUDE_CODE env var to avoid nested session detection
-        env = {k: v for k, v in os.environ.items() if k.upper() not in ("CLAUDECODE", "CLAUDE_CODE")}
+        # Task-launched model processes must not inherit the deployment bearer
+        # credential. Their CCM MCP children receive separate, route-scoped
+        # credentials through each server spec instead.
+        task_secret_env = {
+            "AUTH_TOKEN",
+            "CCM_INTERNAL_SERVICE_TOKEN",
+        }
+        from backend.services.task_agent_isolation import (
+            scrub_task_model_environment,
+        )
+
+        # Every Task starts without Manager ambient Git/GitHub/SSH authority.
+        # The exact project-scoped git_env is applied below; managed-SSH Tasks
+        # have already reduced it to non-secret identity plus fail-closed flags.
+        env = scrub_task_model_environment(
+            os.environ,
+            provider=provider,
+        )
 
         # Inject per-project git identity and credentials as environment variables.
         # These take precedence over any global ~/.gitconfig or system credential helper.
         if git_env:
             env.update(git_env)
+        for key in task_secret_env:
+            env.pop(key, None)
 
         if cloudrouter_account is not None:
             auth_keys = (
@@ -2731,149 +3492,32 @@ class InstanceManager:
         if thinking_budget and thinking_budget > 0 and provider == "claude":
             env["MAX_THINKING_TOKENS"] = str(thinking_budget)
 
-        # Check if this task's project is shared → run in Docker container
-        use_container = False
-        container_project_id = None
-        if task_id and provider == "claude":
-            try:
-                from backend.services.container_manager import is_shared_project, ContainerManager
-                async with self.db_factory() as _db:
-                    from backend.models.task import Task as _Task
-                    _task = await _db.get(_Task, task_id)
-                    if _task and _task.project_id:
-                        _shared = await is_shared_project(_task.project_id, self.db_factory)
-                        if _shared and ContainerManager.is_docker_available():
-                            use_container = True
-                            container_project_id = _task.project_id
-            except Exception:
-                logger.debug("Container check failed, falling back to bare process")
-
-        if use_container and container_project_id:
-            from backend.services.container_manager import (
-                ContainerExecSpawnCleanupError,
-                ContainerManager,
-            )
-            if not hasattr(self, '_container_mgr'):
-                self._container_mgr = ContainerManager()
-            project_path = cwd or os.getcwd()
-            # Get project git credentials
-            _git_creds = {}
-            try:
-                async with self.db_factory() as _db2:
-                    from backend.models.project import Project as _Proj
-                    _p = await _db2.get(_Proj, container_project_id)
-                    if _p:
-                        _git_creds = {
-                            "git_credential_type": _p.git_credential_type,
-                            "git_ssh_key_path": _p.git_ssh_key_path,
-                            "git_https_username": _p.git_https_username,
-                            "git_https_token": _p.git_https_token,
-                        }
-            except Exception:
-                pass
-            await self._container_mgr.ensure_container(
-                container_project_id,
-                project_path,
-                config_dir,
-                api_account_root=(
-                    str(cloudrouter_account.root)
-                    if cloudrouter_account is not None
-                    else None
-                ),
-                **_git_creds,
-            )
-            try:
-                container_env = env
-                if provider == "claude" and config_dir:
-                    container_env = dict(env)
-                    container_env["CLAUDE_CONFIG_DIR"] = "/home/sandbox/.claude"
-                await admit_external_launch("claude_exec")
-                process = await self._container_mgr.exec_command(
-                    container_project_id,
-                    cmd,
-                    env=container_env,
-                    cwd="/workspace",
+        if provider == "codex":
+            # Hold the per-home gate through process creation and tracking.
+            # Maintenance can then either see this active exec or reserve
+            # the home first; it can never edit auth.json in the gap.
+            home_lock = self._codex_home_lock(config_dir)
+            async with home_lock:
+                # The dispatcher snapshot is only a routing hint.  This
+                # lock-local predicate is the authoritative barrier for
+                # two fresh tasks that selected the same home, or for an
+                # ephemeral exec that won admission after selection.
+                self._assert_codex_app_server_home_available(
+                    config_dir,
+                    replacing_exec_instance_id=instance_id,
                 )
-            except ContainerExecSpawnCleanupError as exc:
-                # exec_command was cancelled after docker(1) may have asked
-                # the daemon to create the inner command, and exact cleanup
-                # could not be proven.  Install the hidden spawn outcome under
-                # this Instance before surfacing the failure so stop/shutdown
-                # can retry it; never release the slot as idle.
-                process = exc.process
-                self.processes[instance_id] = process
-                self._container_tasks[instance_id] = container_project_id
-                self._container_exec_processes[instance_id] = process
-                if os.name == "posix":
-                    self._process_groups[instance_id] = process
-                try:
-                    async with self.db_factory() as db:
-                        await db.execute(
-                            update(Instance)
-                            .where(Instance.id == instance_id)
-                            .values(
-                                status="error",
-                                pid=getattr(process, "pid", None),
-                                current_task_id=task_id,
-                            )
-                        )
-                        await db.commit()
-                except Exception:
-                    logger.exception(
-                        "Failed to persist unresolved container spawn "
-                        "for instance %s",
-                        instance_id,
-                    )
-                raise
-            self._container_tasks[instance_id] = container_project_id
-            self._container_exec_processes[instance_id] = process
-            if os.name == "posix":
-                self._process_groups[instance_id] = process
-        else:
-            if provider == "codex":
-                # Hold the per-home gate through process creation and tracking.
-                # Maintenance can then either see this active exec or reserve
-                # the home first; it can never edit auth.json in the gap.
-                home_lock = self._codex_home_lock(config_dir)
-                async with home_lock:
-                    # The dispatcher snapshot is only a routing hint.  This
-                    # lock-local predicate is the authoritative barrier for
-                    # two fresh tasks that selected the same home, or for an
-                    # ephemeral exec that won admission after selection.
-                    self._assert_codex_app_server_home_available(
+                # app-server keeps threads and MCP clients resident in
+                # memory.  Before an exec generation enters the same home,
+                # stop an idle transport or reject an active one.  Holding
+                # the home lock through spawn + ownership registration
+                # closes the reverse race with a concurrent app-server
+                # launch.
+                registry = self._codex_app_server
+                if registry is not None:
+                    await registry.shutdown_home(
                         config_dir,
-                        replacing_exec_instance_id=instance_id,
+                        require_idle=True,
                     )
-                    # app-server keeps threads and MCP clients resident in
-                    # memory.  Before an exec generation enters the same home,
-                    # stop an idle transport or reject an active one.  Holding
-                    # the home lock through spawn + ownership registration
-                    # closes the reverse race with a concurrent app-server
-                    # launch.
-                    registry = self._codex_app_server
-                    if registry is not None:
-                        await registry.shutdown_home(
-                            config_dir,
-                            require_idle=True,
-                        )
-                    spawn_kwargs = {
-                        "stdout": asyncio.subprocess.PIPE,
-                        "stderr": asyncio.subprocess.PIPE,
-                        "cwd": cwd or os.getcwd(),
-                        "env": env,
-                        "limit": 10 * 1024 * 1024,
-                    }
-                    if os.name == "posix":
-                        spawn_kwargs["start_new_session"] = True
-                    await admit_external_launch("codex_exec")
-                    process = await self._spawn_managed_direct_process(
-                        instance_id,
-                        task_id,
-                        cmd,
-                        spawn_kwargs,
-                        codex_home=config_dir,
-                    )
-            else:
                 spawn_kwargs = {
                     "stdout": asyncio.subprocess.PIPE,
                     "stderr": asyncio.subprocess.PIPE,
@@ -2883,13 +3527,31 @@ class InstanceManager:
                 }
                 if os.name == "posix":
                     spawn_kwargs["start_new_session"] = True
-                await admit_external_launch("claude_exec")
+                await admit_external_launch("codex_exec")
                 process = await self._spawn_managed_direct_process(
                     instance_id,
                     task_id,
                     cmd,
                     spawn_kwargs,
+                    codex_home=config_dir,
                 )
+        else:
+            spawn_kwargs = {
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "cwd": cwd or os.getcwd(),
+                "env": env,
+                "limit": 10 * 1024 * 1024,
+            }
+            if os.name == "posix":
+                spawn_kwargs["start_new_session"] = True
+            await admit_external_launch("claude_exec")
+            process = await self._spawn_managed_direct_process(
+                instance_id,
+                task_id,
+                cmd,
+                spawn_kwargs,
+            )
 
         if provider != "codex":
             self.processes[instance_id] = process
@@ -3091,9 +3753,13 @@ class InstanceManager:
             yield current
 
     def _codex_env_remove_for_home(self, codex_home: str) -> set[str]:
+        removed = {
+            "AUTH_TOKEN",
+            "CCM_INTERNAL_SERVICE_TOKEN",
+        }
         if self._cloudrouter_account_for_runtime_home("codex", codex_home):
-            return set(_CLOUDROUTER_CODEX_AUTH_ENV_KEYS)
-        return set()
+            removed.update(_CLOUDROUTER_CODEX_AUTH_ENV_KEYS)
+        return removed
 
     def is_cloudrouter_transient(
         self,
@@ -3400,6 +4066,13 @@ class InstanceManager:
         disable_user_mcp: bool = False,
         codex_service_tier: str = "default",
         sandbox_mode: str = "danger-full-access",
+        task_ssh_protected_paths: Sequence[str] = (),
+        task_ssh_allowed_read_paths: Sequence[str] = (),
+        task_git_read_paths: Sequence[str] = (),
+        task_git_boundary_fingerprint: Sequence[tuple[object, ...]] = (),
+        task_private_tmpdir: "PrivateTaskTempDir | None" = None,
+        task_ssh_disable_network: bool = False,
+        task_managed_network_proxy: bool = False,
         disable_autonomous_features: bool = False,
         network_isolated: bool = False,
         tools_disabled: bool = False,
@@ -3431,6 +4104,13 @@ class InstanceManager:
             skill_context=skill_context,
             codex_service_tier=codex_service_tier,
             sandbox_mode=sandbox_mode,
+            task_ssh_protected_paths=task_ssh_protected_paths,
+            task_ssh_allowed_read_paths=task_ssh_allowed_read_paths,
+            task_git_read_paths=task_git_read_paths,
+            task_git_boundary_fingerprint=task_git_boundary_fingerprint,
+            task_private_tmpdir=task_private_tmpdir,
+            task_ssh_disable_network=task_ssh_disable_network,
+            task_managed_network_proxy=task_managed_network_proxy,
             disable_autonomous_features=disable_autonomous_features,
             network_isolated=network_isolated,
             tools_disabled=tools_disabled,
@@ -4202,6 +4882,53 @@ class InstanceManager:
             expected_codex_home=expected_codex_home,
         )
 
+    @staticmethod
+    def _claude_task_runtime_fingerprint(
+        settings_path: Path,
+        *,
+        mcp_config_path: str | Path | None,
+        git_env: dict | None,
+    ) -> str:
+        """Fingerprint every launch input retained by a hot Claude process."""
+
+        digest = hashlib.sha256()
+
+        def add_component(label: str, value: bytes) -> None:
+            encoded_label = label.encode("utf-8")
+            digest.update(len(encoded_label).to_bytes(4, "big"))
+            digest.update(encoded_label)
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+
+        add_component("settings", settings_path.read_bytes())
+        from backend.services.trusted_runtime import (
+            trusted_hook_components_from_settings,
+        )
+
+        for asset_name, asset_bytes in trusted_hook_components_from_settings(
+            settings_path
+        ):
+            add_component(f"trusted-hook:{asset_name}", asset_bytes)
+        if mcp_config_path is not None:
+            add_component("mcp", Path(mcp_config_path).read_bytes())
+        environment_items = sorted(
+            (
+                str(key),
+                str(value),
+            )
+            for key, value in (git_env or {}).items()
+        )
+        add_component(
+            "git-env-count",
+            len(environment_items).to_bytes(8, "big"),
+        )
+        for key, value in environment_items:
+            # Only the terminal SHA-256 digest is retained on the PTY config;
+            # credential names and values never leave this local hash state.
+            add_component("git-env-key", key.encode("utf-8"))
+            add_component("git-env-value", value.encode("utf-8"))
+        return digest.hexdigest()
+
     async def _launch_pty(
         self,
         instance_id: int,
@@ -4228,6 +4955,7 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        claude_isolation_settings_path: Path | None = None,
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """PTY-mode launch: delegate to claude_pty, mirror -p bookkeeping.
@@ -4237,6 +4965,34 @@ class InstanceManager:
         so everything downstream (DB, WebSocket, dispatcher wait) is
         unchanged.
         """
+        isolation_fingerprint = None
+        if claude_isolation_settings_path is not None:
+            isolation_fingerprint = (
+                self._claude_task_runtime_fingerprint(
+                    claude_isolation_settings_path,
+                    mcp_config_path=mcp_config_path,
+                    git_env=git_env,
+                )
+            )
+            if resume_session_id:
+                existing_session = (
+                    self._pty_backend._pool._sessions.get(
+                        resume_session_id
+                    )
+                )
+                existing_fingerprint = getattr(
+                    getattr(existing_session, "config", None),
+                    "_ccm_task_isolation_fingerprint",
+                    None,
+                )
+                if (
+                    existing_session is not None
+                    and existing_fingerprint != isolation_fingerprint
+                ):
+                    # A hot process cannot absorb changed CLI settings. Stop
+                    # it while idle and cold-resume the same native session.
+                    await self.release_pty_session(resume_session_id)
+
         is_cold_start = (
             resume_session_id
             and resume_session_id not in self._pty_backend._pool._sessions
@@ -4285,38 +5041,138 @@ class InstanceManager:
             # admission lock across patch -> config construction -> restore so
             # a container wrapper can never leak into another launch.
             async with self._pty_build_config_lock:
-                original_build_config = None
-                if claude_binary_override or cloudrouter_api:
-                    original_build_config = self._pty_backend.build_config
-                    wrapper = claude_binary_override
+                original_build_config = getattr(
+                    self._pty_backend,
+                    "build_config",
+                    None,
+                )
+                wrapper = claude_binary_override
+                if original_build_config is None and (
+                    claude_isolation_settings_path is not None
+                    or cloudrouter_api
+                    or wrapper is not None
+                ):
+                    raise RuntimeError(
+                        "PTY backend cannot apply the required launch boundary"
+                    )
 
-                    def _patched_build_config(**kw):
-                        cfg = original_build_config(**kw)
-                        if cloudrouter_api:
-                            final_binary = wrapper or cfg.claude_binary
-                            cloudrouter_wrapper = Path(__file__).with_name(
-                                "cloudrouter_claude_wrapper.sh"
-                            )
-                            if not (
-                                cloudrouter_wrapper.is_file()
-                                and os.access(cloudrouter_wrapper, os.X_OK)
-                            ):
-                                raise RuntimeError(
-                                    "CloudRouter Claude wrapper is unavailable"
-                                )
-                            overrides = dict(cfg.env_overrides or {})
-                            for key in _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS:
-                                overrides.pop(key, None)
-                            overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
-                                final_binary
-                            )
-                            cfg.env_overrides = overrides
-                            cfg.claude_binary = str(cloudrouter_wrapper)
-                        elif wrapper:
-                            cfg.claude_binary = wrapper
-                        return cfg
+                def _patched_build_config(**kw):
+                    if original_build_config is None:
+                        raise RuntimeError(
+                            "PTY backend does not expose secure config construction"
+                        )
+                    cfg = original_build_config(**kw)
+                    original_overrides = dict(
+                        getattr(cfg, "env_overrides", None) or {}
+                    )
+                    from backend.services.task_agent_isolation import (
+                        CLAUDE_SUBPROCESS_ENV_SCRUB,
+                        scrub_task_model_environment,
+                    )
 
-                    self._pty_backend.build_config = _patched_build_config
+                    overrides = scrub_task_model_environment(
+                        original_overrides,
+                        provider="claude",
+                    )
+                    safe_parent = scrub_task_model_environment(
+                        os.environ,
+                        provider="claude",
+                    )
+                    # claude-pty begins with os.environ and only then applies
+                    # env_overrides. Shadow every credential that CCM's direct
+                    # path removes; simply omitting a key would reveal the
+                    # Manager value again. Explicit project GIT_* variables are
+                    # restored below from this exact launch's git_env.
+                    for key in {
+                        *original_overrides,
+                        *os.environ,
+                    }:
+                        if (
+                            (
+                                key in original_overrides
+                                and key not in overrides
+                            )
+                            or (
+                                key in os.environ
+                                and key not in safe_parent
+                            )
+                        ):
+                            overrides[key] = ""
+                    for key, value in (git_env or {}).items():
+                        upper_key = key.upper()
+                        if (
+                            upper_key.startswith("GIT_")
+                            or upper_key
+                            in {
+                                "CCM_ASK_USER_TOKEN",
+                                "CCM_TASK_SSH_GUARD",
+                            }
+                        ):
+                            overrides[key] = value
+                    # Claude strips CLAUDE_* from the PTY parent environment,
+                    # so this security switch must be an explicit override.
+                    overrides[CLAUDE_SUBPROCESS_ENV_SCRUB] = "1"
+                    overrides["AUTH_TOKEN"] = ""
+                    overrides["CCM_INTERNAL_SERVICE_TOKEN"] = ""
+                    final_binary = wrapper or cfg.claude_binary
+                    if cloudrouter_api:
+                        cloudrouter_wrapper = Path(__file__).with_name(
+                            "cloudrouter_claude_wrapper.sh"
+                        )
+                        if not (
+                            cloudrouter_wrapper.is_file()
+                            and os.access(cloudrouter_wrapper, os.X_OK)
+                        ):
+                            raise RuntimeError(
+                                "CloudRouter Claude wrapper is unavailable"
+                            )
+                        for key in _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS:
+                            overrides.pop(key, None)
+                        overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
+                            final_binary
+                        )
+                        final_binary = str(cloudrouter_wrapper)
+                    if claude_isolation_settings_path is not None:
+                        from backend.services.task_agent_isolation import (
+                            CLAUDE_TASK_BUILTIN_TOOLS,
+                        )
+
+                        task_wrapper = Path(__file__).with_name(
+                            "task_claude_wrapper.sh"
+                        )
+                        if not (
+                            task_wrapper.is_file()
+                            and os.access(task_wrapper, os.X_OK)
+                        ):
+                            raise RuntimeError(
+                                "Task Claude isolation wrapper is unavailable"
+                            )
+                        overrides.update({
+                            "CCM_TASK_CLAUDE_SETTINGS": str(
+                                claude_isolation_settings_path
+                            ),
+                            "CCM_TASK_CLAUDE_BINARY": str(final_binary),
+                            "CCM_TASK_CLAUDE_TOOLS": ",".join(
+                                CLAUDE_TASK_BUILTIN_TOOLS
+                            ),
+                        })
+                        cfg.claude_binary = str(task_wrapper)
+                        cfg.dangerously_skip_permissions = False
+                        setattr(
+                            cfg,
+                            "_ccm_task_isolation_fingerprint",
+                            isolation_fingerprint,
+                        )
+                    else:
+                        cfg.claude_binary = str(final_binary)
+                    cfg.env_overrides = overrides
+                    return cfg
+
+                setattr(
+                    self._pty_backend,
+                    "build_config",
+                    _patched_build_config,
+                )
                 try:
                     from backend.services.skill_context import (
                         wrap_skill_context,
@@ -4343,7 +5199,9 @@ class InstanceManager:
                         mcp_config_path=mcp_config_path,
                     )
                 finally:
-                    if original_build_config is not None:
+                    if original_build_config is None:
+                        delattr(self._pty_backend, "build_config")
+                    else:
                         self._pty_backend.build_config = original_build_config
 
             process = self.processes.get(instance_id)
@@ -4649,6 +5507,110 @@ class InstanceManager:
         """Return live PTY background Tasks for same-process reconciliation."""
 
         return {state.task_id for state in self._pty_background_states.values()}
+
+    def project_share_runtime_block_reason(
+        self,
+        *,
+        project_id: int,
+        task_ids: set[int],
+        instance_ids: set[int],
+    ) -> str | None:
+        """Synchronously snapshot runtime evidence that vetoes Project share.
+
+        The caller already holds the durable Project -> Tasks -> Instances
+        writer fence. This method has no await point, so an in-process launch
+        reservation cannot appear halfway through the snapshot. A launch that
+        starts immediately afterwards must cross the Project writer fence and
+        will observe the newly committed share before its provider effect.
+        """
+
+        if (
+            type(project_id) is not int
+            or project_id <= 0
+            or any(type(value) is not int or value <= 0 for value in task_ids)
+            or any(
+                type(value) is not int or value <= 0
+                for value in instance_ids
+            )
+        ):
+            return "Could not verify local Agent runtime; Project sharing is disabled"
+
+        def related(instance_id: int, task_id: int | None = None) -> bool:
+            return bool(
+                instance_id in instance_ids
+                or task_id in task_ids
+                or self._container_tasks.get(instance_id) == project_id
+            )
+
+        for instance_id, reservation in self._launch_reservations.items():
+            if related(instance_id, reservation.task_id):
+                return (
+                    "A local Agent launch is in progress for this Project; "
+                    "wait for it to settle before sharing"
+                )
+
+        live_instance_ids = set(self.processes)
+        live_instance_ids.update(self._process_groups)
+        live_instance_ids.update(self._container_exec_processes)
+        live_instance_ids.update(self._tasks)
+        live_instance_ids.update(self._consumer_records)
+        live_instance_ids.update(self._pty_launch_barriers)
+        live_instance_ids.update(self._codex_exec_homes)
+        live_instance_ids.update(self._stopping)
+        for instance_id in live_instance_ids:
+            record = self._consumer_records.get(instance_id)
+            record_task_id = record.task_id if record is not None else None
+            params = self._launch_params.get(instance_id) or {}
+            params_task_id = params.get("task_id")
+            if related(instance_id, record_task_id) or related(
+                instance_id,
+                params_task_id if type(params_task_id) is int else None,
+            ):
+                return (
+                    "A local Agent runtime is still attached to this Project; "
+                    "stop it before sharing"
+                )
+
+        for (instance_id, _process), evidence in (
+            self._consumer_recovery_pending.items()
+        ):
+            if related(instance_id, evidence.task_id):
+                return (
+                    "A local Agent recovery is unresolved for this Project; "
+                    "wait for recovery before sharing"
+                )
+
+        for state in self._pty_background_states.values():
+            if state.task_id in task_ids:
+                return (
+                    "A local background Agent is still running for this Project; "
+                    "wait for it to settle before sharing"
+                )
+        for proof in self._pty_post_exit_generations.values():
+            if related(proof.instance_id, proof.task_id):
+                return (
+                    "A local Agent terminal handoff is unresolved for this "
+                    "Project; wait before sharing"
+                )
+        for continuation in self._sequential_turn_continuations.values():
+            if related(continuation.instance_id, continuation.task_id):
+                return (
+                    "A local Agent continuation remains admitted for this "
+                    "Project; wait before sharing"
+                )
+        for task_id, _session_id in self._pty_autonomous_activity_handoffs:
+            if task_id in task_ids:
+                return (
+                    "A local autonomous Agent handoff is unresolved for this "
+                    "Project; wait before sharing"
+                )
+        for permission in self._pty_permissions.values():
+            if permission.get("task_id") in task_ids:
+                return (
+                    "A local Agent permission request is still active for this "
+                    "Project; resolve it before sharing"
+                )
+        return None
 
     def pty_background_generation_for(
         self,
@@ -6038,12 +7000,17 @@ class InstanceManager:
     ) -> None:
         """Complete a background epoch only at its exact turn sentinel."""
 
+        completion_state = None
         async with self.pty_background_transition(task_id, session_id):
-            await self._finish_pty_autonomous_activity_locked(
+            completion_state = await self._finish_pty_autonomous_activity_locked(
                 task_id,
                 session_id,
                 generation,
                 event,
+            )
+        if completion_state is not None:
+            await self._try_complete_pty_background_generation(
+                completion_state
             )
 
     async def _finish_pty_autonomous_activity_locked(
@@ -6052,29 +7019,50 @@ class InstanceManager:
         session_id: str,
         generation: str | None,
         event: dict,
-    ) -> None:
+    ) -> _PtyBackgroundState | None:
         if generation is None:
-            return
+            return None
         state = self._pty_background_states.get((task_id, session_id))
         if state is None or state.generation != generation:
-            return
+            return None
         state.last_event_monotonic = time.monotonic()
         if not self._is_pty_autonomous_terminal(event):
-            return
+            return None
         state.terminal_seen = True
         state.pending_tools = 0
-        await self._try_complete_pty_background_generation_locked(state)
+        return state
 
     async def _try_complete_pty_background_generation(
         self,
         state: _PtyBackgroundState,
     ) -> bool:
-        async with self.pty_background_transition(
-            state.task_id, state.session_id
-        ):
-            return await self._try_complete_pty_background_generation_locked(
-                state
+        key = (state.task_id, state.session_id)
+        if (
+            self._pty_background_states.get(key) is not state
+            or state.pending_tools
+            or not state.terminal_seen
+            or await self.pty_background_activity_pending(
+                state.task_id,
+                state.session,
             )
+        ):
+            return False
+        async with self._test_harness_owner_terminal_context(
+            state.task_id,
+            reason="PTY background activity reached terminal completion",
+            expected_retry_count=state.task_retry_count,
+            expected_turn_generation=state.task_turn_generation,
+            expected_session_id=state.session_id,
+            expected_background_generation=state.generation,
+        ) as terminal_fenced:
+            if not terminal_fenced:
+                return False
+            async with self.pty_background_transition(
+                state.task_id, state.session_id
+            ):
+                return await self._try_complete_pty_background_generation_locked(
+                    state
+                )
 
     async def _try_complete_pty_background_generation_locked(
         self,
@@ -6345,9 +7333,9 @@ class InstanceManager:
                     return False
                 owner = owner_rows[0] if owner_rows else None
 
-        succeeded = False
         detached = owner is None
-        try:
+
+        async def stop_exact_background_owner() -> bool:
             if owner is not None:
                 attached = getattr(self._pty_backend, "_sessions", {})
                 attached_keys = (
@@ -6368,7 +7356,7 @@ class InstanceManager:
                     # those durable owners.
                     if not await self._stop_exact_detached_pty_session(state):
                         return False
-                succeeded = await self.stop(
+                return await self.stop(
                     owner.id,
                     expected_task_id=state.task_id,
                     expected_task_turn_generation=state.task_turn_generation,
@@ -6379,25 +7367,35 @@ class InstanceManager:
                     allow_delivery_effect_stop=True,
                     yield_to_worker_task_termination=True,
                 )
-            else:
-                succeeded = (
-                    await self.stop_detached_pty_background_generation(
-                        state.task_id,
-                        state.session_id,
-                        state.generation,
-                        expected_status=task_row.status,
-                        expected_retry_count=task_row.retry_count,
-                        expected_turn_generation=(
-                            task_row.turn_generation
-                        ),
-                        expected_instance_id=task_row.instance_id,
-                        expected_started_at=task_row.started_at,
-                        expected_completed_at=task_row.completed_at,
-                        terminal_status="failed",
-                        error_message=error,
-                        yield_to_worker_task_termination=True,
-                    )
-                )
+            return await self.stop_detached_pty_background_generation(
+                state.task_id,
+                state.session_id,
+                state.generation,
+                expected_status=task_row.status,
+                expected_retry_count=task_row.retry_count,
+                expected_turn_generation=task_row.turn_generation,
+                expected_instance_id=task_row.instance_id,
+                expected_started_at=task_row.started_at,
+                expected_completed_at=task_row.completed_at,
+                terminal_status="failed",
+                error_message=error,
+                yield_to_worker_task_termination=True,
+            )
+
+        succeeded = False
+        try:
+            async with self._test_harness_owner_terminal_context(
+                state.task_id,
+                reason="PTY background watchdog reached its hard timeout",
+                expected_retry_count=state.task_retry_count,
+                expected_turn_generation=state.task_turn_generation,
+                expected_instance_id=task_row.instance_id,
+                expected_session_id=state.session_id,
+                expected_background_generation=state.generation,
+            ) as terminal_fenced:
+                if not terminal_fenced:
+                    return False
+                succeeded = await stop_exact_background_owner()
         finally:
             if self._pty_background_states.get(key) is state:
                 state.watchdog_stopping = False
@@ -6530,20 +7528,135 @@ class InstanceManager:
                 )
 
     @asynccontextmanager
-    async def _chat_terminal_locks(self, task_id: int, instance_id: int):
-        """Acquire the shared capability -> Instance terminal lock order."""
+    async def _test_harness_owner_terminal_context(
+        self,
+        task_id: int,
+        *,
+        reason: str,
+        expected_retry_count: int,
+        expected_turn_generation: int,
+        expected_instance_id: int | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_session_id: str | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_background_generation: str | None | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+    ):
+        """Fence and drain one exact Task owner graph before a status write.
+
+        The Harness identity includes status.  Consequently a terminal writer
+        or a new-turn claim must keep this context open until its Task status /
+        generation change commits; otherwise a Run can materialize under the
+        old identity in the cleanup-to-commit gap.
+        """
+
+        from backend.services.test_harness import (
+            TestHarnessService,
+            test_harness_service as global_test_harness_service,
+        )
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        predicates = [
+            Task.id == task_id,
+            Task.retry_count == expected_retry_count,
+            Task.turn_generation == expected_turn_generation,
+            task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
+        ]
+        if expected_instance_id is not _EXPECTED_GENERATION_UNSET:
+            predicates.append(
+                Task.instance_id.is_(None)
+                if expected_instance_id is None
+                else Task.instance_id == expected_instance_id
+            )
+        if expected_session_id is not _EXPECTED_GENERATION_UNSET:
+            predicates.append(
+                Task.session_id.is_(None)
+                if expected_session_id is None
+                else Task.session_id == expected_session_id
+            )
+        if expected_background_generation is not _EXPECTED_GENERATION_UNSET:
+            predicates.append(
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
+            )
+        async with self.db_factory() as db:
+            task = (
+                await db.execute(select(Task).where(*predicates))
+            ).scalar_one_or_none()
+            if task is None:
+                yield False
+                return
+            identity = test_harness_owner_identity(task)
+
+        service = self.test_harness_service
+        if service is None:
+            service = (
+                global_test_harness_service
+                if global_test_harness_service.db_factory is self.db_factory
+                else TestHarnessService(db_factory=self.db_factory)
+            )
+            self.test_harness_service = service
+        async with service.owner_stop_fence(
+            task_id,
+            reason=reason,
+            expected_identity=identity,
+        ):
+            yield True
+
+    @asynccontextmanager
+    async def _chat_terminal_locks(
+        self,
+        task_id: int,
+        instance_id: int,
+        *,
+        expected_retry_count: int,
+        expected_turn_generation: int,
+        reason: str,
+    ):
+        """Acquire Harness -> capability -> Instance terminal lock order."""
 
         from backend.services.capability_service import capability_task_lock
 
-        async with capability_task_lock(task_id):
-            async with self._instance_lifecycle_lock(instance_id):
-                yield
+        async with self._test_harness_owner_terminal_context(
+            task_id,
+            reason=reason,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            expected_instance_id=instance_id,
+        ) as fenced:
+            if not fenced:
+                yield False
+                return
+            async with capability_task_lock(task_id):
+                async with self._instance_lifecycle_lock(instance_id):
+                    yield True
 
     @asynccontextmanager
-    async def _chat_terminal_db(self, task_id: int, instance_id: int):
+    async def _chat_terminal_db(
+        self,
+        task_id: int,
+        instance_id: int,
+        *,
+        expected_retry_count: int,
+        expected_turn_generation: int,
+        reason: str,
+    ):
         """Open one Task terminal transaction under the global lock order."""
 
-        async with self._chat_terminal_locks(task_id, instance_id):
+        async with self._chat_terminal_locks(
+            task_id,
+            instance_id,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            reason=reason,
+        ) as fenced:
+            if not fenced:
+                yield None
+                return
             async with self.db_factory() as db:
                 yield db
 
@@ -7033,7 +8146,15 @@ class InstanceManager:
             return True
 
         admission = None
-        async with self._chat_terminal_locks(task_id, instance_id):
+        async with self._chat_terminal_locks(
+            task_id,
+            instance_id,
+            expected_retry_count=expected_retry_count,
+            expected_turn_generation=expected_turn_generation,
+            reason="PTY chat turn reached terminal bookkeeping",
+        ) as terminal_fenced:
+            if not terminal_fenced:
+                return None
             if instance_id in self._stopping or not owns_generation():
                 return None
 
@@ -7338,16 +8459,41 @@ class InstanceManager:
         codex_api_account: bool = False,
         codex_service_tier: str = "default",
         tools_disabled: bool = False,
+        claude_isolation_settings_path: Path | None = None,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
             cmd = [
                 settings.claude_binary,
                 "-p", prompt,
-                "--dangerously-skip-permissions",
                 "--output-format", "stream-json",
                 "--verbose",
             ]
+            if claude_isolation_settings_path is not None:
+                from backend.services.task_agent_isolation import (
+                    CLAUDE_TASK_BUILTIN_TOOLS,
+                )
+
+                cmd.extend([
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--settings",
+                    str(claude_isolation_settings_path),
+                    "--setting-sources",
+                    "",
+                    "--strict-mcp-config",
+                    "--disable-slash-commands",
+                    "--no-chrome",
+                ])
+                if not tools_disabled:
+                    cmd.extend([
+                        "--tools",
+                        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                        "--allowedTools",
+                        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                    ])
+            else:
+                cmd.append("--dangerously-skip-permissions")
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:
@@ -7627,7 +8773,26 @@ class InstanceManager:
             task_publication_generation: dict | None = None
             recovery_failure: ConsumerRecoveryUnsettledError | None = None
             try:
-                async with self.db_factory() as db:
+                recovery_db_context = (
+                    self._chat_terminal_db(
+                        task_id,
+                        instance_id,
+                        expected_retry_count=expected_retry_count,
+                        expected_turn_generation=expected_turn_generation,
+                        reason=(
+                            "Chat output bookkeeping failed before terminal "
+                            "settlement"
+                        ),
+                    )
+                    if task_id and chat_initiated
+                    else self.db_factory()
+                )
+                async with recovery_db_context as db:
+                    if db is None:
+                        raise RuntimeError(
+                            "Output consumer recovery lost its exact Harness "
+                            "owner generation"
+                        )
                     task_recovery = None
                     if task_id and chat_initiated:
                         # Recovery participates in the same global
@@ -8060,6 +9225,13 @@ class InstanceManager:
         """
 
         if process.returncode is not None:
+            wait_runtime_cleanup = getattr(
+                process,
+                "wait_runtime_cleanup",
+                None,
+            )
+            if callable(wait_runtime_cleanup):
+                await wait_runtime_cleanup()
             return
         waiter = asyncio.create_task(process.wait())
         try:
@@ -8596,12 +9768,26 @@ class InstanceManager:
         failure_notice_data = None
         admission = None
         terminal_db_context = (
-            self._chat_terminal_db(task_id, instance_id)
+            self._chat_terminal_db(
+                task_id,
+                instance_id,
+                expected_retry_count=expected_retry_count,
+                expected_turn_generation=expected_turn_generation,
+                reason="Chat turn reached terminal bookkeeping",
+            )
             if task_id and chat_initiated
             else self.db_factory()
         )
         async with terminal_db_context as db:
             if task_id and chat_initiated:
+                if db is None:
+                    logger.info(
+                        "Discarding stale chat consumer for instance %s task %s "
+                        "before Harness terminal cleanup",
+                        instance_id,
+                        task_id,
+                    )
+                    return
                 if instance_id in self._stopping or not owns_instance_turn():
                     await db.rollback()
                     return
@@ -10862,6 +12048,38 @@ class InstanceManager:
             return content
         return None
 
+    @staticmethod
+    def _suppress_duplicate_claude_result(
+        event: dict,
+        record: _OutputConsumerRecord | None,
+        provider: str,
+    ) -> dict:
+        """Remove only an exact successful Claude assistant/result repeat."""
+
+        if (
+            provider != "claude"
+            or record is None
+            or event.get("role") != "assistant"
+            or event.get("event_type") not in {"message", "result"}
+            or event.get("is_error")
+            or event.get("orphan")
+            or event.get("autonomous")
+        ):
+            return event
+        content = event.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return event
+        normalized = content.replace("\r\n", "\n").strip()
+        if event["event_type"] == "message":
+            object.__setattr__(record, "last_claude_assistant_text", normalized)
+            return event
+        if normalized != record.last_claude_assistant_text:
+            return event
+        suppressed = dict(event)
+        suppressed["content"] = None
+        suppressed["duplicate_of_assistant"] = True
+        return suppressed
+
     async def _process_event(
         self,
         instance_id: int,
@@ -10894,6 +12112,8 @@ class InstanceManager:
                 else self._consumer_records.get(instance_id)
             )
         )
+        if event_record is not None:
+            provider = str(event_record.provider or provider).lower()
 
         def owns_event_generation() -> bool:
             if event_record is None:
@@ -11276,6 +12496,12 @@ class InstanceManager:
                 except (ValueError, TypeError):
                     pass
 
+        event = self._suppress_duplicate_claude_result(
+            event,
+            event_record,
+            provider,
+        )
+
         # Store the event and related heartbeat/session/unread updates in one
         # transaction.  The old path committed 2-4 times per Codex event,
         # serializing the stream behind SQLite fsyncs before WebSocket delivery.
@@ -11398,6 +12624,7 @@ class InstanceManager:
                 if (
                     event.get("role") == "assistant"
                     and event["event_type"] in ("message", "result")
+                    and event.get("content")
                 ):
                     task_values["has_unread"] = True
                 if task_values:

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from sqlalchemy import select
 
 from backend.models.project import Project
 from backend.models.task import Task
@@ -18,6 +19,8 @@ from backend.services.workspace_review import (
     PreviewConfigurationError,
     PreviewHandle,
     WorkspacePreviewManager,
+    WorkspaceReviewBusyError,
+    WorkspaceReviewError,
     WorkspaceReviewManager,
     capture_workspace_snapshot,
     detect_preview_config,
@@ -212,6 +215,112 @@ def test_sandbox_preview_profile_requires_explicit_port_and_public_hosts(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_new_workspace_review_waits_for_terminal_cleanup_proof(
+    monkeypatch,
+    tmp_path,
+    db_factory,
+):
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_identity,
+    )
+
+    async with db_factory() as db:
+        owner = Task(
+            title="Workspace cleanup owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.flush()
+        identity = test_harness_owner_identity(owner)
+        db.add(
+            WorkspaceReviewRun(
+                id="7" * 32,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                mode="review_only",
+                profile="standard",
+                goal="Retain failed preview cleanup",
+                status="failed",
+                stage="failed",
+                workspace_path=str(tmp_path),
+                git_head="8" * 40,
+                workspace_fingerprint="9" * 64,
+                preview_config={"version": 1},
+                cleanup_status="failed",
+                cleanup_error="preview cleanup was not proven",
+            )
+        )
+        await db.commit()
+        owner_id = owner.id
+
+    monkeypatch.setattr(workspace_review_module, "async_session", db_factory)
+    manager = WorkspaceReviewManager()
+    with pytest.raises(WorkspaceReviewBusyError, match="active workspace review"):
+        await manager.start(
+            task_id=owner_id,
+            owner_identity=identity,
+            goal="Do not overlap unproven preview cleanup",
+            workspace_override=tmp_path,
+            preview_config_override=_http_preview_config(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_fields", "message"),
+    [
+        ({"worker_id": 51}, "Worker-authoritative"),
+        ({"shared_from_id": 52}, "Shared shadow"),
+    ],
+)
+async def test_manager_rejects_remote_authoritative_workspace_owner(
+    monkeypatch,
+    tmp_path,
+    db_factory,
+    owner_fields,
+    message,
+):
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_identity,
+    )
+
+    async with db_factory() as db:
+        owner = Task(
+            title="Remote-authoritative Workspace owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            **owner_fields,
+        )
+        db.add(owner)
+        await db.commit()
+        owner_id = owner.id
+        identity = test_harness_owner_identity(owner)
+
+    monkeypatch.setattr(workspace_review_module, "async_session", db_factory)
+    manager = WorkspaceReviewManager()
+    with pytest.raises(WorkspaceReviewError, match=message):
+        await manager.start(
+            task_id=owner_id,
+            owner_identity=identity,
+            goal="Must execute on the authoritative CCM",
+            workspace_override=tmp_path,
+            preview_config_override=_http_preview_config(),
+        )
+    async with db_factory() as db:
+        assert await db.scalar(
+            select(WorkspaceReviewRun.id).where(
+                WorkspaceReviewRun.task_id == owner_id
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
 async def test_workspace_fingerprint_covers_head_tracked_and_untracked_content(tmp_path):
     workspace = _make_repo(tmp_path)
     config = validate_preview_config(_http_preview_config(), workspace)
@@ -258,6 +367,48 @@ async def test_preview_manager_starts_loopback_process_and_cleans_it_up(tmp_path
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [RuntimeError, asyncio.CancelledError])
+async def test_preview_stop_retains_exact_handle_until_retry_succeeds(
+    monkeypatch,
+    tmp_path,
+    failure_type,
+):
+    manager = WorkspacePreviewManager()
+    temp_dir = tmp_path / "ccm-workspace-preview-retry"
+    temp_dir.mkdir()
+    process = SimpleNamespace(returncode=None)
+    handle = PreviewHandle(
+        run_id="retry-stop",
+        task_id=17,
+        workspace=tmp_path,
+        temp_dir=temp_dir,
+        port=43124,
+        url="http://127.0.0.1:43124/",
+        health_url="http://127.0.0.1:43124/",
+        processes=[process],
+    )
+    manager._handles[handle.run_id] = handle
+    attempts = 0
+
+    async def flaky_terminate(target):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise failure_type("first cleanup did not settle")
+        target.returncode = 0
+
+    monkeypatch.setattr(workspace_review_module, "_terminate_process", flaky_terminate)
+    with pytest.raises(failure_type, match="first cleanup"):
+        await manager.stop(handle.run_id)
+    assert manager._handles[handle.run_id] is handle
+    assert temp_dir.exists()
+
+    assert await manager.stop(handle.run_id) is True
+    assert handle.run_id not in manager._handles
+    assert not temp_dir.exists()
+
+
+@pytest.mark.asyncio
 async def test_workspace_pipeline_creates_context_minimized_browser_task(
     monkeypatch,
     tmp_path,
@@ -295,6 +446,8 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
 
     preview_temp = tmp_path / "isolated-preview"
     preview_temp.mkdir()
+    (preview_temp / "CLAUDE.md").write_text("untrusted preview instructions\n")
+    (preview_temp / "AGENTS.md").write_text("untrusted preview instructions\n")
 
     class FakePreviewManager:
         def __init__(self):
@@ -399,23 +552,20 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
             "selection_source": "browser_review_config",
         },
     )
-    for _ in range(100):
-        async with db_factory() as db:
-            current = await db.get(WorkspaceReviewRun, run.id)
-            if current is not None and current.cleanup_status == "completed":
-                break
-        await asyncio.sleep(0.01)
-    else:
-        pytest.fail("workspace review pipeline did not complete")
+    pipeline = manager._pipelines[run.id]
+    await asyncio.wait_for(pipeline, timeout=5)
+    async with db_factory() as db:
+        current = await db.get(WorkspaceReviewRun, run.id)
 
     assert current is not None
     assert current.status == "completed"
+    assert current.cleanup_status == "completed"
     assert current.stale is False
     assert current.agent_task_id == 918
     assert current.browser_review_job_id == "browser-job-1"
     assert current.report == "# Verdict\n\nThe settings page passed."
     assert preview_manager.stopped == [run.id]
-    assert created_child["target_repo"] == str(preview_temp)
+    assert "target_repo" not in created_child
     assert created_child["archived"] is True
     assert created_child["enabled_skills"] == {"browser-review": "browser-job-1"}
     assert created_child["provider"] == "claude"

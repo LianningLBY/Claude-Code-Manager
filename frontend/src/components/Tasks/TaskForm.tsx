@@ -6,11 +6,13 @@ import type {
   Project,
   TagItem,
   Task,
+  TaskSSHGrantInput,
 } from '../../api/client';
 import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
 import { SecretPicker } from '../Secrets/SecretPicker';
+import { SSHGrantPicker } from '../SSH/TaskSSHAccess';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
@@ -106,6 +108,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const fileUpload = useFileUpload();
   const clearFileUploads = fileUpload.clear;
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
+  const [selectedSSHGrants, setSelectedSSHGrants] = useState<TaskSSHGrantInput[]>([]);
   const [dropError, setDropError] = useState('');
   const [enabledPlugins, setEnabledPlugins] = useState<Record<string, boolean>>({});
   const [codexTaskSkillsEnabled, setCodexTaskSkillsEnabled] = useState(false);
@@ -300,6 +303,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (mode !== 'delivery_loop') return;
     clearFileUploads();
     setSelectedSecretIds([]);
+    setSelectedSSHGrants([]);
     setCloneFromTaskId('');
     setPriority(0);
     setThinkingBudget('');
@@ -462,6 +466,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   }, [provider, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
 
   const handleProjectChange = (val: string) => {
+    const nextProject = projects.find((project) => String(project.id) === val);
+    if (nextProject?.worker_id != null) setSelectedSSHGrants([]);
     if (val === NEW_PROJECT_VALUE) {
       setIsNewProject(true);
       setProjectId('');
@@ -570,9 +576,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       }));
 
       if (mode === 'delivery_loop') {
-        if (uploadedPaths.length > 0 || selectedSecretIds.length > 0) {
+        if (
+          uploadedPaths.length > 0
+          || selectedSecretIds.length > 0
+          || selectedSSHGrants.length > 0
+        ) {
           throw new Error(
-            'Delivery Loop V1 does not accept Task attachments or Task secrets. '
+            'Delivery Loop V1 does not accept Task attachments, secrets, or SSH grants. '
             + 'Put durable requirements in the prompt or repository.',
           );
         }
@@ -612,6 +622,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
+          ...(!remoteTaskScope && selectedSSHGrants.length > 0
+            ? { ssh_grants: selectedSSHGrants }
+            : {}),
           ...(workerId ? { worker_id: parseInt(workerId) } : {}),
           ...(autoCapabilityEligible && autoCapabilityBudgetSum > 0 ? {
             capability_policy: {
@@ -663,6 +676,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setDescription('');
       fileUpload.clear();
       setSelectedSecretIds([]);
+      setSelectedSSHGrants([]);
       setCloneFromTaskId('');
       setGoalCondition('');
       setGoalMaxTurns('30');
@@ -729,6 +743,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             onChange={handleFileSelect}
           />
           <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />
+          {isAdmin && (
+            <SSHGrantPicker
+              value={selectedSSHGrants}
+              onChange={setSelectedSSHGrants}
+              disabledReason={remoteTaskScope ? 'Manager-local SSH keys are unavailable to Worker Tasks' : undefined}
+            />
+          )}
           {fileUpload.uploads.map((upload) => (
             <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
               {upload.preview ? (

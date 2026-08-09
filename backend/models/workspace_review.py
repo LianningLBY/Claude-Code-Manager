@@ -12,6 +12,7 @@ class WorkspaceReviewRun(Base):
     """Durable owner record for one current-workspace browser verification."""
 
     __tablename__ = "workspace_review_runs"
+    __table_args__ = {"mysql_engine": "InnoDB"}
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)

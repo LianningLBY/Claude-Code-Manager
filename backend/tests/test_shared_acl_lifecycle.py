@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
-from backend.api import team_sharing
+from backend.api import sharing, team_sharing
 from backend.models.delivery import DeliveryRun
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
@@ -16,6 +16,7 @@ from backend.models.task_share import ProjectShare, SharedTaskReceived
 from backend.models.team_share import TeamProjectShare, TeamTaskShare
 from backend.models.user import User
 from backend.models.user_group import UserGroup, UserGroupMember
+from backend.services.project_share_admission import ProjectShareAdmissionError
 from backend.services.shared_relay import SharedRelay
 
 
@@ -24,6 +25,62 @@ def _request(*, user_id: int = 7, role: str = "member"):
         user_id=user_id,
         user_role=role,
     ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_detail"),
+    [
+        (
+            ProjectShareAdmissionError(
+                "Could not establish the Project sharing fence; retry"
+            ),
+            409,
+            "retry",
+        ),
+        (ValueError("Project 404 not found"), 404, "Project not found"),
+    ],
+)
+async def test_team_project_share_lock_preserves_admission_error_semantics(
+    db_session,
+    monkeypatch,
+    error,
+    expected_status,
+    expected_detail,
+):
+    monkeypatch.setattr(
+        team_sharing,
+        "lock_project_share_authority",
+        AsyncMock(side_effect=error),
+    )
+
+    with pytest.raises(HTTPException) as rejected:
+        await team_sharing._lock_project_share_authority(404, db_session)
+
+    assert rejected.value.status_code == expected_status
+    assert expected_detail in rejected.value.detail
+
+
+@pytest.mark.asyncio
+async def test_feishu_project_share_admission_error_maps_to_conflict(
+    db_session,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        sharing.task_sharing,
+        "share_project",
+        AsyncMock(side_effect=ProjectShareAdmissionError("local Agent active")),
+    )
+
+    with pytest.raises(HTTPException) as rejected:
+        await sharing.share_project(
+            7,
+            sharing.ShareRequest(targets=[]),
+            db_session,
+        )
+
+    assert rejected.value.status_code == 409
+    assert rejected.value.detail == "local Agent active"
 
 
 @pytest.mark.asyncio

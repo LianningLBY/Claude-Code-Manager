@@ -40,6 +40,7 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("lease_nonce"),
         sa.UniqueConstraint("run_id"),
+        mysql_engine="InnoDB",
     )
     for column in ("run_id", "resource_id", "status"):
         op.create_index(

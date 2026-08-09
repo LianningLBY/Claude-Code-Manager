@@ -682,12 +682,12 @@ export function UpdateButton() {
     <>
       {showUpdateNotice && dryRunResult && createPortal(
         <div
-          className="pointer-events-none fixed inset-x-0 top-3 z-[60] flex justify-center px-4"
+          className="pointer-events-none fixed inset-x-0 top-[calc(env(safe-area-inset-top)+0.75rem)] z-[60] flex justify-center px-3 sm:px-4"
           data-testid="update-available-notice"
           aria-live="polite"
         >
           <div
-            className="pointer-events-auto flex w-full max-w-xl items-center gap-3 rounded-lg border border-amber-500/40 bg-gray-900/95 px-4 py-3 shadow-xl backdrop-blur"
+            className="pointer-events-auto flex w-full max-w-xl items-center gap-2 rounded-lg border border-amber-500/40 bg-gray-900/95 px-3 py-2 shadow-xl backdrop-blur sm:gap-3 sm:px-4 sm:py-3"
             role="status"
           >
             <ArrowUpCircle size={18} className="shrink-0 text-amber-400" />
@@ -704,14 +704,14 @@ export function UpdateButton() {
             <button
               type="button"
               onClick={handleOpenUpdateNotice}
-              className="shrink-0 rounded bg-amber-500/15 px-2.5 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-500/25"
+              className="min-h-11 shrink-0 rounded bg-amber-500/15 px-3 text-xs font-medium text-amber-300 hover:bg-amber-500/25 sm:min-h-0 sm:px-2.5 sm:py-1.5"
             >
               查看详情
             </button>
             <button
               type="button"
               onClick={() => setShowUpdateNotice(false)}
-              className="shrink-0 rounded p-1 text-gray-500 hover:bg-gray-800 hover:text-gray-300"
+              className="flex h-11 w-11 shrink-0 items-center justify-center rounded text-gray-500 hover:bg-gray-800 hover:text-gray-300 sm:h-auto sm:w-auto sm:p-1"
               aria-label="关闭更新提醒"
             >
               <X size={15} />

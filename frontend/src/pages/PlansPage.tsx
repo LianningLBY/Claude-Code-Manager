@@ -30,7 +30,7 @@ const DISPLAY_STATE_QUERY: Record<StatusFilter, string | undefined> = {
   all: undefined,
   waiting_user: 'waiting_user',
   awaiting_review: 'awaiting_review',
-  running: 'planner,reviewer,queued,running',
+  running: 'planner,reviewer,queued,running,cancelling',
   approved: 'approved',
   applied: 'applied',
   failed: 'failed',

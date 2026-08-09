@@ -8,7 +8,7 @@ import secrets
 import re
 from datetime import datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.pr_monitor import (
@@ -21,6 +21,14 @@ from backend.models.pr_monitor import (
     PRReview,
 )
 from backend.models.task import Task
+from backend.services.delivery_pr_policy import (
+    DeliveryPRPolicyError,
+    frozen_delivery_pr_policy,
+    legacy_pr_effect_is_forbidden,
+)
+from backend.services.worker_task_termination import (
+    no_active_worker_task_termination_predicate,
+)
 
 
 def _hash_evidence(value: dict) -> str:
@@ -29,6 +37,87 @@ def _hash_evidence(value: dict) -> str:
 
 
 _REPAIR_PUSH_TIMEOUT = timedelta(minutes=15)
+_REVIEW_ERROR_REASON_PREFIX = "review_error"
+
+
+def _review_error_pause_reason(review: PRReview) -> str:
+    summary = (review.review_summary or "PR reviewer failed without a summary").strip()
+    return f"{_REVIEW_ERROR_REASON_PREFIX}:{review.id}:{summary}"[:2000]
+
+
+def _apply_current_review_error(
+    run: PRMonitorRun,
+    review: PRReview,
+) -> bool:
+    """Pause only the exact Monitor generation owned by a failed Review."""
+
+    if (
+        review.status != "error"
+        or review.action_taken != "error"
+        or review.monitor_run_id != run.id
+        or review.base_sha is None
+        or review.head_sha is None
+        or run.current_review_id != review.id
+        or run.current_base_sha != review.base_sha
+        or run.current_head_sha != review.head_sha
+    ):
+        return False
+    reason = _review_error_pause_reason(review)
+    if run.status == "paused" and run.pause_reason == reason:
+        return False
+    if run.status != "reviewing":
+        return False
+    run.status = "paused"
+    run.pause_reason = reason
+    run.state_version += 1
+    return True
+
+
+async def record_review_error(
+    db: AsyncSession,
+    *,
+    review_id: int,
+) -> bool:
+    """Durably project a terminal Review error onto its exact Monitor Run.
+
+    Review finalization and this Monitor transition share one commit when the
+    caller has just marked the Review as ``error``.  Re-selecting the Review
+    with a row lock also makes this safe for startup recovery: a superseded
+    Review can never pause the replacement head.
+    """
+
+    # Flush a caller's just-written Review/ReviewerRun error before refreshing
+    # the same Review with ``populate_existing`` below.
+    await db.flush()
+    review = (
+        await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    changed = False
+    if (
+        review is not None
+        and review.status == "error"
+        and review.action_taken == "error"
+        and review.monitor_run_id is not None
+    ):
+        run = (
+            await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.id == review.monitor_run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if run is not None:
+            changed = _apply_current_review_error(run, review)
+    # The Review error itself must remain durable even if its Monitor has
+    # already advanced to a newer immutable head.
+    await db.commit()
+    return changed
 
 
 def restore_repair_developer_task(task: Task) -> bool:
@@ -223,8 +312,39 @@ async def record_blocking_evidence(
     ))).scalar_one_or_none()
     if existing is not None:
         return existing
+    try:
+        delivery_owned = (
+            await frozen_delivery_pr_policy(
+                db,
+                review,
+                monitor_run_id=run.id,
+            )
+            is not None
+        )
+        delivery_policy_error = None
+    except DeliveryPRPolicyError as exc:
+        # The marker itself asserts restricted ownership.  Corrupt linkage may
+        # pause the workflow, but it can never re-enable legacy auto-repair.
+        delivery_owned = bool(
+            isinstance(review.delivery_id, str)
+            and review.delivery_id.startswith("delivery:")
+        )
+        delivery_policy_error = str(exc)
+    if not delivery_owned:
+        developer_task = (
+            await db.get(Task, run.developer_task_id, populate_existing=True)
+            if run.developer_task_id is not None
+            else None
+        )
+        delivery_owned = await legacy_pr_effect_is_forbidden(
+            db,
+            review=review,
+            monitor_run=run,
+            task=developer_task,
+        )
     can_deliver = bool(
         repo.auto_repair
+        and not delivery_owned
         and run.developer_task_id is not None
         and run.repair_attempts < run.max_repair_attempts
     )
@@ -243,7 +363,16 @@ async def record_blocking_evidence(
     )
     db.add(wake)
     run.status = "repair_pending" if can_deliver else "waiting_for_fix"
-    if repo.auto_repair and run.repair_attempts >= run.max_repair_attempts:
+    if delivery_policy_error is not None:
+        run.status = "paused"
+        run.pause_reason = (
+            f"delivery_policy_invalid:{delivery_policy_error[:400]}"
+        )
+    if (
+        repo.auto_repair
+        and not delivery_owned
+        and run.repair_attempts >= run.max_repair_attempts
+    ):
         run.status = "paused"
         run.pause_reason = "repair_budget_exhausted"
     run.state_version += 1
@@ -269,6 +398,28 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
         run.state_version += 1
         await db.commit()
         return
+    try:
+        delivery_policy = await frozen_delivery_pr_policy(
+            db,
+            review,
+            monitor_run_id=run.id,
+        )
+    except DeliveryPRPolicyError as exc:
+        # A non-null Delivery marker must never fall back to mutable repository
+        # merge policy.  Surface a durable pause instead of creating any
+        # GitHub side effect from an unverifiable policy.
+        run.status = "paused"
+        run.pause_reason = f"delivery_policy_invalid:{str(exc)[:400]}"
+        run.state_version += 1
+        await db.commit()
+        return
+    delivery_owned = delivery_policy is not None
+    if not delivery_owned:
+        delivery_owned = await legacy_pr_effect_is_forbidden(
+            db,
+            review=review,
+            monitor_run=run,
+        )
     unresolved_published = list((await db.execute(
         select(PRFinding.id)
         .join(PRReview, PRReview.id == PRFinding.pr_review_id)
@@ -290,7 +441,11 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
     run.status = "ready_to_merge"
     run.state_version += 1
     repo = await db.get(MonitoredRepo, review.repo_id, populate_existing=True)
-    if repo is not None and (repo.merge_queue_mode or "manual") in {"shadow", "auto"}:
+    if (
+        not delivery_owned
+        and repo is not None
+        and (repo.merge_queue_mode or "manual") in {"shadow", "auto"}
+    ):
         existing = (await db.execute(select(PRMergeQueueAction).where(
             PRMergeQueueAction.monitor_run_id == run.id,
             PRMergeQueueAction.trigger_head_sha == review.head_sha,
@@ -312,10 +467,10 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
 async def reconcile_terminal_review_runs(db_factory) -> int:
     """Recover the commit gap between a terminal Review and its Run Gate.
 
-    GitHub publication is finalized in its own exact-generation transaction.
-    The process may exit before the subsequent monitor-run transition.  Only a
-    terminal Review that is still the Run's exact current base/head subject may
-    be replayed here.
+    GitHub publication and reviewer failure handling finalize in their own
+    exact-generation transactions.  The process may exit before the subsequent
+    monitor-run transition.  Only a terminal Review that is still the Run's
+    exact current base/head subject may be replayed here.
     """
 
     async with db_factory() as db:
@@ -326,10 +481,20 @@ async def reconcile_terminal_review_runs(db_factory) -> int:
                 PRMonitorRun.status == "reviewing",
                 PRMonitorRun.current_base_sha == PRReview.base_sha,
                 PRMonitorRun.current_head_sha == PRReview.head_sha,
-                PRReview.status.in_(("approved", "commented", "merged")),
-                PRReview.action_taken.in_((
-                    "lgtm_comment", "review_comments", "approved_merged",
-                )),
+                or_(
+                    and_(
+                        PRReview.status.in_(("approved", "commented", "merged")),
+                        PRReview.action_taken.in_((
+                            "lgtm_comment",
+                            "review_comments",
+                            "approved_merged",
+                        )),
+                    ),
+                    and_(
+                        PRReview.status == "error",
+                        PRReview.action_taken == "error",
+                    ),
+                ),
             )
             .order_by(PRReview.id)
         )).scalars())
@@ -337,12 +502,20 @@ async def reconcile_terminal_review_runs(db_factory) -> int:
     reconciled = 0
     for review_id in review_ids:
         async with db_factory() as db:
+            review = (
+                await db.execute(
+                    select(PRReview)
+                    .where(PRReview.id == review_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
             run = (await db.execute(
                 select(PRMonitorRun)
                 .where(PRMonitorRun.current_review_id == review_id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )).scalar_one_or_none()
-            review = await db.get(PRReview, review_id, populate_existing=True)
             if (
                 run is None
                 or review is None
@@ -350,10 +523,14 @@ async def reconcile_terminal_review_runs(db_factory) -> int:
                 or review.monitor_run_id != run.id
                 or run.current_base_sha != review.base_sha
                 or run.current_head_sha != review.head_sha
-                or review.status not in {"approved", "commented", "merged"}
+                or review.status not in {"approved", "commented", "merged", "error"}
             ):
+                await db.rollback()
                 continue
-            if review.action_taken == "review_comments":
+            if review.status == "error" and review.action_taken == "error":
+                _apply_current_review_error(run, review)
+                await db.commit()
+            elif review.action_taken == "review_comments":
                 await record_blocking_evidence(
                     db,
                     review_id=review.id,
@@ -495,6 +672,29 @@ async def _admit_repair_wake_locked(
         or not locked_task.session_id
         or not locked_task.last_cwd
     ):
+        return False
+    locked_review = None
+    if run.current_review_id is not None:
+        locked_review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == run.current_review_id,
+                    PRReview.monitor_run_id == run.id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+    if await legacy_pr_effect_is_forbidden(
+        db,
+        review=locked_review,
+        monitor_run=run,
+        task=locked_task,
+    ):
+        # Delivery creates shadow evidence for its controller.  A stale
+        # pending/delivering legacy Wake must never be admitted merely because
+        # it was written before publisher adoption or monitor binding.
         return False
     accepted = await db.execute(
         update(PRRepairWake)
@@ -669,7 +869,10 @@ async def _cas_repair_terminal(
     # whose SELECT FOR UPDATE support is weaker.
     task_guard = await db.execute(
         update(Task)
-        .where(*_repair_task_cas_predicates(wake, task)[:8])
+        .where(
+            *_repair_task_cas_predicates(wake, task)[:8],
+            no_active_worker_task_termination_predicate(),
+        )
         .values(status=Task.status)
         .execution_options(synchronize_session=False)
     )

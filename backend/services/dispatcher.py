@@ -1,5 +1,6 @@
 import asyncio
 import glob
+import hashlib
 import json
 import logging
 import os
@@ -26,8 +27,13 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.models.plan import Plan
-from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentStep,
+    PlanAgentWorkerDispatchReceipt,
+)
 from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
@@ -36,7 +42,6 @@ from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
     context_tokens_used,
-    is_context_window_exceeded,
 )
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.instance_capacity import (
@@ -76,6 +81,10 @@ from backend.services.task_artifact_contract import (
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
+from backend.services.worker_task_termination import (
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
+)
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
 logger = logging.getLogger(__name__)
@@ -85,6 +94,53 @@ if TYPE_CHECKING:
     from backend.services.codex_pool import CodexPool
 
 
+def _durable_json_digest(payload: dict) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _worker_handoff_message_matches_payload(
+    msg: "QueuedMessage",
+    payload: dict,
+) -> bool:
+    expected = payload.get("expected_task_routing")
+    expected_routing = (
+        tuple(expected)
+        if isinstance(expected, list) and len(expected) == 3
+        else None
+    )
+    timestamp = payload.get("queue_timestamp")
+    return bool(
+        isinstance(timestamp, (int, float))
+        and not isinstance(timestamp, bool)
+        and float(timestamp) == msg.timestamp
+        and payload.get("priority", PRIORITY_USER) == msg.priority
+        and payload.get("prompt") == msg.prompt
+        and payload.get("source", "user") == msg.source
+        and payload.get("user_message_text") == msg.user_message_text
+        and payload.get("command_skills") == msg.command_skills
+        and payload.get("model_override") == msg.model_override
+        and expected_routing == msg.expected_task_routing
+        and payload.get("source_log_id") == msg.source_log_id
+        and payload.get("current_message") == msg.current_message
+        and bool(payload.get("allow_new_session", False))
+        == msg.allow_new_session
+        and payload.get("delivery_key") == msg.delivery_key
+        and payload.get("worker_turn_handoff_id")
+        == msg.worker_turn_handoff_id
+        and payload.get("worker_turn_handoff_retry_count")
+        == msg.worker_turn_handoff_retry_count
+        and payload.get("worker_turn_handoff_from_generation")
+        == msg.worker_turn_handoff_from_generation
+    )
+
 class QueuedMessagePrelaunchError(RuntimeError):
     """A queued message launch failed before any managed turn could start."""
 
@@ -93,12 +149,38 @@ class QueuedMessageRoutingMismatchError(RuntimeError):
     """A user message was admitted from a stale provider/model/tier view."""
 
 
+class QueuedTurnLaunchOutcomeUncertainError(RuntimeError):
+    """A queued turn crossed its provider boundary without settling."""
+
+
+class WorkerTurnLaunchOutcomeUncertainError(
+    QueuedTurnLaunchOutcomeUncertainError
+):
+    """A Worker handoff crossed its external-effect boundary without settling."""
+
+
+class QueuedAdmissionCommitOutcomeUncertainError(RuntimeError):
+    """A queued turn admission commit could not be proven committed or absent."""
+
+
+class CapabilityResumeLeaseLostError(RuntimeError):
+    """Another durable owner superseded this volatile outbox publication."""
+
+
 class TaskQueueAbortTimeoutError(RuntimeError):
     """A dequeued message worker did not settle after cancellation."""
 
 
 class TaskLifecycleSupersededError(RuntimeError):
     """An external routing side effect lost its immutable Task generation."""
+
+
+class AuxiliaryLaunchSupersededError(RuntimeError):
+    """A durable Task termination receipt owns auxiliary cleanup."""
+
+
+class ModeTurnContinuationError(RuntimeError):
+    """A completed mode turn cannot safely authorize its next turn."""
 
 
 async def _settle_despite_cancellation(awaitable):
@@ -271,6 +353,7 @@ def _agent_doc_preamble(task: Task) -> str:
 
 
 # Priority levels for the per-task message queue
+PRIORITY_CAPABILITY_RESUME = -1
 PRIORITY_USER = 0
 PRIORITY_MONITOR_COMPLETE = 1
 PRIORITY_MONITOR_IMPORTANT = 2
@@ -295,6 +378,8 @@ TASK_QUEUE_ABORT_TIMEOUT = 15.0
 AUX_LIFECYCLE_CANCEL_TIMEOUT = 10.0
 DISPATCHER_BACKGROUND_STOP_TIMEOUT = 10.0
 SHUTDOWN_LIFECYCLE_CANCEL_TIMEOUT = 15.0
+PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL = 5.0
+PLAN_RUNTIME_RECOVERY_BACKOFF_MAX = 60.0
 MONITOR_TURN_TIMEOUT = 600.0
 MONITOR_MAX_CONSECUTIVE_FAILURES = 3
 MONITOR_FAILURE_BACKOFF_BASE = 5.0
@@ -310,6 +395,7 @@ class _TaskStatusGeneration:
     shared_from_id: int | None
     status: str
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
@@ -330,12 +416,62 @@ class _TaskLifecycleGeneration:
     worker_id: int | None
     shared_from_id: int | None
     retry_count: int
+    turn_generation: int
     instance_id: int | None
     started_at: datetime | None
     completed_at: datetime | None
 
 
 _TaskRoutingGeneration = _TaskLifecycleGeneration | _TaskStatusGeneration
+
+
+@dataclass(frozen=True)
+class _TaskLifecycleFinalization:
+    """Committed result of one source-aware lifecycle finalization."""
+
+    generation: _TaskStatusGeneration
+    published: bool
+    failed_task: Task | None = None
+
+
+@dataclass(slots=True)
+class _ModeTurnSequence:
+    """In-memory proof carried only across one live Loop/Goal lifecycle.
+
+    The durable source intentionally keeps one logical-turn generation across
+    mode iterations.  A later iteration therefore needs a one-shot authority
+    minted from the immediately preceding successful provider turn; merely
+    observing the same transport in the database is never replay authority.
+    """
+
+    next_token: object | None = None
+    predecessor_process: object | None = None
+    prelaunch_log_id: int | None = None
+    predecessor_loop_iteration: int | None = None
+
+
+@dataclass(slots=True)
+class _ModeTurnTerminalProof:
+    """One exact successful mode turn, consumable by at most one follow-up.
+
+    Loop ``done`` and Goal evaluation need the same durable terminal proof as
+    a continuation, but must not mint replay authority merely to classify the
+    turn.  The identity fields prevent an internal caller from applying proof
+    from another Task/generation/Instance, while ``spent`` preserves the
+    continuation helper's pre-existing one-shot behavior across cancellation
+    and mint failures.
+    """
+
+    task_id: int
+    retry_count: int
+    turn_generation: int
+    instance_id: int
+    source_log_id: int
+    terminal_log_id: int
+    native_turn_id: str | None
+    loop_iteration: int
+    previous_process: object
+    spent: bool = False
 
 
 @dataclass(slots=True)
@@ -397,6 +533,20 @@ class TaskStartConflictError(RuntimeError):
     """A different queued turn already owns this Task's start admission."""
 
 
+@dataclass(frozen=True, slots=True)
+class QueueAdmissionFence:
+    """In-process proof that no Task queue clear happened after a producer read.
+
+    Monitor/sub-agent producers commit their result before publishing the
+    follow-up turn.  An explicit stop can finish in that commit -> enqueue gap;
+    carrying this immutable snapshot into admission prevents the late producer
+    from reopening the just-stopped Task.
+    """
+
+    epoch: str
+    generation: int
+
+
 @dataclass(order=True)
 class QueuedMessage:
     priority: int
@@ -428,6 +578,45 @@ class QueuedMessage:
     # startup recovery may request admission, but only one in-memory item is
     # accepted for this key.
     delivery_key: str | None = field(compare=False, default=None)
+    # Durable Auto-Capability resume identity.  The coordinator publishes only
+    # the row id and its committed publication lease; the queue consumer must
+    # reconstruct and hash-check the model-facing payload from the database.
+    # A claimed retry reuses ``claimed_*`` below and therefore can never turn
+    # one Capability result into G+2.
+    capability_resume_outbox_id: int | None = field(
+        compare=False,
+        default=None,
+    )
+    capability_resume_lease_token: str | None = field(
+        compare=False,
+        default=None,
+        repr=False,
+    )
+    # Manager -> Worker ordinary-chat receipt.  Unlike ``delivery_key`` this
+    # is not a PlanApplicationReceipt; its durable outbox is the Worker-local
+    # user LogEntry.  The three fields authorize exactly retry/G -> G+1.
+    worker_turn_handoff_id: str | None = field(compare=False, default=None)
+    worker_turn_handoff_retry_count: int | None = field(
+        compare=False, default=None
+    )
+    worker_turn_handoff_from_generation: int | None = field(
+        compare=False, default=None
+    )
+    # In-process launch retries reuse the already-claimed logical generation
+    # instead of incorrectly turning one receipt into G+2.
+    worker_turn_handoff_claimed_generation: int | None = field(
+        compare=False, default=None, repr=False
+    )
+    # Any safely requeued pre-launch attempt must reuse the logical turn it
+    # already claimed.  These volatile fields apply to ordinary user/Plan
+    # messages as well as Worker handoffs; otherwise a harmless slot/routing
+    # retry would advance G+1 again and bind the same request to G+2.
+    claimed_retry_count: int | None = field(
+        compare=False, default=None, repr=False
+    )
+    claimed_turn_generation: int | None = field(
+        compare=False, default=None, repr=False
+    )
     # A queue clear can own recovery of an item during the tiny q.get() ->
     # in-flight registration window. The consumer then must not recover the
     # same durable receipt a second time.
@@ -454,6 +643,84 @@ class QueuedMessage:
     # Recovery/compaction messages intentionally starting a replacement
     # session leave this false even though ``allow_new_session`` is true.
     defer_for_initial_session: bool = field(compare=False, default=False)
+    # A structured Codex context rejection may safely create a replacement
+    # logical turn, but only if the rejected generation survives its expected
+    # output-consumer settlement.  This immutable permit prevents a cancel,
+    # retry, or source replacement in the commit -> in-memory enqueue gap from
+    # resurrecting a terminal Task.
+    context_retry_permit: "ContextRetryPermit | None" = field(
+        compare=False,
+        default=None,
+        repr=False,
+    )
+    # Internal producers snapshot this before committing the result which
+    # authorizes their follow-up.  Admission must still observe the same
+    # dispatcher process and per-Task queue generation.
+    queue_admission_fence: "QueueAdmissionFence | None" = field(
+        compare=False,
+        default=None,
+        repr=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ContextRetryPermit:
+    task_id: int
+    instance_id: int
+    retry_count: int
+    turn_generation: int
+    turn_source_log_id: int
+    session_id: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LifecycleContextPreflightPermit:
+    """Exact lifecycle generation proven to be a safe Codex rejection."""
+
+    task_id: int
+    worker_id: int | None
+    shared_from_id: int | None
+    status: str
+    instance_id: int | None
+    retry_count: int
+    turn_generation: int
+    turn_source_log_id: int
+    session_id: str
+    started_at: datetime | None
+    completed_at: datetime | None
+
+
+def _context_retry_permit_matches(
+    task: Task,
+    msg: QueuedMessage,
+) -> bool:
+    """Validate the exact rejected generation before compact-retry admission."""
+
+    permit = msg.context_retry_permit
+    if permit is None:
+        # ``compact_retry`` is an internal replay authority, not merely a
+        # descriptive source label.  Legacy/forged queue items without the
+        # immutable rejected-generation proof must fail closed; ordinary
+        # queued messages do not need this specialized permit.
+        return msg.source != "compact_retry"
+    return bool(
+        msg.source == "compact_retry"
+        and isinstance(permit, ContextRetryPermit)
+        and task.id == permit.task_id
+        # These are the only states the settling rejected consumer may leave
+        # behind.  Keep the allow-list here rather than on the caller-supplied
+        # dataclass so no producer can authorize cancelled/stopped/completed.
+        and task.status in {"executing", "in_progress", "failed"}
+        and task.instance_id == permit.instance_id
+        and task.retry_count == permit.retry_count
+        and task.turn_generation == permit.turn_generation
+        and task.turn_source_log_id == permit.turn_source_log_id
+        and task.session_id == permit.session_id
+        and task.started_at == permit.started_at
+        and task.completed_at == permit.completed_at
+    )
 
 
 def _binary_available(binary: str) -> bool:
@@ -501,6 +768,23 @@ def _default_worker_model(provider: str) -> str:
     return (
         settings.default_codex_model if provider == "codex" else settings.default_model
     )
+
+
+def _turn_transport_name(task: Task) -> str | None:
+    """Return only transport evidence fixed before provider launch.
+
+    Runtime PTY mode may change between the DB admission transaction and
+    ``launch()``.  Ordinary Claude turns therefore stay provider-generic here;
+    a future post-launch exact-process hook may refine that evidence.  PR
+    sandbox isolation and the Codex provider are already immutable at claim.
+    """
+
+    provider = (task.provider or "claude").lower()
+    if provider == "codex":
+        return "codex"
+    if is_pr_sandbox_task(task):
+        return "claude_exec"
+    return None
 
 
 def _initial_task_command(task: Task):
@@ -643,6 +927,9 @@ class GlobalDispatcher:
         self.db_factory = db_factory
         self.instance_manager = instance_manager
         self.broadcaster = broadcaster
+        # Injected by backend.main after the generic Capability coordinator is
+        # constructed.  Durable polling remains the fallback source of truth.
+        self.capability_invocation_wake: Callable[[], None] | None = None
         # Detached PTY chat epochs finalize outside the dispatcher lifecycle.
         # Route their exact terminal point back through the same PR completion
         # consumer used by ordinary foreground tasks.
@@ -722,14 +1009,30 @@ class GlobalDispatcher:
         self._task_queue_workers: dict[int, asyncio.Task] = {}
         self._task_queue_activity: dict[int, float] = {}
         self._queued_delivery_keys: set[str] = set()
+        self._queued_capability_resume_ids: set[int] = set()
+        self._queued_worker_turn_handoffs: set[str] = set()
         self._cancel_durable_queue_tasks: set[int] = set()
         self._task_queue_cancellation_lease_counts: dict[int, int] = {}
+        # A waiting-Capability stop first reaps an already-dequeued resume
+        # consumer, then cancels the Invocation, and only then terminalizes the
+        # outbox.  During that first phase the queue remains admission-closed,
+        # but the consumer must release (not cancel) its publication lease.
+        self._preserve_capability_resume_on_queue_cancel: dict[int, int] = {}
         # A receipt stages against both this process epoch and the task queue
         # generation. A same-process stop that completes before the receipt is
         # committed still invalidates that staged admission; a later process
         # may safely recover the durable pending row under its new epoch.
         self._queue_admission_epoch = secrets.token_hex(16)
         self._task_queue_dequeued: dict[int, QueuedMessage] = {}
+        # Exact volatile owner for the one message currently admitted by each
+        # per-Task consumer.  Durable state can prove that a Capability resume
+        # claimed G+1, but stop/cancel must also prove the local worker it is
+        # about to cancel owns that same outbox/lease/generation.  A count or
+        # the task-wide dedup set alone cannot distinguish an active message
+        # from one merely queued behind it.
+        self._task_queue_active_messages: dict[
+            int, tuple[asyncio.Task, QueuedMessage]
+        ] = {}
         # A queued or currently-consumed resume is task work even before its DB
         # status becomes executing. Keeping it as a maintenance blocker avoids
         # restarting after accepting a chat/monitor message but before launch.
@@ -749,6 +1052,20 @@ class GlobalDispatcher:
         # Alternate local admission when both queues have work so neither
         # ordinary Tasks nor first-class PlanRuns can starve the other.
         self._prefer_plan_runs = True
+        # Cold Plan runtime cleanup can be temporarily unprovable while an old
+        # shared Codex app-server still exists. Retry only from the single
+        # dispatch producer, before it can claim/register another Plan
+        # lifecycle, so recovery never observes that commit-to-registration
+        # window as an orphan. The deadline prevents the 2s task poll from
+        # turning into a high-frequency database/runtime audit.
+        self._plan_runtime_recovery_not_before: float | None = None
+        self._plan_runtime_recovery_backoff = (
+            PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL
+        )
+        # A lifecycle can become orphaned while an older cold scan is awaiting
+        # I/O. The generation stops that older clean result from erasing the
+        # newer retry request.
+        self._plan_runtime_recovery_signal_generation = 0
 
         # Pool: initialized lazily on start() if pool_enabled
         self.pool: "ClaudePool | None" = None
@@ -823,24 +1140,47 @@ class GlobalDispatcher:
         lifecycle = (
             self._running_tasks.get(instance_id) if instance_id is not None else None
         )
-        if lifecycle is None and instance_id is None:
+        if lifecycle is not None and getattr(
+            lifecycle,
+            "_ccm_worker_plan_cancellation_recovery",
+            False,
+        ):
+            lifecycle = None
+        if lifecycle is None:
             lifecycle = next(
                 (
                     task
                     for task in self._running_tasks.values()
                     if not task.done()
-                    and getattr(task, "_ccm_worker_plan_run_id", None) == run_id
+                    and not getattr(
+                        task,
+                        "_ccm_worker_plan_cancellation_recovery",
+                        False,
+                    )
+                    and (
+                        getattr(task, "_ccm_plan_run_id", None) == run_id
+                        or getattr(task, "_ccm_worker_plan_run_id", None) == run_id
+                    )
                 ),
                 None,
             )
         if (
             lifecycle is None
             or lifecycle.done()
+            or getattr(
+                lifecycle,
+                "_ccm_worker_plan_cancellation_recovery",
+                False,
+            )
             or (
                 getattr(lifecycle, "_ccm_plan_run_id", None) != run_id
                 and getattr(lifecycle, "_ccm_worker_plan_run_id", None) != run_id
             )
         ):
+            # This generic runtime API is also called by the ordinary Plan
+            # route, whose request-scoped database may differ from the global
+            # dispatcher's factory in tests and embedded apps. Durable cold-
+            # restart proof therefore belongs to the Capability-only adapter.
             return False
         lifecycle.cancel()
         try:
@@ -857,6 +1197,193 @@ class GlobalDispatcher:
                 f"Plan Run {run_id} runtime cleanup could not be confirmed"
             )
         return True
+
+    async def stop_capability_plan_run_lifecycle(
+        self,
+        run_id: int,
+        instance_id: int | None,
+    ) -> bool:
+        """Stop a Capability PlanRun or prove its cold-start runtime absent.
+
+        Unlike the generic Plan API callback, this method is injected only
+        into the process-global Capability executor and may therefore use the
+        dispatcher's matching database factory for durable absence proof.
+        """
+
+        from backend.models.capability import (
+            CapabilityExecution,
+            CapabilityInvocation,
+        )
+        from backend.services.plan_agent_runner import active_plan_run_ids
+        from backend.services.plan_capability import PLAN_RUN_HANDLE_GENERATION
+        from backend.services.plan_runtime_receipt import (
+            reconcile_runtime_generation,
+        )
+
+        target_generation: int | None = None
+        plan_id: int | None = None
+        async with self.db_factory() as db:
+            run = await db.get(
+                PlanAgentRun,
+                run_id,
+                populate_existing=True,
+            )
+            plan = (
+                await db.get(Plan, run.plan_id, populate_existing=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            execution = (
+                await db.get(
+                    CapabilityExecution,
+                    run.capability_execution_id,
+                    populate_existing=True,
+                )
+                if run is not None and run.capability_execution_id is not None
+                else None
+            )
+            invocation = (
+                await db.get(
+                    CapabilityInvocation,
+                    execution.invocation_id,
+                    populate_existing=True,
+                )
+                if execution is not None
+                else None
+            )
+            if (
+                run is None
+                or run.status != "cancelling"
+                or run.run_type != "capability"
+                or run.capability_execution_id is None
+                or run.cancellation_target_generation is None
+                or run.generation != run.cancellation_target_generation + 1
+                or plan is None
+                or plan.active_run_id != run.id
+                or execution is None
+                or invocation is None
+                or run.capability_execution_id != execution.id
+                or run.plan_id != plan.id
+                or plan.target_task_id != invocation.task_id
+                or invocation.capability_key != "plan"
+                or invocation.executor_kind != "plan_agent"
+                or invocation.status != "cancelling"
+                or invocation.active_task_id != invocation.task_id
+                or execution.invocation_id != invocation.id
+                or execution.executor_kind != "plan_agent"
+                or execution.status != "cancelling"
+                or execution.active_invocation_id != invocation.id
+                or execution.handle_kind != "plan_agent_run"
+                or execution.handle_id != str(run.id)
+                or execution.handle_generation != PLAN_RUN_HANDLE_GENERATION
+                or (
+                    instance_id is not None
+                    and run.instance_id not in {None, instance_id}
+                )
+            ):
+                return False
+            target_generation = run.cancellation_target_generation
+            plan_id = plan.id
+
+        await self.stop_plan_run_lifecycle(run_id, instance_id)
+        if run_id in active_plan_run_ids():
+            return False
+
+        if not await reconcile_runtime_generation(
+            self.db_factory,
+            self.instance_manager,
+            run_id=run_id,
+            generation=target_generation,
+            allow_transport_kill=False,
+        ):
+            return False
+
+        from backend.services.plan_service import (
+            plan_operation_lock,
+            release_capability_run_owner_after_cleanup,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                execution = (
+                    await db.get(
+                        CapabilityExecution,
+                        run.capability_execution_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if run is not None and run.capability_execution_id is not None
+                    else None
+                )
+                invocation = (
+                    await db.get(
+                        CapabilityInvocation,
+                        execution.invocation_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if execution is not None
+                    else None
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or execution is None
+                    or invocation is None
+                    or run.status != "cancelling"
+                    or run.run_type != "capability"
+                    or run.capability_execution_id != execution.id
+                    or run.cancellation_target_generation != target_generation
+                    or run.generation != target_generation + 1
+                    or run.plan_id != plan.id
+                    or plan.active_run_id != run.id
+                    or plan.target_task_id != invocation.task_id
+                    or invocation.capability_key != "plan"
+                    or invocation.executor_kind != "plan_agent"
+                    or invocation.status != "cancelling"
+                    or invocation.active_task_id != invocation.task_id
+                    or execution.invocation_id != invocation.id
+                    or execution.executor_kind != "plan_agent"
+                    or execution.status != "cancelling"
+                    or execution.active_invocation_id != invocation.id
+                    or execution.handle_kind != "plan_agent_run"
+                    or execution.handle_id != str(run.id)
+                    or execution.handle_generation != PLAN_RUN_HANDLE_GENERATION
+                ):
+                    await db.rollback()
+                    return False
+                try:
+                    run = await release_capability_run_owner_after_cleanup(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                except HTTPException:
+                    await db.rollback()
+                    return False
+                reverse_owner = await db.scalar(
+                    select(Instance.id)
+                    .where(Instance.current_plan_run_id == run_id)
+                    .limit(1)
+                )
+                return bool(
+                    run.status == "cancelling"
+                    and run.instance_id is None
+                    and run.last_execution_started_at is None
+                    and reverse_owner is None
+                )
 
     async def start(self):
         if self._shutting_down:
@@ -899,7 +1426,20 @@ class GlobalDispatcher:
             # its pre-spawn phase so no child can appear after reconciliation's
             # manager-owned snapshot without being represented in that snapshot.
             async with self._chat_launch_admission_lock:
-                await self._recover_versioned_plan_runs()
+                recovery_signal_generation = (
+                    self._plan_runtime_recovery_signal_generation
+                )
+                plan_runtime_retry_needed = (
+                    await self._recover_versioned_plan_runs()
+                )
+                if (
+                    plan_runtime_retry_needed
+                    or recovery_signal_generation
+                    == self._plan_runtime_recovery_signal_generation
+                ):
+                    self._record_plan_runtime_recovery_result(
+                        retry_needed=plan_runtime_retry_needed,
+                    )
                 await self._cleanup_stale_state()
             await self._recover_codex_monitor_cleanups()
             await self._recover_monitor_sessions()
@@ -911,6 +1451,10 @@ class GlobalDispatcher:
             # Rehydrate every not-yet-launched delivery after stale runtime
             # reconciliation and capacity setup.
             await self._recover_plan_application_outbox()
+            # Ordinary Manager->Worker chat has its own durable accepted
+            # receipt.  Re-admit it locally as well so Worker recovery does
+            # not depend on the Manager being reachable after this restart.
+            await self._recover_worker_turn_handoff_outbox()
 
             self._dispatch_task = asyncio.create_task(self._dispatch_loop())
             self._curator_task = asyncio.create_task(self._curator_loop())
@@ -923,109 +1467,868 @@ class GlobalDispatcher:
             raise
         logger.info("GlobalDispatcher started")
 
-    async def _recover_versioned_plan_runs(self) -> None:
-        """Reconcile durable PlanRun states before generic Instance cleanup."""
+    def _record_plan_runtime_recovery_result(self, *, retry_needed: bool) -> None:
+        """Update the bounded retry schedule after one serialized cold scan."""
+
+        if not retry_needed:
+            self._plan_runtime_recovery_not_before = None
+            self._plan_runtime_recovery_backoff = (
+                PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL
+            )
+            return
+        delay = self._plan_runtime_recovery_backoff
+        self._plan_runtime_recovery_not_before = time.monotonic() + delay
+        self._plan_runtime_recovery_backoff = min(
+            PLAN_RUNTIME_RECOVERY_BACKOFF_MAX,
+            max(PLAN_RUNTIME_RECOVERY_BACKOFF_INITIAL, delay * 2),
+        )
+
+    def _request_plan_runtime_recovery(self) -> None:
+        """Advertise a newly orphaned unclean generation to the producer."""
+
+        self._plan_runtime_recovery_signal_generation += 1
+        if self._plan_runtime_recovery_not_before is None:
+            self._record_plan_runtime_recovery_result(retry_needed=True)
+        self.wake()
+
+    async def _recover_due_versioned_plan_runs(self) -> None:
+        """Retry an orphan Plan runtime only from the dispatch producer.
+
+        This method must remain inline in ``_dispatch_loop`` before Plan
+        claims. A detached recovery task could scan after ``_claim_plan_run``
+        commits but before its lifecycle is registered in ``_running_tasks``.
+        """
+
+        deadline = self._plan_runtime_recovery_not_before
+        if deadline is None or time.monotonic() < deadline:
+            return
+        # Maintenance must either observe this reconciliation completed or
+        # close admission before it begins. Recheck every flag after acquiring
+        # the same lock used by pause and fresh Task/Plan claims.
+        async with self._dispatch_claim_lock:
+            deadline = self._plan_runtime_recovery_not_before
+            if (
+                deadline is None
+                or time.monotonic() < deadline
+                or self._dispatch_paused
+                or self._shutting_down
+                or not self._running
+            ):
+                return
+            recovery_signal_generation = (
+                self._plan_runtime_recovery_signal_generation
+            )
+            try:
+                retry_needed = await self._recover_versioned_plan_runs()
+            except Exception:
+                self._record_plan_runtime_recovery_result(retry_needed=True)
+                raise
+            if (
+                retry_needed
+                or recovery_signal_generation
+                == self._plan_runtime_recovery_signal_generation
+            ):
+                self._record_plan_runtime_recovery_result(
+                    retry_needed=retry_needed,
+                )
+            if not retry_needed:
+                # A recovered running Run is now queued. Let this same
+                # serialized loop claim it without the normal poll delay.
+                self.wake()
+
+    async def _recover_versioned_plan_runs(self) -> bool:
+        """Reconcile orphan local PlanRuns and report whether to retry.
+
+        ``True`` means at least one non-live local generation remains unclean
+        or has an incomplete cancellation/owner graph. Live in-memory runs and
+        ordinary clean queued/waiting runs do not enable the backoff scanner.
+        """
 
         from backend.services.plan_agent_runner import active_plan_run_ids
+        from backend.services.plan_runtime_receipt import (
+            reconcile_runtime_generation,
+            reconcile_runtime_run,
+        )
 
-        live_run_ids = active_plan_run_ids()
+        live_run_ids = active_plan_run_ids() | {
+            int(run_id)
+            for lifecycle in self._running_tasks.values()
+            if not lifecycle.done()
+            and (run_id := getattr(lifecycle, "_ccm_plan_run_id", None))
+            is not None
+        }
         async with self.db_factory() as db:
             runs = list(
                 (
                     await db.execute(
-                        select(PlanAgentRun).where(
+                        select(
+                            PlanAgentRun.id,
+                            PlanAgentRun.status,
+                            PlanAgentRun.generation,
+                            PlanAgentRun.cancellation_target_generation,
+                        ).where(
                             PlanAgentRun.plan_id.isnot(None),
+                            PlanAgentRun.worker_id.is_(None),
                             PlanAgentRun.status.in_(
-                                ["queued", "running", "waiting_user"]
+                                ["queued", "running", "waiting_user", "cancelling"]
                             ),
                         )
                     )
-                ).scalars()
+                ).all()
             )
-            for run in runs:
-                plan = await db.get(Plan, run.plan_id)
-                if plan is None or plan.active_run_id != run.id:
-                    if run.status != "waiting_user" or plan is None:
-                        run.status = "failed"
-                        run.current_stage = "failed"
-                        run.error = "Plan Run lost its aggregate owner during recovery"
-                        run.finished_at = datetime.utcnow()
-                    run.instance_id = None
-                    continue
-                if run.status == "running" and run.id not in live_run_ids:
-                    if run.last_execution_started_at is not None:
-                        run.execution_seconds = float(run.execution_seconds or 0) + max(
-                            0.0,
-                            (
-                                datetime.utcnow() - run.last_execution_started_at
-                            ).total_seconds(),
-                        )
-                        run.last_execution_started_at = None
-                    if run.instance_id is not None:
-                        owner = await db.get(Instance, run.instance_id)
-                        if (
-                            owner is not None
-                            and owner.current_plan_run_id == run.id
-                            and owner.current_task_id is None
-                            and owner.pid is None
-                        ):
-                            owner.status = "idle"
-                            owner.current_plan_run_id = None
-                    running_steps = list(
-                        (
-                            await db.execute(
-                                select(PlanAgentStep).where(
-                                    PlanAgentStep.run_id == run.id,
-                                    PlanAgentStep.status == "running",
-                                )
-                            )
-                        ).scalars()
-                    )
-                    for step in running_steps:
-                        step.status = "cancelled"
-                        step.error = "Interrupted by CCM restart"
-                        step.finished_at = datetime.utcnow()
-                    run.status = "queued"
-                    run.instance_id = None
-                    run.generation += 1
-                    run.updated_at = datetime.utcnow()
-                elif (
-                    run.status in {"queued", "waiting_user"}
-                    and run.instance_id is not None
-                ):
-                    owner = await db.get(Instance, run.instance_id)
-                    if (
-                        owner is not None
-                        and owner.current_plan_run_id == run.id
-                        and owner.current_task_id is None
-                        and owner.pid is None
-                    ):
-                        owner.status = "idle"
-                        owner.current_plan_run_id = None
-                    run.instance_id = None
-                    run.last_execution_started_at = None
 
-            owners = list(
+        retry_needed = False
+        for run_id, status, generation, cancellation_generation in runs:
+            if run_id in live_run_ids:
+                continue
+            if status == "running":
+                clean = await reconcile_runtime_generation(
+                    self.db_factory,
+                    self.instance_manager,
+                    run_id=run_id,
+                    generation=generation,
+                    allow_transport_kill=True,
+                )
+                if clean:
+                    recovered = await self._recover_clean_running_plan_run(
+                        run_id=run_id,
+                        generation=generation,
+                    )
+                    retry_needed = retry_needed or not recovered
+                else:
+                    retry_needed = True
+            elif status == "cancelling":
+                if cancellation_generation is None:
+                    retry_needed = True
+                    continue
+                if await self._is_exact_capability_plan_cancellation(
+                    run_id=run_id,
+                    target_generation=cancellation_generation,
+                ):
+                    clean = await reconcile_runtime_generation(
+                        self.db_factory,
+                        self.instance_manager,
+                        run_id=run_id,
+                        generation=cancellation_generation,
+                        allow_transport_kill=True,
+                    )
+                    if clean:
+                        recovered = await self.stop_capability_plan_run_lifecycle(
+                            run_id,
+                            None,
+                        )
+                        retry_needed = retry_needed or not recovered
+                    else:
+                        retry_needed = True
+                elif await self._is_exact_standard_plan_cancellation(
+                    run_id=run_id,
+                    target_generation=cancellation_generation,
+                ):
+                    clean = await reconcile_runtime_generation(
+                        self.db_factory,
+                        self.instance_manager,
+                        run_id=run_id,
+                        generation=cancellation_generation,
+                        allow_transport_kill=True,
+                    )
+                    if clean:
+                        recovered = (
+                            await self._recover_clean_standard_plan_cancellation(
+                                run_id=run_id,
+                                target_generation=cancellation_generation,
+                            )
+                        )
+                        retry_needed = retry_needed or not recovered
+                    else:
+                        retry_needed = True
+                else:
+                    retry_needed = True
+            else:
+                clean = await reconcile_runtime_run(
+                    self.db_factory,
+                    self.instance_manager,
+                    run_id=run_id,
+                    allow_transport_kill=True,
+                )
+                if clean:
+                    recovered = await self._recover_clean_inactive_plan_run(
+                        run_id=run_id
+                    )
+                    retry_needed = retry_needed or not recovered
+                else:
+                    retry_needed = True
+        worker_retry_needed = await self._recover_worker_plan_runs()
+        return retry_needed or worker_retry_needed
+
+    async def _recover_worker_plan_runs(self) -> bool:
+        """Recover orphan Manager claims without replaying Worker imports."""
+
+        from backend.main import worker_proxy
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            snapshot_worker_dispatch_receipt,
+        )
+
+        def live_worker_lifecycles(run_id: int) -> list[asyncio.Task]:
+            return [
+                lifecycle
+                for lifecycle in self._running_tasks.values()
+                if not lifecycle.done()
+                and getattr(
+                    lifecycle,
+                    "_ccm_worker_plan_run_id",
+                    None,
+                )
+                == run_id
+            ]
+
+        live_run_ids = {
+            int(run_id)
+            for lifecycle in self._running_tasks.values()
+            if not lifecycle.done()
+            and (
+                run_id := getattr(
+                    lifecycle,
+                    "_ccm_worker_plan_run_id",
+                    None,
+                )
+            )
+            is not None
+        }
+        retry_needed = False
+        async with self.db_factory() as db:
+            cancelling_rows = list(
                 (
                     await db.execute(
-                        select(Instance).where(Instance.current_plan_run_id.isnot(None))
+                        select(
+                            PlanAgentRun.id,
+                            PlanAgentRun.plan_id,
+                            PlanAgentRun.worker_id,
+                            PlanAgentRun.cancellation_target_generation,
+                        ).where(
+                            PlanAgentRun.status == "cancelling",
+                            PlanAgentRun.worker_id.isnot(None),
+                            PlanAgentRun.plan_id.isnot(None),
+                            PlanAgentRun.cancellation_target_generation.isnot(None),
+                        )
+                    )
+                ).all()
+        )
+        for run_id, plan_id, worker_id, target_generation in cancelling_rows:
+            live_lifecycles = live_worker_lifecycles(run_id)
+            if live_lifecycles:
+                if any(
+                    getattr(
+                        lifecycle,
+                        "_ccm_worker_plan_cancellation_recovery",
+                        False,
+                    )
+                    for lifecycle in live_lifecycles
+                ):
+                    # An exact recovery RPC already owns this run. Do not
+                    # cancel it just because the periodic sweep overlaps.
+                    retry_needed = True
+                    continue
+                try:
+                    await self.stop_plan_run_lifecycle(run_id, None)
+                except Exception as exc:
+                    logger.warning(
+                        "Worker Plan Run %s old lifecycle reap remains "
+                        "pending before exact cancellation recovery: %s",
+                        run_id,
+                        exc,
+                    )
+                    retry_needed = True
+                    continue
+                if live_worker_lifecycles(run_id):
+                    retry_needed = True
+                    continue
+                live_run_ids.discard(run_id)
+            async with self.db_factory() as db:
+                plan = await db.get(Plan, plan_id, populate_existing=True)
+                receipts = list(
+                    (
+                        await db.execute(
+                            select(PlanAgentWorkerDispatchReceipt)
+                            .where(PlanAgentWorkerDispatchReceipt.run_id == run_id)
+                            .order_by(
+                                PlanAgentWorkerDispatchReceipt.run_generation,
+                                PlanAgentWorkerDispatchReceipt.id,
+                            )
+                        )
+                    ).scalars()
+                )
+                try:
+                    snapshots = [
+                        snapshot_worker_dispatch_receipt(receipt)
+                        for receipt in receipts
+                    ]
+                except WorkerPlanDispatchConflict:
+                    retry_needed = True
+                    continue
+                digests = {
+                    snapshot.payload_digest
+                    for snapshot in snapshots
+                    if snapshot.payload_digest is not None
+                }
+                if (
+                    plan is None
+                    or plan.worker_id != worker_id
+                    or plan.active_run_id != run_id
+                    or digests == set()
+                    or len(digests) != 1
+                    or any(
+                        snapshot.plan_id != plan_id
+                        or snapshot.worker_id != worker_id
+                        or snapshot.target_task_id != plan.target_task_id
+                        or snapshot.run_generation > target_generation
+                        for snapshot in snapshots
+                    )
+                ):
+                    retry_needed = True
+                    continue
+                if plan.target_task_id is not None:
+                    target = await db.get(
+                        Task,
+                        plan.target_task_id,
+                        populate_existing=True,
+                    )
+                    if target is None or target.worker_id != worker_id:
+                        retry_needed = True
+                        continue
+                payload_digest = next(iter(digests))
+            if worker_proxy is None:
+                retry_needed = True
+                continue
+            key = f"worker-plan-{run_id}"
+            existing = self._running_tasks.get(key)
+            if existing is not None and not existing.done():
+                continue
+            lifecycle = asyncio.create_task(
+                self._run_worker_plan_cancellation_recovery_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    target_generation=target_generation,
+                    payload_digest=payload_digest,
+                )
+            )
+            setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
+            setattr(
+                lifecycle,
+                "_ccm_worker_plan_cancellation_recovery",
+                True,
+            )
+            self._running_tasks[key] = lifecycle
+            lifecycle.add_done_callback(
+                lambda finished, k=key: self._remove_running_task_if_same(
+                    k,
+                    finished,
+                )
+            )
+
+        async with self.db_factory() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(
+                            PlanAgentRun.id,
+                            PlanAgentRun.plan_id,
+                            PlanAgentRun.worker_id,
+                            PlanAgentRun.generation,
+                        ).where(
+                            PlanAgentRun.status == "running",
+                            PlanAgentRun.worker_id.isnot(None),
+                            PlanAgentRun.plan_id.isnot(None),
+                        )
+                    )
+                ).all()
+            )
+
+        for run_id, plan_id, worker_id, generation in rows:
+            if run_id in live_run_ids:
+                continue
+            async with self.db_factory() as db:
+                receipt = (
+                    await db.execute(
+                        select(PlanAgentWorkerDispatchReceipt).where(
+                            PlanAgentWorkerDispatchReceipt.run_id == run_id,
+                            PlanAgentWorkerDispatchReceipt.run_generation
+                            == generation,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if receipt is None:
+                    # A pre-receipt deployment cannot prove whether its old
+                    # HTTP request crossed the Worker boundary. Preserve it.
+                    retry_needed = True
+                    continue
+                try:
+                    snapshot = snapshot_worker_dispatch_receipt(receipt)
+                except WorkerPlanDispatchConflict:
+                    retry_needed = True
+                    continue
+                if snapshot.target_task_id is not None:
+                    target = await db.get(
+                        Task,
+                        snapshot.target_task_id,
+                        populate_existing=True,
+                    )
+                    if target is None or target.worker_id != snapshot.worker_id:
+                        retry_needed = True
+                        continue
+
+            if snapshot.status == "prepared":
+                recovered = await self._settle_prepared_worker_plan_run(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=snapshot.id,
+                )
+                retry_needed = retry_needed or not recovered
+                continue
+            if snapshot.status != "remote_possible" or snapshot.payload_digest is None:
+                retry_needed = True
+                continue
+            if worker_proxy is None:
+                retry_needed = True
+                continue
+            key = f"worker-plan-{run_id}"
+            existing = self._running_tasks.get(key)
+            if existing is not None and not existing.done():
+                continue
+            # Registration happens synchronously with this single recovery
+            # producer. The task itself performs only exact audit/poll calls.
+            lifecycle = asyncio.create_task(
+                self._run_worker_plan_reconciliation_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=snapshot.id,
+                    payload_digest=snapshot.payload_digest,
+                )
+            )
+            setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
+            self._running_tasks[key] = lifecycle
+            lifecycle.add_done_callback(
+                lambda finished, k=key: self._remove_running_task_if_same(
+                    k,
+                    finished,
+                )
+            )
+        return retry_needed
+
+    async def _settle_prepared_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+    ) -> bool:
+        """Requeue G as G+1 only while the receipt proves no import call."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return False
+                try:
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                except (HTTPException, WorkerPlanDispatchConflict):
+                    await db.rollback()
+                    return False
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.worker_id != worker_id
+                    or run.generation != generation
+                    or plan.active_run_id != run.id
+                    or receipt.status != "prepared"
+                ):
+                    await db.rollback()
+                    return False
+                try:
+                    settle_worker_dispatch_receipt(
+                        receipt=receipt,
+                        plan=plan,
+                        run=run,
+                        generation=generation,
+                        reason="not_launched",
+                        remote_status=None,
+                    )
+                except WorkerPlanDispatchConflict:
+                    await db.rollback()
+                    return False
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                run.last_execution_started_at = None
+                run.status = "queued"
+                run.generation = generation + 1
+                run.updated_at = now
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                return True
+
+    async def _is_exact_capability_plan_cancellation(
+        self,
+        *,
+        run_id: int,
+        target_generation: int,
+    ) -> bool:
+        """Authorize destructive recovery only for one exact Capability graph."""
+
+        from backend.models.capability import (
+            CapabilityExecution,
+            CapabilityInvocation,
+        )
+        from backend.services.plan_capability import PLAN_RUN_HANDLE_GENERATION
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+            plan = (
+                await db.get(Plan, run.plan_id, populate_existing=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            execution = (
+                await db.get(
+                    CapabilityExecution,
+                    run.capability_execution_id,
+                    populate_existing=True,
+                )
+                if run is not None and run.capability_execution_id is not None
+                else None
+            )
+            invocation = (
+                await db.get(
+                    CapabilityInvocation,
+                    execution.invocation_id,
+                    populate_existing=True,
+                )
+                if execution is not None
+                else None
+            )
+            return bool(
+                run is not None
+                and plan is not None
+                and execution is not None
+                and invocation is not None
+                and run.status == "cancelling"
+                and run.run_type == "capability"
+                and run.capability_execution_id == execution.id
+                and run.cancellation_target_generation == target_generation
+                and run.generation == target_generation + 1
+                and run.plan_id == plan.id
+                and plan.active_run_id == run.id
+                and plan.target_task_id == invocation.task_id
+                and invocation.capability_key == "plan"
+                and invocation.executor_kind == "plan_agent"
+                and invocation.status == "cancelling"
+                and invocation.active_task_id == invocation.task_id
+                and execution.invocation_id == invocation.id
+                and execution.executor_kind == "plan_agent"
+                and execution.status == "cancelling"
+                and execution.active_invocation_id == invocation.id
+                and execution.handle_kind == "plan_agent_run"
+                and execution.handle_id == str(run.id)
+                and execution.handle_generation == PLAN_RUN_HANDLE_GENERATION
+            )
+
+    async def _is_exact_standard_plan_cancellation(
+        self,
+        *,
+        run_id: int,
+        target_generation: int,
+    ) -> bool:
+        """Recognize only a local non-Capability cancellation fence."""
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+            plan = (
+                await db.get(Plan, run.plan_id, populate_existing=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            if (
+                run is None
+                or plan is None
+                or run.status != "cancelling"
+                or run.run_type == "capability"
+                or run.capability_execution_id is not None
+                or run.worker_id is not None
+                or run.cancellation_target_generation != target_generation
+                or run.generation != target_generation + 1
+                or run.plan_id != plan.id
+                or plan.active_run_id != run.id
+            ):
+                return False
+            capability_owner = await db.scalar(
+                select(PlanAgentRun.id)
+                .where(
+                    PlanAgentRun.plan_id == plan.id,
+                    or_(
+                        PlanAgentRun.run_type == "capability",
+                        PlanAgentRun.capability_execution_id.is_not(None),
+                    ),
+                )
+                .limit(1)
+            )
+            return capability_owner is None
+
+    async def _recover_clean_standard_plan_cancellation(
+        self,
+        *,
+        run_id: int,
+        target_generation: int,
+    ) -> bool:
+        """Release and terminalize one exact ordinary cancellation fence."""
+
+        from backend.services.plan_service import (
+            finalize_run_cancellation,
+            plan_operation_lock,
+            release_run_owner_after_cleanup,
+        )
+
+        async with self.db_factory() as lookup:
+            run = await lookup.get(PlanAgentRun, run_id)
+            plan_id = run.plan_id if run is not None else None
+        if plan_id is None:
+            return False
+        async with plan_operation_lock(plan_id):
+            if not await self._is_exact_standard_plan_cancellation(
+                run_id=run_id,
+                target_generation=target_generation,
+            ):
+                return False
+            async with self.db_factory() as db:
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if run is None or plan is None:
+                    await db.rollback()
+                    return False
+                try:
+                    run = await release_run_owner_after_cleanup(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                    plan = await db.get(
+                        Plan,
+                        plan_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    run = await finalize_run_cancellation(
+                        db,
+                        plan=plan,
+                        run=run,
+                    )
+                except HTTPException:
+                    await db.rollback()
+                    return False
+                return run.status == "cancelled"
+
+    async def _recover_clean_running_plan_run(
+        self,
+        *,
+        run_id: int,
+        generation: int,
+    ) -> bool:
+        """Requeue G only after every G provider attempt is durably clean."""
+
+        from backend.services.plan_runtime_receipt import runtime_generation_is_clean
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+            plan = (
+                await db.get(Plan, run.plan_id, with_for_update=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            if (
+                run is None
+                or plan is None
+                or run.status != "running"
+                or run.generation != generation
+                or plan.active_run_id != run.id
+                or not await runtime_generation_is_clean(
+                    db,
+                    run_id=run.id,
+                    generation=generation,
+                )
+            ):
+                await db.rollback()
+                return False
+            reverse_owners = list(
+                (
+                    await db.execute(
+                        select(Instance)
+                        .where(Instance.current_plan_run_id == run.id)
+                        .order_by(Instance.id)
+                        .with_for_update()
                     )
                 ).scalars()
             )
-            for owner in owners:
-                owned = await db.get(PlanAgentRun, owner.current_plan_run_id)
-                if (
-                    (
-                        owned is None
-                        or owned.instance_id != owner.id
-                        or owned.status != "running"
+            if len(reverse_owners) > 1:
+                await db.rollback()
+                return False
+            owner = reverse_owners[0] if reverse_owners else None
+            if owner is not None and (
+                (run.instance_id is not None and run.instance_id != owner.id)
+                or owner.current_task_id is not None
+                or owner.pid is not None
+                or owner.status not in {"running", "idle"}
+            ):
+                await db.rollback()
+                return False
+            if owner is None and run.instance_id is not None:
+                await db.get(Instance, run.instance_id, with_for_update=True)
+
+            now = datetime.utcnow()
+            if run.last_execution_started_at is not None:
+                run.execution_seconds = float(run.execution_seconds or 0) + max(
+                    0.0,
+                    (now - run.last_execution_started_at).total_seconds(),
+                )
+                run.last_execution_started_at = None
+            run.instance_id = None
+            run.status = "queued"
+            run.generation = generation + 1
+            run.updated_at = now
+            plan.lock_version += 1
+            plan.updated_at = now
+            for step in list(
+                (
+                    await db.execute(
+                        select(PlanAgentStep).where(
+                            PlanAgentStep.run_id == run.id,
+                            PlanAgentStep.generation == generation,
+                            PlanAgentStep.status == "running",
+                        )
                     )
-                    and owner.current_task_id is None
-                    and owner.pid is None
-                ):
-                    owner.status = "idle"
-                    owner.current_plan_run_id = None
+                ).scalars()
+            ):
+                step.status = "cancelled"
+                step.error = "Interrupted by CCM restart"
+                step.finished_at = now
+            if owner is not None:
+                owner.current_plan_run_id = None
+                owner.status = "idle"
             await db.commit()
+            return True
+
+    async def _recover_clean_inactive_plan_run(self, *, run_id: int) -> bool:
+        """Repair a one-way queued/waiting owner only with all-run proof."""
+
+        from backend.services.plan_runtime_receipt import runtime_run_is_clean
+
+        async with self.db_factory() as db:
+            run = await db.get(PlanAgentRun, run_id, with_for_update=True)
+            plan = (
+                await db.get(Plan, run.plan_id, with_for_update=True)
+                if run is not None and run.plan_id is not None
+                else None
+            )
+            if (
+                run is None
+                or plan is None
+                or run.status not in {"queued", "waiting_user"}
+                or plan.active_run_id != run.id
+                or not await runtime_run_is_clean(db, run_id=run.id)
+            ):
+                await db.rollback()
+                return False
+            reverse_owners = list(
+                (
+                    await db.execute(
+                        select(Instance)
+                        .where(Instance.current_plan_run_id == run.id)
+                        .order_by(Instance.id)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if len(reverse_owners) > 1:
+                await db.rollback()
+                return False
+            owner = reverse_owners[0] if reverse_owners else None
+            if owner is not None and (
+                (run.instance_id is not None and run.instance_id != owner.id)
+                or owner.current_task_id is not None
+                or owner.pid is not None
+                or owner.status not in {"running", "idle"}
+            ):
+                await db.rollback()
+                return False
+            if owner is None and run.instance_id is not None:
+                await db.get(Instance, run.instance_id, with_for_update=True)
+            if run.last_execution_started_at is not None:
+                now = datetime.utcnow()
+                run.execution_seconds = float(run.execution_seconds or 0) + max(
+                    0.0,
+                    (now - run.last_execution_started_at).total_seconds(),
+                )
+                run.last_execution_started_at = None
+            run.instance_id = None
+            if owner is not None:
+                owner.current_plan_run_id = None
+                owner.status = "idle"
+            await db.commit()
+            return True
 
     def wake(self) -> None:
         """Wake the task dispatcher after a pending task is committed."""
@@ -1136,9 +2439,11 @@ class GlobalDispatcher:
         self._dispatch_resumed.set()
         self._dispatch_wakeup.set()
         try:
-            asyncio.get_running_loop().create_task(
+            loop = asyncio.get_running_loop()
+            loop.create_task(
                 self._recover_plan_application_outbox(after_restart=False)
             )
+            loop.create_task(self._recover_worker_turn_handoff_outbox())
         except RuntimeError:
             # Synchronous construction/tests may reopen the flag without an
             # event loop. Startup recovery remains authoritative there.
@@ -1307,6 +2612,19 @@ class GlobalDispatcher:
             manager_owned_instance_ids.update(self._launching_instances)
 
         async with self.db_factory() as db:
+            # Durable Worker termination recovery owns these Task generations.
+            # This first snapshot avoids needless stale classification; the
+            # authoritative snapshot is repeated after Task write locks below
+            # so a receipt admitted concurrently cannot be crossed.
+            termination_task_ids = set(
+                (
+                    await db.execute(
+                        select(Task.id).where(
+                            ~no_active_worker_task_termination_predicate()
+                        )
+                    )
+                ).scalars()
+            )
             result = await db.execute(
                 select(Instance).where(
                     or_(
@@ -1317,6 +2635,9 @@ class GlobalDispatcher:
                 )
             )
             persisted_instances = list(result.scalars().all())
+            observed_instance_owners = {
+                inst.id: inst.current_task_id for inst in persisted_instances
+            }
             live_task_ids: set[int] = set()
             unmanaged_live_pids: dict[int, int] = {}
             unmanaged_live_instance_pids: dict[int, int] = {}
@@ -1332,6 +2653,11 @@ class GlobalDispatcher:
                 if inst.id in manager_owned_instance_ids:
                     if inst.current_task_id is not None:
                         live_task_ids.add(inst.current_task_id)
+                    continue
+                if inst.current_task_id in termination_task_ids:
+                    # Receipt recovery, not generic startup cleanup, owns both
+                    # sides of this exact Task/Instance evidence.
+                    live_task_ids.add(inst.current_task_id)
                     continue
                 pid_may_be_alive = False
                 if inst.pid is not None:
@@ -1375,6 +2701,15 @@ class GlobalDispatcher:
                 )
             )
             active_tasks = list(active_result.scalars().all())
+            active_task_ids = {task.id for task in active_tasks}
+            # Freeze the pre-lock observations.  ``populate_existing`` below
+            # refreshes the same ORM objects, so deriving the CAS generation
+            # from the refreshed row would silently adopt a cancel/retry/new
+            # launch that committed between these two reads.
+            active_task_generations = {
+                task.id: self._task_status_generation(task)
+                for task in active_tasks
+            }
             live_background_task_ids = (
                 self.instance_manager.active_pty_background_task_ids()
                 if reconcile_auxiliary
@@ -1402,12 +2737,41 @@ class GlobalDispatcher:
             # where SELECT FOR UPDATE alone is insufficient.
             task_ids_to_lock = {task.id for task in active_tasks}
             task_ids_to_lock.update(task.id for task in stale_background_tasks)
+            task_ids_to_lock.update(termination_task_ids)
             task_ids_to_lock.update(
                 inst.current_task_id
                 for inst, _ in stale_instances
                 if inst.current_task_id is not None
             )
             if task_ids_to_lock:
+                prelock_task_generations = dict(active_task_generations)
+                for task in stale_background_tasks:
+                    prelock_task_generations.setdefault(
+                        task.id,
+                        self._task_status_generation(task),
+                    )
+                missing_snapshot_ids = (
+                    task_ids_to_lock - prelock_task_generations.keys()
+                )
+                if missing_snapshot_ids:
+                    snapshot_rows = list(
+                        (
+                            await db.execute(
+                                select(Task).where(
+                                    Task.id.in_(missing_snapshot_ids)
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    prelock_task_generations.update(
+                        (
+                            task.id,
+                            self._task_status_generation(task),
+                        )
+                        for task in snapshot_rows
+                    )
                 locked_tasks = list(
                     (
                         await db.execute(
@@ -1421,8 +2785,27 @@ class GlobalDispatcher:
                     .scalars()
                     .all()
                 )
+                locked_task_ids = {task.id for task in locked_tasks}
+                if not active_task_ids.issubset(locked_task_ids):
+                    await db.rollback()
+                    logger.warning(
+                        "Aborted stale-state cleanup because an active Task "
+                        "disappeared while acquiring locks"
+                    )
+                    return
                 for locked_task in locked_tasks:
-                    locked_generation = self._task_status_generation(locked_task)
+                    locked_task_id = locked_task.id
+                    locked_generation = prelock_task_generations.get(
+                        locked_task_id
+                    )
+                    if locked_generation is None:
+                        await db.rollback()
+                        logger.warning(
+                            "Aborted stale-state cleanup because task %s was "
+                            "not part of the pre-lock active snapshot",
+                            locked_task_id,
+                        )
+                        return
                     task_guard = await db.execute(
                         update(Task)
                         .where(
@@ -1435,15 +2818,153 @@ class GlobalDispatcher:
                         logger.warning(
                             "Aborted stale-state cleanup because task %s "
                             "changed while acquiring Task->Instance locks",
-                            locked_task.id,
+                            locked_task_id,
                         )
                         return
 
+            # Re-read only after the Task barriers.  If receipt admission won
+            # first it is visible now; if cleanup won first, receipt staging
+            # waits and must validate the post-cleanup generation instead.
+            termination_task_ids = set(
+                (
+                    await db.execute(
+                        select(Task.id).where(
+                            ~no_active_worker_task_termination_predicate()
+                        )
+                    )
+                ).scalars()
+            )
+            live_task_ids.update(termination_task_ids)
+
+            # A Capability resume owns a complete immutable G -> G+1 queue
+            # envelope.  Reconcile it before the generic stale-task logic and
+            # before taking any Instance/source locks: a claimed row whose
+            # exact source still has no actual transport is the one modern
+            # G>1 shape that is safe to replay after restart.  The Task rows
+            # are already write-locked and startup/maintenance admission is
+            # closed, so taking capability_task_lock here would invert the
+            # process-lock -> Task-row order used by normal execution.
+            from backend.services.capability_resume import (
+                reconcile_stale_resume_in_tx,
+            )
+
+            prequarantine_unmanaged_pids: dict[int, int] = {}
+            for stale_instance, pid_may_be_alive in stale_instances:
+                if (
+                    pid_may_be_alive
+                    and stale_instance.current_task_id is not None
+                    and stale_instance.pid is not None
+                ):
+                    prequarantine_unmanaged_pids.setdefault(
+                        stale_instance.current_task_id,
+                        stale_instance.pid,
+                    )
+            capability_resume_outcomes: dict[int, str] = {}
+            reset_tasks: list[_TaskStatusGeneration] = []
+            for active_task in sorted(active_tasks, key=lambda row: row.id):
+                if active_task.id in termination_task_ids:
+                    continue
+                resume_outcome = await reconcile_stale_resume_in_tx(
+                    db,
+                    active_task,
+                    has_live_runtime=active_task.id in live_task_ids,
+                    unmanaged_pid=prequarantine_unmanaged_pids.get(
+                        active_task.id
+                    ),
+                )
+                if resume_outcome == "not_resume":
+                    continue
+                capability_resume_outcomes[active_task.id] = resume_outcome
+                if resume_outcome in {"replayable", "failed"}:
+                    resulting_generation = (
+                        await self._read_task_status_generation(
+                            db,
+                            active_task.id,
+                        )
+                    )
+                    if resulting_generation is not None:
+                        reset_tasks.append(resulting_generation)
+                logger.warning(
+                    "Reconciled Capability resume for task %s as %s",
+                    active_task.id,
+                    resume_outcome,
+                )
+
+            # Decisions below must use receipt/source evidence read after the
+            # Task write fences above.  Startup cleanup can race explicit
+            # cancel and launch-boundary transitions, so a pre-lock snapshot
+            # is not authority.  Preserve the global Task -> Worker -> Plan
+            # order used by combined handoff settlement.
+            from backend.models.plan import PlanApplicationReceipt
+
+            handoff_states_by_task: dict[
+                int, list[WorkerTurnHandoffReceipt]
+            ] = {}
+            plan_states_by_task: dict[int, list[PlanApplicationReceipt]] = {}
+            source_rows_by_id: dict[int, LogEntry] = {}
+            source_ids: set[int] = set()
+            if active_task_ids:
+                handoff_result = await db.execute(
+                    select(WorkerTurnHandoffReceipt)
+                    .where(
+                        WorkerTurnHandoffReceipt.task_id.in_(active_task_ids),
+                        WorkerTurnHandoffReceipt.side == "worker",
+                        WorkerTurnHandoffReceipt.status.in_(
+                            ["claimed", "launching", "launched"]
+                        ),
+                    )
+                    .order_by(
+                        WorkerTurnHandoffReceipt.task_id,
+                        WorkerTurnHandoffReceipt.handoff_id,
+                    )
+                    .with_for_update()
+                )
+                for handoff in handoff_result.scalars():
+                    handoff_states_by_task.setdefault(
+                        handoff.task_id, []
+                    ).append(handoff)
+
+                plan_result = await db.execute(
+                    select(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.target_task_id.in_(
+                            active_task_ids
+                        ),
+                        PlanApplicationReceipt.delivery_status.in_(
+                            ["queued", "launching", "launched", "uncertain"]
+                        ),
+                    )
+                    .order_by(
+                        PlanApplicationReceipt.target_task_id,
+                        PlanApplicationReceipt.id,
+                    )
+                    .with_for_update()
+                )
+                for receipt in plan_result.scalars():
+                    plan_states_by_task.setdefault(
+                        receipt.target_task_id, []
+                    ).append(receipt)
+
+                source_ids = {
+                    task.turn_source_log_id
+                    for task in active_tasks
+                    if type(task.turn_source_log_id) is int
+                    and task.turn_source_log_id > 0
+                }
+                source_ids.update(
+                    handoff.source_log_id
+                    for handoffs in handoff_states_by_task.values()
+                    for handoff in handoffs
+                    if type(handoff.source_log_id) is int
+                    and handoff.source_log_id > 0
+                )
+
             from backend.models.sub_agent import SubAgentSession
 
-            reset_tasks: list[_TaskStatusGeneration] = []
             recovered_background_task_ids: set[int] = set()
             for task in stale_background_tasks:
+                if task.id in termination_task_ids:
+                    continue
                 error = (
                     "CCM restarted before Claude PTY background activity "
                     "reached a terminal turn"
@@ -1498,6 +3019,8 @@ class GlobalDispatcher:
             # Task locks are now held.  Instance quarantine may safely follow;
             # all later Task transitions reuse the already locked rows.
             for inst, pid_may_be_alive in stale_instances:
+                if inst.current_task_id in termination_task_ids:
+                    continue
                 quarantine_values = {"status": "error"}
                 if not pid_may_be_alive:
                     # A definitively dead/no-PID generation is safe to detach.
@@ -1541,8 +3064,32 @@ class GlobalDispatcher:
                 if pid_may_be_alive:
                     unmanaged_live_instance_pids[inst.id] = inst.pid
 
+            # InstanceManager's provider-boundary transaction is
+            # Task -> Instance -> source LogEntry.  Lock exact sources only
+            # after Instance quarantine so startup never inverts that order;
+            # Worker/Plan receipts remain ordered between Task and Instance.
+            if source_ids:
+                source_result = await db.execute(
+                    select(LogEntry)
+                    .where(LogEntry.id.in_(source_ids))
+                    .order_by(LogEntry.id)
+                    .with_for_update()
+                )
+                source_rows_by_id = {
+                    row.id: row for row in source_result.scalars()
+                }
+
             for t in active_tasks:
+                if t.id in termination_task_ids:
+                    continue
                 if t.id in recovered_background_task_ids:
+                    continue
+                if t.id in capability_resume_outcomes:
+                    # The exact outbox helper already preserved, replayed, or
+                    # failed this generation.  Let Instance quarantine below
+                    # retain/clear the reverse owner according to the same live
+                    # runtime and unmanaged-PID evidence; never reinterpret the
+                    # Task through generic source-less G>1 recovery.
                     continue
                 if t.id in live_task_ids:
                     continue
@@ -1556,6 +3103,190 @@ class GlobalDispatcher:
                     # the generation proof. If any one of them changed, leave
                     # the Task untouched and retry reconciliation later.
                     continue
+                task_handoffs = handoff_states_by_task.get(t.id, [])
+                current_handoffs = [
+                    handoff
+                    for handoff in task_handoffs
+                    if handoff.retry_count == t.retry_count
+                    and handoff.claimed_turn_generation == t.turn_generation
+                    and handoff.from_generation + 1 == t.turn_generation
+                ]
+                source = (
+                    source_rows_by_id.get(t.turn_source_log_id)
+                    if type(t.turn_source_log_id) is int
+                    else None
+                )
+                source_is_exact = bool(
+                    source is not None
+                    and source.id == t.turn_source_log_id
+                    and source.task_id == t.id
+                    and source.task_retry_count == t.retry_count
+                    and source.task_turn_generation == t.turn_generation
+                    and source.turn_scope == "source"
+                    and source.is_error is False
+                )
+                source_request_id: object = object()
+                source_is_canonical = False
+                if source_is_exact and source is not None:
+                    if (
+                        source.event_type == "user_message"
+                        and source.role == "user"
+                    ):
+                        source_is_canonical = True
+                        source_request_id = source.id
+                    elif (
+                        source.event_type == "turn_source"
+                        and source.role == "system"
+                        and source.content is None
+                    ):
+                        try:
+                            source_payload = json.loads(source.raw_json or "")
+                        except (TypeError, ValueError, RecursionError):
+                            source_payload = None
+                        original_source_id = (
+                            source_payload.get("original_source_log_id")
+                            if isinstance(source_payload, dict)
+                            and "original_source_log_id" in source_payload
+                            else object()
+                        )
+                        if original_source_id is None or (
+                            type(original_source_id) is int
+                            and original_source_id > 0
+                        ):
+                            source_is_canonical = True
+                            source_request_id = original_source_id
+
+                exact_plan_receipts: list[PlanApplicationReceipt] = []
+                for plan_receipt in plan_states_by_task.get(t.id, []):
+                    evidence = plan_receipt.launch_evidence
+                    if (
+                        not isinstance(evidence, dict)
+                        or evidence.get("task_id") != t.id
+                        or evidence.get("retry_count") != t.retry_count
+                        or evidence.get("turn_generation")
+                        != t.turn_generation
+                        or not source_is_canonical
+                        or evidence.get("source_log_id")
+                        != source_request_id
+                    ):
+                        continue
+                    exact_plan_receipts.append(plan_receipt)
+
+                worker_claim_replayable = False
+                worker_claim_crossed_transport = False
+                if (
+                    len(task_handoffs) == 1
+                    and len(current_handoffs) == 1
+                    and current_handoffs[0].status == "claimed"
+                ):
+                    handoff = current_handoffs[0]
+                    handoff_source = source_rows_by_id.get(
+                        handoff.source_log_id
+                    )
+                    queue_payload = handoff.queue_payload
+                    try:
+                        queue_digest = (
+                            _durable_json_digest(queue_payload)
+                            if isinstance(queue_payload, dict)
+                            else None
+                        )
+                        request_digest = (
+                            _durable_json_digest(handoff.request_payload)
+                            if isinstance(handoff.request_payload, dict)
+                            else None
+                        )
+                    except (TypeError, ValueError, UnicodeError):
+                        queue_digest = None
+                        request_digest = None
+                    expected_route = (
+                        queue_payload.get("expected_task_routing")
+                        if isinstance(queue_payload, dict)
+                        else None
+                    )
+                    queue_timestamp = (
+                        queue_payload.get("queue_timestamp")
+                        if isinstance(queue_payload, dict)
+                        else None
+                    )
+                    worker_claim_identity_valid = bool(
+                        source_is_canonical
+                        and source_request_id == handoff.source_log_id
+                        and handoff_source is not None
+                        and handoff_source.task_id == t.id
+                        and handoff_source.event_type == "user_message"
+                        and handoff_source.role == "user"
+                        and handoff_source.is_error is False
+                        and handoff_source.task_retry_count == t.retry_count
+                        and handoff_source.task_turn_generation
+                        == t.turn_generation
+                        and handoff_source.turn_scope == "source"
+                        and isinstance(queue_payload, dict)
+                        and handoff.queue_payload_digest == queue_digest
+                        and handoff.request_digest == request_digest
+                        and queue_payload.get("worker_turn_handoff_id")
+                        == handoff.handoff_id
+                        and queue_payload.get("source_log_id")
+                        == handoff.source_log_id
+                        and queue_payload.get(
+                            "worker_turn_handoff_retry_count"
+                        )
+                        == handoff.retry_count
+                        and queue_payload.get(
+                            "worker_turn_handoff_from_generation"
+                        )
+                        == handoff.from_generation
+                        and "prompt" in queue_payload
+                        and isinstance(expected_route, list)
+                        and len(expected_route) == 3
+                        and isinstance(queue_timestamp, (int, float))
+                        and not isinstance(queue_timestamp, bool)
+                    )
+                    worker_claim_crossed_transport = bool(
+                        worker_claim_identity_valid
+                        and source is not None
+                        and source.actual_transport is not None
+                    )
+                    worker_claim_replayable = bool(
+                        worker_claim_identity_valid
+                        and source is not None
+                        and source.actual_transport is None
+                    )
+                    delivery_key = (
+                        queue_payload.get("delivery_key")
+                        if isinstance(queue_payload, dict)
+                        else None
+                    )
+                    if worker_claim_replayable and delivery_key is not None:
+                        linked_plans = [
+                            receipt
+                            for receipt in plan_states_by_task.get(t.id, [])
+                            if receipt.receipt_key == delivery_key
+                        ]
+                        worker_claim_replayable = bool(
+                            isinstance(delivery_key, str)
+                            and len(linked_plans) == 1
+                            and await self._linked_recoverable_worker_handoff(
+                                db,
+                                linked_plans[0],
+                            )
+                            is handoff
+                        )
+
+                    if worker_claim_crossed_transport:
+                        # InstanceManager writes the exact transport before its
+                        # claimed->launching callback.  If that callback loses
+                        # its commit/response, the source boundary—not the stale
+                        # receipt label—is authoritative.  Persist the
+                        # conservative post-boundary state so restart recovery
+                        # cannot loop on this G+1.
+                        handoff.status = "launching"
+                        handoff.updated_at = datetime.utcnow()
+
+                plans_to_quarantine: list[PlanApplicationReceipt] = (
+                    []
+                    if worker_claim_replayable
+                    else list(exact_plan_receipts)
+                )
                 unmanaged_pid = unmanaged_live_pids.get(t.id)
                 if unmanaged_pid is None and t.instance_id is not None:
                     unmanaged_pid = unmanaged_live_instance_pids.get(t.instance_id)
@@ -1580,12 +3311,19 @@ class GlobalDispatcher:
                     or (
                         task_reverse_owners and t.instance_id not in task_reverse_owners
                     )
-                    or (not task_reverse_owners and t.instance_id is not None)
+                    or (
+                        not task_reverse_owners
+                        and t.instance_id is not None
+                        and observed_instance_owners.get(t.instance_id)
+                        not in (None, t.id)
+                    )
                 ):
-                    # Only a unique, bidirectionally consistent dead claim is
-                    # safe to retry automatically. Multiple reverse owners (or
-                    # a mismatched Task owner) mean the generation history is
-                    # corrupt; replay could duplicate non-idempotent work.
+                    # Multiple reverse owners or a Task pointer into a peer's
+                    # Instance generation is corrupt.  No reverse owner alone
+                    # is normal before spawn: queued/fresh admission writes the
+                    # Task owner first and Instance.current_task_id only after
+                    # launch.  Its source/receipt boundary evidence below must
+                    # decide replayability.
                     new_status = "failed"
                     values = {
                         "status": "failed",
@@ -1624,17 +3362,229 @@ class GlobalDispatcher:
                         "configuration can be reconciled",
                         t.id,
                     )
-                else:
+                elif len(task_handoffs) > 1:
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "Recovered multiple Worker handoff claims for the "
+                            "same Task generation; automatic replay was blocked"
+                        ),
+                    }
+                    logger.error(
+                        "Failing unowned task %s because generation %s has %s "
+                        "Worker handoff claims",
+                        t.id,
+                        t.turn_generation,
+                        len(task_handoffs),
+                    )
+                elif task_handoffs and not current_handoffs:
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "Recovered a Worker handoff claim that does not "
+                            "match the Task's exact generation; automatic "
+                            "replay was blocked"
+                        ),
+                    }
+                    logger.error(
+                        "Failing unowned task %s because its Worker handoff "
+                        "identity does not match generation %s",
+                        t.id,
+                        t.turn_generation,
+                    )
+                elif worker_claim_crossed_transport:
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "CCM restarted after a claimed Worker handoff "
+                            "selected durable transport "
+                            f"{source.actual_transport}; automatic replay was "
+                            "blocked to prevent duplicate execution"
+                        ),
+                    }
+                    logger.error(
+                        "Fail-closing task %s generation %s after claimed "
+                        "Worker handoff selected transport %s",
+                        t.id,
+                        t.turn_generation,
+                        source.actual_transport,
+                    )
+                elif (
+                    current_handoffs
+                    and current_handoffs[0].status == "claimed"
+                    and worker_claim_replayable
+                ):
+                    # G+1 and its exact user row committed, while both the
+                    # callback state and bound source prove no provider
+                    # transport was admitted. Keep the Task outside the
+                    # generic pending queue; Worker-outbox recovery will replay
+                    # the immutable envelope without incrementing generation.
+                    new_status = "executing"
+                    values = {
+                        "status": "executing",
+                        "instance_id": None,
+                        "completed_at": None,
+                        "error_message": None,
+                    }
+                    logger.warning(
+                        "Recovering exact claimed Worker handoff for task %s "
+                        "generation %s",
+                        t.id,
+                        t.turn_generation,
+                    )
+                elif current_handoffs and current_handoffs[0].status == "claimed":
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "Recovered an invalid claimed Worker handoff; its "
+                            "durable envelope cannot safely replay the exact "
+                            "Task generation"
+                        ),
+                    }
+                    logger.error(
+                        "Failing unowned task %s because claimed Worker "
+                        "handoff %s is not replayable",
+                        t.id,
+                        current_handoffs[0].handoff_id,
+                    )
+                elif current_handoffs:
+                    # ``launching`` is written immediately before the first
+                    # provider side effect. A dead process cannot prove whether
+                    # the request was accepted, so never turn this into pending
+                    # or replay it as a fresh G+2 task.
+                    handoff_status = current_handoffs[0].status
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "CCM restarted after the Worker handoff crossed its "
+                            f"launch boundary ({handoff_status}); automatic "
+                            "replay was blocked to prevent duplicate execution"
+                        ),
+                    }
+                    logger.error(
+                        "Fail-closing task %s generation %s after Worker "
+                        "handoff reached %s",
+                        t.id,
+                        t.turn_generation,
+                        handoff_status,
+                    )
+                elif exact_plan_receipts:
+                    new_status = "failed"
+                    error = (
+                        "CCM restarted with an exact Plan launch claim for "
+                        "this Task generation; automatic replay was blocked "
+                        "to prevent duplicate execution"
+                    )
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": error,
+                    }
+                    logger.error(
+                        "Fail-closing task %s generation %s with exact Plan "
+                        "launch evidence",
+                        t.id,
+                        t.turn_generation,
+                    )
+                elif source is not None and source.actual_transport is not None:
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "CCM restarted after the exact turn selected "
+                            f"transport {source.actual_transport}; automatic "
+                            "replay was blocked to prevent duplicate execution"
+                        ),
+                    }
+                    logger.error(
+                        "Fail-closing task %s generation %s with durable "
+                        "transport %s",
+                        t.id,
+                        t.turn_generation,
+                        source.actual_transport,
+                    )
+                elif (
+                    t.turn_source_log_id is None
+                    and t.turn_generation == 0
+                ):
+                    # Legacy rows predate exact turn identity.  A missing
+                    # source/transport cannot prove that the old process was
+                    # rejected before tools or other external effects.  Worker
+                    # ``claimed`` receipts above are the sole durable recovery
+                    # exception; never reconstruct a legacy active turn from
+                    # Task.description alone.
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "CCM restarted with a legacy generation-zero active "
+                            "Task that has no durable provider-boundary proof; "
+                            "automatic replay was blocked"
+                        ),
+                    }
+                    logger.error(
+                        "Fail-closing legacy generation-zero task %s without "
+                        "provider-boundary proof",
+                        t.id,
+                    )
+                elif (
+                    source_is_canonical
+                    and source_request_id is None
+                    and t.turn_generation == 1
+                    and source is not None
+                    and source.actual_transport is None
+                ):
+                    # The sole modern source-less replay shape is the first
+                    # TaskQueue turn.  Later hidden sources can be internal
+                    # wakes/repairs whose volatile prompt is not the Task
+                    # description, so G>1 must fail closed.
                     new_status = "pending"
                     values = {
                         "status": "pending",
                         "instance_id": None,
                         "started_at": None,
                         "completed_at": None,
-                        "error_message": "Recovered unowned execution claim",
+                        "error_message": "Recovered unlaunched initial Task turn",
                     }
                     logger.warning(
-                        "Releasing unowned task %s from %s back to pending",
+                        "Releasing exact initial task %s generation 1 back to pending",
+                        t.id,
+                    )
+                else:
+                    new_status = "failed"
+                    values = {
+                        "status": "failed",
+                        "instance_id": None,
+                        "completed_at": datetime.utcnow(),
+                        "error_message": (
+                            "CCM restarted after a queued logical turn lost "
+                            "its durable replay envelope; automatic replay of "
+                            "the Task description was blocked"
+                        ),
+                    }
+                    logger.error(
+                        "Fail-closing unowned task %s from %s because its "
+                        "logical turn is not safely replayable",
                         t.id,
                         t.status,
                     )
@@ -1671,6 +3621,10 @@ class GlobalDispatcher:
                     update(Task).where(*release_predicates).values(**values)
                 )
                 if released.rowcount:
+                    for plan_receipt in plans_to_quarantine:
+                        plan_receipt.delivery_status = "uncertain"
+                        plan_receipt.delivery_error = values["error_message"][:2000]
+                        plan_receipt.updated_at = datetime.utcnow()
                     resulting_generation = await self._read_task_status_generation(
                         db, t.id
                     )
@@ -1682,6 +3636,8 @@ class GlobalDispatcher:
             # state regardless of the task's current queue status so startup
             # cannot dispatch a second writer.
             for task_id, (instance_id, unmanaged_pid) in unmanaged_live_owners.items():
+                if task_id in termination_task_ids:
+                    continue
                 pending_owner = await db.get(Task, task_id, populate_existing=True)
                 if pending_owner is None or pending_owner.instance_id not in (
                     None,
@@ -1749,6 +3705,8 @@ class GlobalDispatcher:
                     select(MonitorSession).where(MonitorSession.status == "running")
                 )
                 for ms in result.scalars().all():
+                    if ms.task_id in termination_task_ids:
+                        continue
                     # Remote mirror rows are owned by their source CCM.
                     if ms.remote_id is not None:
                         continue
@@ -2021,33 +3979,117 @@ class GlobalDispatcher:
         for instance_id in managed_instance_ids:
             records = getattr(self.instance_manager, "_consumer_records", {})
             record = records.get(instance_id) if isinstance(records, dict) else None
+            shutdown_turn_error = (
+                "Dispatcher shutdown interrupted an admitted provider turn; "
+                "its outcome is uncertain and automatic replay was blocked"
+            )
             task_status = (
                 "completed"
                 if record is not None and getattr(record, "chat_initiated", False)
-                else "pending"
+                else "failed"
             )
             stop_failed = False
             try:
                 async with self.db_factory() as db:
                     instance = await db.get(Instance, instance_id)
-                    expected_task_id = (
+                    persisted_task_id = (
                         instance.current_task_id if instance is not None else None
                     )
                     expected_pid = instance.pid if instance is not None else None
                     expected_started_at = (
                         instance.started_at if instance is not None else None
                     )
-                stopped = await self.instance_manager.stop(
-                    instance_id,
-                    expected_task_id=expected_task_id,
-                    expected_pid=expected_pid,
-                    expected_started_at=expected_started_at,
-                    task_status=task_status,
-                    terminal_consumer_timeout=(SHUTDOWN_TERMINAL_CONSUMER_TIMEOUT),
-                    consumer_cancel_timeout=SHUTDOWN_CONSUMER_CANCEL_TIMEOUT,
-                )
-                if not stopped and self.instance_manager.is_running(instance_id):
-                    stop_failed = True
+                    record_task_id = getattr(record, "task_id", None)
+                    candidate_task_id = (
+                        record_task_id
+                        if type(record_task_id) is int and record_task_id > 0
+                        else persisted_task_id
+                    )
+                    persisted_task = (
+                        await db.get(Task, candidate_task_id)
+                        if type(candidate_task_id) is int
+                        and candidate_task_id > 0
+                        else None
+                    )
+                    record_retry_count = getattr(
+                        record,
+                        "task_retry_count",
+                        None,
+                    )
+                    record_turn_generation = getattr(
+                        record,
+                        "task_turn_generation",
+                        None,
+                    )
+                    has_record_identity = bool(
+                        record is not None
+                        and type(record_task_id) is int
+                        and record_task_id > 0
+                    )
+                    record_matches_db = bool(
+                        has_record_identity
+                        and persisted_task_id == record_task_id
+                        and persisted_task is not None
+                        and persisted_task.instance_id == instance_id
+                        and type(record_retry_count) is int
+                        and record_retry_count >= 0
+                        and persisted_task.retry_count == record_retry_count
+                        and type(record_turn_generation) is int
+                        and record_turn_generation >= 0
+                        and persisted_task.turn_generation
+                        == record_turn_generation
+                    )
+                    if has_record_identity and not record_matches_db:
+                        logger.error(
+                            "Shutdown consumer identity for instance %s no "
+                            "longer matches its durable Task generation",
+                            instance_id,
+                        )
+                        stop_failed = True
+                        expected_task_id = record_task_id
+                        expected_task_turn_generation = record_turn_generation
+                    else:
+                        expected_task_id = candidate_task_id
+                        expected_task_turn_generation = (
+                            record_turn_generation
+                            if record_matches_db
+                            else (
+                                persisted_task.turn_generation
+                                if persisted_task is not None
+                                else None
+                            )
+                        )
+                if not stop_failed:
+                    stop_kwargs = {
+                        "expected_task_id": expected_task_id,
+                        "expected_pid": expected_pid,
+                        "expected_started_at": expected_started_at,
+                        "task_status": task_status,
+                        "terminal_consumer_timeout": (
+                            SHUTDOWN_TERMINAL_CONSUMER_TIMEOUT
+                        ),
+                        "consumer_cancel_timeout": (
+                            SHUTDOWN_CONSUMER_CANCEL_TIMEOUT
+                        ),
+                        "allow_delivery_effect_stop": True,
+                    }
+                    if (
+                        type(expected_task_id) is int
+                        and expected_task_id > 0
+                        and type(expected_task_turn_generation) is int
+                        and expected_task_turn_generation >= 0
+                    ):
+                        stop_kwargs["expected_task_turn_generation"] = (
+                            expected_task_turn_generation
+                        )
+                    if task_status == "failed":
+                        stop_kwargs["task_error_message"] = shutdown_turn_error
+                    stopped = await self.instance_manager.stop(
+                        instance_id,
+                        **stop_kwargs,
+                    )
+                    if not stopped and self.instance_manager.is_running(instance_id):
+                        stop_failed = True
             except Exception:
                 stop_failed = True
                 logger.exception(
@@ -2167,18 +4209,37 @@ class GlobalDispatcher:
             if self.instance_manager.is_running(instance_id):
                 continue
             async with self.db_factory() as db:
-                task_id = await db.scalar(
-                    select(Task.id).where(
+                active_task = await db.scalar(
+                    select(Task).where(
                         Task.instance_id == instance_id,
                         Task.status.in_(["in_progress", "executing"]),
                         Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
                     )
                 )
-                if task_id is not None:
-                    await TaskQueue(db).defer(
-                        task_id,
-                        "dispatcher shutdown before process launch",
-                        instance_id=instance_id,
+                generation = (
+                    self._task_lifecycle_generation(active_task)
+                    if active_task is not None
+                    else None
+                )
+            if generation is not None:
+                finalized = await self._finalize_fresh_lifecycle_replay_safely(
+                    generation,
+                    pending_reason="dispatcher shutdown before process launch",
+                    failure_reason=(
+                        "Dispatcher shutdown found a process-free Task without "
+                        "proof that provider launch remained un-crossed"
+                    ),
+                )
+                if (
+                    finalized is not None
+                    and finalized.published
+                    and finalized.failed_task is not None
+                ):
+                    await self._handle_pr_review_failure(
+                        finalized.failed_task,
+                        finalized.failed_task.error_message
+                        or "Dispatcher shutdown interrupted the Task",
                     )
 
         # Forget only settled lifecycle registrations.  Pending tasks and
@@ -2313,6 +4374,7 @@ class GlobalDispatcher:
                             generation,
                             expected_status=task.status,
                             expected_retry_count=task.retry_count,
+                            expected_turn_generation=task.turn_generation,
                             expected_instance_id=task.instance_id,
                             expected_started_at=task.started_at,
                             expected_completed_at=task.completed_at,
@@ -2649,6 +4711,28 @@ class GlobalDispatcher:
                 task.id,
             )
 
+    async def _wait_mode_output_consumer(
+        self,
+        instance_id: int,
+        task: Task,
+        process,
+    ) -> None:
+        """Require exact Loop/Goal output bookkeeping to settle completely.
+
+        A mode may launch another provider turn or publish a terminal result.
+        Claude's ordinary 30-second compatibility timeout is therefore unsafe
+        here: its shielded consumer would keep writing terminal rows after the
+        next iteration's boundary.  Propagate consumer failures and wait
+        without a timeout before any mode proof can be created.
+        """
+
+        await self.instance_manager.wait_for_output_consumer(
+            instance_id,
+            provider=task.provider,
+            timeout=None,
+            expected_process=process,
+        )
+
     def _effective_process_exit_code(self, instance_id: int, process) -> int:
         """Return the exact turn's provider-semantic exit code.
 
@@ -2827,21 +4911,43 @@ class GlobalDispatcher:
         instance_id: int,
         run_id: int,
         generation: int,
-    ) -> None:
-        """Release only the exact PlanRun generation left after its coroutine."""
+    ) -> bool:
+        """Release an exact PlanRun owner; return whether cold retry is needed."""
+
+        from backend.services.plan_runtime_receipt import runtime_generation_is_clean
 
         async with self.db_factory() as db:
             run = await db.get(PlanAgentRun, run_id, with_for_update=True)
             owner = await db.get(Instance, instance_id, with_for_update=True)
             if (
-                owner is None
+                run is None
+                or owner is None
                 or owner.current_plan_run_id != run_id
                 or owner.current_task_id is not None
                 or owner.pid is not None
+                or run.instance_id not in {None, instance_id}
             ):
                 await db.rollback()
-                return
-            if run is not None and run.generation == generation:
+                return False
+            cancellation_generation = bool(
+                run.status == "cancelling"
+                and run.cancellation_target_generation == generation
+                and run.generation == generation + 1
+            )
+            if not cancellation_generation and run.generation != generation:
+                await db.rollback()
+                return False
+            if not await runtime_generation_is_clean(
+                db,
+                run_id=run_id,
+                generation=generation,
+            ):
+                # PID is intentionally NULL for Plan claims and is not absence
+                # proof. Preserve both directions until the exact provider
+                # generation has a durable cleaned receipt.
+                await db.rollback()
+                return True
+            if run.generation == generation or cancellation_generation:
                 if run.last_execution_started_at is not None:
                     run.execution_seconds = float(run.execution_seconds or 0) + max(
                         0.0,
@@ -2851,7 +4957,7 @@ class GlobalDispatcher:
                     )
                     run.last_execution_started_at = None
                 run.instance_id = None
-                if run.status == "running":
+                if run.status == "running" and not cancellation_generation:
                     # A path that neither advanced nor recorded failure is not
                     # safe to replay silently; preserve an explicit terminal.
                     run.status = "failed"
@@ -2864,9 +4970,26 @@ class GlobalDispatcher:
                             plan.active_run_id = None
                             plan.lock_version += 1
                             plan.updated_at = datetime.utcnow()
+                elif cancellation_generation:
+                    running_steps = list(
+                        (
+                            await db.execute(
+                                select(PlanAgentStep).where(
+                                    PlanAgentStep.run_id == run.id,
+                                    PlanAgentStep.generation == generation,
+                                    PlanAgentStep.status == "running",
+                                )
+                            )
+                        ).scalars()
+                    )
+                    for step in running_steps:
+                        step.status = "cancelled"
+                        step.error = "Cancelled by user"
+                        step.finished_at = datetime.utcnow()
             owner.status = "idle"
             owner.current_plan_run_id = None
             await db.commit()
+            return False
 
     async def _run_plan_run_lifecycle(
         self,
@@ -2925,13 +5048,23 @@ class GlobalDispatcher:
             await runner.fail_versioned_run(run_id, generation, str(exc))
         finally:
             try:
-                await _settle_despite_cancellation(
+                cleanup, _delayed_cancellation = await _settle_despite_cancellation(
                     self._cleanup_plan_run_owner(
                         instance_id=instance_id,
                         run_id=run_id,
                         generation=generation,
                     )
                 )
+                retry_needed = cleanup.result()
+                if (
+                    retry_needed
+                    and self._running
+                    and not self._shutting_down
+                ):
+                    # The lifecycle is about to disappear from the live set.
+                    # Make its durable unclean generation visible to the
+                    # serialized cold scanner without starting another task.
+                    self._request_plan_runtime_recovery()
             finally:
                 if self._running_tasks.get(instance_id) is lifecycle:
                     self._running_tasks.pop(instance_id, None)
@@ -2947,6 +5080,11 @@ class GlobalDispatcher:
                     except asyncio.TimeoutError:
                         pass
                     continue
+                # Keep orphan Plan cleanup and local Plan claim/lifecycle
+                # registration in this one producer. Do not move this into a
+                # detached timer task: the claim commit is intentionally
+                # followed immediately by in-memory lifecycle registration.
+                await self._recover_due_versioned_plan_runs()
                 # Top up idle workers before looking for capacity
                 await self._ensure_min_idle_instances()
 
@@ -3035,15 +5173,25 @@ class GlobalDispatcher:
                                 global_cfg = await db.get(GlobalSettings, 1)
                                 if project:
                                     if project.local_path and not task.target_repo:
-                                        await db.execute(
+                                        target_updated = await db.execute(
                                             update(Task)
                                             .where(
-                                                Task.id == task.id,
-                                                Task.status == "in_progress",
-                                                Task.instance_id == instance.id,
+                                                *self._task_lifecycle_generation_predicates(
+                                                    self._task_lifecycle_generation(
+                                                        task
+                                                    ),
+                                                    statuses=("in_progress",),
+                                                ),
+                                                no_active_worker_task_termination_predicate(),
                                             )
                                             .values(target_repo=project.local_path)
                                         )
+                                        if not target_updated.rowcount:
+                                            await db.rollback()
+                                            raise TaskLifecycleSupersededError(
+                                                "Task project preparation lost "
+                                                "its exact execution generation"
+                                            )
                                         await db.commit()
                                         task.target_repo = project.local_path
                                     merged = merge_git_config(
@@ -3072,38 +5220,50 @@ class GlobalDispatcher:
                         lifecycle_registered = True
                     except TaskStartPausedError:
                         break
-                    except asyncio.CancelledError:
+                    except TaskLifecycleSupersededError:
+                        logger.info(
+                            "Claimed Task generation was superseded during "
+                            "project preparation"
+                        )
+                    except asyncio.CancelledError as cancellation:
                         if task is not None and instance is not None:
-                            async with self.db_factory() as db:
-                                await TaskQueue(db).defer(
-                                    task.id,
-                                    "dispatcher stopped before launch",
-                                    instance_id=instance.id,
+                            finalizer, delayed_cancellation = (
+                                await _settle_despite_cancellation(
+                                    self._finalize_fresh_lifecycle_replay_safely(
+                                        self._task_lifecycle_generation(task),
+                                        pending_reason=(
+                                            "dispatcher stopped before launch"
+                                        ),
+                                        failure_reason=(
+                                            "Dispatcher preparation lost exact "
+                                            "prelaunch source proof"
+                                        ),
+                                        allow_unbound_prelaunch=True,
+                                    )
                                 )
+                            )
+                            finalizer.result()
+                            if delayed_cancellation is not None:
+                                cancellation = delayed_cancellation
                         if plan_run_claim is not None and instance is not None:
                             await self._cleanup_plan_run_owner(
                                 instance_id=instance.id,
                                 run_id=plan_run_claim[0],
                                 generation=plan_run_claim[1],
                             )
-                        raise
+                        raise cancellation
                     except Exception as exc:
                         logger.exception("Failed to prepare a claimed task for launch")
                         if task is not None and instance is not None:
-                            async with self.db_factory() as db:
-                                deferred = await TaskQueue(db).defer(
-                                    task.id,
-                                    f"launch preparation failed: {exc}"[:500],
-                                    instance_id=instance.id,
-                                )
-                            if deferred:
-                                from backend.services.task_events import (
-                                    broadcast_status_change,
-                                )
-
-                                await broadcast_status_change(
-                                    task.id, "pending", instance.id
-                                )
+                            await self._finalize_fresh_lifecycle_replay_safely(
+                                self._task_lifecycle_generation(task),
+                                pending_reason=f"launch preparation failed: {exc}",
+                                failure_reason=(
+                                    "Launch preparation lost exact prelaunch "
+                                    "source proof"
+                                ),
+                                allow_unbound_prelaunch=True,
+                            )
                         if plan_run_claim is not None and instance is not None:
                             await self._cleanup_plan_run_owner(
                                 instance_id=instance.id,
@@ -3147,6 +5307,7 @@ class GlobalDispatcher:
         if worker_proxy is None:
             return
         from backend.models.worker import Worker as WorkerModel
+        from backend.services.worker_proxy import get_task_operation_lock
 
         async with self.db_factory() as db:
             result = await db.execute(
@@ -3155,6 +5316,7 @@ class GlobalDispatcher:
                     Task.worker_id.isnot(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
             )
             worker_tasks = list(result.scalars().all())
@@ -3166,6 +5328,114 @@ class GlobalDispatcher:
                 or pending_generation.shared_from_id is not None
             ):
                 continue
+
+            # ``mode=plan`` belongs to either the first-class Plan executor or
+            # a pre-v2 legacy carrier.  Generic Manager -> Worker Task create
+            # cannot transport the legacy approval proof (link + Version +
+            # Application), and new Workers reject Plan Task creation
+            # outright.  Gate it while holding the same per-Task operation
+            # lock as forwarding, before advancing the Manager generation.
+            worker_plan_blocked = False
+            worker_plan_failure = None
+            worker_plan_recovery_digest = None
+            async with get_task_operation_lock(task.id):
+                async with self.db_factory() as db:
+                    current = (
+                        await db.execute(
+                            select(Task)
+                            .where(
+                                *self._task_status_generation_predicates(
+                                    pending_generation
+                                ),
+                                no_active_worker_task_termination_predicate(),
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if current is not None and current.mode == "plan":
+                        worker_plan_blocked = True
+                        from backend.services.legacy_plan_execution import (
+                            legacy_approved_execution_carrier_proof,
+                        )
+
+                        legacy_proof = (
+                            await legacy_approved_execution_carrier_proof(
+                                db,
+                                current.id,
+                            )
+                        )
+                        if legacy_proof is not None:
+                            worker_plan_recovery_digest = (
+                                legacy_proof.proof_digest
+                            )
+                            # The matching Worker database already owns the
+                            # pre-v2 Task.  Re-POSTing cannot carry its Plan
+                            # proof and would either be rejected by a new
+                            # Worker or restart planning on an old one.  Leave
+                            # the Manager mirror pending until the dedicated
+                            # proof/readback reconciliation path adopts it.
+                            await db.rollback()
+                        else:
+                            error = (
+                                "Plan Tasks cannot use generic Worker "
+                                "forwarding; use the first-class Plan "
+                                "execution protocol"
+                            )
+                            failed = await db.execute(
+                                update(Task)
+                                .where(
+                                    *self._task_status_generation_predicates(
+                                        pending_generation
+                                    ),
+                                    Task.mode == "plan",
+                                    Task.worker_id
+                                    == pending_generation.worker_id,
+                                    Task.shared_from_id.is_(None),
+                                    task_retry_not_superseded_predicate(),
+                                    no_active_worker_task_termination_predicate(),
+                                )
+                                .values(
+                                    status="failed",
+                                    completed_at=datetime.utcnow(),
+                                    error_message=error,
+                                )
+                            )
+                            if failed.rowcount:
+                                worker_plan_failure = (
+                                    await self._read_task_status_generation(
+                                        db,
+                                        current.id,
+                                    )
+                                )
+                            await db.commit()
+                    else:
+                        await db.rollback()
+            if worker_plan_blocked:
+                if worker_plan_failure is not None:
+                    await self._broadcast_task_status_generation(
+                        worker_plan_failure,
+                        extra={"old_status": "pending"},
+                    )
+                elif worker_plan_recovery_digest is not None:
+                    async with self.db_factory() as db:
+                        worker = await db.get(
+                            WorkerModel,
+                            pending_generation.worker_id,
+                        )
+                    relay = getattr(worker_proxy, "relay", None)
+                    if (
+                        worker is not None
+                        and worker.status == "ready"
+                        and relay is not None
+                    ):
+                        relay.ensure_legacy_plan_execution_carrier_recovery(
+                            worker,
+                            task.id,
+                            worker_plan_recovery_digest,
+                            worker_proxy,
+                        )
+                continue
+
             async with self.db_factory() as db:
                 worker = await db.get(
                     WorkerModel,
@@ -3203,6 +5473,7 @@ class GlobalDispatcher:
                                     if task.target_repo is None
                                     else Task.target_repo == task.target_repo
                                 ),
+                                no_active_worker_task_termination_predicate(),
                             )
                             .values(target_repo=project.local_path)
                         )
@@ -3215,10 +5486,6 @@ class GlobalDispatcher:
             # share the same per-task fence as Skill saves and forwarding:
             # a save that wins first is included in the refreshed claim, while
             # a save that loses observes ``in_progress`` and is rejected.
-            from backend.services.worker_proxy import (
-                get_task_operation_lock,
-            )
-
             async with get_task_operation_lock(task.id):
                 async with self.db_factory() as db:
                     claimed = await db.execute(
@@ -3227,13 +5494,28 @@ class GlobalDispatcher:
                             *self._task_status_generation_predicates(
                                 pending_generation
                             ),
+                            Task.mode != "plan",
                             Task.worker_id == worker.id,
                             Task.shared_from_id.is_(None),
                             task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
                         )
                         .values(
                             status="in_progress",
                             started_at=datetime.utcnow(),
+                            # Keep the Manager mirror on the same deterministic
+                            # admission generation as the Worker's local
+                            # TaskQueue.dequeue().  The remote row is created
+                            # pending at N and its dequeue advances it to N+1;
+                            # advancing the exact Manager pending generation in
+                            # this claim avoids both rejecting that legitimate
+                            # first turn and adopting an arbitrary remote value.
+                            turn_generation=Task.turn_generation + 1,
+                            # Source identity is generation-scoped.  The
+                            # Manager mirror advances in lockstep with the
+                            # Worker's dequeue, so it must not carry G's
+                            # pointer into the newly admitted G+1.
+                            turn_source_log_id=None,
                         )
                     )
                     claimed_generation = None
@@ -3284,11 +5566,58 @@ class GlobalDispatcher:
         claimed_generation: _TaskStatusGeneration,
     ):
         from backend.main import worker_proxy
+        from backend.services.worker_proxy import (
+            WorkerTaskForwardAdmissionBlockedError,
+            WorkerTaskForwardOutcomeUncertainError,
+        )
 
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 await worker_proxy.forward_task_to_worker(task)
+                return
+            except WorkerTaskForwardAdmissionBlockedError:
+                logger.info(
+                    "Initial Worker forwarding for task %s was superseded "
+                    "by a durable termination receipt",
+                    task.id,
+                )
+                return
+            except WorkerTaskForwardOutcomeUncertainError as e:
+                # The Worker may already have committed and started this Task.
+                # Keep the Manager mirror active and exact-generation fenced so
+                # relay events can still converge it; marking it failed or
+                # resending POST would create two authorities for one Task id.
+                async def quarantine_uncertain_forward() -> None:
+                    async with self.db_factory() as db:
+                        quarantined = await db.execute(
+                            update(Task)
+                            .where(
+                                *self._task_status_generation_predicates(
+                                    claimed_generation
+                                ),
+                                Task.worker_id == task.worker_id,
+                                no_active_worker_task_termination_predicate(),
+                            )
+                            .values(
+                                error_message=(
+                                    "Initial Worker Task forwarding outcome is "
+                                    "uncertain; automatic replay was blocked. "
+                                    f"Awaiting Worker relay reconciliation: {e}"
+                                )[:2000]
+                            )
+                        )
+                        await db.commit()
+                    if quarantined.rowcount:
+                        logger.error(
+                            "Quarantined uncertain initial Worker forwarding "
+                            "for task %s; POST will not be replayed",
+                            task.id,
+                        )
+
+                await asyncio.shield(quarantine_uncertain_forward())
+                if e.cancellation is not None:
+                    raise e.cancellation
                 return
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -3318,6 +5647,7 @@ class GlobalDispatcher:
                                     claimed_generation
                                 ),
                                 Task.worker_id == task.worker_id,
+                                no_active_worker_task_termination_predicate(),
                             )
                             .values(
                                 status="failed",
@@ -3343,7 +5673,15 @@ class GlobalDispatcher:
 
         from backend.main import worker_proxy
         from backend.models.worker import Worker
-        from backend.services.plan_service import plan_operation_lock
+        from backend.services.plan_service import (
+            fence_plan_target_task,
+            fence_plan_worker,
+            plan_operation_lock,
+        )
+        from backend.services.worker_plan_dispatch import (
+            load_worker_dispatch_receipt,
+            new_prepared_worker_dispatch_receipt,
+        )
 
         if worker_proxy is None:
             return
@@ -3391,6 +5729,16 @@ class GlobalDispatcher:
                     worker = await db.get(Worker, current.worker_id)
                     if worker is None or worker.status != "ready":
                         continue
+                    try:
+                        await fence_plan_target_task(
+                            db,
+                            target_task_id=plan.target_task_id,
+                            expected_worker_id=worker.id,
+                        )
+                        await fence_plan_worker(db, worker_id=worker.id)
+                    except HTTPException:
+                        # Worker destruction won the Task -> Worker fence.
+                        continue
                     running_tasks = int(
                         await db.scalar(
                             select(func.count(Task.id)).where(
@@ -3413,6 +5761,25 @@ class GlobalDispatcher:
                         continue
                     generation = current.generation
                     worker_id = current.worker_id
+                    receipt = await load_worker_dispatch_receipt(
+                        db,
+                        run_id=run_id,
+                        generation=generation,
+                        for_update=True,
+                    )
+                    if receipt is None:
+                        receipt = new_prepared_worker_dispatch_receipt(
+                            plan=plan,
+                            run=current,
+                        )
+                        db.add(receipt)
+                        await db.flush()
+                    elif receipt.status != "prepared":
+                        # remote_possible is owned exclusively by read-only
+                        # recovery; settled at this same generation is corrupt.
+                        await db.rollback()
+                        continue
+                    now = datetime.utcnow()
                     claimed = await db.execute(
                         update(PlanAgentRun)
                         .where(
@@ -3422,18 +5789,24 @@ class GlobalDispatcher:
                             PlanAgentRun.status == "queued",
                             PlanAgentRun.generation == generation,
                         )
-                        .values(status="running", updated_at=datetime.utcnow())
+                        .values(
+                            status="running",
+                            last_execution_started_at=now,
+                            updated_at=now,
+                        )
                     )
                     if claimed.rowcount != 1:
                         await db.rollback()
                         continue
                     await db.commit()
+                    receipt_id = receipt.id
             lifecycle = asyncio.create_task(
                 self._run_worker_plan_lifecycle(
                     plan_id=plan_id,
                     run_id=run_id,
                     worker_id=worker_id,
                     generation=generation,
+                    receipt_id=receipt_id,
                 )
             )
             setattr(lifecycle, "_ccm_worker_plan_run_id", run_id)
@@ -3451,6 +5824,12 @@ class GlobalDispatcher:
 
     @staticmethod
     def _worker_plan_failure_is_permanent(exc: Exception) -> bool:
+        from backend.services.worker_proxy import (
+            WorkerPlanReconciliationUnsupported,
+        )
+
+        if isinstance(exc, WorkerPlanReconciliationUnsupported):
+            return True
         if isinstance(exc, HTTPException):
             return exc.status_code < 500 and exc.status_code != 429
         if isinstance(exc, httpx.HTTPStatusError):
@@ -3475,12 +5854,33 @@ class GlobalDispatcher:
         run_id: int,
         worker_id: int,
         generation: int,
+        receipt_id: int,
     ) -> None:
         from backend.main import worker_proxy
         from backend.services.plan_service import (
             apply_worker_plan_outcome,
             plan_operation_lock,
         )
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            mark_worker_dispatch_remote_possible,
+        )
+
+        async def publish_remote_possible(payload_digest: str) -> None:
+            operation, delayed_cancellation = await _settle_despite_cancellation(
+                mark_worker_dispatch_remote_possible(
+                    self.db_factory,
+                    receipt_id=receipt_id,
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    payload_digest=payload_digest,
+                )
+            )
+            operation.result()
+            if delayed_cancellation is not None:
+                raise delayed_cancellation
 
         try:
             async with self.db_factory() as db:
@@ -3488,13 +5888,28 @@ class GlobalDispatcher:
                 run = await db.get(PlanAgentRun, run_id)
                 if plan is None or run is None:
                     return
-            payload = await worker_proxy.run_versioned_plan_until_pause(plan, run)
+            payload = await worker_proxy.run_versioned_plan_until_pause(
+                plan,
+                run,
+                on_remote_possible=publish_remote_possible,
+            )
             async with plan_operation_lock(plan_id):
                 async with self.db_factory() as db:
-                    current_plan = await db.get(Plan, plan_id, with_for_update=True)
+                    frozen_receipt = await db.get(
+                        PlanAgentWorkerDispatchReceipt,
+                        receipt_id,
+                        populate_existing=True,
+                    )
+                    if frozen_receipt is None:
+                        return
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
                     current_run = await db.get(
                         PlanAgentRun, run_id, with_for_update=True
                     )
+                    current_plan = await db.get(Plan, plan_id, with_for_update=True)
                     if current_plan is None or current_run is None:
                         return
                     imported = await apply_worker_plan_outcome(
@@ -3504,6 +5919,7 @@ class GlobalDispatcher:
                         worker_id=worker_id,
                         expected_generation=generation,
                         payload=payload,
+                        worker_dispatch_receipt_id=receipt_id,
                     )
                     status = imported.status
                     stage = imported.current_stage
@@ -3516,43 +5932,282 @@ class GlobalDispatcher:
                 round_number=round_number,
             )
         except asyncio.CancelledError:
+            cleanup, _delayed_cancellation = await _settle_despite_cancellation(
+                self._settle_cancelled_worker_plan_lifecycle(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=receipt_id,
+                )
+            )
+            needs_recovery = cleanup.result()
+            if needs_recovery and self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
             raise
         except Exception as exc:
-            permanent = self._worker_plan_failure_is_permanent(exc)
-            logger.exception(
-                "Worker Plan Run %s %s",
-                run_id,
-                "failed" if permanent else "was deferred",
+            deferred_remote = await self._handle_worker_plan_failure(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+                exc=exc,
+            )
+            if deferred_remote and self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+
+    async def _settle_cancelled_worker_plan_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+    ) -> bool:
+        """Return True when shutdown left a maybe-imported remote generation."""
+
+        async with self.db_factory() as db:
+            receipt = await db.get(
+                PlanAgentWorkerDispatchReceipt,
+                receipt_id,
+                populate_existing=True,
+            )
+            if receipt is None or receipt.status == "settled":
+                return False
+            if receipt.status == "remote_possible":
+                return True
+            if receipt.status != "prepared":
+                return True
+        return not await self._settle_prepared_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            worker_id=worker_id,
+            generation=generation,
+            receipt_id=receipt_id,
+        )
+
+    async def _handle_worker_plan_failure(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        exc: Exception,
+    ) -> bool:
+        """Defer uncertain remote errors; only pre-boundary failures requeue."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        permanent = self._worker_plan_failure_is_permanent(exc)
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return True
+                try:
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                except (HTTPException, WorkerPlanDispatchConflict):
+                    await db.rollback()
+                    return True
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                ):
+                    await db.rollback()
+                    return False
+                if receipt.status == "remote_possible":
+                    receipt.last_error = str(exc)[:4000]
+                    receipt.updated_at = datetime.utcnow()
+                    await db.commit()
+                    logger.warning(
+                        "Worker Plan Run %s has an uncertain remote outcome; "
+                        "read-only reconciliation was scheduled: %s",
+                        run_id,
+                        exc,
+                    )
+                    return True
+                if receipt.status != "prepared":
+                    await db.rollback()
+                    return True
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                    run.last_execution_started_at = None
+                if permanent:
+                    try:
+                        settle_worker_dispatch_receipt(
+                            receipt=receipt,
+                            plan=plan,
+                            run=run,
+                            generation=generation,
+                            reason="preflight_failed",
+                            remote_status=None,
+                            last_error=str(exc),
+                        )
+                    except WorkerPlanDispatchConflict:
+                        await db.rollback()
+                        return True
+                    run.status = "failed"
+                    run.current_stage = "failed"
+                    run.error = str(exc)[:4000]
+                    run.finished_at = now
+                    plan.active_run_id = None
+                else:
+                    run.status = "queued"
+                run.updated_at = now
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                status = run.status
+                stage = run.current_stage
+                round_number = run.round
+        logger.exception(
+            "Worker Plan Run %s %s before remote import",
+            run_id,
+            "failed" if permanent else "was deferred",
+            exc_info=exc,
+        )
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status=status,
+            stage=stage,
+            round_number=round_number,
+        )
+        return False
+
+    async def _run_worker_plan_reconciliation_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        payload_digest: str,
+    ) -> None:
+        """Audit and follow one exact maybe-imported Worker Run."""
+
+        from backend.main import worker_proxy
+        from backend.services.plan_service import (
+            apply_worker_plan_outcome,
+            plan_operation_lock,
+        )
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            record_worker_dispatch_error,
+        )
+        from backend.services.worker_proxy import (
+            WorkerPlanRemoteAbsent,
+            WorkerPlanRemoteCancelled,
+            WorkerPlanRemoteIdentityConflict,
+        )
+
+        try:
+            async with self.db_factory() as db:
+                run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+                plan = (
+                    await db.get(Plan, plan_id, populate_existing=True)
+                    if run is not None
+                    else None
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                ):
+                    return
+            payload = await worker_proxy.reconcile_versioned_plan_until_pause(
+                plan,
+                run,
+                payload_digest=payload_digest,
             )
             async with plan_operation_lock(plan_id):
                 async with self.db_factory() as db:
-                    run = await db.get(PlanAgentRun, run_id, with_for_update=True)
-                    plan = await db.get(Plan, plan_id, with_for_update=True)
-                    if (
-                        run is None
-                        or plan is None
-                        or run.status != "running"
-                        or run.generation != generation
-                        or run.worker_id != worker_id
-                        or plan.active_run_id != run.id
-                    ):
+                    frozen_receipt = await db.get(
+                        PlanAgentWorkerDispatchReceipt,
+                        receipt_id,
+                        populate_existing=True,
+                    )
+                    if frozen_receipt is None:
                         return
-                    now = datetime.utcnow()
-                    if permanent:
-                        run.status = "failed"
-                        run.current_stage = "failed"
-                        run.error = str(exc)[:4000]
-                        run.finished_at = now
-                        plan.active_run_id = None
-                    else:
-                        run.status = "queued"
-                    run.updated_at = now
-                    plan.lock_version += 1
-                    plan.updated_at = now
-                    await db.commit()
-                    status = run.status
-                    stage = run.current_stage
-                    round_number = run.round
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                    current_run = await db.get(
+                        PlanAgentRun,
+                        run_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    current_plan = await db.get(
+                        Plan,
+                        plan_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if current_plan is None or current_run is None:
+                        return
+                    imported = await apply_worker_plan_outcome(
+                        db,
+                        plan=current_plan,
+                        run=current_run,
+                        worker_id=worker_id,
+                        expected_generation=generation,
+                        payload=payload,
+                        worker_dispatch_receipt_id=receipt_id,
+                    )
+                    status = imported.status
+                    stage = imported.current_stage
+                    round_number = imported.round
             await self._broadcast_worker_plan_run(
                 plan_id=plan_id,
                 run_id=run_id,
@@ -3560,6 +6215,409 @@ class GlobalDispatcher:
                 stage=stage,
                 round_number=round_number,
             )
+        except WorkerPlanRemoteAbsent:
+            await self._settle_absent_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+            )
+        except WorkerPlanRemoteCancelled:
+            await self._settle_cancelled_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+                payload_digest=payload_digest,
+            )
+        except WorkerPlanRemoteIdentityConflict as exc:
+            await self._fail_conflicting_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                receipt_id=receipt_id,
+                error=str(exc),
+            )
+        except asyncio.CancelledError:
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+            raise
+        except Exception as exc:
+            await record_worker_dispatch_error(
+                self.db_factory,
+                receipt_id=receipt_id,
+                error=str(exc),
+            )
+            logger.warning(
+                "Worker Plan Run %s reconciliation remains uncertain: %s",
+                run_id,
+                exc,
+            )
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+
+    async def _run_worker_plan_cancellation_recovery_lifecycle(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        target_generation: int,
+        payload_digest: str,
+    ) -> None:
+        """Replay an exact RPC for one durable Worker cancellation intent."""
+
+        from backend.main import worker_proxy
+        from backend.services.plan_service import (
+            fence_plan_target_task,
+            plan_operation_lock,
+        )
+        from backend.services.worker_plan_dispatch import (
+            apply_worker_terminal_after_cancellation_race,
+            finalize_worker_mirror_cancellation,
+        )
+
+        try:
+            if worker_proxy is None:
+                raise RuntimeError("Worker Plan runtime is unavailable")
+            remote = await worker_proxy.cancel_versioned_plan_run(
+                worker_id,
+                run_id,
+                plan_id=plan_id,
+                payload_digest=payload_digest,
+            )
+            async with plan_operation_lock(plan_id):
+                async with self.db_factory() as db:
+                    run = await db.get(
+                        PlanAgentRun,
+                        run_id,
+                        populate_existing=True,
+                    )
+                    plan = await db.get(Plan, plan_id, populate_existing=True)
+                    if (
+                        run is None
+                        or plan is None
+                        or run.status != "cancelling"
+                        or run.worker_id != worker_id
+                        or run.cancellation_target_generation != target_generation
+                        or run.generation != target_generation + 1
+                        or plan.active_run_id != run.id
+                    ):
+                        return
+                    await fence_plan_target_task(
+                        db,
+                        target_task_id=plan.target_task_id,
+                        expected_worker_id=worker_id,
+                    )
+                    if remote["state"] == "terminal":
+                        run = await apply_worker_terminal_after_cancellation_race(
+                            db,
+                            plan_id=plan_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                            target_generation=target_generation,
+                            payload_digest=payload_digest,
+                            payload={
+                                "protocol": 3,
+                                "base_worker_version_id": remote.get(
+                                    "base_worker_version_id"
+                                ),
+                                "run": remote.get("run"),
+                                "versions": remote.get("versions"),
+                            },
+                        )
+                    else:
+                        run = await finalize_worker_mirror_cancellation(
+                            db,
+                            plan_id=plan_id,
+                            run_id=run_id,
+                            worker_id=worker_id,
+                            target_generation=target_generation,
+                            payload_digest=payload_digest,
+                            remote_state=remote["state"],
+                        )
+                    stage = run.current_stage
+                    round_number = run.round
+            await self._broadcast_worker_plan_run(
+                plan_id=plan_id,
+                run_id=run_id,
+                status=run.status,
+                stage=stage,
+                round_number=round_number,
+            )
+        except asyncio.CancelledError:
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Worker Plan Run %s exact cancellation recovery remains "
+                "pending: %s",
+                run_id,
+                exc,
+            )
+            if self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+
+    async def _settle_cancelled_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        payload_digest: str,
+    ) -> None:
+        """Terminalize a running mirror after audit found exact tombstone."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            WorkerPlanDispatchConflict,
+            fence_worker_dispatch_target,
+            fence_worker_mirror_cancellation,
+            finalize_worker_mirror_cancellation,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return
+                try:
+                    await fence_worker_dispatch_target(
+                        db,
+                        receipt=frozen_receipt,
+                    )
+                    await fence_worker_mirror_cancellation(
+                        db,
+                        plan_id=plan_id,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        generation=generation,
+                        payload_digest=payload_digest,
+                    )
+                    run = await finalize_worker_mirror_cancellation(
+                        db,
+                        plan_id=plan_id,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        target_generation=generation,
+                        payload_digest=payload_digest,
+                        remote_state="cancelled",
+                    )
+                except (HTTPException, WorkerPlanDispatchConflict):
+                    await db.rollback()
+                    return
+                plan = await db.get(Plan, plan_id, populate_existing=True)
+                if plan is None:
+                    return
+                stage = run.current_stage
+                round_number = run.round
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status="cancelled",
+            stage=stage,
+            round_number=round_number,
+        )
+
+    async def _settle_absent_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+    ) -> None:
+        """Requeue only after exact Worker audit returned ``absent``."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return
+                await fence_worker_dispatch_target(
+                    db,
+                    receipt=frozen_receipt,
+                )
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                    or receipt.status != "remote_possible"
+                ):
+                    await db.rollback()
+                    return
+                settle_worker_dispatch_receipt(
+                    receipt=receipt,
+                    plan=plan,
+                    run=run,
+                    generation=generation,
+                    reason="remote_absent",
+                    remote_status=None,
+                )
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                run.last_execution_started_at = None
+                run.status = "queued"
+                run.generation = generation + 1
+                run.updated_at = now
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                stage = run.current_stage
+                round_number = run.round
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status="queued",
+            stage=stage,
+            round_number=round_number,
+        )
+
+    async def _fail_conflicting_worker_plan_run(
+        self,
+        *,
+        plan_id: int,
+        run_id: int,
+        worker_id: int,
+        generation: int,
+        receipt_id: int,
+        error: str,
+    ) -> None:
+        """Terminalize only an audit-proven immutable identity collision."""
+
+        from backend.services.plan_service import plan_operation_lock
+        from backend.services.worker_plan_dispatch import (
+            fence_worker_dispatch_target,
+            settle_worker_dispatch_receipt,
+        )
+
+        async with plan_operation_lock(plan_id):
+            async with self.db_factory() as db:
+                frozen_receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    populate_existing=True,
+                )
+                if frozen_receipt is None:
+                    await db.rollback()
+                    return
+                await fence_worker_dispatch_target(
+                    db,
+                    receipt=frozen_receipt,
+                )
+                run = await db.get(
+                    PlanAgentRun,
+                    run_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                plan = await db.get(
+                    Plan,
+                    plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                receipt = await db.get(
+                    PlanAgentWorkerDispatchReceipt,
+                    receipt_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if (
+                    run is None
+                    or plan is None
+                    or receipt is None
+                    or run.status != "running"
+                    or run.generation != generation
+                    or run.worker_id != worker_id
+                    or plan.active_run_id != run.id
+                    or receipt.status != "remote_possible"
+                ):
+                    await db.rollback()
+                    return
+                settle_worker_dispatch_receipt(
+                    receipt=receipt,
+                    plan=plan,
+                    run=run,
+                    generation=generation,
+                    reason="identity_conflict",
+                    remote_status="conflict",
+                    last_error=error,
+                )
+                now = datetime.utcnow()
+                if run.last_execution_started_at is not None:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
+                run.last_execution_started_at = None
+                run.status = "failed"
+                run.current_stage = "failed"
+                run.error = error[:4000]
+                run.finished_at = now
+                run.updated_at = now
+                plan.active_run_id = None
+                plan.lock_version += 1
+                plan.updated_at = now
+                await db.commit()
+                stage = run.current_stage
+                round_number = run.round
+        await self._broadcast_worker_plan_run(
+            plan_id=plan_id,
+            run_id=run_id,
+            status="failed",
+            stage=stage,
+            round_number=round_number,
+        )
 
     async def _broadcast_worker_plan_run(
         self,
@@ -5040,6 +8098,13 @@ class GlobalDispatcher:
             if math_hint:
                 parts.append(math_hint)
         parts.append(f"任务:\n{task_description}")
+        from backend.services.auto_capability_policy import (
+            build_auto_capability_instructions,
+        )
+
+        capability_instructions = build_auto_capability_instructions(task)
+        if capability_instructions:
+            parts.append(capability_instructions)
         return "\n\n".join(parts)
 
     async def _relaunch_and_wait(
@@ -5080,6 +8145,7 @@ class GlobalDispatcher:
                     "请继续之前的工作。",
                 ),
                 task_id=task.id,
+                task_turn_generation=generation.turn_generation,
                 cwd=cwd,
                 model=task.model,
                 codex_service_tier=task.codex_service_tier,
@@ -5098,6 +8164,7 @@ class GlobalDispatcher:
                 instance_id=instance_id,
                 prompt=full_prompt,
                 task_id=task.id,
+                task_turn_generation=generation.turn_generation,
                 cwd=cwd,
                 model=task.model,
                 codex_service_tier=task.codex_service_tier,
@@ -5131,6 +8198,7 @@ class GlobalDispatcher:
         effort_level: str | None,
         label: str,
         max_rotations: int = 5,
+        sequence: _ModeTurnSequence | None = None,
     ) -> tuple[int, str | None]:
         """Run one plan/loop/goal turn and rotate provider accounts on limit.
 
@@ -5142,6 +8210,12 @@ class GlobalDispatcher:
         """
         current_home = config_dir
         current_session = resume_session_id
+        sequential_turn_token = None
+        if sequence is not None:
+            sequential_turn_token = sequence.next_token
+            sequence.predecessor_process = None
+            sequence.prelaunch_log_id = None
+            sequence.predecessor_loop_iteration = None
 
         for rotation_attempt in range(max_rotations + 1):
             if not await self._task_claim_is_active(generation):
@@ -5152,28 +8226,67 @@ class GlobalDispatcher:
                     instance_id,
                 )
                 return -2, current_home
-            await self.instance_manager.launch(
-                instance_id=instance_id,
-                prompt=prompt,
-                task_id=task.id,
-                cwd=cwd,
-                model=task.model,
-                codex_service_tier=task.codex_service_tier,
-                resume_session_id=current_session,
-                loop_iteration=loop_iteration,
-                git_env=git_env or {},
-                thinking_budget=task.thinking_budget,
-                effort_level=task.effort_level or effort_level,
-                provider=task.provider,
-                config_dir=current_home,
-                enable_workflows=task.enable_workflows,
-                enabled_skills=task.enabled_skills,
-            )
+            prelaunch_log_id = None
+            if sequence is not None:
+                prelaunch_log_id = await self._exact_turn_log_boundary(
+                    generation
+                )
+            attempt_token = sequential_turn_token
+            sequential_turn_token = None
+            if sequence is not None and attempt_token is not None:
+                if sequence.next_token is not attempt_token:
+                    self.instance_manager.revoke_sequential_turn_continuation(
+                        attempt_token
+                    )
+                    raise ModeTurnContinuationError(
+                        "mode continuation ownership changed before launch"
+                    )
+                # Ownership transfers only at the call boundary.  Earlier
+                # claim/boundary failures leave the token on ``sequence`` so
+                # the lifecycle's finally block can revoke it.  Once handed
+                # off, InstanceManager consumes it before provider effect and
+                # revokes it on every pre-boundary exception/cancellation.
+                sequence.next_token = None
+            try:
+                await self.instance_manager.launch(
+                    instance_id=instance_id,
+                    prompt=prompt,
+                    task_id=task.id,
+                    task_turn_generation=generation.turn_generation,
+                    cwd=cwd,
+                    model=task.model,
+                    codex_service_tier=task.codex_service_tier,
+                    resume_session_id=current_session,
+                    loop_iteration=loop_iteration,
+                    git_env=git_env or {},
+                    thinking_budget=task.thinking_budget,
+                    effort_level=task.effort_level or effort_level,
+                    provider=task.provider,
+                    config_dir=current_home,
+                    enable_workflows=task.enable_workflows,
+                    enabled_skills=task.enabled_skills,
+                    source_log_id=task.turn_source_log_id,
+                    sequential_turn_token=attempt_token,
+                )
+            except BaseException:
+                if attempt_token is not None:
+                    # Safe for both cases: an unconsumed token is removed;
+                    # after provider admission InstanceManager already popped
+                    # it, so this is a no-op and never creates replay power.
+                    try:
+                        self.instance_manager.revoke_sequential_turn_continuation(
+                            attempt_token
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to revoke mode continuation after launch error"
+                        )
+                raise
 
             process = self.instance_manager.processes.get(instance_id)
             if process:
                 await self._wait_process(process, task, label, instance_id=instance_id)
-            await self._wait_output_consumer(instance_id, task, label, process)
+            await self._wait_mode_output_consumer(instance_id, task, process)
             exit_code = self._effective_process_exit_code(instance_id, process)
             if not await self._task_claim_is_active(generation):
                 return -2, current_home
@@ -5183,9 +8296,35 @@ class GlobalDispatcher:
                 # routing aligned with the newly persisted task binding rather
                 # than returning the home used at launch.
                 if exit_code == 0:
+                    if sequence is not None:
+                        sequence.predecessor_process = process
+                        sequence.prelaunch_log_id = prelaunch_log_id
+                        sequence.predecessor_loop_iteration = loop_iteration
                     active_home = self.instance_manager.get_config_dir(instance_id)
                     if isinstance(active_home, str) and active_home:
                         current_home = active_home
+                return exit_code, current_home
+            if attempt_token is not None:
+                # This attempt consumed the authority for a distinct legal
+                # follow-up turn.  Its failure can never be reclassified as a
+                # pool retry of the same prompt, even if later durable reads
+                # are unavailable or malformed.
+                logger.error(
+                    "%s for task %s failed after consuming sequential-turn "
+                    "authority; account rotation replay was blocked",
+                    label,
+                    task.id,
+                )
+                return exit_code, current_home
+            if await self._automatic_relaunch_is_blocked_by_turn_source(
+                generation
+            ):
+                logger.error(
+                    "%s for task %s failed after provider admission; account "
+                    "rotation replay was blocked",
+                    label,
+                    task.id,
+                )
                 return exit_code, current_home
             if rotation_attempt >= max_rotations:
                 return exit_code, current_home
@@ -5211,6 +8350,411 @@ class GlobalDispatcher:
 
         return -1, current_home
 
+    async def _exact_turn_log_boundary(
+        self,
+        generation: _TaskLifecycleGeneration,
+    ) -> int:
+        """Return the greatest durable log id before one mode launch."""
+
+        async with self.db_factory() as db:
+            boundary = (
+                await db.execute(
+                    select(func.max(LogEntry.id)).where(
+                        LogEntry.task_id == generation.task_id,
+                        LogEntry.task_retry_count == generation.retry_count,
+                        LogEntry.task_turn_generation
+                        == generation.turn_generation,
+                    )
+                )
+            ).scalar_one_or_none()
+        return boundary if type(boundary) is int and boundary > 0 else 0
+
+    async def _prove_mode_turn_terminal(
+        self,
+        *,
+        generation: _TaskLifecycleGeneration,
+        sequence: _ModeTurnSequence,
+    ) -> _ModeTurnTerminalProof:
+        """Consume and prove the latest exact successful mode turn.
+
+        The output selector sees the complete exact-generation history, while
+        the per-launch boundary prevents an older successful mode iteration
+        from being mistaken for the provider turn that just settled.  Consume
+        the volatile process/boundary pair before the first await so failed or
+        cancelled validation can never turn the same observation into a later
+        continuation authority.
+        """
+
+        previous_process = sequence.predecessor_process
+        prelaunch_log_id = sequence.prelaunch_log_id
+        loop_iteration = sequence.predecessor_loop_iteration
+        sequence.predecessor_process = None
+        sequence.prelaunch_log_id = None
+        sequence.predecessor_loop_iteration = None
+        if (
+            previous_process is None
+            or type(prelaunch_log_id) is not int
+            or type(loop_iteration) is not int
+            or loop_iteration < 0
+        ):
+            raise ModeTurnContinuationError(
+                "mode turn has no exact settled process/log/iteration boundary"
+            )
+
+        from backend.services.terminal_arbitration import (
+            select_terminal_output,
+            source_alias_original_log_id,
+        )
+
+        async with self.db_factory() as db:
+            task = await self._read_owned_lifecycle_task(db, generation)
+            if task is None:
+                raise ModeTurnContinuationError(
+                    "mode Task generation was superseded before terminal proof"
+                )
+            source = await self._canonical_exact_turn_source(db, task)
+            if source is None:
+                raise ModeTurnContinuationError(
+                    "mode turn has no canonical exact source"
+                )
+            instance_id = generation.instance_id
+            if type(instance_id) is not int or source.instance_id != instance_id:
+                raise ModeTurnContinuationError(
+                    "mode turn source does not match its exact Instance"
+                )
+            original_source = None
+            original_id = source_alias_original_log_id(source)
+            if original_id is not None:
+                original_source = await db.get(LogEntry, original_id)
+            candidates = list(
+                (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.task_id == task.id,
+                            LogEntry.task_retry_count == task.retry_count,
+                            LogEntry.task_turn_generation
+                            == task.turn_generation,
+                        )
+                        .order_by(LogEntry.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            selected = select_terminal_output(
+                task.provider or "claude",
+                source,
+                candidates,
+                source_original=original_source,
+            )
+            if selected is None:
+                raise ModeTurnContinuationError(
+                    "latest mode turn has no canonical successful terminal output"
+                )
+            if selected.output_log.id <= prelaunch_log_id:
+                raise ModeTurnContinuationError(
+                    "selected terminal output predates the current mode launch"
+                )
+            if selected.output_log.loop_iteration != loop_iteration:
+                raise ModeTurnContinuationError(
+                    "selected terminal output belongs to another mode iteration"
+                )
+            source_log_id = task.turn_source_log_id
+            if type(source_log_id) is not int or source_log_id <= 0:
+                raise ModeTurnContinuationError(
+                    "mode turn lost its exact source identity"
+                )
+
+        return _ModeTurnTerminalProof(
+            task_id=generation.task_id,
+            retry_count=generation.retry_count,
+            turn_generation=generation.turn_generation,
+            instance_id=instance_id,
+            source_log_id=source_log_id,
+            terminal_log_id=selected.output_log.id,
+            native_turn_id=selected.native_turn_id,
+            loop_iteration=loop_iteration,
+            previous_process=previous_process,
+        )
+
+    async def _revalidate_mode_turn_terminal(
+        self,
+        *,
+        generation: _TaskLifecycleGeneration,
+        proof: _ModeTurnTerminalProof,
+    ) -> None:
+        """Fail if later durable tail rows invalidate an earlier mode proof."""
+
+        if (
+            not isinstance(proof, _ModeTurnTerminalProof)
+            or proof.task_id != generation.task_id
+            or proof.retry_count != generation.retry_count
+            or proof.turn_generation != generation.turn_generation
+            or proof.instance_id != generation.instance_id
+            or type(proof.loop_iteration) is not int
+            or proof.loop_iteration < 0
+        ):
+            raise ModeTurnContinuationError(
+                "mode terminal proof belongs to another turn"
+            )
+
+        from backend.services.terminal_arbitration import (
+            select_terminal_output,
+            source_alias_original_log_id,
+        )
+
+        async with self.db_factory() as db:
+            task = await self._read_owned_lifecycle_task(db, generation)
+            if task is None:
+                raise ModeTurnContinuationError(
+                    "mode Task generation was superseded during terminal revalidation"
+                )
+            source = await self._canonical_exact_turn_source(db, task)
+            if (
+                source is None
+                or source.id != proof.source_log_id
+                or source.instance_id != proof.instance_id
+            ):
+                raise ModeTurnContinuationError(
+                    "mode turn lost its canonical exact source"
+                )
+            original_source = None
+            original_id = source_alias_original_log_id(source)
+            if original_id is not None:
+                original_source = await db.get(LogEntry, original_id)
+            candidates = list(
+                (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.task_id == task.id,
+                            LogEntry.task_retry_count == task.retry_count,
+                            LogEntry.task_turn_generation
+                            == task.turn_generation,
+                        )
+                        .order_by(LogEntry.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            selected = select_terminal_output(
+                task.provider or "claude",
+                source,
+                candidates,
+                source_original=original_source,
+            )
+        if (
+            selected is None
+            or selected.output_log.id != proof.terminal_log_id
+            or selected.native_turn_id != proof.native_turn_id
+            or selected.output_log.loop_iteration != proof.loop_iteration
+        ):
+            raise ModeTurnContinuationError(
+                "mode turn terminal changed after its initial success proof"
+            )
+
+    async def _mint_mode_turn_continuation(
+        self,
+        *,
+        instance_id: int,
+        generation: _TaskLifecycleGeneration,
+        sequence: _ModeTurnSequence,
+        proof: _ModeTurnTerminalProof | None = None,
+    ) -> object:
+        """Mint one next-turn authority from an exact terminal proof."""
+
+        if proof is None:
+            proof = await self._prove_mode_turn_terminal(
+                generation=generation,
+                sequence=sequence,
+            )
+        if (
+            not isinstance(proof, _ModeTurnTerminalProof)
+            or proof.spent
+            or proof.task_id != generation.task_id
+            or proof.retry_count != generation.retry_count
+            or proof.turn_generation != generation.turn_generation
+            or proof.instance_id != instance_id
+        ):
+            raise ModeTurnContinuationError(
+                "mode terminal proof is spent or belongs to another turn"
+            )
+        # Keep authority spent when minting is cancelled, rejected, or returns
+        # an invalid token.  None of those outcomes proves replay is harmless.
+        proof.spent = True
+        await self._revalidate_mode_turn_terminal(
+            generation=generation,
+            proof=proof,
+        )
+        try:
+            token = await self.instance_manager.mint_sequential_turn_continuation(
+                instance_id=instance_id,
+                task_id=generation.task_id,
+                task_turn_generation=generation.turn_generation,
+                source_log_id=proof.source_log_id,
+                previous_process=proof.previous_process,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ModeTurnContinuationError(
+                f"InstanceManager rejected mode continuation: {exc}"
+            ) from exc
+        if token is None:
+            raise ModeTurnContinuationError(
+                "InstanceManager returned an empty mode continuation"
+            )
+        return token
+
+    async def _automatic_relaunch_is_blocked_by_turn_source(
+        self,
+        generation: _TaskLifecycleGeneration,
+    ) -> bool:
+        """Whether this exact modern turn lacks proof that replay is harmless.
+
+        ``actual_transport`` is written immediately before the first provider
+        call.  A non-NULL value therefore makes transport errors ambiguous,
+        while a malformed bound source is uncertainty rather than permission.
+        Legacy callers without any source pointer keep their historical retry
+        behavior; every newly admitted lifecycle binds one before launch.
+        """
+
+        async with self.db_factory() as db:
+            task = await self._read_owned_lifecycle_task(db, generation)
+            if task is None:
+                return True
+            if task.turn_source_log_id is None:
+                return False
+            source = await self._canonical_exact_turn_source(db, task)
+            if source is None:
+                return True
+            return source.actual_transport is not None
+
+    async def _structured_context_preflight_rejection(
+        self,
+        generation: _TaskLifecycleGeneration,
+    ) -> _LifecycleContextPreflightPermit | None:
+        """Prove a Codex context rejection happened before agent activity.
+
+        Human-readable overflow text is not replay evidence: it can accompany
+        a turn that already emitted assistant output or performed tools.  Only
+        the provider's exact ``turn.failed`` envelope, on the current durable
+        source/transport and with no intervening activity rows, authorizes
+        compaction followed by a fresh logical attempt.
+        """
+
+        async with self.db_factory() as db:
+            task = await self._read_owned_lifecycle_task(db, generation)
+            if (
+                task is None
+                or (task.provider or "claude").lower() != "codex"
+                or not isinstance(task.session_id, str)
+                or not task.session_id
+                or type(task.turn_source_log_id) is not int
+                or task.turn_source_log_id <= 0
+            ):
+                return None
+            source = await self._canonical_exact_turn_source(db, task)
+            if source is None or source.actual_transport not in {
+                "codex_app_server",
+                "codex_exec",
+            }:
+                return None
+            rows = list(
+                (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.task_id == task.id,
+                            LogEntry.task_retry_count == task.retry_count,
+                            LogEntry.task_turn_generation
+                            == task.turn_generation,
+                            LogEntry.turn_scope == "foreground",
+                            LogEntry.id > source.id,
+                        )
+                        .order_by(LogEntry.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if not rows:
+                return None
+
+            parsed_rows: list[dict | None] = []
+            for row in rows:
+                raw = row.raw_json
+                if isinstance(raw, dict):
+                    parsed = raw
+                elif isinstance(raw, str) and raw:
+                    try:
+                        value = json.loads(raw)
+                    except (TypeError, ValueError, RecursionError):
+                        value = None
+                    parsed = value if isinstance(value, dict) else None
+                else:
+                    parsed = None
+                parsed_rows.append(parsed)
+
+            terminal = rows[-1]
+            terminal_raw = parsed_rows[-1]
+            error = (
+                terminal_raw.get("error")
+                if isinstance(terminal_raw, dict)
+                else None
+            )
+            error_code = (
+                error.get("codexErrorInfo")
+                if isinstance(error, dict)
+                else None
+            )
+            error_message = (
+                error.get("message") if isinstance(error, dict) else None
+            )
+            if not (
+                terminal.event_type == "system_event"
+                and terminal.role is None
+                and terminal.is_error is True
+                and isinstance(terminal_raw, dict)
+                and terminal_raw.get("type") == "turn.failed"
+                and isinstance(error_message, str)
+                and terminal.content == error_message
+                and isinstance(error_code, str)
+                and error_code.strip().lower() == "contextwindowexceeded"
+            ):
+                return None
+
+            # Before the terminal, only native attempt-start metadata is
+            # harmless.  Assistant/reasoning/message/tool rows, another error,
+            # or an unknown envelope all fail closed.
+            seen_start_types: set[str] = set()
+            for row, raw in zip(rows[:-1], parsed_rows[:-1], strict=True):
+                raw_type = raw.get("type") if isinstance(raw, dict) else None
+                if not (
+                    row.event_type == "system_event"
+                    and row.is_error is False
+                    and isinstance(raw, dict)
+                    and raw_type in {"thread.started", "turn.started"}
+                    and raw_type not in seen_start_types
+                ):
+                    return None
+                seen_start_types.add(raw_type)
+            return _LifecycleContextPreflightPermit(
+                task_id=task.id,
+                worker_id=task.worker_id,
+                shared_from_id=task.shared_from_id,
+                status=task.status,
+                instance_id=task.instance_id,
+                retry_count=task.retry_count,
+                turn_generation=task.turn_generation,
+                turn_source_log_id=task.turn_source_log_id,
+                session_id=task.session_id,
+                started_at=task.started_at,
+                completed_at=task.completed_at,
+            )
+
     async def _task_claim_is_active(
         self,
         generation: _TaskLifecycleGeneration,
@@ -5229,7 +8773,8 @@ class GlobalDispatcher:
         async with self.db_factory() as db:
             result = await db.execute(
                 select(Task.id).where(
-                    *self._task_lifecycle_generation_predicates(generation)
+                    *self._task_lifecycle_generation_predicates(generation),
+                    no_active_worker_task_termination_predicate(),
                 )
             )
             return result.scalar_one_or_none() is not None
@@ -5258,6 +8803,7 @@ class GlobalDispatcher:
                         select(Task.id).where(
                             *self._task_status_generation_predicates(generation),
                             task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
                         )
                     )
                 ).scalar_one_or_none() is not None
@@ -5281,6 +8827,7 @@ class GlobalDispatcher:
             worker_id=source.worker_id,
             shared_from_id=source.shared_from_id,
             retry_count=source.retry_count,
+            turn_generation=source.turn_generation,
             instance_id=source.instance_id,
             started_at=source.started_at,
             completed_at=source.completed_at,
@@ -5323,6 +8870,7 @@ class GlobalDispatcher:
                 else Task.shared_from_id == generation.shared_from_id
             ),
             Task.retry_count == generation.retry_count,
+            Task.turn_generation == generation.turn_generation,
             (
                 Task.instance_id.is_(None)
                 if generation.instance_id is None
@@ -5337,6 +8885,47 @@ class GlobalDispatcher:
         ]
 
     @staticmethod
+    def _context_preflight_permit_predicates(
+        permit: _LifecycleContextPreflightPermit,
+    ) -> list:
+        """Fence every mutable identity proven by a context rejection."""
+
+        return [
+            Task.id == permit.task_id,
+            (
+                Task.worker_id.is_(None)
+                if permit.worker_id is None
+                else Task.worker_id == permit.worker_id
+            ),
+            (
+                Task.shared_from_id.is_(None)
+                if permit.shared_from_id is None
+                else Task.shared_from_id == permit.shared_from_id
+            ),
+            Task.status == permit.status,
+            (
+                Task.instance_id.is_(None)
+                if permit.instance_id is None
+                else Task.instance_id == permit.instance_id
+            ),
+            Task.retry_count == permit.retry_count,
+            Task.turn_generation == permit.turn_generation,
+            Task.turn_source_log_id == permit.turn_source_log_id,
+            Task.session_id == permit.session_id,
+            (
+                Task.started_at.is_(None)
+                if permit.started_at is None
+                else Task.started_at == permit.started_at
+            ),
+            (
+                Task.completed_at.is_(None)
+                if permit.completed_at is None
+                else Task.completed_at == permit.completed_at
+            ),
+            task_retry_not_superseded_predicate(),
+        ]
+
+    @staticmethod
     def _task_lifecycle_queue_fence(
         generation: _TaskLifecycleGeneration,
     ) -> tuple[
@@ -5345,6 +8934,7 @@ class GlobalDispatcher:
         datetime | None,
         datetime | None,
         str | None,
+        int,
     ]:
         """Adapt the stronger lifecycle fence to TaskQueue's CAS fields."""
 
@@ -5354,6 +8944,7 @@ class GlobalDispatcher:
             generation.started_at,
             generation.completed_at,
             None,
+            generation.turn_generation,
         )
 
     async def _read_owned_lifecycle_task(
@@ -5408,6 +8999,7 @@ class GlobalDispatcher:
             ),
             Task.status == generation.status,
             Task.retry_count == generation.retry_count,
+            Task.turn_generation == generation.turn_generation,
             (
                 Task.instance_id.is_(None)
                 if generation.instance_id is None
@@ -5441,6 +9033,7 @@ class GlobalDispatcher:
             shared_from_id=task.shared_from_id,
             status=task.status,
             retry_count=task.retry_count,
+            turn_generation=task.turn_generation,
             instance_id=task.instance_id,
             started_at=task.started_at,
             completed_at=task.completed_at,
@@ -5462,6 +9055,7 @@ class GlobalDispatcher:
                     Task.shared_from_id,
                     Task.status,
                     Task.retry_count,
+                    Task.turn_generation,
                     Task.instance_id,
                     Task.started_at,
                     Task.completed_at,
@@ -5477,6 +9071,7 @@ class GlobalDispatcher:
             shared_from_id=row.shared_from_id,
             status=row.status,
             retry_count=row.retry_count,
+            turn_generation=row.turn_generation,
             instance_id=row.instance_id,
             started_at=row.started_at,
             completed_at=row.completed_at,
@@ -5501,7 +9096,10 @@ class GlobalDispatcher:
         async def publish_with_session(session) -> bool:
             guarded = await session.execute(
                 update(Task)
-                .where(*self._task_status_generation_predicates(generation))
+                .where(
+                    *self._task_status_generation_predicates(generation),
+                    no_active_worker_task_termination_predicate(),
+                )
                 .values(status=generation.status)
             )
             if not guarded.rowcount:
@@ -5538,6 +9136,8 @@ class GlobalDispatcher:
         payload = {
             "event": "status_change",
             "task_id": generation.task_id,
+            "task_retry_count": generation.retry_count,
+            "task_turn_generation": generation.turn_generation,
             "new_status": generation.status,
         }
         if instance_id is not None:
@@ -5564,81 +9164,215 @@ class GlobalDispatcher:
         async with self.db_factory() as db:
             claimed = await db.execute(
                 update(Task)
-                .where(*self._task_lifecycle_generation_predicates(generation))
+                .where(
+                    *self._task_lifecycle_generation_predicates(generation),
+                    no_active_worker_task_termination_predicate(),
+                )
                 .values(status="executing")
             )
             await db.commit()
         return bool(claimed.rowcount)
 
-    async def _retry_or_fail_mode_task(
+    @staticmethod
+    async def _canonical_exact_turn_source(
+        db,
+        task: Task,
+    ) -> LogEntry | None:
+        """Return the canonical source bound to ``task``'s exact generation.
+
+        A hidden alias with a positive original id is canonical only when the
+        original row is the successful user message it claims to represent.
+        The fresh initial Task uses the stricter ``original_source_log_id=None``
+        shape, while sharing this validator with defensive recovery paths.
+        """
+
+        source_id = task.turn_source_log_id
+        if type(source_id) is not int or source_id <= 0:
+            return None
+        source = (
+            await db.execute(
+                select(LogEntry)
+                .where(LogEntry.id == source_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            source is None
+            or source.task_id != task.id
+            or source.task_retry_count != task.retry_count
+            or source.task_turn_generation != task.turn_generation
+            or source.turn_scope != "source"
+            or source.is_error is not False
+        ):
+            return None
+        if source.event_type == "user_message":
+            return source if source.role == "user" else None
+        if (
+            source.event_type != "turn_source"
+            or source.role != "system"
+            or source.content is not None
+        ):
+            return None
+        try:
+            payload = (
+                source.raw_json
+                if isinstance(source.raw_json, dict)
+                else json.loads(source.raw_json or "")
+            )
+        except (TypeError, ValueError, RecursionError):
+            return None
+        if not isinstance(payload, dict) or "original_source_log_id" not in payload:
+            return None
+        original_id = payload["original_source_log_id"]
+        if original_id is None:
+            return source
+        if type(original_id) is not int or original_id <= 0:
+            return None
+        original = (
+            await db.execute(
+                select(LogEntry)
+                .where(LogEntry.id == original_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if (
+            original is None
+            or original.task_id != task.id
+            or original.event_type != "user_message"
+            or original.role != "user"
+            or original.is_error is not False
+        ):
+            return None
+        return source
+
+    async def _finalize_fresh_lifecycle_replay_safely(
         self,
         generation: _TaskLifecycleGeneration,
-        reason: str,
-    ) -> str | None:
-        failed_pr_task: Task | None = None
+        *,
+        pending_reason: str | None,
+        failure_reason: str,
+        consume_retry: bool = False,
+        allow_unbound_prelaunch: bool = False,
+        pending_broadcast_extra: dict | None = None,
+    ) -> _TaskLifecycleFinalization | None:
+        """Atomically defer/retry only a provably unlaunched fresh turn.
+
+        ``actual_transport`` is committed immediately before the first provider
+        effect.  The Task no-op UPDATE is therefore both the exact generation
+        CAS and the portable writer fence shared with InstanceManager: either
+        this transition commits ``pending`` first and provider admission loses,
+        or admission commits first and this transition fail-closes the Task.
+
+        A missing source is accepted only for a caller that still owns the live
+        pre-Step-2 stack and explicitly proves ``claim_validated=False``.  Crash
+        recovery and every post-claim caller must treat missing or malformed
+        source identity as uncertainty, never as permission to replay.
+        """
+
+        failed_task: Task | None = None
         async with self.db_factory() as db:
+            writer_fence = await db.execute(
+                update(Task)
+                .where(
+                    *self._task_lifecycle_generation_predicates(generation),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(turn_source_log_id=Task.turn_source_log_id)
+            )
+            if writer_fence.rowcount != 1:
+                await db.rollback()
+                return None
             task = await self._read_owned_lifecycle_task(
                 db,
                 generation,
                 for_update=True,
             )
             if task is None:
-                logger.info(
-                    "Skipping stale retry/fail for task %s on instance %s",
-                    generation.task_id,
-                    generation.instance_id,
-                )
+                await db.rollback()
                 return None
 
-            observed_generation = self._task_status_generation(task)
-            if task.retry_count < task.max_retries:
-                changed = await db.execute(
-                    update(Task)
-                    .where(
-                        *self._task_status_generation_predicates(observed_generation),
-                        task_retry_not_superseded_predicate(),
-                    )
-                    .values(
-                        status="pending",
-                        retry_count=Task.retry_count + 1,
-                        instance_id=None,
-                        error_message=None,
-                        started_at=None,
-                        completed_at=None,
-                    )
+            source = await self._canonical_exact_turn_source(db, task)
+            source_is_unbound = task.turn_source_log_id is None
+            replay_is_proven_safe = bool(
+                (
+                    source_is_unbound
+                    and allow_unbound_prelaunch
                 )
-                status = "pending"
+                or (
+                    source is not None
+                    and source.actual_transport is None
+                )
+            )
+            observed_generation = self._task_status_generation(task)
+            retry_budget_available = task.retry_count < task.max_retries
+            if replay_is_proven_safe and (
+                not consume_retry or retry_budget_available
+            ):
+                values: dict = {
+                    "status": "pending",
+                    "instance_id": None,
+                    "error_message": (
+                        pending_reason[:500]
+                        if isinstance(pending_reason, str)
+                        else None
+                    ),
+                    "started_at": None,
+                    "completed_at": None,
+                }
+                if consume_retry:
+                    values["retry_count"] = Task.retry_count + 1
+                target_status = "pending"
             else:
+                if replay_is_proven_safe:
+                    error_message = failure_reason
+                elif source is not None and source.actual_transport is not None:
+                    error_message = (
+                        f"{failure_reason}; exact turn selected transport "
+                        f"{source.actual_transport}, so its outcome is uncertain "
+                        "and automatic replay was blocked"
+                    )
+                elif source_is_unbound:
+                    error_message = (
+                        f"{failure_reason}; the exact turn has no durable source "
+                        "proof, so automatic replay was blocked"
+                    )
+                else:
+                    error_message = (
+                        f"{failure_reason}; exact turn source evidence is stale "
+                        "or malformed, so automatic replay was blocked"
+                    )
+                values = {
+                    "status": "failed",
+                    "error_message": error_message[:2000],
+                    "completed_at": datetime.utcnow(),
+                }
                 from backend.services.frontend_review_goal import (
                     frontend_review_goal_terminal_updates,
                 )
 
-                terminal_values = {
-                    "status": "failed",
-                    "error_message": reason,
-                    "completed_at": datetime.utcnow(),
-                    **frontend_review_goal_terminal_updates(task),
-                }
-                changed = await db.execute(
-                    update(Task)
-                    .where(
-                        *self._task_status_generation_predicates(observed_generation),
-                        task_retry_not_superseded_predicate(),
-                    )
-                    .values(**terminal_values)
-                )
-                status = "failed"
+                values.update(frontend_review_goal_terminal_updates(task))
+                target_status = "failed"
 
-            if not changed.rowcount:
+            changed = await db.execute(
+                update(Task)
+                .where(
+                    *self._task_status_generation_predicates(observed_generation),
+                    task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(**values)
+            )
+            if changed.rowcount != 1:
                 await db.rollback()
                 return None
             resulting_generation = await self._read_task_status_generation(
-                db, generation.task_id
+                db,
+                generation.task_id,
             )
             if resulting_generation is None:
                 await db.rollback()
                 return None
-            if status == "failed" and is_pr_sandbox_task(task):
+            if target_status == "failed" and is_pr_sandbox_task(task):
                 refreshed = await db.get(
                     Task,
                     generation.task_id,
@@ -5650,83 +9384,419 @@ class GlobalDispatcher:
                     == resulting_generation
                 ):
                     db.expunge(refreshed)
-                    failed_pr_task = refreshed
+                    failed_task = refreshed
             await db.commit()
 
+        extra = pending_broadcast_extra if target_status == "pending" else None
         published = await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
+            extra=extra,
         )
-        if published and failed_pr_task is not None:
+        return _TaskLifecycleFinalization(
+            generation=resulting_generation,
+            published=published,
+            failed_task=failed_task,
+        )
+
+    async def _retry_or_fail_mode_task(
+        self,
+        generation: _TaskLifecycleGeneration,
+        reason: str,
+    ) -> str | None:
+        finalized = await self._finalize_fresh_lifecycle_replay_safely(
+            generation,
+            pending_reason=None,
+            failure_reason=reason,
+            consume_retry=True,
+        )
+        if finalized is None:
+            logger.info(
+                "Skipping stale retry/fail for task %s on instance %s",
+                generation.task_id,
+                generation.instance_id,
+            )
+            return None
+        if finalized.published and finalized.failed_task is not None:
             # Normal non-zero exits do not enter the lifecycle exception
             # handler. Consume their exact exhausted generation here so PR
             # fix actions cannot remain durably ``running`` forever. The
             # completion/failure handler performs its own DB CAS as a final
             # fence against a retry that wins after publication.
-            await self._handle_pr_review_failure(failed_pr_task, reason)
-        return status
+            await self._handle_pr_review_failure(finalized.failed_task, reason)
+        return finalized.generation.status
 
     async def _complete_owned_task_result(
         self,
         generation: _TaskLifecycleGeneration,
         *,
         count_completion: bool = False,
+        admit_agent_capability: bool = False,
     ) -> tuple[bool, bool]:
         """Return ``(completed, background_active_at_commit)``."""
 
-        async with self.db_factory() as db:
-            task = await self._read_owned_lifecycle_task(
-                db,
-                generation,
-                for_update=True,
-            )
-            if task is None:
-                return False, False
-            background_active = task.pty_background_generation is not None
-            observed_generation = self._task_status_generation(task)
-            from backend.services.frontend_review_goal import (
-                frontend_review_goal_terminal_updates,
-            )
+        from backend.services.capability_service import capability_task_lock
 
-            terminal_values = {
-                "status": "completed",
-                "completed_at": datetime.utcnow(),
-                "error_message": None,
-                **frontend_review_goal_terminal_updates(task),
-            }
-            changed = await db.execute(
-                update(Task)
-                .where(
-                    *self._task_status_generation_predicates(observed_generation),
-                    task_retry_not_superseded_predicate(),
+        admission = None
+        async with capability_task_lock(generation.task_id):
+            async with self.db_factory() as db:
+                # This is the common terminal writer fence for both ordinary
+                # completion and Agent capability admission.  In particular,
+                # protocol-failure/waiting-capability paths commit inside the
+                # admission branch and therefore never reach the later
+                # completion CAS.  Acquire the Task writer before reading any
+                # terminal evidence so a committed Worker stop/cancel receipt
+                # always wins, while a capability admission that wins this
+                # fence commits before receipt admission can inspect the Task.
+                # The conditional no-op UPDATE is required for SQLite, where
+                # SELECT FOR UPDATE does not establish a writer fence.
+                writer_fence = await db.execute(
+                    update(Task)
+                    .where(
+                        *self._task_lifecycle_generation_predicates(generation),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(turn_source_log_id=Task.turn_source_log_id)
                 )
-                .values(**terminal_values)
-            )
-            if not changed.rowcount:
-                await db.rollback()
-                return False, False
-            if count_completion:
-                # Global lifecycle order is Task -> Instance.  The Task row is
-                # already locked above before this accounting write.
-                await db.execute(
-                    update(Instance)
-                    .where(Instance.id == generation.instance_id)
-                    .values(total_tasks_completed=Instance.total_tasks_completed + 1)
+                if writer_fence.rowcount != 1:
+                    await db.rollback()
+                    return False, False
+                task = await self._read_owned_lifecycle_task(
+                    db,
+                    generation,
+                    for_update=True,
                 )
-            resulting_generation = await self._read_task_status_generation(
-                db, generation.task_id
+                if task is None:
+                    return False, False
+                background_active = task.pty_background_generation is not None
+                if task.session_id:
+                    handoff_lookup = getattr(
+                        self.instance_manager,
+                        "has_pty_autonomous_activity_handoff",
+                        None,
+                    )
+                    if callable(handoff_lookup):
+                        background_active = background_active or bool(
+                            handoff_lookup(task.id, task.session_id)
+                        )
+                if admit_agent_capability and task.capability_policy is not None:
+                    if background_active:
+                        # A native PTY tail is still part of this logical turn.
+                        # Keep the Task executing and retain its Instance owner;
+                        # the lifecycle caller captures and waits for the exact
+                        # background state before retrying terminal admission.
+                        # Completing here would let a capability resume launch
+                        # G+1 while autonomous output can still write G.
+                        await db.rollback()
+                        return False, True
+                    from backend.services.agent_capability_admission import (
+                        AgentTerminalExpectation,
+                        admit_agent_terminal_action_locked,
+                    )
+
+                    if (
+                        not isinstance(task.incarnation_id, str)
+                        or len(task.incarnation_id) != 32
+                        or type(task.turn_source_log_id) is not int
+                        or task.turn_source_log_id <= 0
+                        or type(generation.instance_id) is not int
+                        or generation.instance_id <= 0
+                    ):
+                        task.status = "failed"
+                        task.completed_at = datetime.utcnow()
+                        task.error_message = (
+                            "Auto capability terminal admission lost its exact "
+                            "Task/source identity"
+                        )
+                        admission_status = "protocol_failed"
+                    else:
+                        admission = await admit_agent_terminal_action_locked(
+                            db,
+                            task,
+                            expected=AgentTerminalExpectation(
+                                task_id=task.id,
+                                task_incarnation_id=task.incarnation_id,
+                                retry_count=generation.retry_count,
+                                turn_generation=generation.turn_generation,
+                                instance_id=generation.instance_id,
+                                source_log_id=task.turn_source_log_id,
+                            ),
+                        )
+                        admission_status = admission.outcome
+                    if admission_status == "stale":
+                        await db.rollback()
+                        return False, False
+                    if admission_status != "ordinary_completion":
+                        resulting_generation = (
+                            await self._read_task_status_generation(
+                                db,
+                                generation.task_id,
+                            )
+                        )
+                        if resulting_generation is None:
+                            await db.rollback()
+                            return False, False
+                        await db.commit()
+                        completed = False
+                    else:
+                        resulting_generation = None
+                        completed = True
+                else:
+                    resulting_generation = None
+                    completed = True
+
+                if completed:
+                    observed_generation = self._task_status_generation(task)
+                    from backend.services.frontend_review_goal import (
+                        frontend_review_goal_terminal_updates,
+                    )
+
+                    terminal_values = {
+                        "status": "completed",
+                        "completed_at": datetime.utcnow(),
+                        "error_message": None,
+                        **frontend_review_goal_terminal_updates(task),
+                    }
+                    changed = await db.execute(
+                        update(Task)
+                        .where(
+                            *self._task_status_generation_predicates(
+                                observed_generation
+                            ),
+                            task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
+                        )
+                        .values(**terminal_values)
+                    )
+                    if not changed.rowcount:
+                        await db.rollback()
+                        return False, False
+                    if count_completion:
+                        # Global lifecycle order is Task -> Instance. The Task
+                        # row is already locked above before this accounting.
+                        await db.execute(
+                            update(Instance)
+                            .where(Instance.id == generation.instance_id)
+                            .values(
+                                total_tasks_completed=(
+                                    Instance.total_tasks_completed + 1
+                                )
+                            )
+                        )
+                    resulting_generation = (
+                        await self._read_task_status_generation(
+                            db,
+                            generation.task_id,
+                        )
+                    )
+                    if resulting_generation is None:
+                        await db.rollback()
+                        return False, False
+                    await db.commit()
+
+        if admission is not None and admission.created:
+            # Reuse the chat terminal publisher: it re-enters the Task-scoped
+            # capability fence and verifies the exact waiting generation
+            # before emitting the invalidation.  A stop/cancel that wins after
+            # the terminal commit must not be followed by a stale "created"
+            # event for the old generation.
+            await self.instance_manager._publish_agent_terminal_admission(
+                admission
             )
-            if resulting_generation is None:
-                await db.rollback()
-                return False, False
-            await db.commit()
+            if self.capability_invocation_wake is not None:
+                self.capability_invocation_wake()
 
         await self._broadcast_task_status_generation(
             resulting_generation,
             instance_id=generation.instance_id,
             extra={"background_active": background_active},
         )
-        return True, background_active
+        return completed, (background_active if completed else False)
+
+    async def _complete_owned_task_after_pty_background(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        count_completion: bool,
+    ) -> tuple[bool, bool]:
+        """Wait one exact PTY tail, then retry initial terminal admission.
+
+        The durable Task remains ``executing`` throughout the wait.  Capture
+        the exact in-memory state while holding the Task/session transition
+        lock, then wait on that object after releasing the lock.  A key-based
+        lookup after the watcher removes the state would otherwise lose the
+        wake-up and strand the authoritative lifecycle.
+        """
+
+        while True:
+            async with self.db_factory() as db:
+                task = await self._read_owned_lifecycle_task(db, generation)
+                if task is None:
+                    return False, False
+                session_id = task.session_id
+                marker = task.pty_background_generation
+                capability_policy = task.capability_policy
+
+            if capability_policy is None:
+                return await self._complete_owned_task_result(
+                    generation,
+                    count_completion=count_completion,
+                    admit_agent_capability=True,
+                )
+            if not session_id:
+                if marker is not None:
+                    raise RuntimeError(
+                        "Auto capability terminal admission found a durable "
+                        "PTY background epoch without its exact session identity"
+                    )
+                return await self._complete_owned_task_result(
+                    generation,
+                    count_completion=count_completion,
+                    admit_agent_capability=True,
+                )
+
+            if marker is None:
+                handoff_pending = False
+                handoff_lookup = getattr(
+                    self.instance_manager,
+                    "has_pty_autonomous_activity_handoff",
+                    None,
+                )
+                if callable(handoff_lookup):
+                    handoff_pending = bool(
+                        handoff_lookup(generation.task_id, session_id)
+                    )
+
+            transition = getattr(
+                self.instance_manager,
+                "pty_background_transition",
+                None,
+            )
+            state_lookup = getattr(
+                self.instance_manager,
+                "pty_background_state_for",
+                None,
+            )
+            wait_outcome = getattr(
+                self.instance_manager,
+                "wait_pty_background_outcome",
+                None,
+            )
+            if not (
+                callable(transition)
+                and callable(state_lookup)
+                and callable(wait_outcome)
+            ):
+                raise RuntimeError(
+                    "Auto capability terminal admission cannot prove the "
+                    "exact PTY background generation"
+                )
+
+            exact_state = None
+            ready_to_admit = False
+            post_cutoff_handoff = False
+            async with transition(generation.task_id, session_id):
+                async with self.db_factory() as db:
+                    task = await self._read_owned_lifecycle_task(db, generation)
+                    if task is None:
+                        return False, False
+                    if task.session_id != session_id:
+                        continue
+                    marker = task.pty_background_generation
+                    if marker is not None:
+                        exact_state = state_lookup(
+                            generation.task_id,
+                            session_id,
+                            marker,
+                        )
+                        if exact_state is None:
+                            raise RuntimeError(
+                                "Auto capability terminal admission lost its "
+                                "exact PTY background state while the durable "
+                                "marker remained active"
+                            )
+                    else:
+                        handoff_lookup = getattr(
+                            self.instance_manager,
+                            "has_pty_autonomous_activity_handoff",
+                            None,
+                        )
+                        handoff_pending = bool(
+                            callable(handoff_lookup)
+                            and handoff_lookup(generation.task_id, session_id)
+                        )
+                        if not handoff_pending:
+                            # Retained post-exit proof is the only authority a
+                            # newly arriving autonomous callback can use after
+                            # the foreground proxy/consumer maps disappear.
+                            # Revoke it synchronously under the same transition
+                            # lock before terminal admission. A callback that
+                            # already noted activity is observed above; one
+                            # arriving after this cutoff cannot arm against the
+                            # soon-to-be waiting/completed Task generation.
+                            discard_post_exit = getattr(
+                                self.instance_manager,
+                                "discard_pty_post_exit_generations",
+                                None,
+                            )
+                            if not callable(discard_post_exit):
+                                raise RuntimeError(
+                                    "Auto capability terminal admission cannot "
+                                    "establish its PTY post-exit cutoff"
+                                )
+                            discard_post_exit(
+                                task_id=generation.task_id,
+                                session_id=session_id,
+                                instance_id=generation.instance_id,
+                                invalidate_handoffs=True,
+                            )
+                            ready_to_admit = True
+
+                if ready_to_admit:
+                    # Keep the transition lock through admission. A callback
+                    # that notes activity during a DB await has already lost
+                    # its post-exit proof and cannot attach after this commit.
+                    terminal = await self._complete_owned_task_result(
+                        generation,
+                        count_completion=count_completion,
+                        admit_agent_capability=True,
+                    )
+                    if terminal != (False, True):
+                        return terminal
+                    # note_pty_autonomous_activity() can run synchronously
+                    # during an admission DB await. The cutoff already revoked
+                    # that callback's post-exit proof, so it cannot arm, but
+                    # _complete_owned_task_result deliberately observes the
+                    # handoff and defers. Release the transition lock and let
+                    # the callback clear its now-unusable token, then retry.
+                    post_cutoff_handoff = True
+
+            if exact_state is None:
+                if post_cutoff_handoff:
+                    await asyncio.sleep(0)
+                    continue
+                if not handoff_pending:
+                    continue
+                # note_pty_autonomous_activity() publishes the handoff before
+                # its callback waits for the transition lock.  Yield after
+                # releasing the lock so that exact callback can arm/register
+                # the durable generation, then capture its state on the next
+                # pass. This wait remains cancellable but has no arbitrary
+                # retry ceiling: the callback itself owns the authoritative
+                # arm-or-clear transition.
+                await asyncio.sleep(0)
+                continue
+
+            background_outcome = await wait_outcome(exact_state)
+            if background_outcome != "completed":
+                # failed/abandoned/superseded all revoke this lifecycle's
+                # authority to interpret the foreground terminal action. The
+                # owning failure/stop/replacement path either already changed
+                # the durable Task or will win the final exact-generation CAS.
+                return False, False
+            # The watcher clears the durable marker before setting state.done.
+            # Re-read the same active lifecycle on the next pass; a stop,
+            # retry, replacement marker, or failed tail wins over admission.
 
     async def _complete_owned_task(
         self,
@@ -5773,6 +9843,7 @@ class GlobalDispatcher:
                 .where(
                     *self._task_status_generation_predicates(observed_generation),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(**terminal_values)
             )
@@ -5809,18 +9880,22 @@ class GlobalDispatcher:
         # the deadline.
         self._account_routing_not_before[task_id] = time.monotonic() + delay
         try:
-            async with self.db_factory() as db:
-                queue = TaskQueue(db)
-                deferred = await queue.defer(
-                    task_id,
-                    reason[:500],
-                    instance_id=instance_id,
-                    generation_fence=self._task_lifecycle_queue_fence(generation),
-                )
+            finalized = await self._finalize_fresh_lifecycle_replay_safely(
+                generation,
+                pending_reason=reason,
+                failure_reason=(
+                    "Account routing became unavailable after provider launch "
+                    "admission"
+                ),
+                pending_broadcast_extra={
+                    "reason": "codex_account_wait",
+                    "retry_after": round(delay, 1),
+                },
+            )
         except BaseException:
             self._account_routing_not_before.pop(task_id, None)
             raise
-        if not deferred:
+        if finalized is None:
             # Cancellation/deletion may race the launch failure.  Never revive a
             # terminal task merely because account routing also failed.
             self._account_routing_not_before.pop(task_id, None)
@@ -5829,18 +9904,19 @@ class GlobalDispatcher:
                 task_id,
             )
             return
-
-        await self.broadcaster.broadcast(
-            "tasks",
-            {
-                "event": "status_change",
-                "task_id": task_id,
-                "new_status": "pending",
-                "instance_id": instance_id,
-                "reason": "codex_account_wait",
-                "retry_after": round(delay, 1),
-            },
-        )
+        if finalized.generation.status != "pending":
+            self._account_routing_not_before.pop(task_id, None)
+            if finalized.published and finalized.failed_task is not None:
+                await self._handle_pr_review_failure(
+                    finalized.failed_task,
+                    finalized.failed_task.error_message or reason,
+                )
+            logger.error(
+                "Fail-closed task %s because account routing failed after "
+                "provider admission",
+                task_id,
+            )
+            return
         logger.warning(
             "Deferred task %s for %.1fs while account routing recovers: %s",
             task_id,
@@ -5871,6 +9947,14 @@ class GlobalDispatcher:
         failure is no longer transient (or the budget is exhausted) we hand off
         to account rotation, then to the normal retry/fail path.
         """
+        if await self._automatic_relaunch_is_blocked_by_turn_source(generation):
+            await self._retry_or_fail_mode_task(
+                generation,
+                "Transient provider failure occurred after the exact turn "
+                "crossed its external-effect boundary",
+            )
+            return
+
         from backend.services.claude_pool import is_transient_for, transient_retry_delay
 
         delay = transient_retry_delay(
@@ -6033,6 +10117,7 @@ class GlobalDispatcher:
         has_temporary_initial_skills = False
         initial_skill_overrides: dict = {}
         initial_skill_token: str | None = None
+        initial_source_log_id: int | None = None
         routing_sync_pending = False
         try:
             # === Step 1: Mark in_progress ===
@@ -6085,6 +10170,7 @@ class GlobalDispatcher:
                         Task.worker_id.is_(None),
                         Task.shared_from_id.is_(None),
                         task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(status=Task.status)
                 )
@@ -6162,6 +10248,22 @@ class GlobalDispatcher:
                                     initial_skill_token
                                 )
                                 current.metadata_ = temporary_metadata
+                            # Source identity is part of launch admission, not
+                            # post-launch bookkeeping.  A fresh Task has no
+                            # visible user LogEntry, so bind a hidden source in
+                            # the same transaction as in_progress -> executing.
+                            from backend.services.terminal_arbitration import (
+                                bind_turn_source,
+                            )
+
+                            bound_source = await bind_turn_source(
+                                db,
+                                task=current,
+                                source_log_id=None,
+                                instance_id=instance_id,
+                                transport=_turn_transport_name(current),
+                            )
+                            initial_source_log_id = bound_source.id
                     executing_generation = await self._read_task_status_generation(
                         db, task.id
                     )
@@ -6188,6 +10290,11 @@ class GlobalDispatcher:
             # Launch and cleanup must use the same post-barrier snapshots,
             # including ordinary user saves that won the race before claim.
             task.enabled_skills = launch_skills
+            # ``task`` is the detached dequeue snapshot; bind_turn_source()
+            # updated the freshly loaded row above.  Keep the runtime snapshot
+            # aligned so Plan/Loop/Goal launch helpers carry the same exact
+            # source identity into InstanceManager's provider-boundary fence.
+            task.turn_source_log_id = initial_source_log_id
             (
                 task.provider,
                 task.model,
@@ -6200,16 +10307,48 @@ class GlobalDispatcher:
             )
 
             # === Step 3: Plan mode check ===
-            if task.mode == "plan" and not task.plan_approved:
-                await self._run_plan_phase(
-                    instance_id,
-                    task,
-                    lifecycle_generation,
-                    cwd,
-                    git_env,
-                    effort_level=effort_level,
-                )
-                return
+            if task.mode == "plan":
+                # Plan Tasks are read-only planning records.  Historical
+                # approval used to put the same row back into ``pending`` and
+                # rely on this fall-through to start an ordinary coding turn.
+                # Preserve only the exact carrier recorded by the Plan-v2
+                # migration; plan_approved alone is not execution authority.
+                if task.plan_approved is True:
+                    from backend.services.legacy_plan_execution import (
+                        is_legacy_approved_execution_carrier,
+                    )
+
+                    async with self.db_factory() as db:
+                        legacy_execution = (
+                            await is_legacy_approved_execution_carrier(
+                                db,
+                                task.id,
+                            )
+                        )
+                    if not legacy_execution:
+                        await self._fail_owned_task(
+                            lifecycle_generation,
+                            "Approved Plan Tasks cannot launch ordinary coding "
+                            "turns without an exact migrated execution carrier",
+                        )
+                        return
+                elif task.plan_approved is None:
+                    await self._run_plan_phase(
+                        instance_id,
+                        task,
+                        lifecycle_generation,
+                        cwd,
+                        git_env,
+                        effort_level=effort_level,
+                    )
+                    return
+                else:
+                    await self._fail_owned_task(
+                        lifecycle_generation,
+                        "Rejected Plan Tasks cannot re-enter planning or launch "
+                        "ordinary coding turns",
+                    )
+                    return
 
             # === Step 3b: Loop mode ===
             if task.mode == "loop":
@@ -6262,6 +10401,7 @@ class GlobalDispatcher:
                 instance_id=instance_id,
                 prompt=full_prompt,
                 task_id=task.id,
+                task_turn_generation=lifecycle_generation.turn_generation,
                 cwd=cwd,
                 model=task.model,
                 codex_service_tier=task.codex_service_tier,
@@ -6274,6 +10414,7 @@ class GlobalDispatcher:
                 enable_workflows=task.enable_workflows,
                 enabled_skills=task.enabled_skills,
                 system_prompt_mode=task.system_prompt_mode,
+                source_log_id=initial_source_log_id,
             )
 
             # Wait for process to finish (with timeout)
@@ -6351,6 +10492,29 @@ class GlobalDispatcher:
                 from backend.services.claude_pool import is_transient_for
 
                 combined = await self._collect_failure_output(instance_id, task.id)
+                context_preflight_permit = (
+                    await self._structured_context_preflight_rejection(
+                        lifecycle_generation
+                    )
+                )
+
+                # Text such as "stream disconnected" or "request timed out"
+                # does not prove the provider avoided tools or other side
+                # effects.  Once the exact source records an actual transport,
+                # never resend this logical turn merely because an error looks
+                # transient, rate-limited, or context-related.
+                if (
+                    await self._automatic_relaunch_is_blocked_by_turn_source(
+                        lifecycle_generation
+                    )
+                    and context_preflight_permit is None
+                ):
+                    await self._retry_or_fail_mode_task(
+                        lifecycle_generation,
+                        f"Exit code: {exit_code}; provider turn failed after "
+                        "crossing its external-effect boundary",
+                    )
+                    return
 
                 # Transient overload that only surfaced on stderr (subprocess
                 # mode) — the flag above may miss it, so re-check the text.
@@ -6397,56 +10561,102 @@ class GlobalDispatcher:
                     )
                     return
 
-                # Context overflow — compact and retry instead of failing.
-                # Codex app-server uses a structured contextWindowExceeded
-                # code while exec/Claude may only expose human-readable text.
-                if is_context_window_exceeded(task.provider, combined):
+                # Context overflow may compact/retry only when exact durable
+                # logs proved Codex rejected the request before any assistant
+                # or tool activity. Generic stderr/message matching is never
+                # replay authority, including for legacy source-less turns.
+                if context_preflight_permit is not None:
                     try:
                         async with self.db_factory() as db:
-                            t = await self._read_owned_lifecycle_task(
-                                db,
-                                lifecycle_generation,
-                            )
-                            if t and t.session_id:
-                                logger.warning(
-                                    "Task %d exceeded its context window, "
-                                    "compacting session",
-                                    task.id,
-                                )
-                                summary = await self._compact_session(
-                                    task.id, t.session_id, db
-                                )
-                                if summary:
-                                    compacted = await db.execute(
-                                        update(Task)
-                                        .where(
-                                            *self._task_lifecycle_generation_predicates(
-                                                lifecycle_generation,
-                                                statuses=("executing",),
-                                            )
-                                        )
-                                        .values(
-                                            session_id=None,
-                                            context_window_usage=None,
-                                            status="pending",
-                                            instance_id=None,
-                                            description=build_compacted_task_retry_prompt(
-                                                summary
-                                            ),
+                            permit = context_preflight_permit
+                            still_exact = (
+                                await db.execute(
+                                    select(Task.id).where(
+                                        *self._context_preflight_permit_predicates(
+                                            permit
                                         )
                                     )
-                                    await db.commit()
-                                    if compacted.rowcount:
-                                        await self.broadcaster.broadcast(
-                                            "tasks",
-                                            {
-                                                "event": "status_change",
-                                                "task_id": task.id,
-                                                "new_status": "pending",
-                                                "instance_id": instance_id,
-                                            },
+                                )
+                            ).scalar_one_or_none()
+                            if still_exact is None:
+                                await db.rollback()
+                                logger.info(
+                                    "Discarding stale context preflight for task "
+                                    "%s before summary collection",
+                                    task.id,
+                                )
+                                return
+                            logger.warning(
+                                "Task %d exceeded its context window, "
+                                "compacting session",
+                                task.id,
+                            )
+                            summary = await self._compact_session(
+                                permit.task_id,
+                                permit.session_id,
+                                db,
+                            )
+                            if summary:
+                                compacted = await db.execute(
+                                    update(Task)
+                                    .where(
+                                        *self._context_preflight_permit_predicates(
+                                            permit
                                         )
+                                    )
+                                    .values(
+                                        session_id=None,
+                                        context_window_usage=None,
+                                        status="pending",
+                                        instance_id=None,
+                                        description=build_compacted_task_retry_prompt(
+                                            summary
+                                        ),
+                                    )
+                                )
+                                if not compacted.rowcount:
+                                    await db.rollback()
+                                    logger.info(
+                                        "Discarding stale context compaction "
+                                        "writer for task %s",
+                                        task.id,
+                                    )
                                     return
+                                compacted_generation = (
+                                    await self._read_task_status_generation(
+                                        db,
+                                        task.id,
+                                    )
+                                )
+                                await db.commit()
+                                if compacted_generation is not None:
+                                    await self._broadcast_task_status_generation(
+                                        compacted_generation,
+                                        instance_id=instance_id,
+                                    )
+                                return
+
+                            # A failed/empty summary must not hand the stale
+                            # lifecycle-only generation to the generic retry
+                            # path after source/session ownership changed while
+                            # history was being collected.
+                            still_exact = (
+                                await db.execute(
+                                    select(Task.id).where(
+                                        *self._context_preflight_permit_predicates(
+                                            permit
+                                        )
+                                    )
+                                )
+                            ).scalar_one_or_none()
+                            await db.rollback()
+                            if still_exact is None:
+                                logger.info(
+                                    "Discarding stale empty context compaction "
+                                    "for task %s",
+                                    task.id,
+                                )
+                                return
                     except Exception:
                         logger.exception(
                             "Context-window compaction failed for task %d",
@@ -6460,9 +10670,11 @@ class GlobalDispatcher:
                 return
 
             # === Claude Code completed successfully ===
-            completed, background_active = await self._complete_owned_task_result(
-                lifecycle_generation,
-                count_completion=True,
+            completed, background_active = (
+                await self._complete_owned_task_after_pty_background(
+                    lifecycle_generation,
+                    count_completion=True,
+                )
             )
             if not completed:
                 return
@@ -6474,28 +10686,43 @@ class GlobalDispatcher:
             if not background_active:
                 await self._handle_pr_review_completion(task)
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             lifecycle_cancelled = True
             logger.info(
                 f"Lifecycle cancelled for task {task.id} on instance {instance_id}"
             )
-            if not self._shutting_down:
-                async with self.db_factory() as db:
-                    deferred = await TaskQueue(db).defer(
-                        task.id,
-                        "dispatcher stopped",
-                        instance_id=instance_id,
-                        generation_fence=(
-                            self._task_lifecycle_queue_fence(lifecycle_generation)
-                            if lifecycle_generation is not None
-                            else None
-                        ),
+            delayed_cancellation: asyncio.CancelledError | None = None
+            if lifecycle_generation is not None:
+                async def finalize_cancelled_lifecycle():
+                    finalized = (
+                        await self._finalize_fresh_lifecycle_replay_safely(
+                            lifecycle_generation,
+                            pending_reason="dispatcher stopped before provider launch",
+                            failure_reason=(
+                                "Dispatcher interrupted an admitted provider turn"
+                            ),
+                            allow_unbound_prelaunch=not claim_validated,
+                        )
                     )
-                if deferred:
-                    from backend.services.task_events import broadcast_status_change
+                    if (
+                        finalized is not None
+                        and finalized.published
+                        and finalized.failed_task is not None
+                    ):
+                        await self._handle_pr_review_failure(
+                            finalized.failed_task,
+                            finalized.failed_task.error_message
+                            or "Dispatcher interrupted an admitted provider turn",
+                        )
+                    return finalized
 
-                    await broadcast_status_change(task.id, "pending", instance_id)
-            raise
+                finalizer, delayed_cancellation = (
+                    await _settle_despite_cancellation(
+                        finalize_cancelled_lifecycle()
+                    )
+                )
+                finalizer.result()
+            raise delayed_cancellation or cancellation
         except TaskLifecycleSupersededError:
             logger.info(
                 "Lifecycle routing side effect for task %s on instance %s "
@@ -6555,21 +10782,27 @@ class GlobalDispatcher:
                     )
                 return
             if isinstance(e, InstanceAlreadyRunningError):
-                async with self.db_factory() as db:
-                    deferred = await TaskQueue(db).defer(
-                        task.id,
-                        f"instance admission race: {e}"[:500],
-                        instance_id=instance_id,
-                        generation_fence=(
-                            self._task_lifecycle_queue_fence(lifecycle_generation)
-                            if lifecycle_generation is not None
-                            else None
+                finalized = (
+                    await self._finalize_fresh_lifecycle_replay_safely(
+                        lifecycle_generation,
+                        pending_reason=f"instance admission race: {e}",
+                        failure_reason=(
+                            "Instance admission became uncertain after provider "
+                            "launch admission"
                         ),
                     )
-                if deferred:
-                    from backend.services.task_events import broadcast_status_change
-
-                    await broadcast_status_change(task.id, "pending", instance_id)
+                    if lifecycle_generation is not None
+                    else None
+                )
+                if (
+                    finalized is not None
+                    and finalized.published
+                    and finalized.failed_task is not None
+                ):
+                    await self._handle_pr_review_failure(
+                        finalized.failed_task,
+                        finalized.failed_task.error_message or str(e),
+                    )
                 return
             logger.error(f"Lifecycle error for task {task.id}: {e}", exc_info=True)
             if lifecycle_generation is not None:
@@ -6786,6 +11019,7 @@ class GlobalDispatcher:
                         terminal_task_retry_count=task.retry_count,
                         background_handoff_pending=background_handoff_pending,
                         db_factory=self.db_factory,
+                        operation_lock_held=True,
                     )
         except Exception as e:
             logger.error(f"PR review completion handler error: {e}", exc_info=True)
@@ -6855,6 +11089,7 @@ class GlobalDispatcher:
                                 else Task.completed_at == current.completed_at
                             ),
                             Task.pty_background_generation.is_(None),
+                            no_active_worker_task_termination_predicate(),
                         )
                         .values(status=Task.status)
                     )
@@ -6949,6 +11184,22 @@ class GlobalDispatcher:
                 async with self.db_factory() as db:
                     # Global database lock order is Task -> Instance.  Do not
                     # use db.get(Instance) before acquiring the Task row.
+                    # A Worker termination receipt uses the same Task writer
+                    # barrier before publishing ``active_task_id``.  Whichever
+                    # side commits first owns the exact generation: once a
+                    # receipt is active, this generic fallback must not alter
+                    # either the Task or its reverse Instance evidence.
+                    writer_fence = await db.execute(
+                        update(Task)
+                        .where(
+                            *self._task_lifecycle_stable_predicates(generation),
+                            no_active_worker_task_termination_predicate(),
+                        )
+                        .values(status=Task.status)
+                    )
+                    if writer_fence.rowcount != 1:
+                        await db.rollback()
+                        return
                     task_owner = await self._read_same_lifecycle_task(
                         db,
                         generation,
@@ -6982,11 +11233,16 @@ class GlobalDispatcher:
                             .where(
                                 *self._task_status_generation_predicates(observed_task),
                                 task_retry_not_superseded_predicate(),
+                                no_active_worker_task_termination_predicate(),
                             )
                             .values(
-                                status="completed",
+                                status="failed",
                                 completed_at=datetime.utcnow(),
-                                error_message=None,
+                                error_message=(
+                                    "Dispatcher lifecycle exited without an "
+                                    "authoritative terminal result; automatic "
+                                    "completion was blocked"
+                                ),
                             )
                         )
                         if not task_reset.rowcount:
@@ -7149,6 +11405,14 @@ class GlobalDispatcher:
             session_id,
         )
 
+        if await self._automatic_relaunch_is_blocked_by_turn_source(generation):
+            await self._retry_or_fail_mode_task(
+                generation,
+                "Account rotation was requested after the exact turn crossed "
+                "its external-effect boundary",
+            )
+            return
+
         if not await self._task_claim_is_active(generation):
             logger.info(
                 "Pool retry for task %s was superseded before relaunch",
@@ -7234,6 +11498,7 @@ class GlobalDispatcher:
         """
         if not await self._ensure_owned_executing(generation):
             return
+        sequence = _ModeTurnSequence()
         try:
             await self._run_loop_iterations(
                 instance_id,
@@ -7242,8 +11507,10 @@ class GlobalDispatcher:
                 cwd,
                 git_env,
                 effort_level=effort_level,
+                sequence=sequence,
             )
         finally:
+            self._revoke_mode_turn_sequence(sequence)
             try:
                 async with self.db_factory() as db:
                     t = await self._read_same_lifecycle_task(
@@ -7274,6 +11541,8 @@ class GlobalDispatcher:
         cwd: str,
         git_env: dict | None = None,
         effort_level: str | None = None,
+        *,
+        sequence: _ModeTurnSequence,
     ):
         """Loop: repeatedly invoke Claude Code until it signals done or abort.
 
@@ -7291,7 +11560,6 @@ class GlobalDispatcher:
         history: list[dict] = []
         anchored_total: int | None = None
         plan: str | None = None
-
         max_iterations = task.max_iterations or 50
 
         while True:
@@ -7375,6 +11643,7 @@ class GlobalDispatcher:
                 loop_iteration=iteration,
                 effort_level=effort_level,
                 label="Loop iteration",
+                sequence=sequence,
             )
 
             # P1: Check if task was cancelled/deleted while the iteration was running
@@ -7390,12 +11659,37 @@ class GlobalDispatcher:
                     return
                 task = t
 
-            if iteration_exit_code not in (0, -2, 130):
+            terminal_proof: _ModeTurnTerminalProof | None = None
+            if iteration_exit_code != 0:
                 signal = {
                     "action": "abort",
-                    "reason": f"Loop iteration process failed (exit code {iteration_exit_code})",
+                    "reason": (
+                        f"Loop iteration was interrupted (exit code {iteration_exit_code})"
+                        if iteration_exit_code in (-2, 130)
+                        else f"Loop iteration process failed (exit code {iteration_exit_code})"
+                    ),
                 }
             else:
+                try:
+                    terminal_proof = await self._prove_mode_turn_terminal(
+                        generation=generation,
+                        sequence=sequence,
+                    )
+                except ModeTurnContinuationError as exc:
+                    reason = f"Loop terminal proof was blocked: {exc}"
+                    status = await self._retry_or_fail_mode_task(
+                        generation,
+                        reason,
+                    )
+                    logger.warning(
+                        "Loop task %s could not prove iteration %s terminal "
+                        "-> %s: %s",
+                        task.id,
+                        iteration,
+                        status or "superseded",
+                        exc,
+                    )
+                    break
                 signal = self._read_loop_signal(signal_path)
 
             # P0: If signal is missing, attempt one resume to ask Claude to write it
@@ -7403,16 +11697,34 @@ class GlobalDispatcher:
                 iteration_exit_code == 0
                 and signal.get("reason") == "Signal file missing or invalid JSON"
             ):
-                signal = await self._resume_fix_signal(
-                    instance_id,
-                    task,
-                    generation,
-                    cwd,
-                    signal_path,
-                    iteration,
-                    git_env or {},
-                    effort_level=effort_level,
-                )
+                try:
+                    signal, terminal_proof = await self._resume_fix_signal(
+                        instance_id,
+                        task,
+                        generation,
+                        cwd,
+                        signal_path,
+                        iteration,
+                        git_env or {},
+                        effort_level=effort_level,
+                        sequence=sequence,
+                        predecessor_proof=terminal_proof,
+                    )
+                except ModeTurnContinuationError as exc:
+                    reason = f"Loop signal repair was blocked: {exc}"
+                    status = await self._retry_or_fail_mode_task(
+                        generation,
+                        reason,
+                    )
+                    logger.warning(
+                        "Loop task %s could not authorize signal repair at "
+                        "iteration %s -> %s: %s",
+                        task.id,
+                        iteration,
+                        status or "superseded",
+                        exc,
+                    )
+                    break
 
             # Update loop_progress from signal (Claude's self-reported progress string)
             if signal.get("progress"):
@@ -7461,6 +11773,8 @@ class GlobalDispatcher:
                     "action": signal.get("action", "abort"),
                     "reason": signal.get("reason", ""),
                     "progress": signal.get("progress"),
+                    "task_retry_count": generation.retry_count,
+                    "task_turn_generation": generation.turn_generation,
                 },
             )
 
@@ -7477,21 +11791,96 @@ class GlobalDispatcher:
                         f"Loop task {task.id} rejected premature done "
                         f"(progress {progress_str}, need {anchored_total}), forcing continue"
                     )
+                    if iteration + 1 < max_iterations:
+                        try:
+                            sequence.next_token = (
+                                await self._mint_mode_turn_continuation(
+                                    instance_id=instance_id,
+                                    generation=generation,
+                                    sequence=sequence,
+                                    proof=terminal_proof,
+                                )
+                            )
+                        except ModeTurnContinuationError as exc:
+                            reason = f"Loop continuation was blocked: {exc}"
+                            await self._retry_or_fail_mode_task(
+                                generation,
+                                reason,
+                            )
+                            logger.warning(
+                                "Loop task %s could not authorize forced "
+                                "continuation at iteration %s: %s",
+                                task.id,
+                                iteration,
+                                exc,
+                            )
+                            break
                     iteration += 1
                     continue
 
             if action == "continue":
+                if iteration + 1 < max_iterations:
+                    try:
+                        sequence.next_token = (
+                            await self._mint_mode_turn_continuation(
+                                instance_id=instance_id,
+                                generation=generation,
+                                sequence=sequence,
+                                proof=terminal_proof,
+                            )
+                        )
+                    except ModeTurnContinuationError as exc:
+                        reason = f"Loop continuation was blocked: {exc}"
+                        await self._retry_or_fail_mode_task(
+                            generation,
+                            reason,
+                        )
+                        logger.warning(
+                            "Loop task %s could not authorize continuation "
+                            "at iteration %s: %s",
+                            task.id,
+                            iteration,
+                            exc,
+                        )
+                        break
                 iteration += 1
                 continue
 
             elif action == "done":
-                await self._complete_owned_task(
+                if terminal_proof is None:
+                    reason = "Loop done signal had no exact successful terminal proof"
+                    await self._retry_or_fail_mode_task(generation, reason)
+                    logger.warning("Loop task %s rejected unproven done signal", task.id)
+                    break
+                try:
+                    await self._revalidate_mode_turn_terminal(
+                        generation=generation,
+                        proof=terminal_proof,
+                    )
+                except ModeTurnContinuationError as exc:
+                    reason = f"Loop done terminal proof was invalidated: {exc}"
+                    await self._retry_or_fail_mode_task(generation, reason)
+                    logger.warning(
+                        "Loop task %s rejected done after terminal tail changed: %s",
+                        task.id,
+                        exc,
+                    )
+                    break
+                completed = await self._complete_owned_task(
                     generation,
                     count_completion=True,
                 )
-                logger.info(
-                    f"Loop task {task.id} completed after {iteration + 1} iteration(s)"
-                )
+                if completed:
+                    logger.info(
+                        "Loop task %s completed after %s iteration(s)",
+                        task.id,
+                        iteration + 1,
+                    )
+                else:
+                    logger.info(
+                        "Loop completion for task %s yielded to a newer owner",
+                        task.id,
+                    )
                 break
 
             else:
@@ -7776,6 +12165,18 @@ class GlobalDispatcher:
 
         raise RuntimeError("unreachable goal evaluator retry state")
 
+    def _revoke_mode_turn_sequence(self, sequence: _ModeTurnSequence) -> None:
+        """Revoke any minted authority not handed to its intended launch."""
+
+        token = sequence.next_token
+        sequence.next_token = None
+        if token is None:
+            return
+        try:
+            self.instance_manager.revoke_sequential_turn_continuation(token)
+        except Exception:
+            logger.exception("Failed to revoke unused mode continuation token")
+
     async def _run_goal_lifecycle(
         self,
         instance_id: int,
@@ -7784,6 +12185,31 @@ class GlobalDispatcher:
         cwd: str,
         git_env: dict | None = None,
         effort_level: str | None = None,
+    ):
+        sequence = _ModeTurnSequence()
+        try:
+            await self._run_goal_turns(
+                instance_id,
+                task,
+                generation,
+                cwd,
+                git_env,
+                effort_level=effort_level,
+                sequence=sequence,
+            )
+        finally:
+            self._revoke_mode_turn_sequence(sequence)
+
+    async def _run_goal_turns(
+        self,
+        instance_id: int,
+        task: Task,
+        generation: _TaskLifecycleGeneration,
+        cwd: str,
+        git_env: dict | None = None,
+        effort_level: str | None = None,
+        *,
+        sequence: _ModeTurnSequence,
     ):
         """Goal mode: repeatedly invoke Claude Code until an evaluator confirms
         the goal condition is met.
@@ -7897,6 +12323,7 @@ class GlobalDispatcher:
                 loop_iteration=turn,
                 effort_level=effort_level,
                 label="Goal turn",
+                sequence=sequence,
             )
 
             # Check if cancelled/deleted during execution
@@ -7921,10 +12348,36 @@ class GlobalDispatcher:
                 )
                 return
             if turn_exit_code in (-2, 130):
+                await self._retry_or_fail_mode_task(
+                    generation,
+                    f"Goal turn was interrupted (exit code {turn_exit_code})",
+                )
+                return
+
+            try:
+                terminal_proof = await self._prove_mode_turn_terminal(
+                    generation=generation,
+                    sequence=sequence,
+                )
+            except ModeTurnContinuationError as exc:
+                await self._retry_or_fail_mode_task(
+                    generation,
+                    f"Goal terminal proof was blocked: {exc}",
+                )
+                logger.warning(
+                    "Goal task %s could not prove turn %s terminal: %s",
+                    task.id,
+                    turn,
+                    exc,
+                )
                 return
 
             # Collect conversation summary for evaluator
-            conversation_summary = await self._collect_goal_conversation(task.id, turn)
+            conversation_summary = await self._collect_goal_conversation(
+                generation,
+                turn,
+                terminal_proof,
+            )
             frontend_review_evidence_ready = True
             frontend_review_evidence_reason = ""
             from backend.services.frontend_review_goal import (
@@ -7959,6 +12412,26 @@ class GlobalDispatcher:
                     f"Goal evaluation failed: {exc}",
                 )
                 return
+            try:
+                # The evaluator may run for up to two minutes.  A fatal or
+                # malformed terminal persisted during that await vetoes the
+                # verdict even though the provider process originally exited 0.
+                await self._revalidate_mode_turn_terminal(
+                    generation=generation,
+                    proof=terminal_proof,
+                )
+            except ModeTurnContinuationError as exc:
+                await self._retry_or_fail_mode_task(
+                    generation,
+                    f"Goal terminal proof was invalidated during evaluation: {exc}",
+                )
+                logger.warning(
+                    "Goal task %s rejected evaluator verdict for turn %s: %s",
+                    task.id,
+                    turn,
+                    exc,
+                )
+                return
 
             turn += 1
             achieved = eval_result.achieved
@@ -7988,27 +12461,86 @@ class GlobalDispatcher:
                 return
 
             # Broadcast evaluation result
-            await self.broadcaster.broadcast(f"task:{task.id}", {
-                "event_type": "goal_evaluation",
-                "turn": turn,
-                "max_turns": max_turns,
-                "achieved": achieved,
-                "reason": evaluation_reason,
-            })
-            await self.broadcaster.broadcast("tasks", {
-                "event": "goal_evaluation",
-                "task_id": task.id,
-                "turn": turn,
-                "achieved": achieved,
-            })
+            await self.broadcaster.broadcast(
+                f"task:{task.id}",
+                {
+                    "event_type": "goal_evaluation",
+                    "turn": turn,
+                    "max_turns": max_turns,
+                    "achieved": achieved,
+                    "reason": evaluation_reason,
+                    "task_retry_count": generation.retry_count,
+                    "task_turn_generation": generation.turn_generation,
+                },
+            )
+            await self.broadcaster.broadcast(
+                "tasks",
+                {
+                    "event": "goal_evaluation",
+                    "task_id": task.id,
+                    "turn": turn,
+                    "achieved": achieved,
+                    "task_retry_count": generation.retry_count,
+                    "task_turn_generation": generation.turn_generation,
+                },
+            )
 
             if achieved:
-                await self._complete_owned_task(
+                try:
+                    # Progress publication and broadcasts above await external
+                    # work; close that final tail window before completion.
+                    await self._revalidate_mode_turn_terminal(
+                        generation=generation,
+                        proof=terminal_proof,
+                    )
+                except ModeTurnContinuationError as exc:
+                    await self._retry_or_fail_mode_task(
+                        generation,
+                        f"Goal achieved terminal proof was invalidated: {exc}",
+                    )
+                    logger.warning(
+                        "Goal task %s rejected achieved verdict after terminal "
+                        "tail changed: %s",
+                        task.id,
+                        exc,
+                    )
+                    return
+                completed = await self._complete_owned_task(
                     generation,
                     count_completion=True,
                 )
-                logger.info(f"Goal task {task.id} achieved after {turn} turn(s)")
+                if completed:
+                    logger.info(
+                        "Goal task %s achieved after %s turn(s)",
+                        task.id,
+                        turn,
+                    )
+                else:
+                    logger.info(
+                        "Goal completion for task %s yielded to a newer owner",
+                        task.id,
+                    )
                 return
+            if turn < max_turns:
+                try:
+                    sequence.next_token = await self._mint_mode_turn_continuation(
+                        instance_id=instance_id,
+                        generation=generation,
+                        sequence=sequence,
+                        proof=terminal_proof,
+                    )
+                except ModeTurnContinuationError as exc:
+                    await self._retry_or_fail_mode_task(
+                        generation,
+                        f"Goal continuation was blocked: {exc}",
+                    )
+                    logger.warning(
+                        "Goal task %s could not authorize turn %s continuation: %s",
+                        task.id,
+                        turn,
+                        exc,
+                    )
+                    return
 
         # Exceeded max turns
         fail_msg = f"未在 {max_turns} 轮内达成目标条件"
@@ -8107,22 +12639,52 @@ class GlobalDispatcher:
         )
         return "\n\n".join(parts)
 
-    async def _collect_goal_conversation(self, task_id: int, current_turn: int) -> str:
-        """Collect recent conversation log entries for the evaluator.
+    async def _collect_goal_conversation(
+        self,
+        generation: _TaskLifecycleGeneration,
+        current_turn: int,
+        terminal_proof: _ModeTurnTerminalProof,
+    ) -> str:
+        """Collect exact foreground goal output through ``current_turn``.
 
         Reads the last N assistant messages from log_entries to build a
         summary that the evaluator can judge against the goal condition.
-        Only sends recent turns to keep the evaluator prompt concise.
+        Legacy rows without generation/scope/iteration identity fail closed:
+        stale retries and autonomous/orphan output must never convince the
+        evaluator that the current visible goal turn achieved anything.
         """
         from backend.models.log_entry import LogEntry
 
+        if (
+            type(current_turn) is not int
+            or current_turn < 0
+            or not isinstance(terminal_proof, _ModeTurnTerminalProof)
+            or terminal_proof.task_id != generation.task_id
+            or terminal_proof.retry_count != generation.retry_count
+            or terminal_proof.turn_generation != generation.turn_generation
+            or terminal_proof.instance_id != generation.instance_id
+            or terminal_proof.loop_iteration != current_turn
+            or terminal_proof.source_log_id <= 0
+            or terminal_proof.terminal_log_id <= terminal_proof.source_log_id
+        ):
+            return "(No conversation output recorded)"
         async with self.db_factory() as db:
             result = await db.execute(
                 select(LogEntry.content, LogEntry.loop_iteration)
                 .where(
-                    LogEntry.task_id == task_id,
+                    LogEntry.task_id == generation.task_id,
+                    LogEntry.task_retry_count == generation.retry_count,
+                    LogEntry.task_turn_generation == generation.turn_generation,
+                    LogEntry.instance_id == terminal_proof.instance_id,
+                    LogEntry.turn_scope == "foreground",
                     LogEntry.event_type == "message",
                     LogEntry.role == "assistant",
+                    LogEntry.is_error.is_(False),
+                    LogEntry.loop_iteration.is_not(None),
+                    LogEntry.loop_iteration >= 0,
+                    LogEntry.loop_iteration <= current_turn,
+                    LogEntry.id > terminal_proof.source_log_id,
+                    LogEntry.id <= terminal_proof.terminal_log_id,
                 )
                 .order_by(LogEntry.id.desc())
                 .limit(30)
@@ -8136,9 +12698,7 @@ class GlobalDispatcher:
         parts = []
         for content, iteration in rows:
             if content:
-                turn_label = (
-                    f"[Turn {(iteration or 0) + 1}] " if iteration is not None else ""
-                )
+                turn_label = f"[Turn {iteration + 1}] "
                 parts.append(f"{turn_label}{content}")
 
         summary = "\n\n".join(parts)
@@ -8319,12 +12879,14 @@ class GlobalDispatcher:
         iteration: int,
         git_env: dict,
         effort_level: str | None = None,
-    ) -> dict:
+        sequence: _ModeTurnSequence | None = None,
+        predecessor_proof: _ModeTurnTerminalProof | None = None,
+    ) -> tuple[dict, _ModeTurnTerminalProof | None]:
         """Resume the last session to ask Claude to write the missing signal file.
 
         Called at most once per iteration when Claude completes work but forgets
-        to write the signal JSON.  Returns the signal dict (may still be abort if
-        Claude fails to write it on the second attempt).
+        to write the signal JSON.  Returns the signal plus the repair turn's
+        exact terminal proof (the signal may still be abort if repair fails).
         """
         async with self.db_factory() as db:
             t = await self._read_owned_lifecycle_task(db, generation)
@@ -8334,10 +12896,13 @@ class GlobalDispatcher:
             logger.warning(
                 f"Loop task {task.id} iter {iteration}: signal missing and no session_id to resume"
             )
-            return {
-                "action": "abort",
-                "reason": "Signal file missing and no session to resume",
-            }
+            return (
+                {
+                    "action": "abort",
+                    "reason": "Signal file missing and no session to resume",
+                },
+                predecessor_proof,
+            )
 
         fix_prompt = (
             f"你刚才完成了工作但忘记写信号文件。请检查 {task.todo_file_path} 的当前状态，"
@@ -8362,6 +12927,16 @@ class GlobalDispatcher:
         logger.info(
             f"Loop task {task.id} iter {iteration}: resuming session {resume_sid} to fix missing signal"
         )
+        if sequence is None:
+            raise ModeTurnContinuationError(
+                "signal repair omitted its live mode-turn sequence"
+            )
+        sequence.next_token = await self._mint_mode_turn_continuation(
+            instance_id=instance_id,
+            generation=generation,
+            sequence=sequence,
+            proof=predecessor_proof,
+        )
         exit_code, _ = await self._launch_mode_turn_with_rotation(
             instance_id,
             task,
@@ -8374,14 +12949,26 @@ class GlobalDispatcher:
             loop_iteration=iteration,
             effort_level=effort_level,
             label="Loop signal repair",
+            sequence=sequence,
         )
-        if exit_code not in (0, -2, 130):
-            return {
-                "action": "abort",
-                "reason": f"Signal repair failed (exit code {exit_code})",
-            }
+        if exit_code != 0:
+            return (
+                {
+                    "action": "abort",
+                    "reason": (
+                        f"Signal repair was interrupted (exit code {exit_code})"
+                        if exit_code in (-2, 130)
+                        else f"Signal repair failed (exit code {exit_code})"
+                    ),
+                },
+                None,
+            )
 
-        return self._read_loop_signal(signal_path)
+        repair_proof = await self._prove_mode_turn_terminal(
+            generation=generation,
+            sequence=sequence,
+        )
+        return self._read_loop_signal(signal_path), repair_proof
 
     async def _run_plan_phase(
         self,
@@ -8471,7 +13058,8 @@ class GlobalDispatcher:
                     *self._task_lifecycle_generation_predicates(
                         generation,
                         statuses=("executing",),
-                    )
+                    ),
+                    no_active_worker_task_termination_predicate(),
                 )
                 .values(
                     plan_content=result.plan_content,
@@ -9275,6 +13863,7 @@ class GlobalDispatcher:
         message = (f"Codex Monitor MCP runtime recycle failed: {error}")[:2000]
         now = datetime.utcnow()
         task_id: int | None = None
+        relay_generation: dict[str, int] | None = None
         async with self.db_factory() as db:
             failed = await db.execute(
                 update(MonitorSession)
@@ -9303,14 +13892,20 @@ class GlobalDispatcher:
                         MonitorSession.id == monitor_session_id
                     )
                 )
+                if task_id is not None:
+                    relay_generation = await self._task_relay_generation(
+                        db,
+                        task_id,
+                    )
             await db.commit()
-        if task_id is not None:
+        if task_id is not None and relay_generation is not None:
             await self.broadcaster.broadcast(
                 f"task:{task_id}",
                 {
                     "event": "monitor_session_status",
                     "monitor_session_id": monitor_session_id,
                     "status": "failed",
+                    **relay_generation,
                 },
             )
         return bool(failed.rowcount)
@@ -9471,6 +14066,27 @@ class GlobalDispatcher:
         self._monitor_tasks[monitor_session.id] = task
 
     @staticmethod
+    async def _task_relay_generation(
+        db,
+        task_id: int,
+    ) -> dict[str, int] | None:
+        """Freeze exact Task counters for a non-chat Worker relay event."""
+
+        row = (
+            await db.execute(
+                select(Task.retry_count, Task.turn_generation).where(
+                    Task.id == task_id
+                )
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        return {
+            "task_retry_count": row.retry_count,
+            "task_turn_generation": row.turn_generation,
+        }
+
+    @staticmethod
     def _monitor_failure_backoff(failures: int) -> float:
         return min(
             MONITOR_FAILURE_BACKOFF_BASE * (2 ** max(0, failures - 1)),
@@ -9516,6 +14132,7 @@ class GlobalDispatcher:
 
         completed_at = datetime.utcnow()
         task_id: int | None = None
+        relay_generation: dict[str, int] | None = None
         async with self.db_factory() as db:
             row = await db.execute(
                 update(MonitorSession)
@@ -9539,14 +14156,20 @@ class GlobalDispatcher:
                         MonitorSession.id == monitor_session_id
                     )
                 )
+                if task_id is not None:
+                    relay_generation = await self._task_relay_generation(
+                        db,
+                        task_id,
+                    )
             await db.commit()
-        if task_id is not None:
+        if task_id is not None and relay_generation is not None:
             await self.broadcaster.broadcast(
                 f"task:{task_id}",
                 {
                     "event": "monitor_session_status",
                     "monitor_session_id": monitor_session_id,
                     "status": "failed",
+                    **relay_generation,
                 },
             )
 
@@ -9562,6 +14185,7 @@ class GlobalDispatcher:
 
         terminal = False
         task_id: int | None = None
+        relay_generation: dict[str, int] | None = None
         async with self.db_factory() as db:
             state = (
                 await db.execute(
@@ -9610,16 +14234,26 @@ class GlobalDispatcher:
                 )
                 .values(**values)
             )
+            if advanced.rowcount and terminal and task_id is not None:
+                relay_generation = await self._task_relay_generation(
+                    db,
+                    task_id,
+                )
             await db.commit()
             if not advanced.rowcount:
                 return
-        if terminal and task_id is not None:
+        if (
+            terminal
+            and task_id is not None
+            and relay_generation is not None
+        ):
             await self.broadcaster.broadcast(
                 f"task:{task_id}",
                 {
                     "event": "monitor_session_status",
                     "monitor_session_id": monitor_session_id,
                     "status": "failed",
+                    **relay_generation,
                 },
             )
 
@@ -10016,6 +14650,7 @@ class GlobalDispatcher:
                         ),
                         Task.codex_service_tier == expected_tier,
                         task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(status=Task.status)
                 )
@@ -10048,6 +14683,9 @@ class GlobalDispatcher:
                     task_id,
                     populate_existing=True,
                 )
+                active_termination = (
+                    await active_worker_task_termination_receipt(db, task_id)
+                )
                 if (
                     task_guard.rowcount != 1
                     or monitor_guard.rowcount != 1
@@ -10055,6 +14693,11 @@ class GlobalDispatcher:
                     or has_pending_worker_routing(current_task)
                 ):
                     await db.rollback()
+                    if active_termination is not None:
+                        raise AuxiliaryLaunchSupersededError(
+                            "Codex Monitor launch yielded to an active Worker "
+                            "termination receipt"
+                        )
                     raise RuntimeError(
                         "Codex Monitor launch admission changed or Task "
                         "routing synchronization is pending"
@@ -10370,14 +15013,92 @@ class GlobalDispatcher:
             task_id=task_id,
             turn_generation=generation,
         )
-        process = await self._launch_monitor_agent(
-            prompt=prompt,
-            cwd=str(snapshot["cwd"]),
-            model=(None if snapshot["model"] is None else str(snapshot["model"])),
-            monitor_session_id=monitor_session_id,
-            mcp_config_path=mcp_config_path,
-            interval_seconds=int(snapshot["interval"]),
-        )
+        from backend.models.monitor_session import MonitorSession
+        from backend.services.worker_proxy import get_task_operation_lock
+
+        expected_provider, expected_model, expected_tier = snapshot[
+            "task_routing"
+        ]
+        # Keep the same Task operation lock used by Worker receipt admission
+        # until the exact process is registered. A receipt accepted before
+        # this boundary defeats the SQL gate; one accepted afterwards observes
+        # the registered child and owns its cleanup.
+        async with get_task_operation_lock(task_id):
+            async with self.db_factory() as db:
+                task_guard = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.worker_id.is_(None),
+                        Task.shared_from_id.is_(None),
+                        (
+                            Task.provider.is_(None)
+                            if expected_provider is None
+                            else Task.provider == expected_provider
+                        ),
+                        (
+                            Task.model.is_(None)
+                            if expected_model is None
+                            else Task.model == expected_model
+                        ),
+                        Task.codex_service_tier == expected_tier,
+                        task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                monitor_guard = await db.execute(
+                    update(MonitorSession)
+                    .where(
+                        MonitorSession.id == monitor_session_id,
+                        MonitorSession.task_id == task_id,
+                        MonitorSession.agent_type == "monitor",
+                        MonitorSession.source == "ccm",
+                        MonitorSession.status == "running",
+                        MonitorSession.remote_id.is_(None),
+                        MonitorSession.provider == "claude",
+                        MonitorSession.active_turn_generation == generation,
+                    )
+                    .values(status=MonitorSession.status)
+                )
+                current_task = await db.get(
+                    Task,
+                    task_id,
+                    populate_existing=True,
+                )
+                active_termination = (
+                    await active_worker_task_termination_receipt(db, task_id)
+                )
+                if (
+                    task_guard.rowcount != 1
+                    or monitor_guard.rowcount != 1
+                    or current_task is None
+                    or has_pending_worker_routing(current_task)
+                ):
+                    await db.rollback()
+                    if active_termination is not None:
+                        raise AuxiliaryLaunchSupersededError(
+                            "Claude Monitor launch yielded to an active "
+                            "Worker termination receipt"
+                        )
+                    raise RuntimeError(
+                        "Claude Monitor launch admission changed or Task "
+                        "routing synchronization is pending"
+                    )
+                await db.commit()
+
+            process = await self._launch_monitor_agent(
+                prompt=prompt,
+                cwd=str(snapshot["cwd"]),
+                model=(
+                    None
+                    if snapshot["model"] is None
+                    else str(snapshot["model"])
+                ),
+                monitor_session_id=monitor_session_id,
+                mcp_config_path=mcp_config_path,
+                interval_seconds=int(snapshot["interval"]),
+            )
         handle = _MonitorTurnHandle(
             session_id=monitor_session_id,
             generation=generation,
@@ -10403,6 +15124,7 @@ class GlobalDispatcher:
         generation = int(snapshot["generation"])
         handle: _MonitorTurnHandle | None = None
         turn_error: str | None = None
+        termination_yielded = False
         cancellation: asyncio.CancelledError | None = None
         handles = getattr(self, "_monitor_turn_handles", None)
         if handles is None:
@@ -10448,6 +15170,14 @@ class GlobalDispatcher:
                 turn_error = f"Monitor check turn exited with code {process.returncode}"
         except asyncio.CancelledError as exc:
             cancellation = exc
+        except AuxiliaryLaunchSupersededError:
+            termination_yielded = True
+            logger.info(
+                "Monitor session %s generation %s yielded to an active "
+                "Worker termination receipt",
+                monitor_session_id,
+                generation,
+            )
         except Exception as exc:
             turn_error = f"Monitor check turn failed: {exc}"
             logger.exception(
@@ -10514,7 +15244,12 @@ class GlobalDispatcher:
                 except Exception:
                     pass
 
-            if not reaped:
+            if termination_yielded:
+                # Receipt execution owns both Task and auxiliary-session
+                # terminalization. Preserve the claimed generation as exact
+                # evidence until that executor stops/cancels it.
+                pass
+            elif not reaped:
                 await self._mark_monitor_turn_uncertain(
                     monitor_session_id,
                     generation,
@@ -10552,7 +15287,7 @@ class GlobalDispatcher:
                         ),
                     )
 
-            if reaped:
+            if reaped and not termination_yielded:
                 try:
                     if str(snapshot["provider"]) == "codex":
                         if cancellation is None and delayed_cancellation is None:
@@ -10897,13 +15632,86 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     session_id=session_id,
                     task_id=task_id,
                 )
-                proc = await self._launch_sub_agent(
-                    prompt=prompt,
-                    cwd=task_cwd,
-                    model=model,
-                    session_id=session_id,
-                    mcp_config_path=mcp_config_path,
+                from backend.services.worker_proxy import (
+                    get_task_operation_lock,
                 )
+
+                expected_provider, expected_model, expected_tier = task_routing
+                # Serialize the last Task/session proof with receipt PUT and
+                # retain that boundary until the child process map owns the
+                # exact process generation.
+                async with get_task_operation_lock(task_id):
+                    async with self.db_factory() as db:
+                        task_guard = await db.execute(
+                            update(Task)
+                            .where(
+                                Task.id == task_id,
+                                Task.worker_id.is_(None),
+                                Task.shared_from_id.is_(None),
+                                (
+                                    Task.provider.is_(None)
+                                    if expected_provider is None
+                                    else Task.provider == expected_provider
+                                ),
+                                (
+                                    Task.model.is_(None)
+                                    if expected_model is None
+                                    else Task.model == expected_model
+                                ),
+                                Task.codex_service_tier == expected_tier,
+                                task_retry_not_superseded_predicate(),
+                                no_active_worker_task_termination_predicate(),
+                            )
+                            .values(status=Task.status)
+                        )
+                        session_guard = await db.execute(
+                            update(SubAgentSession)
+                            .where(
+                                SubAgentSession.id == session_id,
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.agent_type == "sub_agent",
+                                SubAgentSession.source == "ccm",
+                                SubAgentSession.status == "running",
+                                SubAgentSession.provider == "claude",
+                            )
+                            .values(status=SubAgentSession.status)
+                        )
+                        current_task = await db.get(
+                            Task,
+                            task_id,
+                            populate_existing=True,
+                        )
+                        active_termination = (
+                            await active_worker_task_termination_receipt(
+                                db,
+                                task_id,
+                            )
+                        )
+                        if (
+                            task_guard.rowcount != 1
+                            or session_guard.rowcount != 1
+                            or current_task is None
+                            or has_pending_worker_routing(current_task)
+                        ):
+                            await db.rollback()
+                            if active_termination is not None:
+                                raise AuxiliaryLaunchSupersededError(
+                                    "Claude sub-agent launch yielded to an "
+                                    "active Worker termination receipt"
+                                )
+                            raise RuntimeError(
+                                "Claude sub-agent launch admission changed or "
+                                "Task routing synchronization is pending"
+                            )
+                        await db.commit()
+
+                    proc = await self._launch_sub_agent(
+                        prompt=prompt,
+                        cwd=task_cwd,
+                        model=model,
+                        session_id=session_id,
+                        mcp_config_path=mcp_config_path,
+                    )
 
             try:
                 await asyncio.wait_for(proc.wait(), timeout=SUB_AGENT_TIMEOUT)
@@ -10923,6 +15731,21 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 await self._terminate_aux_process(proc)
 
             # If session still running after exit, sub-agent didn't call submit_result
+            queue_admission_fence: QueueAdmissionFence | None = None
+            if task_id is not None:
+                try:
+                    queue_admission_fence = await self.snapshot_queue_admission(
+                        task_id
+                    )
+                except (TaskStartPausedError, RuntimeError):
+                    # An explicit Task stop (or service shutdown) already owns
+                    # admission.  The auxiliary row still needs terminal
+                    # cleanup, but it must not publish a new main-agent turn.
+                    logger.info(
+                        "Skipping sub-agent exit notification for task %s "
+                        "because queue admission is closed",
+                        task_id,
+                    )
             async with self.db_factory() as db:
                 sa = await db.get(SubAgentSession, session_id)
                 if sa and sa.status == "running":
@@ -10938,15 +15761,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             "status": "failed",
                         },
                     )
-                    # Notify main agent of failure
-                    await self.enqueue_message(
-                        task_id=task_id,
-                        prompt=f"[Sub-Agent: {sa_description}] 执行失败: 进程退出 (exit_code={proc.returncode})",
-                        priority=PRIORITY_MONITOR_COMPLETE,
-                        source="sub-agent:result",
-                        user_message_text=f"[Sub-Agent: {sa_description}] 执行失败 (exit_code={proc.returncode})",
-                        monitor_session_id=session_id,
-                    )
+                    # Notify the main agent only under the pre-commit queue
+                    # snapshot. A stop which completed after the row commit
+                    # invalidates this late publication atomically.
+                    if queue_admission_fence is not None:
+                        await self.enqueue_message(
+                            task_id=task_id,
+                            prompt=f"[Sub-Agent: {sa_description}] 执行失败: 进程退出 (exit_code={proc.returncode})",
+                            priority=PRIORITY_MONITOR_COMPLETE,
+                            source="sub-agent:result",
+                            user_message_text=f"[Sub-Agent: {sa_description}] 执行失败 (exit_code={proc.returncode})",
+                            monitor_session_id=session_id,
+                            queue_admission_fence=queue_admission_fence,
+                        )
                     logger.warning(
                         f"Sub-agent session {session_id} process exited "
                         f"(rc={proc.returncode}) without submitting result, marked failed"
@@ -10954,6 +15781,15 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         except asyncio.CancelledError:
             raise
+        except AuxiliaryLaunchSupersededError:
+            # The receipt executor holds the authoritative stop/cancel intent
+            # and will terminalize this durable session. Do not race it with a
+            # generic auxiliary failure transition or notification.
+            logger.info(
+                "Sub-agent session %s yielded to an active Worker "
+                "termination receipt",
+                session_id,
+            )
         except Exception:
             logger.exception(f"Sub-agent session {session_id} failed unexpectedly")
             try:
@@ -11148,6 +15984,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             ),
                             Task.codex_service_tier == expected_tier,
                             task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
                         ]
                         task_guard = await db.execute(
                             update(Task)
@@ -11170,6 +16007,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             task_id,
                             populate_existing=True,
                         )
+                        active_termination = (
+                            await active_worker_task_termination_receipt(
+                                db,
+                                task_id,
+                            )
+                        )
                         if (
                             task_guard.rowcount != 1
                             or session_guard.rowcount != 1
@@ -11177,6 +16020,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             or has_pending_worker_routing(current_task)
                         ):
                             await db.rollback()
+                            if active_termination is not None:
+                                raise AuxiliaryLaunchSupersededError(
+                                    "Codex sub-agent launch yielded to an "
+                                    "active Worker termination receipt"
+                                )
                             raise RuntimeError(
                                 "Codex sub-agent launch admission changed or "
                                 "Task routing synchronization is pending"
@@ -11396,7 +16244,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         allow_new_session: bool | None = None,
-    ):
+        context_retry_permit: ContextRetryPermit | None = None,
+        queue_admission_fence: QueueAdmissionFence | None = None,
+    ) -> bool:
         """Enqueue a message for the main agent of a task.
 
         Messages are processed serially by a per-task consumer. Registration
@@ -11430,16 +16280,102 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             defer_for_initial_session=(
                 allow_new_session is None and internal_session_report
             ),
+            context_retry_permit=context_retry_permit,
+            queue_admission_fence=queue_admission_fence,
         )
         async with self._dispatch_claim_lock:
             admitted = self._admit_queued_message_locked(task_id, msg)
             if not admitted:
-                return
+                return False
             q = self._get_task_queue(task_id)
         logger.info(
             f"Enqueued message for task {task_id}: source={source} priority={priority} "
             f"queue_depth={q.qsize()}"
         )
+        return True
+
+    async def enqueue_capability_resume(self, outbox_id: int) -> bool:
+        """Publish one durable Capability resume without trusting caller data.
+
+        The outbox row is the sole source of the prompt, route, and exact
+        generation.  A committed publication lease fences other CCM processes;
+        the in-memory id set only removes duplicate queue entries in this one.
+        """
+
+        if type(outbox_id) is not int or outbox_id <= 0:
+            raise ValueError("Capability resume outbox id must be positive")
+        async with self._dispatch_claim_lock:
+            if outbox_id in self._queued_capability_resume_ids:
+                return False
+
+        from backend.services.capability_resume import (
+            claim_resume_publication,
+            release_resume_publication,
+        )
+
+        envelope = None
+        async with self.db_factory() as db:
+            envelope = await claim_resume_publication(db, outbox_id)
+        if envelope is None:
+            return False
+
+        msg = QueuedMessage(
+            priority=PRIORITY_CAPABILITY_RESUME,
+            timestamp=envelope.queue_timestamp,
+            prompt=envelope.prompt,
+            source=f"capability-resume:{outbox_id}",
+            expected_task_routing=(
+                envelope.provider,
+                envelope.model,
+                envelope.service_tier,
+            ),
+            current_message=envelope.current_message,
+            allow_new_session=envelope.request_session_id is None,
+            capability_resume_outbox_id=outbox_id,
+            capability_resume_lease_token=envelope.lease_token,
+            claimed_retry_count=(
+                envelope.request_retry_count
+                if envelope.claimed_generation is not None
+                else None
+            ),
+            claimed_turn_generation=envelope.claimed_generation,
+        )
+        if not isinstance(msg.capability_resume_lease_token, str):
+            raise RuntimeError("Capability resume publication omitted its lease")
+
+        admitted = False
+        try:
+            async with self._dispatch_claim_lock:
+                admitted = self._admit_queued_message_locked(
+                    envelope.task_id,
+                    msg,
+                )
+        except BaseException:
+            async with self.db_factory() as db:
+                await release_resume_publication(
+                    db,
+                    outbox_id,
+                    lease_token=msg.capability_resume_lease_token,
+                    error_code="queue_publication_interrupted",
+                    error_message="Dispatcher queue publication was interrupted",
+                )
+            raise
+        if not admitted:
+            async with self.db_factory() as db:
+                await release_resume_publication(
+                    db,
+                    outbox_id,
+                    lease_token=msg.capability_resume_lease_token,
+                    error_code="queue_publication_deferred",
+                    error_message="Dispatcher already owns this resume or is paused",
+                )
+            return False
+        logger.info(
+            "Enqueued capability resume outbox %s for task %s",
+            outbox_id,
+            envelope.task_id,
+        )
+        return True
 
     def _assert_queue_admission_locked(self, task_id: int) -> None:
         if self._shutting_down:
@@ -11458,10 +16394,37 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
     ) -> bool:
         """Publish one in-memory queue item while holding admission."""
 
+        expected = msg.queue_admission_fence
+        if expected is not None:
+            # A producer may have committed its durable result immediately
+            # before cancellation acquired the lease.  Treat that expected
+            # race as a rejected publication, not as an API error; ordinary
+            # user messages retain the TaskStartPausedError contract below.
+            if (
+                self._shutting_down
+                or self._maintenance_shutdown_committed
+                or task_id in self._cancel_durable_queue_tasks
+                or expected.epoch != self._queue_admission_epoch
+                or expected.generation
+                != self._task_queue_generations.get(task_id, 0)
+            ):
+                return False
         self._assert_queue_admission_locked(task_id)
         if (
             msg.delivery_key is not None
             and msg.delivery_key in self._queued_delivery_keys
+        ):
+            return False
+        if (
+            msg.capability_resume_outbox_id is not None
+            and msg.capability_resume_outbox_id
+            in self._queued_capability_resume_ids
+        ):
+            return False
+        if (
+            msg.worker_turn_handoff_id is not None
+            and msg.worker_turn_handoff_id
+            in self._queued_worker_turn_handoffs
         ):
             return False
         msg.queue_generation = self._task_queue_generations.get(task_id, 0)
@@ -11469,21 +16432,1410 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         q.put_nowait(msg)
         if msg.delivery_key is not None:
             self._queued_delivery_keys.add(msg.delivery_key)
+        if msg.capability_resume_outbox_id is not None:
+            self._queued_capability_resume_ids.add(
+                msg.capability_resume_outbox_id
+            )
+        if msg.worker_turn_handoff_id is not None:
+            self._queued_worker_turn_handoffs.add(
+                msg.worker_turn_handoff_id
+            )
         self._pending_task_starts.add(task_id)
         self._ensure_queue_worker(task_id)
         return True
 
-    async def snapshot_plan_queue_admission(self, task_id: int) -> dict[str, object]:
-        """Linearization fence captured before a Plan receipt is committed."""
+    async def enqueue_worker_turn_handoff(
+        self,
+        *,
+        task_id: int,
+        source_log_id: int,
+        handoff_id: str,
+    ) -> bool:
+        """Idempotently admit a Worker-local ordinary-chat receipt.
+
+        The exact queue envelope and its digest live in a dedicated receipt so
+        an ``accepted`` handoff survives a Worker restart.  ``claimed`` plus an
+        exact bound source whose ``actual_transport`` is still NULL proves G+1
+        remains before the first possible external side effect; recovery must
+        replay that same generation instead of creating G+2.  A repeated
+        internal POST therefore re-admits the same envelope without creating a
+        second log or turn.
+        """
+
+        plan_delivery_key: str | None = None
+        plan_handoff_fence: tuple[int, int, str, int, int] | None = None
+        async with self.db_factory() as db:
+            receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+            row = await db.get(LogEntry, source_log_id)
+            task = await db.get(Task, task_id)
+            if (
+                receipt is None
+                or receipt.side != "worker"
+                or receipt.status not in {"accepted", "claimed"}
+                or receipt.task_id != task_id
+                or receipt.source_log_id != source_log_id
+                or row is None
+                or row.task_id != task_id
+                or row.event_type != "user_message"
+                or task is None
+                or task.worker_id is not None
+                or task.shared_from_id is not None
+            ):
+                return False
+            payload = receipt.queue_payload
+            try:
+                payload_digest = (
+                    _durable_json_digest(payload)
+                    if isinstance(payload, dict)
+                    else None
+                )
+                request_digest = (
+                    _durable_json_digest(receipt.request_payload)
+                    if isinstance(receipt.request_payload, dict)
+                    else None
+                )
+            except (TypeError, ValueError, UnicodeError):
+                payload_digest = None
+                request_digest = None
+            payload_identity_valid = bool(
+                isinstance(payload, dict)
+                and receipt.queue_payload_digest == payload_digest
+                and receipt.request_digest == request_digest
+                and payload.get("worker_turn_handoff_id") == handoff_id
+                and payload.get("source_log_id") == source_log_id
+                and type(receipt.retry_count) is int
+                and type(receipt.from_generation) is int
+                and payload.get("worker_turn_handoff_retry_count")
+                == receipt.retry_count
+                and payload.get("worker_turn_handoff_from_generation")
+                == receipt.from_generation
+            )
+            claimed_generation = receipt.claimed_turn_generation
+            if receipt.status == "accepted":
+                valid_generation = bool(
+                    type(receipt.retry_count) is int
+                    and type(receipt.from_generation) is int
+                    and claimed_generation is None
+                    and row.task_retry_count is None
+                    and row.task_turn_generation is None
+                    and task.retry_count == receipt.retry_count
+                    and task.turn_generation == receipt.from_generation
+                )
+            else:
+                valid_generation = bool(
+                    type(receipt.retry_count) is int
+                    and type(receipt.from_generation) is int
+                    and type(claimed_generation) is int
+                    and claimed_generation == receipt.from_generation + 1
+                    and row.task_retry_count == receipt.retry_count
+                    and row.task_turn_generation == claimed_generation
+                    and task.retry_count == receipt.retry_count
+                    and task.turn_generation == claimed_generation
+                    and task.status
+                    in {"completed", "failed", "in_progress", "executing"}
+                )
+            if not valid_generation:
+                if receipt.status == "claimed":
+                    # A claimed generation which no longer matches its Task or
+                    # source cannot ever become replayable again.  Leave
+                    # explicit cancellation untouched, but move this stale
+                    # claim out of the recovery query instead of logging the
+                    # same rejection forever.
+                    await db.execute(
+                        update(WorkerTurnHandoffReceipt)
+                        .where(
+                            WorkerTurnHandoffReceipt.handoff_id == handoff_id,
+                            WorkerTurnHandoffReceipt.task_id == task_id,
+                            WorkerTurnHandoffReceipt.source_log_id
+                            == source_log_id,
+                            WorkerTurnHandoffReceipt.side == "worker",
+                            WorkerTurnHandoffReceipt.status == "claimed",
+                        )
+                        .values(
+                            status="launching",
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    await db.commit()
+                return False
+            delivery_key = (
+                payload.get("delivery_key")
+                if payload_identity_valid and isinstance(payload, dict)
+                else None
+            )
+            delivery_key_valid = delivery_key is None or isinstance(
+                delivery_key, str
+            )
+            expected = (
+                payload.get("expected_task_routing")
+                if payload_identity_valid and isinstance(payload, dict)
+                else None
+            )
+            timestamp = (
+                payload.get("queue_timestamp")
+                if payload_identity_valid and isinstance(payload, dict)
+                else None
+            )
+            payload_replayable = bool(
+                payload_identity_valid
+                and isinstance(payload, dict)
+                and "prompt" in payload
+                and delivery_key_valid
+                and isinstance(expected, list)
+                and len(expected) == 3
+                and isinstance(timestamp, (int, float))
+                and not isinstance(timestamp, bool)
+            )
+            if receipt.status == "claimed":
+                bound_source = await self._canonical_exact_turn_source(db, task)
+                source_matches = bool(
+                    bound_source is not None
+                    and await self._turn_source_matches_exact_request(
+                        db,
+                        task=task,
+                        source_log_id=source_log_id,
+                        expected_bound_source_id=bound_source.id,
+                    )
+                )
+                actual_transport = (
+                    bound_source.actual_transport
+                    if source_matches and bound_source is not None
+                    else None
+                )
+                if (
+                    not source_matches
+                    or actual_transport is not None
+                    or not payload_replayable
+                ):
+                    # InstanceManager commits the concrete transport before it
+                    # invokes the receipt callback.  A callback/commit ACK loss
+                    # can therefore leave ``claimed`` behind a durable provider
+                    # boundary. A malformed source/envelope is equally unable
+                    # to prove pre-boundary replay safety. Promote either shape
+                    # to the conservative post-boundary state so later recovery
+                    # converges instead of retrying the same G+1 forever.
+                    await db.execute(
+                        update(WorkerTurnHandoffReceipt)
+                        .where(
+                            WorkerTurnHandoffReceipt.handoff_id == handoff_id,
+                            WorkerTurnHandoffReceipt.task_id == task_id,
+                            WorkerTurnHandoffReceipt.source_log_id
+                            == source_log_id,
+                            WorkerTurnHandoffReceipt.side == "worker",
+                            WorkerTurnHandoffReceipt.retry_count
+                            == receipt.retry_count,
+                            WorkerTurnHandoffReceipt.from_generation
+                            == receipt.from_generation,
+                            WorkerTurnHandoffReceipt.claimed_turn_generation
+                            == claimed_generation,
+                            WorkerTurnHandoffReceipt.status == "claimed",
+                        )
+                        .values(
+                            status="launching",
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    if isinstance(delivery_key, str):
+                        from backend.models.plan import PlanApplicationReceipt
+
+                        error = (
+                            (
+                                "Worker handoff selected transport "
+                                f"{actual_transport} before its launch-boundary "
+                                "receipt settled"
+                            )
+                            if actual_transport is not None
+                            else (
+                                "Worker handoff claimed proof is malformed or "
+                                "does not match the canonical bound source"
+                            )
+                        )
+                        error += (
+                            "; automatic replay was blocked to prevent "
+                            "duplicate execution"
+                        )
+                        await db.execute(
+                            update(PlanApplicationReceipt)
+                            .where(
+                                PlanApplicationReceipt.receipt_key
+                                == delivery_key,
+                                PlanApplicationReceipt.target_task_id == task_id,
+                                PlanApplicationReceipt.delivery_status.in_(
+                                    ["pending", "queued", "launching"]
+                                ),
+                            )
+                            .values(
+                                delivery_status="uncertain",
+                                delivery_error=error,
+                                updated_at=datetime.utcnow(),
+                            )
+                        )
+                    await db.commit()
+                    logger.error(
+                        "Quarantined claimed Worker handoff %s for task %s "
+                        "after non-replayable source/envelope proof (transport=%s)",
+                        handoff_id,
+                        task_id,
+                        actual_transport,
+                    )
+                    return False
+            if not payload_replayable:
+                return False
+            if isinstance(delivery_key, str):
+                # Versioned Plan delivery already has its own durable outbox;
+                # its QueuedMessage carries the same handoff fence below.
+                plan_delivery_key = delivery_key
+                plan_handoff_fence = (
+                    task_id,
+                    source_log_id,
+                    handoff_id,
+                    receipt.retry_count,
+                    receipt.from_generation,
+                )
+            expected_routing = (expected[0], expected[1], expected[2])
+            msg = QueuedMessage(
+                priority=int(payload.get("priority", PRIORITY_USER)),
+                timestamp=float(timestamp),
+                prompt=str(payload["prompt"]),
+                source=str(payload.get("source", "user")),
+                user_message_text=payload.get("user_message_text"),
+                command_skills=payload.get("command_skills"),
+                model_override=payload.get("model_override"),
+                expected_task_routing=expected_routing,
+                source_log_id=source_log_id,
+                current_message=payload.get("current_message"),
+                allow_new_session=bool(
+                    payload.get("allow_new_session", False)
+                ),
+                worker_turn_handoff_id=handoff_id,
+                worker_turn_handoff_retry_count=receipt.retry_count,
+                worker_turn_handoff_from_generation=(
+                    receipt.from_generation
+                ),
+                worker_turn_handoff_claimed_generation=(
+                    claimed_generation if receipt.status == "claimed" else None
+                ),
+                claimed_retry_count=(
+                    receipt.retry_count if receipt.status == "claimed" else None
+                ),
+                claimed_turn_generation=(
+                    claimed_generation if receipt.status == "claimed" else None
+                ),
+            )
+        if plan_delivery_key is not None:
+            if claimed_generation is not None:
+                prepared = await self._prepare_claimed_plan_delivery_replay(
+                    receipt_key=plan_delivery_key,
+                    expected_worker_handoff=plan_handoff_fence,
+                    claimed_turn_generation=claimed_generation,
+                )
+                if not prepared:
+                    return False
+            return await self.enqueue_plan_application_receipt(
+                plan_delivery_key,
+                expected_worker_handoff=plan_handoff_fence,
+                worker_handoff_claimed_generation=claimed_generation,
+            )
+        async with self._dispatch_claim_lock:
+            self._assert_queue_admission_locked(task_id)
+            if handoff_id in self._queued_worker_turn_handoffs:
+                return True
+            return self._admit_queued_message_locked(task_id, msg)
+
+    async def snapshot_queue_admission(
+        self,
+        task_id: int,
+    ) -> QueueAdmissionFence:
+        """Capture a queue-clear fence before an internal producer commits."""
 
         async with self._dispatch_claim_lock:
             self._assert_queue_admission_locked(task_id)
-            return {
-                "epoch": self._queue_admission_epoch,
-                "generation": self._task_queue_generations.get(task_id, 0),
-            }
+            return QueueAdmissionFence(
+                epoch=self._queue_admission_epoch,
+                generation=self._task_queue_generations.get(task_id, 0),
+            )
 
-    async def enqueue_plan_application_receipt(self, receipt_key: str) -> bool:
+    async def snapshot_plan_queue_admission(self, task_id: int) -> dict[str, object]:
+        """Linearization fence captured before a Plan receipt is committed."""
+
+        fence = await self.snapshot_queue_admission(task_id)
+        return {
+            "epoch": fence.epoch,
+            "generation": fence.generation,
+        }
+
+    async def _prepare_claimed_plan_delivery_replay(
+        self,
+        *,
+        receipt_key: str,
+        expected_worker_handoff: tuple[int, int, str, int, int] | None,
+        claimed_turn_generation: int,
+    ) -> bool:
+        """Reopen only a Plan launch proven not to have crossed its side effect.
+
+        The Worker receipt is locked before the Plan receipt everywhere these
+        two durable halves are changed together.  ``claimed`` is the sole
+        receipt state eligible for G+1 replay, but callers must also prove the
+        exact bound source has no ``actual_transport`` because transport is
+        committed before the callback. ``launching`` and ``launched`` remain
+        fail-closed.
+        """
+
+        if expected_worker_handoff is None:
+            return False
+        task_id, source_log_id, handoff_id, retry_count, from_generation = (
+            expected_worker_handoff
+        )
+        if claimed_turn_generation != from_generation + 1:
+            return False
+
+        from backend.models.plan import PlanApplicationReceipt
+
+        async with self.db_factory() as db:
+            handoff = (
+                await db.execute(
+                    select(WorkerTurnHandoffReceipt)
+                    .where(
+                        WorkerTurnHandoffReceipt.handoff_id == handoff_id,
+                        WorkerTurnHandoffReceipt.task_id == task_id,
+                        WorkerTurnHandoffReceipt.source_log_id == source_log_id,
+                        WorkerTurnHandoffReceipt.side == "worker",
+                        WorkerTurnHandoffReceipt.retry_count == retry_count,
+                        WorkerTurnHandoffReceipt.from_generation == from_generation,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                handoff is None
+                or handoff.status != "claimed"
+                or handoff.claimed_turn_generation != claimed_turn_generation
+            ):
+                await db.rollback()
+                return False
+            plan_receipt = (
+                await db.execute(
+                    select(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.receipt_key == receipt_key,
+                        PlanApplicationReceipt.target_task_id == task_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if plan_receipt is None or plan_receipt.delivery_status not in {
+                "queued",
+                "launching",
+            }:
+                await db.rollback()
+                return False
+            payload = plan_receipt.outbox_payload
+            try:
+                payload_digest = (
+                    _durable_json_digest(payload)
+                    if isinstance(payload, dict)
+                    else None
+                )
+            except (TypeError, ValueError, UnicodeError):
+                payload_digest = None
+            if (
+                not isinstance(payload, dict)
+                or plan_receipt.payload_digest != payload_digest
+                or payload.get("source_log_id") != source_log_id
+                or payload.get("worker_turn_handoff_id") != handoff_id
+                or payload.get("worker_turn_handoff_retry_count") != retry_count
+                or payload.get("worker_turn_handoff_from_generation")
+                != from_generation
+            ):
+                await db.rollback()
+                return False
+            if plan_receipt.delivery_status == "launching":
+                evidence = plan_receipt.launch_evidence
+                if (
+                    not isinstance(evidence, dict)
+                    or evidence.get("task_id") != task_id
+                    or evidence.get("source_log_id") != source_log_id
+                    or evidence.get("retry_count") != retry_count
+                    or evidence.get("turn_generation") != claimed_turn_generation
+                ):
+                    await db.rollback()
+                    return False
+                plan_receipt.delivery_status = "queued"
+                plan_receipt.delivery_error = None
+                plan_receipt.updated_at = datetime.utcnow()
+            await db.commit()
+            return True
+
+    async def _persist_worker_handoff_transition(
+        self,
+        *,
+        task_id: int,
+        source_log_id: int,
+        handoff_id: str,
+        retry_count: int,
+        from_generation: int,
+        claimed_turn_generation: int,
+        expected_status: str,
+        next_status: str,
+    ) -> None:
+        """Commit one exact Worker launch-boundary state transition.
+
+        This deliberately CASes only the receipt.  InstanceManager invokes the
+        ``claimed -> launching`` callback while holding its lifecycle lock; a
+        Task-row lock here would invert the ordinary Task -> lifecycle order and
+        could deadlock an explicit stop.  Stop/cancel instead wins by changing
+        this same receipt from ``claimed`` to ``cancelled`` before the CAS.
+        """
+
+        async with self.db_factory() as db:
+            changed = await db.execute(
+                update(WorkerTurnHandoffReceipt)
+                .where(
+                    WorkerTurnHandoffReceipt.handoff_id == handoff_id,
+                    WorkerTurnHandoffReceipt.task_id == task_id,
+                    WorkerTurnHandoffReceipt.source_log_id == source_log_id,
+                    WorkerTurnHandoffReceipt.side == "worker",
+                    WorkerTurnHandoffReceipt.retry_count == retry_count,
+                    WorkerTurnHandoffReceipt.from_generation == from_generation,
+                    WorkerTurnHandoffReceipt.claimed_turn_generation
+                    == claimed_turn_generation,
+                    WorkerTurnHandoffReceipt.status == expected_status,
+                )
+                .values(status=next_status, updated_at=datetime.utcnow())
+            )
+            if changed.rowcount == 1:
+                await db.commit()
+                return
+            await db.rollback()
+            receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+            if (
+                receipt is not None
+                and receipt.task_id == task_id
+                and receipt.source_log_id == source_log_id
+                and receipt.side == "worker"
+                and receipt.retry_count == retry_count
+                and receipt.from_generation == from_generation
+                and receipt.claimed_turn_generation == claimed_turn_generation
+                and receipt.status == next_status
+            ):
+                return
+            raise RuntimeError(
+                "Worker turn handoff launch-boundary generation changed"
+            )
+
+    async def _cancel_plan_linked_worker_handoff(
+        self,
+        db,
+        *,
+        receipt,
+        reason: str,
+        expected_worker_handoff: tuple[int, int, str, int, int] | None = None,
+    ) -> bool:
+        """Cancel a Plan delivery's accepted Worker handoff in this transaction.
+
+        A Worker-side Plan application and ordinary-chat handoff are two views
+        of the same queued turn.  Terminating only the Plan receipt leaves an
+        ``accepted`` handoff that Manager recovery will resume forever.  Find
+        the link from the independently durable Worker receipt as well as the
+        Plan payload so a malformed Plan payload can still fail closed.
+        """
+
+        task_id = receipt.target_task_id
+        if type(task_id) is not int:
+            return False
+        expected = expected_worker_handoff
+        if expected is not None:
+            if (
+                len(expected) != 5
+                or expected[0] != task_id
+                or type(expected[1]) is not int
+                or expected[1] <= 0
+                or not isinstance(expected[2], str)
+                or not expected[2]
+                or len(expected[2]) > 32
+                or type(expected[3]) is not int
+                or expected[3] < 0
+                or type(expected[4]) is not int
+                or expected[4] < 0
+            ):
+                return False
+
+        payload = receipt.outbox_payload
+        try:
+            plan_payload_digest = (
+                _durable_json_digest(payload)
+                if isinstance(payload, dict)
+                else None
+            )
+        except (TypeError, ValueError, UnicodeError):
+            plan_payload_digest = None
+        if (
+            not isinstance(payload, dict)
+            or receipt.payload_digest != plan_payload_digest
+        ):
+            # The Plan half is itself the durable proof used to identify the
+            # Worker half.  Never trust linkage fields from a payload whose
+            # immutable digest no longer matches.
+            return False
+        payload_linked = bool(
+            any(
+                key in payload
+                for key in (
+                    "worker_turn_handoff_id",
+                    "worker_turn_handoff_retry_count",
+                    "worker_turn_handoff_from_generation",
+                )
+            )
+        )
+        candidates = list(
+            (
+                await db.execute(
+                    select(WorkerTurnHandoffReceipt)
+                    .where(
+                        WorkerTurnHandoffReceipt.task_id == task_id,
+                        WorkerTurnHandoffReceipt.side == "worker",
+                        WorkerTurnHandoffReceipt.status.in_(
+                            [
+                                "accepted",
+                                "claimed",
+                                "launching",
+                                "launched",
+                                "cancelled",
+                            ]
+                        ),
+                    )
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        matches: list[WorkerTurnHandoffReceipt] = []
+        for candidate in candidates:
+            queue_payload = candidate.queue_payload
+            request_payload = candidate.request_payload
+            try:
+                queue_payload_digest = (
+                    _durable_json_digest(queue_payload)
+                    if isinstance(queue_payload, dict)
+                    else None
+                )
+                request_payload_digest = (
+                    _durable_json_digest(request_payload)
+                    if isinstance(request_payload, dict)
+                    else None
+                )
+            except (TypeError, ValueError, UnicodeError):
+                queue_payload_digest = None
+                request_payload_digest = None
+            if (
+                not isinstance(queue_payload, dict)
+                or candidate.queue_payload_digest != queue_payload_digest
+                or not isinstance(request_payload, dict)
+                or candidate.request_digest != request_payload_digest
+            ):
+                # A corrupted candidate cannot prove that it is either the
+                # linked handoff or an unrelated row.  Refuse the whole
+                # settlement instead of risking cancellation of the wrong
+                # exact turn.
+                return False
+            if (
+                queue_payload.get("delivery_key") != receipt.receipt_key
+                or queue_payload.get("source_log_id")
+                != candidate.source_log_id
+                or queue_payload.get("worker_turn_handoff_id")
+                != candidate.handoff_id
+                or queue_payload.get("worker_turn_handoff_retry_count")
+                != candidate.retry_count
+                or queue_payload.get("worker_turn_handoff_from_generation")
+                != candidate.from_generation
+            ):
+                continue
+            identity = (
+                candidate.task_id,
+                candidate.source_log_id,
+                candidate.handoff_id,
+                candidate.retry_count,
+                candidate.from_generation,
+            )
+            if expected is not None and identity != expected:
+                continue
+            matches.append(candidate)
+
+        if len(matches) > 1:
+            # A receipt key is intended to identify one immutable queue item.
+            # Refuse to guess if corrupted rows claim the same Plan delivery.
+            return False
+        if not matches:
+            if receipt.delivery_status == "launching":
+                # A generic Plan launch claim has no safe rollback proof. Only
+                # its exact linked accepted/claimed Worker receipt can reopen
+                # this state.
+                return False
+            return expected is None and not payload_linked
+
+        handoff = matches[0]
+        if handoff.status in {"launching", "launched"}:
+            # The provider side-effect boundary was crossed.  A prelaunch Plan
+            # release would make a potentially executed turn both launched and
+            # cancelled.
+            return False
+        if handoff.status in {"accepted", "claimed"}:
+            handoff.status = "cancelled"
+            handoff.claimed_turn_generation = None
+            handoff.cancel_reason = reason[:2000]
+            handoff.updated_at = datetime.utcnow()
+            await db.flush()
+        return True
+
+    async def _release_plan_delivery_with_worker_handoff(
+        self,
+        db,
+        *,
+        receipt_key: str,
+        delivery_status: str,
+        error: str,
+        expected_worker_handoff: tuple[int, int, str, int, int] | None = None,
+    ) -> tuple[list[int], int | None] | None:
+        """Atomically release a prelaunch Plan receipt and linked handoff."""
+
+        from backend.models.plan import PlanApplicationReceipt
+        from backend.services.plan_service import (
+            release_unstarted_plan_application,
+        )
+
+        receipt = (
+            await db.execute(
+                select(PlanApplicationReceipt)
+                .where(
+                    PlanApplicationReceipt.receipt_key == receipt_key,
+                    PlanApplicationReceipt.delivery_status.in_(
+                        ["pending", "queued", "launching"]
+                    ),
+                )
+            )
+        ).scalar_one_or_none()
+        if receipt is None:
+            return None
+        if not await self._cancel_plan_linked_worker_handoff(
+            db,
+            receipt=receipt,
+            reason=error,
+            expected_worker_handoff=expected_worker_handoff,
+        ):
+            raise RuntimeError(
+                "Plan delivery could not atomically settle its Worker turn handoff"
+            )
+        # The Worker receipt is locked first above.  Only a pre-boundary
+        # accepted/claimed receipt can make this safe; launching/launched
+        # returns False and rolls the whole transaction back.  Re-lock the Plan
+        # second, then reopen it for the existing release helper.
+        receipt = (
+            await db.execute(
+                select(PlanApplicationReceipt)
+                .where(
+                    PlanApplicationReceipt.receipt_key == receipt_key,
+                    PlanApplicationReceipt.delivery_status.in_(
+                        ["pending", "queued", "launching"]
+                    ),
+                )
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+        if receipt is None:
+            return None
+        if receipt.delivery_status == "launching":
+            receipt.delivery_status = "queued"
+            receipt.delivery_error = None
+            receipt.updated_at = datetime.utcnow()
+            await db.flush()
+        return await release_unstarted_plan_application(
+            db,
+            receipt_key=receipt_key,
+            delivery_status=delivery_status,
+            error=error,
+        )
+
+    @staticmethod
+    def _plan_launch_evidence_matches(
+        evidence: object,
+        *,
+        task_id: int,
+        instance_id: int,
+        retry_count: int,
+        turn_generation: int,
+        started_at: datetime | None,
+        session_id: str | None,
+        source_log_id: int | None,
+        provider: str,
+        model: str | None,
+        service_tier: str | None,
+        pre_status: str,
+        pre_instance_id: int | None,
+        pre_completed_at: datetime | None,
+    ) -> bool:
+        """Match the complete admission identity written before provider launch."""
+
+        return evidence == {
+            "task_id": task_id,
+            "instance_id": instance_id,
+            "retry_count": retry_count,
+            "turn_generation": turn_generation,
+            "started_at": (
+                started_at.isoformat() if started_at is not None else None
+            ),
+            "session_id": session_id,
+            "source_log_id": source_log_id,
+            "provider": provider,
+            "model": model,
+            "service_tier": service_tier,
+            "pre_status": pre_status,
+            "pre_instance_id": pre_instance_id,
+            "pre_completed_at": (
+                pre_completed_at.isoformat()
+                if pre_completed_at is not None
+                else None
+            ),
+        }
+
+    async def _turn_source_matches_exact_request(
+        self,
+        db,
+        *,
+        task: Task,
+        source_log_id: int | None,
+        expected_bound_source_id: int | None = None,
+    ) -> bool:
+        """Validate the current source pointer, including hidden source aliases."""
+
+        pointer = task.turn_source_log_id
+        if (
+            type(pointer) is not int
+            or pointer <= 0
+            or (
+                expected_bound_source_id is not None
+                and pointer != expected_bound_source_id
+            )
+        ):
+            return False
+        source = await db.get(LogEntry, pointer)
+        if (
+            source is None
+            or source.task_id != task.id
+            or source.task_retry_count != task.retry_count
+            or source.task_turn_generation != task.turn_generation
+            or source.turn_scope != "source"
+        ):
+            return False
+        if source_log_id is not None:
+            if type(source_log_id) is not int or source_log_id <= 0:
+                return False
+            original = await db.get(LogEntry, source_log_id)
+            if original is None or original.task_id != task.id:
+                return False
+            if pointer == source_log_id:
+                return True
+        if source.event_type != "turn_source":
+            return False
+        try:
+            raw = (
+                source.raw_json
+                if isinstance(source.raw_json, dict)
+                else json.loads(source.raw_json)
+            )
+        except (TypeError, ValueError, RecursionError):
+            return False
+        if not isinstance(raw, dict) or "original_source_log_id" not in raw:
+            return False
+        original_source = raw["original_source_log_id"]
+        return (
+            original_source is None
+            if source_log_id is None
+            else type(original_source) is int and original_source == source_log_id
+        )
+
+    async def _generic_plan_replay_claim(
+        self,
+        db,
+        *,
+        receipt,
+        payload: dict,
+    ) -> tuple[int, int] | None:
+        """Recover a generic Plan's already-claimed G after a safe rollback.
+
+        A non-NULL launch evidence record means an earlier process committed the
+        Task/source/receipt admission identity.  It is never safe to treat a
+        malformed or stale record as a fresh envelope, because doing so would
+        advance the same Plan request to G+2.
+        """
+
+        evidence = receipt.launch_evidence
+        if evidence is None:
+            return None
+        worker_fields = (
+            "worker_turn_handoff_id",
+            "worker_turn_handoff_retry_count",
+            "worker_turn_handoff_from_generation",
+        )
+        if any(field in payload for field in worker_fields):
+            raise ValueError(
+                "Plan application launch evidence lost its Worker recovery owner"
+            )
+        task_id = receipt.target_task_id
+        source_log_id = payload.get("source_log_id")
+        task = await db.get(Task, task_id)
+        if (
+            receipt.status != "committed"
+            or type(task_id) is not int
+            or type(source_log_id) is not int
+            or source_log_id <= 0
+            or receipt.manager_user_log_id != source_log_id
+            or task is None
+            or task.worker_id is not None
+            or task.shared_from_id is not None
+        ):
+            raise ValueError("Plan application claimed identity is incomplete")
+        retry_count = evidence.get("retry_count") if isinstance(evidence, dict) else None
+        turn_generation = (
+            evidence.get("turn_generation") if isinstance(evidence, dict) else None
+        )
+        instance_id = evidence.get("instance_id") if isinstance(evidence, dict) else None
+        provider = (task.provider or "claude").lower()
+        model = payload.get("model_override") or task.model
+        service_tier = task.codex_service_tier
+        expected_route = payload.get("expected_task_routing")
+        pre_status = evidence.get("pre_status") if isinstance(evidence, dict) else None
+        pre_instance_id = (
+            evidence.get("pre_instance_id") if isinstance(evidence, dict) else None
+        )
+        pre_completed_at = (
+            evidence.get("pre_completed_at") if isinstance(evidence, dict) else None
+        )
+        if (
+            type(retry_count) is not int
+            or retry_count < 0
+            or type(turn_generation) is not int
+            or turn_generation < 0
+            or type(instance_id) is not int
+            or instance_id <= 0
+            or task.retry_count != retry_count
+            or task.turn_generation != turn_generation
+            or not isinstance(pre_status, str)
+            or pre_status in {"cancelled", "stopped"}
+            or task.status != pre_status
+            or task.instance_id != pre_instance_id
+            or (
+                task.completed_at.isoformat()
+                if task.completed_at is not None
+                else None
+            )
+            != pre_completed_at
+            or expected_route != [provider, model, service_tier or "default"]
+            or not self._plan_launch_evidence_matches(
+                evidence,
+                task_id=task_id,
+                instance_id=instance_id,
+                retry_count=retry_count,
+                turn_generation=turn_generation,
+                started_at=task.started_at,
+                session_id=task.session_id,
+                source_log_id=source_log_id,
+                provider=provider,
+                model=model,
+                service_tier=service_tier,
+                pre_status=pre_status,
+                pre_instance_id=pre_instance_id,
+                pre_completed_at=task.completed_at,
+            )
+            or not await self._turn_source_matches_exact_request(
+                db,
+                task=task,
+                source_log_id=source_log_id,
+            )
+        ):
+            raise ValueError("Plan application launch evidence identity changed")
+        return retry_count, turn_generation
+
+    async def _reconcile_queued_admission_commit(
+        self,
+        *,
+        msg: QueuedMessage,
+        admitted_generation: _TaskStatusGeneration,
+        session_id: str | None,
+        bound_source_id: int,
+        request_source_log_id: int | None,
+        status_before_launch: str,
+        instance_id_before_launch: int | None,
+        completed_at_before_launch: datetime | None,
+        provider: str,
+        model: str | None,
+        service_tier: str | None,
+    ) -> tuple[bool, asyncio.CancelledError | None]:
+        """Settle an admission whose commit acknowledgement was interrupted.
+
+        The provider launch has not been called yet.  A fresh session must
+        nevertheless prove the complete post-commit Task/source/Plan/Worker
+        identity before restoring the pre-admission owner/status.  The claimed
+        logical generation and source binding deliberately remain in place so
+        the same envelope can retry G, never advance to G+1 again.
+        """
+
+        from backend.models.plan import PlanApplicationReceipt
+
+        expected_evidence = {
+            "task_id": admitted_generation.task_id,
+            "instance_id": admitted_generation.instance_id,
+            "retry_count": admitted_generation.retry_count,
+            "turn_generation": admitted_generation.turn_generation,
+            "started_at": (
+                admitted_generation.started_at.isoformat()
+                if admitted_generation.started_at is not None
+                else None
+            ),
+            "session_id": session_id,
+            "source_log_id": request_source_log_id,
+            "provider": provider,
+            "model": model,
+            "service_tier": service_tier,
+            "pre_status": status_before_launch,
+            "pre_instance_id": instance_id_before_launch,
+            "pre_completed_at": (
+                completed_at_before_launch.isoformat()
+                if completed_at_before_launch is not None
+                else None
+            ),
+        }
+
+        async def validate(
+            db,
+            *,
+            reconciled: bool,
+            for_update: bool,
+        ) -> tuple[Task, object | None] | None:
+            statement = select(Task).where(Task.id == admitted_generation.task_id)
+            if for_update:
+                statement = statement.with_for_update()
+            task = (await db.execute(statement)).scalar_one_or_none()
+            expected_status = (
+                status_before_launch if reconciled else admitted_generation.status
+            )
+            expected_instance_id = (
+                instance_id_before_launch
+                if reconciled
+                else admitted_generation.instance_id
+            )
+            expected_completed_at = (
+                completed_at_before_launch
+                if reconciled
+                else admitted_generation.completed_at
+            )
+            if (
+                task is None
+                or task.worker_id != admitted_generation.worker_id
+                or task.shared_from_id != admitted_generation.shared_from_id
+                or task.status != expected_status
+                or task.retry_count != admitted_generation.retry_count
+                or task.turn_generation != admitted_generation.turn_generation
+                or task.instance_id != expected_instance_id
+                or task.started_at != admitted_generation.started_at
+                or task.completed_at != expected_completed_at
+                or task.pty_background_generation
+                != admitted_generation.pty_background_generation
+                or task.session_id != session_id
+                or task.turn_source_log_id != bound_source_id
+                or not await self._turn_source_matches_exact_request(
+                    db,
+                    task=task,
+                    source_log_id=request_source_log_id,
+                    expected_bound_source_id=bound_source_id,
+                )
+            ):
+                return None
+
+            if msg.capability_resume_outbox_id is not None:
+                if not isinstance(msg.capability_resume_lease_token, str):
+                    return None
+                from backend.services.capability_resume import (
+                    load_resume_envelope,
+                )
+
+                resume = await load_resume_envelope(
+                    db,
+                    msg.capability_resume_outbox_id,
+                    expected_lease_token=(
+                        msg.capability_resume_lease_token
+                    ),
+                    for_update=for_update,
+                )
+                if (
+                    resume is None
+                    or resume.task_id != admitted_generation.task_id
+                    or resume.status != "claimed"
+                    or resume.request_retry_count
+                    != admitted_generation.retry_count
+                    or resume.claimed_generation
+                    != admitted_generation.turn_generation
+                    or resume.source_log_id != bound_source_id
+                    or (
+                        resume.provider,
+                        resume.model,
+                        resume.service_tier,
+                    )
+                    != (provider, model, service_tier or "default")
+                ):
+                    return None
+
+            # Global joint-state lock order is Task -> Worker -> Plan.  Stop,
+            # cancel, recovery, and ACK reconciliation must never acquire the
+            # Plan row before the linked Worker receipt.
+            if msg.worker_turn_handoff_id is not None:
+                if (
+                    type(request_source_log_id) is not int
+                    or type(msg.worker_turn_handoff_retry_count) is not int
+                    or type(msg.worker_turn_handoff_from_generation) is not int
+                    or msg.worker_turn_handoff_claimed_generation
+                    not in (None, admitted_generation.turn_generation)
+                ):
+                    return None
+                handoff_statement = select(WorkerTurnHandoffReceipt).where(
+                    WorkerTurnHandoffReceipt.handoff_id
+                    == msg.worker_turn_handoff_id,
+                    WorkerTurnHandoffReceipt.task_id
+                    == admitted_generation.task_id,
+                    WorkerTurnHandoffReceipt.source_log_id
+                    == request_source_log_id,
+                    WorkerTurnHandoffReceipt.side == "worker",
+                )
+                if for_update:
+                    handoff_statement = handoff_statement.with_for_update()
+                handoff = (
+                    await db.execute(handoff_statement)
+                ).scalar_one_or_none()
+                try:
+                    queue_digest = (
+                        _durable_json_digest(handoff.queue_payload)
+                        if handoff is not None
+                        and isinstance(handoff.queue_payload, dict)
+                        else None
+                    )
+                    request_digest = (
+                        _durable_json_digest(handoff.request_payload)
+                        if handoff is not None
+                        and isinstance(handoff.request_payload, dict)
+                        else None
+                    )
+                except (TypeError, ValueError, UnicodeError):
+                    queue_digest = None
+                    request_digest = None
+                if (
+                    handoff is None
+                    or handoff.status != "claimed"
+                    or handoff.retry_count
+                    != msg.worker_turn_handoff_retry_count
+                    or handoff.from_generation
+                    != msg.worker_turn_handoff_from_generation
+                    or handoff.claimed_turn_generation
+                    != admitted_generation.turn_generation
+                    or handoff.queue_payload_digest != queue_digest
+                    or handoff.request_digest != request_digest
+                    or not isinstance(handoff.queue_payload, dict)
+                    or not _worker_handoff_message_matches_payload(
+                        msg,
+                        handoff.queue_payload,
+                    )
+                ):
+                    return None
+            plan_receipt = None
+            if msg.delivery_key is not None:
+                plan_statement = select(PlanApplicationReceipt).where(
+                    PlanApplicationReceipt.receipt_key == msg.delivery_key
+                )
+                if for_update:
+                    plan_statement = plan_statement.with_for_update()
+                plan_receipt = (
+                    await db.execute(plan_statement)
+                ).scalar_one_or_none()
+                payload = (
+                    plan_receipt.outbox_payload
+                    if plan_receipt is not None
+                    else None
+                )
+                try:
+                    payload_digest = (
+                        _durable_json_digest(payload)
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                except (TypeError, ValueError, UnicodeError):
+                    payload_digest = None
+                if (
+                    plan_receipt is None
+                    or plan_receipt.status != "committed"
+                    or plan_receipt.target_task_id != admitted_generation.task_id
+                    or plan_receipt.manager_user_log_id != request_source_log_id
+                    or plan_receipt.delivery_status
+                    != ("queued" if reconciled else "launching")
+                    or not isinstance(payload, dict)
+                    or plan_receipt.payload_digest != payload_digest
+                    or plan_receipt.launch_evidence != expected_evidence
+                    or not _worker_handoff_message_matches_payload(msg, payload)
+                ):
+                    return None
+            return task, plan_receipt
+
+        reconciliation_cancellation: asyncio.CancelledError | None = None
+        async with self.db_factory() as db:
+            matched = await validate(db, reconciled=False, for_update=True)
+            if matched is None:
+                await db.rollback()
+                return False, None
+            _task, plan_receipt = matched
+            reconciled_task = await db.execute(
+                update(Task)
+                .where(
+                    *self._task_status_generation_predicates(
+                        admitted_generation
+                    ),
+                    (
+                        Task.session_id.is_(None)
+                        if session_id is None
+                        else Task.session_id == session_id
+                    ),
+                    Task.turn_source_log_id == bound_source_id,
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(
+                    status=status_before_launch,
+                    instance_id=instance_id_before_launch,
+                    completed_at=completed_at_before_launch,
+                )
+            )
+            if reconciled_task.rowcount != 1:
+                await db.rollback()
+                return False, None
+            if plan_receipt is not None:
+                plan_receipt.delivery_status = "queued"
+                plan_receipt.delivery_error = None
+                plan_receipt.updated_at = datetime.utcnow()
+            commit, reconciliation_cancellation = (
+                await _settle_despite_cancellation(db.commit())
+            )
+            try:
+                commit.result()
+            except BaseException:
+                # The reconciliation commit can lose its acknowledgement too.
+                # Close this transaction and accept success only if a second
+                # fresh reader proves the complete reconciled state.
+                try:
+                    await db.rollback()
+                except BaseException:
+                    pass
+                try:
+                    await db.close()
+                except BaseException:
+                    pass
+                async with self.db_factory() as verify_db:
+                    verified = await validate(
+                        verify_db,
+                        reconciled=True,
+                        for_update=False,
+                    )
+                    await verify_db.rollback()
+                return verified is not None, reconciliation_cancellation
+        return True, reconciliation_cancellation
+
+    async def _fail_unreplayable_queued_launch(
+        self,
+        *,
+        msg: QueuedMessage,
+        admitted_generation: _TaskStatusGeneration,
+        session_id: str | None,
+        bound_source_id: int,
+        reason: str,
+    ) -> _TaskStatusGeneration | None:
+        """Fail one exact admission that no durable envelope may replay.
+
+        This is used while cancellation is already pending.  It deliberately
+        commits the Task failure and any Plan quarantine together, so shutdown
+        cannot leave an unowned ``executing`` row for startup cleanup to turn
+        back into a fresh execution of the Task description.
+        """
+
+        from backend.models.plan import PlanApplicationReceipt
+
+        async with self.db_factory() as db:
+            failed = await db.execute(
+                update(Task)
+                .where(
+                    *self._task_status_generation_predicates(
+                        admitted_generation
+                    ),
+                    (
+                        Task.session_id.is_(None)
+                        if session_id is None
+                        else Task.session_id == session_id
+                    ),
+                    Task.turn_source_log_id == bound_source_id,
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(
+                    status="failed",
+                    completed_at=datetime.utcnow(),
+                    error_message=reason[:2000],
+                )
+            )
+            if failed.rowcount != 1:
+                await db.rollback()
+                return None
+            if msg.worker_turn_handoff_id is not None:
+                # Cancellation can arrive after InstanceManager commits the
+                # source transport but before the receipt callback advances.
+                # This helper is reached only when pre-boundary replay could
+                # not be proven, so a lingering claimed row must be promoted
+                # to the conservative post-boundary state in the same Task ->
+                # Worker -> Plan transaction.
+                await db.execute(
+                    update(WorkerTurnHandoffReceipt)
+                    .where(
+                        WorkerTurnHandoffReceipt.handoff_id
+                        == msg.worker_turn_handoff_id,
+                        WorkerTurnHandoffReceipt.task_id
+                        == admitted_generation.task_id,
+                        WorkerTurnHandoffReceipt.source_log_id
+                        == msg.source_log_id,
+                        WorkerTurnHandoffReceipt.side == "worker",
+                        WorkerTurnHandoffReceipt.retry_count
+                        == msg.worker_turn_handoff_retry_count,
+                        WorkerTurnHandoffReceipt.from_generation
+                        == msg.worker_turn_handoff_from_generation,
+                        WorkerTurnHandoffReceipt.claimed_turn_generation
+                        == msg.worker_turn_handoff_claimed_generation,
+                        WorkerTurnHandoffReceipt.status == "claimed",
+                    )
+                    .values(
+                        status="launching",
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+            if msg.delivery_key is not None:
+                receipt = (
+                    await db.execute(
+                        select(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key
+                            == msg.delivery_key,
+                            PlanApplicationReceipt.target_task_id
+                            == admitted_generation.task_id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if receipt is not None and receipt.delivery_status in {
+                    "pending",
+                    "queued",
+                    "launching",
+                    "uncertain",
+                }:
+                    receipt.delivery_status = "uncertain"
+                    receipt.delivery_error = reason[:2000]
+                    receipt.updated_at = datetime.utcnow()
+            if msg.capability_resume_outbox_id is not None:
+                from backend.services.capability_resume import (
+                    fail_or_cancel_resume_outbox_in_tx,
+                )
+
+                failed_task = await db.get(
+                    Task,
+                    admitted_generation.task_id,
+                    populate_existing=True,
+                )
+                if failed_task is None:
+                    await db.rollback()
+                    return None
+                await fail_or_cancel_resume_outbox_in_tx(
+                    db,
+                    task=failed_task,
+                    outbox_id=msg.capability_resume_outbox_id,
+                    status="failed",
+                    error_code="resume_launch_interrupted",
+                    error_message=reason,
+                )
+            resulting = await self._read_task_status_generation(
+                db, admitted_generation.task_id
+            )
+            await db.commit()
+            return resulting
+
+    async def _queued_turn_preflight_replay_proof(
+        self,
+        *,
+        admitted_generation: _TaskStatusGeneration,
+        session_id: str | None,
+        bound_source_id: int,
+    ) -> tuple[bool, str | None]:
+        """Fresh-read the durable provider boundary for a queued launch.
+
+        InstanceManager persists ``actual_transport`` before invoking the
+        in-memory admission callback.  Its commit may land while the commit
+        acknowledgement is lost, so callback/process maps alone can never
+        prove preflight rejection.  The Task no-op write shares the provider
+        admission lock order and makes the source read portable to SQLite.
+        """
+
+        async with self.db_factory() as db:
+            guarded = await db.execute(
+                update(Task)
+                .where(
+                    *self._task_status_generation_predicates(
+                        admitted_generation
+                    ),
+                    (
+                        Task.session_id.is_(None)
+                        if session_id is None
+                        else Task.session_id == session_id
+                    ),
+                    Task.turn_source_log_id == bound_source_id,
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                )
+                .values(turn_source_log_id=Task.turn_source_log_id)
+            )
+            if guarded.rowcount != 1:
+                await db.rollback()
+                return False, None
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        *self._task_status_generation_predicates(
+                            admitted_generation
+                        ),
+                        Task.turn_source_log_id == bound_source_id,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if task is None:
+                await db.rollback()
+                return False, None
+            source = await self._canonical_exact_turn_source(db, task)
+            if source is None or source.id != bound_source_id:
+                await db.rollback()
+                return False, None
+            transport = source.actual_transport
+            await db.rollback()
+            return transport is None, transport
+
+    async def enqueue_plan_application_receipt(
+        self,
+        receipt_key: str,
+        *,
+        expected_worker_handoff: tuple[int, int, str, int, int] | None = None,
+        worker_handoff_claimed_generation: int | None = None,
+    ) -> bool:
         """Admit one durable Plan application outbox row idempotently."""
 
         from backend.models.plan import PlanApplicationReceipt
@@ -11491,43 +17843,134 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         async with self.db_factory() as db:
             receipt = (
                 await db.execute(
-                    select(PlanApplicationReceipt).where(
-                        PlanApplicationReceipt.receipt_key == receipt_key
-                    )
+                    select(PlanApplicationReceipt)
+                    .where(PlanApplicationReceipt.receipt_key == receipt_key)
                 )
             ).scalar_one_or_none()
-            if receipt is None or receipt.delivery_status in {
-                "launched",
-                "failed",
-                "cancelled",
-                "uncertain",
-            }:
+            if receipt is None:
+                return False
+            if receipt.delivery_status in {"failed", "cancelled"}:
+                # Repair rows written by an older/crashed process which
+                # terminalized only the Plan half of a combined delivery.
+                settled = await self._cancel_plan_linked_worker_handoff(
+                    db,
+                    receipt=receipt,
+                    reason=(
+                        receipt.delivery_error
+                        or "Plan application delivery ended before launch"
+                    ),
+                    expected_worker_handoff=expected_worker_handoff,
+                )
+                if settled:
+                    await db.commit()
+                else:
+                    await db.rollback()
+                return False
+            if receipt.delivery_status == "uncertain":
+                # ``accepted`` is durable proof that this exact Worker G+1 was
+                # never claimed.  Older/crashed code could still leave it
+                # paired with an uncertain Plan receipt; cancel that safe half
+                # so Manager recovery can clear its marker.  A linked
+                # ``launched`` receipt remains untouched because external
+                # execution may exist.
+                settled = await self._cancel_plan_linked_worker_handoff(
+                    db,
+                    receipt=receipt,
+                    reason=(
+                        receipt.delivery_error
+                        or "Plan launch is uncertain; unlaunched Worker handoff cancelled"
+                    ),
+                    expected_worker_handoff=expected_worker_handoff,
+                )
+                if settled:
+                    await db.commit()
+                else:
+                    await db.rollback()
+                return False
+            if receipt.delivery_status == "launched":
                 return False
             payload = receipt.outbox_payload
             if not isinstance(payload, dict):
-                receipt.delivery_status = "failed"
-                receipt.delivery_error = "Plan application outbox payload is missing"
-                receipt.updated_at = datetime.utcnow()
-                await db.commit()
-                raise RuntimeError(receipt.delivery_error)
-            import hashlib
-
-            actual_digest = hashlib.sha256(
-                json.dumps(
-                    payload,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    ensure_ascii=False,
-                ).encode("utf-8")
-            ).hexdigest()
-            if receipt.payload_digest != actual_digest:
-                receipt.delivery_status = "failed"
-                receipt.delivery_error = (
-                    "Plan application outbox payload digest changed"
+                error = "Plan application outbox payload is missing"
+                released = await self._release_plan_delivery_with_worker_handoff(
+                    db,
+                    receipt_key=receipt_key,
+                    delivery_status="failed",
+                    error=error,
+                    expected_worker_handoff=expected_worker_handoff,
                 )
-                receipt.updated_at = datetime.utcnow()
+                if released is None:
+                    await db.rollback()
+                    return False
                 await db.commit()
-                raise RuntimeError(receipt.delivery_error)
+                raise RuntimeError(error)
+            if expected_worker_handoff is not None:
+                (
+                    handoff_task_id,
+                    source_log_id,
+                    handoff_id,
+                    retry_count,
+                    from_generation,
+                ) = expected_worker_handoff
+                if (
+                    receipt.target_task_id != handoff_task_id
+                    or payload.get("source_log_id") != source_log_id
+                    or payload.get("worker_turn_handoff_id") != handoff_id
+                    or payload.get("worker_turn_handoff_retry_count")
+                    != retry_count
+                    or payload.get("worker_turn_handoff_from_generation")
+                    != from_generation
+                ):
+                    error = "Plan application Worker handoff identity changed"
+                    released = (
+                        await self._release_plan_delivery_with_worker_handoff(
+                            db,
+                            receipt_key=receipt_key,
+                            delivery_status="failed",
+                            error=error,
+                            expected_worker_handoff=expected_worker_handoff,
+                        )
+                    )
+                    if released is None:
+                        await db.rollback()
+                    else:
+                        await db.commit()
+                    return False
+            try:
+                actual_digest = _durable_json_digest(payload)
+            except (TypeError, ValueError, UnicodeError):
+                actual_digest = None
+            if receipt.payload_digest != actual_digest:
+                error = "Plan application outbox payload digest changed"
+                released = await self._release_plan_delivery_with_worker_handoff(
+                    db,
+                    receipt_key=receipt_key,
+                    delivery_status="failed",
+                    error=error,
+                    expected_worker_handoff=expected_worker_handoff,
+                )
+                if released is None:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                raise RuntimeError(error)
+            recovered_plan_claim: tuple[int, int] | None = None
+            if expected_worker_handoff is None and receipt.launch_evidence is not None:
+                try:
+                    recovered_plan_claim = await self._generic_plan_replay_claim(
+                        db,
+                        receipt=receipt,
+                        payload=payload,
+                    )
+                except ValueError as exc:
+                    # A non-empty evidence record is a durable claim, never a
+                    # hint.  Quarantine a contradictory record instead of
+                    # silently admitting the same Plan as a fresh G+2 turn.
+                    receipt.delivery_status = "uncertain"
+                    receipt.delivery_error = str(exc)[:2000]
+                    receipt.updated_at = datetime.utcnow()
+                    await db.commit()
+                    return False
             expected = payload.get("expected_task_routing")
             expected_routing = None
             if isinstance(expected, list) and len(expected) == 3:
@@ -11552,6 +17995,36 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             monitor_session_id=payload.get("monitor_session_id"),
             source_log_id=payload.get("source_log_id"),
             delivery_key=receipt_key,
+            worker_turn_handoff_id=payload.get(
+                "worker_turn_handoff_id"
+            ),
+            worker_turn_handoff_retry_count=payload.get(
+                "worker_turn_handoff_retry_count"
+            ),
+            worker_turn_handoff_from_generation=payload.get(
+                "worker_turn_handoff_from_generation"
+            ),
+            worker_turn_handoff_claimed_generation=(
+                worker_handoff_claimed_generation
+            ),
+            claimed_retry_count=(
+                payload.get("worker_turn_handoff_retry_count")
+                if worker_handoff_claimed_generation is not None
+                else (
+                    recovered_plan_claim[0]
+                    if recovered_plan_claim is not None
+                    else None
+                )
+            ),
+            claimed_turn_generation=(
+                worker_handoff_claimed_generation
+                if worker_handoff_claimed_generation is not None
+                else (
+                    recovered_plan_claim[1]
+                    if recovered_plan_claim is not None
+                    else None
+                )
+            ),
             current_message=payload.get("current_message"),
             allow_new_session=bool(payload.get("allow_new_session", False)),
         )
@@ -11571,21 +18044,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 task_id in self._cancel_durable_queue_tasks
                 or same_process_stale_generation
             ):
-                from backend.services.plan_service import (
-                    release_unstarted_plan_application,
-                )
-
                 rejection_error = (
                     "Plan application delivery was cancelled before launch"
                     if task_id in self._cancel_durable_queue_tasks
                     else "Task queue was stopped before Plan admission completed"
                 )
                 async with self.db_factory() as db:
-                    rejected_release = await release_unstarted_plan_application(
-                        db,
-                        receipt_key=receipt_key,
-                        delivery_status="cancelled",
-                        error=rejection_error,
+                    rejected_release = (
+                        await self._release_plan_delivery_with_worker_handoff(
+                            db,
+                            receipt_key=receipt_key,
+                            delivery_status="cancelled",
+                            error=rejection_error,
+                            expected_worker_handoff=expected_worker_handoff,
+                        )
                     )
                     if rejected_release is None:
                         await db.rollback()
@@ -11645,6 +18117,168 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         )
         return True
 
+    async def _linked_recoverable_worker_handoff(
+        self,
+        db,
+        plan_receipt,
+    ) -> WorkerTurnHandoffReceipt | None:
+        """Return the exact Worker proof that must drive Plan recovery.
+
+        A Plan outbox row carrying Worker handoff fields is not an independent
+        message.  Replaying it directly would drop the Worker's immutable
+        receipt/generation fence.  Only a fully verified ``accepted`` or
+        ``claimed`` receipt can own startup recovery; malformed, missing, or
+        post-boundary links remain fail-closed.  InstanceManager persists the
+        exact ``actual_transport`` before advancing the receipt callback, so a
+        claimed row is replayable only while that bound source has no transport.
+        """
+
+        payload = plan_receipt.outbox_payload
+        if not isinstance(payload, dict):
+            return None
+        try:
+            if plan_receipt.payload_digest != _durable_json_digest(payload):
+                return None
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        task_id = plan_receipt.target_task_id
+        source_log_id = payload.get("source_log_id")
+        handoff_id = payload.get("worker_turn_handoff_id")
+        retry_count = payload.get("worker_turn_handoff_retry_count")
+        from_generation = payload.get("worker_turn_handoff_from_generation")
+        if (
+            type(task_id) is not int
+            or type(source_log_id) is not int
+            or not isinstance(handoff_id, str)
+            or type(retry_count) is not int
+            or type(from_generation) is not int
+        ):
+            return None
+        handoff = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        row = await db.get(LogEntry, source_log_id)
+        task = await db.get(Task, task_id)
+        worker_payload_from_plan = dict(payload)
+        # The Plan outbox alone owns this in-process admission fence.  The
+        # Worker's immutable replay envelope is committed in the same API
+        # transaction before the fence is added, so compare the common model
+        # request while validating each row's full digest independently.
+        worker_payload_from_plan.pop("queue_admission_fence", None)
+        if (
+            handoff is None
+            or handoff.side != "worker"
+            or handoff.status not in {"accepted", "claimed"}
+            or handoff.task_id != task_id
+            or handoff.source_log_id != source_log_id
+            or handoff.retry_count != retry_count
+            or handoff.from_generation != from_generation
+            or row is None
+            or row.task_id != task_id
+            or row.event_type != "user_message"
+            or task is None
+            or task.worker_id is not None
+            or task.shared_from_id is not None
+            or task.retry_count != retry_count
+        ):
+            return None
+
+        async def quarantine_claimed_handoff() -> None:
+            """Move a verified linked claimed row out of replay selection."""
+
+            if handoff.status != "claimed":
+                return
+            await db.execute(
+                update(WorkerTurnHandoffReceipt)
+                .where(
+                    WorkerTurnHandoffReceipt.handoff_id == handoff_id,
+                    WorkerTurnHandoffReceipt.task_id == task_id,
+                    WorkerTurnHandoffReceipt.source_log_id == source_log_id,
+                    WorkerTurnHandoffReceipt.side == "worker",
+                    WorkerTurnHandoffReceipt.retry_count == retry_count,
+                    WorkerTurnHandoffReceipt.from_generation == from_generation,
+                    WorkerTurnHandoffReceipt.claimed_turn_generation
+                    == handoff.claimed_turn_generation,
+                    WorkerTurnHandoffReceipt.status == "claimed",
+                )
+                .values(
+                    status="launching",
+                    updated_at=datetime.utcnow(),
+                )
+            )
+
+        try:
+            worker_payload_valid = bool(
+                isinstance(handoff.queue_payload, dict)
+                and handoff.queue_payload == worker_payload_from_plan
+                and handoff.queue_payload_digest
+                == _durable_json_digest(handoff.queue_payload)
+                and isinstance(handoff.request_payload, dict)
+                and handoff.request_digest
+                == _durable_json_digest(handoff.request_payload)
+            )
+        except (TypeError, ValueError, UnicodeError):
+            worker_payload_valid = False
+        if not worker_payload_valid:
+            await quarantine_claimed_handoff()
+            return None
+        if handoff.status == "accepted":
+            if (
+                plan_receipt.delivery_status not in {"pending", "queued"}
+                or handoff.claimed_turn_generation is not None
+                or row.task_retry_count is not None
+                or row.task_turn_generation is not None
+                or task.turn_generation != from_generation
+            ):
+                return None
+        else:
+            claimed_generation = from_generation + 1
+            if (
+                plan_receipt.delivery_status not in {"queued", "launching"}
+                or type(handoff.claimed_turn_generation) is not int
+                or handoff.claimed_turn_generation != claimed_generation
+                or row.task_retry_count != retry_count
+                or row.task_turn_generation != claimed_generation
+                or task.turn_generation != claimed_generation
+                or task.status
+                not in {"completed", "failed", "in_progress", "executing"}
+            ):
+                await quarantine_claimed_handoff()
+                return None
+            bound_source = await self._canonical_exact_turn_source(db, task)
+            source_matches = bool(
+                bound_source is not None
+                and await self._turn_source_matches_exact_request(
+                    db,
+                    task=task,
+                    source_log_id=source_log_id,
+                    expected_bound_source_id=bound_source.id,
+                )
+            )
+            actual_transport = (
+                bound_source.actual_transport
+                if source_matches and bound_source is not None
+                else None
+            )
+            if not source_matches or actual_transport is not None:
+                # The receipt callback may lose its commit/response after
+                # transport admission commits. A non-canonical/mismatched
+                # source likewise cannot prove replay safety. Move either
+                # shape out of the sole replayable state; the caller owns this
+                # transaction and quarantines the linked Plan half.
+                await quarantine_claimed_handoff()
+                return None
+            if plan_receipt.delivery_status == "launching":
+                evidence = plan_receipt.launch_evidence
+                if (
+                    not isinstance(evidence, dict)
+                    or evidence.get("task_id") != task_id
+                    or evidence.get("source_log_id") != source_log_id
+                    or evidence.get("retry_count") != retry_count
+                    or evidence.get("turn_generation") != claimed_generation
+                ):
+                    await quarantine_claimed_handoff()
+                    return None
+        return handoff
+
     async def _recover_plan_application_outbox(
         self,
         *,
@@ -11652,44 +18286,58 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
     ) -> None:
         from backend.models.plan import PlanApplicationReceipt
 
-        uncertain_keys: list[str] = []
+        uncertain: dict[str, str] = {}
+        keys: list[str] = []
         async with self.db_factory() as db:
-            # ``launching`` was committed in the same transaction as the Task
-            # execution claim. After a process restart there is no safe way to
-            # distinguish "spawn not called" from "external turn accepted but
-            # launch acknowledgement not committed". Fail closed instead of
-            # replaying a potentially non-idempotent turn.
+            # ``launching`` normally means the provider side-effect boundary
+            # was crossed and is therefore ambiguous after restart.  The sole
+            # exception is a linked Worker receipt still in ``claimed``: its
+            # exact Task/Log/digest proof says the boundary callback never ran,
+            # so Worker-outbox recovery below may replay the already-bound G+1.
             if after_restart:
-                uncertain_keys = list(
+                launching_receipts = list(
                     (
                         await db.execute(
-                            select(PlanApplicationReceipt.receipt_key).where(
+                            select(PlanApplicationReceipt)
+                            .where(
                                 PlanApplicationReceipt.outbox_payload.isnot(None),
                                 PlanApplicationReceipt.delivery_status == "launching",
                             )
                         )
                     ).scalars()
                 )
-                await db.execute(
-                    update(PlanApplicationReceipt)
-                    .where(
-                        PlanApplicationReceipt.outbox_payload.isnot(None),
-                        PlanApplicationReceipt.delivery_status == "launching",
+                for receipt in launching_receipts:
+                    if await self._linked_recoverable_worker_handoff(db, receipt):
+                        continue
+                    error = (
+                        "CCM restarted after the launch boundary; automatic "
+                        "replay was blocked to prevent duplicate execution"
                     )
-                    .values(
-                        delivery_status="uncertain",
-                        delivery_error=(
-                            "CCM restarted after the launch claim; automatic "
-                            "replay was blocked to prevent duplicate execution"
-                        ),
-                        updated_at=datetime.utcnow(),
+                    changed = await db.execute(
+                        update(PlanApplicationReceipt)
+                        .where(
+                            PlanApplicationReceipt.receipt_key
+                            == receipt.receipt_key,
+                            PlanApplicationReceipt.delivery_status == "launching",
+                        )
+                        .values(
+                            delivery_status="uncertain",
+                            delivery_error=error,
+                            updated_at=datetime.utcnow(),
+                        )
                     )
-                )
-            await db.commit()
-            keys = list(
+                    if changed.rowcount:
+                        uncertain[receipt.receipt_key] = error
+
+            # A pending/queued Plan row with Worker handoff fields is one half
+            # of the same durable message.  Leave valid links for the Worker
+            # recovery pass (which preserves accepted vs claimed G+1).  Never
+            # synthesize a fresh Plan envelope when that link is malformed or
+            # missing; quarantine it instead.
+            recoverable_receipts = list(
                 (
                     await db.execute(
-                        select(PlanApplicationReceipt.receipt_key)
+                        select(PlanApplicationReceipt)
                         .where(
                             PlanApplicationReceipt.outbox_payload.isnot(None),
                             PlanApplicationReceipt.delivery_status.in_(
@@ -11700,17 +18348,54 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
                 ).scalars()
             )
-        for receipt_key in uncertain_keys:
+            for receipt in recoverable_receipts:
+                payload = receipt.outbox_payload
+                has_worker_link = bool(
+                    isinstance(payload, dict)
+                    and any(
+                        field in payload
+                        for field in (
+                            "worker_turn_handoff_id",
+                            "worker_turn_handoff_retry_count",
+                            "worker_turn_handoff_from_generation",
+                        )
+                    )
+                )
+                if not has_worker_link:
+                    keys.append(receipt.receipt_key)
+                    continue
+                if await self._linked_recoverable_worker_handoff(db, receipt):
+                    continue
+                error = (
+                    "Plan application Worker handoff proof is missing or "
+                    "invalid; automatic replay was blocked"
+                )
+                changed = await db.execute(
+                    update(PlanApplicationReceipt)
+                    .where(
+                        PlanApplicationReceipt.receipt_key
+                        == receipt.receipt_key,
+                        PlanApplicationReceipt.delivery_status.in_(
+                            ["pending", "queued"]
+                        ),
+                    )
+                    .values(
+                        delivery_status="uncertain",
+                        delivery_error=error,
+                        updated_at=datetime.utcnow(),
+                    )
+                )
+                if changed.rowcount:
+                    uncertain[receipt.receipt_key] = error
+            await db.commit()
+        for receipt_key, error in uncertain.items():
             plan_ids, target_task_id, evidence = await self._delivery_plan_context(
                 receipt_key
             )
             await self._broadcast_plan_delivery_change(
                 receipt_key=receipt_key,
                 status="uncertain",
-                error=(
-                    "CCM restarted after the launch claim; automatic replay "
-                    "was blocked to prevent duplicate execution"
-                ),
+                error=error,
                 plan_ids=plan_ids,
                 target_task_id=target_task_id,
                 launch_evidence=evidence,
@@ -11720,6 +18405,58 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 await self.enqueue_plan_application_receipt(key)
             except Exception:
                 logger.exception("Could not recover Plan application delivery %s", key)
+
+    async def _recover_worker_turn_handoff_outbox(self) -> None:
+        """Re-admit every exact Worker handoff still safe to execute."""
+
+        async with self.db_factory() as db:
+            receipts = list(
+                (
+                    await db.execute(
+                        select(
+                            WorkerTurnHandoffReceipt.task_id,
+                            WorkerTurnHandoffReceipt.source_log_id,
+                            WorkerTurnHandoffReceipt.handoff_id,
+                        )
+                        .where(
+                            WorkerTurnHandoffReceipt.side == "worker",
+                            WorkerTurnHandoffReceipt.status.in_(
+                                ["accepted", "claimed"]
+                            ),
+                        )
+                        .order_by(WorkerTurnHandoffReceipt.created_at)
+                    )
+                ).all()
+            )
+        for task_id, source_log_id, handoff_id in receipts:
+            try:
+                admitted = await self.enqueue_worker_turn_handoff(
+                    task_id=task_id,
+                    source_log_id=source_log_id,
+                    handoff_id=handoff_id,
+                )
+                if not admitted:
+                    logger.warning(
+                        "Worker turn handoff %s for task %s was not recoverable",
+                        handoff_id,
+                        task_id,
+                    )
+            except (TaskStartPausedError, RuntimeError):
+                # The receipt remains accepted/claimed and a later explicit
+                # resume or non-restart recovery pass may retry it once
+                # admission opens.
+                logger.info(
+                    "Deferred Worker turn handoff %s for task %s until queue "
+                    "admission resumes",
+                    handoff_id,
+                    task_id,
+                )
+            except Exception:
+                logger.exception(
+                    "Could not recover Worker turn handoff %s for task %s",
+                    handoff_id,
+                    task_id,
+                )
 
     async def resolve_uncertain_plan_delivery(
         self,
@@ -11827,12 +18564,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
     ) -> bool:
         if delivery_key is None:
             return False
-        from backend.services.plan_service import (
-            release_unstarted_plan_application,
-        )
-
         async with self.db_factory() as db:
-            released = await release_unstarted_plan_application(
+            released = await self._release_plan_delivery_with_worker_handoff(
                 db,
                 receipt_key=delivery_key,
                 delivery_status=status,
@@ -11940,24 +18673,107 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     error="Plan application delivery was cancelled before launch",
                 )
                 continue
+            claimed_worker_replay: tuple[
+                tuple[int, int, str, int, int],
+                int,
+            ] | None = None
+            launching = False
             async with self.db_factory() as db:
                 from backend.models.plan import PlanApplicationReceipt
 
-                await db.execute(
-                    update(PlanApplicationReceipt)
-                    .where(
+                receipt = await db.scalar(
+                    select(PlanApplicationReceipt).where(
                         PlanApplicationReceipt.receipt_key == delivery_key,
                         PlanApplicationReceipt.delivery_status.in_(
-                            ["pending", "queued"]
+                            ["pending", "queued", "launching"]
                         ),
                     )
-                    .values(
-                        delivery_status="pending",
-                        delivery_error=None,
-                        updated_at=datetime.utcnow(),
+                )
+                launching = bool(
+                    receipt is not None
+                    and receipt.delivery_status == "launching"
+                )
+                linked_worker = bool(
+                    receipt is not None
+                    and isinstance(receipt.outbox_payload, dict)
+                    and any(
+                        field in receipt.outbox_payload
+                        for field in (
+                            "worker_turn_handoff_id",
+                            "worker_turn_handoff_retry_count",
+                            "worker_turn_handoff_from_generation",
+                        )
                     )
                 )
+                if launching:
+                    # Cancellation can arrive after the joint admission commit
+                    # but before InstanceManager invokes the provider-boundary
+                    # callback.  In that window Plan is ``launching`` while its
+                    # exact Worker receipt is still ``claimed``.  That durable
+                    # receipt, not generic Plan recovery, is the only authority
+                    # allowed to reopen this same G for graceful restart.
+                    handoff = await self._linked_recoverable_worker_handoff(
+                        db,
+                        receipt,
+                    )
+                    if handoff is not None and handoff.status == "claimed":
+                        claimed_worker_replay = (
+                            (
+                                handoff.task_id,
+                                handoff.source_log_id,
+                                handoff.handoff_id,
+                                handoff.retry_count,
+                                handoff.from_generation,
+                            ),
+                            handoff.claimed_turn_generation,
+                        )
+                elif receipt is not None and not linked_worker:
+                    # A generic Plan can be admitted again immediately. Linked
+                    # status is intentionally left untouched above because its
+                    # Worker receipt is the sole exact-generation owner.
+                    receipt.delivery_status = "pending"
+                    receipt.delivery_error = None
+                    receipt.updated_at = datetime.utcnow()
                 await db.commit()
+            if launching:
+                if claimed_worker_replay is not None:
+                    expected_handoff, claimed_generation = claimed_worker_replay
+                    reopened = await self._prepare_claimed_plan_delivery_replay(
+                        receipt_key=delivery_key,
+                        expected_worker_handoff=expected_handoff,
+                        claimed_turn_generation=claimed_generation,
+                    )
+                    if reopened:
+                        logger.info(
+                            "Reopened pre-boundary linked Plan delivery %s for "
+                            "exact Worker generation %s after queue cancellation",
+                            delivery_key,
+                            claimed_generation,
+                        )
+                    else:
+                        logger.warning(
+                            "Linked Plan delivery %s changed while its claimed "
+                            "Worker generation was being reopened; leaving it "
+                            "fail-closed",
+                            delivery_key,
+                        )
+                else:
+                    # Generic Plan ``launching`` and post-boundary Worker states
+                    # are ambiguous.  Never feed either through generic replay;
+                    # startup reconciliation will quarantine them if needed.
+                    logger.info(
+                        "Leaving launching Plan delivery %s fail-closed after "
+                        "graceful queue cancellation",
+                        delivery_key,
+                    )
+                continue
+            if linked_worker:
+                logger.info(
+                    "Deferred linked Plan delivery %s to exact Worker handoff "
+                    "recovery after queue cancellation",
+                    delivery_key,
+                )
+                continue
             try:
                 await self.enqueue_plan_application_receipt(delivery_key)
             except (TaskStartPausedError, RuntimeError):
@@ -11981,6 +18797,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         processed (if any) is not affected — callers stop the process separately.
         """
         delivery_keys: list[str] = []
+        capability_resumes: list[tuple[int, str | None]] = []
+        worker_handoffs: list[tuple[str, int | None]] = []
         released_deliveries: list[tuple[str, list[int], int | None]] = []
         async with self._dispatch_claim_lock:
             self._task_queue_generations[task_id] = (
@@ -12000,6 +18818,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 handoff.queue_clear_handled = True
                 if handoff.delivery_key is not None:
                     delivery_keys.append(handoff.delivery_key)
+                if handoff.capability_resume_outbox_id is not None:
+                    capability_resumes.append(
+                        (
+                            handoff.capability_resume_outbox_id,
+                            handoff.capability_resume_lease_token,
+                        )
+                    )
+                if handoff.worker_turn_handoff_id is not None:
+                    worker_handoffs.append(
+                        (
+                            handoff.worker_turn_handoff_id,
+                            handoff.source_log_id,
+                        )
+                    )
             cleared = 0
             if q is not None:
                 while True:
@@ -12009,6 +18841,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         break
                     if queued.delivery_key is not None:
                         delivery_keys.append(queued.delivery_key)
+                    if queued.capability_resume_outbox_id is not None:
+                        capability_resumes.append(
+                            (
+                                queued.capability_resume_outbox_id,
+                                queued.capability_resume_lease_token,
+                            )
+                        )
+                    if queued.worker_turn_handoff_id is not None:
+                        worker_handoffs.append(
+                            (
+                                queued.worker_turn_handoff_id,
+                                queued.source_log_id,
+                            )
+                        )
                     q.task_done()
                     cleared += 1
             if (q is None or q.empty()) and not self._task_queue_inflight.get(
@@ -12017,17 +18863,46 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 self._pending_task_starts.discard(task_id)
             if cancelled_handoff:
                 cleared += 1
-            if task_id in self._cancel_durable_queue_tasks:
-                from backend.services.plan_service import (
-                    release_unstarted_plan_applications_for_task,
-                )
+            cancel_all_worker_handoffs = (
+                task_id in self._cancel_durable_queue_tasks
+            )
+            if cancel_all_worker_handoffs:
+                from backend.models.plan import PlanApplicationReceipt
 
-                if durable_db is None:
-                    async with self.db_factory() as db:
-                        released_deliveries = (
-                            await release_unstarted_plan_applications_for_task(
-                                db,
-                                target_task_id=task_id,
+                async def settle_durable_cancel(session) -> None:
+                    # Lock/cancel every pre-boundary Worker receipt first. The
+                    # joint release helper then locks Plan rows and may safely
+                    # reopen only launching rows linked to those receipts.
+                    await self._cancel_worker_turn_handoff_receipts(
+                        worker_handoffs,
+                        reason=(
+                            "Task queue was explicitly cleared before launch"
+                        ),
+                        db=session,
+                        task_id=task_id,
+                        commit=False,
+                    )
+                    receipt_keys = list(
+                        (
+                            await session.execute(
+                                select(PlanApplicationReceipt.receipt_key)
+                                .where(
+                                    PlanApplicationReceipt.target_task_id
+                                    == task_id,
+                                    PlanApplicationReceipt.outbox_payload.isnot(None),
+                                    PlanApplicationReceipt.delivery_status.in_(
+                                        ["pending", "queued", "launching"]
+                                    ),
+                                )
+                                .order_by(PlanApplicationReceipt.id)
+                            )
+                        ).scalars()
+                    )
+                    for receipt_key in receipt_keys:
+                        released = (
+                            await self._release_plan_delivery_with_worker_handoff(
+                                session,
+                                receipt_key=receipt_key,
                                 delivery_status="cancelled",
                                 error=(
                                     "Plan application delivery was cancelled "
@@ -12035,25 +18910,33 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 ),
                             )
                         )
-                        await db.commit()
+                        if released is not None:
+                            plan_ids, target_task_id = released
+                            released_deliveries.append(
+                                (receipt_key, plan_ids, target_task_id)
+                            )
+                    await session.commit()
+
+                if durable_db is None:
+                    async with self.db_factory() as db:
+                        await settle_durable_cancel(db)
                 else:
-                    released_deliveries = (
-                        await release_unstarted_plan_applications_for_task(
-                            durable_db,
-                            target_task_id=task_id,
-                            delivery_status="cancelled",
-                            error=(
-                                "Plan application delivery was cancelled before launch"
-                            ),
-                        )
-                    )
-                    await durable_db.commit()
+                    await settle_durable_cancel(durable_db)
                 released_keys = {item[0] for item in released_deliveries}
                 for receipt_key in released_keys:
                     self._queued_delivery_keys.discard(receipt_key)
                 cleared += len(released_keys - set(delivery_keys))
             else:
                 released_keys = set()
+            # Graceful shutdown clears only volatile queue ownership.  Keep
+            # accepted/claimed receipts durable so startup can re-admit the
+            # exact same envelope (claimed reuses G+1). Explicit stop/cancel
+            # sets the durable-cancel lease and settles Plan + Worker receipts
+            # together in the branch above.
+            for handoff_id, _source_log_id in worker_handoffs:
+                self._queued_worker_turn_handoffs.discard(handoff_id)
+            for outbox_id, _lease_token in capability_resumes:
+                self._queued_capability_resume_ids.discard(outbox_id)
         for receipt_key, plan_ids, target_task_id in released_deliveries:
             await self._broadcast_plan_delivery_change(
                 receipt_key=receipt_key,
@@ -12068,11 +18951,130 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 delivery_keys,
                 cancel=task_id in self._cancel_durable_queue_tasks,
             )
+        if capability_resumes or cancel_all_worker_handoffs:
+            from backend.services.capability_resume import (
+                cancel_task_resume_outbox_in_tx,
+                release_resume_publication,
+            )
+
+            if cancel_all_worker_handoffs:
+                async def cancel_resume(session) -> None:
+                    task = (
+                        await session.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if task is not None:
+                        await cancel_task_resume_outbox_in_tx(
+                            session,
+                            task,
+                            reason="Task queue was explicitly cleared",
+                        )
+                    await session.commit()
+
+                if durable_db is None:
+                    async with self.db_factory() as db:
+                        await cancel_resume(db)
+                else:
+                    await cancel_resume(durable_db)
+            else:
+                for outbox_id, lease_token in set(capability_resumes):
+                    if not isinstance(lease_token, str):
+                        continue
+                    async with self.db_factory() as db:
+                        await release_resume_publication(
+                            db,
+                            outbox_id,
+                            lease_token=lease_token,
+                            error_code="queue_owner_released",
+                            error_message=(
+                                "Dispatcher queue ownership ended before launch"
+                            ),
+                        )
         if cleared:
             logger.info(
                 f"Cleared {cleared} pending queued message(s) for task {task_id} on interrupt"
             )
         return cleared
+
+    async def _cancel_worker_turn_handoff_receipts(
+        self,
+        handoffs: list[tuple[str, int | None]],
+        *,
+        reason: str,
+        db=None,
+        task_id: int | None = None,
+        commit: bool = True,
+    ) -> int:
+        """Durably prevent pre-boundary queue receipts from resurrection."""
+
+        unique = {
+            (handoff_id, source_log_id)
+            for handoff_id, source_log_id in handoffs
+            if isinstance(handoff_id, str)
+            and type(source_log_id) is int
+        }
+        if not unique and task_id is None:
+            return 0
+
+        async def cancel(session) -> int:
+            changed = 0
+            predicates = [
+                WorkerTurnHandoffReceipt.side == "worker",
+                WorkerTurnHandoffReceipt.status.in_(["accepted", "claimed"]),
+            ]
+            if task_id is not None:
+                predicates.append(WorkerTurnHandoffReceipt.task_id == task_id)
+            else:
+                predicates.append(
+                    or_(
+                        *[
+                            (
+                                (WorkerTurnHandoffReceipt.handoff_id == handoff_id)
+                                & (
+                                    WorkerTurnHandoffReceipt.source_log_id
+                                    == source_log_id
+                                )
+                            )
+                            for handoff_id, source_log_id in unique
+                        ]
+                    )
+                )
+            receipts = list(
+                (
+                    await session.execute(
+                        select(WorkerTurnHandoffReceipt)
+                        .where(*predicates)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            for receipt in receipts:
+                if task_id is None and (
+                    receipt.handoff_id,
+                    receipt.source_log_id,
+                ) not in unique:
+                    continue
+                receipt.status = "cancelled"
+                receipt.claimed_turn_generation = None
+                receipt.cancel_reason = reason[:2000]
+                receipt.updated_at = datetime.utcnow()
+                changed += 1
+            if commit:
+                if changed:
+                    await session.commit()
+                else:
+                    await session.rollback()
+            else:
+                await session.flush()
+            return changed
+
+        if db is not None:
+            return await cancel(db)
+        async with self.db_factory() as session:
+            return await cancel(session)
 
     async def _claim_dequeued_message(
         self,
@@ -12081,14 +19083,47 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
     ) -> bool:
         """Register a dequeued message unless a queue clear invalidated it."""
         cancelled_delivery_key: str | None = None
+        cancelled_capability_resume: tuple[int, str] | None = None
+        cancelled_worker_handoff_id: str | None = None
         cancel_delivery = False
         async with self._dispatch_claim_lock:
             if msg.queue_generation != self._task_queue_generations.get(task_id, 0):
                 cancelled_delivery_key = (
                     None if msg.queue_clear_handled else msg.delivery_key
                 )
+                if (
+                    not msg.queue_clear_handled
+                    and msg.capability_resume_outbox_id is not None
+                    and isinstance(msg.capability_resume_lease_token, str)
+                ):
+                    cancelled_capability_resume = (
+                        msg.capability_resume_outbox_id,
+                        msg.capability_resume_lease_token,
+                    )
+                    self._queued_capability_resume_ids.discard(
+                        msg.capability_resume_outbox_id
+                    )
+                if not msg.queue_clear_handled:
+                    cancelled_worker_handoff_id = (
+                        msg.worker_turn_handoff_id
+                    )
+                if cancelled_worker_handoff_id is not None:
+                    self._queued_worker_turn_handoffs.discard(
+                        cancelled_worker_handoff_id
+                    )
                 cancel_delivery = task_id in self._cancel_durable_queue_tasks
             else:
+                current = asyncio.current_task()
+                if current is None:
+                    raise RuntimeError(
+                        "Dequeued Task message has no asyncio worker identity"
+                    )
+                existing = self._task_queue_active_messages.get(task_id)
+                if existing is not None and existing[0] is not current:
+                    raise RuntimeError(
+                        "Task queue admitted two concurrent message workers"
+                    )
+                self._task_queue_active_messages[task_id] = (current, msg)
                 self._task_queue_inflight[task_id] = (
                     self._task_queue_inflight.get(task_id, 0) + 1
                 )
@@ -12099,6 +19134,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 [cancelled_delivery_key],
                 cancel=cancel_delivery,
             )
+        if cancelled_capability_resume is not None:
+            from backend.services.capability_resume import (
+                release_resume_publication,
+            )
+
+            outbox_id, lease_token = cancelled_capability_resume
+            async with self.db_factory() as db:
+                await release_resume_publication(
+                    db,
+                    outbox_id,
+                    lease_token=lease_token,
+                    error_code="queue_generation_changed",
+                    error_message="Task queue generation changed before claim",
+                )
         return False
 
     async def abort_task_queue(
@@ -12158,6 +19207,106 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             )
         return cleared
 
+    async def quiesce_task_queue_consumer_for_capability_cancel(
+        self,
+        task_id: int,
+        *,
+        timeout: float = TASK_QUEUE_ABORT_TIMEOUT,
+        expected_outbox_id: int | None = None,
+        expected_lease_token: str | None = None,
+        expected_retry_count: int | None = None,
+        expected_turn_generation: int | None = None,
+        expected_instance_id: int | None = None,
+    ) -> bool:
+        """Reap one volatile consumer without cancelling its resume outbox.
+
+        The caller must already own ``task_queue_cancellation_lease`` so no
+        successor can be admitted.  A dequeued Capability resume may have
+        claimed G+1 before it observes cancellation; its ``finally`` path is
+        allowed to restore that exact pre-provider claim to waiting state.
+
+        Supplying ``expected_outbox_id`` turns this into an exact live-owner
+        fence.  It succeeds only when the registered worker is actively
+        processing that outbox with the same lease, G+1, retry, and Instance
+        reservation.  This keeps an unrelated ``executing`` Task from being
+        mistaken for a pre-provider Capability resume.
+        """
+
+        async with self._dispatch_claim_lock:
+            if not self._task_queue_cancellation_lease_counts.get(task_id, 0):
+                raise RuntimeError(
+                    "Capability queue quiescence requires a cancellation lease"
+                )
+            worker = self._task_queue_workers.get(task_id)
+            if expected_outbox_id is not None:
+                active = self._task_queue_active_messages.get(task_id)
+                active_worker = active[0] if active is not None else None
+                message = active[1] if active is not None else None
+                instance_claim = (
+                    message.instance_claim if message is not None else None
+                )
+                exact_live_owner = bool(
+                    worker is not None
+                    and worker is not asyncio.current_task()
+                    and not worker.done()
+                    and active_worker is worker
+                    and message is not None
+                    and message.capability_resume_outbox_id
+                    == expected_outbox_id
+                    and isinstance(expected_lease_token, str)
+                    and message.capability_resume_lease_token
+                    == expected_lease_token
+                    and message.claimed_retry_count == expected_retry_count
+                    and message.claimed_turn_generation
+                    == expected_turn_generation
+                    and isinstance(instance_claim, tuple)
+                    and len(instance_claim) == 2
+                    and instance_claim[0] == expected_instance_id
+                    and self._task_queue_inflight.get(task_id, 0) == 1
+                    and expected_outbox_id
+                    in self._queued_capability_resume_ids
+                )
+                if not exact_live_owner:
+                    return False
+            self._preserve_capability_resume_on_queue_cancel[task_id] = (
+                self._preserve_capability_resume_on_queue_cancel.get(task_id, 0)
+                + 1
+            )
+        try:
+            if (
+                worker is None
+                or worker is asyncio.current_task()
+                or worker.done()
+            ):
+                return expected_outbox_id is None
+            worker.cancel()
+            done, pending = await asyncio.wait({worker}, timeout=timeout)
+            if pending:
+                raise TaskQueueAbortTimeoutError(
+                    f"Task {task_id} queue worker did not stop within "
+                    f"{timeout:.1f}s"
+                )
+            await asyncio.gather(*done, return_exceptions=True)
+            return True
+        finally:
+            async with self._dispatch_claim_lock:
+                remaining = (
+                    self._preserve_capability_resume_on_queue_cancel.get(
+                        task_id,
+                        0,
+                    )
+                    - 1
+                )
+                if remaining > 0:
+                    self._preserve_capability_resume_on_queue_cancel[
+                        task_id
+                    ] = remaining
+                else:
+                    self._preserve_capability_resume_on_queue_cancel.pop(
+                        task_id,
+                        None,
+                    )
+
     @asynccontextmanager
     async def task_queue_cancellation_lease(self, task_id: int):
         """Keep Task message admission closed through a terminal operation.
@@ -12208,8 +19357,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         self,
         task_id: int,
         exc: Exception,
+        *,
+        queued_message: "QueuedMessage | None" = None,
     ) -> None:
-        """Make a non-retryable queued-message routing refusal visible."""
+        """Atomically settle and expose a non-retryable routing refusal."""
 
         from backend.services.codex_app_server import (
             CodexServiceTierUnavailableError,
@@ -12247,7 +19398,160 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 "请检查账号启用状态与模型支持；若是旧会话多副本，"
                 "请先手动指定正确账号后重新发送。"
             )
+        if (
+            queued_message is not None
+            and queued_message.capability_resume_outbox_id is not None
+        ):
+            from backend.services.capability_resume import (
+                fail_or_cancel_resume_outbox_in_tx,
+            )
+            from backend.services.capability_service import capability_task_lock
+
+            generation = None
+            async with capability_task_lock(task_id):
+                async with self.db_factory() as db:
+                    task_fence = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.status.in_((
+                                "waiting_capability",
+                                "in_progress",
+                                "executing",
+                            )),
+                        )
+                        .values(status=Task.status)
+                    )
+                    if task_fence.rowcount != 1:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent Capability resume refusal lost its Task"
+                        )
+                    task = await db.get(Task, task_id, populate_existing=True)
+                    if task is None:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent Capability resume refusal lost its Task"
+                        )
+                    changed = await fail_or_cancel_resume_outbox_in_tx(
+                        db,
+                        task=task,
+                        outbox_id=(
+                            queued_message.capability_resume_outbox_id
+                        ),
+                        status="failed",
+                        error_code="resume_routing_refused",
+                        error_message=str(exc)[:2000],
+                    )
+                    if not changed:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent Capability resume refusal lost its outbox"
+                        )
+                    task.status = "failed"
+                    task.completed_at = datetime.utcnow()
+                    task.error_message = str(exc)[:2000]
+                    entry = LogEntry(
+                        instance_id=None,
+                        task_id=task_id,
+                        event_type="system_event",
+                        role="system",
+                        content=notice,
+                        is_error=True,
+                    )
+                    db.add(entry)
+                    generation = self._task_status_generation(task)
+                    await db.commit()
+            async with self._dispatch_claim_lock:
+                self._queued_capability_resume_ids.discard(
+                    queued_message.capability_resume_outbox_id
+                )
+            if generation is not None:
+                await self._broadcast_task_status_generation(
+                    generation,
+                    instance_id=None,
+                )
+            try:
+                await self.broadcaster.broadcast(
+                    f"task:{task_id}",
+                    {
+                        "event_type": "system_event",
+                        "role": "system",
+                        "content": notice,
+                        "is_error": True,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "Capability resume refusal committed but notification "
+                    "failed for task %s",
+                    task_id,
+                )
+            return
+        released_plan: tuple[list[int], int | None] | None = None
+        commit_cancellation: asyncio.CancelledError | None = None
         async with self.db_factory() as db:
+            if queued_message is not None:
+                if queued_message.delivery_key is not None:
+                    expected_handoff = None
+                    if queued_message.worker_turn_handoff_id is not None:
+                        expected_handoff = (
+                            task_id,
+                            queued_message.source_log_id,
+                            queued_message.worker_turn_handoff_id,
+                            queued_message.worker_turn_handoff_retry_count,
+                            queued_message.worker_turn_handoff_from_generation,
+                        )
+                    released_plan = (
+                        await self._release_plan_delivery_with_worker_handoff(
+                            db,
+                            receipt_key=queued_message.delivery_key,
+                            delivery_status="failed",
+                            error=str(exc)[:2000],
+                            expected_worker_handoff=expected_handoff,
+                        )
+                    )
+                    if released_plan is None:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent routing refusal could not settle its Plan delivery"
+                        )
+                elif queued_message.worker_turn_handoff_id is not None:
+                    handoff = (
+                        await db.execute(
+                            select(WorkerTurnHandoffReceipt)
+                            .where(
+                                WorkerTurnHandoffReceipt.handoff_id
+                                == queued_message.worker_turn_handoff_id,
+                                WorkerTurnHandoffReceipt.task_id == task_id,
+                                WorkerTurnHandoffReceipt.source_log_id
+                                == queued_message.source_log_id,
+                                WorkerTurnHandoffReceipt.side == "worker",
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        handoff is None
+                        or handoff.retry_count
+                        != queued_message.worker_turn_handoff_retry_count
+                        or handoff.from_generation
+                        != queued_message.worker_turn_handoff_from_generation
+                        or handoff.status not in {
+                            "accepted",
+                            "claimed",
+                            "cancelled",
+                        }
+                    ):
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Permanent routing refusal lost its exact Worker handoff"
+                        )
+                    if handoff.status in {"accepted", "claimed"}:
+                        handoff.status = "cancelled"
+                        handoff.claimed_turn_generation = None
+                        handoff.cancel_reason = str(exc)[:2000]
+                        handoff.updated_at = datetime.utcnow()
             entry = LogEntry(
                 instance_id=None,
                 task_id=task_id,
@@ -12257,16 +19561,43 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 is_error=True,
             )
             db.add(entry)
-            await db.commit()
-        await self.broadcaster.broadcast(
-            f"task:{task_id}",
-            {
-                "event_type": "system_event",
-                "role": "system",
-                "content": notice,
-                "is_error": True,
-            },
-        )
+            commit, commit_cancellation = await _settle_despite_cancellation(
+                db.commit()
+            )
+            commit.result()
+        if queued_message is not None and queued_message.delivery_key is not None:
+            async with self._dispatch_claim_lock:
+                self._queued_delivery_keys.discard(queued_message.delivery_key)
+        if commit_cancellation is not None:
+            raise commit_cancellation
+        try:
+            if released_plan is not None and queued_message is not None:
+                plan_ids, target_task_id = released_plan
+                await self._broadcast_plan_delivery_change(
+                    receipt_key=queued_message.delivery_key,
+                    status="failed",
+                    error=str(exc)[:2000],
+                    plan_ids=plan_ids,
+                    target_task_id=target_task_id,
+                )
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {
+                    "event_type": "system_event",
+                    "role": "system",
+                    "content": notice,
+                    "is_error": True,
+                },
+            )
+        except Exception:
+            # Settlement and the user-visible history row already committed.
+            # A transient WebSocket failure must not make the consumer requeue
+            # a turn which the durable receipts now prove was cancelled.
+            logger.exception(
+                "Permanent routing failure for task %s was committed but its "
+                "live notification could not be broadcast",
+                task_id,
+            )
 
     async def _task_queue_consumer(self, task_id: int):
         """Serial consumer: process queued messages one at a time for a task."""
@@ -12303,6 +19634,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         task_id,
                     )
                     continue
+                message_requeued = False
+                preserve_worker_handoff = False
                 try:
                     while True:
                         await self.wait_until_resumed()
@@ -12316,11 +19649,20 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             # updater cancels its restart and reopens the gate.
                             continue
                 except asyncio.CancelledError:
+                    cancel_durable = (
+                        task_id in self._cancel_durable_queue_tasks
+                    )
+                    preserve_worker_handoff = not cancel_durable
                     if msg.delivery_key is not None:
                         await self._reset_plan_deliveries_after_queue_clear(
                             [msg.delivery_key],
-                            cancel=(task_id in self._cancel_durable_queue_tasks),
+                            cancel=cancel_durable,
                         )
+                    # Process shutdown and a cancelled maintenance restart only
+                    # discard volatile queue ownership.  Keep an unclaimed
+                    # accepted Worker receipt durable so startup/resume can
+                    # re-admit this exact envelope.  Explicit stop/cancel owns a
+                    # cancellation lease and must still terminalize it below.
                     raise
                 except Exception as exc:
                     from backend.services.codex_app_server import (
@@ -12334,7 +19676,42 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         InstanceAlreadyRunningError,
                     )
 
-                    if isinstance(
+                    if isinstance(exc, CapabilityResumeLeaseLostError):
+                        # The durable lease, not this queue object, decides who
+                        # may advance the Task.  Drop the stale volatile owner;
+                        # the winning coordinator publication remains intact.
+                        logger.info(
+                            "Dropping superseded capability resume for task %s: %s",
+                            task_id,
+                            exc,
+                        )
+                    elif isinstance(
+                        exc,
+                        (
+                            QueuedAdmissionCommitOutcomeUncertainError,
+                            QueuedTurnLaunchOutcomeUncertainError,
+                        ),
+                    ):
+                        # The durable state may already be post-admission or
+                        # post-provider-boundary.  Never "clean up" by
+                        # cancelling a claimed Worker receipt or releasing a
+                        # Plan that may own the exact turn.
+                        preserve_worker_handoff = True
+                        if isinstance(
+                            exc, QueuedTurnLaunchOutcomeUncertainError
+                        ):
+                            await self._mark_plan_delivery(
+                                msg.delivery_key,
+                                "failed",
+                                error=str(exc)[:2000],
+                            )
+                        logger.error(
+                            "Queued message outcome for task %s is uncertain; "
+                            "leaving durable receipts fail-closed: %s",
+                            task_id,
+                            exc,
+                        )
+                    elif isinstance(
                         exc,
                         (
                             QueuedMessagePrelaunchError,
@@ -12376,6 +19753,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 await self._publish_permanent_account_routing_failure(
                                     task_id,
                                     exc,
+                                    queued_message=msg,
                                 )
                             except Exception:
                                 # If the durable/user-visible refusal itself
@@ -12387,13 +19765,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                     task_id,
                                 )
                                 await q.put(msg)
+                                message_requeued = True
                                 await asyncio.sleep(CODEX_ROUTING_RETRY_DELAY)
-                            else:
-                                await self._release_plan_delivery_before_launch(
-                                    msg.delivery_key,
-                                    status="failed",
-                                    error=str(exc)[:2000],
-                                )
                         else:
                             # Routing/rebind/instance-contention conflicts are
                             # temporary. Preserve the exact user message instead
@@ -12405,6 +19778,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 exc,
                             )
                             await q.put(msg)
+                            message_requeued = True
                             retry_after = getattr(exc, "retry_after", None)
                             await asyncio.sleep(
                                 max(
@@ -12435,8 +19809,82 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             claimed_id, claim_token
                         )
                         msg.instance_claim = None
+                    if (
+                        msg.worker_turn_handoff_id is not None
+                        and msg.worker_turn_handoff_claimed_generation is None
+                        and not message_requeued
+                    ):
+                        if not preserve_worker_handoff:
+                            await self._cancel_worker_turn_handoff_receipts(
+                                [
+                                    (
+                                        msg.worker_turn_handoff_id,
+                                        msg.source_log_id,
+                                    )
+                                ],
+                                reason=(
+                                    "Worker turn handoff was discarded before "
+                                    "its exact launch claim"
+                                ),
+                            )
+                        async with self._dispatch_claim_lock:
+                            self._queued_worker_turn_handoffs.discard(
+                                msg.worker_turn_handoff_id
+                            )
+                    elif (
+                        msg.worker_turn_handoff_id is not None
+                        and not message_requeued
+                    ):
+                        # Keep the dedup owner through the complete claimed
+                        # launch attempt.  Once this consumer settles, durable
+                        # recovery may re-admit ``claimed`` but never
+                        # ``launching``/``launched``.
+                        async with self._dispatch_claim_lock:
+                            self._queued_worker_turn_handoffs.discard(
+                                msg.worker_turn_handoff_id
+                            )
+                    if (
+                        msg.capability_resume_outbox_id is not None
+                        and not message_requeued
+                    ):
+                        if (
+                            isinstance(msg.capability_resume_lease_token, str)
+                            and (
+                                task_id not in self._cancel_durable_queue_tasks
+                                or task_id
+                                in self._preserve_capability_resume_on_queue_cancel
+                            )
+                        ):
+                            from backend.services.capability_resume import (
+                                release_resume_publication,
+                            )
+
+                            async with self.db_factory() as release_db:
+                                await release_resume_publication(
+                                    release_db,
+                                    msg.capability_resume_outbox_id,
+                                    lease_token=(
+                                        msg.capability_resume_lease_token
+                                    ),
+                                    error_code="queue_owner_released",
+                                    error_message=(
+                                        "Dispatcher queue owner settled before "
+                                        "a durable launch acknowledgement"
+                                    ),
+                                )
+                        async with self._dispatch_claim_lock:
+                            self._queued_capability_resume_ids.discard(
+                                msg.capability_resume_outbox_id
+                            )
                     q.task_done()
                     async with self._dispatch_claim_lock:
+                        active = self._task_queue_active_messages.get(task_id)
+                        if (
+                            active is not None
+                            and active[0] is asyncio.current_task()
+                            and active[1] is msg
+                        ):
+                            self._task_queue_active_messages.pop(task_id, None)
                         inflight = self._task_queue_inflight.get(task_id, 0) - 1
                         if inflight > 0:
                             self._task_queue_inflight[task_id] = inflight
@@ -12448,17 +19896,64 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             hb_task.cancel()
             await asyncio.gather(hb_task, return_exceptions=True)
             orphaned_delivery_key = None
+            orphaned_capability_resume: tuple[int, str] | None = None
+            orphaned_worker_handoff_id = None
             async with self._dispatch_claim_lock:
                 handoff = self._task_queue_dequeued.get(task_id)
                 if handoff is not None:
                     self._task_queue_dequeued.pop(task_id, None)
+                    orphaned_worker_handoff_id = (
+                        handoff.worker_turn_handoff_id
+                    )
                     if not handoff.queue_clear_handled:
                         orphaned_delivery_key = handoff.delivery_key
+                        if (
+                            handoff.capability_resume_outbox_id is not None
+                            and isinstance(
+                                handoff.capability_resume_lease_token,
+                                str,
+                            )
+                        ):
+                            orphaned_capability_resume = (
+                                handoff.capability_resume_outbox_id,
+                                handoff.capability_resume_lease_token,
+                            )
+                if orphaned_worker_handoff_id is not None:
+                    self._queued_worker_turn_handoffs.discard(
+                        orphaned_worker_handoff_id
+                    )
+                if orphaned_capability_resume is not None:
+                    self._queued_capability_resume_ids.discard(
+                        orphaned_capability_resume[0]
+                    )
             if orphaned_delivery_key is not None:
                 await self._reset_plan_deliveries_after_queue_clear(
                     [orphaned_delivery_key],
                     cancel=task_id in self._cancel_durable_queue_tasks,
                 )
+            if (
+                orphaned_capability_resume is not None
+                and (
+                    task_id not in self._cancel_durable_queue_tasks
+                    or task_id
+                    in self._preserve_capability_resume_on_queue_cancel
+                )
+            ):
+                from backend.services.capability_resume import (
+                    release_resume_publication,
+                )
+
+                outbox_id, lease_token = orphaned_capability_resume
+                async with self.db_factory() as release_db:
+                    await release_resume_publication(
+                        release_db,
+                        outbox_id,
+                        lease_token=lease_token,
+                        error_code="queue_consumer_interrupted",
+                        error_message=(
+                            "Queue consumer stopped before registering the resume"
+                        ),
+                    )
             # Only deregister if THIS task is still the registered worker. The
             # watchdog (_ensure_queue_worker) may have already cancelled us and
             # registered a fresh consumer; popping unconditionally would erase
@@ -12575,29 +20070,68 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             "has_temp_skills": False,
             "original_skills": {},
             "temporary_skill_token": None,
+            "capability_phase_fence": None,
         }
-        try:
-            return await self._process_queued_message_inner(
-                task_id, msg, launch_admission, cleanup_state
-            )
-        finally:
-            if launch_admission["held"]:
-                launch_admission["held"] = False
-                self._chat_launch_admission_lock.release()
-            # Covers failures during account resolution/compaction/DB writes,
-            # before the narrower launch try/finally is reached.
-            if msg.instance_claim is not None:
-                instance_id, claim_token = msg.instance_claim
-                await self._release_instance_reservation(instance_id, claim_token)
-                msg.instance_claim = None
-            if cleanup_state["has_temp_skills"]:
-                await self._restore_queued_message_skills(
-                    task_id,
-                    msg,
-                    cleanup_state["original_skills"],
-                    cleanup_state["temporary_skill_token"],
+
+        async def process_and_cleanup():
+            try:
+                return await self._process_queued_message_inner(
+                    task_id, msg, launch_admission, cleanup_state
                 )
-                cleanup_state["has_temp_skills"] = False
+            finally:
+                try:
+                    if launch_admission["held"]:
+                        launch_admission["held"] = False
+                        self._chat_launch_admission_lock.release()
+                    # Covers failures during account resolution/compaction/DB
+                    # writes, before the narrower launch try/finally is reached.
+                    if msg.instance_claim is not None:
+                        instance_id, claim_token = msg.instance_claim
+                        await self._release_instance_reservation(
+                            instance_id,
+                            claim_token,
+                        )
+                        msg.instance_claim = None
+                    if cleanup_state["has_temp_skills"]:
+                        await self._restore_queued_message_skills(
+                            task_id,
+                            msg,
+                            cleanup_state["original_skills"],
+                            cleanup_state["temporary_skill_token"],
+                        )
+                        cleanup_state["has_temp_skills"] = False
+                finally:
+                    # Phase-1 failures and early returns never reach the
+                    # explicit release immediately before the provider wait.
+                    # Release even when cleanup itself fails.
+                    self._release_capability_resume_phase_fence(cleanup_state)
+
+        if msg.capability_resume_outbox_id is not None:
+            from backend.services.capability_service import capability_task_lock
+
+            if msg.command_skills:
+                raise QueuedMessageRoutingMismatchError(
+                    "Capability resume cannot carry temporary skill overrides"
+                )
+            # Hold the non-reentrant fence only through Phase 1: envelope and
+            # route validation, exact G+1 claim, launch, provider-boundary
+            # promotion, and prelaunch cleanup. The output consumer needs the
+            # same lock to settle this turn, so Phase 2 must not retain it.
+            phase_fence = capability_task_lock(task_id)
+            await phase_fence.acquire()
+            cleanup_state["capability_phase_fence"] = phase_fence
+            return await process_and_cleanup()
+        return await process_and_cleanup()
+
+    @staticmethod
+    def _release_capability_resume_phase_fence(cleanup_state: dict) -> None:
+        """Release the queue-owned Capability fence at the Phase 1 boundary."""
+
+        phase_fence = cleanup_state.get("capability_phase_fence")
+        if phase_fence is None:
+            return
+        cleanup_state["capability_phase_fence"] = None
+        phase_fence.release()
 
     async def _restore_queued_message_skills(
         self,
@@ -12676,10 +20210,80 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         original_skills: dict = {}
         temporary_skill_token: str | None = None
         queued_turn_generation: _TaskStatusGeneration | None = None
+        worker_handoff_boundary = {
+            "crossed": False,
+            "settled": False,
+        }
         async with self.db_factory() as db:
+            if msg.capability_resume_outbox_id is not None:
+                from backend.services.capability_resume import (
+                    load_resume_envelope,
+                )
+
+                if not isinstance(msg.capability_resume_lease_token, str):
+                    raise CapabilityResumeLeaseLostError(
+                        "Capability resume has no publication lease"
+                    )
+                envelope = await load_resume_envelope(
+                    db,
+                    msg.capability_resume_outbox_id,
+                    expected_lease_token=msg.capability_resume_lease_token,
+                )
+                if envelope is None:
+                    raise CapabilityResumeLeaseLostError(
+                        "Capability resume publication lease is no longer current"
+                    )
+                if envelope.task_id != task_id:
+                    raise QueuedMessageRoutingMismatchError(
+                        "Capability resume belongs to a different Task"
+                    )
+                msg.prompt = envelope.prompt
+                msg.current_message = envelope.current_message
+                msg.timestamp = envelope.queue_timestamp
+                msg.expected_task_routing = (
+                    envelope.provider,
+                    envelope.model,
+                    envelope.service_tier,
+                )
+                msg.allow_new_session = envelope.request_session_id is None
+                if envelope.claimed_generation is not None:
+                    msg.claimed_retry_count = envelope.request_retry_count
+                    msg.claimed_turn_generation = envelope.claimed_generation
             task = await db.get(Task, task_id)
             if not task:
                 logger.warning(f"Task {task_id} not found, skipping queued message")
+                return
+            if await active_worker_task_termination_receipt(db, task_id):
+                raise QueuedMessagePrelaunchError(
+                    "Task has an active Worker termination receipt"
+                )
+            if (
+                task.status == "waiting_capability"
+                and msg.capability_resume_outbox_id is None
+            ):
+                # The terminal Agent turn deliberately yielded ownership to a
+                # durable Capability.  Ordinary user/monitor/Plan messages stay
+                # queued until its exact outbox resume advances G -> G+1.
+                raise QueuedMessagePrelaunchError(
+                    "Task is waiting for its Capability resume outbox"
+                )
+            if task.mode == "plan":
+                # Plan Tasks are read-only planning records. Their planner /
+                # reviewer lifecycle runs through _run_plan_phase; a generic
+                # queued message must never turn a reviewed legacy Plan into
+                # an ordinary coding turn, even if old data retained a native
+                # session id.
+                logger.warning(
+                    "Discarding generic queued message for Plan task %s",
+                    task_id,
+                )
+                return
+            if not _context_retry_permit_matches(task, msg):
+                logger.info(
+                    "Discarding compact retry for task %s because its exact "
+                    "rejected generation no longer owns the Task",
+                    task_id,
+                )
                 return
             if task_is_pr_review_superseded(task):
                 logger.info(
@@ -12806,12 +20410,40 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 await asyncio.sleep(2)
             else:
                 logger.warning(
-                    "Task %s still busy after 120s, re-queueing message: %s",
+                    "Task %s still busy after 120s; deferring message: %s",
                     task_id,
                     msg.source,
                 )
-                await self._get_task_queue(task_id).put(msg)
-                await asyncio.sleep(5)
+                raise QueuedMessagePrelaunchError(
+                    "Task still has a live generation after the queued wait"
+                )
+
+            task = await db.get(Task, task_id, populate_existing=True)
+            if task is None:
+                return
+            if await active_worker_task_termination_receipt(db, task_id):
+                raise QueuedMessagePrelaunchError(
+                    "Task has an active Worker termination receipt"
+                )
+            if (
+                task.status == "waiting_capability"
+                and msg.capability_resume_outbox_id is None
+            ):
+                raise QueuedMessagePrelaunchError(
+                    "Task is waiting for its Capability resume outbox"
+                )
+            if task.mode == "plan":
+                logger.warning(
+                    "Discarding queued message after task %s became a Plan",
+                    task_id,
+                )
+                return
+            if not _context_retry_permit_matches(task, msg):
+                logger.info(
+                    "Discarding compact retry for task %s after its rejected "
+                    "generation was cancelled or superseded",
+                    task_id,
+                )
                 return
 
             # Recover before resuming when the session can't be resumed:
@@ -12828,12 +20460,21 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 bool(task.session_id)
                 and _find_session_jsonl(task.session_id, provider=provider) is None
             )
-            if task.session_id and (task.status == "failed" or session_gone):
+            if msg.capability_resume_outbox_id is not None and session_gone:
+                raise QueuedMessageRoutingMismatchError(
+                    "Capability resume lost its frozen native session"
+                )
+            if (
+                msg.capability_resume_outbox_id is None
+                and task.session_id
+                and (task.status == "failed" or session_gone)
+            ):
                 # Snapshot the complete resume generation before any clone /
                 # compaction awaits.  A concurrent cancel, retry, or owner/session
                 # change must win and keep this exact QueuedMessage unconsumed.
                 recovery_status = task.status
                 recovery_retry_count = task.retry_count
+                recovery_turn_generation = task.turn_generation
                 recovery_instance_id = task.instance_id
                 recovery_session_id = task.session_id
                 recovery_started_at = task.started_at
@@ -12902,6 +20543,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     Task.id == task_id,
                     Task.status == recovery_status,
                     Task.retry_count == recovery_retry_count,
+                    Task.turn_generation == recovery_turn_generation,
                     (
                         Task.instance_id.is_(None)
                         if recovery_instance_id is None
@@ -12924,8 +20566,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     ),
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
+                    Task.mode != "plan",
                     Task.pty_background_generation.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
                 )
                 # Acquire the exact Task write barrier before inspecting the
                 # durable routing fence.  A Worker stage that wins during
@@ -12946,6 +20590,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         logger.info(
                             "Discarding queued recovery for superseded PR "
                             "review task %s",
+                            task_id,
+                        )
+                        return
+                    if current is not None and current.mode == "plan":
+                        logger.info(
+                            "Discarding queued recovery after task %s became "
+                            "a Plan",
                             task_id,
                         )
                         return
@@ -13019,8 +20670,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     "waited for startup reconciliation; preserving message",
                     task_id,
                 )
-                await self._get_task_queue(task_id).put(msg)
-                return
+                raise QueuedMessagePrelaunchError(
+                    "Task acquired a live generation before queued launch"
+                )
             task = await db.get(Task, task_id, populate_existing=True)
             if task is None:
                 return
@@ -13040,12 +20692,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             inst, claim_token = await self._reserve_idle_instance(db)
             if inst is None or claim_token is None:
                 logger.warning(
-                    f"No idle instance for task {task_id}, re-queueing message"
+                    f"No idle instance for task {task_id}; deferring message"
                 )
-                q = self._get_task_queue(task_id)
-                await q.put(msg)
-                await asyncio.sleep(5)
-                return
+                raise QueuedMessagePrelaunchError(
+                    "No idle instance is available for queued launch"
+                )
             msg.instance_claim = (inst.id, claim_token)
 
             # Build git env
@@ -13109,7 +20760,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             effective_skills = dict(task.enabled_skills or {})
 
             # 上下文超阈值时自动摘要 + 新 session（无限续聊）
-            if task.session_id and task.context_window_usage:
+            if (
+                msg.capability_resume_outbox_id is None
+                and task.session_id
+                and task.context_window_usage
+            ):
                 usage = task.context_window_usage
                 used_tokens = context_tokens_used(task.provider, usage)
                 # context_window 可能被 CC 低报（1M 模型报 200K），用模型名兜底；
@@ -13256,6 +20911,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
             status_before_launch = task.status
             retry_count_before_launch = task.retry_count
+            turn_generation_before_launch = task.turn_generation
             completed_at_before_launch = task.completed_at
             instance_id_before_launch = task.instance_id
             session_id_before_launch = task.session_id
@@ -13280,6 +20936,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         Task.id == task_id,
                         Task.status == status_before_launch,
                         Task.retry_count == retry_count_before_launch,
+                        Task.turn_generation == turn_generation_before_launch,
                         (
                             Task.instance_id.is_(None)
                             if instance_id_before_launch is None
@@ -13302,8 +20959,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         ),
                         Task.worker_id.is_(None),
                         Task.shared_from_id.is_(None),
+                        Task.mode != "plan",
                         Task.pty_background_generation.is_(None),
                         task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(status=Task.status)
                 )
@@ -13318,6 +20977,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         logger.info(
                             "Discarding queued message after PR review task %s "
                             "was superseded before final launch claim",
+                            task_id,
+                        )
+                        return
+                    if current is not None and current.mode == "plan":
+                        logger.info(
+                            "Discarding queued message after task %s became "
+                            "a Plan before final launch claim",
                             task_id,
                         )
                         return
@@ -13341,6 +21007,22 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         "Queued task disappeared after launch barrier"
                     )
                 task = current
+                if (
+                    task.status == "waiting_capability"
+                    and msg.capability_resume_outbox_id is None
+                ):
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Task entered waiting_capability before final claim"
+                    )
+                if not _context_retry_permit_matches(task, msg):
+                    await db.rollback()
+                    logger.info(
+                        "Discarding compact retry for task %s at the final "
+                        "Task generation fence",
+                        task_id,
+                    )
+                    return
                 if has_pending_worker_routing(task):
                     await db.rollback()
                     raise QueuedMessagePrelaunchError(
@@ -13352,6 +21034,83 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     raise QueuedMessagePrelaunchError(
                         "Detached PTY activity won the final launch fence"
                     )
+                # Compatibility: durable Worker ``claimed`` receipts already
+                # carried their exact G+1 before the generic in-memory retry
+                # fields existed.  Normalize that proof onto the generic
+                # fields so Worker and ordinary messages follow one no-G+2
+                # rule without changing the durable receipt contract.
+                if (
+                    msg.claimed_retry_count is None
+                    and msg.claimed_turn_generation is None
+                    and msg.worker_turn_handoff_claimed_generation is not None
+                ):
+                    msg.claimed_retry_count = (
+                        msg.worker_turn_handoff_retry_count
+                    )
+                    msg.claimed_turn_generation = (
+                        msg.worker_turn_handoff_claimed_generation
+                    )
+                if (msg.claimed_retry_count is None) != (
+                    msg.claimed_turn_generation is None
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Queued turn retry identity is incomplete"
+                    )
+                claimed_turn_retry = msg.claimed_turn_generation is not None
+                if claimed_turn_retry and (
+                    type(msg.claimed_retry_count) is not int
+                    or type(msg.claimed_turn_generation) is not int
+                    or task.retry_count != msg.claimed_retry_count
+                    or task.turn_generation != msg.claimed_turn_generation
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Queued turn retry generation changed"
+                    )
+                worker_handoff_retry = False
+                if msg.worker_turn_handoff_id is not None:
+                    if (
+                        len(msg.worker_turn_handoff_id) != 32
+                        or type(msg.worker_turn_handoff_retry_count) is not int
+                        or type(msg.worker_turn_handoff_from_generation) is not int
+                        or type(msg.source_log_id) is not int
+                    ):
+                        await db.rollback()
+                        raise QueuedMessageRoutingMismatchError(
+                            "Worker turn handoff envelope is malformed"
+                        )
+                    if msg.worker_turn_handoff_claimed_generation is None:
+                        if (
+                            claimed_turn_retry
+                            or task.retry_count
+                            != msg.worker_turn_handoff_retry_count
+                            or task.turn_generation
+                            != msg.worker_turn_handoff_from_generation
+                        ):
+                            await db.rollback()
+                            raise QueuedMessageRoutingMismatchError(
+                                "Worker turn handoff baseline changed before launch"
+                            )
+                    else:
+                        worker_handoff_retry = True
+                        if (
+                            not claimed_turn_retry
+                            or msg.claimed_retry_count
+                            != msg.worker_turn_handoff_retry_count
+                            or msg.claimed_turn_generation
+                            != msg.worker_turn_handoff_claimed_generation
+                            or task.retry_count
+                            != msg.worker_turn_handoff_retry_count
+                            or task.turn_generation
+                            != msg.worker_turn_handoff_claimed_generation
+                            or msg.worker_turn_handoff_claimed_generation
+                            != msg.worker_turn_handoff_from_generation + 1
+                        ):
+                            await db.rollback()
+                            raise QueuedMessageRoutingMismatchError(
+                                "Worker turn handoff retry generation changed"
+                            )
                 current_effective_model = msg.model_override or task.model
                 current_routing = (
                     (task.provider or "claude").lower(),
@@ -13391,9 +21150,36 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 task_provider = (task.provider or "claude").lower()
                 launch_kwargs["enabled_skills"] = effective_skills
 
-                task.status = "executing"
-                task.instance_id = inst.id
-                task.completed_at = None
+                capability_turn_claim = None
+                if msg.capability_resume_outbox_id is not None:
+                    from backend.services.capability_resume import (
+                        claim_resume_turn_locked,
+                    )
+
+                    if not isinstance(msg.capability_resume_lease_token, str):
+                        await db.rollback()
+                        raise CapabilityResumeLeaseLostError(
+                            "Capability resume lost its exact publication lease"
+                        )
+                    capability_turn_claim = await claim_resume_turn_locked(
+                        db,
+                        task=task,
+                        outbox_id=msg.capability_resume_outbox_id,
+                        lease_token=msg.capability_resume_lease_token,
+                        instance_id=inst.id,
+                        transport=_turn_transport_name(task),
+                    )
+                    claimed_turn_retry = capability_turn_claim.replay
+                else:
+                    task.status = "executing"
+                    task.instance_id = inst.id
+                    task.completed_at = None
+                    # This transaction is the durable admission point for one
+                    # logical model turn. Pre-launch routing may await for a long
+                    # time, so increment only after every final ownership and
+                    # policy fence above has been revalidated.
+                    if not claimed_turn_retry:
+                        task.turn_generation = task.turn_generation + 1
                 if msg.command_skills:
                     # The skill view becomes visible atomically with launch
                     # ownership, before the process can make its first MCP
@@ -13412,9 +21198,107 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     raise QueuedMessagePrelaunchError(
                         "Queued task disappeared after launch claim"
                     )
+                launch_kwargs["task_turn_generation"] = (
+                    queued_turn_generation.turn_generation
+                )
+                if msg.worker_turn_handoff_id is not None:
+                    handoff_log = (
+                        await db.execute(
+                            select(LogEntry)
+                            .where(
+                                LogEntry.id == msg.source_log_id,
+                                LogEntry.task_id == task_id,
+                                LogEntry.event_type == "user_message",
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    handoff_receipt = (
+                        await db.execute(
+                            select(WorkerTurnHandoffReceipt)
+                            .where(
+                                WorkerTurnHandoffReceipt.handoff_id
+                                == msg.worker_turn_handoff_id,
+                                WorkerTurnHandoffReceipt.task_id == task_id,
+                                WorkerTurnHandoffReceipt.source_log_id
+                                == msg.source_log_id,
+                                WorkerTurnHandoffReceipt.side == "worker",
+                            )
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    try:
+                        handoff_payload_digest = (
+                            _durable_json_digest(handoff_receipt.queue_payload)
+                            if handoff_receipt is not None
+                            and isinstance(handoff_receipt.queue_payload, dict)
+                            else None
+                        )
+                        handoff_request_digest = (
+                            _durable_json_digest(handoff_receipt.request_payload)
+                            if handoff_receipt is not None
+                            and isinstance(handoff_receipt.request_payload, dict)
+                            else None
+                        )
+                    except (TypeError, ValueError, UnicodeError):
+                        handoff_payload_digest = None
+                        handoff_request_digest = None
+                    log_unclaimed = bool(
+                        handoff_log is not None
+                        and handoff_log.task_retry_count is None
+                        and handoff_log.task_turn_generation is None
+                    )
+                    log_same_claim = bool(
+                        handoff_log is not None
+                        and handoff_log.task_retry_count
+                        == queued_turn_generation.retry_count
+                        and handoff_log.task_turn_generation
+                        == queued_turn_generation.turn_generation
+                        and handoff_log.turn_scope in (None, "source")
+                    )
+                    if (
+                        handoff_receipt is None
+                        or handoff_receipt.status
+                        not in ({"claimed"} if worker_handoff_retry else {"accepted"})
+                        or handoff_receipt.retry_count
+                        != msg.worker_turn_handoff_retry_count
+                        or handoff_receipt.from_generation
+                        != msg.worker_turn_handoff_from_generation
+                        or not isinstance(handoff_receipt.queue_payload, dict)
+                        or handoff_receipt.queue_payload_digest
+                        != handoff_payload_digest
+                        or handoff_receipt.request_digest
+                        != handoff_request_digest
+                        or not _worker_handoff_message_matches_payload(
+                            msg,
+                            handoff_receipt.queue_payload,
+                        )
+                        or (worker_handoff_retry and not log_same_claim)
+                        or (not worker_handoff_retry and not log_unclaimed)
+                    ):
+                        await db.rollback()
+                        raise QueuedMessageRoutingMismatchError(
+                            "Worker turn handoff durable receipt changed"
+                        )
+                    # Bind the immutable user row and receipt to logical G+1.
+                    # ``claimed`` is the only post-claim receipt state eligible
+                    # for replay, provided the exact source still has no
+                    # durable actual_transport.
+                    if worker_handoff_retry and handoff_log.turn_scope is None:
+                        # Upgrade the pre-turn-scope durable Worker receipt in
+                        # place. Its exact claimed generation and immutable
+                        # digest are proven above, so binding must not invent a
+                        # cross-generation alias for this compatibility case.
+                        handoff_log.turn_scope = "source"
+                    handoff_receipt.status = "claimed"
+                    handoff_receipt.claimed_turn_generation = (
+                        queued_turn_generation.turn_generation
+                    )
+                    handoff_receipt.updated_at = datetime.utcnow()
                 cleanup_state["has_temp_skills"] = bool(msg.command_skills)
                 if monitor_log is not None:
                     db.add(monitor_log)
+                    await db.flush()
                 if msg.delivery_key is not None:
                     from backend.models.plan import PlanApplicationReceipt
 
@@ -13434,6 +21318,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 "task_id": task_id,
                                 "instance_id": inst.id,
                                 "retry_count": queued_turn_generation.retry_count,
+                                "turn_generation": (
+                                    queued_turn_generation.turn_generation
+                                ),
                                 "started_at": (
                                     queued_turn_generation.started_at.isoformat()
                                     if queued_turn_generation.started_at is not None
@@ -13444,6 +21331,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                                 "provider": task_provider,
                                 "model": current_effective_model,
                                 "service_tier": task.codex_service_tier,
+                                "pre_status": status_before_launch,
+                                "pre_instance_id": instance_id_before_launch,
+                                "pre_completed_at": (
+                                    completed_at_before_launch.isoformat()
+                                    if completed_at_before_launch is not None
+                                    else None
+                                ),
                             },
                             updated_at=datetime.utcnow(),
                         )
@@ -13453,18 +21347,323 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         raise QueuedMessagePrelaunchError(
                             "Plan application delivery fence changed"
                         )
-                await db.commit()
-                if monitor_log is not None:
-                    msg.source_log_id = monitor_log.id
-                    launch_kwargs["source_log_id"] = monitor_log.id
-                    if broadcast_data is not None:
+                from backend.services.terminal_arbitration import (
+                    bind_turn_source,
+                )
+
+                source_log_id = (
+                    monitor_log.id
+                    if monitor_log is not None
+                    else msg.source_log_id
+                )
+                bound_source = await bind_turn_source(
+                    db,
+                    task=task,
+                    source_log_id=source_log_id,
+                    instance_id=inst.id,
+                    transport=_turn_transport_name(task),
+                )
+                if (
+                    capability_turn_claim is not None
+                    and bound_source.id != capability_turn_claim.source_log_id
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Capability resume bound a different exact turn source"
+                    )
+                launch_source_log_id = (
+                    source_log_id
+                    if source_log_id is not None
+                    else bound_source.id
+                )
+                admission_session_id = task.session_id
+                admission_service_tier = task.codex_service_tier
+
+                def remember_committed_claim() -> None:
+                    msg.claimed_retry_count = queued_turn_generation.retry_count
+                    msg.claimed_turn_generation = (
+                        queued_turn_generation.turn_generation
+                    )
+                    if msg.worker_turn_handoff_id is not None:
+                        msg.worker_turn_handoff_claimed_generation = (
+                            queued_turn_generation.turn_generation
+                        )
+                    # Preserve a real externally meaningful source id.  A
+                    # source-less internal wake instead launches against its
+                    # hidden bound alias so InstanceManager never receives an
+                    # ambiguous ``None`` turn identity.
+                    launch_kwargs["source_log_id"] = launch_source_log_id
+                    if monitor_log is not None:
+                        msg.source_log_id = monitor_log.id
+
+                commit, commit_cancellation = await _settle_despite_cancellation(
+                    db.commit()
+                )
+                commit_error: BaseException | None = None
+                try:
+                    commit.result()
+                except BaseException as exc:
+                    commit_error = exc
+                    # This session cannot tell whether the server committed and
+                    # only lost the acknowledgement.  Make it unusable before
+                    # consulting a fresh connection for durable truth.
+                    async def discard_unknown_session() -> None:
+                        try:
+                            await db.rollback()
+                        except BaseException:
+                            pass
+                        try:
+                            await db.close()
+                        except BaseException:
+                            pass
+
+                    discard, discard_cancellation = (
+                        await _settle_despite_cancellation(
+                            discard_unknown_session()
+                        )
+                    )
+                    discard.result()
+                    commit_cancellation = (
+                        commit_cancellation or discard_cancellation
+                    )
+
+                reconciliation_cancellation = None
+                if commit_error is not None or commit_cancellation is not None:
+                    reconciliation, outer_reconciliation_cancellation = (
+                        await _settle_despite_cancellation(
+                            self._reconcile_queued_admission_commit(
+                                msg=msg,
+                                admitted_generation=queued_turn_generation,
+                                session_id=admission_session_id,
+                                bound_source_id=bound_source.id,
+                                request_source_log_id=source_log_id,
+                                status_before_launch=status_before_launch,
+                                instance_id_before_launch=(
+                                    instance_id_before_launch
+                                ),
+                                completed_at_before_launch=(
+                                    completed_at_before_launch
+                                ),
+                                provider=task_provider,
+                                model=current_effective_model,
+                                service_tier=admission_service_tier,
+                            )
+                        )
+                    )
+                    try:
+                        reconciled, inner_reconciliation_cancellation = (
+                            reconciliation.result()
+                        )
+                    except BaseException as exc:
+                        raise QueuedAdmissionCommitOutcomeUncertainError(
+                            "Queued turn admission reconciliation failed"
+                        ) from exc
+                    reconciliation_cancellation = (
+                        outer_reconciliation_cancellation
+                        or inner_reconciliation_cancellation
+                    )
+                    if not reconciled:
+                        raise QueuedAdmissionCommitOutcomeUncertainError(
+                            "Queued turn admission commit could not be reconciled"
+                        ) from commit_error
+                    remember_committed_claim()
+                    if broadcast_data is not None and monitor_log is not None:
                         broadcast_data = persisted_chat_event(
                             monitor_log,
                             broadcast_data,
                         )
+                        broadcast, broadcast_cancellation = (
+                            await _settle_despite_cancellation(
+                                self.broadcaster.broadcast(
+                                    f"task:{task_id}",
+                                    broadcast_data,
+                                )
+                            )
+                        )
+                        try:
+                            broadcast.result()
+                        except Exception:
+                            # The row is already durable and will appear after
+                            # history reload.  Mark this exact queue object as
+                            # logged so its retry cannot create a duplicate
+                            # monitor/sub-agent user row.
+                            logger.exception(
+                                "Could not broadcast reconciled queued source "
+                                "for task %s",
+                                task_id,
+                            )
+                        msg.source_logged = True
+                    else:
+                        broadcast_cancellation = None
+                    cancellation = (
+                        commit_cancellation
+                        or reconciliation_cancellation
+                        or broadcast_cancellation
+                    )
+                    if cancellation is not None:
+                        raise cancellation
+                    raise QueuedMessagePrelaunchError(
+                        "Queued turn admission committed but its acknowledgement "
+                        "was lost; preserving the exact claimed generation"
+                    ) from commit_error
+
+                remember_committed_claim()
+                if monitor_log is not None and broadcast_data is not None:
+                    broadcast_data = persisted_chat_event(
+                        monitor_log,
+                        broadcast_data,
+                    )
             if broadcast_data is not None:
                 await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)
                 msg.source_logged = True
+
+            async def mark_launch_boundary() -> None:
+                """Record the last point before any provider side effect.
+
+                InstanceManager invokes this callback for every concrete
+                transport immediately before the first external launch.  The
+                in-memory flag is therefore authoritative for ordinary and
+                Plan-only messages too: a transport may clean up its process
+                maps before propagating a post-boundary error, so an empty map
+                alone is never sufficient proof that replay is safe.
+                """
+
+                if worker_handoff_boundary["crossed"]:
+                    return
+                if queued_turn_generation is None:
+                    raise QueuedMessagePrelaunchError(
+                        "Queued turn lost its exact provider launch generation"
+                    )
+
+                # This is the final durable provider-boundary permit, after
+                # account/session routing and after InstanceManager has taken
+                # its exact launch reservation.  Receipt admission locks this
+                # same Task row before publishing active_task_id.  If it won,
+                # the provider call is refused; if this permit won, a later
+                # receipt cleanup waits on InstanceManager's lifecycle barrier
+                # and terminates the exact process generation instead of
+                # pretending the queued turn never launched.
+                async with self.db_factory() as permit_db:
+                    provider_permit = await permit_db.execute(
+                        update(Task)
+                        .where(
+                            *self._task_status_generation_predicates(
+                                queued_turn_generation
+                            ),
+                            no_active_worker_task_termination_predicate(),
+                        )
+                        .values(status=queued_turn_generation.status)
+                    )
+                    if provider_permit.rowcount != 1:
+                        await permit_db.rollback()
+                        raise QueuedMessagePrelaunchError(
+                            "Queued provider launch is blocked by an active "
+                            "Worker termination receipt or newer Task generation"
+                        )
+                    await permit_db.commit()
+                if msg.capability_resume_outbox_id is not None:
+                    from backend.services.capability_resume import (
+                        mark_resume_launch_boundary_in_tx,
+                    )
+
+                    # InstanceManager writes source.actual_transport before it
+                    # invokes this callback.  From here onward the external
+                    # effect may already exist even if outbox promotion loses
+                    # its commit acknowledgement.
+                    worker_handoff_boundary["crossed"] = True
+                    async def promote_resume_boundary() -> bool:
+                        async with self.db_factory() as boundary_db:
+                            fence = await boundary_db.execute(
+                                update(Task)
+                                .where(
+                                    *self._task_status_generation_predicates(
+                                        queued_turn_generation
+                                    ),
+                                    no_active_worker_task_termination_predicate(),
+                                )
+                                .values(status=Task.status)
+                            )
+                            if fence.rowcount != 1:
+                                await boundary_db.rollback()
+                                return False
+                            boundary_task = await boundary_db.get(
+                                Task,
+                                task_id,
+                                populate_existing=True,
+                            )
+                            if boundary_task is None:
+                                await boundary_db.rollback()
+                                return False
+                            changed = await mark_resume_launch_boundary_in_tx(
+                                boundary_db,
+                                task=boundary_task,
+                                outbox_id=msg.capability_resume_outbox_id,
+                                retry_count=queued_turn_generation.retry_count,
+                                turn_generation=(
+                                    queued_turn_generation.turn_generation
+                                ),
+                                source_log_id=bound_source.id,
+                            )
+                            if changed:
+                                await boundary_db.commit()
+                            else:
+                                await boundary_db.rollback()
+                            return changed
+
+                    promoted, cancellation = await _settle_despite_cancellation(
+                        promote_resume_boundary()
+                    )
+                    try:
+                        promotion_succeeded = promoted.result()
+                    except Exception as exc:
+                        raise QueuedTurnLaunchOutcomeUncertainError(
+                            "Capability resume crossed the provider boundary "
+                            "but its outbox promotion failed"
+                        ) from exc
+                    if not promotion_succeeded:
+                        raise QueuedTurnLaunchOutcomeUncertainError(
+                            "Capability resume provider boundary could not be "
+                            "reconciled with its durable outbox"
+                        )
+                    if cancellation is not None:
+                        raise cancellation
+                    return
+                if msg.worker_turn_handoff_id is not None:
+                    transition, cancellation = await _settle_despite_cancellation(
+                        self._persist_worker_handoff_transition(
+                            task_id=task_id,
+                            source_log_id=msg.source_log_id,
+                            handoff_id=msg.worker_turn_handoff_id,
+                            retry_count=msg.worker_turn_handoff_retry_count,
+                            from_generation=(
+                                msg.worker_turn_handoff_from_generation
+                            ),
+                            claimed_turn_generation=(
+                                msg.worker_turn_handoff_claimed_generation
+                            ),
+                            expected_status="claimed",
+                            next_status="launching",
+                        )
+                    )
+                    try:
+                        transition.result()
+                    except Exception as exc:
+                        raise QueuedMessagePrelaunchError(
+                            "Could not persist the exact Worker launch boundary"
+                        ) from exc
+                    worker_handoff_boundary["crossed"] = True
+                    if cancellation is not None:
+                        raise cancellation
+                    return
+                worker_handoff_boundary["crossed"] = True
+
+            if msg.worker_turn_handoff_id is not None:
+                assert queued_turn_generation is not None
+                assert msg.source_log_id is not None
+                assert msg.worker_turn_handoff_retry_count is not None
+                assert msg.worker_turn_handoff_from_generation is not None
+                assert msg.worker_turn_handoff_claimed_generation is not None
+            launch_kwargs["on_launch_admitted"] = mark_launch_boundary
 
             # Claim the instance across the launch window: launch() only flips
             # its DB status to "running" once the PTY session is fully spawned,
@@ -13473,13 +21672,167 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             # finally so a failed launch can't leak the claim and wedge the
             # instance out of the dispatch pool forever.
             try:
-                await self.instance_manager.launch(**launch_kwargs)
-            except asyncio.CancelledError:
-                # Stop/cancel owns the exact executing generation. Do not race
-                # its termination CAS by publishing a synthetic terminal or
-                # rolling the Task back to an earlier status.
-                await db.rollback()
-                raise
+                if msg.capability_resume_outbox_id is not None:
+                    # _process_queued_message already owns the Capability
+                    # Phase-1 fence before any Instance reservation. Re-taking
+                    # this non-reentrant lock would deadlock the queue worker.
+                    await self.instance_manager.launch(**launch_kwargs)
+                    # Tests/embedders may return without calling the real
+                    # boundary hook. A successful return is already past that
+                    # boundary, so promote while the same lock is held.
+                    if not worker_handoff_boundary["crossed"]:
+                        await mark_launch_boundary()
+                else:
+                    await self.instance_manager.launch(**launch_kwargs)
+                    # Tests and third-party InstanceManager stand-ins may accept
+                    # arbitrary kwargs without invoking the real boundary hook.
+                    if not worker_handoff_boundary["crossed"]:
+                        await mark_launch_boundary()
+                if msg.worker_turn_handoff_id is not None:
+                    settled, settlement_cancellation = (
+                        await _settle_despite_cancellation(
+                            self._persist_worker_handoff_transition(
+                                task_id=task_id,
+                                source_log_id=msg.source_log_id,
+                                handoff_id=msg.worker_turn_handoff_id,
+                                retry_count=msg.worker_turn_handoff_retry_count,
+                                from_generation=(
+                                    msg.worker_turn_handoff_from_generation
+                                ),
+                                claimed_turn_generation=(
+                                    msg.worker_turn_handoff_claimed_generation
+                                ),
+                                expected_status="launching",
+                                next_status="launched",
+                            )
+                        )
+                    )
+                    try:
+                        settled.result()
+                    except Exception as exc:
+                        raise WorkerTurnLaunchOutcomeUncertainError(
+                            "Worker launch succeeded but its durable receipt "
+                            "could not be finalized"
+                        ) from exc
+                    worker_handoff_boundary["settled"] = True
+                    if settlement_cancellation is not None:
+                        raise settlement_cancellation
+            except asyncio.CancelledError as cancellation:
+                # Before the provider boundary, a durable Plan/Worker envelope
+                # can safely reopen this exact G. Ordinary messages have no
+                # restart outbox, so leaving their admitted Task as executing
+                # would make startup cleanup run the Task description instead.
+                proof, proof_cancellation = await _settle_despite_cancellation(
+                    self._queued_turn_preflight_replay_proof(
+                        admitted_generation=queued_turn_generation,
+                        session_id=admission_session_id,
+                        bound_source_id=bound_source.id,
+                    )
+                )
+                try:
+                    source_preflight_proven, durable_transport = proof.result()
+                except BaseException:
+                    source_preflight_proven = False
+                    durable_transport = None
+                    logger.exception(
+                        "Could not prove cancelled queued turn %s remained "
+                        "before provider admission",
+                        task_id,
+                    )
+                if (
+                    not worker_handoff_boundary["crossed"]
+                    and source_preflight_proven
+                    and (
+                        msg.delivery_key is not None
+                        or msg.worker_turn_handoff_id is not None
+                        or msg.capability_resume_outbox_id is not None
+                    )
+                ):
+                    reconciliation, delayed_cancellation = (
+                        await _settle_despite_cancellation(
+                            self._reconcile_queued_admission_commit(
+                                msg=msg,
+                                admitted_generation=queued_turn_generation,
+                                session_id=admission_session_id,
+                                bound_source_id=bound_source.id,
+                                request_source_log_id=source_log_id,
+                                status_before_launch=status_before_launch,
+                                instance_id_before_launch=(
+                                    instance_id_before_launch
+                                ),
+                                completed_at_before_launch=(
+                                    completed_at_before_launch
+                                ),
+                                provider=task_provider,
+                                model=current_effective_model,
+                                service_tier=admission_service_tier,
+                            )
+                        )
+                    )
+                    try:
+                        reconciled, inner_cancellation = reconciliation.result()
+                    except BaseException:
+                        reconciled = False
+                        inner_cancellation = None
+                        logger.exception(
+                            "Could not reconcile cancelled pre-boundary queued "
+                            "turn for task %s",
+                            task_id,
+                        )
+                    if reconciled:
+                        raise (
+                            delayed_cancellation
+                            or inner_cancellation
+                            or proof_cancellation
+                            or cancellation
+                        )
+
+                reason = (
+                    "Queued turn was interrupted after its provider-effect "
+                    "boundary; automatic replay was blocked"
+                    if (
+                        worker_handoff_boundary["crossed"]
+                        or durable_transport is not None
+                    )
+                    else "Queued message was interrupted after admission but "
+                    "has no durable replay receipt; automatic replay was blocked"
+                )
+                settlement, delayed_cancellation = (
+                    await _settle_despite_cancellation(
+                        self._fail_unreplayable_queued_launch(
+                            msg=msg,
+                            admitted_generation=queued_turn_generation,
+                            session_id=admission_session_id,
+                            bound_source_id=bound_source.id,
+                            reason=reason,
+                        )
+                    )
+                )
+                try:
+                    failed_generation = settlement.result()
+                except BaseException:
+                    failed_generation = None
+                    logger.exception(
+                        "Could not fail-close cancelled queued turn for task %s",
+                        task_id,
+                    )
+                if failed_generation is not None:
+                    try:
+                        await self._broadcast_task_status_generation(
+                            failed_generation,
+                            instance_id=inst_id,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not broadcast cancelled queued-turn failure "
+                            "for task %s",
+                            task_id,
+                        )
+                raise (
+                    delayed_cancellation
+                    or proof_cancellation
+                    or cancellation
+                )
             except Exception as exc:
                 from backend.services.codex_app_server import (
                     CodexAppServerBusyError,
@@ -13491,6 +21844,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     CloudRouterAccountError,
                     CloudRouterUnsafePathError,
                 )
+
+                # Receipt recovery owns this exact Task generation and its
+                # launch reservation.  In particular, the provider-boundary
+                # callback can observe a receipt committed after queued
+                # admission.  Do not "repair" that deliberate refusal into a
+                # retry or generic failure: the receipt executor will abort
+                # this queue worker and terminate/settle the exact generation.
+                if await active_worker_task_termination_receipt(db, task_id):
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Queued provider launch yielded to an active Worker "
+                        "termination receipt"
+                    ) from exc
 
                 # Known routing/admission errors cannot have started this turn.
                 # For arbitrary spawn failures, the absence of this exact
@@ -13509,9 +21875,122 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     ),
                 )
                 permanent_prelaunch = isinstance(exc, CloudRouterAccountError)
+                try:
+                    (
+                        source_preflight_proven,
+                        durable_transport,
+                    ) = await self._queued_turn_preflight_replay_proof(
+                        admitted_generation=queued_turn_generation,
+                        session_id=admission_session_id,
+                        bound_source_id=bound_source.id,
+                    )
+                except Exception:
+                    source_preflight_proven = False
+                    durable_transport = None
+                    logger.exception(
+                        "Could not prove queued turn %s remained before "
+                        "provider admission after launch failure",
+                        task_id,
+                    )
+                handoff_prelaunch_proven = msg.worker_turn_handoff_id is None
+                capability_prelaunch_proven = (
+                    msg.capability_resume_outbox_id is None
+                )
+                if (
+                    msg.capability_resume_outbox_id is not None
+                    and not worker_handoff_boundary["crossed"]
+                    and isinstance(msg.capability_resume_lease_token, str)
+                ):
+                    try:
+                        from backend.services.capability_resume import (
+                            load_resume_envelope,
+                        )
+
+                        capability_envelope = await load_resume_envelope(
+                            db,
+                            msg.capability_resume_outbox_id,
+                            expected_lease_token=(
+                                msg.capability_resume_lease_token
+                            ),
+                        )
+                        capability_prelaunch_proven = bool(
+                            capability_envelope is not None
+                            and capability_envelope.status == "claimed"
+                            and capability_envelope.claimed_generation
+                            == queued_turn_generation.turn_generation
+                            and capability_envelope.source_log_id
+                            == bound_source.id
+                        )
+                    except Exception:
+                        await db.rollback()
+                        capability_prelaunch_proven = False
+                        logger.exception(
+                            "Could not prove Capability resume %s remained "
+                            "prelaunch",
+                            msg.capability_resume_outbox_id,
+                        )
+                exact_handoff_status: str | None = None
+                if (
+                    msg.worker_turn_handoff_id is not None
+                    and not worker_handoff_boundary["crossed"]
+                ):
+                    try:
+                        # Keep this proof and the Task rollback in the same
+                        # transaction.  ``FOR UPDATE`` prevents a concurrent
+                        # cancellation/transition from invalidating the proof
+                        # before the generation is made replayable again.  The
+                        # proof is required even when InstanceManager rejected
+                        # the launch before invoking the boundary callback:
+                        # explicit cancel can race ``claimed -> cancelled`` in
+                        # that earlier window too.
+                        exact_handoff_status = (
+                            await db.execute(
+                                select(WorkerTurnHandoffReceipt.status)
+                                .where(
+                                    WorkerTurnHandoffReceipt.handoff_id
+                                    == msg.worker_turn_handoff_id,
+                                    WorkerTurnHandoffReceipt.task_id == task_id,
+                                    WorkerTurnHandoffReceipt.source_log_id
+                                    == msg.source_log_id,
+                                    WorkerTurnHandoffReceipt.side == "worker",
+                                    WorkerTurnHandoffReceipt.retry_count
+                                    == msg.worker_turn_handoff_retry_count,
+                                    WorkerTurnHandoffReceipt.from_generation
+                                    == msg.worker_turn_handoff_from_generation,
+                                    WorkerTurnHandoffReceipt.claimed_turn_generation
+                                    == msg.worker_turn_handoff_claimed_generation,
+                                )
+                                .with_for_update()
+                            )
+                        ).scalar_one_or_none()
+                        handoff_prelaunch_proven = (
+                            exact_handoff_status == "claimed"
+                        )
+                    except Exception:
+                        # Losing the ability to determine the durable state is
+                        # itself an uncertain launch outcome.  Roll back the
+                        # failed read and continue below on the fail-closed
+                        # path using a fresh transaction.
+                        logger.exception(
+                            "Could not prove Worker handoff %s remained "
+                            "prelaunch after its boundary transition failed",
+                            msg.worker_turn_handoff_id,
+                        )
+                        await db.rollback()
+                        handoff_prelaunch_proven = False
                 safe_to_retry = (
-                    known_prelaunch
-                    or self.instance_manager.processes.get(inst_id) is None
+                    not worker_handoff_boundary["crossed"]
+                    and source_preflight_proven
+                    and handoff_prelaunch_proven
+                    and capability_prelaunch_proven
+                    and not (
+                        msg.capability_resume_outbox_id is not None
+                        and permanent_prelaunch
+                    )
+                    and (
+                        known_prelaunch
+                        or self.instance_manager.processes.get(inst_id) is None
+                    )
                 )
                 permanent_notice_data = None
                 rollback_values = {
@@ -13541,9 +22020,49 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         ),
                         Task.worker_id.is_(None),
                         Task.shared_from_id.is_(None),
+                        no_active_worker_task_termination_predicate(),
                     )
                     .values(**rollback_values)
                 )
+                if restored.rowcount != 1:
+                    await db.rollback()
+                    raise QueuedMessagePrelaunchError(
+                        "Queued provider launch yielded to an active Worker "
+                        "termination receipt or newer Task generation"
+                    ) from exc
+                if (
+                    not safe_to_retry
+                    and msg.worker_turn_handoff_id is not None
+                    and exact_handoff_status == "claimed"
+                ):
+                    # A durable transport (or another unproven process
+                    # generation) can exist even though the receipt callback
+                    # never acknowledged claimed -> launching.  Settle that
+                    # stale label before committing the Task failure so
+                    # runtime/startup outbox scans cannot retry it.
+                    await db.execute(
+                        update(WorkerTurnHandoffReceipt)
+                        .where(
+                            WorkerTurnHandoffReceipt.handoff_id
+                            == msg.worker_turn_handoff_id,
+                            WorkerTurnHandoffReceipt.task_id == task_id,
+                            WorkerTurnHandoffReceipt.source_log_id
+                            == msg.source_log_id,
+                            WorkerTurnHandoffReceipt.side == "worker",
+                            WorkerTurnHandoffReceipt.retry_count
+                            == msg.worker_turn_handoff_retry_count,
+                            WorkerTurnHandoffReceipt.from_generation
+                            == msg.worker_turn_handoff_from_generation,
+                            WorkerTurnHandoffReceipt.claimed_turn_generation
+                            == msg.worker_turn_handoff_claimed_generation,
+                            WorkerTurnHandoffReceipt.status == "claimed",
+                        )
+                        .values(
+                            status="launching",
+                            updated_at=datetime.utcnow(),
+                        )
+                    )
+                    worker_handoff_boundary["crossed"] = True
                 failed_generation = None
                 if not safe_to_retry and restored.rowcount:
                     failed_generation = await self._read_task_status_generation(
@@ -13605,6 +22124,36 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             updated_at=datetime.utcnow(),
                         )
                     )
+                if (
+                    not safe_to_retry
+                    and msg.capability_resume_outbox_id is not None
+                ):
+                    from backend.services.capability_resume import (
+                        fail_or_cancel_resume_outbox_in_tx,
+                    )
+
+                    failed_task = await db.get(
+                        Task,
+                        task_id,
+                        populate_existing=True,
+                    )
+                    if failed_task is None:
+                        await db.rollback()
+                        raise QueuedTurnLaunchOutcomeUncertainError(
+                            "Capability resume Task disappeared during failure "
+                            "settlement"
+                        ) from exc
+                    await fail_or_cancel_resume_outbox_in_tx(
+                        db,
+                        task=failed_task,
+                        outbox_id=msg.capability_resume_outbox_id,
+                        status="failed",
+                        error_code="resume_launch_uncertain",
+                        error_message=(
+                            "Capability resume launch could not be proven "
+                            f"pre-boundary: {exc}"
+                        ),
+                    )
                 await db.commit()
                 if permanent_notice_data is not None:
                     await self.broadcaster.broadcast(
@@ -13621,6 +22170,22 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     raise QueuedMessagePrelaunchError(
                         f"Queued message launch failed before process creation: {exc}"
                     ) from exc
+                if (
+                    msg.worker_turn_handoff_id is not None
+                    and not safe_to_retry
+                ):
+                    raise WorkerTurnLaunchOutcomeUncertainError(
+                        "Worker launch failed without durable proof that its "
+                        f"external-effect boundary remained un-crossed: {exc}"
+                    ) from exc
+                if (
+                    worker_handoff_boundary["crossed"]
+                    or durable_transport is not None
+                ) and not safe_to_retry:
+                    raise QueuedTurnLaunchOutcomeUncertainError(
+                        "Queued turn launch failed after its provider-effect "
+                        f"boundary was crossed: {exc}"
+                    ) from exc
                 raise
             finally:
                 await self._release_instance_reservation(inst_id, claim_token)
@@ -13628,19 +22193,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
             await self._mark_plan_delivery(msg.delivery_key, "launched")
 
-            await self.broadcaster.broadcast(
-                "tasks",
-                {
-                    "event": "status_change",
-                    "task_id": task_id,
-                    "new_status": "executing",
-                    "instance_id": inst_id,
-                },
+            await self._broadcast_task_status_generation(
+                queued_turn_generation,
+                instance_id=inst_id,
             )
         # DB session closed — process runs independently
         if launch_admission["held"]:
             launch_admission["held"] = False
             self._chat_launch_admission_lock.release()
+
+        # Provider admission and all Phase-1 launch cleanup are durable.
+        # InstanceManager's terminal consumer needs this same lock to settle
+        # the previous outbox and optionally admit a following capability.
+        self._release_capability_resume_phase_fence(cleanup_state)
 
         # Phase 2: wait for process to finish (no DB held)
         try:

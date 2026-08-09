@@ -90,6 +90,16 @@ async def test_create_monitor_session(client, session_factory):
     assert data["max_checks"] == 10
     assert data["task_id"] == task_id
     mock_dispatcher.start_monitor_session.assert_called_once()
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_created",
+            "monitor_session_id": data["id"],
+            "description": "watch build",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -742,6 +752,16 @@ async def test_delete_monitor_session(client, session_factory):
         ms_id,
         terminal=True,
     )
+    mock_dispatcher.broadcaster.broadcast.assert_awaited_once_with(
+        f"task:{task_id}",
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": ms_id,
+            "status": "cancelled",
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
 
     async with session_factory() as db:
         ms = await db.get(MonitorSession, ms_id)
@@ -867,6 +887,7 @@ async def test_monitor_complete_loses_cas_to_concurrent_cancel(
     callback_ready = asyncio.Event()
     release_callback = asyncio.Event()
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
 
@@ -959,6 +980,7 @@ async def test_sub_agent_result_loses_cas_to_concurrent_stop(
     callback_ready = asyncio.Event()
     release_callback = asyncio.Event()
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_sub_agent_session_process = AsyncMock()
@@ -1055,6 +1077,7 @@ async def test_late_progress_callbacks_do_not_write_after_terminal_state(
         sub_agent_id = sub_agent.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
@@ -1184,6 +1207,7 @@ async def test_monitor_checks_increment_atomically_and_auto_complete(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_monitor_session_process = AsyncMock()
@@ -1254,6 +1278,7 @@ async def test_monitor_callback_requires_exact_active_turn_generation(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     with patch("backend.main.dispatcher", dispatcher):
@@ -1352,6 +1377,7 @@ async def test_sub_agent_progress_then_result_uses_unique_report_numbers(
         session_id = session.id
 
     dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
     dispatcher.broadcaster.broadcast = AsyncMock()
     dispatcher.enqueue_message = AsyncMock()
     dispatcher.stop_sub_agent_session_process = AsyncMock()

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 
 from backend.config import settings
 from backend.database import async_session
@@ -305,6 +305,57 @@ class TestHarnessService:
         )
         async with self._lock:
             async with self.db_factory() as db:
+                task_incarnation_id: str | None = None
+                if task_id is not None:
+                    owner = (
+                        await db.execute(
+                            select(Task)
+                            .where(Task.id == task_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if owner is None or not owner.incarnation_id:
+                        raise TestHarnessError(
+                            "Harness owner Task disappeared or lacks an incarnation"
+                        )
+                    owner_fence = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task_id,
+                            Task.incarnation_id == owner.incarnation_id,
+                        )
+                        .values(incarnation_id=owner.incarnation_id)
+                    )
+                    if owner_fence.rowcount != 1:
+                        raise TestHarnessError(
+                            "Harness owner Task changed during run admission"
+                        )
+                    # Freeze configuration from the same owner generation that
+                    # owns the Run insert. The optimistic read performed by
+                    # ``start_task_run`` is never an execution authority.
+                    project_id = owner.project_id
+                    runtime = self._runtime_for_task(owner, spec)
+                    fingerprint = request_fingerprint(
+                        target_kind=spec.target_kind,
+                        target=spec.target,
+                        test_plan=plan,
+                        runtime=runtime,
+                    )
+                    task_incarnation_id = owner.incarnation_id
+                    if spec.target_kind in {"pull_request", "git_ref"}:
+                        project = (
+                            await db.get(Project, owner.project_id)
+                            if owner.project_id
+                            else None
+                        )
+                        capability = await untrusted_git_target_capability(
+                            project=project,
+                        )
+                        if not capability.available:
+                            raise TestHarnessError(
+                                capability.reason
+                                or "PR/ref sandbox target is unavailable"
+                            )
                 if spec.idempotency_key:
                     existing = await db.scalar(
                         select(TestHarnessRun).where(
@@ -313,7 +364,11 @@ class TestHarnessService:
                         )
                     )
                     if existing is not None:
-                        if existing.request_fingerprint != fingerprint:
+                        if (
+                            existing.request_fingerprint != fingerprint
+                            or existing.task_incarnation_id
+                            != task_incarnation_id
+                        ):
                             raise TestHarnessIdempotencyError(
                                 "idempotency key already belongs to different test input"
                             )
@@ -344,6 +399,7 @@ class TestHarnessService:
                 run = TestHarnessRun(
                     id=run_id,
                     task_id=task_id,
+                    task_incarnation_id=task_incarnation_id,
                     project_id=project_id,
                     owner_user_id=owner_user_id,
                     target_kind=spec.target_kind,
@@ -904,9 +960,55 @@ class TestHarnessService:
         attempt_id = uuid.uuid4().hex
         async with self._db_lock:
             async with self.db_factory() as db:
-                run = await db.get(TestHarnessRun, run_id)
-                if run is None:
+                observed = await db.get(TestHarnessRun, run_id)
+                if (
+                    observed is None
+                    or observed.task_id is None
+                    or not observed.task_incarnation_id
+                ):
                     raise TestHarnessError("Harness run not found")
+                owner = (
+                    await db.execute(
+                        select(Task)
+                        .where(
+                            Task.id == observed.task_id,
+                            Task.incarnation_id
+                            == observed.task_incarnation_id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if owner is None:
+                    raise TestHarnessError("Harness owner Task disappeared")
+                owner_fence = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == owner.id,
+                        Task.incarnation_id == observed.task_incarnation_id,
+                    )
+                    .values(incarnation_id=observed.task_incarnation_id)
+                )
+                if owner_fence.rowcount != 1:
+                    raise TestHarnessError(
+                        "Harness owner Task changed while attaching Browser job"
+                    )
+                run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(TestHarnessRun.id == run_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    run is None
+                    or run.task_id != owner.id
+                    or run.task_incarnation_id != owner.incarnation_id
+                    or run.status in HARNESS_TERMINAL_STATUSES
+                ):
+                    raise TestHarnessError(
+                        "Harness run terminated or changed generation while "
+                        "attaching Browser job"
+                    )
                 existing = await db.scalar(
                     select(TestHarnessAttempt).where(
                         TestHarnessAttempt.run_id == run_id,
@@ -968,17 +1070,23 @@ class TestHarnessService:
     ) -> Any:
         """Attach the fixed-URL adapter to an already persisted harness run."""
 
-        run = await self.get_run_model(run_id)
-        if run is None or run.task_id is None or run.target_kind != "fixed_url":
-            raise TestHarnessError("Fixed URL harness run not found")
-        return await self._start_browser_for_url(
-            run=run,
-            url=str(run.target_spec["url"]),
-            network_policy="external_public",
-            inline=inline,
-            watch_terminal=True,
-            fail_run_on_error=True,
-        )
+        async with self._lock:
+            run = await self.get_run_model(run_id)
+            if (
+                run is None
+                or run.task_id is None
+                or run.target_kind != "fixed_url"
+                or run.status in HARNESS_TERMINAL_STATUSES
+            ):
+                raise TestHarnessError("Fixed URL harness run not found")
+            return await self._start_browser_for_url(
+                run=run,
+                url=str(run.target_spec["url"]),
+                network_policy="external_public",
+                inline=inline,
+                watch_terminal=True,
+                fail_run_on_error=True,
+            )
 
     async def start_managed_preview_browser(
         self,
@@ -986,21 +1094,23 @@ class TestHarnessService:
         run_id: str,
         url: str,
     ) -> Any:
-        run = await self.get_run_model(run_id)
-        if (
-            run is None
-            or run.task_id is None
-            or run.target_kind not in {"pull_request", "git_ref"}
-        ):
-            raise TestHarnessError("Git target Harness run not found")
-        return await self._start_browser_for_url(
-            run=run,
-            url=url,
-            network_policy="managed_preview",
-            inline=False,
-            watch_terminal=False,
-            fail_run_on_error=False,
-        )
+        async with self._lock:
+            run = await self.get_run_model(run_id)
+            if (
+                run is None
+                or run.task_id is None
+                or run.target_kind not in {"pull_request", "git_ref"}
+                or run.status in HARNESS_TERMINAL_STATUSES
+            ):
+                raise TestHarnessError("Git target Harness run not found")
+            return await self._start_browser_for_url(
+                run=run,
+                url=url,
+                network_policy="managed_preview",
+                inline=False,
+                watch_terminal=False,
+                fail_run_on_error=False,
+            )
 
     async def _start_browser_for_url(
         self,
@@ -1015,8 +1125,42 @@ class TestHarnessService:
         run_id = run.id
         assert run.task_id is not None
         async with self.db_factory() as db:
-            task = await db.get(Task, run.task_id)
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == run.task_id,
+                        Task.incarnation_id == run.task_incarnation_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if task is None:
+                raise TestHarnessError("Harness owner Task disappeared")
+            owner_fence = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == task.id,
+                    Task.incarnation_id == run.task_incarnation_id,
+                )
+                .values(incarnation_id=run.task_incarnation_id)
+            )
+            if owner_fence.rowcount != 1:
+                raise TestHarnessError(
+                    "Harness owner Task changed before Browser admission"
+                )
+            durable_run = (
+                await db.execute(
+                    select(TestHarnessRun)
+                    .where(TestHarnessRun.id == run_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if (
+                durable_run is None
+                or durable_run.status in HARNESS_TERMINAL_STATUSES
+                or durable_run.task_incarnation_id != run.task_incarnation_id
+            ):
                 raise TestHarnessError("Harness owner Task disappeared")
             created_by = task.created_by
         runtime = run.runtime_config
@@ -1710,6 +1854,8 @@ class TestHarnessService:
                 "status": "cancelled",
                 "stage": "cancelled",
                 "verdict": "cancelled",
+                "cleanup_status": "completed",
+                "cleanup_error": None,
                 "completed_at": datetime.utcnow(),
             },
             event_type="lifecycle",
@@ -2136,10 +2282,15 @@ class TestHarnessService:
             owner_user_id=owner_user_id,
         )
 
-    async def cleanup_evidence(self) -> int:
-        """Apply TTL and task/global quotas without touching active runs."""
+    async def cleanup_evidence(self, *, required_free_bytes: int = 0) -> int:
+        """Apply TTL/quotas and reserve capacity without touching live evidence."""
 
         cutoff = datetime.utcnow() - timedelta(days=self.artifact_store.retention_days)
+        required = max(0, int(required_free_bytes))
+        retained_global_limit = max(
+            0,
+            self.artifact_store.max_total_bytes - required,
+        )
         removed_keys: list[str] = []
         kept_global = 0
         kept_by_task: dict[int, int] = {}
@@ -2170,7 +2321,7 @@ class TestHarnessService:
                     )
                     exceeds_global = (
                         kept_global + evidence.byte_size
-                        > self.artifact_store.max_total_bytes
+                        > retained_global_limit
                     )
                     if not active and (expired or exceeds_task or exceeds_global):
                         removed_keys.append(evidence.storage_path)
@@ -2203,10 +2354,13 @@ class TestHarnessService:
             from backend.services.browser_review_jobs import browser_review_job_manager
 
             jobs = await browser_review_job_manager.list()
-            # Every in-memory job may still be consumed by its owning pipeline
-            # after the Task itself becomes terminal. Incomplete durable
-            # attempts additionally retain staging across job-history pruning.
-            active_job_ids = {job.id for job in jobs}
+            # Only a nonterminal in-memory job owns a live staging directory.
+            # Terminal jobs are protected solely while their durable archive
+            # is incomplete; retaining all history here caused exact-quota
+            # admission to deadlock forever.
+            active_job_ids = {
+                job.id for job in jobs if job.status not in _BROWSER_TERMINAL
+            }
             active_job_ids.update(protected_staging_job_ids)
         except Exception:
             # Failure to prove which jobs are active must never turn into
@@ -2214,7 +2368,10 @@ class TestHarnessService:
             clean_job_dirs = False
             active_job_ids = set(protected_staging_job_ids)
         if clean_job_dirs:
-            self.artifact_store.cleanup_job_dirs(active_job_ids=active_job_ids)
+            self.artifact_store.cleanup_job_dirs(
+                active_job_ids=active_job_ids,
+                required_free_bytes=required,
+            )
         return len(removed_keys)
 
     async def _retention_loop(self) -> None:

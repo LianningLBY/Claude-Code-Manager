@@ -27,6 +27,48 @@ from backend.services.dispatcher import _build_git_env
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
+
+_DELIVERY_PROJECT_IDENTITY_FIELDS = frozenset(
+    {"git_url", "has_remote", "default_branch"}
+)
+
+
+async def _delivery_run_reference(
+    db: AsyncSession,
+    *,
+    project_id: int,
+    active_only: bool,
+) -> int | None:
+    """Return one Delivery Run whose durable scope depends on this Project."""
+
+    # Keep this import local so the ordinary Project API does not make the
+    # Delivery model part of module-import initialization order.
+    from backend.models.delivery import DeliveryRun
+
+    statement = select(DeliveryRun.id).where(
+        DeliveryRun.project_id == project_id,
+    )
+    if active_only:
+        statement = statement.where(DeliveryRun.activity != "terminal")
+    return (await db.execute(statement.limit(1).with_for_update())).scalar_one_or_none()
+
+
+async def _reject_active_delivery_project_mutation(
+    db: AsyncSession,
+    *,
+    project_id: int,
+) -> None:
+    run_id = await _delivery_run_reference(
+        db,
+        project_id=project_id,
+        active_only=True,
+    )
+    if run_id is not None:
+        raise HTTPException(
+            409,
+            f"Project is frozen while Delivery Run {run_id} is active",
+        )
+
 async def _require_project_access(request: Request, project_id: int, db: AsyncSession):
     """Backward-compatible local alias for the shared Project ACL."""
     await require_project_access(request, project_id, db)
@@ -198,10 +240,29 @@ async def update_project(
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+    await db.rollback()
+    locked = await db.execute(
+        update(Project)
+        .where(Project.id == project_id)
+        .values(id=Project.id)
+    )
+    if locked.rowcount != 1:
+        raise HTTPException(404, "Project not found")
+    project = await db.get(Project, project_id, populate_existing=True)
     updates = body.model_dump(exclude_unset=True)
     # Auto-sync has_remote when git_url is set
     if "git_url" in updates and updates["git_url"] and "has_remote" not in updates:
         updates["has_remote"] = True
+    changed_delivery_identity = {
+        field
+        for field in _DELIVERY_PROJECT_IDENTITY_FIELDS & updates.keys()
+        if updates[field] != getattr(project, field)
+    }
+    if changed_delivery_identity:
+        await _reject_active_delivery_project_mutation(
+            db,
+            project_id=project_id,
+        )
     for key, value in updates.items():
         setattr(project, key, value)
 
@@ -233,10 +294,38 @@ async def delete_project(project_id: int, request: Request, db: AsyncSession = D
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+    await db.rollback()
+    locked = await db.execute(
+        update(Project)
+        .where(Project.id == project_id)
+        .values(id=Project.id)
+    )
+    if locked.rowcount != 1:
+        raise HTTPException(404, "Project not found")
+    project = await db.get(Project, project_id, populate_existing=True)
+    run_id = await _delivery_run_reference(
+        db,
+        project_id=project_id,
+        active_only=False,
+    )
+    if run_id is not None:
+        raise HTTPException(
+            409,
+            f"Cannot delete a Project referenced by Delivery Run {run_id}",
+        )
     # project_todos declares ON DELETE CASCADE, but SQLite does not enforce FKs
     # (no `PRAGMA foreign_keys=ON` in database.py), so the DB won't cascade.
     # Delete the todos explicitly so this works on SQLite too.
+    # Sharing tables also need explicit cleanup: TeamProjectShare has no FK,
+    # and relying on ProjectShare's FK would leave stale grants on SQLite.
+    from backend.models.task_share import ProjectShare
+    from backend.models.team_share import TeamProjectShare
+
     await db.execute(delete(ProjectTodo).where(ProjectTodo.project_id == project_id))
+    await db.execute(delete(ProjectShare).where(ProjectShare.project_id == project_id))
+    await db.execute(delete(TeamProjectShare).where(
+        TeamProjectShare.project_id == project_id
+    ))
     await db.delete(project)
     await db.commit()
     return {"ok": True}
@@ -248,8 +337,23 @@ async def reclone_project(project_id: int, request: Request, db: AsyncSession = 
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+    await db.rollback()
+    project = (
+        await db.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if project is None:
+        raise HTTPException(404, "Project not found")
     if not project.has_remote:
         raise HTTPException(400, "Cannot reclone a local project")
+    await _reject_active_delivery_project_mutation(
+        db,
+        project_id=project_id,
+    )
     project.status = "pending"
     project.error_message = None
     await db.commit()

@@ -34,6 +34,13 @@ class TestHarnessRun(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Freeze the exact Task incarnation that admitted this run. Integer Task
+    # ids are public resource identities and historically could be reused by
+    # some databases after deletion; every later lifecycle commit verifies
+    # this token before attaching an isolated Browser child.
+    task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
     project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     owner_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     workspace_review_run_id: Mapped[str | None] = mapped_column(
@@ -237,12 +244,25 @@ class TestHarnessChildBinding(Base):
         String(32), nullable=True, unique=True, index=True
     )
     owner_task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    owner_task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
     child_task_id: Mapped[int] = mapped_column(
         Integer, nullable=False, unique=True, index=True
+    )
+    child_task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
     )
     browser_review_job_id: Mapped[str] = mapped_column(
         String(32), nullable=False, unique=True, index=True
     )
+    # This tuple is the durable launch authority. The mutable Task projection
+    # is checked against it at queue claim and again at the provider boundary.
+    provider: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    model: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    reasoning_effort: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    codex_service_tier: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    skill_name: Mapped[str | None] = mapped_column(String(80), nullable=True)
     state: Mapped[str] = mapped_column(
         String(24), nullable=False, default="reserved", index=True
     )

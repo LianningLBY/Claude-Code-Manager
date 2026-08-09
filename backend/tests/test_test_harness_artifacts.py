@@ -185,3 +185,30 @@ def test_orphan_and_expired_job_cleanup_is_scoped_to_managed_root(tmp_path):
     assert store.cleanup_job_dirs(now=datetime.now(timezone.utc)) == 1
     assert not job_dir.exists()
     assert outside.read_text(encoding="utf-8") == "keep"
+
+
+def test_exact_quota_admission_reclaims_oldest_unprotected_staging(tmp_path):
+    store = _store(
+        tmp_path,
+        max_file_bytes=8,
+        max_run_bytes=8,
+        max_task_bytes=16,
+        max_total_bytes=16,
+    )
+    oldest = store.create_job_dir("1" * 32)
+    oldest.joinpath("report.md").write_bytes(b"a" * 8)
+    protected = store.create_job_dir("2" * 32)
+    protected.joinpath("report.md").write_bytes(b"b" * 8)
+    old = (datetime.now(timezone.utc) - timedelta(hours=2)).timestamp()
+    new = (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp()
+    os.utime(oldest, (old, old))
+    os.utime(protected, (new, new))
+
+    assert store.total_bytes() == store.max_total_bytes
+    assert store.cleanup_job_dirs(
+        active_job_ids={protected.name},
+        required_free_bytes=1,
+    ) == 1
+    assert not oldest.exists()
+    assert protected.exists()
+    assert store.total_bytes() < store.max_total_bytes

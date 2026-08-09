@@ -173,8 +173,14 @@ class MonitoredRepoResponse(BaseModel):
         return v
 
 
-class MonitoredRepoDetailResponse(MonitoredRepoResponse):
-    """Full detail response — shows unmasked webhook_secret."""
+class MonitoredRepoSecretResponse(MonitoredRepoResponse):
+    """One-time create/rotation response containing the new raw secret.
+
+    Ordinary list, detail, update, and toggle responses always use
+    :class:`MonitoredRepoResponse`, whose validator exposes only a short hint.
+    Keeping the reveal as a distinct response type makes accidental reuse on a
+    read endpoint visible during review.
+    """
 
     # NOTE: must reuse the parent's validator method name ("mask_secret") so it
     # actually overrides it in Pydantic v2; a differently-named validator would

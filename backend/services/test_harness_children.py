@@ -15,7 +15,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.database import async_session
@@ -37,6 +37,7 @@ CHILD_STOPPING = "stopping"
 CHILD_STOPPED = "stopped"
 CHILD_COMPLETED = "completed"
 CHILD_STOP_FAILED = "stop_failed"
+BROWSER_REVIEW_SKILL = "browser-review"
 
 CHILD_TERMINAL_STATES = frozenset({CHILD_STOPPED, CHILD_COMPLETED})
 TASK_TERMINAL_STATUSES = frozenset(
@@ -45,6 +46,13 @@ TASK_TERMINAL_STATUSES = frozenset(
 TASK_ACTIVE_STATUSES = frozenset(
     {"pending_activation", "pending", "in_progress", "executing", "merging"}
 )
+HARNESS_OWNER_TERMINAL_STATES = frozenset(
+    {"cancelling", "completed", "failed", "cancelled", "superseded"}
+)
+WORKSPACE_OWNER_TERMINAL_STATES = frozenset(
+    {"cancelling", "completed", "failed", "cancelled"}
+)
+_UNSET = object()
 
 
 class TestHarnessChildError(RuntimeError):
@@ -56,6 +64,133 @@ class TestHarnessChildRecoveryError(TestHarnessChildError):
 
 
 TaskStopper = Callable[[int], Awaitable[None]]
+
+
+async def browser_child_identity_error(
+    db: AsyncSession,
+    binding: TestHarnessChildBinding,
+    child: Task,
+    *,
+    expected_states: frozenset[str] | set[str] | tuple[str, ...] | None = None,
+    expected_instance_id: int | None | object = _UNSET,
+    expected_retry_count: int | object = _UNSET,
+    lock_related: bool = False,
+) -> str | None:
+    """Return why a durable Browser child is no longer safe to launch.
+
+    The binding, not the public Task projection, is the launch authority.  The
+    owner/run checks make an owner deletion or a stale Task-id incarnation a
+    hard stop even when another process has already selected the child.
+    """
+
+    if expected_states is not None and binding.state not in expected_states:
+        return f"binding state changed to {binding.state}"
+    if binding.child_task_id != child.id:
+        return "binding child identity changed"
+    if (
+        not binding.child_task_incarnation_id
+        or child.incarnation_id != binding.child_task_incarnation_id
+    ):
+        return "child Task incarnation changed"
+    if not binding.owner_task_incarnation_id:
+        return "owner Task incarnation is not frozen"
+    if binding.skill_name != BROWSER_REVIEW_SKILL:
+        return "bound Browser skill identity changed"
+    if not binding.browser_review_job_id:
+        return "bound Browser job identity is missing"
+    if (
+        child.provider != binding.provider
+        or child.model != binding.model
+        or child.effort_level != binding.reasoning_effort
+        or child.codex_service_tier != binding.codex_service_tier
+    ):
+        return "Browser Agent provider/model/effort identity drifted"
+    if child.enabled_skills != {
+        BROWSER_REVIEW_SKILL: binding.browser_review_job_id
+    }:
+        return "Browser Agent skill/job projection drifted"
+    if child.worker_id is not None or child.shared_from_id is not None:
+        return "Browser Agent escaped its local isolated execution scope"
+    if expected_instance_id is not _UNSET and (
+        binding.claimed_instance_id != expected_instance_id
+    ):
+        return "Browser Agent Instance claim changed"
+    if expected_retry_count is not _UNSET and (
+        binding.claimed_retry_count != expected_retry_count
+    ):
+        return "Browser Agent retry generation changed"
+
+    metadata = dict(child.metadata_ or {})
+    expected_metadata = {
+        "browser_review_job_id": binding.browser_review_job_id,
+        "test_harness_run_id": binding.harness_run_id,
+        "workspace_review_run_id": binding.workspace_review_run_id,
+        "test_harness_parent_task_id": binding.owner_task_id,
+        "workspace_review_parent_task_id": binding.owner_task_id,
+        "isolated_browser_agent": True,
+    }
+    if any(metadata.get(key) != value for key, value in expected_metadata.items()):
+        return "Browser Agent durable metadata projection drifted"
+
+    def _stmt(model: type, identity: object):
+        statement = select(model).where(model.id == identity)
+        return statement.with_for_update() if lock_related else statement
+
+    owner = (
+        await db.execute(_stmt(Task, binding.owner_task_id))
+    ).scalar_one_or_none()
+    if owner is None or owner.incarnation_id != binding.owner_task_incarnation_id:
+        return "Browser Agent owner Task disappeared or changed incarnation"
+
+    if binding.harness_run_id:
+        run = (
+            await db.execute(_stmt(TestHarnessRun, binding.harness_run_id))
+        ).scalar_one_or_none()
+        if (
+            run is None
+            or run.task_id != binding.owner_task_id
+            or run.task_incarnation_id != binding.owner_task_incarnation_id
+            or run.status in HARNESS_OWNER_TERMINAL_STATES
+            or run.agent_task_id != child.id
+            or run.browser_review_job_id != binding.browser_review_job_id
+        ):
+            return "Harness run owner/generation is no longer active"
+    if binding.workspace_review_run_id:
+        workspace_run = (
+            await db.execute(
+                _stmt(WorkspaceReviewRun, binding.workspace_review_run_id)
+            )
+        ).scalar_one_or_none()
+        if (
+            workspace_run is None
+            or workspace_run.task_id != binding.owner_task_id
+            or workspace_run.task_incarnation_id
+            != binding.owner_task_incarnation_id
+            or workspace_run.status in WORKSPACE_OWNER_TERMINAL_STATES
+            or workspace_run.agent_task_id != child.id
+            or workspace_run.browser_review_job_id
+            != binding.browser_review_job_id
+        ):
+            return "Workspace review owner/generation is no longer active"
+    return None
+
+
+def fail_browser_child_identity(
+    binding: TestHarnessChildBinding,
+    child: Task,
+    error: str,
+) -> None:
+    """Terminalize a drifted child in the caller's fenced transaction."""
+
+    now = datetime.utcnow()
+    if child.status in TASK_ACTIVE_STATUSES:
+        child.status = "failed"
+        child.completed_at = now
+        child.error_message = error[:4000]
+    binding.state = CHILD_STOPPED
+    binding.stop_requested_at = binding.stop_requested_at or now
+    binding.completed_at = now
+    binding.error = error[:4000]
 
 
 class TestHarnessChildService:
@@ -103,35 +238,112 @@ class TestHarnessChildService:
         values.update(status="pending_activation", metadata_=metadata)
 
         async with self.db_factory() as db:
+            owner = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == owner_task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if owner is None or not owner.incarnation_id:
+                raise TestHarnessChildError(
+                    "Browser child owner Task disappeared or lacks an incarnation"
+                )
+            # SQLite ignores ``FOR UPDATE``. This exact no-op update gives the
+            # transaction a writer fence before any owner/run edge is created.
+            fenced = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == owner_task_id,
+                    Task.incarnation_id == owner.incarnation_id,
+                )
+                .values(incarnation_id=owner.incarnation_id)
+            )
+            if fenced.rowcount != 1:
+                raise TestHarnessChildError(
+                    "Browser child owner Task changed while being fenced"
+                )
+
+            run: TestHarnessRun | None = None
+            workspace_run: WorkspaceReviewRun | None = None
+            if harness_run_id:
+                run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(TestHarnessRun.id == harness_run_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    run is None
+                    or run.task_id != owner_task_id
+                    or run.status in HARNESS_OWNER_TERMINAL_STATES
+                    or (
+                        run.task_incarnation_id is not None
+                        and run.task_incarnation_id != owner.incarnation_id
+                    )
+                ):
+                    raise TestHarnessChildError(
+                        "Harness run disappeared, terminated, or changed owner "
+                        "while reserving child"
+                    )
+                run.task_incarnation_id = owner.incarnation_id
+            if workspace_review_run_id:
+                workspace_run = (
+                    await db.execute(
+                        select(WorkspaceReviewRun)
+                        .where(WorkspaceReviewRun.id == workspace_review_run_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    workspace_run is None
+                    or workspace_run.task_id != owner_task_id
+                    or workspace_run.status in WORKSPACE_OWNER_TERMINAL_STATES
+                    or (
+                        workspace_run.task_incarnation_id is not None
+                        and workspace_run.task_incarnation_id
+                        != owner.incarnation_id
+                    )
+                ):
+                    raise TestHarnessChildError(
+                        "Workspace review disappeared, terminated, or changed "
+                        "owner while reserving child"
+                    )
+                workspace_run.task_incarnation_id = owner.incarnation_id
+
             child = await stage_task_record(db, **values)
             binding = TestHarnessChildBinding(
                 id=uuid.uuid4().hex,
                 harness_run_id=harness_run_id,
                 workspace_review_run_id=workspace_review_run_id,
                 owner_task_id=owner_task_id,
+                owner_task_incarnation_id=owner.incarnation_id,
                 child_task_id=child.id,
+                child_task_incarnation_id=child.incarnation_id,
                 browser_review_job_id=browser_review_job_id,
+                provider=child.provider,
+                model=child.model,
+                reasoning_effort=child.effort_level,
+                codex_service_tier=child.codex_service_tier,
+                skill_name=BROWSER_REVIEW_SKILL,
                 state=CHILD_RESERVED,
             )
             db.add(binding)
-            if harness_run_id:
-                run = await db.get(TestHarnessRun, harness_run_id)
-                if run is None or run.task_id != owner_task_id:
-                    raise TestHarnessChildError(
-                        "Harness run disappeared or changed owner while reserving child"
-                    )
+            if run is not None:
                 run.agent_task_id = child.id
                 run.browser_review_job_id = browser_review_job_id
-            if workspace_review_run_id:
-                workspace_run = await db.get(
-                    WorkspaceReviewRun, workspace_review_run_id
-                )
-                if workspace_run is None or workspace_run.task_id != owner_task_id:
-                    raise TestHarnessChildError(
-                        "Workspace review disappeared or changed owner while reserving child"
-                    )
+            if workspace_run is not None:
                 workspace_run.agent_task_id = child.id
                 workspace_run.browser_review_job_id = browser_review_job_id
+            identity_error = await browser_child_identity_error(
+                db,
+                binding,
+                child,
+                expected_states={CHILD_RESERVED},
+            )
+            if identity_error is not None:
+                raise TestHarnessChildError(identity_error)
             await db.commit()
             await db.refresh(child)
             await db.refresh(binding)
@@ -141,6 +353,61 @@ class TestHarnessChildService:
         """Publish the child to TaskQueue only after its job is attached."""
 
         async with self.db_factory() as db:
+            observed = await db.get(TestHarnessChildBinding, binding_id)
+            if observed is None:
+                raise TestHarnessChildError("Browser child binding disappeared")
+            owner = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == observed.owner_task_id,
+                        Task.incarnation_id
+                        == observed.owner_task_incarnation_id,
+                    )
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if owner is None:
+                raise TestHarnessChildError(
+                    "Browser child owner Task disappeared before activation"
+                )
+            fenced = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == observed.owner_task_id,
+                    Task.incarnation_id
+                    == observed.owner_task_incarnation_id,
+                )
+                .values(incarnation_id=observed.owner_task_incarnation_id)
+            )
+            if fenced.rowcount != 1:
+                raise TestHarnessChildError(
+                    "Browser child owner changed before activation"
+                )
+            if observed.harness_run_id:
+                await db.execute(
+                    select(TestHarnessRun)
+                    .where(TestHarnessRun.id == observed.harness_run_id)
+                    .with_for_update()
+                )
+            if observed.workspace_review_run_id:
+                await db.execute(
+                    select(WorkspaceReviewRun)
+                    .where(
+                        WorkspaceReviewRun.id
+                        == observed.workspace_review_run_id
+                    )
+                    .with_for_update()
+                )
+            child = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == observed.child_task_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if child is None:
+                raise TestHarnessChildError("Browser child disappeared")
             binding = (
                 await db.execute(
                     select(TestHarnessChildBinding)
@@ -156,17 +423,20 @@ class TestHarnessChildService:
                 raise TestHarnessChildError(
                     f"Browser child cannot activate from state {binding.state}"
                 )
-            child = (
-                await db.execute(
-                    select(Task)
-                    .where(Task.id == binding.child_task_id)
-                    .with_for_update()
-                )
-            ).scalar_one_or_none()
-            if child is None or child.status != "pending_activation":
+            if child.status != "pending_activation":
                 raise TestHarnessChildError(
                     "Browser child disappeared or escaped its activation gate"
                 )
+            identity_error = await browser_child_identity_error(
+                db,
+                binding,
+                child,
+                expected_states={CHILD_RESERVED},
+            )
+            if identity_error is not None:
+                fail_browser_child_identity(binding, child, identity_error)
+                await db.commit()
+                raise TestHarnessChildError(identity_error)
             now = datetime.utcnow()
             child.status = "pending"
             binding.state = CHILD_READY
@@ -283,6 +553,50 @@ class TestHarnessChildService:
         child_task_id: int
         job_id: str
         async with self.db_factory() as db:
+            observed = await db.get(TestHarnessChildBinding, binding_id)
+            if observed is None:
+                raise TestHarnessChildError("Browser child binding disappeared")
+            owner_fence = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == observed.owner_task_id,
+                    Task.incarnation_id
+                    == observed.owner_task_incarnation_id,
+                )
+                .values(incarnation_id=observed.owner_task_incarnation_id)
+            )
+            if owner_fence.rowcount != 1:
+                raise TestHarnessChildError(
+                    "Browser child owner disappeared before cleanup"
+                )
+            if observed.harness_run_id:
+                await db.execute(
+                    select(TestHarnessRun)
+                    .where(TestHarnessRun.id == observed.harness_run_id)
+                    .with_for_update()
+                )
+            if observed.workspace_review_run_id:
+                await db.execute(
+                    select(WorkspaceReviewRun)
+                    .where(
+                        WorkspaceReviewRun.id
+                        == observed.workspace_review_run_id
+                    )
+                    .with_for_update()
+                )
+            child_fence = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == observed.child_task_id,
+                    Task.incarnation_id
+                    == observed.child_task_incarnation_id,
+                )
+                .values(incarnation_id=observed.child_task_incarnation_id)
+            )
+            if child_fence.rowcount != 1:
+                raise TestHarnessChildError(
+                    "Browser child generation disappeared before cleanup"
+                )
             binding = (
                 await db.execute(
                     select(TestHarnessChildBinding)
@@ -408,14 +722,24 @@ class TestHarnessChildService:
                         f"Task {task.id}: legacy Browser child identity is incomplete"
                     )
                     continue
+                owner = await db.get(Task, owner_task_id)
                 db.add(
                     TestHarnessChildBinding(
                         id=uuid.uuid4().hex,
                         harness_run_id=harness_run_id,
                         workspace_review_run_id=workspace_run_id,
                         owner_task_id=owner_task_id,
+                        owner_task_incarnation_id=(
+                            owner.incarnation_id if owner is not None else None
+                        ),
                         child_task_id=task.id,
+                        child_task_incarnation_id=task.incarnation_id,
                         browser_review_job_id=job_id,
+                        provider=task.provider,
+                        model=task.model,
+                        reasoning_effort=task.effort_level,
+                        codex_service_tier=task.codex_service_tier,
+                        skill_name=BROWSER_REVIEW_SKILL,
                         state=CHILD_STOP_FAILED,
                         error="Adopted during startup recovery",
                     )

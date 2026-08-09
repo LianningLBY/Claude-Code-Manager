@@ -1,6 +1,8 @@
 from datetime import datetime
+import secrets
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     Float,
     Integer,
@@ -8,6 +10,7 @@ from sqlalchemy import (
     Text,
     DateTime,
     JSON,
+    UniqueConstraint,
     select,
     func,
 )
@@ -23,9 +26,50 @@ class Task(Base):
             "codex_service_tier IN ('default', 'priority')",
             name="ck_tasks_codex_service_tier",
         ),
+        CheckConstraint(
+            "(mode = 'delivery_loop' AND delivery_run_id IS NOT NULL "
+            "AND delivery_role = 'developer') OR "
+            "(mode <> 'delivery_loop' AND delivery_run_id IS NULL "
+            "AND delivery_role IS NULL)",
+            name="ck_tasks_delivery_owner_shape",
+        ),
+        CheckConstraint(
+            "(worker_turn_handoff_id IS NULL "
+            "AND worker_turn_handoff_worker_id IS NULL "
+            "AND worker_turn_handoff_retry_count IS NULL "
+            "AND worker_turn_handoff_from_generation IS NULL "
+            "AND worker_turn_handoff_source_log_id IS NULL "
+            "AND worker_turn_handoff_acknowledged IS NULL) OR "
+            "(worker_turn_handoff_id IS NOT NULL "
+            "AND worker_turn_handoff_worker_id IS NOT NULL "
+            "AND worker_turn_handoff_retry_count IS NOT NULL "
+            "AND worker_turn_handoff_retry_count >= 0 "
+            "AND worker_turn_handoff_from_generation IS NOT NULL "
+            "AND worker_turn_handoff_from_generation >= 0 "
+            "AND worker_turn_handoff_source_log_id IS NOT NULL "
+            "AND worker_turn_handoff_acknowledged IS NOT NULL)",
+            name="ck_tasks_worker_turn_handoff_shape",
+        ),
+        UniqueConstraint(
+            "incarnation_id",
+            name="uq_tasks_incarnation_id",
+        ),
+        # Task ids are external security identities (HTTP resources, WS
+        # channels, share tokens, Worker mirrors).  SQLite's default ROWID may
+        # reuse the deleted highest id; AUTOINCREMENT permanently forbids that
+        # cross-incarnation aliasing.  Other dialects ignore this table option.
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Durable random incarnation used whenever an external integer Task id is
+    # observed before a lock and acted on afterwards.  Nullable keeps legacy
+    # rows readable; every newly constructed Task receives a token.
+    incarnation_id: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+        default=lambda: secrets.token_hex(16),
+    )
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)  # nullable for loop tasks
     status: Mapped[str] = mapped_column(
@@ -44,7 +88,60 @@ class Task(Base):
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
-    mode: Mapped[str] = mapped_column(String(20), default="auto")  # "auto", "plan", "loop", or "goal"
+    mode: Mapped[str] = mapped_column(String(20), default="auto")  # auto/plan/loop/goal/delivery_loop
+    # Monotonic identity of a logical model turn. Retry/account failover within
+    # one turn keeps the same generation; a newly admitted turn increments it.
+    turn_generation: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    # Internal pointer to the exact user/system source row that admitted the
+    # current logical turn.  It is deliberately not a foreign key: Worker
+    # mirrors and migration boundaries cannot assume node-local LogEntry ids.
+    turn_source_log_id: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+    # Manager-side durable reservation for exactly one Worker follow-up turn.
+    # The remote Worker increments ``turn_generation`` only when its queued
+    # message is dequeued, which can happen before the proxy HTTP response.
+    # These fields authorize only the recorded G -> G+1 transition; they are
+    # cleared after both the HTTP ACK and exact Worker generation evidence are
+    # observed.  They are intentionally Manager-only and absent from public
+    # Task schemas / Worker migration payloads.
+    worker_turn_handoff_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True
+    )
+    worker_turn_handoff_worker_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    worker_turn_handoff_retry_count: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    worker_turn_handoff_from_generation: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True
+    )
+    worker_turn_handoff_source_log_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    worker_turn_handoff_acknowledged: Mapped[bool | None] = mapped_column(
+        nullable=True
+    )
+    # Frozen per-Task allow/budget policy for model-requested capabilities.
+    # NULL means the capability surface is unavailable for this Task.
+    capability_policy: Mapped[dict | None] = mapped_column(
+        JSON(none_as_null=True),
+        nullable=True,
+    )
+    # DeliveryRun is Manager authority and is not mirrored as a foreign key on
+    # remote Workers.  The controller is the only writer of these routing
+    # fields; ordinary Task APIs must not synthesize a delivery-owned Task.
+    delivery_run_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    delivery_role: Mapped[str | None] = mapped_column(String(24), nullable=True)
     todo_file_path: Mapped[str | None] = mapped_column(String(500), nullable=True)  # loop only: path relative to target_repo
     loop_progress: Mapped[str | None] = mapped_column(String(200), nullable=True)  # loop only: e.g. "3/5", written by Claude
     max_iterations: Mapped[int] = mapped_column(Integer, default=50)  # loop only: max iterations before auto-abort
@@ -156,6 +253,7 @@ class Task(Base):
 
 
 def _configure_task_properties():
+    from backend.models.delivery import DeliveryRun
     from backend.models.monitor_session import MonitorSession
     from backend.models.plan import PlanLegacyTaskLink
     from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
@@ -164,6 +262,7 @@ def _configure_task_properties():
     legacy_plan_links = PlanLegacyTaskLink.__table__
     plan_runs = PlanAgentRun.__table__
     plan_steps = PlanAgentStep.__table__
+    delivery_runs = DeliveryRun.__table__
     # Always show real running sub-agent count — background agents can
     # outlive the main turn, so even completed tasks may have active sub-agents.
     Task.active_sub_agents = column_property(
@@ -235,6 +334,27 @@ def _configure_task_properties():
     )
     Task.plan_stage_route_slot = column_property(
         latest_plan_step_value(plan_steps.c.route_slot)
+    )
+    Task.delivery_phase = column_property(
+        select(delivery_runs.c.phase)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.delivery_activity = column_property(
+        select(delivery_runs.c.activity)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.delivery_outcome = column_property(
+        select(delivery_runs.c.outcome)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
     )
 
 _configure_task_properties()

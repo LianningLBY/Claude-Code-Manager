@@ -15,6 +15,9 @@ class WorkspaceReviewRun(Base):
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     task_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    task_incarnation_id: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, index=True
+    )
     project_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     harness_run_id: Mapped[str | None] = mapped_column(String(32), nullable=True, unique=True)
     agent_task_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)

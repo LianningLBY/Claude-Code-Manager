@@ -1,8 +1,10 @@
 import errno
 import os
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 
-from sqlalchemy import Float, and_, delete as sa_delete, func, select, update
+from sqlalchemy import Float, and_, delete as sa_delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.sql.functions import FunctionElement
@@ -11,14 +13,26 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.models.test_harness import TestHarnessChildBinding
-from backend.services.task_creation import stage_task_record
 from backend.services.test_harness_children import (
     CHILD_COMPLETED,
     CHILD_READY,
     CHILD_RUNNING,
+    BROWSER_REVIEW_SKILL,
+    browser_child_identity_error,
+    fail_browser_child_identity,
+)
+from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
+from backend.services.task_creation import (
+    purge_task_access_grants,
+    stage_task_record,
 )
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
+)
+from backend.services.worker_task_termination import (
+    WorkerTaskTerminationConflict,
+    active_worker_task_termination_receipt,
+    no_active_worker_task_termination_predicate,
 )
 
 
@@ -33,6 +47,53 @@ PLAN_DELETABLE_TASK_STATUSES = BASE_DELETABLE_TASK_STATUSES | {
 TASK_KIND_STANDALONE_PLAN = "standalone_plan"
 TASK_KIND_RELATED_PLAN = "related_plan"
 TASK_KIND_MAIN = "main"
+
+
+class TaskWaitingCapabilityConflict(RuntimeError):
+    """An ordinary Task mutation raced with its durable capability wait."""
+
+
+def _dispatcher_scope_predicate():
+    """Require durable Controller admission for Delivery-owned Tasks.
+
+    A Delivery Task is only an execution shell. Ordinary pending Tasks remain
+    dispatchable, while a Delivery shell additionally needs one active Turn
+    belonging to a coding/running Run. Feature flags gate new
+    Run admission, not recovery of work already committed before a restart.
+    This is the final queue-level fence for orphans and any API path that
+    accidentally writes ``pending`` directly.
+    """
+
+    from backend.models.delivery import (
+        DELIVERY_TURN_ACTIVE_STATUSES,
+        DeliveryRun,
+        DeliveryTurn,
+    )
+
+    admitted_turn = (
+        select(DeliveryTurn.id)
+        .join(DeliveryRun, DeliveryRun.id == DeliveryTurn.run_id)
+        .where(
+            DeliveryTurn.task_id == Task.id,
+            DeliveryTurn.run_id == Task.delivery_run_id,
+            DeliveryTurn.active_run_id == Task.delivery_run_id,
+            DeliveryTurn.status.in_(DELIVERY_TURN_ACTIVE_STATUSES),
+            DeliveryRun.id == Task.delivery_run_id,
+            DeliveryRun.developer_task_id == Task.id,
+            DeliveryRun.phase == "coding",
+            DeliveryRun.activity == "running",
+        )
+        .correlate(Task)
+        .exists()
+    )
+    return or_(
+        Task.mode != "delivery_loop",
+        and_(
+            Task.delivery_run_id.is_not(None),
+            Task.delivery_role == "developer",
+            admitted_turn,
+        ),
+    )
 
 
 def _task_kind_predicate(task_kind: str):
@@ -139,6 +200,7 @@ TaskGenerationFence = tuple[
     datetime | None,
     datetime | None,
     str | None,
+    int,
 ]
 
 TaskDeleteFence = tuple[
@@ -149,7 +211,16 @@ TaskDeleteFence = tuple[
     datetime | None,
     datetime | None,
     str | None,
+    int,
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class TaskDeletePreflight:
+    """Exact target-owned Plan identity locked for one Task deletion."""
+
+    task_id: int
+    plan_ids: tuple[int, ...]
 
 
 def task_generation_fence(task: Task) -> TaskGenerationFence:
@@ -161,6 +232,7 @@ def task_generation_fence(task: Task) -> TaskGenerationFence:
         task.started_at,
         task.completed_at,
         task.pty_background_generation,
+        task.turn_generation,
     )
 
 
@@ -175,6 +247,7 @@ def task_delete_fence(task: Task) -> TaskDeleteFence:
         task.started_at,
         task.completed_at,
         task.pty_background_generation,
+        task.turn_generation,
     )
 
 
@@ -190,6 +263,7 @@ def append_task_generation_predicates(
         expected_started_at,
         expected_completed_at,
         expected_background_generation,
+        expected_turn_generation,
     ) = generation_fence
     predicates.extend(
         [
@@ -215,6 +289,7 @@ def append_task_generation_predicates(
                 else Task.pty_background_generation
                 == expected_background_generation
             ),
+            Task.turn_generation == expected_turn_generation,
         ]
     )
 
@@ -384,10 +459,36 @@ class TaskQueue:
         await self.db.refresh(task)
         return task
 
-    async def update_task(self, task_id: int, **kwargs) -> Task | None:
-        task = await self.get(task_id)
-        if not task:
-            return None
+    async def update_task(
+        self,
+        task_id: int,
+        *,
+        operation_lock_held: bool = False,
+        **kwargs,
+    ) -> Task | None:
+        """Update one Task only while no durable termination owns it.
+
+        Public edits, Worker configuration saves, and read/unread toggles all
+        converge here.  A process-local operation lock closes same-process
+        admission races; the Task no-op/write CAS is still the authoritative
+        cross-process boundary.  It deliberately starts from a fresh
+        transaction so SQLite WAL cannot raise ``BUSY_SNAPSHOT`` when a
+        receipt committed after an earlier API authorization read.
+        """
+
+        if not operation_lock_held:
+            # Imported lazily because WorkerProxy itself depends on TaskQueue.
+            from backend.services.worker_proxy import get_task_operation_lock
+
+            await self.db.rollback()
+            async with get_task_operation_lock(task_id):
+                return await self.update_task(
+                    task_id,
+                    operation_lock_held=True,
+                    **kwargs,
+                )
+
+        values = {}
         for key, value in kwargs.items():
             if value is None:
                 mapped_attr = getattr(Task, key, None)
@@ -402,10 +503,51 @@ class TaskQueue:
                 # when the mapped column permits it.
                 if not columns or not columns[0].nullable:
                     continue
-            setattr(task, key, value)
+            values[key] = value
+
+        if not values:
+            return await self.get(task_id)
+        waiting_capability_safe = set(values).issubset({"has_unread"})
+
+        # This must be the first statement in the mutation transaction.  The
+        # correlated receipt predicate and receipt admission's own Task write
+        # then have one deterministic winner on every supported database.
+        await self.db.rollback()
+        changed = await self.db.execute(
+            update(Task)
+            .where(
+                Task.id == task_id,
+                *(
+                    ()
+                    if waiting_capability_safe
+                    else (Task.status != "waiting_capability",)
+                ),
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        if changed.rowcount != 1:
+            await self.db.rollback()
+            if await active_worker_task_termination_receipt(self.db, task_id):
+                await self.db.rollback()
+                raise WorkerTaskTerminationConflict(
+                    f"Task {task_id} has an active Worker termination receipt"
+                )
+            if not waiting_capability_safe:
+                current_status = await self.db.scalar(
+                    select(Task.status).where(Task.id == task_id)
+                )
+                await self.db.rollback()
+                if current_status == "waiting_capability":
+                    raise TaskWaitingCapabilityConflict(
+                        f"Task {task_id} is waiting for a capability resume"
+                    )
+            await self.db.rollback()
+            return None
         await self.db.commit()
-        await self.db.refresh(task)
-        return task
+        self.db.expire_all()
+        return await self.db.get(Task, task_id)
 
     async def delete(
         self,
@@ -413,7 +555,45 @@ class TaskQueue:
         *,
         expected_fence: TaskDeleteFence | None = None,
         remote_worker_deleted: bool = False,
+        before_delete: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        remote_delete_confirm: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        prepare_remote_worker_delete: (
+            Callable[[TaskDeletePreflight], Awaitable[bool]] | None
+        ) = None,
+        worker_delete_operation_id: str | None = None,
     ) -> bool:
+        callbacks = tuple(
+            callback
+            for callback in (
+                before_delete,
+                remote_delete_confirm,
+                prepare_remote_worker_delete,
+            )
+            if callback is not None
+        )
+        if len(callbacks) > 1:
+            raise ValueError(
+                "Task delete callbacks are mutually exclusive"
+            )
+        if remote_delete_confirm is not None and not remote_worker_deleted:
+            raise ValueError(
+                "remote_delete_confirm requires remote_worker_deleted=True"
+            )
+        if prepare_remote_worker_delete is not None and remote_worker_deleted:
+            raise ValueError(
+                "prepare_remote_worker_delete precedes remote_worker_deleted"
+            )
+        if worker_delete_operation_id is not None and (
+            not remote_worker_deleted
+            or any(callback is not None for callback in callbacks)
+        ):
+            raise ValueError(
+                "worker_delete_operation_id requires callback-free remote finalization"
+            )
         task = await self.get(task_id)
         if not task:
             return False
@@ -425,7 +605,11 @@ class TaskQueue:
             observed_started_at,
             observed_completed_at,
             observed_background_generation,
+            observed_turn_generation,
         ) = expected_fence or task_delete_fence(task)
+        worker_delete_preparing = prepare_remote_worker_delete is not None
+        if observed_status == "waiting_capability":
+            return False
         if (
             not remote_worker_deleted
             and not is_task_status_deletable(
@@ -434,7 +618,10 @@ class TaskQueue:
             )
         ):
             return False
-        if not remote_worker_deleted and task.pty_background_generation:
+        if (
+            not (remote_worker_deleted or worker_delete_preparing)
+            and task.pty_background_generation
+        ):
             # The foreground status is terminal, but the persistent Claude
             # session still owns detached output for this Task.
             return False
@@ -442,7 +629,38 @@ class TaskQueue:
         # its Manager mirror would lose the only management handle while the
         # remote task/process can still exist.  The API opts in only after a
         # 2xx Worker response with an explicit deletion acknowledgement.
-        if (observed_worker_id is not None) != remote_worker_deleted:
+        if (observed_worker_id is not None) != (
+            remote_worker_deleted or worker_delete_preparing
+        ):
+            return False
+        active_delete_owner = await active_worker_task_termination_receipt(
+            self.db,
+            task_id,
+        )
+        if active_delete_owner is not None and (
+            worker_delete_operation_id is None
+            or active_delete_owner.operation_id != worker_delete_operation_id
+        ):
+            await self.db.rollback()
+            return False
+        if worker_delete_operation_id is not None and active_delete_owner is None:
+            await self.db.rollback()
+            return False
+
+        # Code Review completion locks its aggregate in Developer Task ->
+        # Invocation -> Execution -> Run -> Reviewer Task order.  A reviewer
+        # Task is newly created with (and can never later be attached to) its
+        # Run, so reject that immutable child before taking the reviewer Task
+        # write lock; locking Task -> Run here would invert the completion
+        # order and permit a database deadlock.
+        from backend.models.code_review import CodeReviewResult, CodeReviewRun
+
+        reviewer_run_id = await self.db.scalar(
+            select(CodeReviewRun.id)
+            .where(CodeReviewRun.reviewer_task_id == task_id)
+            .limit(1)
+        )
+        if reviewer_run_id is not None:
             return False
 
         task_predicates = [
@@ -454,6 +672,7 @@ class TaskQueue:
                 else Task.worker_id == observed_worker_id
             ),
             Task.retry_count == observed_retry_count,
+            Task.turn_generation == observed_turn_generation,
             (
                 Task.instance_id.is_(None)
                 if observed_instance_id is None
@@ -475,6 +694,9 @@ class TaskQueue:
                 else Task.pty_background_generation
                 == observed_background_generation
             ),
+            no_active_worker_task_termination_predicate(
+                allow_operation_id=worker_delete_operation_id,
+            ),
         ]
         # Establish the global lifecycle DB lock order at Task first. A no-op
         # exact UPDATE is both a generation CAS and a current-write lock on
@@ -489,6 +711,557 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
+        # Harness admission and child activation take this same Task writer
+        # fence before creating or publishing any edge. Lock the complete
+        # adapter graph now: a concurrent admission must either commit first
+        # and be observed here, or resume after the owner DELETE and fail its
+        # incarnation check. SQLite has no global FK enforcement, so terminal
+        # history is deleted explicitly below in this same transaction.
+        from backend.models.test_harness import (
+            TestHarnessAttempt,
+            TestHarnessEvent,
+            TestHarnessEvidence,
+            TestHarnessFinding,
+            TestHarnessRun,
+            TestHarnessSandboxLease,
+        )
+        from backend.models.workspace_review import WorkspaceReviewRun
+        from backend.services.test_harness_children import (
+            CHILD_TERMINAL_STATES,
+        )
+
+        reverse_browser_binding = await self.db.scalar(
+            select(TestHarnessChildBinding.id)
+            .where(TestHarnessChildBinding.child_task_id == task_id)
+            .limit(1)
+        )
+        if reverse_browser_binding is not None:
+            # Internal Browser children are lifecycle-owned by their parent;
+            # they may not be independently deleted through TaskQueue.
+            await self.db.rollback()
+            return False
+
+        harness_runs = list(
+            (
+                await self.db.execute(
+                    select(TestHarnessRun)
+                    .where(TestHarnessRun.task_id == task_id)
+                    .order_by(TestHarnessRun.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        harness_run_ids = {run.id for run in harness_runs}
+        if any(
+            run.status not in {"completed", "failed", "cancelled", "superseded"}
+            or (
+                run.task_incarnation_id is not None
+                and run.task_incarnation_id != task.incarnation_id
+            )
+            for run in harness_runs
+        ):
+            await self.db.rollback()
+            return False
+
+        workspace_runs = list(
+            (
+                await self.db.execute(
+                    select(WorkspaceReviewRun)
+                    .where(WorkspaceReviewRun.task_id == task_id)
+                    .order_by(WorkspaceReviewRun.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        workspace_run_ids = {run.id for run in workspace_runs}
+        if any(
+            run.status not in {"completed", "failed", "cancelled"}
+            or run.cleanup_status != "completed"
+            or (
+                run.task_incarnation_id is not None
+                and run.task_incarnation_id != task.incarnation_id
+            )
+            for run in workspace_runs
+        ):
+            await self.db.rollback()
+            return False
+
+        binding_predicates = [TestHarnessChildBinding.owner_task_id == task_id]
+        if harness_run_ids:
+            binding_predicates.append(
+                TestHarnessChildBinding.harness_run_id.in_(harness_run_ids)
+            )
+        if workspace_run_ids:
+            binding_predicates.append(
+                TestHarnessChildBinding.workspace_review_run_id.in_(
+                    workspace_run_ids
+                )
+            )
+        browser_bindings = list(
+            (
+                await self.db.execute(
+                    select(TestHarnessChildBinding)
+                    .where(or_(*binding_predicates))
+                    .order_by(TestHarnessChildBinding.id)
+                )
+            ).scalars()
+        )
+
+        browser_child_ids = {binding.child_task_id for binding in browser_bindings}
+        browser_children: list[Task] = []
+        browser_runtime_candidate_ids: set[int] = set()
+        if browser_child_ids:
+            browser_children = list(
+                (
+                    await self.db.execute(
+                        select(Task)
+                        .where(Task.id.in_(browser_child_ids))
+                        .order_by(Task.id)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            children_by_id = {child.id: child for child in browser_children}
+            if set(children_by_id) != browser_child_ids or any(
+                child.status
+                not in {"completed", "failed", "cancelled", "conflict", "superseded"}
+                or child.worker_id is not None
+                or (
+                    binding.child_task_incarnation_id is not None
+                    and children_by_id[binding.child_task_id].incarnation_id
+                    != binding.child_task_incarnation_id
+                )
+                for binding in browser_bindings
+                for child in (children_by_id[binding.child_task_id],)
+            ):
+                await self.db.rollback()
+                return False
+            reverse_child_owner = await self.db.scalar(
+                select(Instance.id)
+                .where(Instance.current_task_id.in_(browser_child_ids))
+                .limit(1)
+                .with_for_update()
+            )
+            if reverse_child_owner is not None:
+                await self.db.rollback()
+                return False
+            for child in browser_children:
+                if child.instance_id is None:
+                    continue
+                child_side_instance = (
+                    await self.db.execute(
+                        select(Instance)
+                        .where(Instance.id == child.instance_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if (
+                    child_side_instance is None
+                    or child_side_instance.current_task_id in (None, child.id)
+                ):
+                    browser_runtime_candidate_ids.add(child.instance_id)
+            binding_ids = [binding.id for binding in browser_bindings]
+            browser_bindings = list(
+                (
+                    await self.db.execute(
+                        select(TestHarnessChildBinding)
+                        .where(TestHarnessChildBinding.id.in_(binding_ids))
+                        .order_by(TestHarnessChildBinding.id)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if len(browser_bindings) != len(binding_ids):
+                await self.db.rollback()
+                return False
+        if any(
+            binding.owner_task_id != task_id
+            or binding.state not in CHILD_TERMINAL_STATES
+            or (
+                binding.owner_task_incarnation_id is not None
+                and binding.owner_task_incarnation_id != task.incarnation_id
+            )
+            for binding in browser_bindings
+        ):
+            await self.db.rollback()
+            return False
+
+        harness_attempts: list[TestHarnessAttempt] = []
+        harness_sandbox_leases: list[TestHarnessSandboxLease] = []
+        if harness_run_ids:
+            harness_attempts = list(
+                (
+                    await self.db.execute(
+                        select(TestHarnessAttempt)
+                        .where(TestHarnessAttempt.run_id.in_(harness_run_ids))
+                        .order_by(TestHarnessAttempt.id)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if any(
+                attempt.status not in {"completed", "failed", "cancelled"}
+                for attempt in harness_attempts
+            ):
+                await self.db.rollback()
+                return False
+            harness_sandbox_leases = list(
+                (
+                    await self.db.execute(
+                        select(TestHarnessSandboxLease)
+                        .where(TestHarnessSandboxLease.run_id.in_(harness_run_ids))
+                        .order_by(TestHarnessSandboxLease.id)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if any(
+                lease.cleanup_status != "completed"
+                for lease in harness_sandbox_leases
+            ):
+                await self.db.rollback()
+                return False
+
+        runs_with_managed_resources = {
+            run.id
+            for run in harness_runs
+            if run.browser_review_job_id is not None
+            or run.workspace_review_run_id is not None
+        } | {lease.run_id for lease in harness_sandbox_leases}
+        if any(
+            run.id in runs_with_managed_resources
+            and run.cleanup_status != "completed"
+            for run in harness_runs
+        ):
+            await self.db.rollback()
+            return False
+
+        locked_worker_delete_receipt = None
+        if worker_delete_operation_id is not None:
+            locked_worker_delete_receipt = (
+                await self.db.execute(
+                    select(WorkerTaskTerminationReceipt)
+                    .where(
+                        WorkerTaskTerminationReceipt.operation_id
+                        == worker_delete_operation_id,
+                        WorkerTaskTerminationReceipt.task_id == task_id,
+                        WorkerTaskTerminationReceipt.active_task_id == task_id,
+                        WorkerTaskTerminationReceipt.side == "manager",
+                        WorkerTaskTerminationReceipt.operation == "delete",
+                        WorkerTaskTerminationReceipt.status == "awaiting_ack",
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if locked_worker_delete_receipt is None:
+                await self.db.rollback()
+                return False
+
+        # Capability lifecycle uses the same global Task -> Invocation ->
+        # Execution lock order. Active work owns an external adapter handle or
+        # an unconsumed result, so deletion must fail closed. Terminal history
+        # is removed explicitly below because SQLite deployments may have
+        # foreign-key enforcement disabled.
+        from backend.models.capability import (
+            ACTIVE_EXECUTION_STATUSES,
+            ACTIVE_INVOCATION_STATUSES,
+            TERMINAL_RESUME_OUTBOX_STATUSES,
+            CapabilityExecution,
+            CapabilityInvocation,
+            CapabilityResumeOutbox,
+        )
+
+        capability_invocations = list(
+            (
+                await self.db.execute(
+                    select(CapabilityInvocation)
+                    .where(CapabilityInvocation.task_id == task_id)
+                    .order_by(CapabilityInvocation.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        capability_invocation_ids = {
+            invocation.id for invocation in capability_invocations
+        }
+        capability_executions = []
+        if capability_invocation_ids:
+            capability_executions = list(
+                (
+                    await self.db.execute(
+                        select(CapabilityExecution)
+                        .where(
+                            CapabilityExecution.invocation_id.in_(
+                                capability_invocation_ids
+                            )
+                        )
+                        .order_by(
+                            CapabilityExecution.invocation_id,
+                            CapabilityExecution.id,
+                        )
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+        if any(
+            invocation.status in ACTIVE_INVOCATION_STATUSES
+            for invocation in capability_invocations
+        ) or any(
+            execution.status in ACTIVE_EXECUTION_STATUSES
+            for execution in capability_executions
+        ):
+            await self.db.rollback()
+            return False
+
+        # Resume delivery is the final child in the global Task -> Invocation
+        # -> Execution -> Outbox lock order.  A live row owns the exact G -> G+1
+        # handoff even when its Invocation/Execution already became terminal.
+        # Lock and reject it before inspecting adapter-specific reverse links.
+        capability_outbox_predicates = [
+            CapabilityResumeOutbox.task_id == task_id,
+        ]
+        if capability_invocation_ids:
+            capability_outbox_predicates.append(
+                CapabilityResumeOutbox.invocation_id.in_(
+                    capability_invocation_ids
+                )
+            )
+        capability_outboxes = list(
+            (
+                await self.db.execute(
+                    select(CapabilityResumeOutbox)
+                    .where(or_(*capability_outbox_predicates))
+                    .order_by(CapabilityResumeOutbox.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        if any(
+            outbox.status not in TERMINAL_RESUME_OUTBOX_STATUSES
+            for outbox in capability_outboxes
+        ):
+            await self.db.rollback()
+            return False
+
+        capability_execution_ids = {
+            execution.id for execution in capability_executions
+        }
+
+        # The Plan graph helper locks both legacy Task-shaped and first-class
+        # Runs in one stable primary-key order before it locks any Plan. Runs
+        # that also belong to the first-class graph are validated/deleted by
+        # that graph; only pure legacy rows are handled locally below.
+        from backend.models.plan_agent import (
+            PlanAgentRun,
+            PlanAgentRuntimeReceipt,
+            PlanAgentStep,
+        )
+        from backend.services.plan_runtime_receipt import runtime_run_is_clean
+
+        # First-class Plan completion/recovery takes Run -> Plan locks after
+        # Capability Core.  Validate and lock the complete target-owned graph
+        # in that same order while the exact Task generation remains fenced.
+        # The helper never commits or rolls back; the final Task DELETE below
+        # is therefore the single commit point for both aggregates.
+        from backend.services.plan_deletion import (
+            PlanDeletionConflict,
+            lock_target_plan_delete_graph,
+        )
+
+        try:
+            target_plan_graph = await lock_target_plan_delete_graph(
+                self.db,
+                task_id,
+                capability_invocation_ids=capability_invocation_ids,
+                capability_execution_ids=capability_execution_ids,
+                capability_outbox_ids={
+                    outbox.id for outbox in capability_outboxes
+                },
+            )
+        except PlanDeletionConflict:
+            await self.db.rollback()
+            return False
+
+        # These rows were included in the helper's Run lock tier. Refresh the
+        # exact legacy subset without introducing a Plan -> Run lock inversion.
+        legacy_plan_runs = list(
+            (
+                await self.db.execute(
+                    select(PlanAgentRun)
+                    .where(PlanAgentRun.plan_task_id == task_id)
+                    .order_by(PlanAgentRun.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalars()
+        )
+
+        target_plan_run_ids = (
+            set(target_plan_graph.run_ids)
+            if target_plan_graph is not None
+            else set()
+        )
+        legacy_only_plan_runs = [
+            run for run in legacy_plan_runs if run.id not in target_plan_run_ids
+        ]
+        legacy_only_plan_run_ids = {
+            run.id for run in legacy_only_plan_runs
+        }
+        # A migrated/first-class Run must be owned by the closed target graph;
+        # otherwise deleting only its legacy Task pointer would strand the
+        # Plan aggregate. Pure legacy Runs have no first-class Plan identity.
+        if any(run.plan_id is not None for run in legacy_only_plan_runs):
+            await self.db.rollback()
+            return False
+        if any(
+            run.status not in {"completed", "failed", "cancelled"}
+            or run.instance_id is not None
+            or run.last_execution_started_at is not None
+            or run.open_input_request_id is not None
+            or run.capability_execution_id is not None
+            for run in legacy_only_plan_runs
+        ):
+            await self.db.rollback()
+            return False
+
+        legacy_plan_steps = []
+        if legacy_only_plan_run_ids:
+            legacy_plan_steps = list(
+                (
+                    await self.db.execute(
+                        select(PlanAgentStep)
+                        .where(
+                            PlanAgentStep.run_id.in_(legacy_only_plan_run_ids)
+                        )
+                        .order_by(PlanAgentStep.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalars()
+            )
+        legacy_plan_step_ids = {step.id for step in legacy_plan_steps}
+        if any(
+            step.status not in {"completed", "failed", "cancelled"}
+            or step.plan_id is not None
+            or step.plan_version_id is not None
+            or step.input_request_id is not None
+            for step in legacy_plan_steps
+        ):
+            await self.db.rollback()
+            return False
+        legacy_plan_steps_by_id = {
+            step.id: step for step in legacy_plan_steps
+        }
+        legacy_plan_runs_by_id = {
+            run.id: run for run in legacy_only_plan_runs
+        }
+        for run in legacy_only_plan_runs:
+            if (
+                run.source_run_id is not None
+                and run.source_run_id not in legacy_only_plan_run_ids
+            ) or (
+                run.draft_step_id is not None
+                and (
+                    run.draft_step_id not in legacy_plan_step_ids
+                    or legacy_plan_steps_by_id[run.draft_step_id].run_id
+                    != run.id
+                )
+            ) or run.base_version_id is not None or run.result_version_id is not None:
+                await self.db.rollback()
+                return False
+
+        legacy_runtime_receipts = []
+        if legacy_only_plan_run_ids:
+            receipt_predicates = [
+                PlanAgentRuntimeReceipt.run_id.in_(legacy_only_plan_run_ids)
+            ]
+            if legacy_plan_step_ids:
+                receipt_predicates.append(
+                    PlanAgentRuntimeReceipt.step_id.in_(legacy_plan_step_ids)
+                )
+            legacy_runtime_receipts = list(
+                (
+                    await self.db.execute(
+                        select(PlanAgentRuntimeReceipt)
+                        .where(or_(*receipt_predicates))
+                        .order_by(PlanAgentRuntimeReceipt.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalars()
+            )
+        for receipt in legacy_runtime_receipts:
+            step = legacy_plan_steps_by_id.get(receipt.step_id)
+            run = legacy_plan_runs_by_id.get(receipt.run_id)
+            if (
+                run is None
+                or step is None
+                or step.run_id != run.id
+                or receipt.status != "cleaned"
+                or receipt.cleaned_at is None
+                or receipt.run_generation != step.generation
+            ):
+                await self.db.rollback()
+                return False
+        for run in legacy_only_plan_runs:
+            if not await runtime_run_is_clean(self.db, run_id=run.id):
+                await self.db.rollback()
+                return False
+
+        # Prove both adapter tables have no reverse ownership of this Task's
+        # Core aggregate.  Do not trust their denormalized developer_task_id:
+        # a corrupt cross-link must not let ordinary Task deletion cascade or
+        # strand a Code Review Run/Result through Invocation/Execution IDs.
+        code_review_run_predicates = [
+            CodeReviewRun.developer_task_id == task_id,
+        ]
+        code_review_result_predicates = [
+            CodeReviewResult.developer_task_id == task_id,
+        ]
+        if capability_invocation_ids:
+            code_review_run_predicates.append(
+                CodeReviewRun.capability_invocation_id.in_(
+                    capability_invocation_ids
+                )
+            )
+            code_review_result_predicates.append(
+                CodeReviewResult.capability_invocation_id.in_(
+                    capability_invocation_ids
+                )
+            )
+        if capability_execution_ids:
+            code_review_run_predicates.append(
+                CodeReviewRun.capability_execution_id.in_(
+                    capability_execution_ids
+                )
+            )
+            code_review_result_predicates.append(
+                CodeReviewResult.capability_execution_id.in_(
+                    capability_execution_ids
+                )
+            )
+        linked_code_review_id = await self.db.scalar(
+            select(CodeReviewRun.id)
+            .where(or_(*code_review_run_predicates))
+            .order_by(CodeReviewRun.id)
+            .with_for_update()
+            .limit(1)
+        )
+        if linked_code_review_id is not None:
+            await self.db.rollback()
+            return False
+        linked_code_review_result_id = await self.db.scalar(
+            select(CodeReviewResult.id)
+            .where(or_(*code_review_result_predicates))
+            .order_by(CodeReviewResult.id)
+            .with_for_update()
+            .limit(1)
+        )
+        if linked_code_review_result_id is not None:
+            await self.db.rollback()
+            return False
+
         # A failed task may be the only durable identity for an unmanaged
         # process retained by startup recovery. Never delete that evidence
         # while any reverse Instance owner may still be alive. A dead PID can
@@ -500,7 +1273,9 @@ class TaskQueue:
             .with_for_update()
         )
         owner_rows = list(result.scalars().all())
-        runtime_candidate_ids = {instance.id for instance in owner_rows}
+        runtime_candidate_ids = {
+            instance.id for instance in owner_rows
+        } | browser_runtime_candidate_ids
         if observed_instance_id is not None:
             task_side_instance = (
                 await self.db.execute(
@@ -556,9 +1331,9 @@ class TaskQueue:
             await self.db.rollback()
             return False
 
-        # Plan history is a first-class child of its target Task. Refuse to
-        # create dangling history; users can explicitly delete those Plans
-        # before deleting the target.
+        # Legacy Task-shaped child Plans are separate Task generations, not
+        # the first-class ``plans.target_task_id`` graph handled above. Keep
+        # their explicit parent reference fail-closed.
         related_plan_id = await self.db.scalar(
             select(Task.id)
             .where(Task.plan_target_task_id == task_id)
@@ -583,7 +1358,7 @@ class TaskQueue:
         )
         monitor_ids = {session.id for session in monitor_rows}
         if (
-            not remote_worker_deleted
+            not (remote_worker_deleted or worker_delete_preparing)
             and any(session.status == "running" for session in monitor_rows)
         ):
             await self.db.rollback()
@@ -671,27 +1446,116 @@ class TaskQueue:
                 await self.db.rollback()
                 return False
 
-        await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
-        from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+        # Expose only the Plan ids from the graph locked above; API callers
+        # must not reconstruct a deletion receipt with a lock-free query. A
+        # Manager mirror also retains this Task writer fence across its
+        # authoritative Worker DELETE. Invoke either callback after every
+        # Capability/Plan/runtime preflight and before the first local DELETE.
+        delete_preflight = TaskDeletePreflight(
+            task_id=task_id,
+            plan_ids=(
+                target_plan_graph.plan_ids
+                if target_plan_graph is not None
+                else ()
+            ),
+        )
+        if worker_delete_operation_id is not None:
+            from backend.services.worker_task_termination import (
+                manager_delete_receipt_allows_finalize,
+            )
 
-        plan_run_ids = list(
-            (
-                await self.db.execute(
-                    select(PlanAgentRun.id).where(
-                        PlanAgentRun.plan_task_id == task_id
+            if not manager_delete_receipt_allows_finalize(
+                locked_worker_delete_receipt,
+                task,
+                operation_id=worker_delete_operation_id,
+                plan_ids=delete_preflight.plan_ids,
+            ):
+                await self.db.rollback()
+                return False
+
+        delete_confirm = (
+            remote_delete_confirm
+            or before_delete
+            or prepare_remote_worker_delete
+        )
+        if delete_confirm is not None:
+            try:
+                delete_confirmed = await delete_confirm(delete_preflight)
+            except BaseException:
+                await self.db.rollback()
+                raise
+            if not delete_confirmed:
+                await self.db.rollback()
+                return False
+        if prepare_remote_worker_delete is not None:
+            # The callback staged the active pending_remote receipt in this
+            # transaction after every local fail-closed check. Commit that
+            # durable owner with the exact locked Task/Plan identity, then
+            # return before the first local DELETE or remote mutation.
+            await self.db.commit()
+            return True
+
+        # Neither task_shares nor team_task_shares can be left to database
+        # cascades: SQLite may not enforce the former FK, while the latter has
+        # no Task FK.  Keeping this inside the fenced delete transaction also
+        # prevents future Task-id reuse from inheriting stale access.
+        await purge_task_access_grants(self.db, task_id)
+        await self.db.execute(sa_delete(LogEntry).where(LogEntry.task_id == task_id))
+        if target_plan_graph is not None:
+            from backend.services.plan_deletion import delete_target_plan_graph
+
+            try:
+                await delete_target_plan_graph(self.db, target_plan_graph)
+            except PlanDeletionConflict:
+                await self.db.rollback()
+                # The complete graph was already locked and validated before
+                # a possible remote delete. A row-count mismatch here is an
+                # internal invariant/transaction failure, not a safe business
+                # rejection after the authoritative Worker may be gone.
+                raise
+        if capability_outboxes:
+            # SQLite deployments commonly run without FK enforcement.  Remove
+            # terminal outbox history explicitly and before its Execution /
+            # Invocation parents so every supported dialect has identical
+            # deletion behavior.
+            await self.db.execute(
+                sa_delete(CapabilityResumeOutbox).where(
+                    CapabilityResumeOutbox.id.in_(
+                        [outbox.id for outbox in capability_outboxes]
                     )
                 )
-            ).scalars().all()
-        )
-        if plan_run_ids:
+            )
+        if capability_invocation_ids:
             await self.db.execute(
-                sa_delete(PlanAgentStep).where(
-                    PlanAgentStep.run_id.in_(plan_run_ids)
+                sa_delete(CapabilityExecution).where(
+                    CapabilityExecution.invocation_id.in_(
+                        capability_invocation_ids
+                    )
                 )
             )
             await self.db.execute(
+                sa_delete(CapabilityInvocation).where(
+                    CapabilityInvocation.task_id == task_id
+                )
+            )
+        if legacy_runtime_receipts:
+            await self.db.execute(
+                sa_delete(PlanAgentRuntimeReceipt).where(
+                    PlanAgentRuntimeReceipt.id.in_(
+                        [receipt.id for receipt in legacy_runtime_receipts]
+                    )
+                )
+            )
+        if legacy_plan_step_ids:
+            await self.db.execute(
+                sa_delete(PlanAgentStep).where(
+                    PlanAgentStep.id.in_(legacy_plan_step_ids)
+                )
+            )
+        if legacy_only_plan_run_ids:
+            await self.db.execute(
                 sa_delete(PlanAgentRun).where(
-                    PlanAgentRun.id.in_(plan_run_ids)
+                    PlanAgentRun.id.in_(legacy_only_plan_run_ids)
                 )
             )
         if monitor_ids:
@@ -703,6 +1567,104 @@ class TaskQueue:
             await self.db.execute(
                 sa_delete(MonitorSession).where(MonitorSession.task_id == task_id)
             )
+
+        # Remove the complete terminal Harness graph before its Task owner.
+        # This is intentionally explicit: several supported SQLite deployments
+        # do not enforce foreign keys, and child Tasks are ordinary rows whose
+        # integer ids must not survive as unowned executable identities.
+        if harness_run_ids:
+            await self.db.execute(
+                sa_delete(TestHarnessEvidence).where(
+                    TestHarnessEvidence.run_id.in_(harness_run_ids)
+                )
+            )
+            await self.db.execute(
+                sa_delete(TestHarnessFinding).where(
+                    TestHarnessFinding.run_id.in_(harness_run_ids)
+                )
+            )
+            await self.db.execute(
+                sa_delete(TestHarnessEvent).where(
+                    TestHarnessEvent.run_id.in_(harness_run_ids)
+                )
+            )
+            await self.db.execute(
+                sa_delete(TestHarnessAttempt).where(
+                    TestHarnessAttempt.run_id.in_(harness_run_ids)
+                )
+            )
+            await self.db.execute(
+                sa_delete(TestHarnessSandboxLease).where(
+                    TestHarnessSandboxLease.run_id.in_(harness_run_ids)
+                )
+            )
+        if browser_bindings:
+            await self.db.execute(
+                sa_delete(TestHarnessChildBinding).where(
+                    TestHarnessChildBinding.id.in_(
+                        [binding.id for binding in browser_bindings]
+                    )
+                )
+            )
+        if workspace_run_ids:
+            await self.db.execute(
+                sa_delete(WorkspaceReviewRun).where(
+                    WorkspaceReviewRun.id.in_(workspace_run_ids)
+                )
+            )
+        if harness_run_ids:
+            await self.db.execute(
+                sa_delete(TestHarnessRun).where(
+                    TestHarnessRun.id.in_(harness_run_ids)
+                )
+            )
+        if browser_child_ids:
+            for browser_child_id in sorted(browser_child_ids):
+                await purge_task_access_grants(self.db, browser_child_id)
+            await self.db.execute(
+                sa_delete(LogEntry).where(LogEntry.task_id.in_(browser_child_ids))
+            )
+            deleted_browser_children = await self.db.execute(
+                sa_delete(Task).where(
+                    Task.id.in_(browser_child_ids),
+                    Task.status.in_(
+                        ("completed", "failed", "cancelled", "conflict", "superseded")
+                    ),
+                    Task.worker_id.is_(None),
+                )
+            )
+            if deleted_browser_children.rowcount != len(browser_child_ids):
+                await self.db.rollback()
+                return False
+
+        if worker_delete_operation_id is not None:
+            consumed_delete_owner = await self.db.execute(
+                sa_delete(WorkerTaskTerminationReceipt).where(
+                    WorkerTaskTerminationReceipt.operation_id
+                    == worker_delete_operation_id,
+                    WorkerTaskTerminationReceipt.task_id == task_id,
+                    WorkerTaskTerminationReceipt.active_task_id == task_id,
+                    WorkerTaskTerminationReceipt.side == "manager",
+                    WorkerTaskTerminationReceipt.operation == "delete",
+                    WorkerTaskTerminationReceipt.status == "awaiting_ack",
+                )
+            )
+            if consumed_delete_owner.rowcount != 1:
+                await self.db.rollback()
+                raise WorkerTaskTerminationConflict(
+                    "Durable Worker Task deletion owner changed before commit"
+                )
+
+        # SQLite deployments do not globally enable FK enforcement, while
+        # PostgreSQL/MySQL cascade this history.  Remove inactive tombstones
+        # explicitly in the same Task-generation transaction so deletion has
+        # identical semantics and downgrade is not blocked by orphan receipts.
+        await self.db.execute(
+            sa_delete(WorkerTaskTerminationReceipt).where(
+                WorkerTaskTerminationReceipt.task_id == task_id,
+                WorkerTaskTerminationReceipt.active_task_id.is_(None),
+            )
+        )
 
         # The terminal status and task-side owner observed above are the delete
         # generation fence. A concurrent retry may move this row to pending and
@@ -740,6 +1702,7 @@ class TaskQueue:
 
         blocked_ids = set(exclude_ids or ())
         while True:
+            dispatcher_scope = _dispatcher_scope_predicate()
             stmt = (
                 select(Task.id)
                 # worker task 不走本地 instance；shadow task (shared_from_id) 不执行
@@ -748,6 +1711,8 @@ class TaskQueue:
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
+                    dispatcher_scope,
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(1)
@@ -774,26 +1739,63 @@ class TaskQueue:
                 # them; final launch barriers independently fail closed.
                 blocked_ids.add(candidate_id)
                 continue
-            isolated_browser_child = bool(
-                (candidate.metadata_ or {}).get("isolated_browser_agent") is True
-            )
-            if isolated_browser_child:
-                binding_state = await self.db.scalar(
-                    select(TestHarnessChildBinding.state).where(
-                        TestHarnessChildBinding.child_task_id == candidate_id
-                    )
+            browser_binding = await self.db.scalar(
+                select(TestHarnessChildBinding).where(
+                    TestHarnessChildBinding.child_task_id == candidate_id
                 )
-                if binding_state != CHILD_READY:
-                    # Missing, reserved, stopping and recovered bindings all
-                    # fail closed. Startup recovery will terminalize legacy
-                    # rows; a live attach path alone may publish ``ready``.
+            )
+            projected_browser_child = bool(
+                (candidate.metadata_ or {}).get("isolated_browser_agent") is True
+                or (
+                    isinstance(candidate.enabled_skills, dict)
+                    and BROWSER_REVIEW_SKILL in candidate.enabled_skills
+                )
+            )
+            isolated_browser_child = browser_binding is not None
+            if browser_binding is None and projected_browser_child:
+                # A public/malformed Task projection is never sufficient launch
+                # authority. Startup recovery may still adopt a legacy row.
+                blocked_ids.add(candidate_id)
+                continue
+            if browser_binding is not None:
+                if browser_binding.state != CHILD_READY:
+                    # Reservation/stopping are lifecycle gates, not identity
+                    # drift. Only the attach path may publish ``ready``.
                     blocked_ids.add(candidate_id)
                     continue
+                identity_error = await browser_child_identity_error(
+                    self.db,
+                    browser_binding,
+                    candidate,
+                    expected_states={CHILD_READY},
+                )
+                if identity_error is not None:
+                    fail_browser_child_identity(
+                        browser_binding,
+                        candidate,
+                        f"Browser Agent launch identity rejected: {identity_error}",
+                    )
+                    await self.db.commit()
+                    self.db.expire_all()
+                    blocked_ids.add(candidate_id)
+                    continue
+            from backend.services.worker_relay import (
+                has_worker_execution_quarantine,
+            )
+
+            if has_worker_execution_quarantine(candidate.metadata_):
+                blocked_ids.add(candidate_id)
+                continue
 
             values = {
                 "status": "in_progress",
                 "started_at": datetime.utcnow(),
                 "error_message": None,
+                "turn_generation": Task.turn_generation + 1,
+                # A source pointer belongs to exactly one logical turn.  Clear
+                # the previous generation in the same CAS that creates G+1;
+                # Step 2 will bind the initial hidden source before launch.
+                "turn_source_log_id": None,
             }
             if instance_id is not None:
                 values["instance_id"] = instance_id
@@ -806,6 +1808,25 @@ class TaskQueue:
                     Task.worker_id.is_(None),
                     Task.shared_from_id.is_(None),
                     task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
+                    dispatcher_scope,
+                    *(
+                        (
+                            Task.provider == browser_binding.provider,
+                            Task.model == browser_binding.model,
+                            Task.effort_level
+                            == browser_binding.reasoning_effort,
+                            Task.codex_service_tier
+                            == browser_binding.codex_service_tier,
+                            Task.enabled_skills
+                            == {
+                                BROWSER_REVIEW_SKILL:
+                                browser_binding.browser_review_job_id
+                            },
+                        )
+                        if browser_binding is not None
+                        else ()
+                    ),
                 )
                 .values(**values)
             )
@@ -815,6 +1836,19 @@ class TaskQueue:
                     .where(
                         TestHarnessChildBinding.child_task_id == candidate_id,
                         TestHarnessChildBinding.state == CHILD_READY,
+                        TestHarnessChildBinding.id == browser_binding.id,
+                        TestHarnessChildBinding.child_task_incarnation_id
+                        == candidate.incarnation_id,
+                        TestHarnessChildBinding.provider == candidate.provider,
+                        TestHarnessChildBinding.model == candidate.model,
+                        TestHarnessChildBinding.reasoning_effort
+                        == candidate.effort_level,
+                        TestHarnessChildBinding.codex_service_tier
+                        == candidate.codex_service_tier,
+                        TestHarnessChildBinding.skill_name
+                        == BROWSER_REVIEW_SKILL,
+                        TestHarnessChildBinding.claimed_retry_count.is_(None),
+                        TestHarnessChildBinding.claimed_instance_id.is_(None),
                     )
                     .values(
                         state=CHILD_RUNNING,
@@ -845,7 +1879,12 @@ class TaskQueue:
         if status in ("completed", "failed"):
             values.setdefault("completed_at", datetime.utcnow())
         await self.db.execute(
-            update(Task).where(Task.id == task_id).values(**values)
+            update(Task)
+            .where(
+                Task.id == task_id,
+                no_active_worker_task_termination_predicate(),
+            )
+            .values(**values)
         )
         await self.db.commit()
 
@@ -866,6 +1905,7 @@ class TaskQueue:
         predicates = [
             Task.id == task_id,
             Task.status.in_(expected_statuses),
+            no_active_worker_task_termination_predicate(),
         ]
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
@@ -906,7 +1946,11 @@ class TaskQueue:
     ) -> bool:
         """Fail only the still-active task generation that produced ``error``."""
 
-        predicates = [Task.id == task_id, Task.status.in_(expected_statuses)]
+        predicates = [
+            Task.id == task_id,
+            Task.status.in_(expected_statuses),
+            no_active_worker_task_termination_predicate(),
+        ]
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicates, generation_fence)
@@ -953,16 +1997,17 @@ class TaskQueue:
             Task.id == task_id,
             Task.status.in_(("in_progress", "executing")),
             task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
         ]
         if instance_id is not None:
             predicate.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicate, generation_fence)
-        metadata = await self.db.scalar(
-            select(Task.metadata_).where(Task.id == task_id)
+        browser_binding = await self.db.scalar(
+            select(TestHarnessChildBinding).where(
+                TestHarnessChildBinding.child_task_id == task_id
+            )
         )
-        isolated_browser_child = bool(
-            (metadata or {}).get("isolated_browser_agent") is True
-        )
+        isolated_browser_child = browser_binding is not None
         result = await self.db.execute(
             update(Task)
             .where(*predicate)
@@ -980,6 +2025,10 @@ class TaskQueue:
                 .where(
                     TestHarnessChildBinding.child_task_id == task_id,
                     TestHarnessChildBinding.state == CHILD_RUNNING,
+                    TestHarnessChildBinding.claimed_retry_count
+                    == browser_binding.claimed_retry_count,
+                    TestHarnessChildBinding.claimed_instance_id
+                    == browser_binding.claimed_instance_id,
                 )
                 .values(
                     state=CHILD_READY,
@@ -1023,8 +2072,10 @@ class TaskQueue:
         predicates = [
             Task.id == task_id,
             Task.status.in_(expected_statuses),
+            Task.status != "waiting_capability",
             Task.pty_background_generation.is_(None),
             task_retry_not_superseded_predicate(),
+            no_active_worker_task_termination_predicate(),
         ]
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
@@ -1037,6 +2088,9 @@ class TaskQueue:
             "started_at": None,
             "completed_at": None,
             "pty_background_generation": None,
+            # The source pointer is exact retry/generation provenance. Clear
+            # it in the same CAS that advances retry_count.
+            "turn_source_log_id": None,
         }
         if task_updates:
             values.update(task_updates)
@@ -1078,6 +2132,7 @@ class TaskQueue:
                         "merging",
                     )
                 ),
+                no_active_worker_task_termination_predicate(),
             )
             .values(status="cancelled", completed_at=datetime.utcnow())
         )

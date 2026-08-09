@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from backend.models.project import Project
 from backend.models.task import Task
@@ -57,6 +57,55 @@ async def _task(db_factory) -> int:
         db.add(task)
         await db.commit()
         return task.id
+
+
+@pytest.mark.asyncio
+async def test_owner_deleted_after_optimistic_read_cannot_create_orphan_run(
+    db_factory,
+    monkeypatch,
+):
+    task_id = await _task(db_factory)
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    entered_create = asyncio.Event()
+    continue_create = asyncio.Event()
+    original_create = service._create_run
+
+    async def delayed_create(**kwargs):
+        entered_create.set()
+        await continue_create.wait()
+        return await original_create(**kwargs)
+
+    monkeypatch.setattr(service, "_create_run", delayed_create)
+    start = asyncio.create_task(
+        service.start_task_run(
+            task_id=task_id,
+            spec=HarnessSpec(
+                target_kind="fixed_url",
+                target={"url": "https://example.com"},
+                goal="Review after an owner deletion race",
+            ),
+        )
+    )
+    await asyncio.wait_for(entered_create.wait(), timeout=1)
+
+    async with db_factory() as db:
+        deleted = await db.execute(delete(Task).where(Task.id == task_id))
+        assert deleted.rowcount == 1
+        await db.commit()
+
+    continue_create.set()
+    with pytest.raises(HarnessError, match="owner Task disappeared"):
+        await start
+
+    async with db_factory() as db:
+        assert await db.get(Task, task_id) is None
+        assert list(
+            (
+                await db.execute(
+                    select(RunModel).where(RunModel.task_id == task_id)
+                )
+            ).scalars()
+        ) == []
 
 
 def test_git_browser_context_exposes_metadata_not_diff_content():

@@ -337,20 +337,33 @@ class TestHarnessArtifactStore:
         *,
         active_job_ids: set[str] | None = None,
         now: datetime | None = None,
+        required_free_bytes: int = 0,
     ) -> int:
         self.ensure_root()
         active = active_job_ids or set()
+        required = max(0, int(required_free_bytes))
+        target_total = max(0, self.max_total_bytes - required)
         cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=self.retention_days)
         removed = 0
-        for candidate in list(self.jobs_root.iterdir()):
+        candidates: list[tuple[int, str, Path]] = []
+        for candidate in self.jobs_root.iterdir():
             if candidate.name in active or not _ID_RE.fullmatch(candidate.name):
                 continue
             try:
                 info = candidate.lstat()
             except FileNotFoundError:
                 continue
+            candidates.append((info.st_mtime_ns, candidate.name, candidate))
+
+        # Capacity recovery is deterministic and sacrifices the oldest
+        # terminal, fully archived staging directory first.
+        for _mtime_ns, _name, candidate in sorted(candidates):
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
             modified = datetime.fromtimestamp(info.st_mtime, tz=timezone.utc)
-            over_quota = self.total_bytes() > self.max_total_bytes
+            over_quota = self.total_bytes() > target_total
             if modified <= cutoff or over_quota:
                 if self.remove_job_dir(candidate.name):
                     removed += 1

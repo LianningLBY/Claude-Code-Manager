@@ -228,6 +228,19 @@ async def test_leader_exit_does_not_leave_descendant_process_group(tmp_path):
 async def test_shutdown_cancels_and_reaps_facilitator(monkeypatch):
     service = DiscussionService(lambda: _FakeDb(), _Broadcaster())
     real_spawn = asyncio.create_subprocess_exec
+    # Keep the test deadline longer than the complete signal escalation.
+    # A just-spawned interpreter is not guaranteed to exit on the first
+    # SIGINT before its startup has settled, especially under suite load.
+    monkeypatch.setattr(
+        discussion_service,
+        "_PROCESS_SIGNAL_TIMEOUTS",
+        (0.1, 0.1, 0.1),
+    )
+    monkeypatch.setattr(
+        discussion_service,
+        "_CONSUMER_SHUTDOWN_TIMEOUT",
+        1.0,
+    )
 
     async def spawn_sleeper(*_args, **kwargs):
         return await real_spawn(

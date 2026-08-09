@@ -27,12 +27,13 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from backend.database import async_session
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessRun
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.process_safety import require_safe_process_group_id
@@ -1072,9 +1073,43 @@ class WorkspaceReviewManager:
                 )
                 if active is not None:
                     raise WorkspaceReviewBusyError("This Task already has an active workspace review")
-                task = await db.get(Task, task_id)
-                if task is None:
+                task = (
+                    await db.execute(
+                        select(Task).where(Task.id == task_id).with_for_update()
+                    )
+                ).scalar_one_or_none()
+                if task is None or not task.incarnation_id:
                     raise WorkspaceReviewError("Task not found")
+                owner_fence = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.incarnation_id == task.incarnation_id,
+                    )
+                    .values(incarnation_id=task.incarnation_id)
+                )
+                if owner_fence.rowcount != 1:
+                    raise WorkspaceReviewError(
+                        "Task changed during workspace review admission"
+                    )
+                if harness_run_id:
+                    harness_run = (
+                        await db.execute(
+                            select(TestHarnessRun)
+                            .where(TestHarnessRun.id == harness_run_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        harness_run is None
+                        or harness_run.task_id != task.id
+                        or harness_run.task_incarnation_id != task.incarnation_id
+                        or harness_run.status
+                        in {"completed", "failed", "cancelled", "superseded"}
+                    ):
+                        raise WorkspaceReviewError(
+                            "Harness run owner/generation changed before Preview admission"
+                        )
                 project = await db.get(Project, task.project_id) if task.project_id else None
                 workspace = (
                     _safe_workspace_override(workspace_override)
@@ -1100,6 +1135,7 @@ class WorkspaceReviewManager:
                 run = WorkspaceReviewRun(
                     id=uuid.uuid4().hex,
                     task_id=task.id,
+                    task_incarnation_id=task.incarnation_id,
                     project_id=task.project_id,
                     harness_run_id=harness_run_id,
                     mode=mode,

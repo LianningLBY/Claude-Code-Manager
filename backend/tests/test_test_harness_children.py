@@ -130,6 +130,33 @@ async def test_reserved_browser_child_is_not_claimable_until_activation(db_facto
 
 
 @pytest.mark.asyncio
+async def test_ready_browser_child_identity_drift_fails_closed_at_dequeue(
+    db_factory,
+):
+    owner_id, run_id = await _owner_and_run(db_factory)
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-drift",
+        harness_run_id=run_id,
+        child_values=_child_values("job-drift"),
+    )
+    await service.activate(binding.id)
+
+    async with db_factory() as db:
+        drifted = await db.get(Task, child.id)
+        drifted.model = "attacker-controlled-model"
+        await db.commit()
+
+        assert await TaskQueue(db).dequeue(instance_id=44) is None
+        persisted = await db.get(Task, child.id)
+        durable = await db.get(ChildBindingModel, binding.id)
+        assert persisted.status == "failed"
+        assert "identity rejected" in (persisted.error_message or "")
+        assert durable.state == CHILD_STOPPED
+
+
+@pytest.mark.asyncio
 async def test_isolated_pending_task_without_binding_is_never_claimed(db_factory):
     async with db_factory() as db:
         orphan = Task(

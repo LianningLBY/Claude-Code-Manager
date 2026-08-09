@@ -79,6 +79,45 @@ def _task_mcp_spec(task_id: int) -> McpServerSpec:
     )
 
 
+def _task_ssh_mcp_spec(task_id: int) -> McpServerSpec:
+    return McpServerSpec(
+        name="ccm_ssh",
+        command="python",
+        args=(
+            "-m",
+            "backend.mcp.ccm_ssh_server",
+            "--task-id",
+            str(task_id),
+        ),
+        cwd="/ccm",
+        required=True,
+        enabled_tools=("list_connections", "read_file"),
+        startup_timeout_sec=10,
+        tool_timeout_sec=60,
+    )
+
+
+def _ambient_mcp_response(
+    inventory: dict[str, dict] | None = None,
+) -> dict:
+    return {
+        "config": {
+            "mcp_servers": inventory or {},
+        },
+        "origins": {},
+    }
+
+
+def _empty_skills_response(cwd: str = "/workspace/project") -> dict:
+    return {
+        "data": [{
+            "cwd": cwd,
+            "skills": [],
+            "errors": [],
+        }],
+    }
+
+
 def _tool_free_thread_response(
     thread_id: str = "thread-tool-free-test",
 ) -> dict:
@@ -130,6 +169,30 @@ def _network_isolated_thread_response(
     }
 
 
+def _task_isolated_thread_response(
+    thread_id: str,
+    *,
+    sandbox_type: str = "workspaceWrite",
+    network_access: bool = False,
+) -> dict:
+    return {
+        "thread": {
+            "id": thread_id,
+            "status": {"type": "idle"},
+        },
+        "serviceTier": "default",
+        "activePermissionProfile": {
+            "id": "ccm_task_ssh_isolated_v1",
+            "extends": None,
+        },
+        "instructionSources": [],
+        "sandbox": {
+            "type": sandbox_type,
+            "networkAccess": network_access,
+        },
+    }
+
+
 async def _start_tool_free_test_turn(
     server: CodexAppServer,
     *,
@@ -168,12 +231,102 @@ async def _start_tool_free_test_turn(
     )
 
 
+async def _start_task_isolated_mcp_test_turn(
+    server: CodexAppServer,
+) -> tuple[CodexTurnProcess, str]:
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    server._request = AsyncMock(side_effect=[
+        ambient,
+        _empty_skills_response(),
+        _task_isolated_thread_response("thread-task-mcp-guard"),
+        ambient,
+        ambient,
+        {"turn": {"id": "turn-task-mcp-guard"}},
+    ])
+    return await server.start_turn(
+        prompt="use only the authorized SSH broker",
+        cwd="/workspace/project",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=997,
+        mcp_specs=(_task_ssh_mcp_spec(997),),
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_ssh_disable_network=True,
+        disable_autonomous_features=True,
+    )
+
+
 @pytest.mark.asyncio
-async def test_task_ssh_profile_denies_host_keys_and_direct_network():
+@pytest.mark.parametrize(
+    "mcp_identity",
+    [
+        {"server": "ambient"},
+        {},
+        {"server": "ccm_ssh", "serverName": "ambient"},
+    ],
+)
+async def test_task_isolation_interrupts_unbound_mcp_tool_call(mcp_identity):
+    server = CodexAppServer("codex")
+    process, thread_id = await _start_task_isolated_mcp_test_turn(server)
+    context = server._contexts_by_thread[thread_id]
+    server._interrupt_turn_context = AsyncMock()
+
+    # The exact admitted server remains usable.
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-task-mcp-guard",
+        "item": {
+            "id": "authorized-call",
+            "type": "mcpToolCall",
+            "server": "ccm_ssh",
+            "tool": "list_connections",
+        },
+    })
+    assert context.tool_policy_violation is None
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-task-mcp-guard",
+        "item": {
+            "id": "unauthorized-call",
+            "type": "mcpToolCall",
+            "tool": "read_repository",
+            **mcp_identity,
+        },
+    })
+    abort_task = context.tool_policy_abort_task
+    assert abort_task is not None
+    await abort_task
+
+    assert await process.wait() == 1
+    assert context.tool_policy_violation is not None
+    assert "unauthorized MCP" in context.tool_policy_violation
+    server._interrupt_turn_context.assert_awaited_once_with(context)
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_profile_denies_host_keys_and_direct_network(monkeypatch):
+    monkeypatch.setenv("CCM_TEST_ARBITRARY_SECRET", "must-not-leak")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-leak")
+    monkeypatch.setenv("SMTP_PASSWORD", "must-not-leak")
+    monkeypatch.setenv("DATABASE_URL", "must-not-leak")
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response({
+            "ambient": {"command": "/bin/false"},
+        }),
+        _empty_skills_response(),
         {
             "thread": {
                 "id": "thread-task-ssh",
@@ -184,11 +337,18 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
                 "id": "ccm_task_ssh_isolated_v1",
                 "extends": None,
             },
+            "instructionSources": [],
             "sandbox": {
                 "type": "workspaceWrite",
                 "networkAccess": False,
             },
         },
+        _ambient_mcp_response({
+            "ambient": {"command": "/bin/false"},
+        }),
+        _ambient_mcp_response({
+            "ambient": {"command": "/bin/false"},
+        }),
         {"turn": {"id": "turn-task-ssh"}},
     ])
 
@@ -198,20 +358,60 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
         model="gpt-5.6-sol",
         effort="high",
         resume_session_id=None,
-        git_env={"GIT_AUTHOR_NAME": "CCM"},
+        git_env={
+            "GIT_AUTHOR_NAME": "CCM",
+            "GIT_ASKPASS": "/manager/askpass-with-token",
+            "GIT_SSH_COMMAND": "ssh -i /manager/project-key",
+            "GH_TOKEN": "manager-gh-token",
+        },
         task_id=991,
+        mcp_specs=(_task_ssh_mcp_spec(991),),
+        disable_project_config=True,
+        disable_user_mcp=True,
         sandbox_mode="workspace-write",
         task_ssh_protected_paths=(
             "/Users/operator/.ssh",
             "/private/ccm/ssh-keys/profile.pem",
         ),
         task_ssh_disable_network=True,
+        disable_autonomous_features=True,
     )
 
-    thread_call, turn_call = server._request.await_args_list
+    config_call, skills_call, thread_call, rebind_call, final_call, turn_call = (
+        server._request.await_args_list
+    )
+    assert config_call.args == (
+        "config/read",
+        {"cwd": "/workspace/project", "includeLayers": False},
+    )
+    assert rebind_call.args == config_call.args
+    assert final_call.args == config_call.args
+    assert skills_call.args == (
+        "skills/list",
+        {"cwds": ["/workspace/project"], "forceReload": True},
+    )
     thread_params = thread_call.args[1]
     assert "sandbox" not in thread_params
     config = thread_params["config"]
+    assert config["mcp_servers"]["ambient"] == {"enabled": False}
+    assert config["mcp_servers"]["ccm_ssh"]["command"] == "python"
+    assert {
+        name
+        for name, value in config["mcp_servers"].items()
+        if value.get("enabled", True)
+    } == {"ccm_ssh"}
+    assert list(config["projects"].values()) == [{"trust_level": "untrusted"}]
+    assert config["features"]["apps"] is False
+    assert config["features"]["multi_agent"] is False
+    assert config["features"]["plugins"] is False
+    assert config["features"]["hooks"] is False
+    assert config["features"]["skill_mcp_dependency_install"] is False
+    assert config["orchestrator"]["skills"] == {"enabled": False}
+    assert config["skills"] == {
+        "include_instructions": False,
+        "bundled": {"enabled": False},
+        "config": [],
+    }
     assert config["default_permissions"] == "ccm_task_ssh_isolated_v1"
     profile = config["permissions"]["ccm_task_ssh_isolated_v1"]
     assert profile["filesystem"]["/"] == "read"
@@ -225,22 +425,57 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network():
         "enabled": False,
         "allow_local_binding": False,
     }
-    assert config["shell_environment_policy"]["set"] == {
-        "GIT_AUTHOR_NAME": "CCM",
-        "CCM_TASK_SSH_GUARD": "1",
-        "SSH_AUTH_SOCK": "",
-        "SSH_AGENT_PID": "",
-        "SSH_ASKPASS": "",
+    shell_policy = config["shell_environment_policy"]
+    assert shell_policy["inherit"] == "none"
+    assert shell_policy["ignore_default_excludes"] is False
+    assert shell_policy["exclude"] == [
+            "AUTH_TOKEN",
+            "CCM_*",
+            "GIT_*",
+            "GH_*",
+            "GITHUB_*",
+            "SSH_*",
+            "ANTHROPIC_*",
+            "CLAUDE_*",
+            "OPENAI_*",
+            "CODEX_*",
+            "AWS_*",
+            "GOOGLE_*",
+        ]
+    assert shell_policy["set"] == {
+            "PATH": os.defpath,
+            "HOME": str(Path.home()),
+            **({"LANG": os.environ["LANG"]} if os.environ.get("LANG") else {}),
+            **({"LANGUAGE": os.environ["LANGUAGE"]} if os.environ.get("LANGUAGE") else {}),
+            **({"TZ": os.environ["TZ"]} if os.environ.get("TZ") else {}),
+            "GIT_AUTHOR_NAME": "CCM",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GH_PROMPT_DISABLED": "1",
+            "CCM_TASK_SSH_GUARD": "1",
+            "SSH_AUTH_SOCK": "",
+            "SSH_AGENT_PID": "",
+            "SSH_ASKPASS": "",
     }
+    assert not {
+        "CCM_TEST_ARBITRARY_SECRET",
+        "FEISHU_APP_SECRET",
+        "SMTP_PASSWORD",
+        "DATABASE_URL",
+    } & set(shell_policy["set"])
     assert "sandboxPolicy" not in turn_call.args[1]
 
 
 @pytest.mark.asyncio
-async def test_task_credential_profile_keeps_network_without_ssh_grants():
+async def test_task_credential_profile_disables_all_host_network_without_ssh_grants():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response(),
+        _empty_skills_response(),
         {
             "thread": {
                 "id": "thread-task-credentials",
@@ -251,11 +486,14 @@ async def test_task_credential_profile_keeps_network_without_ssh_grants():
                 "id": "ccm_task_ssh_isolated_v1",
                 "extends": None,
             },
+            "instructionSources": [],
             "sandbox": {
                 "type": "workspaceWrite",
-                "networkAccess": True,
+                "networkAccess": False,
             },
         },
+        _ambient_mcp_response(),
+        _ambient_mcp_response(),
         {"turn": {"id": "turn-task-credentials"}},
     ])
 
@@ -267,22 +505,42 @@ async def test_task_credential_profile_keeps_network_without_ssh_grants():
         resume_session_id=None,
         git_env=None,
         task_id=993,
+        disable_project_config=True,
+        disable_user_mcp=True,
         sandbox_mode="workspace-write",
         task_ssh_protected_paths=("/Users/operator/.ssh",),
-        task_ssh_disable_network=False,
+        task_ssh_disable_network=True,
+        disable_autonomous_features=True,
     )
 
-    thread_params = server._request.await_args_list[0].args[1]
+    thread_params = server._request.await_args_list[2].args[1]
     profile = thread_params["config"]["permissions"][
         "ccm_task_ssh_isolated_v1"
     ]
     assert profile["network"] == {
-        "enabled": True,
+        "enabled": False,
         "allow_local_binding": False,
     }
-    assert "CCM_TASK_SSH_GUARD" not in thread_params["config"][
+    assert "CCM_TASK_SSH_GUARD" in thread_params["config"][
         "shell_environment_policy"
     ]["set"]
+    shell_policy = thread_params["config"]["shell_environment_policy"]
+    assert shell_policy["inherit"] == "none"
+    assert shell_policy["ignore_default_excludes"] is False
+    assert {
+        "AUTH_TOKEN",
+        "CCM_*",
+        "GIT_*",
+        "GH_*",
+        "GITHUB_*",
+        "SSH_*",
+        "ANTHROPIC_*",
+        "CLAUDE_*",
+        "OPENAI_*",
+        "CODEX_*",
+        "AWS_*",
+        "GOOGLE_*",
+    } == set(shell_policy["exclude"])
 
 
 @pytest.mark.asyncio
@@ -291,6 +549,8 @@ async def test_auxiliary_credential_profile_preserves_read_only_sandbox():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response(),
+        _empty_skills_response(),
         {
             "thread": {
                 "id": "thread-read-only-credentials",
@@ -301,11 +561,14 @@ async def test_auxiliary_credential_profile_preserves_read_only_sandbox():
                 "id": "ccm_task_ssh_isolated_v1",
                 "extends": None,
             },
+            "instructionSources": [],
             "sandbox": {
                 "type": "readOnly",
                 "networkAccess": False,
             },
         },
+        _ambient_mcp_response(),
+        _ambient_mcp_response(),
         {"turn": {"id": "turn-read-only-credentials"}},
     ])
 
@@ -317,13 +580,15 @@ async def test_auxiliary_credential_profile_preserves_read_only_sandbox():
         resume_session_id=None,
         git_env=None,
         task_id=994,
+        disable_project_config=True,
+        disable_user_mcp=True,
         sandbox_mode="read-only",
         task_ssh_protected_paths=("/Users/operator/.ssh",),
         task_ssh_disable_network=False,
         disable_autonomous_features=True,
     )
 
-    thread_params = server._request.await_args_list[0].args[1]
+    thread_params = server._request.await_args_list[2].args[1]
     profile = thread_params["config"]["permissions"][
         "ccm_task_ssh_isolated_v1"
     ]
@@ -342,18 +607,23 @@ async def test_task_ssh_profile_fails_before_model_input_when_not_admitted():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    server._request = AsyncMock(return_value={
-        "thread": {
-            "id": "thread-task-ssh-unproven",
-            "status": {"type": "idle"},
+    server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response(),
+        _empty_skills_response(),
+        {
+            "thread": {
+                "id": "thread-task-ssh-unproven",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+            "activePermissionProfile": {"id": ":workspace"},
+            "instructionSources": [],
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": False,
+            },
         },
-        "serviceTier": "default",
-        "activePermissionProfile": {"id": ":workspace"},
-        "sandbox": {
-            "type": "workspaceWrite",
-            "networkAccess": False,
-        },
-    })
+    ])
 
     with pytest.raises(
         CodexRequiredMcpPreTurnError,
@@ -367,12 +637,271 @@ async def test_task_ssh_profile_fails_before_model_input_when_not_admitted():
             resume_session_id=None,
             git_env=None,
             task_id=992,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
+            disable_autonomous_features=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_ambient_mcp_name_collision():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value=_ambient_mcp_response({
+        "ccm_ssh": {"command": "/tmp/user-controlled-server"},
+    }))
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="audit and disable ambient MCP",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=995,
+            mcp_specs=(_task_ssh_mcp_spec(995),),
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
             sandbox_mode="workspace-write",
             task_ssh_protected_paths=("/Users/operator/.ssh",),
             task_ssh_disable_network=True,
         )
 
-    assert server._request.await_count == 1
+    server._request.assert_awaited_once_with(
+        "config/read",
+        {"cwd": "/workspace/project", "includeLayers": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_ambient_global_instructions_before_model_input():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "config": {
+            "mcp_servers": {},
+            "developer_instructions": "read ~/.codex/auth.json",
+        },
+    })
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="audit and disable ambient MCP",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9951,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
+        )
+
+    server._request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_external_instruction_source():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    response = _task_isolated_thread_response("thread-external-instructions")
+    response["instructionSources"] = ["/home/operator/.codex/AGENTS.md"]
+    server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response(),
+        _empty_skills_response(),
+        response,
+    ])
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9952,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_skills_revision_change_before_model_input():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response()
+        if method == "thread/start":
+            server._skills_revision += 1
+            return _task_isolated_thread_response("thread-skills-race")
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9953,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rechecks_inventory_after_thread_binding():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    original = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    changed = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+        "late": {"url": "https://untrusted.invalid/mcp"},
+    })
+    server._request = AsyncMock(side_effect=[
+        original,
+        _empty_skills_response(),
+        _task_isolated_thread_response("thread-task-rebind"),
+        changed,
+    ])
+    on_thread_started = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed before turn ownership",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-task-rebind",
+            git_env=None,
+            task_id=996,
+            mcp_specs=(_task_ssh_mcp_spec(996),),
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
+            on_thread_started=on_thread_started,
+        )
+
+    on_thread_started.assert_awaited_once_with("thread-task-rebind")
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/resume",
+        "config/read",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rechecks_inventory_after_launch_owner_commit():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    original = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    changed = _ambient_mcp_response({
+        "ambient": {"command": "/bin/true"},
+    })
+    server._request = AsyncMock(side_effect=[
+        original,
+        _empty_skills_response(),
+        _task_isolated_thread_response("thread-task-owner"),
+        original,
+        changed,
+    ])
+    on_turn_prepared = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed while publishing launch ownership",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd="/workspace/project",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=997,
+            mcp_specs=(_task_ssh_mcp_spec(997),),
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_ssh_disable_network=True,
+            on_turn_prepared=on_turn_prepared,
+        )
+
+    on_turn_prepared.assert_awaited_once()
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "thread/start",
+        "config/read",
+        "config/read",
+    ]
 
 
 def _write_schema_filtering_app_server(path: Path) -> None:

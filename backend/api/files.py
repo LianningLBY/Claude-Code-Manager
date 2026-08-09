@@ -22,7 +22,10 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
-from backend.api.deps import require_admin
+from backend.api.deps import (
+    require_admin,
+    require_managed_ssh_auth_configured,
+)
 from backend.config import settings
 from backend.database import get_db
 from backend.models.ssh_profile import SSHProfile
@@ -569,7 +572,10 @@ async def download_file(path: str = Query(..., description="Absolute file path")
 # SSH endpoints
 # ---------------------------------------------------------------------------
 
-@router.post("/ssh/{profile_id}/list")
+@router.post(
+    "/ssh/{profile_id}/list",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def managed_ssh_list_directory(
     profile_id: int,
     req: ManagedSSHPathRequest,
@@ -593,7 +599,10 @@ async def managed_ssh_list_directory(
     }
 
 
-@router.post("/ssh/{profile_id}/read")
+@router.post(
+    "/ssh/{profile_id}/read",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def managed_ssh_read_file(
     profile_id: int,
     req: ManagedSSHPathRequest,
@@ -613,7 +622,10 @@ async def managed_ssh_read_file(
     return {"path": canonical_path, "content": content, "size": size}
 
 
-@router.post("/ssh/{profile_id}/download")
+@router.post(
+    "/ssh/{profile_id}/download",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def managed_ssh_download_file(
     profile_id: int,
     req: ManagedSSHPathRequest,
@@ -644,7 +656,10 @@ async def managed_ssh_download_file(
         ),
     )
 
-@router.post("/ssh/list")
+@router.post(
+    "/ssh/list",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def ssh_list_directory(req: SSHListRequest):
     """List contents of a directory on a remote SSH server."""
     client = _make_ssh_client(req)
@@ -674,7 +689,10 @@ async def ssh_list_directory(req: SSHListRequest):
     return {"path": req.path, "entries": entries}
 
 
-@router.post("/ssh/read")
+@router.post(
+    "/ssh/read",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def ssh_read_file(req: SSHReadRequest):
     """Read a file from a remote SSH server (max 1 MB)."""
     client = _make_ssh_client(req)
@@ -706,7 +724,10 @@ async def ssh_read_file(req: SSHReadRequest):
     return {"path": req.path, "content": content, "size": size}
 
 
-@router.post("/ssh/download")
+@router.post(
+    "/ssh/download",
+    dependencies=[Depends(require_managed_ssh_auth_configured)],
+)
 async def ssh_download_file(req: SSHReadRequest):
     """Download a file from a remote SSH server (max 100 MB)."""
     client = _make_ssh_client(req)

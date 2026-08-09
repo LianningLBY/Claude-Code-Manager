@@ -1,6 +1,9 @@
 import json
 import os
 import stat
+import shlex
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,14 +12,53 @@ import pytest
 from backend.config import settings
 from backend.services.task_agent_isolation import (
     CLAUDE_MONITOR_BUILTIN_TOOLS,
+    CLAUDE_SUBPROCESS_ENV_SCRUB,
     CLAUDE_SUB_AGENT_BUILTIN_TOOLS,
     CLAUDE_TASK_BUILTIN_TOOLS,
     TaskAgentIsolationError,
     generate_claude_aux_isolation_settings,
     generate_claude_task_isolation_settings,
+    generate_claude_zero_tool_isolation_settings,
+    prepare_task_working_directory,
+    require_claude_apply_seccomp,
+    require_task_security_boundary_configured,
+    scrub_task_model_environment,
     validate_claude_task_isolation_settings,
 )
-from backend.services.task_ssh_access import _protected_path_variants
+from backend.services import trusted_runtime
+from backend.services.trusted_runtime import (
+    RUNNING_CCM_CHECKOUT,
+    require_trusted_python_runtime,
+    trusted_runtime_protected_roots,
+    verify_materialized_trusted_python_asset,
+)
+from backend.services.task_ssh_access import (
+    TaskSSHAccessError,
+    _protected_path_variants,
+    manager_secret_protected_paths,
+)
+
+
+def _sandbox_loading_canary_result():
+    return SimpleNamespace(
+        returncode=1,
+        stdout=json.dumps({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": True,
+            "num_turns": 0,
+            "total_cost_usd": 0,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
+        }),
+        stderr=(
+            "Sandbox required but unavailable because "
+            "sandbox.failIfUnavailable is enabled"
+        ),
+    )
 
 
 def test_protected_path_variants_expand_environment_variables(
@@ -29,6 +71,337 @@ def test_protected_path_variants_expand_environment_variables(
     variants = _protected_path_variants("$CCM_TEST_CREDENTIAL_ROOT/ssh")
 
     assert str(credential_root / "ssh") in variants
+
+
+def test_task_process_env_scrubs_ambient_credentials_before_exact_git_overlay():
+    parent = {
+        "PATH": os.environ.get("PATH", ""),
+        "AUTH_TOKEN": "deployment-secret",
+        "CCM_INTERNAL_SERVICE_TOKEN": "internal-secret",
+        "GH_TOKEN": "ambient-gh-secret",
+        "GITHUB_TOKEN": "ambient-github-secret",
+        "GIT_ASKPASS": "/ambient/askpass",
+        "GIT_SSH_COMMAND": "ssh -i /ambient/key",
+        "SSH_AUTH_SOCK": "/ambient/agent.sock",
+        "GIT_AUTHOR_NAME": "Committer",
+        "ANTHROPIC_API_KEY": "provider-parent-secret",
+        "DATABASE_URL": "postgresql://manager-secret",
+        "OPENAI_API_KEY": "whisper-secret",
+        "FEISHU_APP_SECRET": "feishu-secret",
+        "FEISHU_OAUTH_STATE_SECRET": "oauth-state-secret",
+        "SMTP_PASSWORD": "mail-secret",
+        "BACKUP_S3_ACCESS_KEY": "backup-access",
+        "BACKUP_S3_SECRET_KEY": "backup-secret",
+        "BACKUP_OSS_ACCESS_KEY": "oss-access",
+        "BACKUP_OSS_SECRET_KEY": "oss-secret",
+        "CCM_TEST_ARBITRARY_SECRET": "must-not-leak",
+    }
+    child_env = scrub_task_model_environment(parent, provider="claude")
+    child_env.update({
+        "GIT_ASKPASS": "/project/askpass",
+        "GIT_SSH_COMMAND": "ssh -i /project/key",
+        "GIT_AUTHOR_NAME": "Project Committer",
+    })
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json, os; "
+                "print(json.dumps({"
+                "'gh': 'GH_TOKEN' in os.environ, "
+                "'github': 'GITHUB_TOKEN' in os.environ, "
+                "'agent': 'SSH_AUTH_SOCK' in os.environ, "
+                "'askpass': os.environ.get('GIT_ASKPASS'), "
+                "'ssh': os.environ.get('GIT_SSH_COMMAND')}))"
+            ),
+        ],
+        env=child_env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    observed = json.loads(probe.stdout)
+
+    assert observed == {
+        "gh": False,
+        "github": False,
+        "agent": False,
+        "askpass": "/project/askpass",
+        "ssh": "ssh -i /project/key",
+    }
+    assert child_env["GIT_AUTHOR_NAME"] == "Project Committer"
+    assert child_env["ANTHROPIC_API_KEY"] == "provider-parent-secret"
+    assert child_env[CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
+    for secret_name in (
+        "DATABASE_URL",
+        "OPENAI_API_KEY",
+        "FEISHU_APP_SECRET",
+        "FEISHU_OAUTH_STATE_SECRET",
+        "SMTP_PASSWORD",
+        "BACKUP_S3_ACCESS_KEY",
+        "BACKUP_S3_SECRET_KEY",
+        "BACKUP_OSS_ACCESS_KEY",
+        "BACKUP_OSS_SECRET_KEY",
+        "CCM_TEST_ARBITRARY_SECRET",
+    ):
+        assert secret_name not in child_env
+
+
+def test_agent_workloads_require_nonempty_control_plane_auth(monkeypatch):
+    monkeypatch.setattr(settings, "auth_token", "  ")
+    with pytest.raises(TaskAgentIsolationError, match="AUTH_TOKEN"):
+        require_task_security_boundary_configured()
+
+    monkeypatch.setattr(settings, "auth_token", "deployment-secret")
+    require_task_security_boundary_configured()
+
+
+def test_trusted_runtime_protects_live_assets_but_not_complete_checkout():
+    roots = {Path(value) for value in trusted_runtime_protected_roots()}
+    checkout = Path(RUNNING_CCM_CHECKOUT)
+
+    assert checkout not in roots
+    assert (checkout / "backend").resolve() in roots
+    assert Path(os.path.sep) not in roots
+
+
+def test_system_python_prefix_is_not_a_global_task_deny(monkeypatch):
+    monkeypatch.setattr(trusted_runtime.sys, "prefix", "/usr")
+    monkeypatch.setattr(trusted_runtime.sys, "base_prefix", "/usr")
+
+    roots = set(trusted_runtime._startup_protected_roots())
+
+    assert "/usr" not in roots
+
+
+def test_writable_system_python_fails_child_admission_not_manager_import(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(trusted_runtime.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(trusted_runtime.sys, "base_prefix", str(tmp_path))
+    monkeypatch.setattr(trusted_runtime.os, "access", lambda *_args: True)
+
+    with pytest.raises(
+        trusted_runtime.TrustedRuntimeError,
+        match="writable non-venv",
+    ):
+        require_trusted_python_runtime()
+
+
+def _fake_running_checkout(tmp_path, monkeypatch):
+    live = tmp_path / "live-ccm"
+    backend = live / "backend"
+    backend.mkdir(parents=True)
+    managed = live / ".claude-manager" / "worktrees" / "task-worktree"
+    managed.mkdir(parents=True)
+    workspaces = tmp_path / "workspaces"
+    workspaces.mkdir()
+    monkeypatch.setattr(settings, "workspace_dir", str(workspaces))
+    monkeypatch.setattr(trusted_runtime, "RUNNING_CCM_CHECKOUT", str(live))
+    monkeypatch.setattr(
+        trusted_runtime,
+        "TRUSTED_RUNTIME_PROTECTED_ROOTS",
+        (str(backend),),
+    )
+    return live, managed, workspaces
+
+
+def test_working_directory_rejects_live_checkout_but_allows_managed_worktree(
+    tmp_path,
+    monkeypatch,
+):
+    live, managed, _workspaces = _fake_running_checkout(tmp_path, monkeypatch)
+    incarnation = "a" * 32
+
+    with pytest.raises(TaskAgentIsolationError, match="overlaps"):
+        prepare_task_working_directory(
+            7,
+            incarnation,
+            str(live),
+            has_explicit_workspace=True,
+        )
+
+    assert prepare_task_working_directory(
+        7,
+        incarnation,
+        str(managed),
+        has_explicit_workspace=True,
+    ) == str(managed)
+
+
+def test_projectless_workspace_is_incarnation_scoped_and_resumable(
+    tmp_path,
+    monkeypatch,
+):
+    live, _managed, workspaces = _fake_running_checkout(tmp_path, monkeypatch)
+    first_incarnation = "1" * 32
+    second_incarnation = "2" * 32
+
+    first = Path(prepare_task_working_directory(
+        9,
+        first_incarnation,
+        str(live),
+        has_explicit_workspace=False,
+    ))
+    assert first == (
+        workspaces
+        / ".ccm-task-workspaces"
+        / f"task-9-{first_incarnation}"
+    )
+    assert stat.S_IMODE(first.parent.stat().st_mode) == 0o700
+    assert stat.S_IMODE(first.stat().st_mode) == 0o700
+    (first / "old-incarnation.txt").write_text("old", encoding="utf-8")
+
+    assert Path(prepare_task_working_directory(
+        9,
+        first_incarnation,
+        str(first),
+        has_explicit_workspace=False,
+    )) == first
+    second = Path(prepare_task_working_directory(
+        9,
+        second_incarnation,
+        str(first),
+        has_explicit_workspace=False,
+    ))
+    assert second != first
+    assert not (second / "old-incarnation.txt").exists()
+
+
+def test_projectless_workspace_rejects_symlink_leaf(tmp_path, monkeypatch):
+    live, _managed, workspaces = _fake_running_checkout(tmp_path, monkeypatch)
+    incarnation = "3" * 32
+    private_root = workspaces / ".ccm-task-workspaces"
+    private_root.mkdir(mode=0o700)
+    target = tmp_path / "attacker-target"
+    target.mkdir()
+    expected = private_root / f"task-11-{incarnation}"
+    expected.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(TaskAgentIsolationError, match="safe directory"):
+        prepare_task_working_directory(
+            11,
+            incarnation,
+            str(expected),
+            has_explicit_workspace=False,
+        )
+
+    assert not (target / "CLAUDE.md").exists()
+
+
+@pytest.mark.parametrize("incarnation", ("", "A" * 32, "f" * 31))
+def test_working_directory_requires_valid_task_incarnation(
+    tmp_path,
+    incarnation,
+):
+    with pytest.raises(TaskAgentIsolationError, match="incarnation"):
+        prepare_task_working_directory(
+            12,
+            incarnation,
+            str(tmp_path),
+            has_explicit_workspace=True,
+        )
+
+
+def test_claude_zero_tool_policy_has_no_tool_mcp_hook_or_network_authority(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_zero_tool_isolation_settings(
+        "goal",
+        17,
+        [str(tmp_path / "manager-secrets")],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["permissions"]["allow"] == []
+    assert "hooks" not in payload
+    assert payload["sandbox"]["network"]["allowedDomains"] == []
+    assert str(tmp_path / "manager-secrets") in payload["sandbox"][
+        "filesystem"
+    ]["denyRead"]
+
+
+def test_manager_secret_paths_cover_custom_pool_homes_and_backup_roots(
+    tmp_path,
+    monkeypatch,
+):
+    claude_config = tmp_path / "claude-inventory" / "accounts.json"
+    codex_config = tmp_path / "codex-inventory" / "accounts.json"
+    claude_config.parent.mkdir()
+    codex_config.parent.mkdir()
+    claude_home = tmp_path / "custom-claude-home"
+    disabled_claude_home = tmp_path / "disabled-claude-home"
+    codex_home = tmp_path / "custom-codex-home"
+    retired_codex_home = tmp_path / "retired-codex-home"
+    claude_config.write_text(json.dumps({"accounts": [
+        {"id": "a", "config_dir": str(claude_home), "enabled": True},
+        {
+            "id": "b",
+            "config_dir": str(disabled_claude_home),
+            "enabled": False,
+            "retired": True,
+        },
+    ]}), encoding="utf-8")
+    codex_config.write_text(json.dumps({"accounts": [
+        {"id": "a", "codex_home": str(codex_home), "enabled": True},
+        {
+            "id": "b",
+            "codex_home": str(retired_codex_home),
+            "enabled": False,
+            "retired": True,
+        },
+    ]}), encoding="utf-8")
+    backup_temp = tmp_path / "backup-temp"
+    backup_destination = tmp_path / "backup-destination"
+    monkeypatch.setattr(settings, "pool_config_path", str(claude_config))
+    monkeypatch.setattr(settings, "codex_pool_config_path", str(codex_config))
+    monkeypatch.setattr(settings, "backup_temp_dir", str(backup_temp))
+    monkeypatch.setattr(
+        settings,
+        "backup_destination_path",
+        str(backup_destination),
+    )
+
+    protected = set(manager_secret_protected_paths())
+
+    assert str(claude_config.parent) in protected
+    assert str(codex_config.parent) in protected
+    assert str(claude_home) in protected
+    assert str(disabled_claude_home) in protected
+    assert str(codex_home) in protected
+    assert str(retired_codex_home) in protected
+    assert str(backup_temp) in protected
+    assert str(backup_destination) in protected
+
+
+def test_manager_secret_paths_fail_closed_on_one_bad_pool_record(
+    tmp_path,
+    monkeypatch,
+):
+    claude_config = tmp_path / "claude-pool" / "accounts.json"
+    claude_config.parent.mkdir()
+    claude_config.write_text(json.dumps({"accounts": [
+        {"id": "valid", "config_dir": str(tmp_path / "valid-home")},
+        {"id": "broken", "config_dir": "relative/home"},
+        {"id": "later", "config_dir": str(tmp_path / "later-home")},
+    ]}), encoding="utf-8")
+    codex_config = tmp_path / "codex-pool" / "accounts.json"
+    codex_config.parent.mkdir()
+    codex_config.write_text('{"accounts": []}', encoding="utf-8")
+    monkeypatch.setattr(settings, "pool_config_path", str(claude_config))
+    monkeypatch.setattr(settings, "codex_pool_config_path", str(codex_config))
+
+    with pytest.raises(TaskSSHAccessError, match="inventory is invalid"):
+        manager_secret_protected_paths()
 
 
 @pytest.mark.parametrize(
@@ -104,8 +477,23 @@ def test_claude_task_isolation_denies_credentials_and_direct_ssh_network(
         for entry in payload["hooks"]["PreToolUse"]
         for hook in entry["hooks"]
     ]
-    assert any("ask_user_hook.py" in command for command in commands)
-    assert any("task_ssh_guard_hook.py" in command for command in commands)
+    script_paths = {Path(shlex.split(command)[1]) for command in commands}
+    ask_user_script = next(
+        path for path in script_paths if path.name.startswith("ask-user-hook-")
+    )
+    ssh_guard_script = next(
+        path
+        for path in script_paths
+        if path.name.startswith("task-ssh-guard-hook-")
+    )
+    verify_materialized_trusted_python_asset(
+        "ask_user_hook",
+        ask_user_script,
+    )
+    verify_materialized_trusted_python_asset(
+        "task_ssh_guard_hook",
+        ssh_guard_script,
+    )
     assert all("AUTH_TOKEN" not in command for command in commands)
     assert all("--auth-token" not in command for command in commands)
 
@@ -153,37 +541,337 @@ def test_claude_isolation_preflight_scrubs_manager_tokens(
     tmp_path,
     monkeypatch,
 ):
-    path = tmp_path / "settings.json"
-    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(
+        34,
+        ["/Users/operator/.ssh"],
+    )
     monkeypatch.setenv("AUTH_TOKEN", "deployment-secret")
     monkeypatch.setenv("CCM_INTERNAL_SERVICE_TOKEN", "internal-secret")
     monkeypatch.setenv("CCM_ASK_USER_TOKEN", "task-secret")
-    captured = {}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "model-secret")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "cloud-secret")
+    captured = []
+
+    binaries = {
+        "claude": "/opt/claude/bin/claude",
+        "bwrap": "/usr/bin/bwrap",
+        "socat": "/usr/bin/socat",
+    }
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.shutil.which",
+        lambda name: binaries.get(name),
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.require_claude_apply_seccomp",
+        lambda _binary: Path("/opt/sandbox-runtime/x64/apply-seccomp"),
+    )
 
     def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["env"] = kwargs["env"]
+        captured.append({"argv": argv, "env": kwargs["env"]})
+        if len(captured) == 1:
+            return _sandbox_loading_canary_result()
         return SimpleNamespace(
             returncode=0,
-            stdout="Claude Code doctor\nEverything looks healthy",
+            stdout=json.dumps({
+                "type": "result",
+                "subtype": "success",
+                "is_error": False,
+                "num_turns": 0,
+                "total_cost_usd": 0,
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            }),
+            stderr="",
         )
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.subprocess.run",
+        fake_run,
+    )
 
     validate_claude_task_isolation_settings(path, claude_binary="claude")
 
-    assert captured["argv"] == [
-        "claude",
-        "--settings",
+    assert len(captured) == 2
+    assert captured[0]["argv"] == captured[1]["argv"] == [
+        "/usr/bin/bwrap",
+        "--unshare-net",
+        "--die-with-parent",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--ro-bind",
         str(path),
+        "/tmp/ccm-claude-isolation-settings.json",
+        "--chdir",
+        "/",
+        "--",
+        "/opt/claude/bin/claude",
+        "--bare",
+        "--settings",
+        "/tmp/ccm-claude-isolation-settings.json",
         "--setting-sources",
         "",
         "--strict-mcp-config",
-        "doctor",
+        "--permission-mode",
+        "acceptEdits",
+        "--disable-slash-commands",
+        "--no-chrome",
+        "--tools",
+        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+        "--allowedTools",
+        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+        "--no-session-persistence",
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
     ]
-    assert "AUTH_TOKEN" not in captured["env"]
-    assert "CCM_INTERNAL_SERVICE_TOKEN" not in captured["env"]
-    assert "CCM_ASK_USER_TOKEN" not in captured["env"]
+    assert captured[0]["env"]["PATH"] == "/nonexistent/ccm-claude-sandbox-canary"
+    for invocation in captured:
+        assert "AUTH_TOKEN" not in invocation["env"]
+        assert "CCM_INTERNAL_SERVICE_TOKEN" not in invocation["env"]
+        assert "CCM_ASK_USER_TOKEN" not in invocation["env"]
+        assert "ANTHROPIC_API_KEY" not in invocation["env"]
+        assert "AWS_ACCESS_KEY_ID" not in invocation["env"]
+        assert invocation["env"][CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
+
+
+def test_claude_isolation_preflight_rejects_weakened_local_contract(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(
+        35,
+        ["/Users/operator/.ssh"],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["sandbox"]["failIfUnavailable"] = False
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("local contract failure must precede CLI")
+        ),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="fail-closed"):
+        validate_claude_task_isolation_settings(path, claude_binary="claude")
+
+
+def test_claude_isolation_preflight_requires_sandbox_dependencies(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_aux_isolation_settings(
+        namespace="monitor",
+        identifier=36,
+        protected_paths=["/Users/operator/.ssh"],
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.shutil.which",
+        lambda name: None if name == "socat" else f"/usr/bin/{name}",
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="bubblewrap, and socat"):
+        validate_claude_task_isolation_settings(
+            path,
+            claude_binary="claude",
+            tools=CLAUDE_MONITOR_BUILTIN_TOOLS,
+        )
+
+
+def test_claude_isolation_preflight_requires_apply_seccomp(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_aux_isolation_settings(
+        namespace="monitor",
+        identifier=39,
+        protected_paths=["/Users/operator/.ssh"],
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.shutil.which",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.require_claude_apply_seccomp",
+        lambda _binary: (_ for _ in ()).throw(
+            TaskAgentIsolationError("matching apply-seccomp helper is missing")
+        ),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="apply-seccomp"):
+        validate_claude_task_isolation_settings(
+            path,
+            claude_binary="claude",
+            tools=CLAUDE_MONITOR_BUILTIN_TOOLS,
+        )
+
+
+def test_apply_seccomp_resolution_uses_matching_global_architecture(
+    tmp_path,
+    monkeypatch,
+):
+    prefix = tmp_path / "npm-prefix"
+    helper = (
+        prefix
+        / "lib/node_modules/@anthropic-ai/sandbox-runtime"
+        / "vendor/seccomp/x64/apply-seccomp"
+    )
+    helper.parent.mkdir(parents=True)
+    helper.write_bytes(b"official helper fixture")
+    helper.chmod(0o755)
+    monkeypatch.setenv("NPM_CONFIG_PREFIX", str(prefix))
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.platform.system",
+        lambda: "Linux",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.platform.machine",
+        lambda: "x86_64",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.shutil.which",
+        lambda name: "/opt/claude" if name == "claude" else None,
+    )
+
+    assert require_claude_apply_seccomp("claude") == helper.resolve()
+
+
+def test_claude_isolation_preflight_accepts_real_cli_empty_zero_turn_shape(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_aux_isolation_settings(
+        namespace="monitor",
+        identifier=38,
+        protected_paths=["/Users/operator/.ssh"],
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.shutil.which",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.require_claude_apply_seccomp",
+        lambda _binary: Path("/opt/sandbox-runtime/x64/apply-seccomp"),
+    )
+    results = iter((
+        _sandbox_loading_canary_result(),
+        SimpleNamespace(returncode=0, stdout="", stderr=""),
+    ))
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.subprocess.run",
+        lambda *_args, **_kwargs: next(results),
+    )
+
+    validate_claude_task_isolation_settings(
+        path,
+        claude_binary="claude",
+        tools=CLAUDE_MONITOR_BUILTIN_TOOLS,
+    )
+
+
+@pytest.mark.parametrize(
+    "result_event",
+    [
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 1,
+            "total_cost_usd": 0,
+            "usage": {"input_tokens": 0},
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "num_turns": 0,
+            "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 1},
+        },
+    ],
+)
+def test_claude_isolation_preflight_rejects_model_execution(
+    tmp_path,
+    monkeypatch,
+    result_event,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_aux_isolation_settings(
+        namespace="sub-agent",
+        identifier=37,
+        protected_paths=["/Users/operator/.ssh"],
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.shutil.which",
+        lambda name: f"/usr/bin/{name}",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.require_claude_apply_seccomp",
+        lambda _binary: Path("/opt/sandbox-runtime/x64/apply-seccomp"),
+    )
+    results = iter((
+        _sandbox_loading_canary_result(),
+        SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(result_event),
+            stderr="",
+        ),
+    ))
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.subprocess.run",
+        lambda *_args, **_kwargs: next(results),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="model turn"):
+        validate_claude_task_isolation_settings(
+            path,
+            claude_binary="claude",
+            tools=CLAUDE_SUB_AGENT_BUILTIN_TOOLS,
+        )
 
 
 def test_task_claude_wrapper_is_private_and_uses_exact_cli_boundary():
@@ -208,3 +896,4 @@ def test_task_claude_wrapper_is_private_and_uses_exact_cli_boundary():
         "Read",
         "Write",
     }
+    prepare_task_working_directory,

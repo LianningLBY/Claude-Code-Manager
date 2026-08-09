@@ -33,6 +33,7 @@ from backend.services.codex_models import clamp_codex_effort
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.task_queue import task_retry_not_superseded_predicate
+from backend.services.trusted_runtime import prime_trusted_runtime
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
@@ -43,6 +44,10 @@ from backend.services.worker_task_termination import (
     worker_task_termination_authority_matches,
 )
 from backend.services.ws_broadcaster import WebSocketBroadcaster
+
+# Freeze standalone Task hook/MCP entrypoints while the Manager runtime itself
+# is loading, before any writable Agent checkout can influence later launches.
+prime_trusted_runtime()
 
 if TYPE_CHECKING:
     from backend.services.mcp_config import McpServerSpec
@@ -69,6 +74,19 @@ _CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
     "APEXROUTER_API_KEY",
     "APEXROUTER_CODEX_API_KEY",
 )
+_TASK_SSH_GIT_IDENTITY_ENV_KEYS = frozenset({
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+})
+_TASK_SSH_SAFE_GIT_ENV = {
+    "GIT_TERMINAL_PROMPT": "0",
+    "GCM_INTERACTIVE": "never",
+    "GIT_CONFIG_GLOBAL": os.devnull,
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GH_PROMPT_DISABLED": "1",
+}
 _ACTUAL_TURN_TRANSPORTS = frozenset(
     {"claude_pty", "claude_exec", "codex_app_server", "codex_exec"}
 )
@@ -1974,6 +1992,11 @@ class InstanceManager:
         that loop-task chat history can be grouped by iteration in the frontend.
         """
         provider = (provider or "claude").lower()
+        from backend.services.task_agent_isolation import (
+            require_task_security_boundary_configured,
+        )
+
+        require_task_security_boundary_configured()
         launch_boundary_attempted = False
         launch_boundary_completed = False
 
@@ -2021,11 +2044,15 @@ class InstanceManager:
         # files, containers, or a real agent process; a post-spawn rowcount
         # check remains below as defense against cross-process DB mutation.
         task_retry_count: int | None = None
+        task_status: str | None = None
+        task_incarnation_id: str | None = None
         task_skill_context = ""
         codex_monitor_enabled = False
         pr_review_task = False
         task_ssh_capabilities: set[str] = set()
+        task_ssh_broker_only = False
         task_ssh_protected_path_values: tuple[str, ...] = ()
+        task_git_credential_read_path_values: tuple[str, ...] = ()
         delivery_task = False
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
@@ -2047,6 +2074,7 @@ class InstanceManager:
                         select(
                             Task.retry_count,
                             Task.turn_generation,
+                            Task.status,
                         ).where(*generation_predicates)
                     )
                 ).first()
@@ -2056,11 +2084,25 @@ class InstanceManager:
                     )
                 task_retry_count = generation_row[0]
                 task_turn_generation = generation_row[1]
+                task_status = generation_row[2]
                 task = await db.get(Task, task_id)
                 if task is None:
                     raise LaunchSupersededError(
                         f"Task {task_id} disappeared before launch"
                     )
+                task_incarnation_id = task.incarnation_id
+                from backend.services.task_agent_isolation import (
+                    prepare_task_working_directory,
+                )
+
+                cwd = prepare_task_working_directory(
+                    task_id,
+                    task_incarnation_id or "",
+                    cwd,
+                    has_explicit_workspace=bool(
+                        task.project_id is not None or task.target_repo
+                    ),
+                )
                 delivery_task = await _require_delivery_workspace_launch_boundary(
                     db,
                     task,
@@ -2091,23 +2133,66 @@ class InstanceManager:
 
                 pr_review_task = is_pr_sandbox_task(task)
                 if not pr_review_task:
+                    from backend.services.task_agent_isolation import (
+                        explicit_git_credential_paths,
+                    )
                     from backend.services.task_ssh_access import (
+                        task_git_non_overridable_paths,
                         task_ssh_policy_context,
                         task_ssh_protected_paths,
-                        valid_task_ssh_capabilities,
+                        task_ssh_runtime_policy,
                     )
 
-                    task_ssh_capabilities = await valid_task_ssh_capabilities(
+                    task_ssh_runtime = await task_ssh_runtime_policy(
                         db,
                         task,
+                    )
+                    if delivery_task and task_ssh_runtime.broker_only:
+                        # Delivery Developer turns have a frozen networkless
+                        # policy.  A durable SSH grant is conflicting ambient
+                        # authority even when its Profile is stale/disabled;
+                        # never make it disappear merely because Delivery
+                        # intentionally omits the ccm_ssh MCP server.
+                        raise LaunchSupersededError(
+                            "Delivery Developer Task has a durable SSH grant"
+                        )
+                    task_ssh_capabilities = set(
+                        task_ssh_runtime.capabilities
+                    )
+                    task_ssh_broker_only = task_ssh_runtime.broker_only
+                    explicit_git_paths = (
+                        ()
+                        if task_ssh_broker_only
+                        else explicit_git_credential_paths(git_env)
                     )
                     # Every local Task must be unable to inspect Manager SSH,
                     # provider-account, and scoped runtime credentials. A Task
                     # with grants additionally loses direct network access and
                     # reaches SSH only through the broker MCP.
                     task_ssh_protected_path_values = (
-                        await task_ssh_protected_paths(db)
+                        await task_ssh_protected_paths(
+                            db,
+                            task=task,
+                            working_directory=cwd,
+                            include_direct_git_credentials=True,
+                            allowed_credential_paths=explicit_git_paths,
+                        )
                     )
+                    if not task_ssh_broker_only:
+                        from backend.services.task_agent_isolation import (
+                            require_git_credentials_outside_protected_paths,
+                        )
+
+                        task_git_credential_read_path_values = (
+                            require_git_credentials_outside_protected_paths(
+                                git_env,
+                                task_ssh_protected_path_values,
+                                allowed_read_paths=explicit_git_paths,
+                                non_overridable_paths=task_git_non_overridable_paths(
+                                    *((config_dir,) if config_dir else ()),
+                                ),
+                            )
+                        )
                 from backend.services.skill_context import (
                     codex_monitor_supported_for_scope,
                 )
@@ -2134,15 +2219,29 @@ class InstanceManager:
                         project_dir=cwd,
                         enabled_skills=enabled_skills,
                     )
-                if task_ssh_capabilities:
-                    ssh_policy = task_ssh_policy_context(
-                        task_ssh_capabilities
-                    )
-                    task_skill_context = "\n\n".join(
-                        value
-                        for value in (task_skill_context.strip(), ssh_policy)
-                        if value
-                    )
+                if task_ssh_broker_only:
+                    # A managed-SSH Task has no direct network authority. Keep
+                    # only non-secret commit identity from Dispatcher git_env;
+                    # project/global SSH keys and HTTPS askpass helpers remain
+                    # Manager-side and are never exposed to the model process.
+                    git_env = {
+                        key: value
+                        for key, value in (git_env or {}).items()
+                        if key.upper() in _TASK_SSH_GIT_IDENTITY_ENV_KEYS
+                    }
+                    git_env.update(_TASK_SSH_SAFE_GIT_ENV)
+                    if task_ssh_capabilities:
+                        ssh_policy = task_ssh_policy_context(
+                            task_ssh_capabilities
+                        )
+                        task_skill_context = "\n\n".join(
+                            value
+                            for value in (
+                                task_skill_context.strip(),
+                                ssh_policy,
+                            )
+                            if value
+                        )
                 if pr_review_task or delivery_task:
                     # PR input is already snapshotted into the fixed prompt.
                     # No ambient skills or monitor capability may reintroduce
@@ -2215,9 +2314,14 @@ class InstanceManager:
                 task_id,
                 enabled_skills or {},
                 task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
             )
 
             from backend.services.task_agent_isolation import (
+                CLAUDE_TASK_BUILTIN_TOOLS,
                 generate_claude_task_isolation_settings,
                 validate_claude_task_isolation_settings,
             )
@@ -2226,13 +2330,16 @@ class InstanceManager:
                 generate_claude_task_isolation_settings(
                     task_id,
                     task_ssh_protected_path_values,
+                    allowed_read_paths=task_git_credential_read_path_values,
                     ssh_capabilities=task_ssh_capabilities,
+                    disable_direct_network=task_ssh_broker_only,
                 )
             )
             await asyncio.to_thread(
                 validate_claude_task_isolation_settings,
                 claude_isolation_settings_path,
                 claude_binary=settings.claude_binary,
+                tools=CLAUDE_TASK_BUILTIN_TOOLS,
             )
 
         # Prompt-only Claude launches have no Task-scoped exact settings file;
@@ -2263,6 +2370,7 @@ class InstanceManager:
             ask_user_token = issue_internal_service_token(
                 audience="ccm_ask_user",
                 task_id=task_id,
+                task_incarnation_id=task_incarnation_id,
                 owner_kind="task-turn",
                 owner_id=task_id,
             )
@@ -2270,7 +2378,7 @@ class InstanceManager:
                 git_env = dict(git_env or {})
                 git_env[ASK_USER_TOKEN_ENV] = ask_user_token
 
-        if task_id is not None and not pr_review_task:
+        if task_id is not None and not pr_review_task and not delivery_task:
             # These variables are inherited by Claude PTY, Claude direct, and
             # Codex shell environments. Empty agent coordinates prevent any
             # Task (granted or not) from reaching a service-level SSH agent.
@@ -2280,7 +2388,7 @@ class InstanceManager:
                 "SSH_AGENT_PID": "",
                 "SSH_ASKPASS": "",
             })
-            if task_ssh_capabilities:
+            if task_ssh_broker_only:
                 git_env["CCM_TASK_SSH_GUARD"] = "1"
 
         # Check if shared project → prepare Docker container wrapper for PTY
@@ -2379,13 +2487,17 @@ class InstanceManager:
                 enabled_skills or {},
                 provider=provider,
                 codex_monitor_enabled=codex_monitor_enabled,
+                task_incarnation_id=task_incarnation_id,
             )
         elif codex_sub_agent_mcp_required:
             from backend.services.mcp_config import (
                 build_sub_agent_controller_mcp_server_specs,
             )
 
-            codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(task_id)
+            codex_mcp_specs = build_sub_agent_controller_mcp_server_specs(
+                task_id,
+                task_incarnation_id=task_incarnation_id or "",
+            )
         if codex_ssh_mcp_required:
             from backend.services.mcp_config import (
                 build_task_ssh_mcp_server_specs,
@@ -2394,6 +2506,10 @@ class InstanceManager:
             codex_mcp_specs += build_task_ssh_mcp_server_specs(
                 task_id,
                 capabilities=tuple(sorted(task_ssh_capabilities)),
+                task_incarnation_id=task_incarnation_id or "",
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
             )
 
         if (
@@ -2478,6 +2594,7 @@ class InstanceManager:
                             cloudrouter_account is not None
                             or pr_review_task
                             or delivery_task
+                            or codex_task_isolation_required
                         ),
                         codex_service_tier=codex_service_tier,
                         sandbox_mode=(
@@ -2492,15 +2609,28 @@ class InstanceManager:
                             if codex_task_isolation_required
                             else ()
                         ),
-                        task_ssh_disable_network=bool(
-                            task_ssh_capabilities
+                        task_ssh_allowed_read_paths=(
+                            task_git_credential_read_path_values
+                            if codex_task_isolation_required
+                            else ()
                         ),
+                        # Codex 0.144.6's network-enabled permission profile
+                        # also admits arbitrary host Unix sockets. Clearing
+                        # SSH_AUTH_SOCK cannot prevent rediscovery of an
+                        # ambient ssh-agent/secret-service socket, so every
+                        # ordinary Codex Task stays network-closed until Codex
+                        # exposes a separately auditable Unix-socket policy.
+                        task_ssh_disable_network=True,
                         disable_user_mcp=(
                             pr_review_task
                             or delivery_task
-                            or bool(task_ssh_capabilities)
+                            or codex_task_isolation_required
                         ),
-                        disable_autonomous_features=(pr_review_task or delivery_task),
+                        disable_autonomous_features=(
+                            pr_review_task
+                            or delivery_task
+                            or codex_task_isolation_required
+                        ),
                         network_isolated=delivery_task,
                         tools_disabled=pr_review_task,
                         on_launch_admitted=admit_codex_app_server_transport,
@@ -2741,12 +2871,17 @@ class InstanceManager:
             "AUTH_TOKEN",
             "CCM_INTERNAL_SERVICE_TOKEN",
         }
-        env = {
-            k: v
-            for k, v in os.environ.items()
-            if k.upper()
-            not in {"CLAUDECODE", "CLAUDE_CODE", *task_secret_env}
-        }
+        from backend.services.task_agent_isolation import (
+            scrub_task_model_environment,
+        )
+
+        # Every Task starts without Manager ambient Git/GitHub/SSH authority.
+        # The exact project-scoped git_env is applied below; managed-SSH Tasks
+        # have already reduced it to non-secret identity plus fail-closed flags.
+        env = scrub_task_model_environment(
+            os.environ,
+            provider=provider,
+        )
 
         # Inject per-project git identity and credentials as environment variables.
         # These take precedence over any global ~/.gitconfig or system credential helper.
@@ -3454,6 +3589,7 @@ class InstanceManager:
         codex_service_tier: str = "default",
         sandbox_mode: str = "danger-full-access",
         task_ssh_protected_paths: Sequence[str] = (),
+        task_ssh_allowed_read_paths: Sequence[str] = (),
         task_ssh_disable_network: bool = False,
         disable_autonomous_features: bool = False,
         network_isolated: bool = False,
@@ -3486,6 +3622,7 @@ class InstanceManager:
             codex_service_tier=codex_service_tier,
             sandbox_mode=sandbox_mode,
             task_ssh_protected_paths=task_ssh_protected_paths,
+            task_ssh_allowed_read_paths=task_ssh_allowed_read_paths,
             task_ssh_disable_network=task_ssh_disable_network,
             disable_autonomous_features=disable_autonomous_features,
             network_isolated=network_isolated,
@@ -4276,14 +4413,32 @@ class InstanceManager:
             digest.update(value)
 
         add_component("settings", settings_path.read_bytes())
+        from backend.services.trusted_runtime import (
+            trusted_hook_components_from_settings,
+        )
+
+        for asset_name, asset_bytes in trusted_hook_components_from_settings(
+            settings_path
+        ):
+            add_component(f"trusted-hook:{asset_name}", asset_bytes)
         if mcp_config_path is not None:
             add_component("mcp", Path(mcp_config_path).read_bytes())
-        add_component(
-            "ask-user-token",
-            str((git_env or {}).get("CCM_ASK_USER_TOKEN", "")).encode(
-                "utf-8"
-            ),
+        environment_items = sorted(
+            (
+                str(key),
+                str(value),
+            )
+            for key, value in (git_env or {}).items()
         )
+        add_component(
+            "git-env-count",
+            len(environment_items).to_bytes(8, "big"),
+        )
+        for key, value in environment_items:
+            # Only the terminal SHA-256 digest is retained on the PTY config;
+            # credential names and values never leave this local hash state.
+            add_component("git-env-key", key.encode("utf-8"))
+            add_component("git-env-value", value.encode("utf-8"))
         return digest.hexdigest()
 
     async def _launch_pty(
@@ -4419,12 +4574,56 @@ class InstanceManager:
                             "PTY backend does not expose secure config construction"
                         )
                     cfg = original_build_config(**kw)
-                    overrides = dict(
+                    original_overrides = dict(
                         getattr(cfg, "env_overrides", None) or {}
                     )
-                    # claude-pty inherits the Manager environment. Shadow the
-                    # deployment credential for every Task PTY; MCP servers
-                    # receive their own scoped token from their config entry.
+                    from backend.services.task_agent_isolation import (
+                        CLAUDE_SUBPROCESS_ENV_SCRUB,
+                        scrub_task_model_environment,
+                    )
+
+                    overrides = scrub_task_model_environment(
+                        original_overrides,
+                        provider="claude",
+                    )
+                    safe_parent = scrub_task_model_environment(
+                        os.environ,
+                        provider="claude",
+                    )
+                    # claude-pty begins with os.environ and only then applies
+                    # env_overrides. Shadow every credential that CCM's direct
+                    # path removes; simply omitting a key would reveal the
+                    # Manager value again. Explicit project GIT_* variables are
+                    # restored below from this exact launch's git_env.
+                    for key in {
+                        *original_overrides,
+                        *os.environ,
+                    }:
+                        if (
+                            (
+                                key in original_overrides
+                                and key not in overrides
+                            )
+                            or (
+                                key in os.environ
+                                and key not in safe_parent
+                            )
+                        ):
+                            overrides[key] = ""
+                    for key, value in (git_env or {}).items():
+                        upper_key = key.upper()
+                        if (
+                            upper_key.startswith("GIT_")
+                            or upper_key
+                            in {
+                                "CCM_ASK_USER_TOKEN",
+                                "CCM_TASK_SSH_GUARD",
+                            }
+                        ):
+                            overrides[key] = value
+                    # Claude strips CLAUDE_* from the PTY parent environment,
+                    # so this security switch must be an explicit override.
+                    overrides[CLAUDE_SUBPROCESS_ENV_SCRUB] = "1"
                     overrides["AUTH_TOKEN"] = ""
                     overrides["CCM_INTERNAL_SERVICE_TOKEN"] = ""
                     final_binary = wrapper or cfg.claude_binary
@@ -7535,6 +7734,8 @@ class InstanceManager:
                     "--disable-slash-commands",
                     "--no-chrome",
                     "--tools",
+                    ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                    "--allowedTools",
                     ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
                 ])
             else:

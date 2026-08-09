@@ -48,6 +48,7 @@ from backend.services.mcp_config import (
     build_task_ssh_mcp_server_specs,
     render_codex_exec_config_args,
 )
+from backend.services.task_agent_isolation import TaskAgentIsolationError
 from backend.config import Settings, settings
 from backend.database import Base
 from backend.models.delivery import DeliveryCycle, DeliveryRun, DeliveryTurn
@@ -129,7 +130,7 @@ def test_claude_terminal_result_suppresses_only_exact_assistant_duplicate():
     )["content"] == " Finished safely. "
 
 
-def test_claude_hot_runtime_fingerprint_covers_mcp_and_ask_user_token(
+def test_claude_hot_runtime_fingerprint_covers_mcp_and_full_git_environment(
     tmp_path,
 ):
     settings_path = tmp_path / "settings.json"
@@ -140,25 +141,59 @@ def test_claude_hot_runtime_fingerprint_covers_mcp_and_ask_user_token(
     baseline = InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
     )
     assert baseline == InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+        git_env={
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "CCM_ASK_USER_TOKEN": "token-a",
+        },
     )
 
     mcp_path.write_text('{"mcpServers":{"ccm_ssh":{}}}')
     assert baseline != InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-a"},
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
     )
     mcp_path.write_text('{"mcpServers":{}}')
     assert baseline != InstanceManager._claude_task_runtime_fingerprint(
         settings_path,
         mcp_config_path=mcp_path,
-        git_env={"CCM_ASK_USER_TOKEN": "token-b"},
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-b",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
+    )
+    assert baseline != InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-b",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-a",
+        },
+    )
+    assert baseline != InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=mcp_path,
+        git_env={
+            "CCM_ASK_USER_TOKEN": "token-a",
+            "GIT_ASKPASS": "/private/askpass-a",
+            "GIT_SSH_COMMAND": "ssh -i /private/key-b",
+        },
     )
 
 
@@ -662,6 +697,27 @@ async def test_launch_preflight_failure_does_not_publish_launch_admission(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_final_provider_launch_fails_before_side_effect_without_auth_token(
+    db_factory,
+    monkeypatch,
+    provider,
+):
+    monkeypatch.setattr(settings, "auth_token", "")
+    manager = InstanceManager(db_factory, MagicMock())
+    manager._build_command = MagicMock()
+
+    with pytest.raises(TaskAgentIsolationError, match="AUTH_TOKEN"):
+        await manager._launch_locked(
+            instance_id=999_998,
+            prompt="must never reach a model",
+            provider=provider,
+        )
+
+    manager._build_command.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_direct_launch_callback_runs_immediately_before_spawn(
     db_factory,
 ):
@@ -706,8 +762,13 @@ async def test_direct_launch_callback_runs_immediately_before_spawn(
 
 @pytest.mark.asyncio
 async def test_container_launch_callback_runs_immediately_before_exec(
-    db_factory, tmp_path,
+    db_factory, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     async with db_factory() as db:
         project = Project(
             name="container-launch-boundary-project",
@@ -1441,7 +1502,11 @@ def test_build_command_codex_renders_required_mcp_as_exact_argv_tokens(
     resume_session_id, expected_tail,
 ):
     im = InstanceManager(MagicMock(), MagicMock())
-    specs = build_mcp_server_specs(73, {"monitor": True})
+    specs = build_mcp_server_specs(
+        73,
+        {"monitor": True},
+        task_incarnation_id="a" * 32,
+    )
 
     cmd = im._build_command(
         provider="codex",
@@ -1785,7 +1850,6 @@ def _gate_first_two_db_sessions(db_factory):
         ("claude", "claude_exec", False, False),
         ("claude", "claude_pty", False, True),
         ("codex", "codex_app_server", True, False),
-        ("codex", "codex_exec", False, False),
     ],
 )
 async def test_launch_persists_final_actual_transport_before_provider_boundary(
@@ -1801,6 +1865,11 @@ async def test_launch_persists_final_actual_transport_before_provider_boundary(
         settings,
         "codex_app_server_enabled",
         app_server_enabled,
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
     )
     instance_id, task_id, source_id = await _make_actual_transport_scope(
         db_factory,
@@ -1851,7 +1920,7 @@ async def test_launch_persists_final_actual_transport_before_provider_boundary(
 
 
 @pytest.mark.asyncio
-async def test_codex_safe_pre_turn_fallback_records_only_exec_transport(
+async def test_codex_task_pre_turn_failure_never_falls_back_to_exec(
     db_factory,
     monkeypatch,
     tmp_path,
@@ -1862,28 +1931,30 @@ async def test_codex_safe_pre_turn_fallback_records_only_exec_transport(
         provider="codex",
     )
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    process = _make_mock_process(pid=61_100)
     manager._launch_codex_app_server = AsyncMock(
         side_effect=RuntimeError("protocol unavailable before turn/start")
     )
-    manager._spawn_managed_direct_process = AsyncMock(return_value=process)
-    manager._persist_and_track_launch = AsyncMock(return_value=process.pid)
+    manager._spawn_managed_direct_process = AsyncMock()
 
-    assert await manager.launch(
-        instance_id=instance_id,
-        prompt="safe fallback",
-        task_id=task_id,
-        task_turn_generation=7,
-        cwd=str(tmp_path),
-        provider="codex",
-        config_dir=str(tmp_path / "codex-home"),
-        source_log_id=source_id,
-    ) == process.pid
+    with pytest.raises(
+        CodexRequiredMcpError,
+        match="required ccm_ssh could be guaranteed",
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must fail closed",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "codex-home"),
+            source_log_id=source_id,
+        )
 
     async with db_factory() as db:
         source = await db.get(LogEntry, source_id)
-        assert source.actual_transport == "codex_exec"
-    manager._spawn_managed_direct_process.assert_awaited_once()
+        assert source.actual_transport is None
+    manager._spawn_managed_direct_process.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3482,8 +3553,14 @@ async def test_launch_with_effort_level(db_factory):
 @pytest.mark.asyncio
 async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     db_factory,
+    monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     async with db_factory() as db:
         inst = Instance(name="claude-task-ssh")
         profile = _managed_ssh_profile("claude-launch-ssh")
@@ -3558,8 +3635,14 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
 @pytest.mark.asyncio
 async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
     db_factory,
+    monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     async with db_factory() as db:
         inst = Instance(name="claude-pty-task-ssh")
         profile = _managed_ssh_profile("claude-pty-launch-ssh")
@@ -3593,17 +3676,157 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
         cwd=str(tmp_path),
         provider="claude",
         config_dir=str(tmp_path / "claude-pty-ssh-home"),
+        git_env={
+            "GIT_AUTHOR_NAME": "Task Author",
+            "GIT_AUTHOR_EMAIL": "author@example.com",
+            "GIT_COMMITTER_NAME": "Task Committer",
+            "GIT_COMMITTER_EMAIL": "committer@example.com",
+            "GIT_SSH_COMMAND": "ssh -i /manager/project-key",
+            "GIT_ASKPASS": "/manager/askpass-with-token",
+            "GIT_CONFIG_GLOBAL": "/manager/gitconfig",
+            "GH_TOKEN": "manager-gh-token",
+            "GITHUB_TOKEN": "manager-github-token",
+        },
     )
 
     assert pid == 54_321
     kwargs = im._launch_pty.await_args.kwargs
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert {
+        key: kwargs["git_env"][key]
+        for key in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        )
+    } == {
+        "GIT_AUTHOR_NAME": "Task Author",
+        "GIT_AUTHOR_EMAIL": "author@example.com",
+        "GIT_COMMITTER_NAME": "Task Committer",
+        "GIT_COMMITTER_EMAIL": "committer@example.com",
+    }
+    assert not {
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    } & kwargs["git_env"].keys()
+    assert kwargs["git_env"]["GIT_CONFIG_GLOBAL"] == os.devnull
     assert kwargs["claude_isolation_settings_path"].name == (
         "claude-security.json"
     )
     assert "ccm_ssh.list_connections" in kwargs["skill_context"]
     assert "known_hosts" in kwargs["skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_claude_pty_scrubs_ambient_credentials_and_restores_exact_git_env(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services.task_agent_isolation import (
+        CLAUDE_SUBPROCESS_ENV_SCRUB,
+    )
+
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    async with db_factory() as db:
+        instance = Instance(name="claude-pty-ambient-env")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="Claude PTY ambient env boundary",
+            status="executing",
+            provider="claude",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    observed = {}
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class FakePTYBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={
+                    "GH_TOKEN": "override-gh-secret",
+                    "SAFE_VALUE": "kept",
+                },
+                claude_binary="/opt/claude-real",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            config = self.build_config()
+            observed["binary"] = config.claude_binary
+            # Mirror claude_pty._env: start from the parent, remove its nested
+            # Claude coordinates, then apply CCM's exact overrides.
+            runtime_env = {
+                key: value
+                for key, value in os.environ.items()
+                if "CLAUDE" not in key.upper()
+                and "CLAUDECODE" not in key.upper()
+                and "AI_AGENT" not in key.upper()
+            }
+            runtime_env.update(config.env_overrides)
+            observed["env"] = runtime_env
+            observed["dangerous"] = config.dangerously_skip_permissions
+            im.processes[kwargs["instance_id"]] = MagicMock(
+                pid=52_002,
+                returncode=None,
+            )
+            return "claude-pty-ambient-env-session"
+
+    im._pty_backend = FakePTYBackend()
+    im._pty_enabled = True
+    ambient = {
+        "AUTH_TOKEN": "deployment-secret",
+        "CCM_INTERNAL_SERVICE_TOKEN": "internal-secret",
+        "GH_TOKEN": "ambient-gh-secret",
+        "GITHUB_TOKEN": "ambient-github-secret",
+        "GIT_ASKPASS": "/ambient/askpass",
+        "GIT_SSH_COMMAND": "ssh -i /ambient/key",
+        "SSH_AUTH_SOCK": "/ambient/agent.sock",
+        "ANTHROPIC_API_KEY": "provider-parent-secret",
+    }
+    with patch.dict(os.environ, ambient, clear=False):
+        await im.launch(
+            instance_id=instance_id,
+            prompt="edit project",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            git_env={
+                "GIT_ASKPASS": "/project/askpass",
+                "GIT_SSH_COMMAND": "ssh -i /project/key",
+            },
+        )
+
+    env = observed["env"]
+    assert Path(observed["binary"]).name == "task_claude_wrapper.sh"
+    assert observed["dangerous"] is False
+    assert env["SAFE_VALUE"] == "kept"
+    assert env["AUTH_TOKEN"] == ""
+    assert env["CCM_INTERNAL_SERVICE_TOKEN"] == ""
+    assert env["GH_TOKEN"] == ""
+    assert env["GITHUB_TOKEN"] == ""
+    assert env["SSH_AUTH_SOCK"] == ""
+    assert env["GIT_ASKPASS"] == "/project/askpass"
+    assert env["GIT_SSH_COMMAND"] == "ssh -i /project/key"
+    assert env["ANTHROPIC_API_KEY"] == "provider-parent-secret"
+    assert env[CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
 
 
 @pytest.mark.asyncio
@@ -3754,6 +3977,17 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
         cwd=str(tmp_path),
         provider="codex",
         config_dir=str(tmp_path / "codex-app-server-ssh-home"),
+        git_env={
+            "GIT_AUTHOR_NAME": "Task Author",
+            "GIT_AUTHOR_EMAIL": "author@example.com",
+            "GIT_COMMITTER_NAME": "Task Committer",
+            "GIT_COMMITTER_EMAIL": "committer@example.com",
+            "GIT_SSH_COMMAND": "ssh -i /manager/project-key",
+            "GIT_ASKPASS": "/manager/askpass-with-token",
+            "GIT_CONFIG_GLOBAL": "/manager/gitconfig",
+            "GH_TOKEN": "manager-gh-token",
+            "GITHUB_TOKEN": "manager-github-token",
+        },
     )
 
     assert pid == 45_678
@@ -3768,11 +4002,35 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
     )
     kwargs = im._launch_codex_app_server.await_args.kwargs
     assert kwargs["sandbox_mode"] == "workspace-write"
+    assert kwargs["disable_project_config"] is True
+    assert kwargs["disable_user_mcp"] is True
+    assert kwargs["disable_autonomous_features"] is True
     assert kwargs["task_ssh_disable_network"] is True
     assert "/private/test/id_ed25519" in kwargs["task_ssh_protected_paths"]
     assert any(path.endswith("/.ssh") for path in kwargs["task_ssh_protected_paths"])
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
+    assert {
+        key: kwargs["git_env"][key]
+        for key in (
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        )
+    } == {
+        "GIT_AUTHOR_NAME": "Task Author",
+        "GIT_AUTHOR_EMAIL": "author@example.com",
+        "GIT_COMMITTER_NAME": "Task Committer",
+        "GIT_COMMITTER_EMAIL": "committer@example.com",
+    }
+    assert not {
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    } & kwargs["git_env"].keys()
+    assert kwargs["git_env"]["GIT_CONFIG_GLOBAL"] == os.devnull
     assert "ccm_ssh.list_connections" in kwargs["skill_context"]
     assert "known_hosts" in kwargs["skill_context"]
 
@@ -4107,6 +4365,99 @@ async def test_codex_delivery_uses_network_isolated_app_server_without_credentia
     assert kwargs["sandbox_mode"] == "workspace-write"
     assert kwargs["network_isolated"] is True
     assert kwargs["tools_disabled"] is False
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_codex_delivery_rejects_any_durable_ssh_grant_before_transport(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+    )
+    async with db_factory() as db:
+        profile = _managed_ssh_profile("delivery-must-not-use-ssh")
+        db.add(profile)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task_id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._launch_codex_app_server = AsyncMock(return_value=54_321)
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(LaunchSupersededError, match="durable SSH grant"):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must reject conflicting authority",
+                task_id=task_id,
+                cwd=workspace,
+                model="gpt-5.6-sol",
+                provider="codex",
+                config_dir=str(tmp_path / "delivery-codex-home"),
+                effort_level="high",
+                codex_service_tier="default",
+            )
+
+    manager._launch_codex_app_server.assert_not_awaited()
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incarnation", (None, "invalid-incarnation"))
+async def test_task_launch_rejects_missing_or_invalid_incarnation_before_spawn(
+    db_factory,
+    tmp_path,
+    incarnation,
+):
+    async with db_factory() as db:
+        instance = Instance(name="invalid-incarnation-launch")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="invalid incarnation",
+            status="executing",
+            provider="codex",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        await db.execute(
+            update(Task)
+            .where(Task.id == task.id)
+            .values(incarnation_id=incarnation)
+        )
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(TaskAgentIsolationError, match="incarnation"):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must fail before transport",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+            )
+
     exec_mock.assert_not_awaited()
 
 
@@ -5680,7 +6031,11 @@ async def test_launch_codex_app_server_uses_passed_task_scoped_specs(
         config_dir="/tmp/codex-mcp",
         enable_workflows=False,
         enabled_skills={"monitor": True},
-        mcp_specs=build_mcp_server_specs(73, {"monitor": True}),
+        mcp_specs=build_mcp_server_specs(
+            73,
+            {"monitor": True},
+            task_incarnation_id="a" * 32,
+        ),
     )
 
     assert pid == 7655
@@ -5719,7 +6074,10 @@ async def test_codex_app_server_uses_passed_sub_agent_controller_specs(
         config_dir="/tmp/codex-sub-agent",
         enable_workflows=False,
         enabled_skills={"sub-agent": True},
-        mcp_specs=build_sub_agent_controller_mcp_server_specs(74),
+        mcp_specs=build_sub_agent_controller_mcp_server_specs(
+            74,
+            task_incarnation_id="a" * 32,
+        ),
     )
 
     specs = registry.start_turn.await_args.kwargs["mcp_specs"]

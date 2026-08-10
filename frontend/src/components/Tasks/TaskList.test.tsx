@@ -377,24 +377,46 @@ describe('TaskList', () => {
       await waitFor(() => expect(onRefresh).toHaveBeenCalled());
     });
 
-    it('shows Retry in overflow menu for failed tasks', async () => {
-      const tasks = [makeTask({
-        status: 'failed',
-        provider: 'codex',
-        model: 'gpt-5.6-sol',
-        codex_service_tier: 'priority',
-      })];
-      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+    it.each(['failed', 'cancelled', 'conflict', 'completed'])(
+      'shows Retry in overflow menu for %s tasks',
+      async (status) => {
+        const tasks = [makeTask({
+          status,
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+          codex_service_tier: 'priority',
+        })];
+        render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+
+        await userEvent.click(screen.getByTitle('More actions'));
+        await userEvent.click(screen.getByText('Retry'));
+
+        expect(api.retryTask).toHaveBeenCalledWith(1, {
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+          codex_service_tier: 'priority',
+        });
+        await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+      },
+    );
+
+    it.each([
+      { mode: 'plan', status: 'failed' },
+      { mode: 'auto', status: 'pending' },
+      { mode: 'auto', status: 'completed', background_active: true },
+      { mode: 'auto', status: 'failed', delivery_run_id: 17 },
+    ])('hides Retry when the Task lifecycle does not allow it: %o', async (overrides) => {
+      render(
+        <TaskList
+          tasks={[makeTask(overrides)]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
 
       await userEvent.click(screen.getByTitle('More actions'));
-      await userEvent.click(screen.getByText('Retry'));
-
-      expect(api.retryTask).toHaveBeenCalledWith(1, {
-        provider: 'codex',
-        model: 'gpt-5.6-sol',
-        codex_service_tier: 'priority',
-      });
-      await waitFor(() => expect(onRefresh).toHaveBeenCalled());
+      expect(screen.queryByText('Retry')).not.toBeInTheDocument();
     });
 
     it('closes overflow menu on outside click', async () => {

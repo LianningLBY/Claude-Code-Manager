@@ -42,6 +42,7 @@ async def _database_now(db) -> datetime:
 class QueueEntry:
     id: str
     state: str
+    base_ref: str
     base_sha: str
     head_sha: str
     created_by_call: bool = False
@@ -57,10 +58,10 @@ class QueueEntryCleanupError(RuntimeError):
 
 
 async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None:
-    from backend.services.pr_review_service import _gh_api_value
+    from backend.services.pr_review_service import _gh_api_value, _valid_base_ref
 
     owner, name = repo_name.split("/", 1)
-    query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id mergeQueueEntry{id state baseCommit{oid} headCommit{oid}}}}}"""
+    query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id baseRefName mergeQueueEntry{id state baseCommit{oid} headCommit{oid}}}}}"""
     result = await _gh_api_value("graphql", payload={
         "query": query,
         "variables": {"owner": owner, "name": name, "number": pr_number},
@@ -78,6 +79,7 @@ async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None
         raise ValueError("GitHub Merge Queue entry is malformed")
     base_commit = entry.get("baseCommit")
     head_commit = entry.get("headCommit")
+    base_ref = pr.get("baseRefName")
     base_sha = base_commit.get("oid") if isinstance(base_commit, dict) else None
     head_sha = head_commit.get("oid") if isinstance(head_commit, dict) else None
     if (
@@ -87,6 +89,7 @@ async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None
         or not entry["id"]
         or not isinstance(entry.get("state"), str)
         or entry["state"].upper() not in _QUEUE_ENTRY_STATES
+        or not _valid_base_ref(base_ref)
         or not isinstance(base_sha, str)
         or _SHA_RE.fullmatch(base_sha.lower()) is None
         or not isinstance(head_sha, str)
@@ -96,6 +99,7 @@ async def _read_queue_entry(repo_name: str, pr_number: int) -> QueueEntry | None
     return QueueEntry(
         id=entry["id"],
         state=entry["state"].upper(),
+        base_ref=base_ref,
         base_sha=base_sha.lower(),
         head_sha=head_sha.lower(),
         pull_request_id=pr["id"],
@@ -193,6 +197,7 @@ async def _remove_new_queue_entry_or_raise(
 async def _enqueue(
     repo_name: str,
     pr_number: int,
+    base_ref: str,
     base_sha: str,
     head_sha: str,
 ) -> QueueEntry:
@@ -200,11 +205,15 @@ async def _enqueue(
 
     existing = await _read_queue_entry(repo_name, pr_number)
     if existing is not None:
-        if existing.base_sha != base_sha or existing.head_sha != head_sha:
+        if (
+            existing.base_ref != base_ref
+            or existing.base_sha != base_sha
+            or existing.head_sha != head_sha
+        ):
             raise ValueError("Existing Merge Queue entry is not the exact subject")
         return existing
     owner, name = repo_name.split("/", 1)
-    node_query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id baseRefOid headRefOid}}}"""
+    node_query = """query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id baseRefName baseRefOid headRefOid}}}"""
     node_result = await _gh_api_value("graphql", payload={
         "query": node_query,
         "variables": {"owner": owner, "name": name, "number": pr_number},
@@ -218,6 +227,7 @@ async def _enqueue(
     if (
         not isinstance(pr.get("id"), str)
         or not pr["id"]
+        or pr.get("baseRefName") != base_ref
         or not isinstance(pr.get("baseRefOid"), str)
         or pr["baseRefOid"].lower() != base_sha
         or not isinstance(pr.get("headRefOid"), str)
@@ -264,6 +274,7 @@ async def _enqueue(
     if (
         confirmed is None
         or confirmed.id != entry["id"]
+        or confirmed.base_ref != base_ref
         or confirmed.base_sha != base_sha
         or confirmed.head_sha != head_sha
     ):
@@ -280,6 +291,7 @@ async def _enqueue(
     return QueueEntry(
         id=confirmed.id,
         state=confirmed.state,
+        base_ref=confirmed.base_ref,
         base_sha=confirmed.base_sha,
         head_sha=confirmed.head_sha,
         created_by_call=True,
@@ -306,13 +318,21 @@ async def bind_merge_group(
     matches = []
     for action in actions:
         run = await db.get(PRMonitorRun, action.monitor_run_id)
+        review = await db.get(PRReview, action.review_id)
         expected_prefix = (
-            f"refs/heads/gh-readonly-queue/{repo.default_branch}/"
+            f"refs/heads/gh-readonly-queue/{review.base_ref}/"
             f"pr-{run.pr_number}-"
-            if run is not None
+            if (
+                run is not None
+                and review is not None
+                and run.current_review_id == review.id
+                and review.monitor_run_id == run.id
+                and review.base_sha == action.trigger_base_sha
+                and review.head_sha == action.trigger_head_sha
+            )
             else ""
         )
-        if run is not None and head_ref.startswith(expected_prefix):
+        if expected_prefix and head_ref.startswith(expected_prefix):
             matches.append((action, run))
     if len(matches) != 1:
         return False
@@ -572,6 +592,9 @@ async def reconcile_merge_queue(db_factory) -> int:
                 run.current_base_sha != action.trigger_base_sha
                 or run.current_head_sha != action.trigger_head_sha
                 or run.current_review_id != review.id
+                or review.monitor_run_id != run.id
+                or review.base_sha != action.trigger_base_sha
+                or review.head_sha != action.trigger_head_sha
             ):
                 action.status = "superseded"
                 action.completed_at = datetime.utcnow()
@@ -588,7 +611,11 @@ async def reconcile_merge_queue(db_factory) -> int:
                 )
                 await db.commit()
                 continue
-            if snapshot["state"] == "MERGED":
+            if (
+                snapshot["state"] == "MERGED"
+                and snapshot["base_ref"] == review.base_ref
+                and snapshot["head_sha"] == action.trigger_head_sha
+            ):
                 action.status = "merged"
                 action.completed_at = datetime.utcnow()
                 action.last_error = None
@@ -602,6 +629,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                 snapshot["state"] != "OPEN"
                 or snapshot["merged_at"] is not None
                 or snapshot["is_draft"]
+                or snapshot["base_ref"] != review.base_ref
                 or snapshot["base_sha"] != action.trigger_base_sha
                 or snapshot["head_sha"] != action.trigger_head_sha
             ):
@@ -622,6 +650,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                 review_id = review.id
                 enqueue_repo_name = repo.repo_full_name
                 enqueue_pr_number = run.pr_number
+                enqueue_base_ref = review.base_ref
                 enqueue_base_sha = action.trigger_base_sha
                 enqueue_head_sha = action.trigger_head_sha
                 expected_run_status = run.status
@@ -648,6 +677,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                     entry = await _enqueue(
                         enqueue_repo_name,
                         enqueue_pr_number,
+                        enqueue_base_ref,
                         enqueue_base_sha,
                         enqueue_head_sha,
                     )
@@ -722,6 +752,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                 elif (
                     review.monitor_run_id != run.id
                     or review.status != expected_review_status
+                    or review.base_ref != enqueue_base_ref
                     or review.base_sha != enqueue_base_sha
                     or review.head_sha != enqueue_head_sha
                 ):
@@ -850,7 +881,8 @@ async def reconcile_merge_queue(db_factory) -> int:
                 await db.commit()
                 continue
             entry_subject_changed = entry is not None and (
-                entry.base_sha != action.trigger_base_sha
+                entry.base_ref != review.base_ref
+                or entry.base_sha != action.trigger_base_sha
                 or entry.head_sha != action.trigger_head_sha
             )
             if entry is None or entry_subject_changed:
@@ -870,6 +902,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                     continue
                 if (
                     fresh_snapshot["state"] == "MERGED"
+                    and fresh_snapshot["base_ref"] == review.base_ref
                     and fresh_snapshot["base_sha"] == action.trigger_base_sha
                     and fresh_snapshot["head_sha"] == action.trigger_head_sha
                 ):
@@ -914,7 +947,7 @@ async def reconcile_merge_queue(db_factory) -> int:
             try:
                 merge_group = await _read_merge_group_ref(
                     repo.repo_full_name,
-                    default_branch=repo.default_branch,
+                    default_branch=review.base_ref,
                     pr_number=run.pr_number,
                 )
             except ValueError as exc:

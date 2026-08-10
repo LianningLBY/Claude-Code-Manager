@@ -4,12 +4,21 @@ from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.plan import Plan
-from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
+from backend.models.plan_agent import (
+    PlanAgentRun,
+    PlanAgentRuntimeReceipt,
+    PlanAgentStep,
+)
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.schemas.plan import PlanModelRoute, PlanPipelineConfig
@@ -32,6 +41,7 @@ from backend.services.plan_agent_runner import (
     _validate_structured_v2,
 )
 from backend.services.plan_runtime_receipt import prepare_runtime_attempt
+from backend.services.task_queue import TaskQueue
 from backend.services.task_runtime_secrets import (
     create_private_runtime_temp_dir,
 )
@@ -50,6 +60,67 @@ def _plan_runtime_tmp(owner_id: int, *, attempt: int = 1):
             "attempt": attempt,
         },
     )
+
+
+async def _seed_first_class_provider_boundary(
+    db_factory,
+    *,
+    target_status: str = "pending",
+    with_project: bool = False,
+):
+    async with db_factory() as db:
+        project_id = None
+        if with_project:
+            project = Project(name="provider-boundary-project", status="ready")
+            db.add(project)
+            await db.flush()
+            project_id = project.id
+        instance = Instance(name="provider-boundary-instance", status="running")
+        db.add(instance)
+        await db.flush()
+        target = Task(
+            title="provider boundary target",
+            status=target_status,
+            provider="codex",
+            incarnation_id="7" * 32,
+            project_id=project_id,
+        )
+        db.add(target)
+        await db.flush()
+        plan = Plan(
+            title="provider boundary Plan",
+            initial_request="admit exactly once",
+            target_task_id=target.id,
+            project_id=project_id,
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="standalone",
+            status="running",
+            generation=1,
+            instance_id=instance.id,
+        )
+        db.add(run)
+        await db.flush()
+        step = PlanAgentStep(
+            run_id=run.id,
+            plan_id=plan.id,
+            generation=1,
+            step_type="planner",
+            provider="codex",
+            status="running",
+        )
+        db.add(step)
+        await db.flush()
+        plan.active_run_id = run.id
+        instance.current_plan_run_id = run.id
+        await db.commit()
+        ids = (target.id, plan.id, run.id, step.id, instance.id)
+    receipt = await prepare_runtime_attempt(db_factory, ids[3])
+    return (*ids, receipt)
 
 
 def test_claude_plan_command_is_read_only():
@@ -478,6 +549,235 @@ async def test_projectless_plan_target_passes_provider_gate(
 
     assert "/private/codex-home" in boundary[0]
     boundary[-1].cleanup()
+
+
+@pytest.mark.asyncio
+async def test_first_class_provider_gate_locks_target_before_plan_graph(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    (
+        _target_id,
+        _plan_id,
+        run_id,
+        _step_id,
+        _instance_id,
+        receipt,
+    ) = await _seed_first_class_provider_boundary(
+        db_factory,
+        with_project=True,
+    )
+    updates: list[str] = []
+    locked_gets: list[str] = []
+    original_execute = AsyncSession.execute
+    original_get = AsyncSession.get
+
+    async def traced_execute(self, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if getattr(statement, "is_update", False) and table is not None:
+            updates.append(table.name)
+        return await original_execute(self, statement, *args, **kwargs)
+
+    async def traced_get(self, entity, ident, *args, **kwargs):
+        if kwargs.get("with_for_update") is True:
+            locked_gets.append(entity.__tablename__)
+        return await original_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", traced_execute)
+    monkeypatch.setattr(AsyncSession, "get", traced_get)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+
+    boundary = await runner._prepare_provider_effect_boundary(
+        task_id=-run_id,
+        provider="codex",
+        cwd=str(tmp_path),
+        admitted_home="/private/codex-home",
+        runtime_receipt=receipt,
+    )
+
+    assert updates[:3] == ["projects", "tasks", "plan_agent_runs"]
+    assert locked_gets[:5] == [
+        "plan_agent_runs",
+        "plans",
+        "plan_agent_steps",
+        "plan_agent_runtime_receipts",
+        "instances",
+    ]
+    boundary[-1].cleanup()
+
+
+@pytest.mark.asyncio
+async def test_first_class_provider_gate_fails_closed_on_target_probe_drift(
+    db_factory,
+    tmp_path,
+):
+    (
+        target_id,
+        _plan_id,
+        run_id,
+        _step_id,
+        _instance_id,
+        receipt,
+    ) = await _seed_first_class_provider_boundary(db_factory)
+    opens = 0
+
+    @asynccontextmanager
+    async def drift_factory():
+        nonlocal opens
+        opens += 1
+        if opens == 2:
+            async with db_factory() as writer:
+                await writer.execute(
+                    update(Task)
+                    .where(Task.id == target_id)
+                    .values(worker_id=4815)
+                )
+                await writer.commit()
+        async with db_factory() as db:
+            yield db
+
+    runner = PlanAgentRunner(
+        db_factory=drift_factory,
+        instance_manager=MagicMock(),
+    )
+
+    with pytest.raises(PlanAgentError, match="target Task changed"):
+        await runner._prepare_provider_effect_boundary(
+            task_id=-run_id,
+            provider="codex",
+            cwd=str(tmp_path),
+            admitted_home="/private/codex-home",
+            runtime_receipt=receipt,
+        )
+
+    async with db_factory() as db:
+        current_receipt = await db.get(PlanAgentRuntimeReceipt, receipt.id)
+        assert current_receipt is not None
+        assert current_receipt.status == "admitting"
+
+
+@pytest.mark.asyncio
+async def test_sqlite_wal_provider_admission_serializes_terminal_task_delete(
+    tmp_path,
+):
+    from backend.database import Base
+
+    task_fenced = asyncio.Event()
+    release_admission = asyncio.Event()
+    delete_task_update_attempted = asyncio.Event()
+
+    class HeldAdmissionSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            table = getattr(statement, "table", None)
+            if (
+                getattr(statement, "is_update", False)
+                and getattr(table, "name", None) == Task.__tablename__
+                and not task_fenced.is_set()
+            ):
+                result = await super().execute(statement, *args, **kwargs)
+                task_fenced.set()
+                await release_admission.wait()
+                return result
+            return await super().execute(statement, *args, **kwargs)
+
+    class ObservedDeleteSession(AsyncSession):
+        async def execute(self, statement, *args, **kwargs):
+            table = getattr(statement, "table", None)
+            if (
+                getattr(statement, "is_update", False)
+                and getattr(table, "name", None) == Task.__tablename__
+                and not delete_task_update_attempted.is_set()
+            ):
+                delete_task_update_attempted.set()
+            return await super().execute(statement, *args, **kwargs)
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'plan-provider-delete-wal.db'}",
+        connect_args={"timeout": 2},
+    )
+    admission = None
+    deleting = None
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        admission_factory = async_sessionmaker(
+            engine,
+            class_=HeldAdmissionSession,
+            expire_on_commit=False,
+        )
+        delete_factory = async_sessionmaker(
+            engine,
+            class_=ObservedDeleteSession,
+            expire_on_commit=False,
+        )
+        (
+            target_id,
+            plan_id,
+            run_id,
+            _step_id,
+            _instance_id,
+            receipt,
+        ) = await _seed_first_class_provider_boundary(
+            factory,
+            target_status="completed",
+        )
+        runner = PlanAgentRunner(
+            db_factory=admission_factory,
+            instance_manager=MagicMock(),
+        )
+        admission = asyncio.create_task(
+            runner._prepare_provider_effect_boundary(
+                task_id=-run_id,
+                provider="codex",
+                cwd=str(tmp_path),
+                admitted_home="/private/codex-home",
+                runtime_receipt=receipt,
+            )
+        )
+        await asyncio.wait_for(task_fenced.wait(), timeout=1)
+
+        async def delete_target() -> bool:
+            async with delete_factory() as db:
+                return await TaskQueue(db).delete(target_id)
+
+        deleting = asyncio.create_task(delete_target())
+        await asyncio.wait_for(delete_task_update_attempted.wait(), timeout=1)
+        release_admission.set()
+        boundary, deleted = await asyncio.wait_for(
+            asyncio.gather(admission, deleting),
+            timeout=3,
+        )
+
+        assert deleted is False
+        boundary[-1].cleanup()
+        async with factory() as db:
+            target = await db.get(Task, target_id)
+            plan = await db.get(Plan, plan_id)
+            run = await db.get(PlanAgentRun, run_id)
+            current_receipt = await db.get(PlanAgentRuntimeReceipt, receipt.id)
+            assert target is not None and target.incarnation_id == "7" * 32
+            assert plan is not None and plan.active_run_id == run_id
+            assert run is not None and run.generation == receipt.run_generation
+            assert current_receipt is not None
+            assert current_receipt.runtime_token == receipt.runtime_token
+            assert current_receipt.status == "admitting"
+    finally:
+        release_admission.set()
+        for operation in (admission, deleting):
+            if operation is not None and not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

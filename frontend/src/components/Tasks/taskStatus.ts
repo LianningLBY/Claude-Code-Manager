@@ -15,7 +15,9 @@ export function getTaskStatusLabel(task: Task): string {
 
   if (task.mode === 'delivery_loop' && task.delivery_run_id != null) {
     if (task.delivery_phase === 'done') {
-      if (task.delivery_outcome === 'success') return 'Ready to Merge';
+      if (task.delivery_outcome === 'success') {
+        return task.delivery_terminal === 'merged' ? 'Merged' : 'Ready to Merge';
+      }
       return task.delivery_outcome
         ? `Delivery ${titleCaseStatus(task.delivery_outcome)}`
         : 'Delivery Done';

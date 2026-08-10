@@ -89,8 +89,28 @@ async def record_review_error(
     Review can never pause the replacement head.
     """
 
-    # Flush a caller's just-written Review/ReviewerRun error before refreshing
-    # the same Review with ``populate_existing`` below.
+    # Discover the durable owner without flushing a caller's pending Review
+    # update: an autoflush here would acquire Review before PRMonitorRun and
+    # invert the controller's terminal order.  Every transaction that touches
+    # both rows uses PRMonitorRun -> PRReview.
+    with db.no_autoflush:
+        monitor_run_id = await db.scalar(
+            select(PRReview.monitor_run_id).where(PRReview.id == review_id)
+        )
+        run = (
+            (
+                await db.execute(
+                    select(PRMonitorRun)
+                    .where(PRMonitorRun.id == monitor_run_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if monitor_run_id is not None
+            else None
+        )
+    # PRMonitorRun is now locked, so flushing the just-written
+    # Review/ReviewerRun error preserves the global pair order.
     await db.flush()
     review = (
         await db.execute(
@@ -102,21 +122,13 @@ async def record_review_error(
     ).scalar_one_or_none()
     changed = False
     if (
-        review is not None
+        run is not None
+        and review is not None
         and review.status == "error"
         and review.action_taken == "error"
-        and review.monitor_run_id is not None
+        and review.monitor_run_id == run.id
     ):
-        run = (
-            await db.execute(
-                select(PRMonitorRun)
-                .where(PRMonitorRun.id == review.monitor_run_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        if run is not None:
-            changed = _apply_current_review_error(run, review)
+        changed = _apply_current_review_error(run, review)
     # The Review error itself must remain durable even if its Monitor has
     # already advanced to a newer immutable head.
     await db.commit()
@@ -146,7 +158,7 @@ async def attach_review_to_run(
 ) -> PRMonitorRun:
     """Attach one immutable review snapshot to its cross-head lifecycle."""
 
-    if not review.base_sha or not review.head_sha:
+    if not review.base_ref or not review.base_sha or not review.head_sha:
         raise ValueError("review snapshot is incomplete")
     run = (await db.execute(
         select(PRMonitorRun)
@@ -164,6 +176,7 @@ async def attach_review_to_run(
         db.add(run)
         await db.flush()
     else:
+        old_review_id = run.current_review_id
         old_base = run.current_base_sha
         old_head = run.current_head_sha
         run.current_base_sha = review.base_sha
@@ -171,7 +184,11 @@ async def attach_review_to_run(
         run.max_repair_attempts = repo.max_repair_attempts
         run.state_version += 1
         run.pause_reason = None
-        if old_base != review.base_sha or old_head != review.head_sha:
+        if (
+            old_review_id != review.id
+            or old_base != review.base_sha
+            or old_head != review.head_sha
+        ):
             old_wakes = list((await db.execute(
                 select(PRRepairWake).where(
                     PRRepairWake.monitor_run_id == run.id,
@@ -291,7 +308,13 @@ async def record_blocking_evidence(
     )).scalars())
     evidence = {
         "schema_version": 1,
-        "subject": {"repo": repo.repo_full_name, "pr_number": review.pr_number, "base_sha": review.base_sha, "head_sha": review.head_sha},
+        "subject": {
+            "repo": repo.repo_full_name,
+            "pr_number": review.pr_number,
+            "base_ref": review.base_ref,
+            "base_sha": review.base_sha,
+            "head_sha": review.head_sha,
+        },
         "ci": {"status": review.ci_status, "summary": review.ci_summary, "details": review.ci_details},
         "findings": [{
             "fingerprint": item.fingerprint,
@@ -385,14 +408,45 @@ async def record_blocking_evidence(
 
 
 async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
-    review = await db.get(PRReview, review_id, populate_existing=True)
-    if review is None or review.monitor_run_id is None:
+    # Discover the parent id without taking a Review row lock.  This path can
+    # update both rows after an accepted rebuttal, so it must share the same
+    # cross-database writer order as panel completion and Delivery recovery:
+    # PRMonitorRun -> PRReview.  A plain discovery read does not participate in
+    # the PostgreSQL/MySQL row-lock graph; the exact binding is revalidated
+    # after both durable locks are held.
+    with db.no_autoflush:
+        monitor_run_id = await db.scalar(
+            select(PRReview.monitor_run_id).where(PRReview.id == review_id)
+        )
+    if monitor_run_id is None:
         return
-    run = await db.get(PRMonitorRun, review.monitor_run_id, populate_existing=True)
-    if run is None or run.current_review_id != review.id or run.current_head_sha != review.head_sha:
+    run = (
+        await db.execute(
+            select(PRMonitorRun)
+            .where(PRMonitorRun.id == monitor_run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    review = (
+        await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        run is None
+        or review is None
+        or review.monitor_run_id != run.id
+        or run.current_review_id != review.id
+        or run.current_base_sha != review.base_sha
+        or run.current_head_sha != review.head_sha
+    ):
         return
     if review.status == "merged":
-        # Legacy auto-merge already obtained and verified the remote terminal.
+        # Direct auto-merge already obtained and verified the remote terminal.
         # Do not demote that fact back to a pre-merge Gate or create a queue
         # action for a PR that no longer exists as an open queue subject.
         run.status = "merged"
@@ -423,24 +477,113 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
             review=review,
             monitor_run=run,
         )
-    unresolved_published = list((await db.execute(
+    unresolved_blocking = list((await db.execute(
         select(PRFinding.id)
         .join(PRReview, PRReview.id == PRFinding.pr_review_id)
         .where(
             PRReview.monitor_run_id == run.id,
             PRFinding.severity.in_(("critical", "high", "medium")),
-            PRFinding.thread_status.in_(("published_inline", "published_fallback")),
+            or_(
+                PRFinding.status == "open",
+                PRFinding.thread_status.in_((
+                    "published_inline",
+                    "published_fallback",
+                )),
+            ),
         )
         .limit(1)
     )).scalars())
-    if unresolved_published:
+    if unresolved_blocking:
         # A newer green head is evidence that findings from older immutable
-        # subjects were fixed, but the GitHub effects must be durably cleared
-        # before this lifecycle is allowed to reach the merge gate.
+        # subjects were fixed, but every old Finding publication and GitHub
+        # effect must complete durably before this lifecycle reaches the Gate.
         run.status = "resolving_fixed_threads"
         run.state_version += 1
         await db.commit()
         return
+    if review.status == "commented" and review.action_taken == "review_comments":
+        # A same-head accepted rebuttal clears the blocking review without
+        # creating a new reviewer Task.  If that exact Task froze auto-merge,
+        # re-arm a fresh publication identity/generation through an explicit
+        # crash-recoverable stage.  The old blocking publication identity must
+        # never be reused after an arbitrarily long adjudication.
+        from backend.services.pr_review_service import (
+            _frozen_task_ci_policy,
+            _needs_identity_action,
+            _validated_action_nonce,
+        )
+
+        task = (
+            await db.get(Task, review.task_id, populate_existing=True)
+            if review.task_id is not None
+            else None
+        )
+        frozen_auto_merge = (
+            (task.metadata_ or {}).get("pr_auto_merge")
+            if task is not None
+            else None
+        )
+        ci_policy = (
+            _frozen_task_ci_policy(task, panel_task=True)
+            if task is not None
+            else None
+        )
+        current_blocker = await db.scalar(
+            select(PRFinding.id)
+            .where(
+                PRFinding.pr_review_id == review.id,
+                PRFinding.severity.in_(("critical", "high", "medium")),
+                or_(
+                    PRFinding.status == "open",
+                    PRFinding.thread_status != "resolved",
+                ),
+            )
+            .limit(1)
+        )
+        policy_matches = bool(
+            task is not None
+            and _validated_action_nonce(task, review) is not None
+            and type(frozen_auto_merge) is bool
+            and ci_policy is not None
+            and (
+                delivery_policy is None
+                or (
+                    delivery_policy.auto_merge == frozen_auto_merge
+                    and delivery_policy.wait_for_ci == ci_policy[0]
+                    and delivery_policy.required_checks == ci_policy[1]
+                )
+            )
+        )
+        if not policy_matches:
+            run.status = "paused"
+            run.pause_reason = "publication_policy_invalid_after_rebuttal"
+            run.state_version += 1
+            await db.commit()
+            return
+        if frozen_auto_merge and current_blocker is None:
+            review.status = "publishing"
+            review.pending_action = _needs_identity_action("approved_merged")
+            review.pending_review_body = (
+                "All blocking findings for the exact reviewed head were "
+                "resolved by accepted independent rebuttal."
+            )
+            review.publishing_actor = None
+            review.publishing_retry_count = None
+            review.publishing_task_started_at = None
+            review.publishing_started_at = None
+            review.publishing_lease_token = None
+            review.publishing_lease_expires_at = None
+            review.review_summary = (
+                "Accepted rebuttal cleared the Finding Gate; publication "
+                "identity pending"
+            )
+            review.completed_at = None
+            run.status = "reviewing"
+            run.pause_reason = None
+            run.completed_at = None
+            run.state_version += 1
+            await db.commit()
+            return
     run.status = "ready_to_merge"
     run.state_version += 1
     repo = await db.get(MonitoredRepo, review.repo_id, populate_existing=True)
@@ -451,7 +594,7 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
     ):
         existing = (await db.execute(select(PRMergeQueueAction).where(
             PRMergeQueueAction.monitor_run_id == run.id,
-            PRMergeQueueAction.trigger_head_sha == review.head_sha,
+            PRMergeQueueAction.review_id == review.id,
         ))).scalar_one_or_none()
         if existing is None:
             db.add(PRMergeQueueAction(
@@ -477,8 +620,8 @@ async def reconcile_terminal_review_runs(db_factory) -> int:
     """
 
     async with db_factory() as db:
-        review_ids = list((await db.execute(
-            select(PRReview.id)
+        candidates = list((await db.execute(
+            select(PRReview.id, PRMonitorRun.id)
             .join(PRMonitorRun, PRMonitorRun.current_review_id == PRReview.id)
             .where(
                 PRMonitorRun.status == "reviewing",
@@ -500,11 +643,22 @@ async def reconcile_terminal_review_runs(db_factory) -> int:
                 ),
             )
             .order_by(PRReview.id)
-        )).scalars())
+        )).all())
 
     reconciled = 0
-    for review_id in review_ids:
+    for review_id, run_id in candidates:
         async with db_factory() as db:
+            # Match Delivery terminalization and all online error paths:
+            # PRMonitorRun is the parent state machine and is always locked
+            # before its exact current Review.
+            run = (
+                await db.execute(
+                    select(PRMonitorRun)
+                    .where(PRMonitorRun.id == run_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
             review = (
                 await db.execute(
                     select(PRReview)
@@ -513,12 +667,6 @@ async def reconcile_terminal_review_runs(db_factory) -> int:
                     .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
-            run = (await db.execute(
-                select(PRMonitorRun)
-                .where(PRMonitorRun.current_review_id == review_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )).scalar_one_or_none()
             if (
                 run is None
                 or review is None
@@ -581,6 +729,28 @@ to the existing PR branch. Do not create another PR, merge, close the PR, or
 claim the Gate passed. If the subject is stale or the branch cannot be proven,
 stop and report the mismatch instead of modifying another branch.
 """
+
+
+async def _repair_remote_subject_is_current(
+    repo: MonitoredRepo,
+    review: PRReview,
+) -> bool:
+    from backend.services.pr_review_service import (
+        _gh_pr_view,
+        _validated_pr_snapshot,
+    )
+
+    snapshot = _validated_pr_snapshot(
+        await _gh_pr_view(review.pr_number, repo.repo_full_name)
+    )
+    return bool(
+        snapshot["state"] == "OPEN"
+        and snapshot["merged_at"] is None
+        and snapshot["is_draft"] is False
+        and snapshot["base_ref"] == review.base_ref
+        and snapshot["base_sha"] == review.base_sha
+        and snapshot["head_sha"] == review.head_sha
+    )
 
 
 async def admit_repair_wake(
@@ -689,6 +859,13 @@ async def _admit_repair_wake_locked(
                 .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
+    if (
+        locked_review is None
+        or locked_review.id != wake.review_id
+        or locked_review.base_sha != wake.trigger_base_sha
+        or locked_review.head_sha != wake.trigger_head_sha
+    ):
+        return False
     if await legacy_pr_effect_is_forbidden(
         db,
         review=locked_review,
@@ -698,6 +875,30 @@ async def _admit_repair_wake_locked(
         # Delivery creates shadow evidence for its controller.  A stale
         # pending/delivering legacy Wake must never be admitted merely because
         # it was written before publisher adoption or monitor binding.
+        return False
+    try:
+        remote_current = await _repair_remote_subject_is_current(
+            repo,
+            locked_review,
+        )
+    except Exception as exc:
+        wake.status = "pending"
+        wake.delivery_token = secrets.token_hex(24)
+        wake.last_error = (
+            f"repair_pr_read_failed:{type(exc).__name__}:{str(exc)[:200]}"
+        )
+        run.status = "repair_pending"
+        run.state_version += 1
+        await db.commit()
+        return False
+    if not remote_current:
+        wake.status = "superseded"
+        wake.completed_at = datetime.utcnow()
+        wake.last_error = "repair_pr_subject_changed"
+        run.status = "paused"
+        run.pause_reason = wake.last_error
+        run.state_version += 1
+        await db.commit()
         return False
     accepted = await db.execute(
         update(PRRepairWake)
@@ -1393,6 +1594,46 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                     run.pause_reason = "repo_disabled" if run.status == "paused" else None
                     run.state_version += 1
                 continue
+            review = (
+                await db.get(PRReview, wake.review_id)
+                if wake.review_id is not None
+                else None
+            )
+            if (
+                review is None
+                or run.current_review_id != review.id
+                or review.monitor_run_id != run.id
+                or run.current_base_sha != wake.trigger_base_sha
+                or run.current_head_sha != wake.trigger_head_sha
+                or review.base_sha != wake.trigger_base_sha
+                or review.head_sha != wake.trigger_head_sha
+            ):
+                wake.status = "superseded"
+                wake.completed_at = datetime.utcnow()
+                wake.last_error = "repair_review_subject_changed"
+                run.status = "paused"
+                run.pause_reason = wake.last_error
+                run.state_version += 1
+                continue
+            try:
+                remote_current = await _repair_remote_subject_is_current(
+                    repo,
+                    review,
+                )
+            except Exception as exc:
+                wake.last_error = (
+                    f"repair_pr_read_failed:{type(exc).__name__}:"
+                    f"{str(exc)[:200]}"
+                )
+                continue
+            if not remote_current:
+                wake.status = "superseded"
+                wake.completed_at = datetime.utcnow()
+                wake.last_error = "repair_pr_subject_changed"
+                run.status = "paused"
+                run.pause_reason = wake.last_error
+                run.state_version += 1
+                continue
             if task.worker_id is not None:
                 from backend.main import task_migrator
 
@@ -1468,6 +1709,50 @@ async def reconcile_repair_wakes(db_factory, dispatcher) -> int:
                 or not task.last_cwd
             ):
                 await db.rollback()
+                continue
+            review = (
+                await db.get(
+                    PRReview,
+                    wake.review_id,
+                    populate_existing=True,
+                )
+                if wake.review_id is not None
+                else None
+            )
+            if (
+                review is None
+                or review.monitor_run_id != run.id
+                or review.base_sha != wake.trigger_base_sha
+                or review.head_sha != wake.trigger_head_sha
+            ):
+                wake.status = "superseded"
+                wake.completed_at = datetime.utcnow()
+                wake.last_error = "repair_review_subject_changed"
+                run.status = "paused"
+                run.pause_reason = wake.last_error
+                run.state_version += 1
+                await db.commit()
+                continue
+            try:
+                remote_current = await _repair_remote_subject_is_current(
+                    repo,
+                    review,
+                )
+            except Exception as exc:
+                wake.last_error = (
+                    f"repair_pr_read_failed:{type(exc).__name__}:"
+                    f"{str(exc)[:200]}"
+                )
+                await db.commit()
+                continue
+            if not remote_current:
+                wake.status = "superseded"
+                wake.completed_at = datetime.utcnow()
+                wake.last_error = "repair_pr_subject_changed"
+                run.status = "paused"
+                run.pause_reason = wake.last_error
+                run.state_version += 1
+                await db.commit()
                 continue
             fenced_task = await _fence_repair_developer_task_graph(db, task)
             if fenced_task is None:

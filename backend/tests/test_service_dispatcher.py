@@ -15477,6 +15477,7 @@ async def test_stale_pr_failure_cannot_overwrite_superseded_review(db_factory):
         review = PRReview(
             repo_id=repo.id,
             pr_number=7,
+            base_ref="main",
             pr_title="old",
             pr_author="author",
             pr_url="https://example.test/pr/7",
@@ -15521,6 +15522,7 @@ async def test_stale_pr_failure_cannot_overwrite_retried_generation(db_factory):
         review = PRReview(
             repo_id=repo.id,
             pr_number=8,
+            base_ref="main",
             pr_title="retry",
             pr_author="author",
             pr_url="https://example.test/pr/8",
@@ -15580,6 +15582,7 @@ async def test_pr_failure_writer_yields_to_worker_termination_receipt(
         review = PRReview(
             repo_id=repo.id,
             pr_number=18,
+            base_ref="main",
             pr_title="receipt failure",
             pr_author="author",
             pr_url="https://example.test/pr/18",

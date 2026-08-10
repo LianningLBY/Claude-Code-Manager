@@ -5592,6 +5592,422 @@ async def test_dispatch_worker_tasks_forwards(db_factory, session_factory, broad
     assert resulting.status == "executing"
 
 
+async def test_dispatch_worker_task_respects_running_plan_capacity(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory, max_tasks=1)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+    )
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Running Worker Plan consumes capacity",
+            initial_request="Plan first",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan first",
+            pipeline_config=pipeline,
+            status="running",
+            generation=0,
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.turn_generation == task.turn_generation
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
+async def test_dispatch_worker_task_respects_ack_unconfirmed_cancelling_plan_capacity(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory, max_tasks=1)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+    )
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Cancelling Worker Plan still consumes capacity",
+            initial_request="Plan first",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan first",
+            pipeline_config=pipeline,
+            status="cancelling",
+            generation=1,
+            cancellation_target_generation=0,
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        db.add(
+            PlanAgentWorkerDispatchReceipt(
+                plan_id=plan.id,
+                run_id=run.id,
+                worker_id=worker.id,
+                run_generation=0,
+                protocol=1,
+                status="remote_possible",
+                payload_digest="a" * 64,
+            )
+        )
+        await db.commit()
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        assert current.status == "pending"
+        assert current.turn_generation == task.turn_generation
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
+async def test_dispatch_worker_plan_respects_running_task_capacity(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory, max_tasks=1)
+    await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+    )
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Running Worker Task consumes capacity",
+            initial_request="Plan later",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan later",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+
+    monkeypatch.setattr(main_module, "worker_proxy", AsyncMock())
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+
+    async with session_factory() as db:
+        current = await db.get(PlanAgentRun, run_id)
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentWorkerDispatchReceipt).where(
+                        PlanAgentWorkerDispatchReceipt.run_id == run_id
+                    )
+                )
+            ).scalars()
+        )
+        assert current.status == "queued"
+        assert receipts == []
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
+async def test_dispatch_worker_plan_respects_ack_unconfirmed_cancelling_plan_capacity(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory, max_tasks=1)
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        blocker_plan = Plan(
+            title="Cancelling Worker Plan still consumes capacity",
+            initial_request="Block the Worker until cancellation is confirmed",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+        )
+        db.add(blocker_plan)
+        await db.flush()
+        blocker_run = PlanAgentRun(
+            plan_id=blocker_plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Block the Worker until cancellation is confirmed",
+            pipeline_config=pipeline,
+            status="cancelling",
+            generation=1,
+            cancellation_target_generation=0,
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(blocker_run)
+        await db.flush()
+        blocker_plan.active_run_id = blocker_run.id
+        db.add(
+            PlanAgentWorkerDispatchReceipt(
+                plan_id=blocker_plan.id,
+                run_id=blocker_run.id,
+                worker_id=worker.id,
+                run_generation=0,
+                protocol=1,
+                status="remote_possible",
+                payload_digest="a" * 64,
+            )
+        )
+
+        queued_plan = Plan(
+            title="Queued Worker Plan waits for capacity",
+            initial_request="Plan later",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+        )
+        db.add(queued_plan)
+        await db.flush()
+        queued_run = PlanAgentRun(
+            plan_id=queued_plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Plan later",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(queued_run)
+        await db.flush()
+        queued_plan.active_run_id = queued_run.id
+        await db.commit()
+        queued_run_id = queued_run.id
+
+    monkeypatch.setattr(main_module, "worker_proxy", AsyncMock())
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+
+    async with session_factory() as db:
+        current = await db.get(PlanAgentRun, queued_run_id)
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentWorkerDispatchReceipt).where(
+                        PlanAgentWorkerDispatchReceipt.run_id == queued_run_id
+                    )
+                )
+            ).scalars()
+        )
+        assert current.status == "queued"
+        assert receipts == []
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
+@pytest.mark.asyncio
+async def test_worker_task_and_plan_share_atomic_capacity_in_sqlite_wal(
+    tmp_path,
+    monkeypatch,
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from backend.database import Base
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'worker-shared-capacity.db'}",
+        connect_args={"timeout": 5},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            worker = Worker(
+                name="worker-shared-capacity",
+                status="ready",
+                max_tasks=1,
+                auth_token="worker-token",
+            )
+            setup.add(worker)
+            await setup.flush()
+            task = Task(
+                title="Ordinary Worker candidate",
+                description="Only one candidate may win",
+                status="pending",
+                worker_id=worker.id,
+            )
+            setup.add(task)
+            await setup.flush()
+            plan = Plan(
+                title="Worker Plan candidate",
+                initial_request="Only one candidate may win",
+                worker_id=worker.id,
+                target_task_id=task.id,
+                pipeline_config=pipeline,
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                worker_id=worker.id,
+                run_type="initial",
+                request_text="Only one candidate may win",
+                pipeline_config=pipeline,
+                status="queued",
+                generation=0,
+            )
+            setup.add(run)
+            await setup.flush()
+            plan.active_run_id = run.id
+            await setup.commit()
+            task_id = task.id
+            run_id = run.id
+
+        proxy = AsyncMock()
+        monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+        async def preserve_plan_claim(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(
+            GlobalDispatcher,
+            "_run_worker_plan_lifecycle",
+            preserve_plan_claim,
+        )
+        task_dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+        task_dispatcher.db_factory = sessions
+        task_dispatcher.broadcaster = FakeBroadcaster()
+        task_dispatcher._running_tasks = {}
+        plan_dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+        plan_dispatcher.db_factory = sessions
+        plan_dispatcher.broadcaster = FakeBroadcaster()
+        plan_dispatcher._running_tasks = {}
+
+        await asyncio.gather(
+            task_dispatcher._dispatch_worker_tasks(),
+            plan_dispatcher._dispatch_worker_plan_runs(),
+        )
+        await asyncio.sleep(0)
+
+        async with sessions() as check:
+            current_task = await check.get(Task, task_id)
+            current_run = await check.get(PlanAgentRun, run_id)
+            receipts = list(
+                (
+                    await check.execute(
+                        select(PlanAgentWorkerDispatchReceipt).where(
+                            PlanAgentWorkerDispatchReceipt.run_id == run_id
+                        )
+                    )
+                ).scalars()
+            )
+        task_won = current_task.status == "in_progress"
+        plan_won = current_run.status == "running"
+        assert int(task_won) + int(plan_won) == 1
+        assert current_task.status in {"pending", "in_progress"}
+        assert current_run.status in {"queued", "running"}
+        if plan_won:
+            assert len(receipts) == 1
+            assert receipts[0].status == "prepared"
+            proxy.forward_task_to_worker.assert_not_awaited()
+        else:
+            assert receipts == []
+            proxy.forward_task_to_worker.assert_awaited_once()
+
+        pending_lifecycles = {
+            lifecycle
+            for dispatcher in (task_dispatcher, plan_dispatcher)
+            for lifecycle in dispatcher._running_tasks.values()
+        }
+        if pending_lifecycles:
+            await asyncio.gather(*pending_lifecycles)
+    finally:
+        await engine.dispose()
+
+
 async def test_dispatch_worker_tasks_without_auth_keeps_pending_and_never_posts(
     db_factory,
     session_factory,
@@ -5944,6 +6360,7 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
     proxy.run_versioned_plan_until_pause.side_effect = run_remote
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
     original_get = AsyncSession.get
+    original_execute = AsyncSession.execute
     locked_rows = []
 
     async def recording_get(self, entity, ident, *args, **kwargs):
@@ -5951,7 +6368,16 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
             locked_rows.append((entity, ident))
         return await original_get(self, entity, ident, *args, **kwargs)
 
+    async def recording_execute(self, statement, *args, **kwargs):
+        if getattr(statement, "_for_update_arg", None) is not None:
+            descriptions = getattr(statement, "column_descriptions", ())
+            entity = descriptions[0].get("entity") if descriptions else None
+            if entity is PlanAgentWorkerDispatchReceipt:
+                locked_rows.append((entity, "current-generation"))
+        return await original_execute(self, statement, *args, **kwargs)
+
     monkeypatch.setattr(AsyncSession, "get", recording_get)
+    monkeypatch.setattr(AsyncSession, "execute", recording_execute)
     dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
     dispatcher.db_factory = db_factory
     dispatcher.broadcaster = broadcaster
@@ -5962,9 +6388,16 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
     await lifecycle
 
     assert locked_rows == [
+        # Claim: Task/Worker writer fences are already held, then every Plan
+        # aggregate writer takes Run -> Plan -> boundary receipt.
+        (PlanAgentRun, run_id),
+        (Plan, plan_id),
+        (PlanAgentWorkerDispatchReceipt, "current-generation"),
+        # Remote-boundary publication.
         (PlanAgentRun, run_id),
         (Plan, plan_id),
         (PlanAgentWorkerDispatchReceipt, 1),
+        # Terminal outcome import.
         (PlanAgentRun, run_id),
         (Plan, plan_id),
         (PlanAgentWorkerDispatchReceipt, 1),
@@ -5982,6 +6415,320 @@ async def test_dispatch_worker_plan_run_imports_terminal_outcome(
         and event.get("status") == "failed"
         for channel, event in broadcaster.sent
     )
+
+
+@pytest.mark.asyncio
+async def test_worker_plan_claim_loses_cleanly_to_wal_cancel(
+    tmp_path,
+    monkeypatch,
+):
+    """A cross-process cancel between routing read and Task fence is exact."""
+
+    from sqlalchemy.ext.asyncio import (
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services import plan_service
+    from backend.services.dispatcher import GlobalDispatcher
+    from backend.services.plan_service import cancel_worker_mirror_run_after_ack
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'worker-plan-claim-cancel.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            worker = Worker(
+                name="worker-plan-claim-cancel",
+                status="ready",
+                max_tasks=8,
+                auth_token="worker-token",
+            )
+            setup.add(worker)
+            await setup.flush()
+            target = Task(
+                title="Worker Plan claim target",
+                description="target",
+                status="pending",
+                worker_id=worker.id,
+            )
+            setup.add(target)
+            await setup.flush()
+            plan = Plan(
+                title="Worker Plan WAL claim",
+                initial_request="claim exactly once",
+                target_task_id=target.id,
+                worker_id=worker.id,
+                pipeline_config=pipeline,
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                worker_id=worker.id,
+                run_type="initial",
+                request_text="claim exactly once",
+                pipeline_config=pipeline,
+                status="queued",
+                generation=0,
+            )
+            setup.add(run)
+            await setup.flush()
+            plan.active_run_id = run.id
+            await setup.commit()
+            plan_id = plan.id
+            run_id = run.id
+
+        fence_entered = asyncio.Event()
+        allow_fence = asyncio.Event()
+        real_fence = plan_service.fence_plan_target_task
+
+        async def delayed_target_fence(
+            db,
+            *,
+            target_task_id,
+            expected_worker_id,
+        ):
+            fence_entered.set()
+            await allow_fence.wait()
+            return await real_fence(
+                db,
+                target_task_id=target_task_id,
+                expected_worker_id=expected_worker_id,
+            )
+
+        monkeypatch.setattr(
+            plan_service,
+            "fence_plan_target_task",
+            delayed_target_fence,
+        )
+        monkeypatch.setattr(main_module, "worker_proxy", AsyncMock())
+        dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+        dispatcher.db_factory = sessions
+        dispatcher.broadcaster = FakeBroadcaster()
+        dispatcher._running_tasks = {}
+
+        claim = asyncio.create_task(dispatcher._dispatch_worker_plan_runs())
+        await asyncio.wait_for(fence_entered.wait(), timeout=2)
+        try:
+            async with sessions() as cancellation_db:
+                cancel_plan = await cancellation_db.get(Plan, plan_id)
+                cancel_run = await cancellation_db.get(PlanAgentRun, run_id)
+                assert cancel_plan is not None and cancel_run is not None
+                cancelled = await cancel_worker_mirror_run_after_ack(
+                    cancellation_db,
+                    plan=cancel_plan,
+                    run=cancel_run,
+                )
+                assert cancelled.status == "cancelled"
+        finally:
+            allow_fence.set()
+        await asyncio.wait_for(claim, timeout=5)
+
+        async with sessions() as check:
+            persisted_plan = await check.get(Plan, plan_id)
+            persisted_run = await check.get(PlanAgentRun, run_id)
+            receipts = list(
+                (
+                    await check.execute(
+                        select(PlanAgentWorkerDispatchReceipt).where(
+                            PlanAgentWorkerDispatchReceipt.run_id == run_id
+                        )
+                    )
+                ).scalars()
+            )
+            assert persisted_plan is not None
+            assert persisted_plan.active_run_id is None
+            assert persisted_run is not None and persisted_run.status == "cancelled"
+            assert receipts == []
+        assert dispatcher._running_tasks == {}
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "with_target_task",
+    (True, False),
+    ids=("task-fence", "standalone-run-fence"),
+)
+async def test_worker_plan_remote_boundary_restarts_after_wal_receipt_read(
+    tmp_path,
+    monkeypatch,
+    with_target_task,
+):
+    """A concurrent commit after receipt routing read cannot leak BUSY_SNAPSHOT."""
+
+    from sqlalchemy.ext.asyncio import (
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.worker_plan_dispatch import (
+        mark_worker_dispatch_remote_possible,
+    )
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'worker-plan-boundary.db'}",
+        connect_args={"timeout": 1},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            worker = Worker(
+                name="worker-plan-boundary",
+                status="ready",
+                auth_token="worker-token",
+            )
+            setup.add(worker)
+            await setup.flush()
+            target = None
+            if with_target_task:
+                target = Task(
+                    title="Worker Plan boundary target",
+                    description="target",
+                    status="pending",
+                    worker_id=worker.id,
+                )
+                setup.add(target)
+                await setup.flush()
+            plan = Plan(
+                title="Worker Plan boundary",
+                initial_request="publish boundary exactly",
+                target_task_id=target.id if target is not None else None,
+                worker_id=worker.id,
+                pipeline_config=pipeline,
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                worker_id=worker.id,
+                run_type="initial",
+                request_text="publish boundary exactly",
+                pipeline_config=pipeline,
+                status="running",
+                generation=3,
+                last_execution_started_at=datetime.utcnow(),
+            )
+            setup.add(run)
+            await setup.flush()
+            plan.active_run_id = run.id
+            receipt = PlanAgentWorkerDispatchReceipt(
+                plan_id=plan.id,
+                run_id=run.id,
+                target_task_id=target.id if target is not None else None,
+                worker_id=worker.id,
+                run_generation=run.generation,
+                protocol=1,
+                status="prepared",
+            )
+            setup.add(receipt)
+            await setup.commit()
+            worker_id = worker.id
+            plan_id = plan.id
+            run_id = run.id
+            receipt_id = receipt.id
+            generation = run.generation
+
+        routing_read = asyncio.Event()
+        allow_boundary = asyncio.Event()
+        original_get = AsyncSession.get
+
+        async def interleaved_get(self, entity, ident, *args, **kwargs):
+            result = await original_get(self, entity, ident, *args, **kwargs)
+            if (
+                (
+                    with_target_task
+                    and entity is PlanAgentWorkerDispatchReceipt
+                    and ident == receipt_id
+                    and not kwargs.get("with_for_update")
+                )
+                or (
+                    not with_target_task
+                    and entity is PlanAgentRun
+                    and ident == run_id
+                    and kwargs.get("with_for_update")
+                )
+            ) and not routing_read.is_set():
+                routing_read.set()
+                await allow_boundary.wait()
+            return result
+
+        monkeypatch.setattr(AsyncSession, "get", interleaved_get)
+        boundary = asyncio.create_task(
+            mark_worker_dispatch_remote_possible(
+                sessions,
+                receipt_id=receipt_id,
+                plan_id=plan_id,
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                payload_digest="a" * 64,
+            )
+        )
+        await asyncio.wait_for(routing_read.wait(), timeout=2)
+
+        async def concurrent_commit():
+            async with sessions() as concurrent_writer:
+                await concurrent_writer.execute(
+                    update(Worker)
+                    .where(Worker.id == worker_id)
+                    .values(name="worker-plan-boundary-concurrent-writer")
+                )
+                await concurrent_writer.commit()
+
+        try:
+            writer = asyncio.create_task(concurrent_commit())
+            if with_target_task:
+                # The commit lands after the routing SELECT but before the
+                # helper discards that snapshot.
+                await asyncio.wait_for(writer, timeout=2)
+            else:
+                # A standalone Plan has no Task row. Its portable no-op Run
+                # writer fence must already exclude this second connection
+                # before SELECT FOR UPDATE reloads the aggregate.
+                await asyncio.sleep(0.05)
+                assert not writer.done()
+        finally:
+            allow_boundary.set()
+        snapshot = await asyncio.wait_for(boundary, timeout=5)
+        await asyncio.wait_for(writer, timeout=2)
+
+        assert snapshot.status == "remote_possible"
+        assert snapshot.payload_digest == "a" * 64
+        async with sessions() as check:
+            persisted = await check.get(
+                PlanAgentWorkerDispatchReceipt,
+                receipt_id,
+            )
+            assert persisted is not None
+            assert persisted.status == "remote_possible"
+            assert persisted.payload_digest == "a" * 64
+    finally:
+        await engine.dispose()
 
 
 async def test_dispatch_worker_plan_without_auth_keeps_queued_without_receipt(

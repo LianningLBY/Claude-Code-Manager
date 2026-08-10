@@ -29,7 +29,7 @@ function titleCase(value: string): string {
 function statusLabel(run: DeliveryRun): string {
   if (run.activity === 'terminal') {
     return run.outcome === 'success'
-      ? 'Ready to Merge'
+      ? (run.terminal === 'merged' ? 'Merged' : 'Ready to Merge')
       : `Delivery ${titleCase(run.outcome || 'done')}`;
   }
   return `${titleCase(run.phase)} · ${titleCase(run.activity)}`;

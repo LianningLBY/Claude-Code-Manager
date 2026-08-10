@@ -443,12 +443,43 @@ class FakePublisher:
         async with self.db_factory() as db:
             run = await db.get(DeliveryRun, run_id)
             monitor = await db.get(PRMonitorRun, monitor_run_id)
+            review = await db.get(PRReview, monitor.current_review_id)
             assert run.pr_number == pull_request.pr_number
             assert run.pr_url == pull_request.url
             assert run.base_sha == pull_request.base_sha
             assert run.head_sha == pull_request.head_sha
             assert monitor.status == "ready_to_merge"
             assert monitor.state_version == expected_monitor_state_version
+            assert review.monitor_run_id == monitor.id
+            assert review.base_ref == run.base_branch
+            assert review.base_sha == run.base_sha
+            assert review.head_sha == run.head_sha
+        return pull_request
+
+    async def verify_merged(
+        self,
+        *,
+        run_id,
+        pull_request,
+        monitor_run_id,
+        expected_monitor_state_version,
+    ):
+        self.verify_calls += 1
+        async with self.db_factory() as db:
+            run = await db.get(DeliveryRun, run_id)
+            monitor = await db.get(PRMonitorRun, monitor_run_id)
+            review = await db.get(PRReview, monitor.current_review_id)
+            assert run.pr_number == pull_request.pr_number
+            assert run.pr_url == pull_request.url
+            assert run.base_sha == pull_request.base_sha
+            assert run.head_sha == pull_request.head_sha
+            assert monitor.status == "merged"
+            assert monitor.state_version == expected_monitor_state_version
+            assert review.status == "merged"
+            assert review.action_taken == "approved_merged"
+            assert review.base_ref == run.base_branch
+            assert review.base_sha == run.base_sha
+            assert review.head_sha == run.head_sha
         return pull_request
 
 
@@ -637,11 +668,44 @@ class RacingReadyPublisher(FakePublisher):
         return pull_request
 
 
+class RacingReviewBaseRefPublisher(FakePublisher):
+    """Retarget the same-SHA Review after verifier success, before final CAS."""
+
+    async def _retarget_review(self, monitor_run_id: int) -> None:
+        async with self.db_factory() as db:
+            monitor = await db.get(
+                PRMonitorRun,
+                monitor_run_id,
+                populate_existing=True,
+            )
+            review = await db.get(
+                PRReview,
+                monitor.current_review_id,
+                populate_existing=True,
+            )
+            assert review.base_ref == "main"
+            assert review.base_sha == monitor.current_base_sha
+            assert review.head_sha == monitor.current_head_sha
+            review.base_ref = "release/1.x"
+            await db.commit()
+
+    async def verify_ready_to_merge(self, **kwargs):
+        pull_request = await super().verify_ready_to_merge(**kwargs)
+        await self._retarget_review(kwargs["monitor_run_id"])
+        return pull_request
+
+    async def verify_merged(self, **kwargs):
+        pull_request = await super().verify_merged(**kwargs)
+        await self._retarget_review(kwargs["monitor_run_id"])
+        return pull_request
+
+
 async def _scope(
     db_session,
     *,
     max_cycles: int = 4,
     max_no_progress: int = 2,
+    auto_merge: bool = False,
 ):
     project = Project(
         name="delivery-controller-project",
@@ -658,7 +722,7 @@ async def _scope(
         project_id=project.id,
         webhook_secret="secret",
         enabled=True,
-        auto_merge=False,
+        auto_merge=auto_merge,
         auto_repair=True,
         review_mode="panel",
         wait_for_ci=True,
@@ -851,6 +915,51 @@ async def _to_monitoring(controller, db_factory, workspace, run_id):
         run = await db.get(DeliveryRun, run_id, populate_existing=True)
         assert (run.phase, run.activity) == ("monitoring", "waiting")
         return run.pr_monitor_run_id
+
+
+async def _set_monitor_terminal(
+    db_factory,
+    *,
+    run_id: int,
+    monitor_id: int,
+    auto_merge: bool,
+) -> int:
+    """Install the exact Review generation represented by a terminal Monitor."""
+
+    async with db_factory() as db:
+        run = await db.get(DeliveryRun, run_id, populate_existing=True)
+        monitor = await db.get(
+            PRMonitorRun,
+            monitor_id,
+            populate_existing=True,
+        )
+        review = PRReview(
+            repo_id=monitor.repo_id,
+            monitor_run_id=monitor.id,
+            pr_number=monitor.pr_number,
+            base_ref=run.base_branch,
+            base_sha=run.base_sha,
+            head_sha=run.head_sha,
+            delivery_id=f"delivery:{run.id}:{run.head_sha}",
+            pr_title=run.title,
+            pr_author="delivery-bot",
+            pr_url=run.pr_url,
+            status="merged" if auto_merge else "approved",
+            action_nonce="e" * 48,
+            action_taken="approved_merged" if auto_merge else "lgtm_comment",
+            publishing_actor="ccm-bot" if auto_merge else None,
+            publishing_started_at=datetime.utcnow() if auto_merge else None,
+            merge_method="fast-forward" if auto_merge else None,
+            completed_at=datetime.utcnow(),
+        )
+        db.add(review)
+        await db.flush()
+        monitor.current_review_id = review.id
+        monitor.status = "merged" if auto_merge else "ready_to_merge"
+        monitor.completed_at = datetime.utcnow() if auto_merge else None
+        monitor.state_version += 1
+        await db.commit()
+        return review.id
 
 
 @pytest.mark.asyncio
@@ -1423,11 +1532,12 @@ async def test_happy_path_stops_at_exact_ready_to_merge(
     )
 
     monitor_id = await _to_monitoring(controller, db_factory, workspace, run.id)
-    async with db_factory() as db:
-        monitor = await db.get(PRMonitorRun, monitor_id)
-        monitor.status = "ready_to_merge"
-        monitor.state_version += 1
-        await db.commit()
+    await _set_monitor_terminal(
+        db_factory,
+        run_id=run.id,
+        monitor_id=monitor_id,
+        auto_merge=False,
+    )
 
     assert await controller.reconcile_run(run.id)
 
@@ -1453,6 +1563,246 @@ async def test_happy_path_stops_at_exact_ready_to_merge(
     assert publisher.pr_calls == 1
     assert publisher.monitor_calls == 1
     assert publisher.verify_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_happy_path_requires_exact_merged_review(
+    db_session,
+    db_factory,
+):
+    run, repo = await _scope(db_session, auto_merge=True)
+    workspace = FakeWorkspace()
+    capabilities = FakeCapabilities(db_factory)
+    publisher = FakePublisher(db_factory)
+    dispatcher = FakeDispatcher()
+    controller = _controller(
+        db_factory,
+        workspace,
+        capabilities,
+        publisher,
+        dispatcher=dispatcher,
+    )
+
+    monitor_id = await _to_monitoring(controller, db_factory, workspace, run.id)
+    async with db_factory() as db:
+        stored_run = await db.get(DeliveryRun, run.id)
+        monitor = await db.get(PRMonitorRun, monitor_id)
+        review = PRReview(
+            repo_id=repo.id,
+            monitor_run_id=monitor.id,
+            pr_number=stored_run.pr_number,
+            base_ref="main",
+            base_sha=stored_run.base_sha,
+            head_sha=stored_run.head_sha,
+            delivery_id=(
+                f"delivery:{stored_run.id}:{stored_run.head_sha}"
+            ),
+            pr_title=stored_run.title,
+            pr_author="delivery-bot",
+            pr_url=stored_run.pr_url,
+            status="merged",
+            action_nonce="e" * 48,
+            action_taken="approved_merged",
+            publishing_actor="ccm-bot",
+            publishing_started_at=datetime.utcnow(),
+            merge_method="merge",
+            completed_at=datetime.utcnow(),
+        )
+        db.add(review)
+        await db.flush()
+        monitor.current_review_id = review.id
+        monitor.status = "merged"
+        monitor.completed_at = datetime.utcnow()
+        monitor.state_version += 1
+        await db.commit()
+
+    assert await controller.reconcile_run(run.id)
+
+    async with db_factory() as db:
+        completed = await db.get(DeliveryRun, run.id)
+        task = await db.get(Task, completed.developer_task_id)
+        assert (completed.phase, completed.activity, completed.outcome) == (
+            "done",
+            "terminal",
+            "success",
+        )
+        assert completed.policy_snapshot["auto_merge"] is True
+        assert completed.policy_snapshot["terminal"] == "merged"
+        assert task.status == "completed"
+    assert dispatcher.wake_count == 1
+    assert publisher.verify_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("auto_merge", [False, True])
+async def test_terminal_review_base_ref_drift_after_verifier_cannot_complete(
+    db_session,
+    db_factory,
+    auto_merge,
+):
+    """The final locked CAS must recheck the Review's frozen target branch."""
+
+    run, _repo = await _scope(db_session, auto_merge=auto_merge)
+    workspace = FakeWorkspace()
+    publisher = RacingReviewBaseRefPublisher(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        publisher,
+    )
+    monitor_id = await _to_monitoring(
+        controller,
+        db_factory,
+        workspace,
+        run.id,
+    )
+    review_id = await _set_monitor_terminal(
+        db_factory,
+        run_id=run.id,
+        monitor_id=monitor_id,
+        auto_merge=auto_merge,
+    )
+
+    assert await controller.reconcile_run(run.id)
+
+    async with db_factory() as db:
+        paused = await db.get(DeliveryRun, run.id, populate_existing=True)
+        review = await db.get(PRReview, review_id, populate_existing=True)
+        assert (review.base_ref, review.base_sha, review.head_sha) == (
+            "release/1.x",
+            paused.base_sha,
+            paused.head_sha,
+        )
+        assert (paused.phase, paused.activity, paused.outcome) == (
+            "monitoring",
+            "paused",
+            None,
+        )
+        assert f"{paused.policy_snapshot['terminal']} subject changed" in (
+            paused.pause_reason or ""
+        )
+    assert publisher.verify_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_blocked_repair_clean_then_exact_merged(
+    db_session,
+    db_factory,
+):
+    run, repo = await _scope(db_session, auto_merge=True)
+    run_id = run.id
+    repo_id = repo.id
+    workspace = FakeWorkspace()
+    capabilities = FakeCapabilities(
+        db_factory,
+        review_verdicts=["approved", "approved"],
+    )
+    publisher = FakePublisher(db_factory)
+    dispatcher = FakeDispatcher()
+    controller = _controller(
+        db_factory,
+        workspace,
+        capabilities,
+        publisher,
+        dispatcher=dispatcher,
+    )
+
+    monitor_id = await _to_monitoring(
+        controller,
+        db_factory,
+        workspace,
+        run_id,
+    )
+    async with db_factory() as db:
+        blocked = await db.get(DeliveryRun, run_id)
+        monitor = await db.get(PRMonitorRun, monitor_id)
+        assert (blocked.phase, blocked.activity, blocked.cycle_count) == (
+            "monitoring",
+            "waiting",
+            1,
+        )
+        assert monitor.status == "waiting_for_fix"
+
+    assert await controller.reconcile_run(run_id)
+    async with db_factory() as db:
+        repairing = await db.get(DeliveryRun, run_id)
+        repair_cycle = await db.get(DeliveryCycle, repairing.current_cycle_id)
+        assert (repairing.phase, repairing.activity, repairing.cycle_count) == (
+            "planning",
+            "ready",
+            2,
+        )
+        assert repair_cycle.trigger_kind == "pr_monitor_blocked"
+
+    await _to_publishing(
+        controller,
+        db_factory,
+        workspace,
+        run_id,
+        head=HEAD_TWO,
+        tree=TREE_TWO,
+    )
+    assert await controller.reconcile_run(run_id)
+
+    async with db_factory() as db:
+        repaired = await db.get(DeliveryRun, run_id)
+        monitor = await db.get(PRMonitorRun, monitor_id)
+        assert (repaired.phase, repaired.activity, repaired.head_sha) == (
+            "monitoring",
+            "waiting",
+            HEAD_TWO,
+        )
+        assert monitor.status == "reviewing"
+        assert monitor.current_head_sha == HEAD_TWO
+        review = PRReview(
+            repo_id=repo_id,
+            monitor_run_id=monitor.id,
+            pr_number=repaired.pr_number,
+            base_ref="main",
+            base_sha=repaired.base_sha,
+            head_sha=repaired.head_sha,
+            delivery_id=f"delivery:{run_id}:{HEAD_TWO}",
+            pr_title=repaired.title,
+            pr_author="delivery-bot",
+            pr_url=repaired.pr_url,
+            status="merged",
+            action_nonce="f" * 48,
+            action_taken="approved_merged",
+            publishing_actor="ccm-bot",
+            publishing_started_at=datetime.utcnow(),
+            merge_method="merge",
+            completed_at=datetime.utcnow(),
+        )
+        db.add(review)
+        await db.flush()
+        monitor.current_review_id = review.id
+        monitor.status = "merged"
+        monitor.completed_at = datetime.utcnow()
+        monitor.state_version += 1
+        await db.commit()
+
+    assert await controller.reconcile_run(run_id)
+    async with db_factory() as db:
+        completed = await db.get(DeliveryRun, run_id)
+        developer = await db.get(Task, completed.developer_task_id)
+        monitor = await db.get(PRMonitorRun, monitor_id)
+        review = await db.get(PRReview, monitor.current_review_id)
+        assert (completed.phase, completed.activity, completed.outcome) == (
+            "done",
+            "terminal",
+            "success",
+        )
+        assert completed.cycle_count == 2
+        assert completed.head_sha == HEAD_TWO
+        assert developer.status == "completed"
+        assert monitor.status == "merged"
+        assert review.status == "merged"
+        assert review.action_taken == "approved_merged"
+    assert publisher.pr_calls == 2
+    assert publisher.monitor_calls == 2
+    assert publisher.verify_calls == 1
+    assert dispatcher.wake_count == 2
 
 
 @pytest.mark.asyncio
@@ -2403,6 +2753,7 @@ async def test_current_review_error_terminalizes_delivery_instead_of_waiting(
             monitor_run_id=monitor.id,
             repo_id=monitor.repo_id,
             pr_number=monitor.pr_number,
+            base_ref="main",
             base_sha=monitor.current_base_sha,
             head_sha=monitor.current_head_sha,
             pr_title="failed delivery review",
@@ -2464,6 +2815,7 @@ async def test_review_error_monitor_version_race_cannot_fail_new_generation(
             monitor_run_id=monitor.id,
             repo_id=monitor.repo_id,
             pr_number=monitor.pr_number,
+            base_ref="main",
             base_sha=monitor.current_base_sha,
             head_sha=monitor.current_head_sha,
             pr_title="racing failed review",
@@ -2524,11 +2876,12 @@ async def test_ready_monitor_version_race_cannot_cross_terminal_cas(
         publisher,
     )
     monitor_id = await _to_monitoring(controller, db_factory, workspace, run.id)
-    async with db_factory() as db:
-        monitor = await db.get(PRMonitorRun, monitor_id)
-        monitor.status = "ready_to_merge"
-        monitor.state_version += 1
-        await db.commit()
+    await _set_monitor_terminal(
+        db_factory,
+        run_id=run.id,
+        monitor_id=monitor_id,
+        auto_merge=False,
+    )
 
     assert await controller.reconcile_run(run.id)
 

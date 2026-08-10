@@ -22,6 +22,26 @@ function renderRequiredChecks(repo: MonitoredRepo) {
   return (repo.required_checks || []).map((item) => `${item.kind},${item.name},${item.app_slug}`).join('\n');
 }
 
+function mergePolicyLabel(repo: MonitoredRepo): string {
+  if (repo.auto_merge) return 'AUTO';
+  if (repo.merge_queue_mode === 'auto') return 'QUEUE AUTO';
+  if (repo.merge_queue_mode === 'shadow') return 'SHADOW';
+  return 'MANUAL';
+}
+
+function mergePolicyHelp(autoMerge: boolean, mergeQueueMode: 'manual' | 'shadow' | 'auto'): string {
+  if (autoMerge) {
+    return 'Direct auto-merge is ON: CCM confirms the exact-head merge, then comments that the PR was merged.';
+  }
+  if (mergeQueueMode === 'auto') {
+    return 'Direct auto-merge is OFF. Merge Queue AUTO is a separate automatic policy and may still merge after its merge-group gate.';
+  }
+  if (mergeQueueMode === 'shadow') {
+    return 'Direct auto-merge is OFF. Merge Queue SHADOW only observes; CCM leaves the PR open and comments that it is ready to merge.';
+  }
+  return 'Direct auto-merge is OFF: CCM leaves the PR open and comments that it is ready to merge.';
+}
+
 function useProviderModels(): {
   providers: string[];
   defaultProvider: string;
@@ -184,7 +204,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
       }
       const created = await api.createMonitoredRepo({
         repo_full_name: repoName.trim(),
-        auto_merge: reviewMode === 'single' && autoMerge,
+        auto_merge: autoMerge,
         auto_repair: reviewMode === 'panel' && autoRepair,
         max_repair_attempts: 3,
         merge_queue_mode: reviewMode === 'panel' && waitForCi ? mergeQueueMode : 'manual',
@@ -264,11 +284,14 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             />
           </div>
           <div className="flex items-center gap-2">
-            <input type="checkbox" id="autoMerge" checked={reviewMode === 'single' && autoMerge}
-              disabled={reviewMode !== 'single'} onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
+            <input type="checkbox" id="autoMerge" checked={autoMerge}
+              onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
               className="rounded bg-gray-700 border-gray-600" />
-            <label htmlFor="autoMerge" className="text-sm text-gray-300">Legacy auto-merge (single reviewer only)</label>
+            <label htmlFor="autoMerge" className="text-sm text-gray-300">Direct auto-merge after review and exact-head gates pass</label>
           </div>
+          <p className="text-xs text-gray-500">
+            {mergePolicyHelp(autoMerge, mergeQueueMode)}
+          </p>
           <div>
             <label className="block text-xs text-gray-400 mb-1">Merge Queue</label>
             <select value={mergeQueueMode} onChange={(e) => { const value = e.target.value as 'manual' | 'shadow' | 'auto'; setMergeQueueMode(value); if (value !== 'manual') setAutoMerge(false); }}
@@ -297,11 +320,10 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
               value={reviewMode} onChange={(e) => {
                 const value = e.target.value as 'single' | 'panel';
                 setReviewMode(value);
-                if (value === 'panel') setAutoMerge(false);
-                else { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
               }}>
               <option value="panel">Independent Principal / Senior / QA panel</option>
-              <option value="single">Legacy single reviewer</option>
+              <option value="single">Single reviewer</option>
             </select>
           </div>
           <div className="flex items-center gap-2">
@@ -385,7 +407,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [detail, setDetail] = useState<MonitoredRepo>(repo);
   const [reviews, setReviews] = useState<PRReview[]>([]);
   const [page, setPage] = useState(1);
-  const [autoMerge, setAutoMerge] = useState(initialReviewMode === 'single' && repo.auto_merge);
+  const [autoMerge, setAutoMerge] = useState(Boolean(repo.auto_merge));
   const [autoRepair, setAutoRepair] = useState(initialReviewMode === 'panel' && Boolean(repo.auto_repair));
   const [maxRepairAttempts, setMaxRepairAttempts] = useState(repo.max_repair_attempts || 3);
   const [mergeQueueMode, setMergeQueueMode] = useState<'manual' | 'shadow' | 'auto'>(
@@ -445,7 +467,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
         throw new Error('启用 CI Gate 时至少配置一个 required check');
       }
       const updated = await api.updateMonitoredRepo(repo.id, {
-        auto_merge: reviewMode === 'single' && autoMerge,
+        auto_merge: autoMerge,
         auto_repair: reviewMode === 'panel' && autoRepair,
         max_repair_attempts: maxRepairAttempts,
         merge_queue_mode: reviewMode === 'panel' && waitForCi ? mergeQueueMode : 'manual',
@@ -560,11 +582,14 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div className="flex items-center gap-2">
-            <input type="checkbox" id="detailAutoMerge" checked={reviewMode === 'single' && autoMerge}
-              disabled={reviewMode !== 'single'} onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
+            <input type="checkbox" id="detailAutoMerge" checked={autoMerge}
+              onChange={(e) => { setAutoMerge(e.target.checked); if (e.target.checked) setMergeQueueMode('manual'); }}
               className="rounded bg-gray-700 border-gray-600" />
-            <label htmlFor="detailAutoMerge" className="text-sm text-gray-300">Legacy auto-merge (single reviewer only)</label>
+            <label htmlFor="detailAutoMerge" className="text-sm text-gray-300">Direct auto-merge after review and exact-head gates pass</label>
           </div>
+          <p className="text-xs text-gray-500 md:col-span-2">
+            {mergePolicyHelp(autoMerge, mergeQueueMode)}
+          </p>
           <div className="flex items-center gap-2">
             <input type="checkbox" id="detailAutoRepair" checked={autoRepair}
               disabled={reviewMode !== 'panel'} onChange={(e) => setAutoRepair(e.target.checked)} />
@@ -632,11 +657,10 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
               value={reviewMode} onChange={(e) => {
                 const value = e.target.value as 'single' | 'panel';
                 setReviewMode(value);
-                if (value === 'panel') setAutoMerge(false);
-                else { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+                if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
               }}>
               <option value="panel">Independent Principal / Senior / QA panel</option>
-              <option value="single">Legacy single reviewer</option>
+              <option value="single">Single reviewer</option>
             </select>
           </div>
           <div className="flex items-center gap-2">
@@ -984,7 +1008,7 @@ export function PRMonitorPage() {
               <tr className="text-gray-400 text-left border-b border-gray-700">
                 <th className="px-4 py-3">Repository</th>
                 <th className="px-4 py-3">Status</th>
-                <th className="px-4 py-3">Auto Merge</th>
+                <th className="px-4 py-3">Merge Policy</th>
                 <th className="px-4 py-3">Enabled</th>
                 <th className="px-4 py-3">Created</th>
                 <th className="px-4 py-3"></th>
@@ -1000,11 +1024,13 @@ export function PRMonitorPage() {
                     {repo.status}
                   </td>
                   <td className="px-4 py-3">
-                    {repo.auto_merge ? (
-                      <span className="px-2 py-0.5 bg-green-500/20 text-green-400 rounded text-xs">ON</span>
-                    ) : (
-                      <span className="px-2 py-0.5 bg-gray-600/50 text-gray-400 rounded text-xs">OFF</span>
-                    )}
+                    <span className={`px-2 py-0.5 rounded text-xs ${
+                      repo.auto_merge || repo.merge_queue_mode === 'auto'
+                        ? 'bg-green-500/20 text-green-400'
+                        : 'bg-gray-600/50 text-gray-400'
+                    }`}>
+                      {mergePolicyLabel(repo)}
+                    </span>
                   </td>
                   <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
                     <button onClick={() => handleToggle(repo)} className="text-gray-400 hover:text-foreground">

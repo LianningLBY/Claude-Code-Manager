@@ -766,6 +766,7 @@ export interface Task {
   delivery_phase?: string | null;
   delivery_activity?: string | null;
   delivery_outcome?: string | null;
+  delivery_terminal?: 'ready_to_merge' | 'merged' | null;
   todo_file_path: string | null;
   loop_progress: string | null;
   max_iterations: number;
@@ -1395,6 +1396,7 @@ export interface DeliveryRun {
   phase: DeliveryPhase;
   activity: DeliveryActivity;
   outcome: 'success' | 'failed' | 'cancelled' | 'superseded' | null;
+  terminal: 'ready_to_merge' | 'merged' | null;
   wait_reason: string | null;
   pause_reason: string | null;
   error_code: string | null;
@@ -1441,6 +1443,7 @@ export interface PRReview {
   monitor_run_id: number | null;
   repo_id: number;
   pr_number: number;
+  base_ref: string | null;
   base_sha: string | null;
   head_sha: string | null;
   delivery_id: string | null;
@@ -1451,6 +1454,7 @@ export interface PRReview {
   status: string;
   review_summary: string | null;
   action_taken: string | null;
+  merge_method: 'merge' | 'squash' | 'fast-forward' | null;
   ci_status: string | null;
   ci_summary: string | null;
   ci_details: {

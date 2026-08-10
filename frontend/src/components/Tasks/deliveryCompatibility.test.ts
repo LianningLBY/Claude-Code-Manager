@@ -57,12 +57,16 @@ describe('isDeliveryCompatible', () => {
     expect(isDeliveryCompatible(project, repo)).toBe(true);
   });
 
+  it('accepts a repository whose PR Monitor owns automatic merge', () => {
+    expect(isDeliveryCompatible(project, { ...repo, auto_merge: true })).toBe(true);
+  });
+
   it.each([
     ['remote project', { ...project, worker_id: 9 }, repo],
     ['project without remote', { ...project, has_remote: false }, repo],
     ['remote monitor', project, { ...repo, worker_id: 9 }],
     ['base mismatch', project, { ...repo, default_branch: 'develop' }],
-    ['automatic merge', project, { ...repo, auto_merge: true }],
+    ['automatic Merge Queue', project, { ...repo, merge_queue_mode: 'auto' }],
     ['missing checks', project, { ...repo, required_checks: [] }],
   ])('rejects %s before admission', (_label, candidateProject, candidateRepo) => {
     expect(isDeliveryCompatible(

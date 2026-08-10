@@ -14,12 +14,15 @@ from unittest.mock import MagicMock, patch
 
 from alembic import command
 from alembic.config import Config
+from alembic.migration import MigrationContext
+from alembic.operations import Operations
 from alembic.script import ScriptDirectory
 import pytest
 from sqlalchemy import (
     BigInteger,
     CheckConstraint,
     ForeignKeyConstraint,
+    Integer,
     UniqueConstraint,
     create_engine,
     inspect,
@@ -81,6 +84,8 @@ TASK_SSH_EFFECT_REVISION = "c2f8a6d4e1b9"
 DISCUSSION_LEASE_REVISION = "d1a9c4e7b260"
 COMBINED_BROWSER_MAIN_REVISION = "4e8a1c6d9b20"
 BROWSER_OPERATION_RECEIPT_REVISION = "6f3b9d2a7c10"
+PR_REVIEW_MERGE_METHOD_REVISION = "1a7c9e4d2b60"
+PR_REVIEW_BASE_REF_REVISION = "2b8d4f6a1c90"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -91,7 +96,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = BROWSER_OPERATION_RECEIPT_REVISION
+CURRENT_HEAD_REVISION = PR_REVIEW_BASE_REF_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -241,6 +246,24 @@ def _load_browser_operation_receipt_migration(
 ):
     return _load_revision_migration(
         "6f3b9d2a7c10_add_browser_operation_receipts.py",
+        module_suffix,
+    )
+
+
+def _load_pr_review_merge_method_migration(
+    module_suffix: str = "test",
+):
+    return _load_revision_migration(
+        "1a7c9e4d2b60_freeze_pr_review_merge_method.py",
+        module_suffix,
+    )
+
+
+def _load_pr_review_base_ref_migration(
+    module_suffix: str = "test",
+):
+    return _load_revision_migration(
+        "2b8d4f6a1c90_freeze_pr_review_base_ref.py",
         module_suffix,
     )
 
@@ -489,9 +512,11 @@ class TestLegacyMigration:
         assert "tags" in project_cols
 
         pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_ref" in pr_review_cols
         assert "base_sha" in pr_review_cols
         assert "head_sha" in pr_review_cols
         assert "delivery_id" in pr_review_cols
+        assert "merge_method" in pr_review_cols
 
         # Verify existing data survived
         with engine.connect() as conn:
@@ -4937,9 +4962,16 @@ class TestFreshMigration:
         assert (
             "repo_id",
             "pr_number",
+            "base_ref",
             "base_sha",
             "head_sha",
         ) in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) not in unique_column_sets
         assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         assert ("repo_id", "delivery_id") in unique_column_sets
 
@@ -5884,12 +5916,13 @@ class TestAlreadyMigratedDb:
         engine = create_engine(f"sqlite:///{db_path}")
         with engine.connect() as conn:
             row = conn.execute(text(
-                "SELECT base_sha, head_sha, delivery_id, action_nonce, "
+                "SELECT base_ref, base_sha, head_sha, delivery_id, action_nonce, "
                 "pending_action, pending_review_body, publishing_actor, "
                 "publishing_retry_count, publishing_task_started_at, "
                 "publishing_started_at FROM pr_reviews"
             )).one()
             assert row == (
+                "main",
                 None,
                 "a" * 40,
                 "delivery-1",
@@ -5909,16 +5942,27 @@ class TestAlreadyMigratedDb:
             assert (
                 "repo_id",
                 "pr_number",
+                "base_ref",
                 "base_sha",
                 "head_sha",
             ) in unique_column_sets
+            assert (
+                "repo_id",
+                "pr_number",
+                "base_sha",
+                "head_sha",
+            ) not in unique_column_sets
             assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         engine.dispose()
 
     def test_base_sha_migration_downgrade_restores_head_constraint(self, tmp_path):
         db_path = str(tmp_path / "base_sha_roundtrip.db")
         cfg = _alembic_cfg(db_path)
-        _run_alembic(cfg, command.upgrade, "head")
+        # Stop immediately before the base_ref migration.  This test exercises
+        # the older base_sha downgrade and intentionally needs legacy Review
+        # rows; the newer migration refuses to discard frozen non-empty
+        # base_ref subjects on downgrade.
+        _run_alembic(cfg, command.upgrade, "1a7c9e4d2b60")
 
         engine = create_engine(f"sqlite:///{db_path}")
         with engine.begin() as conn:
@@ -5982,6 +6026,7 @@ class TestAlreadyMigratedDb:
 
         engine = create_engine(f"sqlite:///{db_path}")
         pr_review_cols = _get_table_columns(engine, "pr_reviews")
+        assert "base_ref" in pr_review_cols
         assert "base_sha" in pr_review_cols
         assert "publishing_actor" in pr_review_cols
         log_cols = _get_table_columns(engine, "log_entries")
@@ -5993,9 +6038,16 @@ class TestAlreadyMigratedDb:
         assert (
             "repo_id",
             "pr_number",
+            "base_ref",
             "base_sha",
             "head_sha",
         ) in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_sha",
+            "head_sha",
+        ) not in unique_column_sets
         assert ("repo_id", "pr_number", "head_sha") not in unique_column_sets
         engine.dispose()
 
@@ -7380,6 +7432,14 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == PR_REVIEW_MERGE_METHOD_REVISION
+        )
+        assert (
+            script.get_revision(PR_REVIEW_MERGE_METHOD_REVISION).down_revision
+            == BROWSER_OPERATION_RECEIPT_REVISION
+        )
+        assert (
+            script.get_revision(BROWSER_OPERATION_RECEIPT_REVISION).down_revision
             == COMBINED_BROWSER_MAIN_REVISION
         )
         assert set(
@@ -8050,6 +8110,1110 @@ class TestPublishedMigrationHistory:
             snapshot_schema_present=True,
         )
         engine.dispose()
+
+
+    def test_pr_review_merge_method_backfills_only_legacy_merge_outbox(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-review-merge-method-backfill.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    931, 'owner/legacy-merge-outbox', 'secret',
+                    '[]', '2026-08-10 00:00:00',
+                    '2026-08-10 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO pr_reviews (
+                    id, repo_id, pr_number, pr_title, pr_author, pr_url,
+                    status, pending_action, created_at
+                ) VALUES
+                    (932, 931, 1, 'legacy merge', 'ccm-bot',
+                     'https://github.com/owner/legacy-merge-outbox/pull/1',
+                     'publishing', 'approved_merged',
+                     '2026-08-10 00:00:00'),
+                    (933, 931, 2, 'ready only', 'ccm-bot',
+                     'https://github.com/owner/legacy-merge-outbox/pull/2',
+                     'publishing', 'lgtm_comment',
+                     '2026-08-10 00:00:00'),
+                    (934, 931, 3, 'blocking review', 'ccm-bot',
+                     'https://github.com/owner/legacy-merge-outbox/pull/3',
+                     'publishing', 'review_comments',
+                     '2026-08-10 00:00:00'),
+                    (935, 931, 4, 'already terminal', 'ccm-bot',
+                     'https://github.com/owner/legacy-merge-outbox/pull/4',
+                     'merged', 'approved_merged',
+                     '2026-08-10 00:00:00'),
+                    (936, 931, 5, 'not yet armed', 'ccm-bot',
+                     'https://github.com/owner/legacy-merge-outbox/pull/5',
+                     'reviewing', 'approved_merged',
+                     '2026-08-10 00:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            methods = dict(conn.execute(text("""
+                SELECT id, merge_method
+                FROM pr_reviews
+                WHERE id BETWEEN 932 AND 936
+                ORDER BY id
+            """)).all())
+        assert methods == {
+            932: "merge",
+            933: None,
+            934: None,
+            935: None,
+            936: None,
+        }
+        engine.dispose()
+
+
+    def test_pr_review_merge_method_migration_roundtrip(self, tmp_path):
+        db_path = str(tmp_path / "pr-review-merge-method-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "merge_method" not in _get_table_columns(engine, "pr_reviews")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "merge_method" in _get_table_columns(engine, "pr_reviews")
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "merge_method" not in _get_table_columns(engine, "pr_reviews")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == BROWSER_OPERATION_RECEIPT_REVISION
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "merge_method" in _get_table_columns(engine, "pr_reviews")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_MERGE_METHOD_REVISION
+        engine.dispose()
+
+    def test_pr_review_merge_method_downgrade_refuses_durable_evidence(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-review-merge-method-refusal.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    941, 'owner/merge-evidence', 'secret',
+                    '[]', '2026-08-10 00:00:00',
+                    '2026-08-10 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO pr_reviews (
+                    id, repo_id, pr_number, pr_title, pr_author, pr_url,
+                    status, merge_method, created_at
+                ) VALUES (
+                    942, 941, 7, 'merged evidence', 'ccm-bot',
+                    'https://github.com/owner/merge-evidence/pull/7',
+                    'merged', 'squash', '2026-08-10 00:00:00'
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="durable merge evidence exists"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                BROWSER_OPERATION_RECEIPT_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "merge_method" in _get_table_columns(engine, "pr_reviews")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT merge_method FROM pr_reviews WHERE id = 942"
+            )).scalar_one() == "squash"
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_MERGE_METHOD_REVISION
+        engine.dispose()
+
+    def test_pr_review_merge_method_upgrade_replays_partial_add_column(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-review-merge-method-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+
+        # Simulate non-transactional DDL committing before Alembic writes the
+        # new revision stamp, followed by a process crash.
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE pr_reviews ADD COLUMN "
+                "merge_method VARCHAR(16) NULL"
+            ))
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    951, 'owner/partial-add', 'secret',
+                    '[]', '2026-08-10 00:00:00',
+                    '2026-08-10 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO pr_reviews (
+                    id, repo_id, pr_number, pr_title, pr_author, pr_url,
+                    status, pending_action, created_at
+                ) VALUES (
+                    952, 951, 8, 'partial add', 'ccm-bot',
+                    'https://github.com/owner/partial-add/pull/8',
+                    'publishing', 'approved_merged',
+                    '2026-08-10 00:00:00'
+                )
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT merge_method FROM pr_reviews WHERE id = 952"
+            )).scalar_one() == "merge"
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_MERGE_METHOD_REVISION
+        engine.dispose()
+
+    def test_pr_review_merge_method_upgrade_rejects_partial_wrong_shape(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-review-merge-method-wrong-shape.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE pr_reviews ADD COLUMN "
+                "merge_method VARCHAR(15) NULL"
+            ))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="nullable VARCHAR\\(16\\)"):
+            _run_alembic(
+                cfg,
+                command.upgrade,
+                PR_REVIEW_MERGE_METHOD_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == BROWSER_OPERATION_RECEIPT_REVISION
+        assert _get_table_columns(engine, "pr_reviews")["merge_method"] == (
+            "VARCHAR(15)"
+        )
+        engine.dispose()
+
+    def test_pr_review_merge_method_mysql_add_crash_replays_once(self):
+        module = _load_pr_review_merge_method_migration("mysql_add_replay")
+        column_state = {"value": None}
+        exact_column = {
+            "name": "merge_method",
+            "type": mysql.VARCHAR(length=16),
+            "nullable": True,
+        }
+
+        def add_column():
+            column_state["value"] = exact_column
+
+        class SimulatedCrash(RuntimeError):
+            pass
+
+        with (
+            patch.object(module, "_dialect_name", return_value="mysql"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(
+                module,
+                "_reflected_merge_method_column",
+                side_effect=lambda: column_state["value"],
+            ),
+            patch.object(
+                module,
+                "_add_merge_method_column",
+                side_effect=add_column,
+            ) as add,
+            patch.object(module, "_assert_existing_merge_values"),
+            patch.object(
+                module,
+                "_backfill_legacy_merge_outboxes",
+                side_effect=(SimulatedCrash("after DDL"), None),
+            ) as backfill,
+        ):
+            with pytest.raises(SimulatedCrash, match="after DDL"):
+                module.upgrade()
+            module.upgrade()
+
+        assert add.call_count == 1
+        assert backfill.call_count == 2
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            {
+                "name": "merge_method",
+                "type": postgresql.VARCHAR(length=15),
+                "nullable": True,
+            },
+            {
+                "name": "merge_method",
+                "type": mysql.VARCHAR(length=16),
+                "nullable": False,
+            },
+            {
+                "name": "merge_method",
+                "type": Integer(),
+                "nullable": True,
+            },
+            {
+                "name": "merge_method",
+                "type": postgresql.CHAR(length=16),
+                "nullable": True,
+            },
+            {
+                "name": "merge_method",
+                "type": postgresql.VARCHAR(length=16),
+                "nullable": True,
+                "default": "'merge'::character varying",
+            },
+        ],
+    )
+    def test_pr_review_merge_method_replay_rejects_wrong_column_shape(
+        self,
+        column,
+    ):
+        module = _load_pr_review_merge_method_migration("wrong_shape")
+        with pytest.raises(RuntimeError, match="nullable VARCHAR\\(16\\)"):
+            module._assert_merge_method_column_shape(column)
+
+    @pytest.mark.parametrize("dialect", ["sqlite", "mysql", "mariadb"])
+    def test_pr_review_merge_method_offline_nontransactional_upgrade_refused(
+        self,
+        dialect,
+    ):
+        module = _load_pr_review_merge_method_migration(
+            f"offline_{dialect}"
+        )
+        with (
+            patch.object(module, "_dialect_name", return_value=dialect),
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module, "_add_merge_method_column") as add,
+            pytest.raises(RuntimeError, match="Offline PR merge-method"),
+        ):
+            module._ensure_merge_method_column()
+        add.assert_not_called()
+
+    def test_pr_review_merge_method_postgresql_downgrade_fences_first(self):
+        module = _load_pr_review_merge_method_migration("postgresql_fence")
+        events = []
+        column = {
+            "name": "merge_method",
+            "type": postgresql.VARCHAR(length=16),
+            "nullable": True,
+        }
+
+        def record_lock(statement):
+            events.append(("lock", str(statement)))
+
+        def reflect_column():
+            events.append(("reflect", None))
+            return column
+
+        def count_evidence():
+            events.append(("count", None))
+            return 0
+
+        def drop_column():
+            events.append(("drop", None))
+
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(
+                module,
+                "_dialect_name",
+                return_value="postgresql",
+            ),
+            patch.object(module.op, "execute", side_effect=record_lock),
+            patch.object(
+                module,
+                "_reflected_merge_method_column",
+                side_effect=reflect_column,
+            ),
+            patch.object(
+                module,
+                "_count_frozen_merge_evidence",
+                side_effect=count_evidence,
+            ),
+            patch.object(
+                module,
+                "_drop_merge_method_column",
+                side_effect=drop_column,
+            ),
+        ):
+            module.downgrade()
+
+        assert [name for name, _ in events] == [
+            "lock",
+            "reflect",
+            "count",
+            "drop",
+        ]
+        assert events[0][1] == (
+            "LOCK TABLE pr_reviews IN ACCESS EXCLUSIVE MODE"
+        )
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_pr_review_merge_method_mysql_downgrade_fails_closed(
+        self,
+        dialect,
+    ):
+        module = _load_pr_review_merge_method_migration(
+            f"{dialect}_downgrade"
+        )
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_dialect_name", return_value=dialect),
+            patch.object(
+                module,
+                "_reflected_merge_method_column",
+            ) as reflect,
+            pytest.raises(RuntimeError, match="refused for MySQL/MariaDB"),
+        ):
+            module.downgrade()
+        reflect.assert_not_called()
+
+    def test_pr_review_merge_method_sqlite_downgrade_replays_partial_drop(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-review-merge-method-drop-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+
+        # Simulate batch DDL completing before Alembic can stamp the parent.
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE pr_reviews DROP COLUMN merge_method"
+            ))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            BROWSER_OPERATION_RECEIPT_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "merge_method" not in _get_table_columns(
+            engine,
+            "pr_reviews",
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == BROWSER_OPERATION_RECEIPT_REVISION
+        engine.dispose()
+
+
+    def test_pr_review_base_ref_backfills_frozen_monitor_branch(self, tmp_path):
+        db_path = str(tmp_path / "pr-review-base-ref-backfill.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, default_branch,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    961, 'owner/base-ref-backfill', 'secret', 'release/2026',
+                    '[]', '2026-08-10 00:00:00', '2026-08-10 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO pr_reviews (
+                    id, repo_id, pr_number, pr_title, pr_author, pr_url,
+                    status, created_at
+                ) VALUES
+                    (962, 961, 1, 'open review', 'alice',
+                     'https://github.com/owner/base-ref-backfill/pull/1',
+                     'reviewing', '2026-08-10 00:00:00'),
+                    (963, 961, 2, 'terminal review', 'alice',
+                     'https://github.com/owner/base-ref-backfill/pull/2',
+                     'approved', '2026-08-10 00:00:00')
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        base_ref_column = inspect(engine).get_columns("pr_reviews")
+        base_ref_column = next(
+            item for item in base_ref_column if item["name"] == "base_ref"
+        )
+        assert base_ref_column["nullable"] is False
+        subject_constraints = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspect(engine).get_unique_constraints("pr_reviews")
+        }
+        assert "uq_pr_reviews_repo_pr_base_head" not in subject_constraints
+        assert subject_constraints[
+            "uq_pr_reviews_repo_pr_base_ref_base_head"
+        ] == (
+            "repo_id", "pr_number", "base_ref", "base_sha", "head_sha",
+        )
+        queue_constraints = {
+            item["name"]: tuple(item["column_names"])
+            for item in inspect(engine).get_unique_constraints(
+                "pr_merge_queue_actions"
+            )
+        }
+        assert "uq_pr_merge_queue_actions_run_head" not in queue_constraints
+        assert queue_constraints[
+            "uq_pr_merge_queue_actions_run_review"
+        ] == ("monitor_run_id", "review_id")
+        with engine.connect() as conn:
+            assert dict(conn.execute(text(
+                "SELECT id, base_ref FROM pr_reviews ORDER BY id"
+            )).all()) == {962: "release/2026", 963: "release/2026"}
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_BASE_REF_REVISION
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="review subjects still exist"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                PR_REVIEW_MERGE_METHOD_REVISION,
+            )
+
+
+    def test_pr_review_base_ref_migration_empty_roundtrip(self, tmp_path):
+        db_path = str(tmp_path / "pr-review-base-ref-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "base_ref" in _get_table_columns(engine, "pr_reviews")
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            PR_REVIEW_MERGE_METHOD_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "base_ref" not in _get_table_columns(engine, "pr_reviews")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "base_ref" in _get_table_columns(engine, "pr_reviews")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_BASE_REF_REVISION
+        engine.dispose()
+
+
+    def test_pr_review_base_ref_is_part_of_unique_subject(self, tmp_path):
+        db_path = str(tmp_path / "pr-review-base-ref-unique.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, default_branch,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    964, 'owner/base-ref-unique', 'secret', 'main', '[]',
+                    '2026-08-10 00:00:00', '2026-08-10 00:00:00'
+                )
+            """))
+            for review_id, base_ref in ((965, "main"), (966, "release")):
+                conn.execute(text("""
+                    INSERT INTO pr_reviews (
+                        id, repo_id, pr_number, base_ref, base_sha, head_sha,
+                        pr_title, pr_author, pr_url, status, created_at
+                    ) VALUES (
+                        :id, 964, 7, :base_ref, :base_sha, :head_sha,
+                        'same commits', 'alice',
+                        'https://github.com/owner/base-ref-unique/pull/7',
+                        'approved', '2026-08-10 00:00:00'
+                    )
+                """), {
+                    "id": review_id,
+                    "base_ref": base_ref,
+                    "base_sha": "a" * 40,
+                    "head_sha": "b" * 40,
+                })
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text("""
+                    INSERT INTO pr_reviews (
+                        id, repo_id, pr_number, base_ref, base_sha, head_sha,
+                        pr_title, pr_author, pr_url, status, created_at
+                    ) VALUES (
+                        967, 964, 7, 'main', :base_sha, :head_sha,
+                        'duplicate subject', 'alice',
+                        'https://github.com/owner/base-ref-unique/pull/7',
+                        'approved', '2026-08-10 00:00:00'
+                    )
+                """), {"base_sha": "a" * 40, "head_sha": "b" * 40})
+        engine.dispose()
+
+
+    def test_pr_review_base_ref_upgrade_replays_partial_add_column(self, tmp_path):
+        db_path = str(tmp_path / "pr-review-base-ref-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE pr_reviews ADD COLUMN base_ref VARCHAR(200) NULL"
+            ))
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, default_branch,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    971, 'owner/base-ref-replay', 'secret', 'stable', '[]',
+                    '2026-08-10 00:00:00', '2026-08-10 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO pr_reviews (
+                    id, repo_id, pr_number, pr_title, pr_author, pr_url,
+                    status, created_at
+                ) VALUES (
+                    972, 971, 1, 'partial add', 'alice',
+                    'https://github.com/owner/base-ref-replay/pull/1',
+                    'reviewing', '2026-08-10 00:00:00'
+                )
+            """))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT base_ref FROM pr_reviews WHERE id = 972"
+            )).scalar_one() == "stable"
+        engine.dispose()
+
+
+    def test_pr_review_base_ref_upgrade_rejects_invalid_backfill(self, tmp_path):
+        db_path = str(tmp_path / "pr-review-base-ref-invalid.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_MERGE_METHOD_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, default_branch,
+                    required_checks, created_at, updated_at
+                ) VALUES (
+                    981, 'owner/base-ref-invalid', 'secret', '', '[]',
+                    '2026-08-10 00:00:00', '2026-08-10 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO pr_reviews (
+                    id, repo_id, pr_number, pr_title, pr_author, pr_url,
+                    status, created_at
+                ) VALUES (
+                    982, 981, 1, 'invalid base', 'alice',
+                    'https://github.com/owner/base-ref-invalid/pull/1',
+                    'reviewing', '2026-08-10 00:00:00'
+                )
+            """))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="valid target branch"):
+            _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "base_ref" in _get_table_columns(engine, "pr_reviews")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_MERGE_METHOD_REVISION
+        engine.dispose()
+
+
+    def test_pr_review_base_ref_mysql_add_crash_replays_once(self):
+        module = _load_pr_review_base_ref_migration("mysql_add_replay")
+        column_state = {"value": None}
+        exact_column = {
+            "name": "base_ref",
+            "type": mysql.VARCHAR(length=200),
+            "nullable": True,
+        }
+
+        def add_column():
+            column_state["value"] = exact_column
+
+        class SimulatedCrash(RuntimeError):
+            pass
+
+        with (
+            patch.object(module, "_dialect_name", return_value="mysql"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(
+                module,
+                "_reflected_base_ref_column",
+                side_effect=lambda: column_state["value"],
+            ),
+            patch.object(
+                module,
+                "_add_base_ref_column",
+                side_effect=add_column,
+            ) as add,
+            patch.object(
+                module,
+                "_backfill_existing_reviews",
+                side_effect=(SimulatedCrash("after DDL"), None),
+            ) as backfill,
+            patch.object(module, "_assert_backfilled_values"),
+            patch.object(module, "_make_base_ref_non_nullable"),
+            patch.object(module, "_ensure_frozen_subject_constraint"),
+            patch.object(module, "_ensure_frozen_queue_constraint"),
+        ):
+            with pytest.raises(SimulatedCrash, match="after DDL"):
+                module.upgrade()
+            module.upgrade()
+
+        assert add.call_count == 1
+        assert backfill.call_count == 2
+
+
+    @pytest.mark.parametrize(
+        ("constraint_kind", "crash_phase"),
+        [
+            ("subject", "create"),
+            ("subject", "drop"),
+            ("queue", "create"),
+            ("queue", "drop"),
+        ],
+    )
+    def test_pr_review_base_ref_constraint_crash_replays_once(
+        self,
+        constraint_kind,
+        crash_phase,
+    ):
+        module = _load_pr_review_base_ref_migration(
+            f"{constraint_kind}_{crash_phase}_replay"
+        )
+        state = {"old": True, "new": False}
+        crashed = {"value": False}
+
+        class SimulatedCrash(RuntimeError):
+            pass
+
+        def reflect():
+            return state["old"], state["new"]
+
+        def mutate(phase, *, old, new):
+            state.update(old=old, new=new)
+            if phase == crash_phase and not crashed["value"]:
+                crashed["value"] = True
+                raise SimulatedCrash(f"after {phase} DDL")
+
+        if constraint_kind == "subject":
+            ensure_name = "_ensure_frozen_subject_constraint"
+            reflect_name = "_reflected_subject_constraints"
+            create_name = "_create_subject_constraint"
+            drop_name = "_drop_subject_constraint"
+        else:
+            ensure_name = "_ensure_frozen_queue_constraint"
+            reflect_name = "_reflected_queue_constraints"
+            create_name = "_create_queue_constraint"
+            drop_name = "_drop_queue_constraint"
+
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, reflect_name, side_effect=reflect),
+            patch.object(
+                module,
+                create_name,
+                side_effect=lambda *_: mutate("create", old=True, new=True),
+            ) as create,
+            patch.object(
+                module,
+                drop_name,
+                side_effect=lambda *_: mutate("drop", old=False, new=True),
+            ) as drop,
+        ):
+            with pytest.raises(SimulatedCrash, match=f"after {crash_phase}"):
+                getattr(module, ensure_name)()
+            getattr(module, ensure_name)()
+
+        assert state == {"old": False, "new": True}
+        assert create.call_count == 1
+        assert drop.call_count == 1
+
+
+    @pytest.mark.parametrize(
+        "column",
+        [
+            {
+                "name": "base_ref",
+                "type": postgresql.VARCHAR(length=199),
+                "nullable": True,
+            },
+            {
+                "name": "base_ref",
+                "type": Integer(),
+                "nullable": True,
+            },
+            {
+                "name": "base_ref",
+                "type": postgresql.VARCHAR(length=200),
+                "nullable": "yes",
+            },
+            {
+                "name": "base_ref",
+                "type": postgresql.VARCHAR(length=200),
+                "nullable": True,
+                "default": "'main'::character varying",
+            },
+        ],
+    )
+    def test_pr_review_base_ref_replay_rejects_wrong_column_shape(
+        self,
+        column,
+    ):
+        module = _load_pr_review_base_ref_migration("wrong_shape")
+        with pytest.raises(RuntimeError, match="VARCHAR\\(200\\)"):
+            module._assert_base_ref_column_shape(column)
+
+
+    @pytest.mark.parametrize("dialect", ["sqlite", "mysql", "mariadb"])
+    def test_pr_review_base_ref_offline_nontransactional_upgrade_refused(
+        self,
+        dialect,
+    ):
+        module = _load_pr_review_base_ref_migration(f"offline_{dialect}")
+        with (
+            patch.object(module, "_dialect_name", return_value=dialect),
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module, "_add_base_ref_column") as add,
+            pytest.raises(RuntimeError, match="Offline PR base-ref"),
+        ):
+            module._ensure_base_ref_column()
+        add.assert_not_called()
+
+
+    def test_pr_review_base_ref_postgresql_offline_upgrade_is_transactional(
+        self,
+    ):
+        module = _load_pr_review_base_ref_migration("postgresql_offline")
+        output = io.StringIO()
+        migration_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(migration_context)),
+            patch.object(module, "_is_offline", return_value=True),
+        ):
+            module.upgrade()
+
+        ddl = output.getvalue().lower()
+        add_column = ddl.index(
+            "alter table pr_reviews add column base_ref varchar(200)"
+        )
+        backfill = ddl.index("update pr_reviews")
+        assertion = ddl.index("do $ccm$")
+        non_null = ddl.index(
+            "alter table pr_reviews alter column base_ref set not null"
+        )
+        new_subject = ddl.index(
+            "add constraint uq_pr_reviews_repo_pr_base_ref_base_head"
+        )
+        old_subject = ddl.index(
+            "drop constraint uq_pr_reviews_repo_pr_base_head"
+        )
+        new_queue = ddl.index(
+            "add constraint uq_pr_merge_queue_actions_run_review"
+        )
+        old_queue = ddl.index(
+            "drop constraint uq_pr_merge_queue_actions_run_head"
+        )
+        assert (
+            add_column
+            < backfill
+            < assertion
+            < non_null
+            < new_subject
+            < old_subject
+            < new_queue
+            < old_queue
+        )
+        assert "where base_ref is null" in ddl
+        assert "raise exception" in ddl
+
+
+    def test_pr_review_base_ref_postgresql_offline_downgrade_is_refused(
+        self,
+    ):
+        module = _load_pr_review_base_ref_migration(
+            "postgresql_offline_downgrade"
+        )
+        output = io.StringIO()
+        migration_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(migration_context)),
+            patch.object(module, "_is_offline", return_value=True),
+            pytest.raises(RuntimeError, match="Offline downgrade is refused"),
+        ):
+            module.downgrade()
+        assert output.getvalue() == ""
+
+
+    def test_pr_review_base_ref_postgresql_downgrade_fences_first(self):
+        module = _load_pr_review_base_ref_migration("postgresql_fence")
+        events = []
+        column = {
+            "name": "base_ref",
+            "type": postgresql.VARCHAR(length=200),
+            "nullable": False,
+        }
+
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_dialect_name", return_value="postgresql"),
+            patch.object(
+                module.op,
+                "execute",
+                side_effect=lambda statement: events.append(("lock", str(statement))),
+            ),
+            patch.object(
+                module,
+                "_reflected_base_ref_column",
+                side_effect=lambda: (events.append(("reflect", None)), column)[1],
+            ),
+            patch.object(
+                module,
+                "_count_reviews",
+                side_effect=lambda: (events.append(("count", None)), 0)[1],
+            ),
+            patch.object(
+                module,
+                "_ensure_legacy_subject_constraint",
+                side_effect=lambda: events.append(("constraint", None)),
+            ),
+            patch.object(
+                module,
+                "_ensure_legacy_queue_constraint",
+                side_effect=lambda: events.append(("queue", None)),
+            ),
+            patch.object(
+                module,
+                "_drop_base_ref_column",
+                side_effect=lambda: events.append(("drop", None)),
+            ),
+        ):
+            module.downgrade()
+
+        assert [name for name, _ in events] == [
+            "lock", "reflect", "count", "queue", "constraint", "drop",
+        ]
+
+
+    @pytest.mark.parametrize("dialect", ["mysql", "mariadb"])
+    def test_pr_review_base_ref_mysql_downgrade_fails_closed(
+        self,
+        dialect,
+    ):
+        module = _load_pr_review_base_ref_migration(f"{dialect}_downgrade")
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_dialect_name", return_value=dialect),
+            patch.object(module, "_reflected_base_ref_column") as reflect,
+            pytest.raises(RuntimeError, match="refused for MySQL/MariaDB"),
+        ):
+            module.downgrade()
+        reflect.assert_not_called()
+
+
+    def test_pr_review_base_ref_sqlite_downgrade_replays_partial_drop(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-review-base-ref-drop-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_BASE_REF_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        module = _load_pr_review_base_ref_migration("sqlite_drop_replay")
+        with engine.begin() as conn:
+            migration_context = MigrationContext.configure(conn)
+            with (
+                patch.object(module, "op", Operations(migration_context)),
+                patch.object(module, "_is_offline", return_value=False),
+            ):
+                module.downgrade()
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            PR_REVIEW_MERGE_METHOD_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "base_ref" not in _get_table_columns(engine, "pr_reviews")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_MERGE_METHOD_REVISION
+        engine.dispose()
+
+
+    @pytest.mark.parametrize(
+        ("subject_state", "queue_state"),
+        [
+            ((False, False), (True, False)),
+            ((True, True), (True, False)),
+            ((True, False), (False, False)),
+            ((True, False), (True, True)),
+        ],
+    )
+    def test_pr_review_base_ref_sqlite_missing_column_replay_requires_exact_constraints(
+        self,
+        subject_state,
+        queue_state,
+    ):
+        module = _load_pr_review_base_ref_migration(
+            "sqlite_missing_column_wrong_constraints"
+        )
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(
+                module,
+                "_acquire_downgrade_writer_fence",
+                return_value="sqlite",
+            ),
+            patch.object(
+                module,
+                "_reflected_base_ref_column",
+                return_value=None,
+            ),
+            patch.object(
+                module,
+                "_reflected_subject_constraints",
+                return_value=subject_state,
+            ),
+            patch.object(
+                module,
+                "_reflected_queue_constraints",
+                return_value=queue_state,
+            ),
+            patch.object(module, "_count_reviews") as count,
+            patch.object(module, "_drop_base_ref_column") as drop,
+            pytest.raises(RuntimeError, match="exact legacy constraints"),
+        ):
+            module.downgrade()
+        count.assert_not_called()
+        drop.assert_not_called()
+
+
+    def test_pr_review_base_ref_sqlite_missing_column_replay_rejects_new_reviews(
+        self,
+    ):
+        module = _load_pr_review_base_ref_migration(
+            "sqlite_missing_column_with_reviews"
+        )
+        with (
+            patch.object(
+                module,
+                "_acquire_downgrade_writer_fence",
+                return_value="sqlite",
+            ),
+            patch.object(
+                module,
+                "_reflected_base_ref_column",
+                return_value=None,
+            ),
+            patch.object(
+                module,
+                "_reflected_subject_constraints",
+                return_value=(True, False),
+            ),
+            patch.object(
+                module,
+                "_reflected_queue_constraints",
+                return_value=(True, False),
+            ),
+            patch.object(module, "_count_reviews", return_value=1),
+            patch.object(module, "_drop_base_ref_column") as drop,
+            pytest.raises(RuntimeError, match="review subjects still exist"),
+        ):
+            module.downgrade()
+        drop.assert_not_called()
 
 
     def test_discussion_provider_lease_migration_roundtrip(self, tmp_path):

@@ -9,8 +9,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 import backend.main as main_module
+import backend.services.worker_plan_dispatch as worker_plan_dispatch_module
 from backend.models.plan import Plan
 from backend.models.plan_agent import (
     PlanAgentRun,
@@ -28,6 +30,8 @@ from backend.services.worker_plan_dispatch import (
 )
 from backend.services.worker_proxy import (
     WorkerPlanRemoteAbsent,
+    WorkerPlanRemoteCancelled,
+    WorkerPlanRemoteIdentityConflict,
     WorkerPlanReconciliationUnsupported,
     WorkerProxy,
 )
@@ -527,6 +531,146 @@ async def test_restart_remote_absence_is_proved_before_requeue(
         assert run.generation == graph.generation + 1
         assert receipt.status == "settled"
         assert receipt.settlement_reason == "remote_absent"
+
+
+@pytest.mark.parametrize(
+    (
+        "exception_type",
+        "final_status",
+        "settlement_reason",
+        "remote_status",
+        "generation_delta",
+    ),
+    [
+        (WorkerPlanRemoteAbsent, "queued", "remote_absent", None, 1),
+        (
+            WorkerPlanRemoteCancelled,
+            "cancelled",
+            "remote_cancelled",
+            "cancelled",
+            1,
+        ),
+        (
+            WorkerPlanRemoteIdentityConflict,
+            "failed",
+            "identity_conflict",
+            "conflict",
+            0,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reconciliation_settlement_failure_rearms_cold_recovery(
+    db_factory,
+    monkeypatch,
+    exception_type,
+    final_status,
+    settlement_reason,
+    remote_status,
+    generation_delta,
+):
+    graph = await _seed_graph(
+        db_factory,
+        receipt_status="remote_possible",
+        with_target_task=True,
+    )
+
+    async def exact_remote_outcome(*_args, **_kwargs):
+        raise exception_type(f"exact {settlement_reason}")
+
+    proxy = AsyncMock()
+    proxy.reconcile_versioned_plan_until_pause.side_effect = (
+        exact_remote_outcome
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    real_fence = worker_plan_dispatch_module.fence_worker_dispatch_target
+    fence_calls = 0
+
+    async def fail_first_target_fence(db, *, receipt):
+        nonlocal fence_calls
+        fence_calls += 1
+        if fence_calls == 1:
+            raise HTTPException(409, "temporary target fence")
+        return await real_fence(db, receipt=receipt)
+
+    monkeypatch.setattr(
+        worker_plan_dispatch_module,
+        "fence_worker_dispatch_target",
+        fail_first_target_fence,
+    )
+    dispatcher = _dispatcher(db_factory)
+
+    async def cold_sweep() -> bool:
+        signal_generation = (
+            dispatcher._plan_runtime_recovery_signal_generation
+        )
+        retry_needed = await dispatcher._recover_versioned_plan_runs()
+        if (
+            retry_needed
+            or signal_generation
+            == dispatcher._plan_runtime_recovery_signal_generation
+        ):
+            dispatcher._record_plan_runtime_recovery_result(
+                retry_needed=retry_needed,
+            )
+        return retry_needed
+
+    # The producer clears its old schedule after synchronously registering the
+    # lifecycle. A later temporary settlement failure must publish a newer
+    # recovery generation and restore the durable retry deadline.
+    assert await cold_sweep() is False
+    first_lifecycle = dispatcher._running_tasks[
+        f"worker-plan-{graph.run_id}"
+    ]
+    await first_lifecycle
+    await asyncio.sleep(0)
+
+    assert fence_calls == 1
+    assert dispatcher._plan_runtime_recovery_not_before is not None
+    assert dispatcher.wake.called
+    async with db_factory() as db:
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipt = await db.get(
+            PlanAgentWorkerDispatchReceipt,
+            graph.receipt_id,
+        )
+        assert run.status == "running"
+        assert run.generation == graph.generation
+        assert receipt.status == "remote_possible"
+        assert receipt.settlement_reason is None
+
+    # The next cold sweep retries the same exact audit identity. Once its
+    # settlement fence succeeds, no further retry remains armed.
+    assert await cold_sweep() is False
+    second_lifecycle = dispatcher._running_tasks[
+        f"worker-plan-{graph.run_id}"
+    ]
+    assert second_lifecycle is not first_lifecycle
+    await second_lifecycle
+    await asyncio.sleep(0)
+
+    assert fence_calls == 2
+    assert proxy.reconcile_versioned_plan_until_pause.await_count == 2
+    assert dispatcher._plan_runtime_recovery_not_before is None
+    async with db_factory() as db:
+        plan = await db.get(Plan, graph.plan_id)
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipt = await db.get(
+            PlanAgentWorkerDispatchReceipt,
+            graph.receipt_id,
+        )
+        assert run.status == final_status
+        assert run.generation == graph.generation + generation_delta
+        assert receipt.status == "settled"
+        assert receipt.settlement_reason == settlement_reason
+        assert receipt.remote_status == remote_status
+        if final_status == "queued":
+            assert plan.active_run_id == graph.run_id
+        else:
+            assert plan.active_run_id is None
+        if final_status == "failed":
+            assert settlement_reason in run.error
 
 
 @pytest.mark.asyncio

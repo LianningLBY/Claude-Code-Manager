@@ -55,6 +55,7 @@ from backend.schemas.plan_resource import (
 
 ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "waiting_user"})
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled"})
+LOCAL_CANCELLATION_FENCE_ATTEMPTS = 3
 ACTIVE_PLAN_DELIVERY_STATUSES = frozenset(
     {"pending", "queued", "launching", "uncertain"}
 )
@@ -1276,13 +1277,13 @@ async def answer_input_request(
                 "Answered Plan input can only replay its exact idempotent payload",
             )
 
+    capability_invocation_id: int | None = None
+    capability_invocation_version: int | None = None
+    capability_execution_version: int | None = None
     if capability_owned:
-        # The API already holds plan_operation_lock.  Locking the Capability
-        # Invocation then its Execution here makes an input answer serialize
-        # with Capability cancellation's fence without inverting the
-        # process-local capability_task_lock -> plan_operation_lock order.
-        # A cancellation that wins first publishes ``cancelling``; an answer
-        # that wins first commits before cancellation can proceed.
+        # Freeze the immutable Core link before ending the routing snapshot.
+        # The fresh transaction below takes writer fences in the same global
+        # order as Core/deletion: Invocation -> Execution -> Run -> Input.
         from backend.models.capability import (
             CapabilityExecution,
             CapabilityInvocation,
@@ -1298,22 +1299,16 @@ async def answer_input_request(
                 409,
                 "Plan Capability execution disappeared before input answer",
             )
-        invocation = (
-            await db.execute(
-                select(CapabilityInvocation)
-                .where(CapabilityInvocation.id == execution_ref.invocation_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
-        execution = (
-            await db.execute(
-                select(CapabilityExecution)
-                .where(CapabilityExecution.id == run.capability_execution_id)
-                .with_for_update()
-                .execution_options(populate_existing=True)
-            )
-        ).scalar_one_or_none()
+        invocation = await db.get(
+            CapabilityInvocation,
+            execution_ref.invocation_id,
+            populate_existing=True,
+        )
+        execution = await db.get(
+            CapabilityExecution,
+            run.capability_execution_id,
+            populate_existing=True,
+        )
         immutable_link_valid = (
             invocation is not None
             and execution is not None
@@ -1344,6 +1339,9 @@ async def answer_input_request(
                 409,
                 "Plan Capability is no longer accepting input",
             )
+        capability_invocation_id = invocation.id
+        capability_invocation_version = invocation.state_version
+        capability_execution_version = execution.state_version
     if replay:
         return input_request
     if plan.active_run_id != run.id or run.status != "waiting_user":
@@ -1362,12 +1360,96 @@ async def answer_input_request(
             "Plan answers cannot store API keys or access tokens. "
             "Save the credential in Settings → Secrets and answer with its name/reference.",
         )
+
+    plan_id = plan.id
+    run_id = run.id
+    input_request_id = input_request.id
+    target_task_id = plan.target_task_id
+    capability_execution_id = run.capability_execution_id
+
+    # End all read snapshots before the first writer fence. SQLite WAL cannot
+    # upgrade a snapshot after a concurrent cancellation/claim commits. The
+    # conditional writer sequence below also gives PostgreSQL/MySQL one global
+    # row-lock order, so answer and every cancellation path cannot deadlock.
+    await db.rollback()
     now = datetime.utcnow()
+
+    if capability_owned:
+        assert capability_invocation_id is not None
+        assert capability_invocation_version is not None
+        assert capability_execution_id is not None
+        assert capability_execution_version is not None
+        invocation_fenced = await db.execute(
+            update(CapabilityInvocation)
+            .where(
+                CapabilityInvocation.id == capability_invocation_id,
+                CapabilityInvocation.task_id == target_task_id,
+                CapabilityInvocation.active_task_id == target_task_id,
+                CapabilityInvocation.capability_key == "plan",
+                CapabilityInvocation.executor_kind == "plan_agent",
+                CapabilityInvocation.status.in_(["running", "waiting_user"]),
+                CapabilityInvocation.state_version
+                == capability_invocation_version,
+            )
+            # A self-assignment is an intentional portable writer/row-lock
+            # fence; the Core version remains owned by Core transitions.
+            .values(state_version=CapabilityInvocation.state_version)
+        )
+        if invocation_fenced.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(409, "Plan Capability is no longer accepting input")
+        execution_fenced = await db.execute(
+            update(CapabilityExecution)
+            .where(
+                CapabilityExecution.id == capability_execution_id,
+                CapabilityExecution.invocation_id == capability_invocation_id,
+                CapabilityExecution.active_invocation_id
+                == capability_invocation_id,
+                CapabilityExecution.executor_kind == "plan_agent",
+                CapabilityExecution.handle_kind == "plan_agent_run",
+                CapabilityExecution.handle_id == str(run_id),
+                CapabilityExecution.handle_generation
+                == PLAN_RUN_HANDLE_GENERATION,
+                CapabilityExecution.status.in_(["running", "waiting_user"]),
+                CapabilityExecution.state_version == capability_execution_version,
+            )
+            .values(state_version=CapabilityExecution.state_version)
+        )
+        if execution_fenced.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(409, "Plan Capability is no longer accepting input")
+
+    resumed = await db.execute(
+        update(PlanAgentRun)
+        .where(
+            PlanAgentRun.id == run_id,
+            PlanAgentRun.plan_id == plan_id,
+            PlanAgentRun.status == "waiting_user",
+            PlanAgentRun.generation == expected_generation,
+            PlanAgentRun.open_input_request_id == input_request_id,
+            (
+                PlanAgentRun.capability_execution_id == capability_execution_id
+                if capability_owned
+                else PlanAgentRun.capability_execution_id.is_(None)
+            ),
+        )
+        .values(
+            status="queued",
+            current_stage="planner",
+            open_input_request_id=None,
+            generation=PlanAgentRun.generation + 1,
+            updated_at=now,
+        )
+    )
+    if resumed.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(409, "Input request was answered concurrently")
     updated = await db.execute(
         update(PlanInputRequest)
         .where(
-            PlanInputRequest.id == input_request.id,
-            PlanInputRequest.run_id == run.id,
+            PlanInputRequest.id == input_request_id,
+            PlanInputRequest.plan_id == plan_id,
+            PlanInputRequest.run_id == run_id,
             PlanInputRequest.status == "open",
         )
         .values(
@@ -1380,29 +1462,22 @@ async def answer_input_request(
             answer_idempotency_key=idempotency_key,
         )
     )
-    resumed = await db.execute(
-        update(PlanAgentRun)
-        .where(
-            PlanAgentRun.id == run.id,
-            PlanAgentRun.plan_id == plan.id,
-            PlanAgentRun.status == "waiting_user",
-            PlanAgentRun.generation == expected_generation,
-            PlanAgentRun.open_input_request_id == input_request.id,
-        )
-        .values(
-            status="queued",
-            current_stage="planner",
-            open_input_request_id=None,
-            generation=PlanAgentRun.generation + 1,
-            updated_at=now,
-        )
-    )
-    if updated.rowcount != 1 or resumed.rowcount != 1:
+    if updated.rowcount != 1:
         await db.rollback()
         raise HTTPException(409, "Input request was answered concurrently")
     await db.commit()
-    await db.refresh(input_request)
-    return input_request
+    # Rehydrate identities expired by the fresh-writer rollback. Callers use
+    # Plan/Run fields for the response event after this service returns.
+    await db.get(Plan, plan_id, populate_existing=True)
+    await db.get(PlanAgentRun, run_id, populate_existing=True)
+    answered = await db.get(
+        PlanInputRequest,
+        input_request_id,
+        populate_existing=True,
+    )
+    if answered is None:
+        raise HTTPException(409, "Input request disappeared after answer commit")
+    return answered
 
 
 async def decide_version(
@@ -1850,69 +1925,159 @@ async def cancel_run(
     here makes a failed stop or Manager crash safely retryable.
     """
 
-    if run.status == "cancelled":
-        await db.commit()
-        await db.refresh(run)
-        return run
-    if (
-        run.run_type == "capability"
-        or run.capability_execution_id is not None
-        or await db.scalar(
-            select(Plan.id)
-            .where(Plan.id == plan.id, _capability_plan_owner_exists())
-            .limit(1)
-        )
-        is not None
-    ):
-        raise HTTPException(409, dict(CAPABILITY_OWNED_PLAN_MUTATION_DETAIL))
-    if run.worker_id is not None:
-        raise HTTPException(409, "Worker Plan Run requires a remote cancellation receipt")
-    if run.status == "cancelling":
+    for attempt in range(LOCAL_CANCELLATION_FENCE_ATTEMPTS):
+        if run.status == "cancelled":
+            await db.commit()
+            await db.refresh(run)
+            return run
         if (
-            plan.active_run_id != run.id
-            or run.cancellation_target_generation is None
-            or run.generation != run.cancellation_target_generation + 1
-        ):
-            raise HTTPException(409, "Plan Run cancellation fence is inconsistent")
-        await db.commit()
-        await db.refresh(run)
-        return run
-    if plan.active_run_id != run.id or run.status not in ACTIVE_RUN_STATUSES:
-        raise HTTPException(409, "Plan Run is no longer active")
-    now = datetime.utcnow()
-    if run.open_input_request_id is not None:
-        await db.execute(
-            update(PlanInputRequest)
-            .where(
-                PlanInputRequest.id == run.open_input_request_id,
-                PlanInputRequest.status.in_(["prepared", "open"]),
+            run.run_type == "capability"
+            or run.capability_execution_id is not None
+            or await db.scalar(
+                select(Plan.id)
+                .where(Plan.id == plan.id, _capability_plan_owner_exists())
+                .limit(1)
             )
-            .values(status="cancelled", cancelled_at=now)
-        )
-    changed = await db.execute(
-        update(PlanAgentRun)
-        .where(
-            PlanAgentRun.id == run.id,
-            PlanAgentRun.plan_id == plan.id,
-            PlanAgentRun.status.in_(ACTIVE_RUN_STATUSES),
-        )
-        .values(
-            status="cancelling",
-            open_input_request_id=None,
-            cancellation_target_generation=run.generation,
-            generation=PlanAgentRun.generation + 1,
-            error="Cancellation requested",
-            updated_at=now,
-        )
-    )
-    if changed.rowcount != 1:
+            is not None
+        ):
+            raise HTTPException(409, dict(CAPABILITY_OWNED_PLAN_MUTATION_DETAIL))
+        if run.worker_id is not None:
+            raise HTTPException(
+                409,
+                "Worker Plan Run requires a remote cancellation receipt",
+            )
+        if run.status == "cancelling":
+            if (
+                plan.active_run_id != run.id
+                or run.cancellation_target_generation is None
+                or run.generation != run.cancellation_target_generation + 1
+            ):
+                raise HTTPException(
+                    409,
+                    "Plan Run cancellation fence is inconsistent",
+                )
+            await db.commit()
+            await db.refresh(run)
+            return run
+        if plan.active_run_id != run.id or run.status not in ACTIVE_RUN_STATUSES:
+            raise HTTPException(409, "Plan Run is no longer active")
+
+        run_id = run.id
+        plan_id = plan.id
+        expected_plan_lock_version = plan.lock_version
+        expected_input_request_id = run.open_input_request_id
+
+        # End every authorization/read snapshot before the Run UPDATE becomes
+        # the first statement in a fresh writer transaction.  This is required
+        # on SQLite WAL: SELECT -> concurrent claim commit -> UPDATE otherwise
+        # fails with SQLITE_BUSY_SNAPSHOT instead of choosing a durable winner.
         await db.rollback()
-        raise HTTPException(409, "Plan Run changed while fencing cancellation")
-    plan.lock_version += 1
-    plan.updated_at = now
-    await db.commit()
-    await db.refresh(run)
-    return run
+        now = datetime.utcnow()
+        # Run is the global Plan-aggregate writer fence.  It must be the first
+        # write after the WAL snapshot rollback and precede Plan/children/Input
+        # on every supported database.  The exact open-input pointer makes an
+        # answer and cancellation choose one winner without opposite row locks.
+        changed = await db.execute(
+            update(PlanAgentRun)
+            .where(
+                PlanAgentRun.id == run_id,
+                PlanAgentRun.plan_id == plan_id,
+                PlanAgentRun.worker_id.is_(None),
+                PlanAgentRun.run_type != "capability",
+                PlanAgentRun.capability_execution_id.is_(None),
+                PlanAgentRun.status.in_(ACTIVE_RUN_STATUSES),
+                (
+                    PlanAgentRun.open_input_request_id.is_(None)
+                    if expected_input_request_id is None
+                    else PlanAgentRun.open_input_request_id
+                    == expected_input_request_id
+                ),
+            )
+            # Capture the database generation on the same atomic write that
+            # fences it. MySQL evaluates ordered SET values left-to-right.
+            .ordered_values(
+                (
+                    PlanAgentRun.cancellation_target_generation,
+                    PlanAgentRun.generation,
+                ),
+                (PlanAgentRun.generation, PlanAgentRun.generation + 1),
+                (PlanAgentRun.status, "cancelling"),
+                (PlanAgentRun.open_input_request_id, None),
+                (PlanAgentRun.error, "Cancellation requested"),
+                (PlanAgentRun.updated_at, now),
+            )
+        )
+        plan_changed = None
+        if changed is not None and changed.rowcount == 1:
+            plan_changed = await db.execute(
+                update(Plan)
+                .where(
+                    Plan.id == plan_id,
+                    Plan.active_run_id == run_id,
+                    Plan.lock_version == expected_plan_lock_version,
+                )
+                .values(
+                    lock_version=Plan.lock_version + 1,
+                    updated_at=now,
+                )
+            )
+        input_changed = None
+        if (
+            changed.rowcount == 1
+            and plan_changed is not None
+            and plan_changed.rowcount == 1
+            and expected_input_request_id is not None
+        ):
+            input_changed = await db.execute(
+                update(PlanInputRequest)
+                .where(
+                    PlanInputRequest.id == expected_input_request_id,
+                    PlanInputRequest.run_id == run_id,
+                    PlanInputRequest.status.in_(["prepared", "open"]),
+                )
+                .values(status="cancelled", cancelled_at=now)
+            )
+        input_won = expected_input_request_id is None or (
+            input_changed is not None and input_changed.rowcount == 1
+        )
+        if (
+            changed.rowcount == 1
+            and plan_changed is not None
+            and plan_changed.rowcount == 1
+            and input_won
+        ):
+            await db.commit()
+            fenced = await db.get(
+                PlanAgentRun,
+                run_id,
+                populate_existing=True,
+            )
+            if fenced is None:
+                raise HTTPException(
+                    409,
+                    "Plan Run disappeared after fencing cancellation",
+                )
+            return fenced
+
+        await db.rollback()
+        if attempt + 1 >= LOCAL_CANCELLATION_FENCE_ATTEMPTS:
+            break
+        run = await db.get(
+            PlanAgentRun,
+            run_id,
+            populate_existing=True,
+        )
+        plan = await db.get(
+            Plan,
+            plan_id,
+            populate_existing=True,
+        )
+        if run is None or plan is None or run.plan_id != plan.id:
+            await db.rollback()
+            raise HTTPException(409, "Plan Run changed while fencing cancellation")
+
+    await db.rollback()
+    raise HTTPException(409, "Plan Run changed while fencing cancellation")
 
 
 async def release_run_owner_after_cleanup(
@@ -2111,8 +2276,10 @@ async def cancel_worker_mirror_run_after_ack(
     *,
     plan: Plan,
     run: PlanAgentRun,
+    receipt_settlement_reason: str = "remote_cancelled",
+    receipt_remote_status: str | None = "cancelled",
 ) -> PlanAgentRun:
-    """Terminalize a Manager mirror after its Worker returned exact cancelled."""
+    """Terminalize a Manager mirror after exact remote-absence evidence."""
 
     expected_run_id = run.id
     expected_plan_id = plan.id
@@ -2152,22 +2319,108 @@ async def cancel_worker_mirror_run_after_ack(
         is not None
     ):
         raise HTTPException(409, "Worker Plan Run mirror is not safe to cancel")
+    observed_worker_id = run.worker_id
+    observed_generation = run.generation
+    observed_status = run.status
+    expected_plan_lock_version = plan.lock_version
+    observed_input_request_id = run.open_input_request_id
 
+    # The Worker ACK proves only the exact generation observed above. End the
+    # SELECT/FOR UPDATE snapshot before taking the portable writer fence:
+    # SQLite WAL ignores FOR UPDATE and cannot upgrade a stale read snapshot
+    # after another connection commits. Unlike local cancellation, a newer
+    # Worker mirror generation must never be absorbed; the caller must rebuild
+    # its remote proof from scratch.
+    await db.rollback()
     now = datetime.utcnow()
+    run_fenced = await db.execute(
+        update(PlanAgentRun)
+        .where(
+            PlanAgentRun.id == expected_run_id,
+            PlanAgentRun.plan_id == expected_plan_id,
+            PlanAgentRun.worker_id == observed_worker_id,
+            PlanAgentRun.run_type != "capability",
+            PlanAgentRun.capability_execution_id.is_(None),
+            PlanAgentRun.instance_id.is_(None),
+            PlanAgentRun.status == observed_status,
+            PlanAgentRun.generation == observed_generation,
+            (
+                PlanAgentRun.open_input_request_id.is_(None)
+                if observed_input_request_id is None
+                else PlanAgentRun.open_input_request_id
+                == observed_input_request_id
+            ),
+        )
+        .values(updated_at=now)
+    )
+    if run_fenced.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Worker Plan Run generation changed after cancellation proof",
+        )
+    plan_fenced = await db.execute(
+        update(Plan)
+        .where(
+            Plan.id == expected_plan_id,
+            Plan.active_run_id == expected_run_id,
+            Plan.worker_id == observed_worker_id,
+            Plan.lock_version == expected_plan_lock_version,
+        )
+        .values(
+            active_run_id=None,
+            lock_version=Plan.lock_version + 1,
+            updated_at=now,
+        )
+    )
+    if plan_fenced.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Worker Plan changed after cancellation proof",
+        )
+
     # Canonical deletion/dispatch ordering is Run -> Plan -> boundary receipt.
-    # Taking the receipt first deadlocks against settlement or graph deletion
-    # that already holds the Run row and is waiting for this receipt.
+    # The two writes above now hold that boundary through receipt settlement.
+    run = await db.get(
+        PlanAgentRun,
+        expected_run_id,
+        populate_existing=True,
+    )
+    plan = await db.get(
+        Plan,
+        expected_plan_id,
+        populate_existing=True,
+    )
+    if (
+        run is None
+        or plan is None
+        or run.generation != observed_generation
+        or run.status != observed_status
+        or run.worker_id != observed_worker_id
+        or plan.active_run_id is not None
+        or await db.scalar(
+            select(Instance.id)
+            .where(Instance.current_plan_run_id == expected_run_id)
+            .limit(1)
+        )
+        is not None
+    ):
+        await db.rollback()
+        raise HTTPException(409, "Worker Plan Run changed while cancelling")
+
     dispatch_receipt = (
         await db.execute(
             select(PlanAgentWorkerDispatchReceipt)
             .where(
-                PlanAgentWorkerDispatchReceipt.run_id == run.id,
-                PlanAgentWorkerDispatchReceipt.run_generation == run.generation,
+                PlanAgentWorkerDispatchReceipt.run_id == expected_run_id,
+                PlanAgentWorkerDispatchReceipt.run_generation
+                == observed_generation,
             )
             .with_for_update()
         )
     ).scalar_one_or_none()
-    if dispatch_receipt is not None and dispatch_receipt.status != "settled":
+    if dispatch_receipt is not None:
         from backend.services.worker_plan_dispatch import (
             settle_worker_dispatch_receipt,
         )
@@ -2176,64 +2429,70 @@ async def cancel_worker_mirror_run_after_ack(
             receipt=dispatch_receipt,
             plan=plan,
             run=run,
-            generation=run.generation,
-            reason="remote_cancelled",
-            remote_status="cancelled",
+            generation=observed_generation,
+            reason=receipt_settlement_reason,
+            remote_status=receipt_remote_status,
         )
+
+    # Input is always the final aggregate lock tier. An answer first fences the
+    # Run, so exactly one of answer/cancel can reach this row.
+    if observed_input_request_id is not None:
+        input_fenced = await db.execute(
+            update(PlanInputRequest)
+            .where(
+                PlanInputRequest.id == observed_input_request_id,
+                PlanInputRequest.plan_id == expected_plan_id,
+                PlanInputRequest.run_id == expected_run_id,
+                PlanInputRequest.status.in_(["prepared", "open"]),
+            )
+            .values(status="cancelled", cancelled_at=now)
+        )
+        if input_fenced.rowcount != 1:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Worker Plan input changed after cancellation proof",
+            )
+
     execution_seconds = float(run.execution_seconds or 0)
     if run.last_execution_started_at is not None:
         execution_seconds += max(
             0.0,
             (now - run.last_execution_started_at).total_seconds(),
         )
-    if run.open_input_request_id is not None:
-        await db.execute(
-            update(PlanInputRequest)
-            .where(
-                PlanInputRequest.id == run.open_input_request_id,
-                PlanInputRequest.status.in_(["prepared", "open"]),
-            )
-            .values(status="cancelled", cancelled_at=now)
-        )
     changed = await db.execute(
         update(PlanAgentRun)
         .where(
-            PlanAgentRun.id == run.id,
-            PlanAgentRun.plan_id == plan.id,
-            PlanAgentRun.worker_id == run.worker_id,
-            PlanAgentRun.status.in_(ACTIVE_RUN_STATUSES),
+            PlanAgentRun.id == expected_run_id,
+            PlanAgentRun.plan_id == expected_plan_id,
+            PlanAgentRun.worker_id == observed_worker_id,
+            PlanAgentRun.status == observed_status,
+            PlanAgentRun.generation == observed_generation,
         )
         .values(
             status="cancelled",
             open_input_request_id=None,
             execution_seconds=execution_seconds,
             last_execution_started_at=None,
-            # Preserve the exact Manager generation acknowledged by the
-            # Worker. Input answering can advance the claim before a new
-            # dispatch receipt exists, so deletion/restart must not infer this
-            # boundary from whichever historical receipt happens to be last.
-            cancellation_target_generation=run.generation,
-            generation=PlanAgentRun.generation + 1,
+            cancellation_target_generation=observed_generation,
+            generation=observed_generation + 1,
             error="Cancelled by user",
             updated_at=now,
             finished_at=now,
         )
     )
-    released = await db.execute(
-        update(Plan)
-        .where(Plan.id == plan.id, Plan.active_run_id == run.id)
-        .values(
-            active_run_id=None,
-            lock_version=Plan.lock_version + 1,
-            updated_at=now,
-        )
-    )
-    if changed.rowcount != 1 or released.rowcount != 1:
+    if changed.rowcount != 1:
         await db.rollback()
         raise HTTPException(409, "Worker Plan Run changed while cancelling")
     await db.commit()
-    await db.refresh(run)
-    return run
+    cancelled = await db.get(
+        PlanAgentRun,
+        expected_run_id,
+        populate_existing=True,
+    )
+    if cancelled is None:
+        raise HTTPException(409, "Worker Plan Run disappeared after cancellation")
+    return cancelled
 
 
 async def fence_capability_run_cancellation(
@@ -2250,57 +2509,144 @@ async def fence_capability_run_cancellation(
     no longer sees a claimable queued/running/waiting Run.
     """
 
-    if run.status == "cancelling":
-        if run.cancellation_target_generation is None:
-            raise HTTPException(
-                409,
-                "Plan Run cancellation has no exact runtime generation",
-            )
-        await db.commit()
-        await db.refresh(run)
-        return run
-    if run.status not in ACTIVE_RUN_STATUSES:
-        if run.status in TERMINAL_RUN_STATUSES:
+    run_id = run.id
+    plan_id = plan.id
+    capability_execution_id = run.capability_execution_id
+    for attempt in range(LOCAL_CANCELLATION_FENCE_ATTEMPTS):
+        if (
+            run.run_type != "capability"
+            or capability_execution_id is None
+            or run.capability_execution_id != capability_execution_id
+            or run.plan_id != plan.id
+        ):
+            raise HTTPException(409, "Capability Plan Run identity changed")
+        if run.status == "cancelling":
+            if (
+                plan.active_run_id != run.id
+                or run.cancellation_target_generation is None
+                or run.generation != run.cancellation_target_generation + 1
+            ):
+                raise HTTPException(
+                    409,
+                    "Plan Run cancellation fence is inconsistent",
+                )
             await db.commit()
             await db.refresh(run)
             return run
-        raise HTTPException(409, "Plan Run cannot enter cancellation")
-    if plan.active_run_id != run.id:
-        raise HTTPException(409, "Plan Run is no longer active")
-    now = datetime.utcnow()
-    if run.open_input_request_id is not None:
-        await db.execute(
-            update(PlanInputRequest)
-            .where(
-                PlanInputRequest.id == run.open_input_request_id,
-                PlanInputRequest.status.in_(["prepared", "open"]),
-            )
-            .values(status="cancelled", cancelled_at=now)
-        )
-    changed = await db.execute(
-        update(PlanAgentRun)
-        .where(
-            PlanAgentRun.id == run.id,
-            PlanAgentRun.plan_id == plan.id,
-            PlanAgentRun.status.in_(ACTIVE_RUN_STATUSES),
-        )
-        .values(
-            status="cancelling",
-            open_input_request_id=None,
-            cancellation_target_generation=run.generation,
-            generation=PlanAgentRun.generation + 1,
-            error="Cancellation requested",
-            updated_at=now,
-        )
-    )
-    if changed.rowcount != 1:
+        if run.status not in ACTIVE_RUN_STATUSES:
+            if run.status in TERMINAL_RUN_STATUSES:
+                await db.commit()
+                await db.refresh(run)
+                return run
+            raise HTTPException(409, "Plan Run cannot enter cancellation")
+        if plan.active_run_id != run.id:
+            raise HTTPException(409, "Plan Run is no longer active")
+
+        expected_plan_lock_version = plan.lock_version
+        expected_input_request_id = run.open_input_request_id
+        # See cancel_run: Run must be the first writer in the fresh transaction
+        # and every Plan mutation uses Run -> Plan -> children/Input order.
         await db.rollback()
-        raise HTTPException(409, "Plan Run changed while fencing cancellation")
-    plan.lock_version += 1
-    plan.updated_at = now
-    await db.commit()
-    await db.refresh(run)
-    return run
+        now = datetime.utcnow()
+        changed = await db.execute(
+            update(PlanAgentRun)
+            .where(
+                PlanAgentRun.id == run_id,
+                PlanAgentRun.plan_id == plan_id,
+                PlanAgentRun.worker_id.is_(None),
+                PlanAgentRun.run_type == "capability",
+                PlanAgentRun.capability_execution_id == capability_execution_id,
+                PlanAgentRun.status.in_(ACTIVE_RUN_STATUSES),
+                (
+                    PlanAgentRun.open_input_request_id.is_(None)
+                    if expected_input_request_id is None
+                    else PlanAgentRun.open_input_request_id
+                    == expected_input_request_id
+                ),
+            )
+            .ordered_values(
+                (
+                    PlanAgentRun.cancellation_target_generation,
+                    PlanAgentRun.generation,
+                ),
+                (PlanAgentRun.generation, PlanAgentRun.generation + 1),
+                (PlanAgentRun.status, "cancelling"),
+                (PlanAgentRun.open_input_request_id, None),
+                (PlanAgentRun.error, "Cancellation requested"),
+                (PlanAgentRun.updated_at, now),
+            )
+        )
+        plan_changed = None
+        if changed is not None and changed.rowcount == 1:
+            plan_changed = await db.execute(
+                update(Plan)
+                .where(
+                    Plan.id == plan_id,
+                    Plan.active_run_id == run_id,
+                    Plan.lock_version == expected_plan_lock_version,
+                )
+                .values(
+                    lock_version=Plan.lock_version + 1,
+                    updated_at=now,
+                )
+            )
+        input_changed = None
+        if (
+            changed.rowcount == 1
+            and plan_changed is not None
+            and plan_changed.rowcount == 1
+            and expected_input_request_id is not None
+        ):
+            input_changed = await db.execute(
+                update(PlanInputRequest)
+                .where(
+                    PlanInputRequest.id == expected_input_request_id,
+                    PlanInputRequest.run_id == run_id,
+                    PlanInputRequest.status.in_(["prepared", "open"]),
+                )
+                .values(status="cancelled", cancelled_at=now)
+            )
+        input_won = expected_input_request_id is None or (
+            input_changed is not None and input_changed.rowcount == 1
+        )
+        if (
+            changed.rowcount == 1
+            and plan_changed is not None
+            and plan_changed.rowcount == 1
+            and input_won
+        ):
+            await db.commit()
+            fenced = await db.get(
+                PlanAgentRun,
+                run_id,
+                populate_existing=True,
+            )
+            if fenced is None:
+                raise HTTPException(
+                    409,
+                    "Plan Run disappeared after fencing cancellation",
+                )
+            return fenced
+
+        await db.rollback()
+        if attempt + 1 >= LOCAL_CANCELLATION_FENCE_ATTEMPTS:
+            break
+        run = await db.get(
+            PlanAgentRun,
+            run_id,
+            populate_existing=True,
+        )
+        plan = await db.get(
+            Plan,
+            plan_id,
+            populate_existing=True,
+        )
+        if run is None or plan is None or run.plan_id != plan.id:
+            await db.rollback()
+            raise HTTPException(409, "Plan Run changed while fencing cancellation")
+
+    await db.rollback()
+    raise HTTPException(409, "Plan Run changed while fencing cancellation")
 
 
 async def release_capability_run_owner_after_cleanup(

@@ -356,5 +356,12 @@ def _configure_task_properties():
         .correlate(Task.__table__)
         .scalar_subquery()
     )
+    Task.delivery_terminal = column_property(
+        select(delivery_runs.c.policy_snapshot["terminal"].as_string())
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
 
 _configure_task_properties()

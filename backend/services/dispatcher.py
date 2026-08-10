@@ -5392,6 +5392,7 @@ class GlobalDispatcher:
         if worker_proxy is None:
             return
         from backend.models.worker import Worker as WorkerModel
+        from backend.services.plan_service import fence_plan_worker
         from backend.services.worker_proxy import get_task_operation_lock
 
         async with self.db_factory() as db:
@@ -5528,18 +5529,6 @@ class GlobalDispatcher:
                 )
             if not worker or worker.status != "ready":
                 continue  # worker 没就绪，留在 pending 等下轮
-            # Check worker concurrency limit
-            async with self.db_factory() as db:
-                running_on_worker = (
-                    await db.execute(
-                        select(func.count(Task.id)).where(
-                            Task.worker_id == worker.id,
-                            Task.status.in_(["in_progress", "executing"]),
-                        )
-                    )
-                ).scalar() or 0
-            if running_on_worker >= worker.max_tasks:
-                continue  # worker 已满，留在 pending 等下轮
             # 与本地路径一致：把 project.local_path 写进 target_repo——
             # 否则迁回本机后 chat 解析不出 cwd（实测 task 58 教训）
             if task.project_id and not task.target_repo:
@@ -5573,6 +5562,69 @@ class GlobalDispatcher:
             # a save that loses observes ``in_progress`` and is rejected.
             async with get_task_operation_lock(task.id):
                 async with self.db_factory() as db:
+                    # Worker capacity is shared by ordinary Tasks and
+                    # first-class Plan Runs.  Take the exact Task writer fence
+                    # first, then the Worker lifecycle/capacity fence, matching
+                    # Worker destruction and Plan admission across processes.
+                    # The final status CAS remains in this same transaction, so
+                    # a competing Task/Plan claim cannot pass the COUNT boundary
+                    # before this claim becomes visible.
+                    task_fenced = await db.execute(
+                        update(Task)
+                        .where(
+                            *self._task_status_generation_predicates(
+                                pending_generation
+                            ),
+                            Task.mode != "plan",
+                            Task.worker_id == pending_generation.worker_id,
+                            Task.shared_from_id.is_(None),
+                            task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
+                        )
+                        .values(status=Task.status)
+                    )
+                    if task_fenced.rowcount != 1:
+                        await db.rollback()
+                        continue
+                    try:
+                        await fence_plan_worker(
+                            db,
+                            worker_id=pending_generation.worker_id,
+                        )
+                    except HTTPException:
+                        await db.rollback()
+                        continue
+                    locked_worker = await db.get(
+                        WorkerModel,
+                        pending_generation.worker_id,
+                        populate_existing=True,
+                    )
+                    if locked_worker is None or locked_worker.status != "ready":
+                        await db.rollback()
+                        continue
+                    running_tasks = int(
+                        await db.scalar(
+                            select(func.count(Task.id)).where(
+                                Task.worker_id == locked_worker.id,
+                                Task.status.in_(["in_progress", "executing"]),
+                            )
+                        )
+                        or 0
+                    )
+                    running_plans = int(
+                        await db.scalar(
+                            select(func.count(PlanAgentRun.id)).where(
+                                PlanAgentRun.worker_id == locked_worker.id,
+                                PlanAgentRun.status.in_(
+                                    ("running", "cancelling")
+                                ),
+                            )
+                        )
+                        or 0
+                    )
+                    if running_tasks + running_plans >= locked_worker.max_tasks:
+                        await db.rollback()
+                        continue
                     claimed = await db.execute(
                         update(Task)
                         .where(
@@ -5580,7 +5632,7 @@ class GlobalDispatcher:
                                 pending_generation
                             ),
                             Task.mode != "plan",
-                            Task.worker_id == worker.id,
+                            Task.worker_id == locked_worker.id,
                             Task.shared_from_id.is_(None),
                             task_retry_not_superseded_predicate(),
                             no_active_worker_task_termination_predicate(),
@@ -5829,20 +5881,37 @@ class GlobalDispatcher:
                     worker = await db.get(Worker, current.worker_id)
                     if worker is None or worker.status != "ready":
                         continue
+                    # Routing reads above are only a cheap candidate filter.
+                    # End their SQLite WAL snapshot before the Task writer
+                    # fence, then re-lock and revalidate the aggregate below.
+                    # Holding Task -> Worker first remains compatible with
+                    # Worker destruction; every Plan outcome writer then uses
+                    # the canonical Run -> Plan -> receipt order.
+                    target_task_id = plan.target_task_id
+                    worker_id = worker.id
+                    await db.commit()
                     try:
                         await fence_plan_target_task(
                             db,
-                            target_task_id=plan.target_task_id,
-                            expected_worker_id=worker.id,
+                            target_task_id=target_task_id,
+                            expected_worker_id=worker_id,
                         )
-                        await fence_plan_worker(db, worker_id=worker.id)
+                        await fence_plan_worker(db, worker_id=worker_id)
                     except HTTPException:
                         # Worker destruction won the Task -> Worker fence.
+                        continue
+                    worker = await db.get(
+                        Worker,
+                        worker_id,
+                        populate_existing=True,
+                    )
+                    if worker is None or worker.status != "ready":
+                        await db.rollback()
                         continue
                     running_tasks = int(
                         await db.scalar(
                             select(func.count(Task.id)).where(
-                                Task.worker_id == worker.id,
+                                Task.worker_id == worker_id,
                                 Task.status.in_(["in_progress", "executing"]),
                             )
                         )
@@ -5851,16 +5920,45 @@ class GlobalDispatcher:
                     running_plans = int(
                         await db.scalar(
                             select(func.count(PlanAgentRun.id)).where(
-                                PlanAgentRun.worker_id == worker.id,
-                                PlanAgentRun.status == "running",
+                                PlanAgentRun.worker_id == worker_id,
+                                PlanAgentRun.status.in_(
+                                    ("running", "cancelling")
+                                ),
                             )
                         )
                         or 0
                     )
                     if running_tasks + running_plans >= worker.max_tasks:
+                        await db.rollback()
+                        continue
+                    current = await db.get(
+                        PlanAgentRun,
+                        run_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if current is None:
+                        await db.rollback()
+                        continue
+                    plan = await db.get(
+                        Plan,
+                        plan_id,
+                        with_for_update=True,
+                        populate_existing=True,
+                    )
+                    if (
+                        plan is None
+                        or current.plan_id != plan_id
+                        or current.status != "queued"
+                        or current.worker_id != worker_id
+                        or plan.worker_id != worker_id
+                        or plan.target_task_id != target_task_id
+                        or plan.active_run_id != current.id
+                        or plan.archived_at is not None
+                    ):
+                        await db.rollback()
                         continue
                     generation = current.generation
-                    worker_id = current.worker_id
                     receipt = await load_worker_dispatch_receipt(
                         db,
                         run_id=run_id,
@@ -5898,8 +5996,10 @@ class GlobalDispatcher:
                     if claimed.rowcount != 1:
                         await db.rollback()
                         continue
-                    await db.commit()
                     receipt_id = receipt.id
+                    claimed_stage = current.current_stage
+                    claimed_round = current.round
+                    await db.commit()
             lifecycle = asyncio.create_task(
                 self._run_worker_plan_lifecycle(
                     plan_id=plan_id,
@@ -5918,8 +6018,8 @@ class GlobalDispatcher:
                 plan_id=plan_id,
                 run_id=run_id,
                 status="running",
-                stage=current.current_stage,
-                round_number=current.round,
+                stage=claimed_stage,
+                round_number=claimed_round,
             )
 
     @staticmethod
@@ -6246,6 +6346,34 @@ class GlobalDispatcher:
             WorkerPlanRemoteIdentityConflict,
         )
 
+        async def finish_settlement(settlement, *, outcome: str) -> bool:
+            """Re-arm cold recovery unless one exact settlement completed.
+
+            The cold scan clears its retry schedule after registering this
+            lifecycle.  A temporary Task termination fence or another process
+            winning the Run/receipt lock must therefore trigger one more scan.
+            That scan safely converges a real winner, while an unchanged
+            ``running + remote_possible`` row remains durably retried.
+            """
+
+            try:
+                settled = await settlement
+            except asyncio.CancelledError:
+                if self._running and not self._shutting_down:
+                    self._request_plan_runtime_recovery()
+                raise
+            except Exception as exc:
+                settled = False
+                logger.warning(
+                    "Worker Plan Run %s %s settlement remains pending: %s",
+                    run_id,
+                    outcome,
+                    exc,
+                )
+            if not settled and self._running and not self._shutting_down:
+                self._request_plan_runtime_recovery()
+            return settled
+
         try:
             async with self.db_factory() as db:
                 run = await db.get(PlanAgentRun, run_id, populate_existing=True)
@@ -6316,30 +6444,39 @@ class GlobalDispatcher:
                 round_number=round_number,
             )
         except WorkerPlanRemoteAbsent:
-            await self._settle_absent_worker_plan_run(
-                plan_id=plan_id,
-                run_id=run_id,
-                worker_id=worker_id,
-                generation=generation,
-                receipt_id=receipt_id,
+            await finish_settlement(
+                self._settle_absent_worker_plan_run(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=receipt_id,
+                ),
+                outcome="remote-absent",
             )
         except WorkerPlanRemoteCancelled:
-            await self._settle_cancelled_worker_plan_run(
-                plan_id=plan_id,
-                run_id=run_id,
-                worker_id=worker_id,
-                generation=generation,
-                receipt_id=receipt_id,
-                payload_digest=payload_digest,
+            await finish_settlement(
+                self._settle_cancelled_worker_plan_run(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=receipt_id,
+                    payload_digest=payload_digest,
+                ),
+                outcome="remote-cancelled",
             )
         except WorkerPlanRemoteIdentityConflict as exc:
-            await self._fail_conflicting_worker_plan_run(
-                plan_id=plan_id,
-                run_id=run_id,
-                worker_id=worker_id,
-                generation=generation,
-                receipt_id=receipt_id,
-                error=str(exc),
+            await finish_settlement(
+                self._fail_conflicting_worker_plan_run(
+                    plan_id=plan_id,
+                    run_id=run_id,
+                    worker_id=worker_id,
+                    generation=generation,
+                    receipt_id=receipt_id,
+                    error=str(exc),
+                ),
+                outcome="identity-conflict",
             )
         except asyncio.CancelledError:
             if self._running and not self._shutting_down:
@@ -6471,7 +6608,7 @@ class GlobalDispatcher:
         generation: int,
         receipt_id: int,
         payload_digest: str,
-    ) -> None:
+    ) -> bool:
         """Terminalize a running mirror after audit found exact tombstone."""
 
         from backend.services.plan_service import plan_operation_lock
@@ -6491,7 +6628,7 @@ class GlobalDispatcher:
                 )
                 if frozen_receipt is None:
                     await db.rollback()
-                    return
+                    return False
                 try:
                     await fence_worker_dispatch_target(
                         db,
@@ -6516,10 +6653,10 @@ class GlobalDispatcher:
                     )
                 except (HTTPException, WorkerPlanDispatchConflict):
                     await db.rollback()
-                    return
+                    return False
                 plan = await db.get(Plan, plan_id, populate_existing=True)
                 if plan is None:
-                    return
+                    return True
                 stage = run.current_stage
                 round_number = run.round
         await self._broadcast_worker_plan_run(
@@ -6529,6 +6666,7 @@ class GlobalDispatcher:
             stage=stage,
             round_number=round_number,
         )
+        return True
 
     async def _settle_absent_worker_plan_run(
         self,
@@ -6538,7 +6676,7 @@ class GlobalDispatcher:
         worker_id: int,
         generation: int,
         receipt_id: int,
-    ) -> None:
+    ) -> bool:
         """Requeue only after exact Worker audit returned ``absent``."""
 
         from backend.services.plan_service import plan_operation_lock
@@ -6556,7 +6694,7 @@ class GlobalDispatcher:
                 )
                 if frozen_receipt is None:
                     await db.rollback()
-                    return
+                    return False
                 await fence_worker_dispatch_target(
                     db,
                     receipt=frozen_receipt,
@@ -6590,7 +6728,7 @@ class GlobalDispatcher:
                     or receipt.status != "remote_possible"
                 ):
                     await db.rollback()
-                    return
+                    return False
                 settle_worker_dispatch_receipt(
                     receipt=receipt,
                     plan=plan,
@@ -6621,6 +6759,7 @@ class GlobalDispatcher:
             stage=stage,
             round_number=round_number,
         )
+        return True
 
     async def _fail_conflicting_worker_plan_run(
         self,
@@ -6631,7 +6770,7 @@ class GlobalDispatcher:
         generation: int,
         receipt_id: int,
         error: str,
-    ) -> None:
+    ) -> bool:
         """Terminalize only an audit-proven immutable identity collision."""
 
         from backend.services.plan_service import plan_operation_lock
@@ -6649,7 +6788,7 @@ class GlobalDispatcher:
                 )
                 if frozen_receipt is None:
                     await db.rollback()
-                    return
+                    return False
                 await fence_worker_dispatch_target(
                     db,
                     receipt=frozen_receipt,
@@ -6683,7 +6822,7 @@ class GlobalDispatcher:
                     or receipt.status != "remote_possible"
                 ):
                     await db.rollback()
-                    return
+                    return False
                 settle_worker_dispatch_receipt(
                     receipt=receipt,
                     plan=plan,
@@ -6718,6 +6857,7 @@ class GlobalDispatcher:
             stage=stage,
             round_number=round_number,
         )
+        return True
 
     async def _broadcast_worker_plan_run(
         self,
@@ -11645,6 +11785,10 @@ class GlobalDispatcher:
                             db,
                             reviewer_run_id=reviewer_run_id,
                             task_id=task.id,
+                            expected_status=current.status,
+                            retry_count=current.retry_count,
+                            expected_started_at=current.started_at,
+                            expected_completed_at=current.completed_at,
                             error=error,
                         )
                         if changed_review_id:

@@ -240,6 +240,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     () => filterDeliveryRepos(selectedProject, monitoredRepos),
     [monitoredRepos, selectedProject],
   );
+  const selectedDeliveryRepo = compatibleDeliveryRepos.find(
+    (repo) => repo.id === deliveryRepoId,
+  );
   const remoteTaskScope = Boolean(workerId)
     || selectedProject?.worker_id != null;
   const autoCapabilityEligible = autoCapabilityAvailable
@@ -849,15 +852,22 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                 {deliveryReposLoading ? 'Loading repositories…' : 'Select a compatible repository…'}
               </option>
               {compatibleDeliveryRepos.map((repo) => (
-                <option key={repo.id} value={repo.id}>{repo.repo_full_name}</option>
+                <option key={repo.id} value={repo.id}>
+                  {repo.repo_full_name} · {repo.auto_merge ? 'auto merge' : 'ready to merge only'}
+                </option>
               ))}
             </select>
           </label>
           <p className="text-[11px] leading-relaxed text-indigo-200/70">
             Requires a local project and an enabled PR Monitor using panel review,
-            exact-head required CI checks, manual merge, and no Merge Queue. The
-            loop stops at ready to merge; it never merges automatically.
+            exact-head required CI checks, and no Merge Queue. Merge behavior is
+            inherited from the selected PR Monitor.
           </p>
+          {selectedDeliveryRepo && (
+            <p className="text-[11px] leading-relaxed text-indigo-200/90">
+              PR Monitor Auto Merge is {selectedDeliveryRepo.auto_merge ? 'ON: CCM will finish only after GitHub confirms the merge.' : 'OFF: CCM will stop when the PR is ready to merge.'}
+            </p>
+          )}
           {!deliveryReposLoading && selectedProject && compatibleDeliveryRepos.length === 0 && (
             <p className="text-xs text-amber-300">
               No compatible PR Monitor configuration is bound to this project.

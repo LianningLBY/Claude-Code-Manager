@@ -186,8 +186,13 @@ def _response(
     has_active_delivery_action: bool = False,
 ) -> DeliveryRunResponse:
     payload = DeliveryRunResponse.model_validate(run)
+    policy = run.policy_snapshot if isinstance(run.policy_snapshot, dict) else {}
+    terminal = policy.get("terminal")
+    if terminal not in {"ready_to_merge", "merged"}:
+        terminal = None
     return payload.model_copy(
         update={
+            "terminal": terminal,
             "allowed_actions": _allowed_actions(
                 run,
                 has_active_controller_capability=has_active_controller_capability,

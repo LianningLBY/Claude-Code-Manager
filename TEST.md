@@ -812,7 +812,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 
 | 测试 | 验证内容 |
 |------|---------|
-| `test_build_review_prompt_auto_merge_on` / `..._off` | auto_merge 开关影响 prompt（是否含 `gh pr merge`） |
+| `test_build_review_prompt_*` | Reviewer prompt 始终禁止 Agent 执行 `gh pr merge`；合并权限只在后端 |
+| `test_publish_auto_merge_*` / `test_publish_merged_comment_*` | OFF 只发布 ready-to-merge Review；ON 固定 head merge，并以 nonce/head/actor/time 对账最终 merged comment；merge/comment ACK 丢失均不重复写 |
+| `test_delivery_durable_publication_*` | Delivery publication 只能恢复 Run 冻结的 merge policy，错配 outbox fail closed |
 | `test_create_pr_review_task_happy_path` | 创建 PRReview + Task 并广播 `review_created` |
 | `test_create_pr_review_task_broadcast_failure_logged_not_raised` | 广播失败 → logger.warning，不中断流程 |
 | `test_check_and_update_review_merged` / `..._approved` / `..._changes_requested` | gh 状态映射 merged/approved/commented |
@@ -1252,8 +1254,8 @@ proxy 全部失败；sandbox loopback bind/self-connect 仅在隔离 netns 内�
 不暴露给宿主。缺少 CLI、版本不足或非 Linux 时对应用例跳过。
 
 真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
-一次性 canary 仓库执行；V1 的成功终点必须是 `ready_to_merge`，不得自动
-merge 或 deploy。
+一次性 canary 仓库执行。`auto_merge=false` 的成功终点必须是 `ready_to_merge`；
+`auto_merge=true` 会真实合并，只能在明确授权的 disposable canary 验证。两种模式都不得 deploy。
 
 ## Auto Capability policy、terminal admission 与 durable resume
 

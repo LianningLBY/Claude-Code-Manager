@@ -70,6 +70,8 @@ class DeliveryRunResponse(BaseModel):
     phase: str
     activity: str
     outcome: str | None
+    # Frozen completion policy selected from the PR Monitor at admission.
+    terminal: Literal["ready_to_merge", "merged"] | None = None
     wait_reason: str | None
     pause_reason: str | None
     error_code: str | None

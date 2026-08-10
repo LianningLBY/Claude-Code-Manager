@@ -74,6 +74,9 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
     ),
     [monitoredRepos, project, projectId],
   );
+  const selectedDeliveryRepo = compatibleDeliveryRepos.find(
+    (repo) => repo.id === deliveryRepoId,
+  );
 
   // Track in-flight mutations per row. A single scalar would let one row's
   // completion clear another row's busy flag mid-flight and allow double-submits.
@@ -561,9 +564,16 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
                   >
                     <option value="">Select a compatible repository…</option>
                     {compatibleDeliveryRepos.map((repo) => (
-                      <option key={repo.id} value={repo.id}>{repo.repo_full_name}</option>
+                      <option key={repo.id} value={repo.id}>
+                        {repo.repo_full_name} · {repo.auto_merge ? 'auto merge' : 'ready to merge only'}
+                      </option>
                     ))}
                   </select>
+                  {selectedDeliveryRepo && (
+                    <span className="block text-xs text-gray-400">
+                      PR Monitor Auto Merge is {selectedDeliveryRepo.auto_merge ? 'ON; completion waits for GitHub to confirm the merge.' : 'OFF; completion stops when the PR is ready to merge.'}
+                    </span>
+                  )}
                   {compatibleDeliveryRepos.length === 0 && (
                     <span className="block text-xs text-amber-300">
                       This project has no compatible panel-review PR Monitor with required CI checks.

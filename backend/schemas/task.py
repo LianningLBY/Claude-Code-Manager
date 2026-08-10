@@ -380,6 +380,7 @@ class TaskResponse(BaseModel):
     delivery_phase: str | None = None
     delivery_activity: str | None = None
     delivery_outcome: str | None = None
+    delivery_terminal: str | None = None
     todo_file_path: str | None
     loop_progress: str | None
     max_iterations: int

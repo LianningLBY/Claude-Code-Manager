@@ -30,6 +30,7 @@ from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
 from backend.models.task import Task
+from backend.schemas.pr_monitor import required_checks_support_direct_auto_merge
 from backend.services.delivery_reducer import (
     DeliveryReducerEvent,
     DeliveryState,
@@ -537,9 +538,9 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Project GitHub remote must exactly match the monitored repository"
         )
-    if repo.auto_merge or (repo.merge_queue_mode or "manual") != "manual":
+    if (repo.merge_queue_mode or "manual") != "manual":
         raise DeliveryValidationError(
-            "Delivery Loop V1 requires manual merge and Merge Queue disabled"
+            "Delivery Loop requires Merge Queue disabled"
         )
     if (
         (repo.review_mode or "single") != "panel"
@@ -549,6 +550,13 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Delivery Loop requires PR Monitor panel review with exact-head "
             "required CI checks"
+        )
+    if repo.auto_merge and not required_checks_support_direct_auto_merge(
+        repo.required_checks
+    ):
+        raise DeliveryValidationError(
+            "Delivery auto-merge requires app-bound check_run required CI "
+            "policies"
         )
     source_todo: ProjectTodo | None = None
     if spec.source_todo_id is not None:
@@ -585,10 +593,11 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Delivery base branch must match the PR Monitor default branch"
         )
+    auto_merge = bool(repo.auto_merge)
     policy = {
         "schema_version": 1,
-        "terminal": "ready_to_merge",
-        "auto_merge": False,
+        "terminal": "merged" if auto_merge else "ready_to_merge",
+        "auto_merge": auto_merge,
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
         "provider": resolved_provider,

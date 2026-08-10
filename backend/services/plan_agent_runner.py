@@ -314,6 +314,22 @@ class PlanPipelineResult:
     run_id: int
 
 
+@dataclass(frozen=True, slots=True)
+class _ProviderEffectGraphProbe:
+    """Scalar routing identity frozen before the provider-effect fence."""
+
+    project_id: int | None
+    plan_target_task_id: int | None
+    target_task_id: int | None
+    target_task_incarnation_id: str | None
+    target_task_project_id: int | None
+    target_task_worker_id: int | None
+    run_id: int
+    plan_id: int | None
+    plan_task_id: int | None
+    instance_id: int | None
+
+
 @dataclass
 class _RetainedProcess:
     process: asyncio.subprocess.Process
@@ -1405,25 +1421,11 @@ class PlanAgentRunner:
                 provider=provider,
             )
 
-        async def validate_graph(db, *, lock: bool) -> tuple[int | None, Task | None]:
-            receipt = await db.get(
-                PlanAgentRuntimeReceipt,
-                runtime_receipt.id,
-                with_for_update=lock,
-                populate_existing=True,
-            )
-            step = await db.get(
-                PlanAgentStep,
-                runtime_receipt.step_id,
-                with_for_update=lock,
-                populate_existing=True,
-            )
-            run = await db.get(
-                PlanAgentRun,
-                runtime_receipt.run_id,
-                with_for_update=lock,
-                populate_existing=True,
-            )
+        def validate_runtime_rows(
+            receipt: PlanAgentRuntimeReceipt | None,
+            step: PlanAgentStep | None,
+            run: PlanAgentRun | None,
+        ) -> None:
             if (
                 receipt is None
                 or step is None
@@ -1447,11 +1449,29 @@ class PlanAgentRunner:
                     provider=provider,
                 )
 
+        async def probe_graph(db) -> _ProviderEffectGraphProbe:
+            receipt = await db.get(
+                PlanAgentRuntimeReceipt,
+                runtime_receipt.id,
+                populate_existing=True,
+            )
+            step = await db.get(
+                PlanAgentStep,
+                runtime_receipt.step_id,
+                populate_existing=True,
+            )
+            run = await db.get(
+                PlanAgentRun,
+                runtime_receipt.run_id,
+                populate_existing=True,
+            )
+            validate_runtime_rows(receipt, step, run)
+            assert step is not None and run is not None
+
             if run.plan_id is None:
                 parent_task = await db.get(
                     Task,
                     run.plan_task_id,
-                    with_for_update=lock,
                     populate_existing=True,
                 )
                 if (
@@ -1465,29 +1485,52 @@ class PlanAgentRunner:
                         "Legacy Plan Task ownership changed before provider admission",
                         provider=provider,
                     )
-                return parent_task.project_id, parent_task
+                return _ProviderEffectGraphProbe(
+                    project_id=parent_task.project_id,
+                    plan_target_task_id=None,
+                    target_task_id=parent_task.id,
+                    target_task_incarnation_id=parent_task.incarnation_id,
+                    target_task_project_id=parent_task.project_id,
+                    target_task_worker_id=parent_task.worker_id,
+                    run_id=run.id,
+                    plan_id=None,
+                    plan_task_id=run.plan_task_id,
+                    instance_id=None,
+                )
 
             plan = await db.get(
                 Plan,
                 run.plan_id,
-                with_for_update=lock,
                 populate_existing=True,
+            )
+            if (
+                plan is not None
+                and plan.target_task_id is not None
+                and run.plan_task_id is not None
+                and plan.target_task_id != run.plan_task_id
+            ):
+                raise PlanAgentError(
+                    "Plan Run has conflicting Task owners before provider admission",
+                    provider=provider,
+                )
+            fenced_task_id = (
+                plan.target_task_id
+                if plan is not None and plan.target_task_id is not None
+                else run.plan_task_id
             )
             target_task = (
                 await db.get(
                     Task,
-                    plan.target_task_id,
-                    with_for_update=lock,
+                    fenced_task_id,
                     populate_existing=True,
                 )
-                if plan is not None and plan.target_task_id is not None
+                if fenced_task_id is not None
                 else None
             )
             owner = (
                 await db.get(
                     Instance,
                     run.instance_id,
-                    with_for_update=lock,
                     populate_existing=True,
                 )
                 if run.instance_id is not None
@@ -1509,7 +1552,7 @@ class PlanAgentRunner:
                     "Plan Run lost its exact local Instance owner before provider admission",
                     provider=provider,
                 )
-            if plan.target_task_id is not None and (
+            if fenced_task_id is not None and (
                 target_task is None
                 or target_task.project_id != plan.project_id
             ):
@@ -1519,13 +1562,213 @@ class PlanAgentRunner:
                 )
             # A first-class Plan never inherits Task SSH authority.  It is an
             # independent read-only principal even when it references a Task.
-            return plan.project_id, None
+            return _ProviderEffectGraphProbe(
+                project_id=plan.project_id,
+                plan_target_task_id=plan.target_task_id,
+                target_task_id=fenced_task_id,
+                target_task_incarnation_id=(
+                    target_task.incarnation_id if target_task is not None else None
+                ),
+                target_task_project_id=(
+                    target_task.project_id if target_task is not None else None
+                ),
+                target_task_worker_id=(
+                    target_task.worker_id if target_task is not None else None
+                ),
+                run_id=run.id,
+                plan_id=plan.id,
+                plan_task_id=run.plan_task_id,
+                instance_id=run.instance_id,
+            )
+
+        async def lock_and_validate_graph(
+            db,
+            probe: _ProviderEffectGraphProbe,
+        ) -> Task | None:
+            """Lock the exact graph in Task deletion/completion order."""
+
+            from backend.services.worker_task_termination import (
+                no_active_worker_task_termination_predicate,
+            )
+
+            target_task = None
+            if probe.target_task_id is not None:
+                incarnation_predicate = (
+                    Task.incarnation_id.is_(None)
+                    if probe.target_task_incarnation_id is None
+                    else Task.incarnation_id == probe.target_task_incarnation_id
+                )
+                project_predicate = (
+                    Task.project_id.is_(None)
+                    if probe.target_task_project_id is None
+                    else Task.project_id == probe.target_task_project_id
+                )
+                worker_predicate = (
+                    Task.worker_id.is_(None)
+                    if probe.target_task_worker_id is None
+                    else Task.worker_id == probe.target_task_worker_id
+                )
+                fenced_task = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == probe.target_task_id,
+                        incarnation_predicate,
+                        project_predicate,
+                        worker_predicate,
+                        Task.status != "migrating",
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                    .execution_options(synchronize_session=False)
+                )
+                if fenced_task.rowcount != 1:
+                    raise PlanAgentError(
+                        "Plan target Task changed before provider admission",
+                        provider=provider,
+                    )
+                target_task = await db.get(
+                    Task,
+                    probe.target_task_id,
+                    populate_existing=True,
+                )
+
+            run_plan_predicate = (
+                PlanAgentRun.plan_id.is_(None)
+                if probe.plan_id is None
+                else PlanAgentRun.plan_id == probe.plan_id
+            )
+            run_task_predicate = (
+                PlanAgentRun.plan_task_id.is_(None)
+                if probe.plan_task_id is None
+                else PlanAgentRun.plan_task_id == probe.plan_task_id
+            )
+            run_instance_predicate = (
+                PlanAgentRun.instance_id.is_(None)
+                if probe.instance_id is None
+                else PlanAgentRun.instance_id == probe.instance_id
+            )
+            fenced_run = await db.execute(
+                update(PlanAgentRun)
+                .where(
+                    PlanAgentRun.id == probe.run_id,
+                    run_plan_predicate,
+                    run_task_predicate,
+                    run_instance_predicate,
+                    PlanAgentRun.generation == runtime_receipt.run_generation,
+                )
+                .values(updated_at=PlanAgentRun.updated_at)
+                .execution_options(synchronize_session=False)
+            )
+            if fenced_run.rowcount != 1:
+                raise PlanAgentError(
+                    "Plan Run changed before provider admission",
+                    provider=provider,
+                )
+
+            # Runtime preparation locks Step -> Receipt. Provider admission,
+            # completion, recovery, and Task deletion all use the canonical
+            # Run -> Plan -> Step -> Receipt order so no pair can deadlock.
+            run = await db.get(
+                PlanAgentRun,
+                probe.run_id,
+                with_for_update=True,
+                populate_existing=True,
+            )
+            plan = (
+                await db.get(
+                    Plan,
+                    probe.plan_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if probe.plan_id is not None
+                else None
+            )
+            step = await db.get(
+                PlanAgentStep,
+                runtime_receipt.step_id,
+                with_for_update=True,
+                populate_existing=True,
+            )
+            receipt = await db.get(
+                PlanAgentRuntimeReceipt,
+                runtime_receipt.id,
+                with_for_update=True,
+                populate_existing=True,
+            )
+            owner = (
+                await db.get(
+                    Instance,
+                    probe.instance_id,
+                    with_for_update=True,
+                    populate_existing=True,
+                )
+                if probe.instance_id is not None
+                else None
+            )
+            validate_runtime_rows(receipt, step, run)
+            assert run is not None
+
+            if probe.plan_id is None:
+                if (
+                    target_task is None
+                    or target_task.id != probe.target_task_id
+                    or target_task.incarnation_id
+                    != probe.target_task_incarnation_id
+                    or target_task.project_id != probe.target_task_project_id
+                    or target_task.worker_id != probe.target_task_worker_id
+                    or run.plan_id is not None
+                    or run.plan_task_id != task_id
+                    or task_id <= 0
+                    or run.status not in {"planning", "reviewing"}
+                    or target_task.status not in {"in_progress", "executing"}
+                ):
+                    raise PlanAgentError(
+                        "Legacy Plan Task ownership changed before provider admission",
+                        provider=provider,
+                    )
+                return target_task
+
+            if (
+                plan is None
+                or plan.id != probe.plan_id
+                or plan.project_id != probe.project_id
+                or plan.target_task_id != probe.plan_target_task_id
+                or task_id != -run.id
+                or run.plan_id != plan.id
+                or run.plan_task_id != probe.plan_task_id
+                or run.status != "running"
+                or run.worker_id is not None
+                or plan.worker_id is not None
+                or plan.active_run_id != run.id
+                or owner is None
+                or owner.id != probe.instance_id
+                or owner.current_plan_run_id != run.id
+                or owner.current_task_id is not None
+                or owner.pid is not None
+                or step is None
+                or step.plan_id != plan.id
+            ):
+                raise PlanAgentError(
+                    "Plan Run lost its exact local Instance owner before provider admission",
+                    provider=provider,
+                )
+            if probe.target_task_id is not None and (
+                target_task is None
+                or target_task.id != probe.target_task_id
+                or target_task.incarnation_id != probe.target_task_incarnation_id
+                or target_task.project_id != probe.target_task_project_id
+                or target_task.worker_id != probe.target_task_worker_id
+                or target_task.project_id != plan.project_id
+            ):
+                raise PlanAgentError(
+                    "Plan target Task changed Project before provider admission",
+                    provider=provider,
+                )
+            return None
 
         async with self.db_factory() as probe_db:
-            project_id, _parent_task = await validate_graph(
-                probe_db,
-                lock=False,
-            )
+            probe = await probe_graph(probe_db)
             await probe_db.rollback()
 
         from backend.services.project_share_admission import (
@@ -1535,23 +1778,16 @@ class PlanAgentRunner:
         from backend.services.task_ssh_access import task_ssh_protected_paths
 
         async with self.db_factory() as boundary_db:
-            if project_id is not None:
-                await lock_project_share_authority(boundary_db, project_id)
-            current_project_id, parent_task = await validate_graph(
-                boundary_db,
-                lock=True,
-            )
-            if current_project_id != project_id:
-                raise PlanAgentError(
-                    "Plan Project changed before provider admission",
-                    provider=provider,
-                )
+            if probe.project_id is not None:
+                await lock_project_share_authority(boundary_db, probe.project_id)
+            parent_task = await lock_and_validate_graph(boundary_db, probe)
             if (
-                project_id is not None
-                and await project_has_active_share(boundary_db, project_id)
+                probe.project_id is not None
+                and await project_has_active_share(boundary_db, probe.project_id)
             ):
                 raise PlanAgentError(
-                    f"Plan Agent execution is disabled while Project {project_id} is shared",
+                    "Plan Agent execution is disabled while Project "
+                    f"{probe.project_id} is shared",
                     provider=provider,
                 )
             protected_paths = await task_ssh_protected_paths(

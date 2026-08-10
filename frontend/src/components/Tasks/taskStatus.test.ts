@@ -11,6 +11,7 @@ function deliveryTask(overrides: Partial<Task>): Task {
     delivery_phase: 'planning',
     delivery_activity: 'waiting',
     delivery_outcome: null,
+    delivery_terminal: 'ready_to_merge',
     background_active: false,
     ...overrides,
   } as Task;
@@ -28,6 +29,16 @@ describe('getTaskStatusLabel Delivery projection', () => {
       delivery_outcome: 'success',
       status: 'completed',
     }))).toBe('Ready to Merge');
+  });
+
+  it('renders an auto-merge terminal as merged', () => {
+    expect(getTaskStatusLabel(deliveryTask({
+      delivery_phase: 'done',
+      delivery_activity: 'terminal',
+      delivery_outcome: 'success',
+      delivery_terminal: 'merged',
+      status: 'completed',
+    }))).toBe('Merged');
   });
 
   it('keeps a failed Delivery terminal explicit', () => {

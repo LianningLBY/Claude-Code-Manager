@@ -9,7 +9,8 @@ the caller keeps the target Task generation fence and owns the transaction.
 
 The caller must already hold the target Task lock and the Task's Capability
 Invocation -> Execution -> ResumeOutbox locks.  The next database lock order
-is Run -> Plan, matching Plan completion/recovery.  All remaining children are
+is Run -> Plan -> WorkerDispatchReceipt -> Step/RuntimeReceipt -> Input,
+matching Plan answer/cancellation/completion recovery. Remaining children are
 then locked in stable primary-key order.
 """
 

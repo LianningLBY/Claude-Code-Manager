@@ -1908,6 +1908,7 @@ async def test_shared_pr_review_chat_waits_for_terminal_owner_state(
         review = PRReview(
             repo_id=repo.id,
             pr_number=1,
+            base_ref="main",
             pr_title="Shared review",
             pr_author="alice",
             pr_url="https://example.test/pr/1",

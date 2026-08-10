@@ -48,7 +48,11 @@ async def _scope(db_session, *, worker_id=None, auto_merge=False):
         auto_merge=auto_merge,
         review_mode="panel",
         wait_for_ci=True,
-        required_checks=[{"kind": "check_run", "name": "test", "app_id": 1}],
+        required_checks=[{
+            "kind": "check_run",
+            "name": "test",
+            "app_slug": "github-actions",
+        }],
         merge_queue_mode="manual",
         default_branch="main",
     )
@@ -314,20 +318,71 @@ async def test_create_delivery_run_rejects_remote_worker_scope(db_session):
 
 
 @pytest.mark.asyncio
-async def test_create_delivery_run_rejects_automatic_merge_policy(db_session):
+async def test_create_delivery_run_freezes_automatic_merge_terminal(db_session):
     project, repo = await _scope(db_session, auto_merge=True)
 
-    with pytest.raises(DeliveryValidationError, match="manual merge"):
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-auto-merge",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Merge after the Gate",
+            requirements="Merge only after the exact PR Monitor Gate passes.",
+        ),
+    )
+
+    assert run.policy_snapshot["auto_merge"] is True
+    assert run.policy_snapshot["terminal"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_admission_rejects_legacy_status_ci_policy(db_session):
+    project, repo = await _scope(db_session, auto_merge=True)
+    repo.required_checks = [{
+        "kind": "status",
+        "name": "tests",
+        "app_slug": "ci-bot",
+    }]
+    await db_session.commit()
+
+    with pytest.raises(
+        DeliveryValidationError,
+        match="app-bound check_run required CI policies",
+    ):
         await create_delivery_run(
             db_session,
             DeliveryCreateSpec(
-                idempotency_key="service-auto-merge",
+                idempotency_key="service-status-auto-merge",
                 project_id=project.id,
                 monitored_repo_id=repo.id,
-                title="No merge",
-                requirements="Stop at ready_to_merge.",
+                title="Reject late auto-merge failure",
+                requirements="Reject before any agent work is admitted.",
             ),
         )
+
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(DeliveryRun.id))) == 0
+    assert await db_session.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_create_delivery_run_freezes_manual_ready_terminal(db_session):
+    project, repo = await _scope(db_session, auto_merge=False)
+
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-manual-merge",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Wait for merge",
+            requirements="Stop after the exact PR Monitor Gate passes.",
+        ),
+    )
+
+    assert run.policy_snapshot["auto_merge"] is False
+    assert run.policy_snapshot["terminal"] == "ready_to_merge"
 
 
 @pytest.mark.asyncio

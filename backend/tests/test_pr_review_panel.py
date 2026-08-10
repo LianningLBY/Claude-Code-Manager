@@ -3,6 +3,7 @@
 import json
 import base64
 import hashlib
+from contextlib import asynccontextmanager
 from datetime import datetime
 from unittest.mock import AsyncMock, patch
 
@@ -44,6 +45,7 @@ def _context():
     return {
         "repo_name": "owner/repo",
         "pr_number": 17,
+        "base_ref": "main",
         "base_sha": BASE_SHA,
         "head_sha": HEAD_SHA,
         "guidance": {"CLAUDE.md": "Keep the gate strict.", "PROGRESS.md": None},
@@ -166,6 +168,7 @@ async def _create_recoverable_panel_run(
     review = PRReview(
         repo_id=repo.id,
         pr_number=17,
+        base_ref="main",
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
         pr_title="Recovery review",
@@ -574,10 +577,14 @@ async def test_panel_creates_three_independent_tasks_and_gates_findings(
         assert blocked.value.status_code == 409
 
     with (
-        patch(
-            "backend.services.pr_review_service._gh_authenticated_login",
-            AsyncMock(return_value="ccm-reviewer"),
-        ),
+            patch(
+                "backend.services.pr_review_service._gh_authenticated_login",
+                AsyncMock(return_value="ccm-reviewer"),
+            ),
+            patch(
+                "backend.services.pr_review_service._freeze_safe_merge_method",
+                AsyncMock(return_value="merge"),
+            ),
         patch(
             "backend.services.pr_review_service._resume_publishing_review",
             AsyncMock(),
@@ -615,6 +622,262 @@ async def test_panel_creates_three_independent_tasks_and_gates_findings(
     assert len(findings) == 1
     assert findings[0].role == "qa_engineer"
     publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_clean_panel_arms_frozen_direct_auto_merge(
+    db_session,
+    db_factory,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/repo",
+        webhook_secret="s" * 64,
+        provider="claude",
+        review_model="claude-sonnet-4-6",
+        review_mode="panel",
+        wait_for_ci=False,
+        auto_merge=True,
+        merge_queue_mode="manual",
+        default_branch="main",
+        allowed_authors=[],
+    )
+    db_session.add(repo)
+    await db_session.commit()
+    review = await pr_review_panel.create_pr_review_panel(
+        db_session,
+        repo,
+        PR_DATA,
+        prepared_context=_context(),
+    )
+    review_id = review.id
+    runs = list((await db_session.execute(
+        select(PRReviewerRun)
+        .where(PRReviewerRun.pr_review_id == review_id)
+        .order_by(PRReviewerRun.id)
+    )).scalars())
+    tasks = [await db_session.get(Task, run.task_id) for run in runs]
+    assert all(task.metadata_["pr_auto_merge"] is True for task in tasks)
+    run_task_specs = [
+        (run.id, run.role, task.id, task.retry_count)
+        for run, task in zip(runs, tasks)
+    ]
+    freeze = AsyncMock(side_effect=[
+        pr_review_service.GhError("GitHub API HTTP 503"),
+        "fast-forward",
+    ])
+
+    with (
+            patch(
+                "backend.services.pr_review_service._gh_authenticated_login",
+                AsyncMock(return_value="ccm-reviewer"),
+            ),
+            patch(
+                "backend.services.pr_review_service._freeze_safe_merge_method",
+                freeze,
+            ),
+        patch(
+            "backend.services.pr_review_service._resume_publishing_review",
+            AsyncMock(),
+        ) as publish,
+    ):
+        for run_id, role, task_id, retry_count in run_task_specs:
+            task = await db_session.get(
+                Task,
+                task_id,
+                populate_existing=True,
+            )
+            now = datetime.utcnow()
+            task.status = "completed"
+            task.started_at = now
+            task.completed_at = now
+            db_session.add(LogEntry(
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                event_type="result",
+                role="assistant",
+                content=_output(role),
+                timestamp=now,
+            ))
+            await db_session.commit()
+            result = await pr_review_panel.check_and_update_reviewer_run(
+                db_session,
+                reviewer_run_id=run_id,
+                task_id=task_id,
+                retry_count=retry_count,
+                db_factory=db_factory,
+            )
+            if role == pr_review_panel.REVIEWER_ROLES[-1]:
+                assert result is False
+                transient = await db_session.get(
+                    PRReview,
+                    review_id,
+                    populate_existing=True,
+                )
+                assert transient.status == "reviewing"
+                result = await pr_review_panel.check_and_update_reviewer_run(
+                    db_session,
+                    reviewer_run_id=run_id,
+                    task_id=task_id,
+                    retry_count=retry_count,
+                    db_factory=db_factory,
+                )
+                assert result is True
+
+    refreshed = await db_session.get(
+        PRReview,
+        review_id,
+        populate_existing=True,
+    )
+    assert refreshed.status == "publishing"
+    assert refreshed.pending_action == "approved_merged"
+    assert refreshed.merge_method == "fast-forward"
+    assert freeze.await_count == 2
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("auto_merge", "thread_status"),
+    [
+        (True, "published_inline"),
+        (True, "pending"),
+        (False, "pending"),
+    ],
+)
+async def test_clean_panel_waits_for_old_finding_threads_before_any_publication(
+    db_session,
+    db_factory,
+    auto_merge,
+    thread_status,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/repo",
+        webhook_secret="s" * 64,
+        provider="claude",
+        review_model="claude-sonnet-4-6",
+        review_mode="panel",
+        wait_for_ci=False,
+        auto_merge=auto_merge,
+        merge_queue_mode="manual",
+        default_branch="main",
+        allowed_authors=[],
+    )
+    db_session.add(repo)
+    await db_session.commit()
+    review = await pr_review_service.create_pr_review_task(
+        db_session,
+        repo,
+        PR_DATA,
+        prepared_context=_context(),
+    )
+    monitor_run = await db_session.get(PRMonitorRun, review.monitor_run_id)
+    old_review = PRReview(
+        monitor_run_id=monitor_run.id,
+        repo_id=repo.id,
+        pr_number=review.pr_number,
+        base_ref="main",
+        base_sha=BASE_SHA,
+        head_sha="c" * 40,
+        pr_title="older blocked head",
+        pr_author="alice",
+        pr_url=review.pr_url,
+        status="commented",
+        action_taken="review_comments",
+    )
+    db_session.add(old_review)
+    await db_session.flush()
+    old_reviewer = PRReviewerRun(
+        pr_review_id=old_review.id,
+        role="qa_engineer",
+        provider="claude",
+        status="changes_required",
+        prompt_policy_hash="4" * 64,
+        guide_pack_hash="5" * 64,
+    )
+    db_session.add(old_reviewer)
+    await db_session.flush()
+    db_session.add(PRFinding(
+        pr_review_id=old_review.id,
+        reviewer_run_id=old_reviewer.id,
+        fingerprint="6" * 64,
+        role="qa_engineer",
+        severity="high",
+        category="correctness",
+        path="backend/old.py",
+        line=9,
+        title="old blocking thread",
+        evidence="The old head had a race.",
+        impact="The race could lose work.",
+        required_fix="Serialize the state transition.",
+        test="Exercise the old interleaving.",
+        base_sha=BASE_SHA,
+        head_sha="c" * 40,
+        thread_nonce="7" * 48,
+        thread_status=thread_status,
+        github_comment_id=(991 if thread_status == "published_inline" else None),
+    ))
+    await db_session.commit()
+    runs = list((await db_session.execute(
+        select(PRReviewerRun)
+        .where(PRReviewerRun.pr_review_id == review.id)
+        .order_by(PRReviewerRun.id)
+    )).scalars())
+
+    with (
+        patch(
+            "backend.services.pr_review_service._gh_authenticated_login",
+            AsyncMock(return_value="ccm-reviewer"),
+        ),
+        patch(
+            "backend.services.pr_review_service._freeze_safe_merge_method",
+            AsyncMock(return_value="merge"),
+        ),
+        patch(
+            "backend.services.pr_review_service._resume_publishing_review",
+            AsyncMock(),
+        ) as publish,
+    ):
+        for reviewer_run in runs:
+            task = await db_session.get(
+                Task,
+                reviewer_run.task_id,
+                populate_existing=True,
+            )
+            now = datetime.utcnow()
+            task.status = "completed"
+            task.started_at = now
+            task.completed_at = now
+            db_session.add(LogEntry(
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                event_type="result",
+                role="assistant",
+                content=_output(reviewer_run.role),
+                timestamp=now,
+            ))
+            await db_session.commit()
+            await pr_review_panel.check_and_update_reviewer_run(
+                db_session,
+                reviewer_run_id=reviewer_run.id,
+                task_id=task.id,
+                retry_count=task.retry_count,
+                db_factory=db_factory,
+            )
+
+    current = await db_session.get(PRReview, review.id, populate_existing=True)
+    lifecycle = await db_session.get(
+        PRMonitorRun,
+        monitor_run.id,
+        populate_existing=True,
+    )
+    assert current.status == "publishing"
+    assert current.pending_action == (
+        "waiting_threads:approved_merged"
+        if auto_merge
+        else "waiting_threads:lgtm_comment"
+    )
+    assert lifecycle.status == "resolving_fixed_threads"
+    publish.assert_not_awaited()
 
 
 def test_finding_fingerprint_distinguishes_location_root_cause_and_path_case():
@@ -792,6 +1055,10 @@ async def test_reviewer_task_failure_pauses_exact_monitor_once(
         db_session,
         reviewer_run_id=reviewer_run_id,
         task_id=task_id,
+        expected_status=task.status,
+        retry_count=task.retry_count,
+        expected_started_at=task.started_at,
+        expected_completed_at=task.completed_at,
         error=failure,
     ) == review_id
     refreshed = await db_session.get(
@@ -807,6 +1074,10 @@ async def test_reviewer_task_failure_pauses_exact_monitor_once(
         db_session,
         reviewer_run_id=reviewer_run_id,
         task_id=task_id,
+        expected_status=task.status,
+        retry_count=task.retry_count,
+        expected_started_at=task.started_at,
+        expected_completed_at=task.completed_at,
         error=failure,
     ) is None
     refreshed = await db_session.get(
@@ -912,6 +1183,10 @@ async def test_panel_terminal_consumers_yield_to_active_termination_receipt(
             db_session,
             reviewer_run_id=run_id,
             task_id=task_id,
+            expected_status=task.status,
+            retry_count=task.retry_count,
+            expected_started_at=task.started_at,
+            expected_completed_at=task.completed_at,
             error="receipt owns failure arbitration",
         )
 
@@ -1047,9 +1322,58 @@ async def test_panel_startup_recovery_holds_shared_task_operation_lock(
 
 
 @pytest.mark.asyncio
+async def test_panel_failure_recovery_rejects_new_retry_generation(
+    db_session,
+    db_factory,
+):
+    review, reviewer_run, task = await _create_recoverable_panel_run(
+        db_session,
+        worker_id=None,
+    )
+    task.status = "failed"
+    await db_session.commit()
+    review_id = review.id
+    reviewer_run_id = reviewer_run.id
+    task_id = task.id
+
+    @asynccontextmanager
+    async def retry_wins_after_recovery_scan():
+        async with db_factory() as concurrent:
+            current = await concurrent.get(Task, task_id)
+            current.retry_count += 1
+            current.status = "completed"
+            current.started_at = datetime.utcnow()
+            current.completed_at = datetime.utcnow()
+            await concurrent.commit()
+        yield
+
+    with patch(
+        "backend.services.worker_proxy.get_task_operation_lock",
+        side_effect=lambda _task_id: retry_wins_after_recovery_scan(),
+    ):
+        assert await pr_review_panel.recover_panel_reviews(db_factory) == 0
+
+    current_review = await db_session.get(
+        PRReview,
+        review_id,
+        populate_existing=True,
+    )
+    current_run = await db_session.get(
+        PRReviewerRun,
+        reviewer_run_id,
+        populate_existing=True,
+    )
+    current_task = await db_session.get(Task, task_id, populate_existing=True)
+    assert current_review.status == "reviewing"
+    assert current_run.status == "pending"
+    assert current_task.status == "completed"
+    assert current_task.retry_count == 1
+
+
+@pytest.mark.asyncio
 async def test_fetch_exact_head_ci_combines_checks_and_statuses():
     responses = [
-        {"total_count": 1, "check_runs": [{"id": 12, "name": "tests", "status": "completed", "conclusion": "success", "app": {"slug": "github-actions"}, "output": {"title": "Tests", "summary": "All passed"}}]},
+        {"total_count": 1, "check_runs": [{"id": 12, "name": "tests", "status": "completed", "conclusion": "success", "app": {"id": 15368, "slug": "github-actions"}, "output": {"title": "Tests", "summary": "All passed"}}]},
         {"state": "success", "statuses": [{"id": 13, "context": "lint", "state": "success", "creator": {"login": "ci-bot"}}]},
     ]
     with patch(
@@ -1067,6 +1391,7 @@ async def test_fetch_exact_head_ci_combines_checks_and_statuses():
     assert status == "passed"
     assert summary == "2 required exact-head CI checks passed"
     assert [item["state"] for item in details["observed"]] == ["passed", "passed"]
+    assert details["observed"][0]["app_id"] == 15368
     assert details["observed"][0]["output"]["summary"] == "All passed"
 
 
@@ -1131,7 +1456,7 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
         review_model="claude-sonnet-4-6",
         review_mode="panel",
         wait_for_ci=True,
-        auto_merge=False,
+        auto_merge=True,
         enabled=True,
         default_branch="main",
         allowed_authors=[],
@@ -1176,6 +1501,8 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
     assert refreshed.status == "reviewing"
     assert refreshed.ci_status == "passed"
     assert len(runs) == 3
+    tasks = [await db_session.get(Task, run.task_id) for run in runs]
+    assert all(task.metadata_["pr_auto_merge"] is True for task in tasks)
 
 
 @pytest.mark.asyncio

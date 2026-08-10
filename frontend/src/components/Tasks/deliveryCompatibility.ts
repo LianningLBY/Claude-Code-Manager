@@ -18,7 +18,6 @@ export function isDeliveryCompatible(
     && repo.worker_id == null
     && repo.enabled
     && repo.status === 'active'
-    && repo.auto_merge === false
     && repo.merge_queue_mode === 'manual'
     && repo.review_mode === 'panel'
     && repo.wait_for_ci

@@ -90,7 +90,7 @@ class Settings(BaseSettings):
     # each ordinary Task still requires an explicit capability policy.
     auto_capability_enabled: bool = True
     # Autonomous Plan -> Code -> Review -> PR Monitor controller. Admission is
-    # enabled by default; V1 can push/create a PR but still stops before merge.
+    # enabled by default; each Run freezes the Monitor's ready/merged terminal.
     delivery_loop_enabled: bool = True
     delivery_controller_poll_interval_seconds: float = 2.0
     delivery_controller_lease_seconds: int = 30

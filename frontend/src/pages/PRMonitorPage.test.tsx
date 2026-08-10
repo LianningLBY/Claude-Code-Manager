@@ -210,43 +210,59 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.queryByRole('dialog', { name: 'Add Repository' })).not.toBeInTheDocument();
   });
 
-  it('keeps panel-only settings out of a new single-reviewer payload', async () => {
+  it('allows panel auto-merge and keeps it mutually exclusive with Merge Queue', async () => {
     const user = userEvent.setup();
     render(<PRMonitorPage />);
     await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
 
-    const legacyAutoMerge = screen.getByLabelText('Legacy auto-merge (single reviewer only)');
-    const autoRepair = screen.getByLabelText(/Auto-resume bound local Developer Task/);
-    const waitForCi = screen.getByLabelText('Wait for exact-head CI');
+    const autoMerge = screen.getByLabelText('Direct auto-merge after review and exact-head gates pass');
     const mergeQueue = selectFollowingLabel('Merge Queue');
-    const harness = selectFollowingLabel('Review Harness');
-
-    expect(legacyAutoMerge).toBeDisabled();
-    await user.click(autoRepair);
+    expect(autoMerge).toBeEnabled();
+    expect(autoMerge).not.toBeChecked();
     await user.selectOptions(mergeQueue, 'auto');
-    await user.selectOptions(harness, 'single');
-
-    expect(autoRepair).toBeDisabled();
-    expect(autoRepair).not.toBeChecked();
-    expect(waitForCi).toBeDisabled();
-    expect(waitForCi).not.toBeChecked();
-    expect(mergeQueue).toBeDisabled();
+    expect(autoMerge).not.toBeChecked();
+    expect(screen.getByText(/Merge Queue AUTO is a separate automatic policy/)).toBeInTheDocument();
+    await user.click(autoMerge);
+    expect(autoMerge).toBeChecked();
     expect(mergeQueue).toHaveValue('manual');
 
-    await user.click(legacyAutoMerge);
-    expect(legacyAutoMerge).toBeChecked();
-    await user.selectOptions(harness, 'panel');
-    expect(legacyAutoMerge).toBeDisabled();
-    expect(legacyAutoMerge).not.toBeChecked();
-
-    await user.selectOptions(harness, 'single');
-    await user.click(legacyAutoMerge);
     await user.type(screen.getByPlaceholderText('owner/repo'), 'acme/new-repo');
+    await user.type(
+      screen.getByPlaceholderText(/check_run,tests,github-actions/),
+      'check_run,tests,github-actions',
+    );
     await user.click(screen.getByRole('button', { name: 'Add' }));
 
     await waitFor(() => {
       expect(api.createMonitoredRepo).toHaveBeenCalledWith(expect.objectContaining({
         repo_full_name: 'acme/new-repo',
+        review_mode: 'panel',
+        auto_merge: true,
+        auto_repair: false,
+        wait_for_ci: true,
+        merge_queue_mode: 'manual',
+        required_checks: [{ kind: 'check_run', name: 'tests', app_slug: 'github-actions' }],
+      }));
+    });
+    expect(await screen.findByText('newly-created-raw-secret')).toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('will not be shown again');
+  });
+
+  it('allows direct auto-merge with the single-reviewer harness', async () => {
+    const user = userEvent.setup();
+    render(<PRMonitorPage />);
+    await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
+
+    await user.selectOptions(selectFollowingLabel('Review Harness'), 'single');
+    const autoMerge = screen.getByLabelText('Direct auto-merge after review and exact-head gates pass');
+    expect(autoMerge).toBeEnabled();
+    await user.click(autoMerge);
+    await user.type(screen.getByPlaceholderText('owner/repo'), 'acme/single-review');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+
+    await waitFor(() => {
+      expect(api.createMonitoredRepo).toHaveBeenCalledWith(expect.objectContaining({
+        repo_full_name: 'acme/single-review',
         review_mode: 'single',
         auto_merge: true,
         auto_repair: false,
@@ -255,8 +271,6 @@ describe('PRMonitorPage safety controls', () => {
         required_checks: [],
       }));
     });
-    expect(await screen.findByText('newly-created-raw-secret')).toBeInTheDocument();
-    expect(screen.getByRole('alert')).toHaveTextContent('will not be shown again');
   });
 
   it('keeps stored secrets masked and reveals only the rotated value', async () => {
@@ -272,25 +286,41 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.getByTitle('Copy newly generated secret')).toBeEnabled();
   });
 
-  it('normalizes an invalid panel auto-merge setting before saving', async () => {
+  it('preserves auto-merge when editing a panel repository', async () => {
     const user = userEvent.setup();
-    const invalidRepo = { ...baseRepo, auto_merge: true };
-    await openRepo(user, invalidRepo);
+    const autoRepo = { ...baseRepo, auto_merge: true, merge_queue_mode: 'manual' as const };
+    await openRepo(user, autoRepo);
 
-    const legacyAutoMerge = screen.getByLabelText('Legacy auto-merge (single reviewer only)');
-    expect(legacyAutoMerge).toBeDisabled();
-    expect(legacyAutoMerge).not.toBeChecked();
+    const autoMerge = screen.getByLabelText('Direct auto-merge after review and exact-head gates pass');
+    expect(autoMerge).toBeEnabled();
+    expect(autoMerge).toBeChecked();
+    expect(screen.getByText(/ON: CCM confirms the exact-head merge/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Save Changes' }));
 
     await waitFor(() => {
-      expect(api.updateMonitoredRepo).toHaveBeenCalledWith(invalidRepo.id, expect.objectContaining({
+      expect(api.updateMonitoredRepo).toHaveBeenCalledWith(autoRepo.id, expect.objectContaining({
         review_mode: 'panel',
-        auto_merge: false,
+        auto_merge: true,
         auto_repair: true,
         wait_for_ci: true,
-        merge_queue_mode: 'shadow',
+        merge_queue_mode: 'manual',
       }));
     });
+  });
+
+  it('shows direct and queued automatic merge policies distinctly', async () => {
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([
+      { ...baseRepo, id: 1, repo_full_name: 'acme/shadow' },
+      { ...baseRepo, id: 2, repo_full_name: 'acme/direct', auto_merge: true, merge_queue_mode: 'manual' },
+      { ...baseRepo, id: 3, repo_full_name: 'acme/queued', merge_queue_mode: 'auto' },
+    ]);
+
+    render(<PRMonitorPage />);
+
+    expect(await screen.findByText('Merge Policy')).toBeInTheDocument();
+    expect(screen.getByText('SHADOW')).toBeInTheDocument();
+    expect(screen.getByText('AUTO')).toBeInTheDocument();
+    expect(screen.getByText('QUEUE AUTO')).toBeInTheDocument();
   });
 
   it('shows CI and monitor details before reviewer runs exist', async () => {

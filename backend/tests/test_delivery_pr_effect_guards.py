@@ -88,6 +88,7 @@ async def _seed_marker_owned_finding(session_factory, *, suffix: str) -> dict:
             monitor_run_id=monitor.id,
             repo_id=repo.id,
             pr_number=17,
+            base_ref="main",
             base_sha=BASE_SHA,
             head_sha=HEAD_SHA,
             # Corrupt reserved markers still assert restricted ownership.
@@ -214,6 +215,7 @@ async def test_reserved_marker_and_delivery_run_association_both_block_legacy_ef
         monitor_run_id=monitor.id,
         repo_id=repo.id,
         pr_number=23,
+        base_ref="main",
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
         delivery_id="delivery:corrupt",
@@ -389,6 +391,7 @@ async def test_fix_service_rechecks_delivery_adoption_before_return_or_push(
     review = PRReview(
         repo_id=repo.id,
         pr_number=31,
+        base_ref="main",
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
         delivery_id="delivery:adopted-after-action",

@@ -5,14 +5,21 @@ from datetime import datetime
 import pytest
 from sqlalchemy import text
 
+import backend.services.plan_deletion as plan_deletion_module
 from backend.models.capability import (
     CapabilityExecution,
     CapabilityInvocation,
     CapabilityResumeOutbox,
 )
-from backend.models.plan import Plan, PlanApplicationReceipt, PlanVersion
+from backend.models.plan import (
+    Plan,
+    PlanApplicationReceipt,
+    PlanInputRequest,
+    PlanVersion,
+)
 from backend.models.plan_agent import (
     PlanAgentRun,
+    PlanAgentRuntimeReceipt,
     PlanAgentStep,
     PlanAgentWorkerDispatchReceipt,
 )
@@ -125,6 +132,89 @@ async def test_terminal_target_plan_graph_is_explicitly_deleted(db_session):
     assert await db_session.get(Task, ids[0]) is not None
     assert await db_session.get(Plan, ids[1]) is None
     assert await db_session.get(PlanAgentRun, ids[2]) is None
+
+
+@pytest.mark.asyncio
+async def test_plan_deletion_locks_run_plan_receipts_children_then_input(
+    db_session,
+    monkeypatch,
+):
+    task = await _target(db_session, "delete lock order")
+    plan = Plan(
+        title="delete lock order",
+        initial_request="plan",
+        target_task_id=task.id,
+        pipeline_config={},
+    )
+    db_session.add(plan)
+    await db_session.flush()
+    run = PlanAgentRun(
+        plan_id=plan.id,
+        run_type="initial",
+        status="failed",
+        current_stage="failed",
+        generation=2,
+        finished_at=datetime.utcnow(),
+    )
+    db_session.add(run)
+    await db_session.flush()
+    step = PlanAgentStep(
+        run_id=run.id,
+        plan_id=plan.id,
+        generation=run.generation,
+        step_type="planner",
+        round=1,
+        provider="codex",
+        status="failed",
+        finished_at=datetime.utcnow(),
+    )
+    db_session.add(step)
+    await db_session.flush()
+    input_request = PlanInputRequest(
+        plan_id=plan.id,
+        run_id=run.id,
+        source_step_id=step.id,
+        requested_by="planner",
+        questions=[],
+        status="cancelled",
+        idempotency_key=f"delete-lock-order:{run.id}",
+        opened_at=datetime.utcnow(),
+        cancelled_at=datetime.utcnow(),
+    )
+    db_session.add(input_request)
+    await db_session.flush()
+    step.input_request_id = input_request.id
+    runtime_receipt = new_prepared_runtime_receipt(step, attempt_index=1)
+    runtime_receipt.status = "cleaned"
+    runtime_receipt.cleaned_at = datetime.utcnow()
+    db_session.add(runtime_receipt)
+    await db_session.commit()
+
+    original_lock_rows = plan_deletion_module._lock_rows
+    lock_order: list[type] = []
+
+    async def traced_lock_rows(db, model, *predicates):
+        lock_order.append(model)
+        return await original_lock_rows(db, model, *predicates)
+
+    monkeypatch.setattr(plan_deletion_module, "_lock_rows", traced_lock_rows)
+    graph = await lock_target_plan_delete_graph(
+        db_session,
+        task.id,
+        capability_invocation_ids=set(),
+        capability_execution_ids=set(),
+        capability_outbox_ids=set(),
+    )
+
+    assert graph is not None
+    assert lock_order[:6] == [
+        PlanAgentRun,
+        Plan,
+        PlanAgentWorkerDispatchReceipt,
+        PlanAgentStep,
+        PlanAgentRuntimeReceipt,
+        PlanInputRequest,
+    ]
 
 
 @pytest.mark.asyncio

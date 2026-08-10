@@ -665,6 +665,7 @@ async def test_pr_monitor_detail_reviews_and_mutations_require_exact_worker_owne
         review = PRReview(
             repo_id=repo.id,
             pr_number=7,
+            base_ref="main",
             head_sha="a" * 40,
             pr_title="Private PR",
             pr_author="private-author",

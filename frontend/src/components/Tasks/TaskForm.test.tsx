@@ -919,7 +919,7 @@ describe('TaskForm Delivery Loop mode', () => {
       project_id: 1,
       worker_id: null,
       enabled: true,
-      auto_merge: false,
+      auto_merge: true,
       auto_repair: true,
       max_repair_attempts: 3,
       provider: 'codex',
@@ -979,6 +979,10 @@ describe('TaskForm Delivery Loop mode', () => {
     const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
     await waitFor(() => expect(repoSelect).not.toBeDisabled());
     await userEvent.selectOptions(repoSelect, '9');
+    expect(screen.getByText(/Merge behavior is inherited from the selected PR Monitor/)).toBeInTheDocument();
+    expect(screen.getByText(/PR Monitor Auto Merge is ON/)).toHaveTextContent(
+      'CCM will finish only after GitHub confirms the merge',
+    );
     await userEvent.type(
       screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
       'Fix exact-head loop\nwith complete regression tests',

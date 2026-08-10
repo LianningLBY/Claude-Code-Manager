@@ -61,7 +61,7 @@ const monitoredRepo = {
   project_id: 7,
   worker_id: null,
   enabled: true,
-  auto_merge: false,
+  auto_merge: true,
   auto_repair: true,
   max_repair_attempts: 3,
   provider: 'codex',
@@ -192,6 +192,9 @@ describe('ProjectTodoList', () => {
     render(<ProjectTodoList projectId={7} project={localProject} />);
 
     const dialog = await openDeliveryTaskModal();
+    expect(within(dialog).getByText(/PR Monitor Auto Merge is ON/)).toHaveTextContent(
+      'completion waits for GitHub to confirm the merge',
+    );
     await userEvent.click(within(dialog).getByRole('button', { name: 'Create task' }));
 
     await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledWith({

@@ -36,6 +36,23 @@ _RESOLUTION_LEASE_RENEW_SECONDS = 30.0
 _RESOLUTION_MUTATION_GUARD = timedelta(seconds=45)
 
 
+def _thread_wait_stage_action(review: PRReview) -> str | None:
+    from backend.services.pr_review_service import _restored_thread_action
+
+    if review.status != "publishing":
+        return None
+    return _restored_thread_action(review.pending_action)
+
+
+def _fixed_current_is_eligible(review: PRReview) -> bool:
+    """Accept the new outbox wait stage plus pre-upgrade green terminals."""
+
+    return bool(
+        _thread_wait_stage_action(review) is not None
+        or review.status in ("approved", "commented")
+    )
+
+
 _OUTPUT_RE = re.compile(
     r"(?:\A|\n)PR_REBUTTAL_ADJUDICATION_BEGIN\n"
     r"(?P<body>\{.*\})\n"
@@ -711,15 +728,28 @@ async def _resolve_fallback_comment(
                     matches.append(item)
         if not matches:
             return False
-        if rebuttal.resolution_actor is None or any(
-            type(item.get("id")) is not int
-            or item["id"] <= 0
-            or not isinstance(item.get("user"), dict)
-            or item["user"].get("login", "").lower() != rebuttal.resolution_actor.lower()
+        if rebuttal.resolution_actor is None:
+            raise ValueError("GitHub fallback resolution actor is not frozen")
+        valid = [
+            item
             for item in matches
-        ):
-            raise ValueError("GitHub fallback resolution actor is mismatched")
-        return True
+            if (
+                type(item.get("id")) is int
+                and item["id"] > 0
+                and isinstance(item.get("user"), dict)
+                and isinstance(item["user"].get("login"), str)
+                and item["user"]["login"].lower()
+                == rebuttal.resolution_actor.lower()
+            )
+        ]
+        if len(valid) != len(matches):
+            logger.warning(
+                "Ignoring %d untrusted fallback-resolution marker(s) for "
+                "Finding %s",
+                len(matches) - len(valid),
+                finding.fingerprint,
+            )
+        return bool(valid)
 
     if await find_existing():
         return
@@ -798,15 +828,25 @@ async def _resolve_fixed_fallback_comment(
                     matches.append(item)
         if not matches:
             return False
-        if any(
-            type(item.get("id")) is not int
-            or item["id"] <= 0
-            or not isinstance(item.get("user"), dict)
-            or item["user"].get("login", "").lower() != actor.lower()
+        valid = [
+            item
             for item in matches
-        ):
-            raise ValueError("GitHub fixed-resolution actor is mismatched")
-        return True
+            if (
+                type(item.get("id")) is int
+                and item["id"] > 0
+                and isinstance(item.get("user"), dict)
+                and isinstance(item["user"].get("login"), str)
+                and item["user"]["login"].lower() == actor.lower()
+            )
+        ]
+        if len(valid) != len(matches):
+            logger.warning(
+                "Ignoring %d untrusted fixed-resolution marker(s) for "
+                "Finding %s",
+                len(matches) - len(valid),
+                finding.fingerprint,
+            )
+        return bool(valid)
 
     if await find_existing():
         return
@@ -941,7 +981,7 @@ async def _fixed_resolution_is_current(
         or current.repo_id != repo.id
         or current.head_sha != claim.target_head_sha
         or current.pr_number != claim.pr_number
-        or current.status not in ("approved", "commented")
+        or not _fixed_current_is_eligible(current)
         or source_review.monitor_run_id != run.id
         or source_review.repo_id != repo.id
         or source_review.pr_number != run.pr_number
@@ -1159,7 +1199,7 @@ async def _claim_fixed_resolution(
             or run.pr_number != current.pr_number
             or current.monitor_run_id != run.id
             or current.repo_id != repo.id
-            or current.status not in ("approved", "commented")
+            or not _fixed_current_is_eligible(current)
             or source_review.monitor_run_id != run.id
             or source_review.repo_id != repo.id
             or finding.pr_review_id != source_review.id
@@ -1553,7 +1593,7 @@ def _locked_fixed_resolution_is_current(
         and current.repo_id == rows.repo.id
         and current.pr_number == claim.pr_number
         and current.head_sha == claim.target_head_sha
-        and current.status in ("approved", "commented")
+        and _fixed_current_is_eligible(current)
         and source.monitor_run_id == rows.run.id
         and source.repo_id == rows.repo.id
         and source.pr_number == rows.run.pr_number
@@ -1705,7 +1745,15 @@ async def _finish_fixed_resolution_gate(
 ) -> bool:
     """Advance the zero-thread Gate under the exact durable policy fence."""
 
+    from backend.services.delivery_pr_policy import (
+        DeliveryPRPolicyError,
+        frozen_delivery_pr_policy,
+    )
     from backend.services.pr_monitor_loop import record_gate_pass
+    from backend.services.pr_review_service import (
+        _frozen_task_ci_policy,
+        _validated_action_nonce,
+    )
 
     async with db_factory() as db:
         repo_id = (await db.execute(
@@ -1747,6 +1795,9 @@ async def _finish_fixed_resolution_gate(
         current_blockers = [
             item for item in findings if item.pr_review_id == current_review_id
         ]
+        old_blockers = [
+            item for item in findings if item.pr_review_id != current_review_id
+        ]
         if (
             repo is None
             or run is None
@@ -1761,19 +1812,108 @@ async def _finish_fixed_resolution_gate(
             or run.pr_number != current.pr_number
             or current.repo_id != repo.id
             or current.monitor_run_id != run.id
-            or current.status not in ("approved", "commented")
+            or not _fixed_current_is_eligible(current)
             or any(
                 item.status == "open" or item.thread_status != "resolved"
                 for item in current_blockers
             )
             or any(
-                item.thread_status in ("published_inline", "published_fallback")
-                for item in findings
+                item.status == "open"
+                or item.thread_status in (
+                    "published_inline",
+                    "published_fallback",
+                )
+                for item in old_blockers
             )
         ):
             await db.rollback()
             return False
-        await record_gate_pass(db, current.id)
+        restored_action = _thread_wait_stage_action(current)
+        if restored_action is None:
+            # Compatibility for durable green terminals produced before the
+            # explicit wait substage existed.  They already performed their
+            # Review side effect, so only the historical Gate transition is
+            # replayed; no pending publication is synthesized.
+            await record_gate_pass(db, current.id)
+            return True
+        task = (
+            await db.get(Task, current.task_id, populate_existing=True)
+            if current.task_id is not None
+            else None
+        )
+        ci_policy = (
+            _frozen_task_ci_policy(task, panel_task=True)
+            if task is not None
+            else None
+        )
+        frozen_auto_merge = (
+            (task.metadata_ or {}).get("pr_auto_merge")
+            if task is not None
+            else None
+        )
+        try:
+            delivery_policy = await frozen_delivery_pr_policy(
+                db,
+                current,
+                monitor_run_id=run.id,
+                require_effect_ready=True,
+            )
+        except DeliveryPRPolicyError:
+            await db.rollback()
+            return False
+        publication_identity_valid = bool(
+            restored_action in {"approved_merged", "lgtm_comment"}
+            and task is not None
+            and task.status == "completed"
+            and task.pty_background_generation is None
+            and type(task.retry_count) is int
+            and task.retry_count == current.publishing_retry_count
+            and isinstance(task.started_at, datetime)
+            and task.started_at == current.publishing_task_started_at
+            and _validated_action_nonce(task, current) is not None
+            and type(frozen_auto_merge) is bool
+            and (
+                (
+                    frozen_auto_merge
+                    and current.merge_method
+                    in ("merge", "squash", "fast-forward")
+                )
+                or (
+                    not frozen_auto_merge
+                    and current.merge_method is None
+                )
+            )
+            and (
+                (restored_action == "approved_merged" and frozen_auto_merge)
+                or (restored_action == "lgtm_comment" and not frozen_auto_merge)
+            )
+            and ci_policy is not None
+            and isinstance(current.pending_review_body, str)
+            and isinstance(current.publishing_actor, str)
+            and 0 < len(current.publishing_actor) <= 200
+            and isinstance(current.publishing_started_at, datetime)
+            and current.publishing_lease_token is None
+            and current.publishing_lease_expires_at is None
+            and (
+                delivery_policy is None
+                or (
+                    delivery_policy.auto_merge == frozen_auto_merge
+                    and delivery_policy.wait_for_ci == ci_policy[0]
+                    and delivery_policy.required_checks == ci_policy[1]
+                )
+            )
+        )
+        if not publication_identity_valid:
+            await db.rollback()
+            return False
+        current.pending_action = restored_action
+        current.review_summary = (
+            "All prior blocking Finding threads are durably resolved; "
+            "GitHub publication pending"
+        )
+        run.status = "reviewing"
+        run.state_version += 1
+        await db.commit()
         return True
 
 
@@ -1815,7 +1955,7 @@ async def reconcile_fixed_finding_resolutions(db_factory) -> int:
                 or current.pr_number != run.pr_number
                 or current.base_sha != run.current_base_sha
                 or current.head_sha != run.current_head_sha
-                or current.status not in ("approved", "commented")
+                or not _fixed_current_is_eligible(current)
             ):
                 continue
             current_blockers = list((await db.execute(select(PRFinding).where(
@@ -1827,18 +1967,24 @@ async def reconcile_fixed_finding_resolutions(db_factory) -> int:
                 for item in current_blockers
             ):
                 continue
-            finding_ids = list((await db.execute(
-                select(PRFinding.id)
+            old_blockers = list((await db.execute(
+                select(PRFinding)
                 .join(PRReview, PRReview.id == PRFinding.pr_review_id)
                 .where(
                     PRReview.monitor_run_id == run.id,
                     PRReview.id != current.id,
                     PRFinding.severity.in_(("critical", "high", "medium")),
-                    PRFinding.thread_status.in_(("published_inline", "published_fallback")),
+                    or_(
+                        PRFinding.status == "open",
+                        PRFinding.thread_status.in_((
+                            "published_inline",
+                            "published_fallback",
+                        )),
+                    ),
                 )
                 .order_by(PRFinding.id)
             )).scalars())
-            if not finding_ids:
+            if not old_blockers:
                 # The final Finding resolution is committed independently from
                 # the zero-thread Gate.  A process exit between those commits
                 # leaves no work items to revisit, so explicitly finish the
@@ -1856,6 +2002,19 @@ async def reconcile_fixed_finding_resolutions(db_factory) -> int:
                 run.state_version += 1
                 await db.commit()
             current_review_id = current.id
+            finding_ids = [
+                item.id
+                for item in old_blockers
+                if item.thread_status in (
+                    "published_inline",
+                    "published_fallback",
+                )
+            ]
+            if not finding_ids:
+                # Open/pending Findings are owned by their durable publication
+                # outbox.  Never let upgrade recovery skip them or fabricate a
+                # thread effect for a different generation.
+                continue
 
         for finding_id in finding_ids:
             claim = await _claim_fixed_resolution(

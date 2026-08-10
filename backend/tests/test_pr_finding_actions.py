@@ -59,6 +59,7 @@ async def _seed_finding(db_session):
     review = PRReview(
         repo_id=repo.id,
         pr_number=7,
+        base_ref="main",
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
         pr_title="Fix issue",
@@ -1338,7 +1339,7 @@ async def test_current_head_route_rejects_retargeted_base_with_same_head(
         AsyncMock(return_value={
             "state": "open",
             "draft": False,
-            "base": {"sha": "2" * 40},
+            "base": {"ref": "main", "sha": "2" * 40},
             "head": {
                 "repo": {"full_name": "fork-owner/repo"},
                 "ref": "feature/fix",

@@ -2142,20 +2142,12 @@ class TaskQueue:
             if instance_id is not None:
                 values["instance_id"] = instance_id
 
-            claimed = await self.db.execute(
-                update(Task)
-                .where(
-                    Task.id == candidate_id,
-                    Task.status == "pending",
-                    Task.worker_id.is_(None),
-                    Task.shared_from_id.is_(None),
-                    task_retry_not_superseded_predicate(),
-                    no_active_worker_task_termination_predicate(),
-                    dispatcher_scope,
-                )
-                .values(**values)
-            )
-            if claimed.rowcount and isolated_browser_child:
+            if isolated_browser_child:
+                # Browser stop/admission paths serialize on the durable
+                # binding before touching the child Task.  Keep the queue on
+                # that same cross-process order; otherwise stop can hold the
+                # binding while dequeue holds the child row and each waits on
+                # the other under PostgreSQL/MySQL.
                 binding_claimed = await self.db.execute(
                     update(TestHarnessChildBinding)
                     .where(
@@ -2173,6 +2165,26 @@ class TaskQueue:
                     await self.db.rollback()
                     self.db.expire_all()
                     continue
+            claimed = await self.db.execute(
+                update(Task)
+                .where(
+                    Task.id == candidate_id,
+                    Task.status == "pending",
+                    Task.worker_id.is_(None),
+                    Task.shared_from_id.is_(None),
+                    task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
+                    dispatcher_scope,
+                )
+                .values(**values)
+            )
+            if not claimed.rowcount and isolated_browser_child:
+                # The preceding binding transition belongs to this exact
+                # claim.  A child CAS loser must restore it atomically rather
+                # than publishing a phantom running Browser generation.
+                await self.db.rollback()
+                self.db.expire_all()
+                continue
             await self.db.commit()
             if not claimed.rowcount:
                 # Another dispatcher won after our candidate SELECT.  Expire a
@@ -2339,18 +2351,7 @@ class TaskQueue:
             if browser_child_owner_error(binding, owner) is not None:
                 await self.db.rollback()
                 return False
-        result = await self.db.execute(
-            update(Task)
-            .where(*predicate)
-            .values(
-                status="pending",
-                instance_id=None,
-                error_message=reason,
-                started_at=None,
-                completed_at=None,
-            )
-        )
-        if result.rowcount and isolated_browser_child:
+        if isolated_browser_child:
             released = await self.db.execute(
                 update(TestHarnessChildBinding)
                 .where(
@@ -2367,6 +2368,22 @@ class TaskQueue:
             if not released.rowcount:
                 await self.db.rollback()
                 return False
+        result = await self.db.execute(
+            update(Task)
+            .where(*predicate)
+            .values(
+                status="pending",
+                instance_id=None,
+                error_message=reason,
+                started_at=None,
+                completed_at=None,
+            )
+        )
+        if not result.rowcount and isolated_browser_child:
+            # Do not commit the binding release unless the exact active child
+            # generation was returned to pending in the same transaction.
+            await self.db.rollback()
+            return False
         await self.db.commit()
         return bool(result.rowcount)
 
@@ -2474,20 +2491,6 @@ class TaskQueue:
             if browser_child_owner_error(binding, owner) is not None:
                 await self.db.rollback()
                 return None
-        result = await self.db.execute(
-            update(Task)
-            .where(*predicates)
-            .values(**values)
-        )
-        if not result.rowcount:
-            if rollback_on_miss:
-                await self.db.rollback()
-            else:
-                # Preserve the historical transaction boundary for ordinary
-                # standalone retries. Callers that staged ownership cleanup
-                # in the same transaction opt into rollback_on_miss.
-                await self.db.commit()
-            return None
         if isolated_browser_child and binding is not None:
             released = await self.db.execute(
                 update(TestHarnessChildBinding)
@@ -2507,6 +2510,22 @@ class TaskQueue:
             if not released.rowcount:
                 await self.db.rollback()
                 return None
+        result = await self.db.execute(
+            update(Task)
+            .where(*predicates)
+            .values(**values)
+        )
+        if not result.rowcount:
+            if rollback_on_miss or isolated_browser_child:
+                # A Browser retry has already staged its binding release, so
+                # every child CAS miss must roll the whole transaction back.
+                await self.db.rollback()
+            else:
+                # Preserve the historical transaction boundary for ordinary
+                # standalone retries. Callers that staged ownership cleanup
+                # in the same transaction opt into rollback_on_miss.
+                await self.db.commit()
+            return None
         if commit:
             await self.db.commit()
         else:

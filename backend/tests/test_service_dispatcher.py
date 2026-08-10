@@ -205,6 +205,111 @@ async def _set_bound_source_transport(
         return source.id
 
 
+async def _seed_browser_child_lifecycle(
+    db_factory,
+    *,
+    suffix: str,
+) -> SimpleNamespace:
+    """Seed one exact running Browser child and its immutable owner binding."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+    from backend.services.test_harness_children import (
+        BROWSER_LAUNCH_PROFILE_VERSION,
+        browser_child_launch_digest,
+    )
+
+    browser_job_id = hashlib.sha256(
+        f"browser-job-{suffix}".encode()
+    ).hexdigest()[:32]
+    harness_run_id = hashlib.sha256(
+        f"harness-run-{suffix}".encode()
+    ).hexdigest()[:32]
+    binding_id = hashlib.sha256(
+        f"binding-{suffix}".encode()
+    ).hexdigest()[:32]
+    started_at = datetime.utcnow()
+    description = f"Immutable Browser prompt {suffix}"
+
+    async with db_factory() as db:
+        owner = Task(
+            title=f"Browser owner {suffix}",
+            status="executing",
+        )
+        db.add(owner)
+        await db.flush()
+        instance = Instance(
+            name=f"Browser instance {suffix}",
+            status="running",
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        child = Task(
+            title=f"Browser child {suffix}",
+            description=description,
+            status="in_progress",
+            instance_id=instance.id,
+            started_at=started_at,
+            retry_count=0,
+            turn_generation=7,
+            max_retries=0,
+            mode="auto",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+            target_repo="",
+            target_branch="main",
+            enabled_skills={"browser-review": browser_job_id},
+            archived=True,
+            metadata_={
+                "browser_review_job_id": browser_job_id,
+                "test_harness_run_id": harness_run_id,
+                "workspace_review_run_id": None,
+                "test_harness_parent_task_id": owner.id,
+                "workspace_review_parent_task_id": owner.id,
+                "isolated_browser_agent": True,
+            },
+        )
+        db.add(child)
+        await db.flush()
+        instance.current_task_id = child.id
+        launch_digest = browser_child_launch_digest(child)
+        binding = TestHarnessChildBinding(
+            id=binding_id,
+            harness_run_id=harness_run_id,
+            owner_task_id=owner.id,
+            owner_task_incarnation_id=owner.incarnation_id,
+            owner_task_retry_count=owner.retry_count,
+            owner_task_turn_generation=owner.turn_generation,
+            owner_task_status=owner.status,
+            child_task_id=child.id,
+            child_task_incarnation_id=child.incarnation_id,
+            browser_review_job_id=browser_job_id,
+            launch_profile_version=BROWSER_LAUNCH_PROFILE_VERSION,
+            provider=child.provider,
+            model=child.model,
+            reasoning_effort=child.effort_level,
+            codex_service_tier=child.codex_service_tier,
+            task_mode=child.mode,
+            launch_config_digest=launch_digest,
+            state="running",
+            claimed_retry_count=child.retry_count,
+            claimed_instance_id=instance.id,
+        )
+        db.add(binding)
+        await db.commit()
+        return SimpleNamespace(
+            owner_id=owner.id,
+            instance_id=instance.id,
+            child_id=child.id,
+            binding_id=binding.id,
+            description=description,
+            launch_digest=launch_digest,
+            metadata=dict(child.metadata_),
+        )
+
+
 @pytest.mark.asyncio
 async def test_compact_retry_enqueued_after_cancel_cannot_revive_task(db_factory):
     """The immutable retry permit closes cancel's commit -> enqueue gap."""
@@ -1956,6 +2061,105 @@ async def test_lifecycle_codex_context_error_compacts_before_retry(db_factory):
     assert len(pending_events) == 1
     assert pending_events[0]["task_retry_count"] == current.retry_count
     assert pending_events[0]["task_turn_generation"] == current.turn_generation
+
+
+@pytest.mark.asyncio
+async def test_browser_context_preflight_fails_without_compaction_or_relaunch(
+    db_factory,
+):
+    """A clean context rejection cannot mutate/relaunch a frozen Browser job."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+    from backend.services.test_harness_children import browser_child_launch_digest
+
+    scope = await _seed_browser_child_lifecycle(
+        db_factory,
+        suffix="context-preflight",
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._collect_failure_output = AsyncMock(
+        return_value=(
+            '{"type":"turn.failed","error":{"message":"request failed",'
+            '"codexErrorInfo":"contextWindowExceeded"}}'
+        )
+    )
+    dispatcher._compact_session = AsyncMock(return_value="must not be used")
+    process = MagicMock(
+        pid=43210,
+        returncode=1,
+        wait=AsyncMock(return_value=1),
+    )
+    dispatcher.instance_manager.processes = {scope.instance_id: process}
+
+    async with db_factory() as db:
+        child = await db.get(Task, scope.child_id)
+        db.expunge(child)
+
+    async def launch_structured_preflight(**kwargs):
+        assert kwargs["resume_session_id"] is None
+        await _set_bound_source_transport(
+            db_factory,
+            scope.child_id,
+            "codex_exec",
+        )
+        async with db_factory() as db:
+            current = await db.get(Task, scope.child_id)
+            assert current is not None
+            current.session_id = "codex-browser-context-thread"
+            current.context_window_usage = {
+                "context_tokens": 250_000,
+                "context_window": 258_400,
+            }
+            db.add(
+                LogEntry(
+                    instance_id=scope.instance_id,
+                    task_id=current.id,
+                    task_retry_count=current.retry_count,
+                    task_turn_generation=current.turn_generation,
+                    turn_scope="foreground",
+                    event_type="system_event",
+                    role=None,
+                    content="request failed",
+                    raw_json=json.dumps(
+                        {
+                            "type": "turn.failed",
+                            "error": {
+                                "message": "request failed",
+                                "codexErrorInfo": "contextWindowExceeded",
+                            },
+                        }
+                    ),
+                    is_error=True,
+                )
+            )
+            await db.commit()
+        return process.pid
+
+    dispatcher.instance_manager.launch.side_effect = launch_structured_preflight
+
+    await dispatcher._run_task_lifecycle(scope.instance_id, child)
+
+    dispatcher._compact_session.assert_not_awaited()
+    dispatcher.instance_manager.launch.assert_awaited_once()
+    async with db_factory() as db:
+        failed_child = await db.get(Task, scope.child_id)
+        idle_instance = await db.get(Instance, scope.instance_id)
+        terminal_binding = await db.get(
+            TestHarnessChildBinding,
+            scope.binding_id,
+        )
+        assert failed_child.status == "failed"
+        assert "fresh-only launch profile" in failed_child.error_message
+        assert failed_child.retry_count == 0
+        assert failed_child.session_id == "codex-browser-context-thread"
+        assert failed_child.description == scope.description
+        assert browser_child_launch_digest(failed_child) == scope.launch_digest
+        assert idle_instance.status == "idle"
+        assert idle_instance.current_task_id is None
+        assert idle_instance.pid is None
+        assert terminal_binding.state == "completed"
+        assert terminal_binding.completed_at is not None
+        assert terminal_binding.launch_config_digest == scope.launch_digest
 
 
 @pytest.mark.asyncio
@@ -12611,6 +12815,168 @@ async def test_read_only_plan_with_unlaunched_exact_source_retains_retry_budget(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "allow_unbound_prelaunch",
+    (False, True),
+    ids=("bound-source", "unbound-prelaunch"),
+)
+async def test_browser_replay_finalizer_atomically_releases_running_binding(
+    db_factory,
+    allow_unbound_prelaunch,
+):
+    """Browser replay locks owner -> binding -> child and releases both."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+    from backend.services.test_harness_children import browser_child_launch_digest
+
+    scope = await _seed_browser_child_lifecycle(
+        db_factory,
+        suffix=f"replay-{allow_unbound_prelaunch}",
+    )
+    if not allow_unbound_prelaunch:
+        await _bind_hidden_lifecycle_source(db_factory, scope.child_id)
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        child = await db.get(Task, scope.child_id)
+        generation = dispatcher._task_lifecycle_generation(child)
+
+    dispatcher._test_harness_terminal_context = AsyncMock(
+        side_effect=AssertionError(
+            "safe Browser deferral must not install a child terminal gate"
+        )
+    )
+
+    original_execute = AsyncSession.execute
+    write_tables: list[str] = []
+
+    async def record_writes(session, statement, *args, **kwargs):
+        table_name = getattr(
+            getattr(statement, "table", None),
+            "name",
+            None,
+        )
+        if getattr(statement, "is_update", False) and table_name in {
+            "tasks",
+            "test_harness_child_bindings",
+        }:
+            write_tables.append(table_name)
+        return await original_execute(session, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", new=record_writes):
+        finalized = await dispatcher._finalize_fresh_lifecycle_replay_safely(
+            generation,
+            pending_reason="Browser launch admission was deferred",
+            failure_reason="Browser launch outcome was uncertain",
+            allow_unbound_prelaunch=allow_unbound_prelaunch,
+        )
+
+    assert finalized is not None
+    assert finalized.generation.status == "pending"
+    dispatcher._test_harness_terminal_context.assert_not_awaited()
+    assert write_tables[:3] == [
+        "tasks",
+        "test_harness_child_bindings",
+        "tasks",
+    ], write_tables
+
+    async with db_factory() as db:
+        owner = await db.get(Task, scope.owner_id)
+        child = await db.get(Task, scope.child_id)
+        binding = await db.get(TestHarnessChildBinding, scope.binding_id)
+        assert owner.status == "executing"
+        assert child.status == "pending"
+        assert child.instance_id is None
+        assert child.started_at is None
+        assert child.description == scope.description
+        assert child.metadata_ == scope.metadata
+        assert browser_child_launch_digest(child) == scope.launch_digest
+        assert binding.state == "ready"
+        assert binding.claimed_retry_count is None
+        assert binding.claimed_instance_id is None
+        assert binding.launch_config_digest == scope.launch_digest
+
+    from backend.services.task_queue import TaskQueue
+
+    async with db_factory() as db:
+        reclaimed = await TaskQueue(db).dequeue(instance_id=scope.instance_id)
+        assert reclaimed is not None
+        assert reclaimed.id == scope.child_id
+        binding = await db.get(TestHarnessChildBinding, scope.binding_id)
+        assert binding.state == "running"
+        assert binding.claimed_retry_count == reclaimed.retry_count
+        assert binding.claimed_instance_id == scope.instance_id
+
+
+@pytest.mark.asyncio
+async def test_browser_transport_admission_wins_safe_replay_classification(
+    db_factory,
+):
+    """A Browser transport race terminalizes and leaves a durable reap receipt."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+
+    scope = await _seed_browser_child_lifecycle(
+        db_factory,
+        suffix="transport-wins-safe-classification",
+    )
+    await _bind_hidden_lifecycle_source(db_factory, scope.child_id)
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        child = await db.get(Task, scope.child_id)
+        generation = dispatcher._task_lifecycle_generation(child)
+
+    original_writer = (
+        dispatcher._finalize_fresh_lifecycle_replay_under_harness_fence
+    )
+    provider_admitted = False
+
+    async def admit_provider_before_browser_writer(*args, **kwargs):
+        nonlocal provider_admitted
+        if kwargs.get("browser_pending_only") and not provider_admitted:
+            provider_admitted = True
+            await _set_bound_source_transport(
+                db_factory,
+                scope.child_id,
+                "codex_app_server",
+            )
+        return await original_writer(*args, **kwargs)
+
+    dispatcher._finalize_fresh_lifecycle_replay_under_harness_fence = (
+        admit_provider_before_browser_writer
+    )
+    finalized = await dispatcher._finalize_fresh_lifecycle_replay_safely(
+        generation,
+        pending_reason="Browser routing was temporarily unavailable",
+        failure_reason="Browser provider admission raced routing deferral",
+    )
+
+    assert provider_admitted is True
+    assert finalized is not None
+    assert finalized.generation.status == "failed"
+
+    # Mirror the lifecycle's cancellation-shielded ``finally``. The exact
+    # dead runtime proof must clear the reverse Instance owner and persist the
+    # incoming Browser binding's terminal receipt in the same transaction.
+    await dispatcher._reset_instance_if_stale(scope.instance_id, generation)
+
+    async with db_factory() as db:
+        child = await db.get(Task, scope.child_id)
+        instance = await db.get(Instance, scope.instance_id)
+        binding = await db.get(TestHarnessChildBinding, scope.binding_id)
+        source = await db.get(LogEntry, child.turn_source_log_id)
+        assert child.status == "failed"
+        assert "codex_app_server" in child.error_message
+        assert source.actual_transport == "codex_app_server"
+        assert instance.status == "idle"
+        assert instance.current_task_id is None
+        assert instance.pid is None
+        assert binding.state == "completed"
+        assert binding.completed_at is not None
+
+
+@pytest.mark.asyncio
 async def test_sqlite_transport_writer_wins_replay_finalizer_race(tmp_path):
     """Committed provider admission makes the waiting finalizer fail closed."""
 
@@ -14914,6 +15280,106 @@ async def test_old_lifecycle_cannot_finalize_same_task_same_slot_reclaim(
         assert task.retry_count == 1
         assert task.started_at == replacement_started_at
         assert instance.total_tasks_completed == 0
+
+
+@pytest.mark.asyncio
+async def test_browser_natural_terminal_locks_binding_before_child_and_instance(
+    db_factory,
+):
+    """Natural reap keeps Browser binding -> child Task -> Instance lock order."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+
+    dispatcher = _make_dispatcher(db_factory)
+    started_at = datetime.utcnow()
+    async with db_factory() as db:
+        owner = Task(
+            title="Browser terminal lock-order owner",
+            status="completed",
+        )
+        db.add(owner)
+        await db.flush()
+        instance = Instance(
+            name="Browser terminal lock-order instance",
+            status="running",
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        child = Task(
+            title="Browser terminal lock-order child",
+            status="executing",
+            instance_id=instance.id,
+            started_at=started_at,
+            archived=True,
+        )
+        db.add(child)
+        await db.flush()
+        instance.current_task_id = child.id
+        binding = TestHarnessChildBinding(
+            id="b" * 32,
+            harness_run_id="h" * 32,
+            owner_task_id=owner.id,
+            owner_task_incarnation_id=owner.incarnation_id,
+            owner_task_retry_count=owner.retry_count,
+            owner_task_turn_generation=owner.turn_generation,
+            owner_task_status=owner.status,
+            child_task_id=child.id,
+            child_task_incarnation_id=child.incarnation_id,
+            browser_review_job_id="j" * 32,
+            state="running",
+            claimed_retry_count=child.retry_count,
+            claimed_instance_id=instance.id,
+        )
+        db.add(binding)
+        await db.commit()
+        generation = dispatcher._task_lifecycle_generation(child)
+        instance_id = instance.id
+        child_id = child.id
+        binding_id = binding.id
+
+    @asynccontextmanager
+    async def terminal_context():
+        yield
+
+    dispatcher._test_harness_terminal_context = AsyncMock(
+        return_value=terminal_context()
+    )
+    dispatcher._reconcile_superseded_reverse_task_owners = AsyncMock()
+
+    original_execute = AsyncSession.execute
+    write_tables: list[str] = []
+
+    async def record_writes(session, statement, *args, **kwargs):
+        table_name = getattr(
+            getattr(statement, "table", None),
+            "name",
+            None,
+        )
+        if getattr(statement, "is_update", False) and table_name in {
+            "tasks",
+            "instances",
+            "test_harness_child_bindings",
+        }:
+            write_tables.append(table_name)
+        return await original_execute(session, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", new=record_writes):
+        await dispatcher._reset_instance_if_stale(instance_id, generation)
+
+    async with db_factory() as db:
+        terminal_child = await db.get(Task, child_id)
+        terminal_instance = await db.get(Instance, instance_id)
+        terminal_binding = await db.get(TestHarnessChildBinding, binding_id)
+        assert terminal_child.status == "failed"
+        assert terminal_instance.status == "idle"
+        assert terminal_instance.current_task_id is None
+        assert terminal_binding.state == "completed"
+
+    binding_position = write_tables.index("test_harness_child_bindings")
+    child_position = write_tables.index("tasks")
+    instance_position = write_tables.index("instances")
+    assert binding_position < child_position < instance_position, write_tables
 
 
 @pytest.mark.asyncio

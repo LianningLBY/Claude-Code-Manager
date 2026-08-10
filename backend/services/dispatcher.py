@@ -27,6 +27,7 @@ from backend.config import settings
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
+from backend.models.test_harness import TestHarnessChildBinding
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.models.plan import Plan
 from backend.models.plan_agent import (
@@ -437,6 +438,10 @@ class _TaskLifecycleFinalization:
     generation: _TaskStatusGeneration
     published: bool
     failed_task: Task | None = None
+
+
+class _BrowserPendingReplayBecameUnsafe(RuntimeError):
+    """Provider admission won after Browser replay was read as deferrable."""
 
 
 @dataclass(slots=True)
@@ -9447,6 +9452,39 @@ class GlobalDispatcher:
         allow_unbound_prelaunch: bool = False,
         pending_broadcast_extra: dict | None = None,
     ) -> _TaskLifecycleFinalization | None:
+        browser_disposition = await self._incoming_browser_replay_disposition(
+            generation,
+            consume_retry=consume_retry,
+            allow_unbound_prelaunch=allow_unbound_prelaunch,
+        )
+        if browser_disposition == "stale":
+            return None
+        if browser_disposition == "defer":
+            # A Browser child owns one immutable fresh launch and cannot own a
+            # nested Harness graph.  Returning a provably unlaunched attempt
+            # to pending must not install the ordinary terminal owner gate:
+            # that gate mutates metadata frozen by the Browser launch digest.
+            # The specialized transaction below revalidates everything under
+            # parent owner -> binding -> child writer locks and fails closed
+            # if the read-only classification raced another terminal writer.
+            try:
+                return await self._finalize_fresh_lifecycle_replay_under_harness_fence(
+                    generation,
+                    pending_reason=pending_reason,
+                    failure_reason=failure_reason,
+                    consume_retry=consume_retry,
+                    allow_unbound_prelaunch=allow_unbound_prelaunch,
+                    pending_broadcast_extra=pending_broadcast_extra,
+                    browser_pending_only=True,
+                )
+            except _BrowserPendingReplayBecameUnsafe:
+                # Provider admission committed between the read hint and the
+                # writer fence.  The child is no longer eligible for the
+                # metadata-preserving pending path; fall through to the
+                # ordinary terminal graph fence so the exact generation and
+                # its reverse Browser binding are reaped fail-closed.
+                pass
+
         terminal_context = await self._test_harness_terminal_context(
             generation,
             reason=failure_reason,
@@ -9472,6 +9510,42 @@ class GlobalDispatcher:
             )
             return None
 
+    async def _incoming_browser_replay_disposition(
+        self,
+        generation: _TaskLifecycleGeneration,
+        *,
+        consume_retry: bool,
+        allow_unbound_prelaunch: bool,
+    ) -> str:
+        """Classify an incoming Browser child before any terminal gate write.
+
+        ``defer`` is only a read hint; the writer transaction repeats every
+        proof.  ``unsafe`` deliberately falls through to the normal terminal
+        owner fence, while ``stale`` must not mutate a replacement generation.
+        Browser children are provisioned with ``max_retries=0`` and authorize
+        one exact fresh prompt, so retry-consuming replay is always terminal.
+        """
+
+        async with self.db_factory() as db:
+            binding_id = await db.scalar(
+                select(TestHarnessChildBinding.id).where(
+                    TestHarnessChildBinding.child_task_id == generation.task_id
+                )
+            )
+            if binding_id is None:
+                return "not_browser"
+            task = await self._read_owned_lifecycle_task(db, generation)
+            if task is None:
+                return "stale"
+            if consume_retry:
+                return "unsafe"
+            source = await self._canonical_exact_turn_source(db, task)
+            if task.turn_source_log_id is None:
+                return "defer" if allow_unbound_prelaunch else "unsafe"
+            if source is not None and source.actual_transport is None:
+                return "defer"
+            return "unsafe"
+
     async def _finalize_fresh_lifecycle_replay_under_harness_fence(
         self,
         generation: _TaskLifecycleGeneration,
@@ -9481,6 +9555,7 @@ class GlobalDispatcher:
         consume_retry: bool = False,
         allow_unbound_prelaunch: bool = False,
         pending_broadcast_extra: dict | None = None,
+        browser_pending_only: bool = False,
     ) -> _TaskLifecycleFinalization | None:
         """Atomically defer/retry only a provably unlaunched fresh turn.
 
@@ -9498,12 +9573,82 @@ class GlobalDispatcher:
 
         failed_task: Task | None = None
         async with self.db_factory() as db:
+            # An isolated Browser child is owned by an incoming durable
+            # binding.  Discover that immutable reverse edge in a read-only
+            # snapshot, then restart the transaction before taking writer
+            # locks so SQLite WAL never upgrades a stale snapshot.  Browser
+            # materialization/activation uses owner -> binding -> child; keep
+            # the same order here for every active -> pending replay.
+            browser_binding_snapshot = await db.scalar(
+                select(TestHarnessChildBinding).where(
+                    TestHarnessChildBinding.child_task_id == generation.task_id
+                )
+            )
+            browser_binding_id: str | None = None
+            browser_owner_identity = None
+            if browser_binding_snapshot is not None:
+                from backend.services.test_harness_children import (
+                    browser_binding_owner_identity,
+                )
+
+                try:
+                    browser_owner_identity = browser_binding_owner_identity(
+                        browser_binding_snapshot
+                    )
+                except RuntimeError:
+                    await db.rollback()
+                    return None
+                browser_binding_id = browser_binding_snapshot.id
+            await db.rollback()
+            db.expire_all()
+
+            browser_binding = None
+            browser_owner = None
+            if browser_binding_id is not None:
+                from backend.services.test_harness_owner_fence import (
+                    lock_test_harness_owner,
+                )
+
+                try:
+                    browser_owner = await lock_test_harness_owner(
+                        db,
+                        browser_owner_identity,
+                    )
+                except RuntimeError:
+                    await db.rollback()
+                    return None
+                binding_fence = await db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(TestHarnessChildBinding.id == browser_binding_id)
+                    .values(state=TestHarnessChildBinding.state)
+                )
+                if binding_fence.rowcount != 1:
+                    await db.rollback()
+                    return None
+                browser_binding = await db.scalar(
+                    select(TestHarnessChildBinding)
+                    .where(TestHarnessChildBinding.id == browser_binding_id)
+                    .execution_options(populate_existing=True)
+                )
+                if browser_binding is None:
+                    await db.rollback()
+                    return None
+
+            writer_predicates = [
+                *self._task_lifecycle_generation_predicates(generation),
+                no_active_worker_task_termination_predicate(),
+            ]
+            if browser_pending_only:
+                from backend.services.test_harness_owner_fence import (
+                    no_active_test_harness_owner_graph_predicate,
+                )
+
+                writer_predicates.append(
+                    no_active_test_harness_owner_graph_predicate()
+                )
             writer_fence = await db.execute(
                 update(Task)
-                .where(
-                    *self._task_lifecycle_generation_predicates(generation),
-                    no_active_worker_task_termination_predicate(),
-                )
+                .where(*writer_predicates)
                 .values(turn_source_log_id=Task.turn_source_log_id)
             )
             if writer_fence.rowcount != 1:
@@ -9580,13 +9725,81 @@ class GlobalDispatcher:
                 }
                 target_status = "failed"
 
+            if browser_pending_only and target_status != "pending":
+                await db.rollback()
+                raise _BrowserPendingReplayBecameUnsafe
+
+            isolated_browser_child = bool(
+                browser_binding is not None or _is_isolated_browser_task(task)
+            )
+            if target_status == "pending" and isolated_browser_child:
+                from backend.services.test_harness_children import (
+                    CHILD_READY,
+                    CHILD_RUNNING,
+                    browser_binding_owner_identity,
+                    browser_child_binding_error,
+                    browser_child_owner_error,
+                )
+
+                if (
+                    browser_binding is None
+                    or browser_owner is None
+                    or browser_binding.state != CHILD_RUNNING
+                    or browser_binding_owner_identity(browser_binding)
+                    != browser_owner_identity
+                    or browser_child_owner_error(
+                        browser_binding,
+                        browser_owner,
+                    )
+                    is not None
+                    or browser_child_binding_error(browser_binding, task)
+                    is not None
+                    or browser_binding.claimed_retry_count
+                    != generation.retry_count
+                    or browser_binding.claimed_instance_id
+                    != generation.instance_id
+                ):
+                    await db.rollback()
+                    return None
+                released_binding = await db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(
+                        TestHarnessChildBinding.id == browser_binding.id,
+                        TestHarnessChildBinding.state == CHILD_RUNNING,
+                        TestHarnessChildBinding.child_task_incarnation_id
+                        == task.incarnation_id,
+                        TestHarnessChildBinding.claimed_retry_count
+                        == generation.retry_count,
+                        TestHarnessChildBinding.claimed_instance_id
+                        == generation.instance_id,
+                    )
+                    .values(
+                        state=CHILD_READY,
+                        claimed_retry_count=None,
+                        claimed_instance_id=None,
+                        error=(
+                            pending_reason[:500]
+                            if isinstance(pending_reason, str)
+                            else None
+                        ),
+                    )
+                )
+                if released_binding.rowcount != 1:
+                    await db.rollback()
+                    return None
+
+            changed_predicates = [
+                *self._task_status_generation_predicates(observed_generation),
+                task_retry_not_superseded_predicate(),
+                no_active_worker_task_termination_predicate(),
+            ]
+            if browser_pending_only:
+                changed_predicates.append(
+                    no_active_test_harness_owner_graph_predicate()
+                )
             changed = await db.execute(
                 update(Task)
-                .where(
-                    *self._task_status_generation_predicates(observed_generation),
-                    task_retry_not_superseded_predicate(),
-                    no_active_worker_task_termination_predicate(),
-                )
+                .where(*changed_predicates)
                 .values(**values)
             )
             if changed.rowcount != 1:
@@ -10857,6 +11070,30 @@ class GlobalDispatcher:
                 # or tool activity. Generic stderr/message matching is never
                 # replay authority, including for legacy source-less turns.
                 if context_preflight_permit is not None:
+                    if _is_isolated_browser_task(task):
+                        # Browser bindings freeze one exact fresh launch
+                        # profile, including the prompt digest.  Compaction
+                        # would replace that prompt and authorize a different
+                        # second launch under the old owner/job receipt.  Even
+                        # a clean provider preflight cannot grant that new
+                        # authority, so terminate the exact child generation
+                        # and let the binding-first reap path publish its
+                        # durable terminal receipt.
+                        failed = await self._fail_owned_task(
+                            lifecycle_generation,
+                            (
+                                "Isolated Browser Agent uses a fresh-only "
+                                "launch profile and cannot compact or relaunch "
+                                "after a context-window rejection"
+                            ),
+                        )
+                        if not failed:
+                            logger.info(
+                                "Discarding stale Browser context preflight "
+                                "for task %s",
+                                task.id,
+                            )
+                        return
                     try:
                         async with self.db_factory() as db:
                             permit = context_preflight_permit
@@ -11537,6 +11774,30 @@ class GlobalDispatcher:
                         pass
 
                 async with self.db_factory() as db:
+                    # Avoid a missing-key UPDATE for ordinary Tasks: under
+                    # MySQL/InnoDB REPEATABLE READ it can take an unnecessary
+                    # next-key gap lock.  Incoming Browser bindings are
+                    # durable before their child becomes runnable, so a short
+                    # discovery snapshot may safely decide whether the exact
+                    # reverse row needs the binding-first writer fence.
+                    browser_binding_id = await db.scalar(
+                        select(TestHarnessChildBinding.id).where(
+                            TestHarnessChildBinding.child_task_id
+                            == generation.task_id
+                        )
+                    )
+                    await db.rollback()
+                    if browser_binding_id is not None:
+                        binding_fence = await db.execute(
+                            update(TestHarnessChildBinding)
+                            .where(
+                                TestHarnessChildBinding.id == browser_binding_id
+                            )
+                            .values(state=TestHarnessChildBinding.state)
+                        )
+                        if binding_fence.rowcount != 1:
+                            await db.rollback()
+                            return
                     # Global database lock order is Task -> Instance.  Do not
                     # use db.get(Instance) before acquiring the Task row.
                     # A Worker termination receipt uses the same Task writer

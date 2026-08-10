@@ -1,8 +1,8 @@
 # CCM Autonomous Delivery Loop — V1 实现基线与后续 Backlog
 
 - 文档状态：Delivery Loop V1 已实现；自动合并、部署、Worker 等后续范围仍是 Backlog
-- 文档版本：v0.4
-- 更新日期：2026-08-07
+- 文档版本：v0.5
+- 更新日期：2026-08-10
 - 文档类型：当前实现基线 + 可领取、可验收的长期 Backlog
 - V1 目标：用持久状态机驱动“Plan → Code → Pre-PR Review → PR → CI/PR Monitor → 修复循环 → ready_to_merge”
 - 当前安全范围：Codex app-server 本地执行、一个仓库、一个 Developer Task、一个 PR、exact-head CI + Reviewer Panel、人工合并
@@ -18,7 +18,7 @@
 - 普通任务仍是 `mode=auto`；Delivery Loop 是独立的 `mode=delivery_loop`。
 - Delivery Run 只能通过 `POST /api/delivery-runs` 创建。Run、Developer Task 和首个 Cycle 在同一事务提交，普通 Task API 无法伪造 Delivery ownership。
 - Plan 与 Pre-PR Code Review 都通过通用 `CapabilityInvocation/CapabilityExecution` 接口调用。Delivery Controller 使用 required-gate invocation；普通 Auto Task 可创建 human advisory invocation，也可在创建时显式冻结 `capability_policy`，由模型通过 exact terminal action 请求 Plan/Review。
-- Capability executor 与调用者解耦。Auto 请求严格绑定 exact source/output/terminal，并在 provider 提供时绑定 native turn；原子消费预算后进入 `waiting_capability`，完成结果经 durable resume outbox 推进同一 Task 的 G→G+1。`CAPABILITY_CORE_ENABLED` 与 `AUTO_CAPABILITY_ENABLED` 均默认关闭，Worker/Shared 及非普通 Auto scope 继续 fail closed。
+- Capability executor 与调用者解耦。Auto 请求严格绑定 exact source/output/terminal，并在 provider 提供时绑定 native turn；原子消费预算后进入 `waiting_capability`，完成结果经 durable resume outbox 推进同一 Task 的 G→G+1。`CAPABILITY_CORE_ENABLED` 与 `AUTO_CAPABILITY_ENABLED` 均默认开启，但普通 Task 仍须显式冻结 `capability_policy`；Worker/Shared 及非普通 Auto scope 继续 fail closed。
 
 ### 0.2 当前闭环
 
@@ -187,20 +187,23 @@ PR 合并后发生应用错误时，不能回到原 PR 继续 push。系统只�
 - 进入持久 Human Gate / Incident；或
 - 在未来启用的精确环境代次保护下执行回滚。
 
-### 2.8 默认关闭所有有副作用的自动化
+### 2.8 Admission 默认开启，不可逆自动化保持关闭
 
 V1 默认值：
 
 ```text
-CAPABILITY_CORE_ENABLED = false
-AUTO_CAPABILITY_ENABLED = false
-DELIVERY_LOOP_ENABLED   = false
+CAPABILITY_CORE_ENABLED = true
+AUTO_CAPABILITY_ENABLED = true
+DELIVERY_LOOP_ENABLED   = true
 delivery auto merge     = unsupported/off
 delivery deployment     = unsupported/off
 delivery auto rollback  = unsupported/off
 ```
 
-三个开关只阻止各自的新 admission，不抛弃已接纳 work。V1 开启后也只运行到 `ready_to_merge`；自动 merge/deploy 没有可被误开的隐式路径。后续能力必须独立 opt-in 并保留同样的 exact-subject fence。
+三个开关默认允许各自的新 admission，显式关闭时也不抛弃已接纳 work。普通
+Auto Task 没有显式 `capability_policy` 时仍不能自行请求 Capability。Delivery V1
+也只运行到 `ready_to_merge`；自动 merge/deploy 没有可被误开的隐式路径。后续
+能力必须独立 opt-in 并保留同样的 exact-subject fence。
 
 ---
 

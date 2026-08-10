@@ -93,9 +93,10 @@ pending → in_progress → executing → completed
                      pending (retry)
 ```
 
-Auto Capability 默认关闭。创建本地普通 Auto Task 时可显式允许 Plan / Code
-Review 并设置总预算与分类预算；任务卡片和聊天页会展示 policy、剩余预算及
-`waiting_capability` 等待状态。Worker、Shared 和其他 Task mode 不接受该 policy。
+Auto Capability 的全局 admission 默认开启，但本地普通 Auto Task 默认不带
+`capability_policy`，仍需在创建时显式允许 Plan / Code Review 并设置总预算与
+分类预算；任务卡片和聊天页会展示 policy、剩余预算及 `waiting_capability`
+等待状态。Worker、Shared 和其他 Task mode 不接受该 policy。
 
 ## 技术栈
 
@@ -618,9 +619,9 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `WORKSPACE_DIR` | `~/Projects` | 项目 clone 目标目录 |
 | `MAX_CONCURRENT_INSTANCES` | `5` | 最大并发 worker 数 |
 | `AUTO_START_DISPATCHER` | `true` | 启动时自动开始调度 |
-| `CAPABILITY_CORE_ENABLED` | `false` | 允许新建人工/Controller Capability invocation；已接纳工作不受关闭影响 |
-| `AUTO_CAPABILITY_ENABLED` | `false` | 允许带显式 `capability_policy` 的本地普通 Auto Task 通过 exact terminal action 请求 Plan/Code Review，并由 durable outbox 恢复下一轮；同时要求 Capability Core |
-| `DELIVERY_LOOP_ENABLED` | `false` | 允许新建 Delivery Loop；同时要求 Capability Core |
+| `CAPABILITY_CORE_ENABLED` | `true` | 允许新建人工/Controller Capability invocation；已接纳工作不受关闭影响 |
+| `AUTO_CAPABILITY_ENABLED` | `true` | 允许带显式 `capability_policy` 的本地普通 Auto Task 通过 exact terminal action 请求 Plan/Code Review，并由 durable outbox 恢复下一轮；同时要求 Capability Core |
+| `DELIVERY_LOOP_ENABLED` | `true` | 允许新建 Delivery Loop；同时要求 Capability Core |
 | `TASK_TIMEOUT_SECONDS` | `1800` | 单个任务最长执行时间（秒） |
 | `SERVICE_NAME` | (自动检测) | systemd 服务名，一键更新重启时使用 |
 

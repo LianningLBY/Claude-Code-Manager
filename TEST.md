@@ -1284,7 +1284,7 @@ cd frontend && npx vitest run \
 | `test_default_policy_is_real_sql_null` | 默认关闭持久化为 SQL `NULL`，不落 JSON `null` |
 | `test_project_worker_resolution_rejects_policy_before_task_write` | Project 解析出远端 Worker 后仍在任何 Task 副作用前 fail closed |
 | `test_clone_requires_explicit_policy_opt_in` | clone 不继承源 Task 的自动能力授权 |
-| `test_auto_capability_switch_is_independent_and_fail_closed` | `AUTO_CAPABILITY_ENABLED` 独立默认关闭，且 Capability Core 关闭时有效值仍为 false |
+| `test_auto_capability_switch_is_independent_and_fail_closed` | 三个 admission 开关默认开启；Capability Core 关闭时 Auto/Delivery 有效值仍为 false |
 | `test_agent_capability_admission.py` | 只接受当前 exact source/output/terminal 的严格 terminal action，并在 provider 提供时校验 native turn；原子消费总预算与分类预算，失败请求不退预算 |
 | `test_agent_capability_production_adapters.py` | Agent Plan/Review 请求进入真实 executor，原 Task 保持 `waiting_capability`，结果 identity 反向验证 |
 | `test_capability_result.py` | completed Execution、结果类型/id/hash 与 Plan/Review 权威聚合必须完整反向匹配 |
@@ -1297,9 +1297,9 @@ cd frontend && npx vitest run \
 | `test_public_mutation_rejects_agent_resume_invocation` | 人工 advisory consume/cancel 不能改写 Agent/Controller-owned resume 状态机 |
 | 前端 Chat/TaskForm/TaskList/taskStatus | policy 总预算与分类预算配置、`waiting_capability` 状态/等待提示和旧 turn 事件隔离 |
 
-两项开关仍默认关闭；开启后也只有创建时显式冻结了 `capability_policy` 的本地
-普通 Auto Task 可由模型请求 Plan/Review。Worker、Shared、Delivery、Plan、Loop、
-Goal 与迁移导入继续 fail closed。
+Capability Core 与 Auto Capability 的全局 admission 默认开启；仍只有创建时显式
+冻结了 `capability_policy` 的本地普通 Auto Task 可由模型请求 Plan/Review。
+Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail closed。
 
 ## 开发规范
 

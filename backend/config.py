@@ -78,21 +78,20 @@ class Settings(BaseSettings):
     plan_structured_output_whitespace_limit: int = 4_096
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
-    # Generic Plan/review capability admission. Dark by default; disabling it
-    # blocks only new admission, while already accepted work still recovers.
-    capability_core_enabled: bool = False
+    # Generic Plan/review capability admission. Enabled by default; disabling
+    # it blocks only new admission, while already accepted work still recovers.
+    capability_core_enabled: bool = True
     capability_coordinator_poll_interval_seconds: float = 2.0
     capability_coordinator_max_concurrency: int = 4
     capability_coordinator_scan_limit: int = 64
     capability_coordinator_initial_backoff_seconds: float = 1.0
     capability_coordinator_max_backoff_seconds: float = 60.0
-    # Model-requested Plan/Review admission is a separate opt-in from Human
-    # advisory capabilities and the Delivery Controller.
-    auto_capability_enabled: bool = False
+    # Model-requested Plan/Review admission has an independent global gate;
+    # each ordinary Task still requires an explicit capability policy.
+    auto_capability_enabled: bool = True
     # Autonomous Plan -> Code -> Review -> PR Monitor controller. Admission is
-    # dark by default because enabling it can push a branch and create a PR;
-    # V1 still stops before merge.
-    delivery_loop_enabled: bool = False
+    # enabled by default; V1 can push/create a PR but still stops before merge.
+    delivery_loop_enabled: bool = True
     delivery_controller_poll_interval_seconds: float = 2.0
     delivery_controller_lease_seconds: int = 30
     delivery_controller_scan_limit: int = 32

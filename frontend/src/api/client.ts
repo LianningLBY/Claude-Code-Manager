@@ -723,7 +723,7 @@ export interface SystemConfig {
   plan_pipeline_defaults?: PlanPipelineConfig;
   /** Side-effecting mode stays hidden unless both server feature gates are on. */
   capability_core_enabled?: boolean;
-  /** Model-requested Plan/Review is independently opt-in and defaults off. */
+  /** Server gate defaults on; each ordinary Task still needs explicit policy. */
   auto_capability_enabled?: boolean;
   delivery_loop_enabled?: boolean;
 }

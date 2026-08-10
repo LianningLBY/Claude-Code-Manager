@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import datetime
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import func, select
@@ -618,6 +619,263 @@ async def test_defer_atomically_reopens_browser_child_claim(db_factory):
         assert task.status == "pending"
         assert durable.state == CHILD_READY
         assert durable.claimed_instance_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("dequeue", "defer", "retry"))
+async def test_browser_queue_transitions_lock_binding_before_child_task(
+    db_factory,
+    transition,
+):
+    """Browser queue writes keep the PostgreSQL/MySQL binding -> child order.
+
+    Browser callbacks, provider admission and stop all lock the durable binding
+    before the child Task.  Reversing those two writes here lets a queue claim
+    or release hold the child while stop holds the binding, forming a real
+    row-lock cycle on PostgreSQL/MySQL even though SQLite serializes the test
+    transaction without exposing it.
+    """
+
+    owner_id, run_id = await _owner_and_run(db_factory, suffix=transition)
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id=f"job-lock-order-{transition}",
+        harness_run_id=run_id,
+        child_values=_child_values(f"job-lock-order-{transition}"),
+    )
+    await service.activate(binding.id)
+    instance_id = 70
+
+    if transition != "dequeue":
+        async with db_factory() as setup:
+            claimed = await TaskQueue(setup).dequeue(instance_id=instance_id)
+            assert claimed is not None and claimed.id == child.id
+
+    async with db_factory() as db:
+        queue = TaskQueue(db)
+        original_execute = db.execute
+        write_tables: list[str] = []
+
+        async def record_writes(statement, *args, **kwargs):
+            table_name = getattr(
+                getattr(statement, "table", None),
+                "name",
+                None,
+            )
+            if getattr(statement, "is_update", False) and table_name in {
+                "tasks",
+                "test_harness_child_bindings",
+            }:
+                write_tables.append(table_name)
+            return await original_execute(statement, *args, **kwargs)
+
+        with patch.object(
+            db,
+            "execute",
+            new=AsyncMock(side_effect=record_writes),
+        ):
+            if transition == "dequeue":
+                result = await queue.dequeue(instance_id=instance_id)
+                assert result is not None and result.id == child.id
+            elif transition == "defer":
+                assert await queue.defer(
+                    child.id,
+                    "ordered Browser claim release",
+                    instance_id=instance_id,
+                )
+            else:
+                result = await queue.retry(
+                    child.id,
+                    expected_statuses=("in_progress",),
+                    instance_id=instance_id,
+                )
+                assert result is not None and result.id == child.id
+
+    assert write_tables[:3] == [
+        "tasks",
+        "test_harness_child_bindings",
+        "tasks",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_browser_dequeue_retries_after_child_cas_miss_without_stuck_binding(
+    db_factory,
+):
+    """A claim loser rolls back its binding CAS before retrying the child."""
+
+    owner_id, run_id = await _owner_and_run(
+        db_factory,
+        suffix="dequeue-cas-miss",
+    )
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-dequeue-cas-miss",
+        harness_run_id=run_id,
+        child_values=_child_values("job-dequeue-cas-miss"),
+    )
+    await service.activate(binding.id)
+    instance_id = 79
+
+    async with db_factory() as db:
+        queue = TaskQueue(db)
+        original_execute = db.execute
+        binding_claim_staged = False
+        binding_claim_attempts = 0
+        child_cas_misses = 0
+
+        async def miss_first_child_cas(statement, *args, **kwargs):
+            nonlocal binding_claim_staged
+            nonlocal binding_claim_attempts
+            nonlocal child_cas_misses
+            table_name = getattr(
+                getattr(statement, "table", None),
+                "name",
+                None,
+            )
+            if (
+                getattr(statement, "is_update", False)
+                and table_name == "test_harness_child_bindings"
+            ):
+                result = await original_execute(statement, *args, **kwargs)
+                if result.rowcount:
+                    binding_claim_attempts += 1
+                    binding_claim_staged = True
+                return result
+            if (
+                binding_claim_staged
+                and child_cas_misses == 0
+                and getattr(statement, "is_update", False)
+                and table_name == "tasks"
+            ):
+                # Clear the local marker as the real method must now roll back
+                # this staged binding transition before starting its next loop.
+                binding_claim_staged = False
+                child_cas_misses += 1
+                return MagicMock(rowcount=0)
+            return await original_execute(statement, *args, **kwargs)
+
+        with patch.object(
+            db,
+            "execute",
+            new=AsyncMock(side_effect=miss_first_child_cas),
+        ):
+            claimed = await queue.dequeue(instance_id=instance_id)
+
+        assert claimed is not None and claimed.id == child.id
+        assert child_cas_misses == 1
+        assert binding_claim_attempts == 2
+
+    async with db_factory() as db:
+        durable_child = await db.get(Task, child.id)
+        durable_binding = await db.get(ChildBindingModel, binding.id)
+        assert durable_child is not None
+        assert durable_child.status == "in_progress"
+        assert durable_child.turn_generation == 1
+        assert durable_child.instance_id == instance_id
+        assert durable_binding is not None
+        assert durable_binding.state == CHILD_RUNNING
+        assert durable_binding.claimed_retry_count == 0
+        assert durable_binding.claimed_instance_id == instance_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transition", ("defer", "retry"))
+async def test_browser_queue_release_rolls_back_when_child_cas_misses(
+    db_factory,
+    transition,
+):
+    """A lost child CAS cannot publish the staged Browser binding release.
+
+    ``retry`` intentionally uses its default ``rollback_on_miss=False``.  That
+    historical commit-on-miss behavior is valid for ordinary Tasks, but a
+    Browser retry has already updated its binding and must roll back the whole
+    transaction when the exact child generation loses its CAS.
+    """
+
+    owner_id, run_id = await _owner_and_run(
+        db_factory,
+        suffix=f"{transition}-cas-miss",
+    )
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id=f"job-{transition}-cas-miss",
+        harness_run_id=run_id,
+        child_values=_child_values(f"job-{transition}-cas-miss"),
+    )
+    await service.activate(binding.id)
+    instance_id = 80
+
+    async with db_factory() as setup:
+        claimed = await TaskQueue(setup).dequeue(instance_id=instance_id)
+        assert claimed is not None and claimed.id == child.id
+
+    async with db_factory() as db:
+        queue = TaskQueue(db)
+        original_execute = db.execute
+        binding_release_staged = False
+        child_cas_missed = False
+
+        async def force_child_cas_miss(statement, *args, **kwargs):
+            nonlocal binding_release_staged, child_cas_missed
+            table_name = getattr(
+                getattr(statement, "table", None),
+                "name",
+                None,
+            )
+            if (
+                getattr(statement, "is_update", False)
+                and table_name == "test_harness_child_bindings"
+            ):
+                result = await original_execute(statement, *args, **kwargs)
+                binding_release_staged = True
+                return result
+            if (
+                binding_release_staged
+                and not child_cas_missed
+                and getattr(statement, "is_update", False)
+                and table_name == "tasks"
+            ):
+                child_cas_missed = True
+                return MagicMock(rowcount=0)
+            return await original_execute(statement, *args, **kwargs)
+
+        with patch.object(
+            db,
+            "execute",
+            new=AsyncMock(side_effect=force_child_cas_miss),
+        ):
+            if transition == "defer":
+                assert not await queue.defer(
+                    child.id,
+                    "simulated exact child CAS loss",
+                    instance_id=instance_id,
+                )
+            else:
+                assert await queue.retry(
+                    child.id,
+                    expected_statuses=("in_progress",),
+                    instance_id=instance_id,
+                ) is None
+
+        assert binding_release_staged
+        assert child_cas_missed
+
+    async with db_factory() as db:
+        durable_child = await db.get(Task, child.id)
+        durable_binding = await db.get(ChildBindingModel, binding.id)
+        assert durable_child is not None
+        assert durable_child.status == "in_progress"
+        assert durable_child.retry_count == 0
+        assert durable_child.instance_id == instance_id
+        assert durable_binding is not None
+        assert durable_binding.state == CHILD_RUNNING
+        assert durable_binding.claimed_retry_count == 0
+        assert durable_binding.claimed_instance_id == instance_id
+        assert durable_binding.error is None
 
 
 @pytest.mark.asyncio

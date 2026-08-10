@@ -136,13 +136,15 @@ class FakeGit:
     async def remote_ref_sha(self, subject, branch: str) -> str | None:
         return self.remote_refs.get(branch)
 
-    async def push_exact(self, subject) -> None:
+    async def push_exact(self, subject):
         self.push_calls += 1
         if self.push_error is not None:
             raise self.push_error
         self.remote_refs[subject.delivery_branch] = subject.head_sha
         if self.push_response_lost:
             raise DeliveryGitError("response lost")
+        from backend.services.delivery_publisher import PushResult
+        return PushResult()
 
 
 @dataclass

@@ -23,7 +23,9 @@ import type {
 } from '../../api/client';
 import {
   acknowledgeDeliveryAdmission,
+  deliveryProviderOptions,
   prepareDeliveryAdmission,
+  resolveDeliveryProvider,
 } from '../Tasks/deliveryAdmission';
 import { filterDeliveryRepos } from '../Tasks/deliveryCompatibility';
 
@@ -58,6 +60,7 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
   const [taskDraft, setTaskDraft] = useState<TodoDraft>(emptyDraft);
   const [taskProvider, setTaskProvider] = useState('codex');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
+  const [providerConfigLoaded, setProviderConfigLoaded] = useState(false);
   const [taskMode, setTaskMode] = useState<'auto' | 'delivery_loop'>('auto');
   const [deliveryLoopEnabled, setDeliveryLoopEnabled] = useState(false);
   const [monitoredRepos, setMonitoredRepos] = useState<MonitoredRepo[]>([]);
@@ -67,12 +70,22 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
   const [updatingIds, setUpdatingIds] = useState<Set<number>>(() => new Set());
 
   const openCount = useMemo(() => todos.filter((todo) => todo.status === 'open').length, [todos]);
+  const deliveryProviders = useMemo(
+    () => deliveryProviderOptions(providerOptions),
+    [providerOptions],
+  );
   const compatibleDeliveryRepos = useMemo(
     () => filterDeliveryRepos(
       project?.id === projectId ? project : undefined,
       monitoredRepos,
+      providerConfigLoaded ? deliveryProviders : [],
     ),
-    [monitoredRepos, project, projectId],
+    [deliveryProviders, monitoredRepos, project, projectId, providerConfigLoaded],
+  );
+  const selectedDeliveryProvider = resolveDeliveryProvider(
+    taskProvider,
+    undefined,
+    deliveryProviders,
   );
   const selectedDeliveryRepo = compatibleDeliveryRepos.find(
     (repo) => repo.id === deliveryRepoId,
@@ -209,11 +222,18 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
     setTaskDraft({ title: todo.title, prompt: todo.prompt });
     setTaskMode('auto');
     setDeliveryRepoId('');
+    setProviderConfigLoaded(false);
     setDeliveryLoopEnabled(false);
     setMonitoredRepos([]);
     api.config().then((c) => {
-      if (c.provider_options?.length) setProviderOptions(c.provider_options);
-      if (c.default_provider) setTaskProvider(c.default_provider);
+      const configuredProviders = c.provider_options?.length
+        ? c.provider_options
+        : ['claude', 'codex'];
+      setProviderOptions(configuredProviders);
+      setProviderConfigLoaded(true);
+      setTaskProvider((current) => (
+        resolveDeliveryProvider(c.default_provider, current, configuredProviders) ?? current
+      ));
       const enabled = c.delivery_loop_enabled === true;
       setDeliveryLoopEnabled(enabled);
       if (enabled) {
@@ -221,7 +241,9 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
       } else {
         setMonitoredRepos([]);
       }
-    }).catch(() => {});
+    }).catch(() => {
+      setProviderConfigLoaded(true);
+    });
   };
 
   const createTask = async (event: FormEvent) => {
@@ -237,6 +259,9 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
       if (taskMode === 'delivery_loop') {
         const repo = compatibleDeliveryRepos.find((item) => item.id === deliveryRepoId);
         if (!repo) throw new Error('Select a compatible PR Monitor repository.');
+        if (!selectedDeliveryProvider) {
+          throw new Error('Select a supported Delivery provider.');
+        }
         admissionScope = deliveryAdmissionScope(projectId, taskTodo.id);
         deliveryRequest = prepareDeliveryAdmission(admissionScope, {
           project_id: projectId,
@@ -244,7 +269,7 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
           source_todo_id: taskTodo.id,
           title: taskDraft.title,
           requirements: taskDraft.prompt,
-          provider: 'codex',
+          provider: selectedDeliveryProvider,
         });
         const run = await api.createDeliveryRun(deliveryRequest);
         taskId = run.developer_task_id;
@@ -530,24 +555,33 @@ export function ProjectTodoList({ projectId, project }: ProjectTodoListProps) {
                   onChange={(e) => {
                     const nextMode = e.target.value === 'delivery_loop' ? 'delivery_loop' : 'auto';
                     setTaskMode(nextMode);
-                    if (nextMode === 'delivery_loop') setTaskProvider('codex');
+                    if (nextMode === 'delivery_loop') {
+                      const nextProvider = resolveDeliveryProvider(
+                        taskProvider,
+                        undefined,
+                        deliveryProviders,
+                      );
+                      if (nextProvider) setTaskProvider(nextProvider);
+                    }
                     setDeliveryRepoId('');
                   }}
                   className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-foreground outline-none focus:border-indigo-500"
                 >
                   <option value="auto">Auto</option>
-                  {deliveryLoopEnabled && <option value="delivery_loop">Delivery Loop</option>}
+                  {deliveryLoopEnabled && deliveryProviders.length > 0 && (
+                    <option value="delivery_loop">Delivery Loop</option>
+                  )}
                 </select>
               </label>
               <label className="block space-y-1.5">
                 <span className="text-sm text-gray-300">Provider</span>
                 <select
+                  aria-label="Task provider"
                   value={taskProvider}
                   onChange={(e) => setTaskProvider(e.target.value)}
-                  disabled={taskMode === 'delivery_loop'}
                   className="w-full rounded border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-foreground outline-none focus:border-indigo-500"
                 >
-                  {(taskMode === 'delivery_loop' ? ['codex'] : providerOptions).map((p) => (
+                  {(taskMode === 'delivery_loop' ? deliveryProviders : providerOptions).map((p) => (
                     <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>
                   ))}
                 </select>

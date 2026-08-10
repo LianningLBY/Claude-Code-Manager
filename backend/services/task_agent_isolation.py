@@ -40,6 +40,17 @@ CLAUDE_TASK_BUILTIN_TOOLS = (
     "Write",
 )
 
+CLAUDE_DELIVERY_BUILTIN_TOOLS = (
+    "Bash",
+    "Edit",
+    "Glob",
+    "Grep",
+    "MultiEdit",
+    "NotebookEdit",
+    "Read",
+    "Write",
+)
+
 CLAUDE_MONITOR_BUILTIN_TOOLS = (
     "Bash",
     "Glob",
@@ -1091,6 +1102,121 @@ def _canonical_protected_paths(values: Iterable[str]) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def _canonical_exact_filesystem_paths(
+    values: Iterable[str],
+    *,
+    label: str,
+) -> tuple[str, ...]:
+    """Normalize exact non-root paths without adding ambient deny roots."""
+
+    paths: set[str] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise TaskAgentIsolationError(
+                f"Claude Task isolation {label} contains an invalid path"
+            )
+        expanded = os.path.expandvars(os.path.expanduser(value))
+        if not os.path.isabs(expanded):
+            raise TaskAgentIsolationError(
+                f"Claude Task isolation {label} requires absolute paths"
+            )
+        path = os.path.abspath(expanded)
+        if path == os.path.sep:
+            raise TaskAgentIsolationError(
+                f"Claude Task isolation {label} cannot target filesystem root"
+            )
+        paths.add(path)
+    return tuple(sorted(paths))
+
+
+def _delivery_git_projection(
+    working_directory: str | os.PathLike[str],
+    *,
+    expected_boundary: LinkedWorktreeGitReadBoundary | None = None,
+) -> tuple[LinkedWorktreeGitReadBoundary, tuple[str, ...]]:
+    """Discover and validate the immutable Git view for one Delivery turn."""
+
+    boundary = discover_linked_worktree_git_read_boundary(working_directory)
+    if boundary is None:
+        raise TaskAgentIsolationError(
+            "Claude Delivery requires a linked-worktree Git boundary"
+        )
+    if expected_boundary is not None and boundary != expected_boundary:
+        raise TaskAgentIsolationError(
+            "Claude Delivery linked-worktree Git boundary changed before launch"
+        )
+    try:
+        workspace = Path(working_directory).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise TaskAgentIsolationError(
+            "Claude Delivery workspace is unavailable"
+        ) from exc
+    pointer = str(workspace / ".git")
+    deny_roots = _canonical_exact_filesystem_paths(
+        (pointer, boundary.git_dir, boundary.common_dir),
+        label="Delivery Git deny projection",
+    )
+    read_paths = _canonical_exact_filesystem_paths(
+        boundary.read_paths,
+        label="Delivery Git read projection",
+    )
+    if pointer not in read_paths:
+        raise TaskAgentIsolationError(
+            "Claude Delivery Git projection lost its worktree pointer"
+        )
+    for path in read_paths:
+        if path == pointer:
+            continue
+        try:
+            covered = any(
+                os.path.commonpath((path, root)) == root
+                for root in (boundary.git_dir, boundary.common_dir)
+            )
+        except ValueError:
+            covered = False
+        if not covered:
+            raise TaskAgentIsolationError(
+                "Claude Delivery Git read projection escaped its metadata roots"
+            )
+    return boundary, deny_roots
+
+
+def _delivery_private_tmp_projection(
+    private_tmpdir: str | os.PathLike[str],
+) -> tuple[str, str]:
+    """Prove one service-owned 0700 scratch leaf and its private parent."""
+
+    try:
+        lexical = Path(os.path.abspath(
+            os.path.expandvars(os.path.expanduser(os.fspath(private_tmpdir)))
+        ))
+        scratch = lexical.resolve(strict=True)
+        scratch_info = lexical.lstat()
+        root = scratch.parent
+        root_info = root.lstat()
+    except (OSError, RuntimeError) as exc:
+        raise TaskAgentIsolationError(
+            "Claude Delivery private TMPDIR is unavailable"
+        ) from exc
+    if (
+        lexical != scratch
+        or scratch == root
+        or root == Path(os.path.sep)
+        or stat.S_ISLNK(scratch_info.st_mode)
+        or not stat.S_ISDIR(scratch_info.st_mode)
+        or scratch_info.st_uid != os.geteuid()
+        or stat.S_IMODE(scratch_info.st_mode) != 0o700
+        or stat.S_ISLNK(root_info.st_mode)
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or stat.S_IMODE(root_info.st_mode) != 0o700
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Delivery private TMPDIR must be a service-owned 0700 leaf"
+        )
+    return str(root), str(scratch)
+
+
 def _permission_path(path: str) -> str:
     return f"//{path.lstrip('/')}"
 
@@ -1121,6 +1247,9 @@ def _generate_claude_isolation_settings(
     include_task_hooks: bool,
     builtin_tools: Iterable[str],
     include_mcp_tools: bool = True,
+    read_only_deny_paths: Iterable[str] = (),
+    read_only_allow_paths: Iterable[str] = (),
+    allowed_write_paths: Iterable[str] | None = None,
 ) -> Path:
     from backend.config import settings
     from backend.services.ask_user_settings import (
@@ -1131,11 +1260,38 @@ def _generate_claude_isolation_settings(
         materialize_trusted_python_asset,
     )
 
-    paths = _canonical_protected_paths(protected_paths)
-    read_overrides = _canonical_exact_credential_paths(
+    credential_paths = _canonical_protected_paths(protected_paths)
+    credential_read_overrides = _canonical_exact_credential_paths(
         allowed_read_paths,
         require_private_regular_file=True,
     )
+    read_only_denies = _canonical_exact_filesystem_paths(
+        read_only_deny_paths,
+        label="read-only deny projection",
+    )
+    read_only_overrides = _canonical_exact_filesystem_paths(
+        read_only_allow_paths,
+        label="read-only allow projection",
+    )
+    write_overrides = (
+        None
+        if allowed_write_paths is None
+        else _canonical_exact_filesystem_paths(
+            allowed_write_paths,
+            label="write allow projection",
+        )
+    )
+    write_denies = tuple(sorted({*credential_paths, *read_only_denies}))
+    read_denies = write_denies
+    read_overrides = tuple(sorted({
+        *credential_read_overrides,
+        *read_only_overrides,
+    }))
+    if set(credential_paths) & set(read_only_denies):
+        raise TaskAgentIsolationError(
+            "Claude Task isolation cannot classify a credential path as a "
+            "read-only projection"
+        )
     immutable_denies = _canonical_protected_paths(())
     if any(
         path == os.path.sep
@@ -1174,13 +1330,13 @@ def _generate_claude_isolation_settings(
         )
         hooks.append(
             task_ssh_guard_hook_entry(
-                paths,
+                read_denies,
                 script_path=guard_script,
             )
         )
 
     permission_denies: list[str] = []
-    for path in paths:
+    for path in read_denies:
         rule_path = _permission_path(path)
         permission_denies.extend((
             f"Read({rule_path})",
@@ -1188,6 +1344,18 @@ def _generate_claude_isolation_settings(
             f"Edit({rule_path})",
             f"Edit({rule_path}/**)",
         ))
+
+    filesystem: dict[str, object] = {
+        "denyRead": list(read_denies),
+        "denyWrite": list(write_denies),
+        # Claude 2.1.168 documents allowRead as an exact re-allow
+        # inside denyRead regions. Parent credential roots remain
+        # denied; only the selected Git key/askpass is readable by
+        # the git subprocess for this turn.
+        "allowRead": list(read_overrides),
+    }
+    if write_overrides is not None:
+        filesystem["allowWrite"] = list(write_overrides)
 
     payload: dict[str, object] = {
         "showThinkingSummaries": True,
@@ -1210,19 +1378,11 @@ def _generate_claude_isolation_settings(
             "autoAllowBashIfSandboxed": True,
             "allowUnsandboxedCommands": False,
             "excludedCommands": [],
-            "filesystem": {
-                "denyRead": list(paths),
-                "denyWrite": list(paths),
-                # Claude 2.1.168 documents allowRead as an exact re-allow
-                # inside denyRead regions. Parent credential roots remain
-                # denied; only the selected Git key/askpass is readable by
-                # the git subprocess for this turn.
-                "allowRead": list(read_overrides),
-            },
+            "filesystem": filesystem,
             "credentials": {
                 "files": [
                     {"path": path, "mode": "deny"}
-                    for path in paths
+                    for path in credential_paths
                 ],
             },
             "network": {
@@ -1272,6 +1432,43 @@ def generate_claude_task_isolation_settings(
         include_task_hooks=True,
         builtin_tools=CLAUDE_TASK_BUILTIN_TOOLS,
     )
+
+
+def generate_claude_delivery_isolation_settings(
+    task_id: int,
+    protected_paths: Iterable[str],
+    *,
+    working_directory: str | os.PathLike[str],
+    private_tmpdir: str | os.PathLike[str],
+) -> tuple[Path, LinkedWorktreeGitReadBoundary]:
+    """Write the networkless, no-MCP policy for a Delivery Developer turn.
+
+    Git control metadata is broadly denied for both reads and writes. Only the
+    exact linked-worktree projection proven by
+    :func:`discover_linked_worktree_git_read_boundary` is re-opened for
+    sandboxed subprocess reads, so ``git status/diff/log`` can work while the
+    model cannot commit, reset, update refs, inspect config/hooks, or push.
+    """
+
+    boundary, deny_roots = _delivery_git_projection(working_directory)
+    workspace = str(Path(working_directory).expanduser().resolve(strict=True))
+    scratch_root, scratch = _delivery_private_tmp_projection(private_tmpdir)
+    settings_path = _generate_claude_isolation_settings(
+        namespace="task",
+        identifier=task_id,
+        filename="claude-delivery-security.json",
+        protected_paths=protected_paths,
+        allowed_read_paths=(),
+        ssh_capabilities=(),
+        disable_direct_network=True,
+        include_task_hooks=False,
+        builtin_tools=CLAUDE_DELIVERY_BUILTIN_TOOLS,
+        include_mcp_tools=False,
+        read_only_deny_paths=(*deny_roots, scratch_root),
+        read_only_allow_paths=(*boundary.read_paths, scratch),
+        allowed_write_paths=(workspace, scratch),
+    )
+    return settings_path, boundary
 
 
 def generate_claude_aux_isolation_settings(
@@ -1378,6 +1575,11 @@ def _validate_claude_security_contract(
     *,
     expected_tools: tuple[str, ...],
     include_mcp_tools: bool = True,
+    expected_read_only_denies: tuple[str, ...] = (),
+    expected_allow_read: tuple[str, ...] | None = None,
+    expected_allow_write: tuple[str, ...] | None = None,
+    require_network_disabled: bool = False,
+    require_no_hooks: bool = False,
 ) -> None:
     """Validate the exact CCM-owned settings contract without trusting CLI."""
 
@@ -1460,12 +1662,19 @@ def _validate_claude_security_contract(
         raise TaskAgentIsolationError(
             "Claude Task isolation sandbox fail-closed policy is not exact"
         )
+    expected_filesystem_keys = {"denyRead", "denyWrite", "allowRead"}
+    if expected_allow_write is not None:
+        expected_filesystem_keys.add("allowWrite")
     filesystem = _require_exact_keys(
         sandbox.get("filesystem"),
-        {"denyRead", "denyWrite", "allowRead"},
+        expected_filesystem_keys,
         "sandbox filesystem",
     )
     paths = filesystem["denyRead"]
+    read_only_denies = _canonical_exact_filesystem_paths(
+        expected_read_only_denies,
+        label="validated read-only deny projection",
+    )
     if (
         not isinstance(paths, list)
         or not paths
@@ -1486,7 +1695,28 @@ def _validate_claude_security_contract(
             for path in paths
         )
         or str(runtime_secret_root()) not in paths
-        or (os.name == "posix" and Path("/proc").is_dir() and "/proc" not in paths)
+        or (
+            os.name == "posix"
+            and Path("/proc").is_dir()
+            and "/proc" not in paths
+        )
+        or not set(read_only_denies).issubset(paths)
+        or (
+            expected_allow_read is not None
+            and filesystem["allowRead"]
+            != list(_canonical_exact_filesystem_paths(
+                expected_allow_read,
+                label="validated read-only allow projection",
+            ))
+        )
+        or (
+            expected_allow_write is not None
+            and filesystem["allowWrite"]
+            != list(_canonical_exact_filesystem_paths(
+                expected_allow_write,
+                label="validated write allow projection",
+            ))
+        )
     ):
         raise TaskAgentIsolationError(
             "Claude Task isolation protected filesystem paths are not exact"
@@ -1510,8 +1740,11 @@ def _validate_claude_security_contract(
         {"files"},
         "sandbox credentials",
     )
+    credential_paths = [
+        path for path in paths if path not in set(read_only_denies)
+    ]
     if credentials["files"] != [
-        {"path": path, "mode": "deny"} for path in paths
+        {"path": path, "mode": "deny"} for path in credential_paths
     ]:
         raise TaskAgentIsolationError(
             "Claude Task isolation credential denies are not exact"
@@ -1530,6 +1763,7 @@ def _validate_claude_security_contract(
     if (
         network["strictAllowlist"] is not True
         or network["allowedDomains"] not in ([], ["*"])
+        or (require_network_disabled and network["allowedDomains"] != [])
         or network["deniedDomains"] != []
         or network["allowAllUnixSockets"] is not False
         or network["allowLocalBinding"] is not False
@@ -1539,6 +1773,10 @@ def _validate_claude_security_contract(
         )
 
     hooks = payload.get("hooks")
+    if require_no_hooks and hooks is not None:
+        raise TaskAgentIsolationError(
+            "Claude Task isolation unexpectedly includes hooks"
+        )
     if hooks is not None:
         from backend.services.ask_user_settings import (
             ask_user_hook_entry,
@@ -1708,6 +1946,11 @@ def validate_claude_task_isolation_settings(
     tools: Iterable[str] = CLAUDE_TASK_BUILTIN_TOOLS,
     timeout_seconds: float = 5.0,
     include_mcp_tools: bool = True,
+    _expected_read_only_denies: tuple[str, ...] = (),
+    _expected_allow_read: tuple[str, ...] | None = None,
+    _expected_allow_write: tuple[str, ...] | None = None,
+    _require_network_disabled: bool = False,
+    _require_no_hooks: bool = False,
 ) -> None:
     """Strictly validate settings, then run a networkless zero-turn CLI probe."""
 
@@ -1723,6 +1966,11 @@ def validate_claude_task_isolation_settings(
         settings_path,
         expected_tools=selected_tools,
         include_mcp_tools=include_mcp_tools,
+        expected_read_only_denies=_expected_read_only_denies,
+        expected_allow_read=_expected_allow_read,
+        expected_allow_write=_expected_allow_write,
+        require_network_disabled=_require_network_disabled,
+        require_no_hooks=_require_no_hooks,
     )
     resolved_claude = shutil.which(claude_binary)
     bubblewrap = shutil.which("bwrap")
@@ -1820,6 +2068,37 @@ def validate_claude_task_isolation_settings(
             "Claude Task isolation settings could not be validated"
         ) from exc
     _validate_zero_turn_probe(result)
+
+
+def validate_claude_delivery_isolation_settings(
+    settings_path: Path,
+    *,
+    claude_binary: str,
+    working_directory: str | os.PathLike[str],
+    private_tmpdir: str | os.PathLike[str],
+    expected_git_boundary: LinkedWorktreeGitReadBoundary,
+    timeout_seconds: float = 5.0,
+) -> None:
+    """Re-prove the Delivery Git identity and validate its exact policy."""
+
+    current_boundary, deny_roots = _delivery_git_projection(
+        working_directory,
+        expected_boundary=expected_git_boundary,
+    )
+    workspace = str(Path(working_directory).expanduser().resolve(strict=True))
+    scratch_root, scratch = _delivery_private_tmp_projection(private_tmpdir)
+    validate_claude_task_isolation_settings(
+        settings_path,
+        claude_binary=claude_binary,
+        tools=CLAUDE_DELIVERY_BUILTIN_TOOLS,
+        timeout_seconds=timeout_seconds,
+        include_mcp_tools=False,
+        _expected_read_only_denies=(*deny_roots, scratch_root),
+        _expected_allow_read=(*current_boundary.read_paths, scratch),
+        _expected_allow_write=(workspace, scratch),
+        _require_network_disabled=True,
+        _require_no_hooks=True,
+    )
 
 
 def validate_claude_zero_tool_isolation_settings(

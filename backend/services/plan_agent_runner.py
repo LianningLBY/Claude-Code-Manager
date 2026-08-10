@@ -41,6 +41,7 @@ from backend.services.claude_pool import (
 from backend.services.codex_app_server import (
     CodexAppServerBusyError,
     CodexAppServerError,
+    CodexRequiredMcpPreTurnError,
     CodexTurnProcess,
 )
 from backend.services.codex_models import clamp_codex_effort
@@ -94,6 +95,23 @@ _MODEL_UNAVAILABLE_RE = re.compile(
     r"|do not have access to (?:the )?model",
     flags=re.IGNORECASE | re.DOTALL,
 )
+_PLAN_PROVIDERS = frozenset({"claude", "codex"})
+
+
+def _configured_plan_providers() -> frozenset[str]:
+    """Return provider routes enabled for this deployment.
+
+    An empty/invalid legacy value keeps the historical dual-provider default,
+    matching the provider catalog exposed elsewhere by CCM.
+    """
+
+    configured = {
+        item.strip().lower()
+        for item in (settings.provider_options or "").split(",")
+        if item.strip().lower() in _PLAN_PROVIDERS
+    }
+    return frozenset(configured or _PLAN_PROVIDERS)
+
 
 PLANNER_SCHEMA = {
     "type": "object",
@@ -1271,6 +1289,13 @@ class PlanAgentRunner:
                 max_chars=settings.plan_transcript_max_chars,
             )
 
+    def _require_provider_configured(self, provider: str) -> None:
+        if provider not in _configured_plan_providers():
+            raise PlanRouteUnavailable(
+                f"{provider.title()} Plan provider is not configured",
+                provider=provider,
+            )
+
     def _select_home(
         self,
         *,
@@ -2337,6 +2362,15 @@ class PlanAgentRunner:
                         provider=provider,
                         stderr=str(exc),
                     ) from exc
+                except CodexRequiredMcpPreTurnError as exc:
+                    # This exception is emitted only before thread admission;
+                    # no model work can have started, so the configured
+                    # provider fallback is safe and intentional.
+                    raise PlanRouteUnavailable(
+                        "Codex Plan pre-turn route is unavailable",
+                        provider=provider,
+                        stderr=str(exc),
+                    ) from exc
                 except CodexAppServerError as exc:
                     raise PlanAgentError(
                         "Codex Plan app-server failed",
@@ -2511,6 +2545,15 @@ class PlanAgentRunner:
                             provider=provider,
                             stderr=str(exc),
                         ) from exc
+                if process is None and isinstance(
+                    exc,
+                    (FileNotFoundError, PermissionError),
+                ):
+                    raise PlanRouteUnavailable(
+                        "Claude Plan CLI became unavailable before process admission",
+                        provider=provider,
+                        stderr=str(exc),
+                    ) from exc
                 raise PlanAgentError(
                     f"{provider.title()} Plan Agent process failed",
                     provider=provider,
@@ -2613,6 +2656,7 @@ class PlanAgentRunner:
     ) -> tuple[dict, str, str | None]:
         """Exhaust accounts for one model before declaring the route unavailable."""
 
+        self._require_provider_configured(route.provider)
         excluded: set[str] = set()
         reasons: list[str] = []
         while True:

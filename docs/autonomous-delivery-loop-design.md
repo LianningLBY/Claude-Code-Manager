@@ -5,7 +5,7 @@
 - 更新日期：2026-08-10
 - 文档类型：当前实现基线 + 可领取、可验收的长期 Backlog
 - 当前目标：用持久状态机驱动“Plan → Code → Pre-PR Review → PR → CI/PR Monitor → 修复循环 → ready_to_merge 或 merged”
-- 当前安全范围：Codex app-server 本地执行、一个仓库、一个 Developer Task、一个 PR、exact-head CI + Reviewer Panel；合并终点继承 PR Monitor 的冻结开关
+- 当前安全范围：admission 冻结的 Claude/Codex 本地执行、一个仓库、一个 Developer Task、一个 PR、exact-head CI + Reviewer Panel；合并终点继承 PR Monitor 的冻结开关
 
 > 第 0 节描述当前 V1 的权威实现。第 18 节起保留最初面向完整自动交付平台的长期 Todo；其中 `[ ]` 表示该 Todo 的完整远期范围尚未全部完成，不能据此否定第 0 节列出的 V1 子集。
 
@@ -40,11 +40,11 @@ Create DeliveryRun
 
 ### 0.3 Developer 执行 Profile
 
-- V1 的 Developer 固定为 Codex-only；provider/model/service tier/effort 在 Run admission 时冻结，后续每次领取和 launch 都复验同一 policy hash 与路由 tuple。
-- Developer 只允许走 Codex app-server；app-server 被关闭、启动失败、隔离无法确认或 turn/start 结果不确定时均 fail closed，绝不回退 `codex exec`。
-- turn 使用 `workspace-write` 且 `sandboxPolicy.networkAccess=false`；`writableRoots` 只显式列出本 Run 的受管 worktree。
-- Developer 不继承 Git/GitHub credential；user/project MCP、CCM 主 MCP、Sub-agent MCP、Apps、web search 和 autonomous features 全部关闭，线程配置强制 `mcp_servers={}`。
-- Developer 不能可信地写 linked-worktree 的仓库外 Git metadata；即便修改 worktree 内 `.git` pointer，Controller 也会在执行 Git 前重新验证 commondir/backlink 和受管路径。
+- V1 Developer 支持 `claude` 与 `codex`；provider/model/effort 及 provider-specific service tier 在 Run admission 时冻结，后续每次领取和 launch 都复验同一 policy hash 与路由 tuple，运行中不得静默切换 provider。
+- Claude Developer 可走 Claude CLI direct 或 PTY，但必须使用本 Turn 的 exact `--settings`、`--setting-sources ""` 与 `failIfUnavailable` 隔离配置；网络关闭，工具严格限于非自主的本地读写/测试工具，不生成或注入 MCP、Skills、AskUserQuestion/hook/token、Agent/Task/Workflow、web 或 Git/GitHub credential。
+- Claude profile 对 worktree 内 `.git` pointer、per-worktree Git dir 与 common Git dir 先做 broad deny，再只把已验证的 linked-worktree Git metadata 路径投影到 exact `allowRead`，因此可读 `git status/diff/log` 但不能写 refs、objects、config 或 hooks；真正 spawn 前必须重新发现并精确比对 Git dir/common dir、read paths 与 identity fingerprint，漂移即 fail closed。
+- Codex Developer 仍只允许走 app-server：使用 `workspace-write`、`sandboxPolicy.networkAccess=false`，且 `writableRoots` 只显式列出本 Run 的受管 worktree；user/project MCP、CCM 主 MCP、Sub-agent MCP、Apps、web 与 autonomous features 全部关闭，线程配置强制 `mcp_servers={}`。app-server 被关闭、启动失败、隔离无法确认或 `turn/start` 结果不确定时均 fail closed，绝不回退 `codex exec`。
+- 两种 provider 都不继承 Git/GitHub credential，且 Developer 只能产生未提交 diff；Controller 在任何 privileged Git effect 前仍重新验证 commondir/backlink、受管路径与 exact subject。
 
 ### 0.4 权限、副作用 Fence 与安全终点
 
@@ -234,7 +234,7 @@ merge 终点在 admission 时从 PR Monitor 冻结；deployment 仍没有可被�
 
 - `worker_id != null` 的 DeliveryRun。
 - Shared shadow Task 发起或控制 DeliveryRun。
-- Claude Developer 或任何 `codex exec` fallback；V1 必须使用可确认隔离策略的 Codex app-server。
+- admission 未冻结为 `claude`/`codex` 的 Developer、任何 `codex exec` fallback，或无法证明上述 Claude exact-settings / Codex app-server 隔离边界的执行。
 - 已经有 session 的普通 Task 原地转换成受控 DeliveryRun。
 - 一个 Run 管理多个仓库或多个 PR。
 - 自动 Merge Queue；direct auto-merge 只允许继承 PR Monitor 的冻结策略。
@@ -326,10 +326,11 @@ merge 终点在 admission 时从 PR Monitor 冻结；deployment 仍没有可被�
                                       └────────┬─────────┘ │ PR Monitor   │
                                                │           │ CI + Panel   │
                                                ▼           └──────┬───────┘
-                                      ┌──────────────────┐        │
-                                      │Codex app-server  │        │ exact-head verdict
-                                      │isolated Developer│        │
-                                      └────────┬─────────┘        │
+                                      ┌──────────────────────┐    │
+                                      │Claude direct/PTY or  │    │ exact-head verdict
+                                      │Codex app-server      │    │
+                                      │isolated Developer    │    │
+                                      └──────────┬───────────┘    │
                                                │ uncommitted diff │
                                                ▼                  │
                                       ┌──────────────────┐        │
@@ -808,7 +809,7 @@ created_at / answered_at
 ### 9.2 调度、隔离与 PR Monitor 接线
 
 - `backend/services/dispatcher.py`、`task_queue.py` 在 claim 前后校验 active Run/Turn fence；Controller 只通过正常 Dispatcher 唤醒 Developer Task。
-- `backend/services/instance_manager.py` 与 `codex_app_server.py` 实施 Codex-only、app-server-only、workspace-write、network-off、no-MCP/no-credential execution profile。
+- `backend/services/instance_manager.py`、`task_agent_isolation.py` 与 `codex_app_server.py` 按 admission 冻结的 provider 实施隔离：Claude 使用 exact-settings 的 direct/PTY profile 与 linked-worktree Git metadata 只读投影，Codex 保持 app-server-only；两者均 network-off、no-MCP/no-credential，并在 provider effect 前复验边界。
 - `backend/api/tasks.py`、`chat.py`、`instances.py`、`projects.py`、`shared_access.py`、`task_migrator.py`、`task_termination.py` 封闭普通 Task/Worker/Shared/迁移旁路。
 - `backend/api/pr_monitor.py`、`pr_monitor_loop.py`、`pr_review_*` 封闭 legacy repair/merge 旁路，并让 Delivery 只消费 exact-head Review/Monitor evidence。
 - `backend/main.py` 按 Dispatcher → Capability Coordinator → Delivery Controller 启动恢复，并按反序停机。
@@ -973,7 +974,7 @@ TaskForm 和 ProjectTodo 不应先创建一个可被 Dispatcher 抢走的普通 
 
 1. 以 principal scope + Project + `idempotency_key` 做 portable admission mutex，并比较 canonical request hash。
 2. 锁定并验证本地 Project 与对应 MonitoredRepo：GitHub remote、panel review、required CI、无 Merge Queue、无 Worker/Shared。
-3. 冻结 Codex provider/model/tier/effort、Monitor policy、cycle/no-progress budget，以及 repo 的 direct
+3. 冻结 Claude/Codex provider、model、effort 与适用的 service tier、Monitor policy、cycle/no-progress budget，以及 repo 的 direct
    merge policy：`false/ready_to_merge` 或 `true/merged`。
 4. 同一事务创建 `DeliveryRun(planning/ready)`、resting Developer Task、首个 active Cycle、初始 Transition；Todo 来源也在同一事务 claim。
 5. commit 后唤醒 Controller；Controller 再幂等 prepare 固定 worktree。API 返回 `201`，相同 key/相同 payload 返回既有 Run，不同 payload 返回 409。
@@ -1174,8 +1175,9 @@ Controller 启动或 Turn 前验证：
 
 但 Prompt 不是安全边界，还必须：
 
-- Developer 运行于 network-off app-server sandbox，且不注入 Git/GitHub credential。
-- `writableRoots` 只显式列出 Run worktree，并关闭 MCP/Apps/web/autonomous routes。
+- Developer 运行于 provider-specific network-off sandbox，且不注入 Git/GitHub credential。
+- Claude direct/PTY 使用 exact settings、空 setting sources、无 MCP/Skills/AskUserQuestion/hook/token/autonomous tools，并对 linked-worktree Git metadata broad deny 后只开放已验证的 exact read projection；Codex 的 `writableRoots` 只显式列出 Run worktree，并关闭 MCP/Apps/web/autonomous routes、禁止 exec fallback。
+- 两条路径都在真正 spawn/provider effect 前复验冻结 execution policy；Claude 还须复验 Git identity fingerprint 与完整 read projection。
 - Controller 每次 privileged Git 前验证 linked-worktree control metadata，并只允许 non-force push frozen delivery ref。
 - workspace、base/head/tree/patch、remote PR 任一漂移都停止 publication，而不是依赖模型遵守提示。
 

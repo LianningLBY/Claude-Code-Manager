@@ -2,6 +2,31 @@ import type { DeliveryRunCreate } from '../../api/client';
 
 type DeliveryAdmissionDraft = Omit<DeliveryRunCreate, 'idempotency_key'>;
 
+export type DeliveryProvider = 'claude' | 'codex';
+
+/** Keep Delivery creation on the two providers implemented by the controller. */
+export function deliveryProviderOptions(options: readonly string[]): DeliveryProvider[] {
+  return Array.from(new Set(options.filter(
+    (provider): provider is DeliveryProvider => provider === 'claude' || provider === 'codex',
+  )));
+}
+
+/** Resolve a persisted/current choice without leaking an unavailable provider. */
+export function resolveDeliveryProvider(
+  requested: string | null | undefined,
+  fallback: string | null | undefined,
+  options: readonly string[],
+): DeliveryProvider | null {
+  const supported = deliveryProviderOptions(options);
+  if (requested === 'claude' || requested === 'codex') {
+    if (supported.includes(requested)) return requested;
+  }
+  if (fallback === 'claude' || fallback === 'codex') {
+    if (supported.includes(fallback)) return fallback;
+  }
+  return supported[0] ?? null;
+}
+
 interface StoredAdmission {
   version: 1;
   fingerprint: string;

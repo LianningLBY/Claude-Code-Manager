@@ -691,9 +691,19 @@ async def test_launch_boundary_ignores_ordinary_legacy_worktree_row(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "model", "other_model"),
+    (
+        ("codex", "gpt-5.6-sol", "gpt-5.6-terra"),
+        ("claude", "claude-opus-4-6", "claude-sonnet-4-6"),
+    ),
+)
 async def test_launch_boundary_allows_only_exact_delivery_binding(
     session_factory,
     tmp_path,
+    provider,
+    model,
+    other_model,
 ):
     repo_path = tmp_path / "repo"
     workspace_path = repo_path / ".claude-manager" / "worktrees" / "delivery-1"
@@ -707,8 +717,8 @@ async def test_launch_boundary_allows_only_exact_delivery_binding(
         await db.flush()
         policy = {
             "schema_version": 1,
-            "provider": "codex",
-            "model": "gpt-5.6-sol",
+            "provider": provider,
+            "model": model,
             "codex_service_tier": "default",
             "effort_level": "high",
         }
@@ -745,8 +755,8 @@ async def test_launch_boundary_allows_only_exact_delivery_binding(
             mode="delivery_loop",
             delivery_run_id=run.id,
             delivery_role="developer",
-            provider="codex",
-            model="gpt-5.6-sol",
+            provider=provider,
+            model=model,
             codex_service_tier="default",
             effort_level="high",
         )
@@ -842,7 +852,7 @@ async def test_launch_boundary_allows_only_exact_delivery_binding(
             )
 
         cycle.status = "coding"
-        task.model = "gpt-5.6-terra"
+        task.model = other_model
         await db.flush()
         with pytest.raises(LaunchSupersededError, match="exact active owner"):
             await _require_delivery_workspace_launch_boundary(

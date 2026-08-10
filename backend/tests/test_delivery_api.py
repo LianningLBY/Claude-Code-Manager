@@ -131,7 +131,7 @@ async def test_create_is_fail_closed_by_both_feature_flags(
 
 
 @pytest.mark.asyncio
-async def test_delivery_admission_contract_rejects_non_codex_provider(
+async def test_delivery_admission_contract_accepts_claude_provider(
     client,
     session_factory,
     delivery_enabled,
@@ -145,12 +145,43 @@ async def test_delivery_admission_contract_rejects_non_codex_provider(
             repo,
             provider="claude",
             model="claude-opus-4-6",
+        ),
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, body["id"])
+        task = await db.get(Task, body["developer_task_id"])
+        assert run is not None
+        assert task is not None
+        assert run.policy_snapshot["provider"] == "claude"
+        assert run.policy_snapshot["model"] == "claude-opus-4-6"
+        assert task.provider == "claude"
+        assert task.model == "claude-opus-4-6"
+
+
+@pytest.mark.asyncio
+async def test_delivery_admission_rejects_codex_fast_for_claude_provider(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="claude-fast")
+
+    response = await client.post(
+        "/api/delivery-runs",
+        json=_payload(
+            project,
+            repo,
+            provider="claude",
+            model="claude-opus-4-6",
             codex_service_tier="priority",
         ),
     )
 
-    assert response.status_code == 422, response.text
-    assert "codex" in response.text
+    assert response.status_code == 400, response.text
+    assert "only available" in response.text
     async with session_factory() as db:
         assert await db.scalar(select(func.count(DeliveryRun.id))) == 0
         assert await db.scalar(select(func.count(Task.id))) == 0

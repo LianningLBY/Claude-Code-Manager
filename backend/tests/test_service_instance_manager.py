@@ -73,6 +73,7 @@ from backend.models.worktree import Worktree
 from backend.services import worker_task_termination as termination
 from backend.services.delivery_service import value_hash
 from backend.services.task_queue import TaskQueue
+from backend.services.task_runtime_secrets import create_private_task_temp_dir
 from backend.services.test_harness_children import (
     TestHarnessChildService as HarnessChildService,
 )
@@ -306,7 +307,13 @@ async def _isolated_browser_launch_scope(
         return instance, claimed
 
 
-async def _delivery_launch_scope(db_factory, tmp_path):
+async def _delivery_launch_scope(
+    db_factory,
+    tmp_path,
+    *,
+    provider="codex",
+    model="gpt-5.6-sol",
+):
     repo_path = tmp_path / "delivery-project"
     workspace_path = (
         repo_path / ".claude-manager" / "worktrees" / "delivery-1"
@@ -342,8 +349,8 @@ async def _delivery_launch_scope(db_factory, tmp_path):
     )
     policy = {
         "schema_version": 1,
-        "provider": "codex",
-        "model": "gpt-5.6-sol",
+        "provider": provider,
+        "model": model,
         "codex_service_tier": "default",
         "effort_level": "high",
     }
@@ -389,8 +396,8 @@ async def _delivery_launch_scope(db_factory, tmp_path):
             mode="delivery_loop",
             delivery_run_id=run.id,
             delivery_role="developer",
-            provider="codex",
-            model="gpt-5.6-sol",
+            provider=provider,
+            model=model,
             codex_service_tier="default",
             effort_level="high",
             enable_workflows=False,
@@ -4936,6 +4943,397 @@ async def test_codex_delivery_uses_network_isolated_app_server_without_credentia
     )
     assert kwargs["task_private_tmpdir"].cleaned is True
     assert not kwargs["task_private_tmpdir"].path.exists()
+    exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claude_delivery_uses_networkless_git_read_only_profile_without_mcp(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services.task_agent_isolation import (
+        CLAUDE_DELIVERY_BUILTIN_TOOLS,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_delivery_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    process = _make_mock_process(returncode=None)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._consume_output = AsyncMock()
+
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as exec_mock,
+        patch(
+            "backend.services.mcp_config.generate_mcp_config"
+        ) as generate_mcp,
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="implement the approved plan",
+            task_id=task_id,
+            cwd=workspace,
+            model="claude-opus-4-6",
+            provider="claude",
+            config_dir=str(tmp_path / "delivery-claude-home"),
+            git_env={
+                "GH_TOKEN": "must-not-reach-model",
+                "GIT_ASKPASS": "/manager/askpass",
+            },
+            effort_level="high",
+            codex_service_tier="default",
+        )
+
+    generate_mcp.assert_not_called()
+    argv = list(exec_mock.await_args.args)
+    expected_tools = ",".join(CLAUDE_DELIVERY_BUILTIN_TOOLS)
+    assert argv[argv.index("--tools") + 1] == expected_tools
+    assert argv[argv.index("--allowedTools") + 1] == expected_tools
+    assert "--mcp-config" not in argv
+    assert "AskUserQuestion" not in expected_tools
+    settings_path = Path(argv[argv.index("--settings") + 1])
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    boundary = discover_linked_worktree_git_read_boundary(workspace)
+    assert boundary is not None
+    filesystem = payload["sandbox"]["filesystem"]
+    assert payload["sandbox"]["network"]["allowedDomains"] == []
+    assert "hooks" not in payload
+    assert payload["permissions"]["allow"] == list(
+        CLAUDE_DELIVERY_BUILTIN_TOOLS
+    )
+    launched_env = exec_mock.await_args.kwargs["env"]
+    scratch = launched_env["TMPDIR"]
+    assert launched_env["TMP"] == scratch
+    assert launched_env["TEMP"] == scratch
+    assert filesystem["allowRead"] == sorted(
+        (*boundary.read_paths, scratch)
+    )
+    assert filesystem["allowWrite"] == sorted((workspace, scratch))
+    assert str(Path(scratch).parent) in filesystem["denyRead"]
+    assert str(Path(scratch).parent) in filesystem["denyWrite"]
+    assert {
+        str(Path(workspace) / ".git"),
+        boundary.git_dir,
+        boundary.common_dir,
+    }.issubset(filesystem["denyWrite"])
+    assert "GH_TOKEN" not in launched_env
+    assert "GIT_ASKPASS" not in launched_env
+    assert "CCM_ASK_USER_TOKEN" not in launched_env
+    assert {
+        key: launched_env[key]
+        for key in (
+            "GIT_TERMINAL_PROMPT",
+            "GCM_INTERACTIVE",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GH_PROMPT_DISABLED",
+            "GIT_OPTIONAL_LOCKS",
+        )
+    } == {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    process.returncode = 0
+    await manager._cleanup_active_private_runtime_tempdir(
+        instance_id,
+        process,
+    )
+
+
+@pytest.mark.asyncio
+async def test_claude_delivery_pty_receives_same_exact_profile(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services.task_agent_isolation import (
+        CLAUDE_DELIVERY_BUILTIN_TOOLS,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_delivery_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+    manager._launch_pty = AsyncMock(return_value=54_321)
+
+    with patch(
+        "backend.services.mcp_config.generate_mcp_config"
+    ) as generate_mcp:
+        pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="implement the approved plan",
+            task_id=task_id,
+            cwd=workspace,
+            model="claude-opus-4-6",
+            provider="claude",
+            config_dir=str(tmp_path / "delivery-claude-home"),
+            git_env={"GH_TOKEN": "must-not-reach-model"},
+            effort_level="high",
+            codex_service_tier="default",
+        )
+
+    assert pid == 54_321
+    generate_mcp.assert_not_called()
+    kwargs = manager._launch_pty.await_args.kwargs
+    scratch = str(kwargs["private_runtime_tempdir"].path)
+    assert kwargs["git_env"] == {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GH_PROMPT_DISABLED": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "TMPDIR": scratch,
+        "TMP": scratch,
+        "TEMP": scratch,
+    }
+    assert kwargs["mcp_config_path"] is None
+    assert kwargs["skill_context"] == ""
+    assert kwargs["claude_isolation_tools"] == (
+        CLAUDE_DELIVERY_BUILTIN_TOOLS
+    )
+    assert kwargs["claude_isolation_settings_path"].name == (
+        "claude-delivery-security.json"
+    )
+    await manager._cleanup_unbound_private_runtime_tempdir(instance_id)
+
+
+@pytest.mark.asyncio
+async def test_claude_delivery_rejects_system_prompt_override_before_spawn(
+    db_factory,
+    tmp_path,
+):
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(LaunchSupersededError, match="frozen execution policy"):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must not load an ambient system prompt",
+                task_id=task_id,
+                cwd=workspace,
+                model="claude-opus-4-6",
+                provider="claude",
+                config_dir=str(tmp_path / "delivery-claude-home"),
+                effort_level="high",
+                codex_service_tier="default",
+                system_prompt_mode="append",
+            )
+
+    exec_mock.assert_not_awaited()
+    assert not manager._pending_private_runtime_tempdirs
+
+
+@pytest.mark.asyncio
+async def test_private_runtime_tempdir_is_removed_after_normal_terminal_reap(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="delivery-private-tmp-cleanup")
+        db.add(instance)
+        await db.commit()
+        await db.refresh(instance)
+        instance_id = instance.id
+
+    runtime_tempdir = create_private_task_temp_dir(
+        task_id=instance_id,
+        task_incarnation_id="a" * 32,
+        retry_count=0,
+        turn_generation=0,
+    )
+    process = _make_mock_process(pid=54_322, returncode=0)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    manager._reserve_private_runtime_tempdir(instance_id, runtime_tempdir)
+    manager._bind_private_runtime_tempdir(instance_id, runtime_tempdir)
+    manager._adopt_private_runtime_tempdir(
+        instance_id,
+        process,
+        runtime_tempdir,
+    )
+
+    try:
+        await manager._consume_output_impl(
+            instance_id,
+            None,
+            process,
+            provider="claude",
+        )
+        assert runtime_tempdir.cleaned is True
+        assert not runtime_tempdir.path.exists()
+        assert (instance_id, process) not in (
+            manager._active_private_runtime_tempdirs
+        )
+    finally:
+        runtime_tempdir.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_claude_delivery_spawn_retains_tmpdir_when_reap_unconfirmed(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_delivery_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    process = _make_mock_process(pid=54_334, returncode=None)
+    spawn_started = asyncio.Event()
+    release_spawn = asyncio.Event()
+
+    async def delayed_spawn(*_args, **_kwargs):
+        spawn_started.set()
+        await release_spawn.wait()
+        return process
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            side_effect=delayed_spawn,
+        ),
+        patch.object(manager, "_process_group_alive", return_value=True),
+        patch.object(manager, "_signal_process_tree"),
+        patch.object(
+            manager,
+            "_wait_process_tree",
+            new_callable=AsyncMock,
+            side_effect=asyncio.TimeoutError,
+        ),
+    ):
+        launch = asyncio.create_task(manager.launch(
+            instance_id=instance_id,
+            prompt="cancel while spawning Claude Delivery",
+            task_id=task_id,
+            cwd=workspace,
+            model="claude-opus-4-6",
+            provider="claude",
+            config_dir=str(tmp_path / "delivery-claude-home"),
+            effort_level="high",
+            codex_service_tier="default",
+        ))
+        await asyncio.wait_for(spawn_started.wait(), timeout=2.0)
+        launch.cancel()
+        release_spawn.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+
+    key = (instance_id, process)
+    runtime_tempdir = manager._active_private_runtime_tempdirs[key]
+    try:
+        assert manager.processes[instance_id] is process
+        assert runtime_tempdir.bound is True
+        assert runtime_tempdir.cleaned is False
+        assert runtime_tempdir.path.is_dir()
+        assert instance_id not in manager._pending_private_runtime_tempdirs
+    finally:
+        await manager._cleanup_active_private_runtime_tempdir(
+            instance_id,
+            process,
+        )
+
+
+@pytest.mark.asyncio
+async def test_claude_delivery_rechecks_git_boundary_at_provider_effect(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from dataclasses import replace
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_delivery_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    boundary = discover_linked_worktree_git_read_boundary(workspace)
+    assert boundary is not None
+    changed_boundary = replace(
+        boundary,
+        identity_fingerprint=(*boundary.identity_fingerprint, ("changed",)),
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with (
+        patch(
+            "backend.services.task_agent_isolation."
+            "discover_linked_worktree_git_read_boundary",
+            side_effect=(boundary, boundary, changed_boundary),
+        ),
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+        ) as exec_mock,
+    ):
+        with pytest.raises(
+            LaunchSupersededError,
+            match="changed at provider launch",
+        ):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="must not cross a stale Git boundary",
+                task_id=task_id,
+                cwd=workspace,
+                model="claude-opus-4-6",
+                provider="claude",
+                config_dir=str(tmp_path / "delivery-claude-home"),
+                effort_level="high",
+                codex_service_tier="default",
+            )
+
     exec_mock.assert_not_awaited()
 
 

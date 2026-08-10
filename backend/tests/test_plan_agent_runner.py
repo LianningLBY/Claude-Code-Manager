@@ -22,7 +22,10 @@ from backend.models.plan_agent import (
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.schemas.plan import PlanModelRoute, PlanPipelineConfig
-from backend.services.codex_app_server import CodexTurnProcess
+from backend.services.codex_app_server import (
+    CodexRequiredMcpPreTurnError,
+    CodexTurnProcess,
+)
 from backend.services.plan_agent_runner import (
     PLANNER_SCHEMA,
     PLANNER_SCHEMA_V2,
@@ -831,6 +834,225 @@ async def test_codex_plan_preflight_failure_cleans_private_tmpdir(
             home=admitted_home,
             step_id=706,
             step_type="planner",
+            runtime_receipt=None,
+        )
+
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_provider", "primary_provider", "fallback_provider"),
+    [
+        ("claude", "codex", "claude"),
+        ("codex", "claude", "codex"),
+    ],
+)
+async def test_stage_skips_unconfigured_provider_and_uses_same_provider_fallback(
+    db_factory,
+    monkeypatch,
+    configured_provider,
+    primary_provider,
+    fallback_provider,
+):
+    monkeypatch.setattr(settings, "provider_options", configured_provider)
+    pipeline = PlanPipelineConfig.model_validate({
+        "version": 1,
+        "planner": {
+            "primary": {
+                "provider": "claude",
+                "model": "claude-fable-5",
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": "codex",
+                "model": "gpt-5.6-terra",
+                "effort": "xhigh",
+            },
+        },
+        "reviewer": {
+            "enabled": True,
+            "primary": {
+                "provider": primary_provider,
+                "model": (
+                    "gpt-5.6-sol"
+                    if primary_provider == "codex"
+                    else "claude-sonnet-5"
+                ),
+                "effort": "high",
+            },
+            "fallback": {
+                "provider": fallback_provider,
+                "model": (
+                    "gpt-5.6-terra"
+                    if fallback_provider == "codex"
+                    else "claude-sonnet-5"
+                ),
+                "effort": "high",
+            },
+        },
+        "max_revision_cycles": 0,
+    })
+    task = Task(
+        id=707 if configured_provider == "claude" else 708,
+        title=f"{configured_provider}-only review",
+        description="review without the other provider",
+        mode="plan",
+    )
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    run_id = await runner._create_run(task=task, pipeline=pipeline)
+    runner._run_process = AsyncMock(return_value=(
+        {"action": "approve", "feedback": ""},
+        '{"action":"approve","feedback":""}',
+    ))
+
+    result, _raw, route, route_slot, account_id = await runner._run_stage(
+        run_id=run_id,
+        task_id=task.id,
+        step_type="reviewer",
+        round_number=1,
+        routes=pipeline.reviewer,
+        cwd="/tmp",
+        prompt="review",
+        schema=REVIEWER_SCHEMA_V2,
+        timeout=30,
+    )
+
+    assert result == {"action": "approve", "feedback": ""}
+    assert route.provider == configured_provider
+    assert route_slot == "fallback"
+    assert account_id == "__default__"
+    runner._run_process.assert_awaited_once()
+    assert runner._run_process.await_args.kwargs["provider"] == configured_provider
+    async with db_factory() as db:
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep)
+                    .where(PlanAgentStep.run_id == run_id)
+                    .order_by(PlanAgentStep.id)
+                )
+            ).scalars()
+        )
+    assert [step.route_slot for step in steps] == ["primary", "fallback"]
+    assert [step.status for step in steps] == ["failed", "completed"]
+    assert "not configured" in steps[0].error
+
+
+@pytest.mark.asyncio
+async def test_codex_pre_turn_startup_failure_is_route_unavailable(
+    db_factory,
+    monkeypatch,
+):
+    runtime_temp_dir = _plan_runtime_tmp(709)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield "/private/codex-home", None
+
+    async def fail_before_turn(**kwargs):
+        kwargs["runtime_temp_dir"].cleanup_if_unbound()
+        raise CodexRequiredMcpPreTurnError(
+            "Codex app-server could not start required task context: "
+            "[Errno 2] No such file or directory: 'codex'"
+        )
+
+    runner._runtime_admission = runtime_admission
+    runner._run_codex_turn = AsyncMock(side_effect=fail_before_turn)
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="pre-turn route is unavailable",
+    ):
+        await runner._run_process_attempt(
+            task_id=709,
+            provider="codex",
+            model="gpt-5.6-sol",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home="/private/codex-home",
+            step_id=709,
+            step_type="reviewer",
+            runtime_receipt=None,
+        )
+
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_claude_missing_binary_before_spawn_is_route_unavailable(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    runtime_temp_dir = _plan_runtime_tmp(710)
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=MagicMock(),
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield None, None
+
+    async def missing_binary(*_args, **_kwargs):
+        raise FileNotFoundError("No such file or directory: 'claude'")
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "generate_claude_read_only_isolation_settings",
+        lambda *_args, **_kwargs: tmp_path / "plan-security.json",
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "backend.services.plan_agent_runner._settle_spawn",
+        missing_binary,
+    )
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="became unavailable before process admission",
+    ):
+        await runner._run_process_attempt(
+            task_id=710,
+            provider="claude",
+            model="claude-sonnet-5",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home=None,
+            step_id=710,
+            step_type="reviewer",
             runtime_receipt=None,
         )
 

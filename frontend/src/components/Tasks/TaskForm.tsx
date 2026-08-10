@@ -622,6 +622,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           mode,
           ...(mode === 'loop' ? { todo_file_path: todoFilePath, max_iterations: parseInt(maxIterations) || 50, must_complete: mustComplete } : {}),
           ...(mode === 'goal' ? { goal_condition: goalCondition, goal_max_turns: parseInt(goalMaxTurns) || 30 } : {}),
+          ...(mode === 'pr_loop' ? { pr_loop_max_turns: parseInt(goalMaxTurns) || 20, pr_loop_poll_interval: parseInt((document.getElementById('pr-loop-poll-interval') as HTMLInputElement)?.value || '60') || 60 } : {}),
           ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
@@ -930,6 +931,30 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           />
         </div>
       )}
+      {mode === 'pr_loop' && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-xs text-gray-400 whitespace-nowrap">Max turns:</label>
+          <input
+            type="text"
+            inputMode="numeric"
+            className="w-16 bg-gray-700 text-foreground rounded px-2 py-1.5 text-sm"
+            value={goalMaxTurns}
+            onChange={(e) => setGoalMaxTurns(e.target.value.replace(/[^0-9]/g, ''))}
+            onBlur={() => {
+              const n = parseInt(goalMaxTurns);
+              setGoalMaxTurns(String((!n || n < 1) ? 1 : n));
+            }}
+          />
+          <label className="text-xs text-gray-400 whitespace-nowrap">Poll interval (s):</label>
+          <input
+            type="text"
+            inputMode="numeric"
+            className="w-16 bg-gray-700 text-foreground rounded px-2 py-1.5 text-sm"
+            defaultValue="60"
+            id="pr-loop-poll-interval"
+          />
+        </div>
+      )}
       {/* Bottom action row */}
       <div className="flex items-center gap-2 flex-wrap">
         {/* Attach files */}
@@ -993,6 +1018,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="auto">Auto</option>
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
+                  <option value="pr_loop">PR Loop</option>
                   {deliveryLoopEnabled && (
                     <option value="delivery_loop">Delivery Loop</option>
                   )}

@@ -776,6 +776,13 @@ export interface Task {
   goal_max_turns: number;
   goal_turns_used: number;
   goal_last_reason: string | null;
+  pr_loop_url: string | null;
+  pr_loop_number: number | null;
+  pr_loop_repo: string | null;
+  pr_loop_state: string | null;
+  pr_loop_max_turns: number;
+  pr_loop_turns_used: number;
+  pr_loop_poll_interval: number;
   plan_content: string | null;
   plan_approved: boolean | null;
   plan_target_task_id: number | null;
@@ -2253,7 +2260,7 @@ export const api = {
     request<{ task_id: number; suggested_name: string; content: string; provider: string; model: string }>(`/api/tasks/${id}/distill`, { method: 'POST', body: JSON.stringify({ custom_instruction: customInstruction || null, expected_routing: expectedRouting }) }),
   saveDistilledSkill: (taskId: number, data: { name: string; description?: string; content: string }) =>
     request<{ id: number; name: string; description: string; content: string }>(`/api/tasks/${taskId}/distill/save`, { method: 'POST', body: JSON.stringify(data) }),
-  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; capability_policy?: AutoCapabilityPolicy; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; frontend_review?: FrontendReviewConfig; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
+  createTask: (data: { id?: number; worker_id?: number; title?: string; description?: string; project_id?: number; priority?: number; target_branch?: string; mode?: string; capability_policy?: AutoCapabilityPolicy; todo_file_path?: string; max_iterations?: number; goal_condition?: string; goal_max_turns?: number; goal_evaluator_model?: string; pr_loop_max_turns?: number; pr_loop_poll_interval?: number; frontend_review?: FrontendReviewConfig; image_paths?: string[]; file_paths?: string[]; attachments?: { url: string; name: string; is_image: boolean }[]; secret_ids?: number[]; ssh_grants?: TaskSSHGrantInput[]; provider?: string; model?: string; effort_level?: string; plan_pipeline_config?: PlanPipelineConfig; codex_service_tier?: CodexServiceTier; thinking_budget?: number | null; timeout_hours?: number | null; enable_workflows?: boolean; enabled_skills?: Record<string, boolean>; selected_user_skills?: number[]; starred?: boolean; attention_tag?: string | null; clone_from_task_id?: number }) =>
     request<Task>('/api/tasks', { method: 'POST', body: JSON.stringify(data) }),
   createTaskFromProjectTodo: (
     projectId: number,

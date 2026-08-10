@@ -11018,6 +11018,18 @@ class GlobalDispatcher:
                 )
                 return
 
+            # === Step 3d: PR Loop mode ===
+            if task.mode == "pr_loop":
+                await self._run_pr_loop_lifecycle(
+                    instance_id,
+                    task,
+                    lifecycle_generation,
+                    cwd,
+                    git_env,
+                    effort_level=effort_level,
+                )
+                return
+
             # === Step 4: Launch Claude Code ===
             full_prompt = await self._build_task_prompt(task)
 
@@ -13512,6 +13524,415 @@ class GlobalDispatcher:
         if len(summary) > 15000:
             summary = summary[-15000:]
         return summary
+
+    # ── PR Loop lifecycle ──────────────────────────────────────────────
+
+    async def _run_pr_loop_lifecycle(
+        self,
+        instance_id: int,
+        task: Task,
+        lifecycle_generation: _TaskLifecycleGeneration,
+        cwd: str,
+        git_env: dict[str, str] | None,
+        *,
+        effort_level: str | None = None,
+    ) -> None:
+        """Execute a PR Loop task: agent writes code → PR → poll reviews → iterate."""
+        sequence = _ModeTurnSequence()
+        try:
+            await self._run_pr_loop_turns(
+                instance_id,
+                task,
+                lifecycle_generation,
+                cwd,
+                git_env,
+                effort_level=effort_level,
+                sequence=sequence,
+            )
+        finally:
+            self._revoke_mode_turn_sequence(sequence)
+
+    async def _run_pr_loop_turns(
+        self,
+        instance_id: int,
+        task: Task,
+        generation: _TaskLifecycleGeneration,
+        cwd: str,
+        git_env: dict[str, str] | None,
+        *,
+        effort_level: str | None = None,
+        sequence: _ModeTurnSequence,
+    ) -> None:
+        from backend.services.pr_loop_checker import PRLoopChecker, extract_pr_from_logs
+
+        if not await self._ensure_owned_executing(generation):
+            return
+
+        checker = PRLoopChecker()
+        turn = max(0, int(task.pr_loop_turns_used or 0))
+        max_turns = task.pr_loop_max_turns or 10
+        poll_interval = task.pr_loop_poll_interval or 60
+        session_id: str | None = task.session_id
+        last_review_id: int | None = None
+
+        # Phase 1: Initial turn — agent writes code and creates PR
+        if not task.pr_loop_number:
+            initial_prompt = await self._build_pr_loop_initial_prompt(task)
+            config_dir = await self._resolve_resume_config_dir(
+                None,
+                task.provider,
+                task_id=task.id,
+                expected_generation=generation,
+                **({"model": task.model} if task.model else {}),
+            )
+
+            exit_code, config_dir = await self._launch_mode_turn_with_rotation(
+                instance_id,
+                task,
+                generation,
+                cwd,
+                git_env,
+                prompt=initial_prompt,
+                config_dir=config_dir,
+                resume_session_id=None,
+                loop_iteration=0,
+                effort_level=effort_level,
+                label="PR Loop initial",
+                sequence=sequence,
+            )
+
+            if exit_code != 0:
+                await self._retry_or_fail_mode_task(generation, "PR Loop initial turn failed")
+                return
+
+            # Detect PR from output logs
+            async with self.db_factory() as db:
+                t = await self._read_owned_lifecycle_task(db, generation)
+                if not t:
+                    return
+                task = t
+                session_id = t.session_id
+
+                from backend.models.log_entry import LogEntry
+                result = await db.execute(
+                    select(LogEntry.content)
+                    .where(
+                        LogEntry.task_id == task.id,
+                        LogEntry.role == "assistant",
+                        LogEntry.event_type == "message",
+                    )
+                    .order_by(LogEntry.id.desc())
+                    .limit(10)
+                )
+                rows = result.scalars().all()
+                log_text = "\n".join(r for r in rows if r)
+
+                pr_info = extract_pr_from_logs(log_text)
+                if pr_info:
+                    repo, number, url = pr_info
+                    task.pr_loop_repo = repo
+                    task.pr_loop_number = number
+                    task.pr_loop_url = url
+                    task.pr_loop_state = "awaiting_review"
+                    task.pr_loop_turns_used = 1
+                    turn = 1
+                    await db.commit()
+                    logger.info("PR Loop task %d: detected PR %s#%d", task.id, repo, number)
+                else:
+                    # Try branch-based detection
+                    detected = await self._detect_pr_from_project(task, checker, cwd)
+                    if detected:
+                        repo, number, url = detected
+                        task.pr_loop_repo = repo
+                        task.pr_loop_number = number
+                        task.pr_loop_url = url
+                        task.pr_loop_state = "awaiting_review"
+                        task.pr_loop_turns_used = 1
+                        turn = 1
+                        await db.commit()
+                        logger.info("PR Loop task %d: detected PR from branch → %s#%d", task.id, repo, number)
+                    else:
+                        logger.warning("PR Loop task %d: no PR detected after initial turn, completing", task.id)
+                        await db.commit()
+                        await self._complete_owned_task(generation)
+                        return
+
+        # Phase 2: Poll + iterate loop
+        while turn < max_turns:
+            async with self.db_factory() as db:
+                t = await self._read_owned_lifecycle_task(db, generation)
+                if not t:
+                    return
+                task = t
+                turn = max(turn, int(t.pr_loop_turns_used or 0))
+                max_turns = t.pr_loop_max_turns or 10
+                poll_interval = t.pr_loop_poll_interval or 60
+                session_id = t.session_id or session_id
+
+            if turn >= max_turns:
+                break
+
+            await asyncio.sleep(poll_interval)
+
+            # Re-check ownership after sleep
+            async with self.db_factory() as db:
+                t = await self._read_owned_lifecycle_task(db, generation)
+                if not t:
+                    return
+                task = t
+
+            status = await checker.check_pr_status(task.pr_loop_repo, task.pr_loop_number)
+            if not status:
+                logger.warning("PR Loop task %d: failed to fetch PR status, retrying", task.id)
+                continue
+
+            # Update state in DB
+            new_state = self._pr_loop_state_label(status)
+            async with self.db_factory() as db:
+                t = await self._read_owned_lifecycle_task(db, generation)
+                if not t:
+                    return
+                t.pr_loop_state = new_state
+                await db.commit()
+                task = t
+
+            # Decision
+            if status.state == "merged":
+                logger.info("PR Loop task %d: PR merged", task.id)
+                await self._complete_owned_task(generation)
+                return
+
+            if status.state == "closed":
+                logger.info("PR Loop task %d: PR closed without merge", task.id)
+                await self._complete_owned_task(generation)
+                return
+
+            if status.reviews_state == "approved" and status.ci_state == "success":
+                logger.info("PR Loop task %d: approved + CI passed", task.id)
+                async with self.db_factory() as db:
+                    t = await self._read_owned_lifecycle_task(db, generation)
+                    if t:
+                        t.pr_loop_state = "approved"
+                        await db.commit()
+                await self._complete_owned_task(generation)
+                return
+
+            if status.reviews_state == "changes_requested":
+                feedback = await checker.get_review_feedback(
+                    task.pr_loop_repo, task.pr_loop_number, last_review_id
+                )
+                if not feedback:
+                    continue
+
+                last_review_id = max(
+                    (f.review_id for f in feedback if f.review_id), default=last_review_id
+                )
+
+                turn += 1
+                revision_prompt = self._build_pr_loop_revision_prompt(task, feedback, status)
+                config_dir = await self._resolve_resume_config_dir(
+                    session_id,
+                    task.provider,
+                    task_id=task.id,
+                    expected_generation=generation,
+                    **({"model": task.model} if task.model else {}),
+                )
+
+                exit_code, config_dir = await self._launch_mode_turn_with_rotation(
+                    instance_id,
+                    task,
+                    generation,
+                    cwd,
+                    git_env,
+                    prompt=revision_prompt,
+                    config_dir=config_dir,
+                    resume_session_id=session_id,
+                    loop_iteration=turn,
+                    effort_level=effort_level,
+                    label="PR Loop revision",
+                    sequence=sequence,
+                )
+
+                async with self.db_factory() as db:
+                    t = await self._read_owned_lifecycle_task(db, generation)
+                    if not t:
+                        return
+                    t.pr_loop_turns_used = turn
+                    t.pr_loop_state = "revision_pushed"
+                    session_id = t.session_id or session_id
+                    await db.commit()
+
+                if exit_code != 0:
+                    await self._retry_or_fail_mode_task(generation, "PR Loop revision turn failed")
+                    return
+
+            elif status.ci_state == "failure":
+                turn += 1
+                ci_prompt = self._build_pr_loop_ci_fix_prompt(task, status)
+                config_dir = await self._resolve_resume_config_dir(
+                    session_id,
+                    task.provider,
+                    task_id=task.id,
+                    expected_generation=generation,
+                    **({"model": task.model} if task.model else {}),
+                )
+
+                exit_code, config_dir = await self._launch_mode_turn_with_rotation(
+                    instance_id,
+                    task,
+                    generation,
+                    cwd,
+                    git_env,
+                    prompt=ci_prompt,
+                    config_dir=config_dir,
+                    resume_session_id=session_id,
+                    loop_iteration=turn,
+                    effort_level=effort_level,
+                    label="PR Loop CI fix",
+                    sequence=sequence,
+                )
+
+                async with self.db_factory() as db:
+                    t = await self._read_owned_lifecycle_task(db, generation)
+                    if not t:
+                        return
+                    t.pr_loop_turns_used = turn
+                    session_id = t.session_id or session_id
+                    await db.commit()
+
+                if exit_code != 0:
+                    await self._retry_or_fail_mode_task(generation, "PR Loop CI fix turn failed")
+                    return
+            # else: pending reviews or CI still running, keep polling
+
+        # Exhausted turns
+        logger.info("PR Loop task %d: max turns (%d) exhausted", task.id, max_turns)
+        async with self.db_factory() as db:
+            t = await self._read_owned_lifecycle_task(db, generation)
+            if t:
+                t.pr_loop_state = "max_turns_exhausted"
+                await db.commit()
+        await self._complete_owned_task(generation)
+
+    async def _detect_pr_from_project(
+        self, task: Task, checker, cwd: str
+    ) -> tuple[str, int, str] | None:
+        """Try to detect a PR by looking at the current branch and project git URL."""
+        if not task.project_id:
+            return None
+        async with self.db_factory() as db:
+            from backend.models.project import Project
+            project = await db.get(Project, task.project_id)
+            if not project or not project.git_url:
+                return None
+            repo_match = re.search(r"github\.com[:/]([^/]+/[^/.]+)", project.git_url)
+            if not repo_match:
+                return None
+            repo_slug = repo_match.group(1).rstrip(".git")
+
+        branch_proc = await asyncio.create_subprocess_exec(
+            "git", "-C", cwd, "branch", "--show-current",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await branch_proc.communicate()
+        branch = stdout.decode().strip()
+        if not branch or branch in ("main", "master"):
+            return None
+
+        detected = await checker.detect_pr_from_branch(repo_slug, branch)
+        if detected:
+            number, url = detected
+            return repo_slug, number, url
+        return None
+
+    async def _build_pr_loop_initial_prompt(self, task: Task) -> str:
+        """Build the first-turn prompt that tells the agent to write code and open a PR."""
+        preamble = _agent_doc_preamble(task)
+        desc = task.description or ""
+        return f"""{preamble}
+
+You are working in PR Loop mode. Your task:
+
+{desc}
+
+## Instructions
+
+1. Implement the requested changes on a new branch
+2. Commit your work with clear commit messages
+3. Push the branch and create a Pull Request using `gh pr create`
+4. Output the PR URL so the system can track it
+
+Important:
+- Create a descriptive branch name (e.g., feat/short-description or fix/short-description)
+- Write a clear PR title and description
+- Make sure CI will pass — run tests before pushing if a test suite exists
+- After creating the PR, your turn is done. The system will monitor review feedback and call you back if changes are requested.
+"""
+
+    def _build_pr_loop_revision_prompt(
+        self, task: Task, feedback: list, status
+    ) -> str:
+        """Build a prompt that shows review feedback and asks the agent to address it."""
+        parts = ["## Review Feedback Received\n"]
+        parts.append(f"PR: {task.pr_loop_url}\n")
+
+        for comment in feedback:
+            header = f"**{comment.reviewer}**"
+            if comment.state == "CHANGES_REQUESTED":
+                header += " (requested changes)"
+            if comment.path:
+                header += f" on `{comment.path}`"
+                if comment.line:
+                    header += f":{comment.line}"
+            parts.append(f"{header}:\n> {comment.body}\n")
+
+        parts.append("""
+## Instructions
+
+Address the review feedback above:
+1. Read the comments carefully
+2. Make the requested changes
+3. Commit and push to the same branch
+4. The PR will be updated automatically
+
+Do NOT create a new PR. Push to the existing branch.""")
+
+        return "\n".join(parts)
+
+    def _build_pr_loop_ci_fix_prompt(self, task: Task, status) -> str:
+        """Build a prompt for CI failure remediation."""
+        failed = [c for c in status.ci_checks if c.get("conclusion") == "failure"]
+        check_names = ", ".join(c.get("name", "unknown") for c in failed[:5])
+
+        return f"""## CI Failure on PR {task.pr_loop_url}
+
+The following CI checks failed: {check_names}
+
+## Instructions
+
+1. Investigate the CI failure (check test output, lint errors, build errors)
+2. Fix the issues
+3. Commit and push to the same branch
+
+Do NOT create a new PR. Push fixes to the existing branch."""
+
+    @staticmethod
+    def _pr_loop_state_label(status) -> str:
+        """Derive a human-readable state label from PRStatus."""
+        if status.state == "merged":
+            return "merged"
+        if status.state == "closed":
+            return "closed"
+        if status.reviews_state == "approved" and status.ci_state == "success":
+            return "approved"
+        if status.reviews_state == "changes_requested":
+            return "changes_requested"
+        if status.ci_state == "failure":
+            return "ci_failed"
+        if status.ci_state == "pending":
+            return "ci_pending"
+        return "awaiting_review"
 
     def _build_loop_prompt(
         self,

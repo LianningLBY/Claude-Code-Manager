@@ -248,6 +248,43 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('will not be shown again');
   });
 
+  it('creates a Claude PR Monitor when Claude is the only available provider', async () => {
+    const configRequest = deferred<Awaited<ReturnType<typeof api.config>>>();
+    vi.mocked(api.config).mockReturnValue(configRequest.promise);
+    const claudeOnlyConfig = {
+      default_provider: 'codex',
+      provider_options: ['claude'],
+      default_model: 'claude-opus-4-6',
+      model_options: ['default', 'claude-opus-4-6'],
+      default_codex_model: 'gpt-5.6-sol',
+      codex_model_options: ['default', 'gpt-5.6-sol'],
+      default_effort: 'medium',
+      effort_options: ['low', 'medium', 'high'],
+      claude_model_efforts: {},
+      claude_model_context_windows: {},
+      codex_effort_options: ['low', 'medium', 'high'],
+      codex_model_efforts: {},
+      codex_model_service_tiers: {},
+    } as Awaited<ReturnType<typeof api.config>>;
+    const user = userEvent.setup();
+    render(<PRMonitorPage />);
+    await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
+
+    await user.selectOptions(selectFollowingLabel('Review Harness'), 'single');
+    await user.type(screen.getByPlaceholderText('owner/repo'), 'acme/claude-only');
+    expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
+    await act(async () => configRequest.resolve(claudeOnlyConfig));
+
+    const provider = selectFollowingLabel('Provider');
+    await waitFor(() => expect(provider).toHaveValue('claude'));
+    expect(provider.options).toHaveLength(1);
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+
+    await waitFor(() => expect(api.createMonitoredRepo).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'claude' }),
+    ));
+  });
+
   it('allows direct auto-merge with the single-reviewer harness', async () => {
     const user = userEvent.setup();
     render(<PRMonitorPage />);

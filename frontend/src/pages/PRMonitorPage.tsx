@@ -42,15 +42,25 @@ function mergePolicyHelp(autoMerge: boolean, mergeQueueMode: 'manual' | 'shadow'
   return 'Direct auto-merge is OFF: CCM leaves the PR open and comments that it is ready to merge.';
 }
 
+function availableProvider(
+  requested: string | null | undefined,
+  providers: readonly string[],
+): string {
+  if (requested && providers.includes(requested)) return requested;
+  return providers[0] || '';
+}
+
 function useProviderModels(): {
   providers: string[];
   defaultProvider: string;
+  providerConfigLoaded: boolean;
   modelsFor: (p: string) => string[];
   effortsFor: (p: string, model: string) => string[];
 } {
   const [cfg, setCfg] = useState<{
     providers: string[];
     defaultProvider: string;
+    providerConfigLoaded: boolean;
     defaultClaudeModel: string;
     defaultCodexModel: string;
     claude: string[];
@@ -60,28 +70,43 @@ function useProviderModels(): {
     defaultEfforts: string[];
     codexDefaultEfforts: string[];
   }>({
-    providers: ['claude', 'codex'], defaultProvider: 'codex',
+    providers: [], defaultProvider: '', providerConfigLoaded: false,
     defaultClaudeModel: '', defaultCodexModel: '',
     claude: [], codex: [], claudeEfforts: {}, codexEfforts: {},
     defaultEfforts: [], codexDefaultEfforts: [],
   });
   useEffect(() => {
-    api.config().then((c) => setCfg({
-      providers: c.provider_options?.length ? c.provider_options : ['claude', 'codex'],
-      defaultProvider: c.default_provider || 'codex',
-      defaultClaudeModel: c.default_model,
-      defaultCodexModel: c.default_codex_model,
-      claude: c.model_options.filter((m) => m !== 'default'),
-      codex: (c.codex_model_options || []).filter((m) => m !== 'default'),
-      claudeEfforts: c.claude_model_efforts || {},
-      codexEfforts: c.codex_model_efforts || {},
-      defaultEfforts: c.effort_options || [],
-      codexDefaultEfforts: c.codex_effort_options || [],
-    })).catch(() => {});
+    api.config().then((c) => {
+      const configuredProviders = c.provider_options?.length
+        ? c.provider_options
+        : ['claude', 'codex'];
+      const providers = Array.from(new Set(configuredProviders.filter(
+        (provider) => provider === 'claude' || provider === 'codex',
+      )));
+      setCfg({
+        providers,
+        defaultProvider: availableProvider(c.default_provider, providers),
+        providerConfigLoaded: true,
+        defaultClaudeModel: c.default_model,
+        defaultCodexModel: c.default_codex_model,
+        claude: c.model_options.filter((m) => m !== 'default'),
+        codex: (c.codex_model_options || []).filter((m) => m !== 'default'),
+        claudeEfforts: c.claude_model_efforts || {},
+        codexEfforts: c.codex_model_efforts || {},
+        defaultEfforts: c.effort_options || [],
+        codexDefaultEfforts: c.codex_effort_options || [],
+      });
+    }).catch(() => setCfg((current) => ({
+      ...current,
+      providers: [],
+      defaultProvider: '',
+      providerConfigLoaded: true,
+    })));
   }, []);
   return {
     providers: cfg.providers,
     defaultProvider: cfg.defaultProvider,
+    providerConfigLoaded: cfg.providerConfigLoaded,
     modelsFor: (p: string) => (p === 'codex' ? cfg.codex : cfg.claude),
     effortsFor: (p: string, model: string) => {
       const effectiveModel = model || (p === 'codex' ? cfg.defaultCodexModel : cfg.defaultClaudeModel);
@@ -170,7 +195,13 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   const [provider, setProvider] = useState('codex');
   const [reviewModel, setReviewModel] = useState('');
   const [reviewEffort, setReviewEffort] = useState('');
-  const { providers, defaultProvider, modelsFor, effortsFor } = useProviderModels();
+  const {
+    providers,
+    defaultProvider,
+    providerConfigLoaded,
+    modelsFor,
+    effortsFor,
+  } = useProviderModels();
   const modelOptions = modelsFor(provider);
   const effortOptions = effortsFor(provider, reviewModel);
   const [defaultBranch, setDefaultBranch] = useState('main');
@@ -189,14 +220,17 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   }, []);
 
   useEffect(() => {
-    setProvider(defaultProvider);
-  }, [defaultProvider]);
+    if (providerConfigLoaded) setProvider(defaultProvider);
+  }, [defaultProvider, providerConfigLoaded]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitting(true);
     setError(null);
     try {
+      if (!providerConfigLoaded || !providers.includes(provider)) {
+        throw new Error('No supported PR Monitor provider is available');
+      }
       const authors = allowedAuthors.trim() ? allowedAuthors.split(',').map(a => a.trim()).filter(Boolean) : [];
       const checks = reviewMode === 'panel' ? parseRequiredChecks(requiredChecks) : [];
       if (reviewMode === 'panel' && waitForCi && checks.length === 0) {
@@ -338,6 +372,7 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
             <label className="block text-xs text-gray-400 mb-1">Provider</label>
             <select
               className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
+              disabled={!providerConfigLoaded || providers.length === 0}
               value={provider} onChange={(e) => { setProvider(e.target.value); setReviewModel(''); setReviewEffort(''); }}
             >
               {providers.map((p) => <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>)}
@@ -390,7 +425,12 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
           </div>
           <div className="flex justify-end gap-2 pt-1">
             <button type="button" onClick={onClose} className="px-4 py-2 text-sm text-gray-300 hover:text-foreground">Cancel</button>
-            <button type="submit" disabled={submitting || !repoName.trim()}
+            <button type="submit" disabled={
+              submitting
+              || !repoName.trim()
+              || !providerConfigLoaded
+              || !providers.includes(provider)
+            }
               className="px-4 py-2 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500 disabled:opacity-50">
               {submitting ? 'Adding...' : 'Add'}
             </button>
@@ -422,7 +462,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [selectedReview, setSelectedReview] = useState<PRReview | null>(null);
   const [monitorRun, setMonitorRun] = useState<PRMonitorRun | null>(null);
   const [developerTaskId, setDeveloperTaskId] = useState('');
-  const { providers, modelsFor, effortsFor } = useProviderModels();
+  const { providers, providerConfigLoaded, modelsFor, effortsFor } = useProviderModels();
   const modelOptions = modelsFor(provider);
   const effortOptions = effortsFor(provider, reviewModel);
   const [defaultBranch, setDefaultBranch] = useState(repo.default_branch);
@@ -440,6 +480,14 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
       .then(info => setWebhookUrl(info.webhook_url || DEFAULT_WEBHOOK_URL))
       .catch(() => setWebhookUrl(DEFAULT_WEBHOOK_URL));
   }, []);
+
+  useEffect(() => {
+    if (providerConfigLoaded && !providers.includes(provider)) {
+      setProvider(availableProvider(provider, providers));
+      setReviewModel('');
+      setReviewEffort('');
+    }
+  }, [provider, providerConfigLoaded, providers]);
 
   const loadDetail = useCallback(async () => {
     try {
@@ -461,6 +509,9 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
     setSaving(true);
     setSaveError(null);
     try {
+      if (!providerConfigLoaded || !providers.includes(provider)) {
+        throw new Error('No supported PR Monitor provider is available');
+      }
       const authors = authorsInput.trim() ? authorsInput.split(',').map(a => a.trim()).filter(Boolean) : [];
       const checks = reviewMode === 'panel' ? parseRequiredChecks(requiredChecks) : [];
       if (reviewMode === 'panel' && waitForCi && checks.length === 0) {
@@ -620,6 +671,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
           <div>
             <label className="block text-xs text-gray-400 mb-1">Provider</label>
             <select className="w-full bg-gray-700 text-foreground text-sm rounded px-3 py-2 outline-none focus:ring-1 focus:ring-indigo-500"
+              disabled={!providerConfigLoaded || providers.length === 0}
               value={provider} onChange={(e) => { setProvider(e.target.value); setReviewModel(''); setReviewEffort(''); }}>
               {providers.map((p) => <option key={p} value={p}>{p === 'codex' ? 'Codex' : 'Claude Code'}</option>)}
             </select>
@@ -678,7 +730,9 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
           </div>
         </div>
 
-        <button onClick={handleSave} disabled={saving}
+        <button onClick={handleSave} disabled={
+          saving || !providerConfigLoaded || !providers.includes(provider)
+        }
           className="px-4 py-2 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500 disabled:opacity-50">
           {saving ? 'Saving...' : 'Save Changes'}
         </button>

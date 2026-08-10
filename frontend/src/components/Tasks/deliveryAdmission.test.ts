@@ -41,6 +41,16 @@ describe('Delivery admission persistence', () => {
     expect(changed.idempotency_key).not.toBe(first.idempotency_key);
   });
 
+  it('rotates the key when the Delivery provider changes', () => {
+    const first = prepareDeliveryAdmission('task-form-provider', draft);
+    const changed = prepareDeliveryAdmission('task-form-provider', {
+      ...draft,
+      provider: 'claude',
+    });
+
+    expect(changed.idempotency_key).not.toBe(first.idempotency_key);
+  });
+
   it('clears the key only after the exact request is acknowledged', () => {
     const first = prepareDeliveryAdmission('task-form', draft);
     acknowledgeDeliveryAdmission('task-form', {

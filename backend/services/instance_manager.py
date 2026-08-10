@@ -88,6 +88,13 @@ _TASK_SSH_SAFE_GIT_ENV = {
     "GIT_CONFIG_NOSYSTEM": "1",
     "GH_PROMPT_DISABLED": "1",
 }
+_DELIVERY_SAFE_GIT_ENV = {
+    **_TASK_SSH_SAFE_GIT_ENV,
+    # Delivery Developers may inspect the worktree but the Controller owns
+    # every index/ref mutation and commit.
+    "GIT_OPTIONAL_LOCKS": "0",
+}
+_DELIVERY_RUNTIME_TEMP_ENV_KEYS = frozenset({"TMPDIR", "TMP", "TEMP"})
 _ACTUAL_TURN_TRANSPORTS = frozenset(
     {"claude_pty", "claude_exec", "codex_app_server", "codex_exec"}
 )
@@ -560,7 +567,7 @@ async def _require_delivery_workspace_launch_boundary(
         and task.shared_from_id is None
         and isinstance(policy, dict)
         and value_hash(policy) == run.policy_hash
-        and policy.get("provider") == "codex"
+        and policy.get("provider") in {"claude", "codex"}
         and task.provider == policy.get("provider")
         and task.model == policy.get("model")
         and task.codex_service_tier == policy.get("codex_service_tier")
@@ -824,6 +831,14 @@ class InstanceManager:
         # Keep the Task-visible reservation until launch either publishes its
         # durable reverse owner or proves the aborted generation fully reaped.
         self._launch_reservations: dict[int, _LaunchReservation] = {}
+        # Claude Delivery uses one inode-fenced scratch leaf per exact Task
+        # generation. Pending entries cover pre-spawn failures; active entries
+        # stay bound to the exact process object until the process tree is
+        # proven terminal and the output lifecycle removes the leaf.
+        self._pending_private_runtime_tempdirs: dict[int, object] = {}
+        self._active_private_runtime_tempdirs: dict[
+            tuple[int, object], object
+        ] = {}
         # Goal/Loop intentionally contain multiple sequential provider turns
         # inside one Task generation.  An already-bound source may cross the
         # provider boundary again only with a one-shot token minted from the
@@ -1480,6 +1495,19 @@ class InstanceManager:
                         self.revoke_sequential_turn_continuation(
                             sequential_turn_token
                         )
+                        try:
+                            await self._cleanup_unbound_private_runtime_tempdir(
+                                instance_id
+                            )
+                        except Exception:
+                            # Retaining an inode-fenced 0700 leaf is safer than
+                            # masking the launch failure or guessing cleanup
+                            # ownership after an indeterminate provider start.
+                            logger.exception(
+                                "Could not clean pending private runtime "
+                                "directory for instance %s",
+                                instance_id,
+                            )
                         current_process = (
                             self.processes.get(instance_id)
                             or self._process_groups.get(instance_id)
@@ -2298,6 +2326,26 @@ class InstanceManager:
                 raise RuntimeError("Launch admission callback is already running")
             launch_boundary_attempted = True
             selected_actual_transport = actual_transport
+            if provider == "claude" and delivery_task:
+                from backend.services.task_agent_isolation import (
+                    discover_linked_worktree_git_read_boundary,
+                )
+
+                current_git_boundary = (
+                    discover_linked_worktree_git_read_boundary(
+                        cwd or os.getcwd()
+                    )
+                )
+                if task_private_tmpdir is None:
+                    raise LaunchSupersededError(
+                        "Claude Delivery private runtime boundary disappeared"
+                    )
+                task_private_tmpdir.assert_valid()
+                if current_git_boundary != claude_delivery_git_boundary:
+                    raise LaunchSupersededError(
+                        "Claude Delivery Git isolation boundary changed at "
+                        "provider launch"
+                    )
             # Sharing may be enabled after the initial Task snapshot. Recheck
             # at the last common boundary for Claude PTY/direct and Codex
             # app-server/direct routes; an unavailable check is also a veto.
@@ -2412,23 +2460,32 @@ class InstanceManager:
                 )
                 if delivery_task:
                     if (
-                        provider != "codex"
-                        or task.provider != "codex"
+                        provider not in {"claude", "codex"}
+                        or provider != task.provider
                         or model != task.model
                         or codex_service_tier != task.codex_service_tier
                         or effort_level != task.effort_level
                         or enable_workflows
                         or bool(enabled_skills)
+                        or bool(task.system_prompt_mode)
+                        or bool(system_prompt_mode)
                     ):
                         raise LaunchSupersededError(
                             "Delivery Developer launch no longer matches its "
-                            "frozen Codex execution policy"
+                            "frozen execution policy"
                         )
                     # Dispatcher normally builds project Git credentials before
                     # it knows which pending Task won the queue.  The Delivery
                     # boundary deliberately drops that ambient authority here;
                     # only the Controller publisher may receive push credentials.
-                    git_env = None
+                    # Codex's network-isolated app-server installs the same
+                    # safe Git environment internally and forbids any caller
+                    # environment. Claude direct/PTY needs it supplied here.
+                    git_env = (
+                        dict(_DELIVERY_SAFE_GIT_ENV)
+                        if provider == "claude"
+                        else None
+                    )
                 from backend.services.pr_review_runtime import (
                     is_pr_sandbox_task,
                 )
@@ -2781,39 +2838,95 @@ class InstanceManager:
 
         mcp_config_path = None
         claude_isolation_settings_path = None
+        claude_isolation_tools: tuple[str, ...] | None = None
+        claude_delivery_git_boundary = None
         if provider == "claude" and task_id and not pr_review_task:
-            from backend.services.mcp_config import generate_mcp_config
-            mcp_config_path = generate_mcp_config(
-                task_id,
-                enabled_skills or {},
-                task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
-                task_incarnation_id=task_incarnation_id,
-                task_retry_count=task_retry_count,
-                task_turn_generation=task_turn_generation,
-                task_status=task_status,
-            )
-
             from backend.services.task_agent_isolation import (
                 CLAUDE_TASK_BUILTIN_TOOLS,
                 generate_claude_task_isolation_settings,
                 validate_claude_task_isolation_settings,
             )
 
-            claude_isolation_settings_path = (
-                generate_claude_task_isolation_settings(
+            if delivery_task:
+                from backend.services.task_agent_isolation import (
+                    CLAUDE_DELIVERY_BUILTIN_TOOLS,
+                    generate_claude_delivery_isolation_settings,
+                    validate_claude_delivery_isolation_settings,
+                )
+                from backend.services.task_runtime_secrets import (
+                    create_private_task_temp_dir,
+                )
+
+                if (
+                    task_incarnation_id is None
+                    or task_retry_count is None
+                    or task_turn_generation is None
+                ):
+                    raise LaunchSupersededError(
+                        "Claude Delivery isolation lost its exact generation"
+                    )
+                task_private_tmpdir = create_private_task_temp_dir(
+                    task_id=task_id,
+                    task_incarnation_id=task_incarnation_id,
+                    retry_count=task_retry_count,
+                    turn_generation=task_turn_generation,
+                )
+                self._reserve_private_runtime_tempdir(
+                    instance_id,
+                    task_private_tmpdir,
+                )
+                git_env = dict(git_env or _DELIVERY_SAFE_GIT_ENV)
+                git_env.update({
+                    key: str(task_private_tmpdir.path)
+                    for key in _DELIVERY_RUNTIME_TEMP_ENV_KEYS
+                })
+
+                claude_isolation_tools = CLAUDE_DELIVERY_BUILTIN_TOOLS
+                (
+                    claude_isolation_settings_path,
+                    claude_delivery_git_boundary,
+                ) = generate_claude_delivery_isolation_settings(
                     task_id,
                     task_ssh_protected_path_values,
-                    allowed_read_paths=task_git_credential_read_path_values,
-                    ssh_capabilities=task_ssh_capabilities,
-                    disable_direct_network=task_ssh_broker_only,
+                    working_directory=cwd or os.getcwd(),
+                    private_tmpdir=task_private_tmpdir.path,
                 )
-            )
-            await asyncio.to_thread(
-                validate_claude_task_isolation_settings,
-                claude_isolation_settings_path,
-                claude_binary=settings.claude_binary,
-                tools=CLAUDE_TASK_BUILTIN_TOOLS,
-            )
+                await asyncio.to_thread(
+                    validate_claude_delivery_isolation_settings,
+                    claude_isolation_settings_path,
+                    claude_binary=settings.claude_binary,
+                    working_directory=cwd or os.getcwd(),
+                    private_tmpdir=task_private_tmpdir.path,
+                    expected_git_boundary=claude_delivery_git_boundary,
+                )
+            else:
+                from backend.services.mcp_config import generate_mcp_config
+
+                mcp_config_path = generate_mcp_config(
+                    task_id,
+                    enabled_skills or {},
+                    task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
+                    task_incarnation_id=task_incarnation_id,
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
+                    task_status=task_status,
+                )
+                claude_isolation_tools = CLAUDE_TASK_BUILTIN_TOOLS
+                claude_isolation_settings_path = (
+                    generate_claude_task_isolation_settings(
+                        task_id,
+                        task_ssh_protected_path_values,
+                        allowed_read_paths=task_git_credential_read_path_values,
+                        ssh_capabilities=task_ssh_capabilities,
+                        disable_direct_network=task_ssh_broker_only,
+                    )
+                )
+                await asyncio.to_thread(
+                    validate_claude_task_isolation_settings,
+                    claude_isolation_settings_path,
+                    claude_binary=settings.claude_binary,
+                    tools=CLAUDE_TASK_BUILTIN_TOOLS,
+                )
 
         # Prompt-only Claude launches have no Task-scoped exact settings file;
         # retain the legacy account-level AskUser compatibility hook for them.
@@ -2833,6 +2946,7 @@ class InstanceManager:
             provider == "claude"
             and task_id is not None
             and not pr_review_task
+            and not delivery_task
             and settings.ask_user_enabled
         ):
             from backend.services.internal_service_auth import (
@@ -3363,6 +3477,23 @@ class InstanceManager:
                             task_private_tmpdir.cleanup_if_unbound
                         )
 
+        if provider == "claude" and delivery_task:
+            from backend.services.task_agent_isolation import (
+                discover_linked_worktree_git_read_boundary,
+            )
+
+            refreshed_boundary = discover_linked_worktree_git_read_boundary(
+                cwd or os.getcwd()
+            )
+            if (
+                claude_delivery_git_boundary is None
+                or refreshed_boundary is None
+                or refreshed_boundary != claude_delivery_git_boundary
+            ):
+                raise LaunchSupersededError(
+                    "Claude Delivery Git isolation boundary changed before launch"
+                )
+
         if (
             provider == "claude"
             and self.pty_mode_enabled
@@ -3397,6 +3528,8 @@ class InstanceManager:
                 claude_isolation_settings_path=(
                     claude_isolation_settings_path
                 ),
+                claude_isolation_tools=claude_isolation_tools,
+                private_runtime_tempdir=task_private_tmpdir,
                 on_launch_admitted=admit_claude_pty_transport,
             )
 
@@ -3429,6 +3562,7 @@ class InstanceManager:
                 pr_review_task or (provider == "claude" and browser_review_task)
             ),
             claude_isolation_settings_path=claude_isolation_settings_path,
+            claude_isolation_tools=claude_isolation_tools,
         )
         if provider == "codex":
             logger.info(
@@ -3546,12 +3680,58 @@ class InstanceManager:
             if os.name == "posix":
                 spawn_kwargs["start_new_session"] = True
             await admit_external_launch("claude_exec")
-            process = await self._spawn_managed_direct_process(
-                instance_id,
-                task_id,
-                cmd,
-                spawn_kwargs,
-            )
+            if task_private_tmpdir is not None:
+                self._bind_private_runtime_tempdir(
+                    instance_id,
+                    task_private_tmpdir,
+                )
+            previous_direct_process = self.processes.get(instance_id)
+            try:
+                process = await self._spawn_managed_direct_process(
+                    instance_id,
+                    task_id,
+                    cmd,
+                    spawn_kwargs,
+                )
+            except BaseException:
+                if task_private_tmpdir is not None:
+                    exact_process = self.processes.get(instance_id)
+                    if (
+                        exact_process is not None
+                        and exact_process is not previous_direct_process
+                        and not self._generation_reap_confirmed(
+                            instance_id,
+                            exact_process,
+                        )
+                    ):
+                        # _spawn_managed_direct_process publishes the exact
+                        # child before delivering delayed cancellation.  A
+                        # failed reap must retain both that generation and its
+                        # bound scratch leaf; deleting TMPDIR while the child
+                        # may still be running would race model filesystem
+                        # effects and destroy recovery evidence.
+                        self._adopt_private_runtime_tempdir(
+                            instance_id,
+                            exact_process,
+                            task_private_tmpdir,
+                        )
+                    else:
+                        await self._abort_private_runtime_tempdir(
+                            instance_id,
+                            task_private_tmpdir,
+                            process=(
+                                exact_process
+                                if exact_process is not previous_direct_process
+                                else None
+                            ),
+                        )
+                raise
+            if task_private_tmpdir is not None:
+                self._adopt_private_runtime_tempdir(
+                    instance_id,
+                    process,
+                    task_private_tmpdir,
+                )
 
         if provider != "codex":
             self.processes[instance_id] = process
@@ -4342,6 +4522,10 @@ class InstanceManager:
                     record = self._consumer_records.get(instance_id)
                     if record is not None and record.task is consumer:
                         self._consumer_records.pop(instance_id, None)
+                    await self._cleanup_active_private_runtime_tempdir(
+                        instance_id,
+                        process,
+                    )
                 try:
                     async with self.db_factory() as db:
                         if reap_confirmed:
@@ -4929,6 +5113,111 @@ class InstanceManager:
             add_component("git-env-value", value.encode("utf-8"))
         return digest.hexdigest()
 
+    def _reserve_private_runtime_tempdir(
+        self,
+        instance_id: int,
+        runtime_tempdir,
+    ) -> None:
+        """Reserve one pre-spawn scratch generation for an Instance launch."""
+
+        current = self._pending_private_runtime_tempdirs.get(instance_id)
+        if current is not None and current is not runtime_tempdir:
+            raise RuntimeError(
+                "Instance already owns a pending private runtime directory"
+            )
+        runtime_tempdir.assert_valid()
+        self._pending_private_runtime_tempdirs[instance_id] = runtime_tempdir
+
+    def _bind_private_runtime_tempdir(
+        self,
+        instance_id: int,
+        runtime_tempdir,
+    ) -> None:
+        """Transfer a pending scratch leaf to the imminent provider turn."""
+
+        if self._pending_private_runtime_tempdirs.get(instance_id) is not runtime_tempdir:
+            raise RuntimeError(
+                "Private runtime directory lost its launch reservation"
+            )
+        runtime_tempdir.assert_valid()
+        if not runtime_tempdir.bound:
+            runtime_tempdir.bind_to_runtime()
+
+    def _adopt_private_runtime_tempdir(
+        self,
+        instance_id: int,
+        process: object,
+        runtime_tempdir,
+    ) -> None:
+        """Bind cleanup ownership to an exact process object."""
+
+        if self._pending_private_runtime_tempdirs.get(instance_id) is not runtime_tempdir:
+            raise RuntimeError(
+                "Private runtime directory lost its pending owner"
+            )
+        if not runtime_tempdir.bound:
+            raise RuntimeError(
+                "Private runtime directory was not bound before provider launch"
+            )
+        key = (instance_id, process)
+        existing = self._active_private_runtime_tempdirs.get(key)
+        if existing is not None and existing is not runtime_tempdir:
+            raise RuntimeError(
+                "Process already owns another private runtime directory"
+            )
+        self._active_private_runtime_tempdirs[key] = runtime_tempdir
+        self._pending_private_runtime_tempdirs.pop(instance_id, None)
+
+    async def _cleanup_unbound_private_runtime_tempdir(
+        self,
+        instance_id: int,
+    ) -> None:
+        runtime_tempdir = self._pending_private_runtime_tempdirs.get(instance_id)
+        if runtime_tempdir is None:
+            return
+        cleaned = await _settle_instance_cleanup(
+            asyncio.to_thread(runtime_tempdir.cleanup_if_unbound)
+        )
+        if cleaned or runtime_tempdir.cleaned:
+            if self._pending_private_runtime_tempdirs.get(instance_id) is runtime_tempdir:
+                self._pending_private_runtime_tempdirs.pop(instance_id, None)
+
+    async def _cleanup_active_private_runtime_tempdir(
+        self,
+        instance_id: int,
+        process: object,
+    ) -> None:
+        key = (instance_id, process)
+        runtime_tempdir = self._active_private_runtime_tempdirs.get(key)
+        if runtime_tempdir is None:
+            return
+        await _settle_instance_cleanup(
+            asyncio.to_thread(runtime_tempdir.cleanup)
+        )
+        if self._active_private_runtime_tempdirs.get(key) is runtime_tempdir:
+            self._active_private_runtime_tempdirs.pop(key, None)
+
+    async def _abort_private_runtime_tempdir(
+        self,
+        instance_id: int,
+        runtime_tempdir,
+        *,
+        process: object | None,
+    ) -> None:
+        """Clean an aborted generation after its provider is proven absent."""
+
+        if process is not None:
+            key = (instance_id, process)
+            if self._active_private_runtime_tempdirs.get(key) is runtime_tempdir:
+                await self._cleanup_active_private_runtime_tempdir(
+                    instance_id,
+                    process,
+                )
+                return
+        await _settle_instance_cleanup(asyncio.to_thread(runtime_tempdir.cleanup))
+        if self._pending_private_runtime_tempdirs.get(instance_id) is runtime_tempdir:
+            self._pending_private_runtime_tempdirs.pop(instance_id, None)
+
     async def _launch_pty(
         self,
         instance_id: int,
@@ -4956,6 +5245,8 @@ class InstanceManager:
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         claude_isolation_settings_path: Path | None = None,
+        claude_isolation_tools: Sequence[str] | None = None,
+        private_runtime_tempdir=None,
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
         """PTY-mode launch: delegate to claude_pty, mirror -p bookkeeping.
@@ -5102,6 +5393,8 @@ class InstanceManager:
                         upper_key = key.upper()
                         if (
                             upper_key.startswith("GIT_")
+                            or upper_key in _DELIVERY_SAFE_GIT_ENV
+                            or upper_key in _DELIVERY_RUNTIME_TEMP_ENV_KEYS
                             or upper_key
                             in {
                                 "CCM_ASK_USER_TOKEN",
@@ -5137,6 +5430,11 @@ class InstanceManager:
                             CLAUDE_TASK_BUILTIN_TOOLS,
                         )
 
+                        selected_claude_tools = tuple(
+                            claude_isolation_tools
+                            or CLAUDE_TASK_BUILTIN_TOOLS
+                        )
+
                         task_wrapper = Path(__file__).with_name(
                             "task_claude_wrapper.sh"
                         )
@@ -5153,7 +5451,7 @@ class InstanceManager:
                             ),
                             "CCM_TASK_CLAUDE_BINARY": str(final_binary),
                             "CCM_TASK_CLAUDE_TOOLS": ",".join(
-                                CLAUDE_TASK_BUILTIN_TOOLS
+                                selected_claude_tools
                             ),
                         })
                         cfg.claude_binary = str(task_wrapper)
@@ -5181,6 +5479,11 @@ class InstanceManager:
                     wrapped_prompt = wrap_skill_context(prompt, skill_context)
                     if on_launch_admitted is not None:
                         await on_launch_admitted()
+                    if private_runtime_tempdir is not None:
+                        self._bind_private_runtime_tempdir(
+                            instance_id,
+                            private_runtime_tempdir,
+                        )
                     session_id = await self._pty_backend.launch_for_ccm(
                         instance_id=instance_id,
                         prompt=wrapped_prompt,
@@ -5209,6 +5512,12 @@ class InstanceManager:
             if process is None:
                 raise RuntimeError(
                     "PTY backend did not register a process during startup"
+                )
+            if private_runtime_tempdir is not None:
+                self._adopt_private_runtime_tempdir(
+                    instance_id,
+                    process,
+                    private_runtime_tempdir,
                 )
             native_session = getattr(process, "session", None)
             if (
@@ -5322,6 +5631,18 @@ class InstanceManager:
         except BaseException:
             process = self.processes.get(instance_id)
             consumer = self._tasks.get(instance_id)
+            if (
+                private_runtime_tempdir is not None
+                and process is not None
+                and private_runtime_tempdir.bound
+                and self._pending_private_runtime_tempdirs.get(instance_id)
+                is private_runtime_tempdir
+            ):
+                self._adopt_private_runtime_tempdir(
+                    instance_id,
+                    process,
+                    private_runtime_tempdir,
+                )
             consumer_record = self._consumer_records.get(instance_id)
             if (
                 consumer_record is not None
@@ -5355,7 +5676,14 @@ class InstanceManager:
 
             async def _cleanup_failed_pty_launch() -> None:
                 reap_confirmed = not (owns_new_process or owns_new_consumer)
-                if owns_new_process or owns_new_consumer:
+                if (
+                    owns_new_process
+                    or owns_new_consumer
+                    or (
+                        private_runtime_tempdir is not None
+                        and private_runtime_tempdir.bound
+                    )
+                ):
                     backend_stopped = True
                     stop_pty = getattr(self._pty_backend, "stop", None)
                     if stop_pty is not None:
@@ -5416,6 +5744,12 @@ class InstanceManager:
                         record = self._consumer_records.get(instance_id)
                         if record is not None and record.task is consumer:
                             self._consumer_records.pop(instance_id, None)
+                if reap_confirmed and private_runtime_tempdir is not None:
+                    await self._abort_private_runtime_tempdir(
+                        instance_id,
+                        private_runtime_tempdir,
+                        process=process,
+                    )
                 if reap_confirmed:
                     if (
                         pty_launch_params is not None
@@ -8460,6 +8794,7 @@ class InstanceManager:
         codex_service_tier: str = "default",
         tools_disabled: bool = False,
         claude_isolation_settings_path: Path | None = None,
+        claude_isolation_tools: Sequence[str] | None = None,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -8472,6 +8807,10 @@ class InstanceManager:
             if claude_isolation_settings_path is not None:
                 from backend.services.task_agent_isolation import (
                     CLAUDE_TASK_BUILTIN_TOOLS,
+                )
+
+                selected_claude_tools = tuple(
+                    claude_isolation_tools or CLAUDE_TASK_BUILTIN_TOOLS
                 )
 
                 cmd.extend([
@@ -8488,9 +8827,9 @@ class InstanceManager:
                 if not tools_disabled:
                     cmd.extend([
                         "--tools",
-                        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                        ",".join(selected_claude_tools),
                         "--allowedTools",
-                        ",".join(CLAUDE_TASK_BUILTIN_TOOLS),
+                        ",".join(selected_claude_tools),
                     ])
             else:
                 cmd.append("--dangerously-skip-permissions")
@@ -8745,6 +9084,17 @@ class InstanceManager:
                     )
             if reap_confirmed:
                 self._forget_container_exec(instance_id, process)
+                try:
+                    await self._cleanup_active_private_runtime_tempdir(
+                        instance_id,
+                        process,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Private runtime cleanup failed during consumer "
+                        "recovery for instance %s",
+                        instance_id,
+                    )
             if not tracked_generation:
                 # In-memory identity alone cannot prove which durable
                 # Task/Instance generation is still stored.  Never degrade an
@@ -9432,6 +9782,10 @@ class InstanceManager:
                     f"Process generation for instance {instance_id} "
                     "could not be proven terminal"
                 )
+            await self._cleanup_active_private_runtime_tempdir(
+                instance_id,
+                process,
+            )
         except Exception as exc:
             # Drain/cancel stderr below before surfacing the failure.  The
             # outer recovery boundary will retry the exact kill and retain

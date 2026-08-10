@@ -11,6 +11,7 @@ import pytest
 
 from backend.config import settings
 from backend.services.task_agent_isolation import (
+    CLAUDE_DELIVERY_BUILTIN_TOOLS,
     CLAUDE_MONITOR_BUILTIN_TOOLS,
     CLAUDE_SUBPROCESS_ENV_SCRUB,
     CLAUDE_SUB_AGENT_BUILTIN_TOOLS,
@@ -18,12 +19,14 @@ from backend.services.task_agent_isolation import (
     TaskAgentIsolationError,
     discover_linked_worktree_git_read_boundary,
     generate_claude_aux_isolation_settings,
+    generate_claude_delivery_isolation_settings,
     generate_claude_task_isolation_settings,
     generate_claude_zero_tool_isolation_settings,
     prepare_task_working_directory,
     require_claude_apply_seccomp,
     require_task_security_boundary_configured,
     scrub_task_model_environment,
+    validate_claude_delivery_isolation_settings,
     validate_claude_task_isolation_settings,
 )
 from backend.services import trusted_runtime
@@ -72,6 +75,14 @@ def _linked_git_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     return repository, linked, common
 
 
+def _private_scratch(tmp_path: Path, name: str = "scratch") -> Path:
+    tmp_path.chmod(0o700)
+    scratch = tmp_path / name
+    scratch.mkdir(mode=0o700)
+    scratch.chmod(0o700)
+    return scratch
+
+
 def test_linked_worktree_git_boundary_is_exact_read_only_projection(tmp_path):
     repository, linked, common = _linked_git_fixture(tmp_path)
     other = tmp_path / "other"
@@ -112,6 +123,166 @@ def test_normal_git_directory_has_no_linked_read_projection(tmp_path):
     repository, _linked, _common = _linked_git_fixture(tmp_path)
 
     assert discover_linked_worktree_git_read_boundary(repository) is None
+
+
+def test_claude_delivery_policy_has_exact_networkless_git_projection(
+    tmp_path,
+    monkeypatch,
+):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    runtime_root = tmp_path / "runtime"
+    manager_secret = tmp_path / "manager-secret"
+    scratch = _private_scratch(tmp_path)
+    sibling_scratch = _private_scratch(tmp_path, "sibling-scratch")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(runtime_root),
+    )
+
+    path, boundary = generate_claude_delivery_isolation_settings(
+        91,
+        [str(manager_secret)],
+        working_directory=linked,
+        private_tmpdir=scratch,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    filesystem = payload["sandbox"]["filesystem"]
+    git_denies = {
+        str(linked / ".git"),
+        boundary.git_dir,
+        boundary.common_dir,
+    }
+
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.name == "claude-delivery-security.json"
+    assert "hooks" not in payload
+    assert payload["permissions"]["allow"] == list(
+        CLAUDE_DELIVERY_BUILTIN_TOOLS
+    )
+    assert not any(
+        tool.startswith("mcp__")
+        for tool in payload["permissions"]["allow"]
+    )
+    assert "AskUserQuestion" not in CLAUDE_DELIVERY_BUILTIN_TOOLS
+    assert "Agent" not in CLAUDE_DELIVERY_BUILTIN_TOOLS
+    assert "Task" not in CLAUDE_DELIVERY_BUILTIN_TOOLS
+    assert "Workflow" not in CLAUDE_DELIVERY_BUILTIN_TOOLS
+    assert payload["sandbox"]["network"]["allowedDomains"] == []
+    assert filesystem["denyRead"] == filesystem["denyWrite"]
+    assert git_denies.issubset(filesystem["denyRead"])
+    assert str(tmp_path) in filesystem["denyRead"]
+    assert filesystem["allowRead"] == sorted(
+        (*boundary.read_paths, str(scratch))
+    )
+    assert filesystem["allowWrite"] == sorted((str(linked), str(scratch)))
+    assert str(sibling_scratch) not in filesystem["allowRead"]
+    assert str(sibling_scratch) not in filesystem["allowWrite"]
+    credential_denies = {
+        entry["path"]
+        for entry in payload["sandbox"]["credentials"]["files"]
+    }
+    assert git_denies.isdisjoint(credential_denies)
+    assert str(manager_secret) in credential_denies
+    for git_path in git_denies:
+        permission_path = f"//{git_path.lstrip('/')}"
+        assert f"Read({permission_path}/**)" in payload["permissions"]["deny"]
+        assert f"Edit({permission_path}/**)" in payload["permissions"]["deny"]
+
+
+def test_claude_delivery_policy_requires_linked_worktree(tmp_path, monkeypatch):
+    repository, _linked, _common = _linked_git_fixture(tmp_path)
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    scratch = _private_scratch(tmp_path)
+
+    with pytest.raises(TaskAgentIsolationError, match="linked-worktree"):
+        generate_claude_delivery_isolation_settings(
+            92,
+            [str(tmp_path / "manager-secret")],
+            working_directory=repository,
+            private_tmpdir=scratch,
+        )
+
+
+def test_claude_delivery_validation_rechecks_git_identity_before_cli(
+    tmp_path,
+    monkeypatch,
+):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    scratch = _private_scratch(tmp_path)
+    path, boundary = generate_claude_delivery_isolation_settings(
+        93,
+        [str(tmp_path / "manager-secret")],
+        working_directory=linked,
+        private_tmpdir=scratch,
+    )
+    branch_ref = Path(boundary.common_dir).joinpath(
+        *(boundary.head_ref or "").split("/")
+    )
+    branch_ref.write_text("0" * 40 + "\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Git identity failure must precede CLI")
+        ),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="changed before launch"):
+        validate_claude_delivery_isolation_settings(
+            path,
+            claude_binary="claude",
+            working_directory=linked,
+            private_tmpdir=scratch,
+            expected_git_boundary=boundary,
+        )
+
+
+def test_claude_delivery_validation_rejects_extra_git_read_override(
+    tmp_path,
+    monkeypatch,
+):
+    _repository, linked, _common = _linked_git_fixture(tmp_path)
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    scratch = _private_scratch(tmp_path)
+    path, boundary = generate_claude_delivery_isolation_settings(
+        94,
+        [str(tmp_path / "manager-secret")],
+        working_directory=linked,
+        private_tmpdir=scratch,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["sandbox"]["filesystem"]["allowRead"].append("/etc/passwd")
+    payload["sandbox"]["filesystem"]["allowRead"].sort()
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation.subprocess.run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("settings failure must precede CLI")
+        ),
+    )
+
+    with pytest.raises(TaskAgentIsolationError, match="filesystem paths"):
+        validate_claude_delivery_isolation_settings(
+            path,
+            claude_binary="claude",
+            working_directory=linked,
+            private_tmpdir=scratch,
+            expected_git_boundary=boundary,
+        )
 
 
 def test_linked_worktree_git_boundary_rejects_pointer_symlink(tmp_path):

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskForm } from './TaskForm';
 
@@ -922,7 +922,7 @@ describe('TaskForm Delivery Loop mode', () => {
       auto_merge: true,
       auto_repair: true,
       max_repair_attempts: 3,
-      provider: 'codex',
+      provider: 'claude',
       review_model: null,
       review_effort: null,
       review_mode: 'panel',
@@ -968,7 +968,11 @@ describe('TaskForm Delivery Loop mode', () => {
     await selectProject();
     await openConfigPanel();
     await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
-    expect(screen.getByDisplayValue('Codex')).toBeDisabled();
+    const providerSelect = screen.getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('codex');
+    expect(providerSelect).not.toBeDisabled();
+    expect(within(providerSelect).getByRole('option', { name: 'Claude' })).toBeInTheDocument();
+    expect(within(providerSelect).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
 
     expect(screen.queryByRole('button', { name: 'Attach files' })).not.toBeInTheDocument();
     expect(screen.queryByText('Priority')).not.toBeInTheDocument();
@@ -1002,6 +1006,46 @@ describe('TaskForm Delivery Loop mode', () => {
     }));
     expect(api.createTask).not.toHaveBeenCalled();
     expect(onCreated).toHaveBeenCalledOnce();
+  });
+
+  it('creates a Claude Delivery Run when Claude is the only configured provider', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      default_provider: 'claude',
+      provider_options: ['claude'],
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+
+    const providerSelect = screen.getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('claude');
+    expect(within(providerSelect).getAllByRole('option')).toHaveLength(1);
+    expect(within(providerSelect).queryByRole('option', { name: 'Codex' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
+
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    await userEvent.type(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      'Ship with Claude only',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    const payload = vi.mocked(api.createDeliveryRun).mock.calls[0][0];
+    expect(payload).toEqual(expect.objectContaining({
+      project_id: 1,
+      monitored_repo_id: 9,
+      title: 'Ship with Claude only',
+      requirements: 'Ship with Claude only',
+      base_branch: 'main',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+    }));
+    expect(payload).not.toHaveProperty('codex_service_tier');
   });
 
   it('keeps a failed admission key across remount and acknowledges it only after success', async () => {

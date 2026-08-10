@@ -1423,7 +1423,7 @@ export interface DeliveryRunCreate {
   requirements: string;
   source_todo_id?: number;
   base_branch?: string;
-  provider?: 'codex';
+  provider?: 'claude' | 'codex';
   model?: string;
   codex_service_tier?: CodexServiceTier;
   effort_level?: string;

@@ -18,7 +18,9 @@ import { useFileUpload } from '../../hooks/useFileUpload';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
 import {
   acknowledgeDeliveryAdmission,
+  deliveryProviderOptions,
   prepareDeliveryAdmission,
+  resolveDeliveryProvider,
 } from './deliveryAdmission';
 import { filterDeliveryRepos } from './deliveryCompatibility';
 
@@ -78,6 +80,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   // workers state removed — Run on moved to Project level
   const [model, setModel] = useState('');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
+  const [providerConfigLoaded, setProviderConfigLoaded] = useState(false);
   const [effort, setEffort] = useState('');
   const [defaultProvider, setDefaultProvider] = useState('codex');
   const [defaultModel, setDefaultModel] = useState('claude-opus-4-6');
@@ -127,22 +130,39 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     stored: StoredTaskDefaults | null,
     fallbackProvider: string,
     allowDeliveryLoop = false,
+    availableProviders: readonly string[] = ['claude', 'codex'],
   ) => {
     setPriority(stored?.priority ?? 0);
     // Plan creation now lives on the first-class Plans page. Normalize the
     // legacy saved value so an old browser preference cannot recreate the
     // removed Task-form mode invisibly.
     const storedMode = stored?.mode || 'auto';
+    const requestedProvider = stored?.provider || fallbackProvider;
+    const deliveryProvider = resolveDeliveryProvider(
+      requestedProvider,
+      fallbackProvider,
+      availableProviders,
+    );
     const normalizedMode = (
-      storedMode === 'plan' || (storedMode === 'delivery_loop' && !allowDeliveryLoop)
+      storedMode === 'plan'
+      || (storedMode === 'delivery_loop' && (!allowDeliveryLoop || !deliveryProvider))
         ? 'auto'
         : storedMode
     );
+    const resolvedProvider = normalizedMode === 'delivery_loop'
+      ? deliveryProvider!
+      : requestedProvider;
+    const deliveryProviderChanged = normalizedMode === 'delivery_loop'
+      && resolvedProvider !== requestedProvider;
     setMode(normalizedMode);
-    setProvider(normalizedMode === 'delivery_loop' ? 'codex' : (stored?.provider || fallbackProvider));
-    setModel(normalizedMode === 'delivery_loop' ? '' : (stored?.model || ''));
-    setEffort(stored?.effort || '');
-    setCodexServiceTier(stored?.codexServiceTier === 'priority' ? 'priority' : 'default');
+    setProvider(resolvedProvider);
+    setModel(deliveryProviderChanged ? '' : (stored?.model || ''));
+    setEffort(deliveryProviderChanged ? '' : (stored?.effort || ''));
+    setCodexServiceTier(
+      resolvedProvider === 'codex' && stored?.codexServiceTier === 'priority'
+        ? 'priority'
+        : 'default',
+    );
     setThinkingBudget(stored?.thinkingBudget || '');
     setTimeoutHours(stored?.timeoutHours || '');
     setSystemPromptMode(stored?.systemPromptMode || '');
@@ -158,11 +178,15 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     // Restore persisted user choices independently of the server request.
     // A slow or unavailable backend must not make local defaults disappear.
-    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
+    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
     api.config().then((c) => {
       const configuredProvider = c.default_provider || 'codex';
+      const configuredProviderOptions = c.provider_options.length
+        ? c.provider_options
+        : ['claude', 'codex'];
       setDefaultProvider(configuredProvider);
-      setProviderOptions(c.provider_options.length ? c.provider_options : ['claude', 'codex']);
+      setProviderOptions(configuredProviderOptions);
+      setProviderConfigLoaded(true);
       setDefaultModel(c.default_model);
       setModelOptions(c.model_options.filter((m) => m !== 'default'));
       setDefaultCodexModel(c.default_codex_model);
@@ -181,13 +205,19 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       );
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
-      applyStoredDefaults(readStoredTaskDefaults(), configuredProvider, deliveryEnabled);
+      applyStoredDefaults(
+        readStoredTaskDefaults(),
+        configuredProvider,
+        deliveryEnabled,
+        configuredProviderOptions,
+      );
     }).catch(() => {
+      setProviderConfigLoaded(true);
       setCodexModelServiceTiers({});
       setCodexCapabilitiesLoaded(true);
       setDeliveryLoopEnabled(false);
       setAutoCapabilityAvailable(false);
-      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
+      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
     });
     api.getRuntimeSettings()
       .then((runtime) => {
@@ -236,9 +266,22 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const selectedProject = projectId
     ? projects.find((project) => project.id === projectId)
     : undefined;
+  const deliveryProviders = useMemo(
+    () => deliveryProviderOptions(providerOptions),
+    [providerOptions],
+  );
   const compatibleDeliveryRepos = useMemo(
-    () => filterDeliveryRepos(selectedProject, monitoredRepos),
-    [monitoredRepos, selectedProject],
+    () => filterDeliveryRepos(
+      selectedProject,
+      monitoredRepos,
+      providerConfigLoaded ? deliveryProviders : [],
+    ),
+    [deliveryProviders, monitoredRepos, providerConfigLoaded, selectedProject],
+  );
+  const selectedDeliveryProvider = resolveDeliveryProvider(
+    provider,
+    defaultProvider,
+    deliveryProviders,
   );
   const selectedDeliveryRepo = compatibleDeliveryRepos.find(
     (repo) => repo.id === deliveryRepoId,
@@ -539,6 +582,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       && selectedProject?.has_remote === true
       && selectedProject?.local_path != null
       && deliveryRepoId !== ''
+      && selectedDeliveryProvider != null
     )) &&
     (projectId || (isNewProject && newProjectName)) &&
     !fileUpload.isUploading &&
@@ -595,6 +639,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         if (!selectedProject || !deliveryRepo) {
           throw new Error('Select a compatible local PR Monitor repository.');
         }
+        if (!selectedDeliveryProvider) {
+          throw new Error('Select a supported Delivery provider.');
+        }
         const title = normalizedDeliveryRequirements
           .split(/\r?\n/)
           .map((line) => line.trim())
@@ -606,10 +653,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           title,
           requirements: normalizedDeliveryRequirements,
           base_branch: selectedProject.default_branch,
-          provider: 'codex',
-          model: model || activeDefaultModel,
+          provider: selectedDeliveryProvider,
+          model: model || (
+            selectedDeliveryProvider === 'codex' ? defaultCodexModel : defaultModel
+          ),
           ...(effort ? { effort_level: effort } : {}),
-          codex_service_tier: codexServiceTier,
+          ...(selectedDeliveryProvider === 'codex'
+            ? { codex_service_tier: codexServiceTier }
+            : {}),
           ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
         });
         await api.createDeliveryRun(request);
@@ -691,6 +742,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         readStoredTaskDefaults(),
         defaultProvider,
         deliveryLoopEnabled,
+        providerOptions,
       );
       onCreated();
     } catch (err) {
@@ -985,15 +1037,24 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     const nextMode = e.target.value;
                     setMode(nextMode);
                     if (nextMode === 'delivery_loop') {
-                      setProvider('codex');
-                      setModel('');
+                      const nextProvider = resolveDeliveryProvider(
+                        provider,
+                        defaultProvider,
+                        deliveryProviders,
+                      );
+                      if (nextProvider && nextProvider !== provider) {
+                        setProvider(nextProvider);
+                        setModel('');
+                        setEffort('');
+                      }
+                      if (nextProvider !== 'codex') setCodexServiceTier('default');
                     }
                   }}
                 >
                   <option value="auto">Auto</option>
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
-                  {deliveryLoopEnabled && (
+                  {deliveryLoopEnabled && deliveryProviders.length > 0 && (
                     <option value="delivery_loop">Delivery Loop</option>
                   )}
                 </select>
@@ -1089,9 +1150,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
                 <span className="text-gray-400">CLI</span>
                 <select
+                  aria-label="Task provider"
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={provider}
-                  disabled={mode === 'delivery_loop'}
                   onChange={(e) => {
                     const nextProvider = e.target.value;
                     setProvider(nextProvider);
@@ -1100,7 +1161,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     if (nextProvider !== 'codex') setCodexServiceTier('default');
                   }}
                 >
-                  {(mode === 'delivery_loop' ? ['codex'] : providerOptions).map((p) => (
+                  {(mode === 'delivery_loop' ? deliveryProviders : providerOptions).map((p) => (
                     <option key={p} value={p}>{p === 'claude' ? 'Claude' : p === 'codex' ? 'Codex' : p}</option>
                   ))}
                 </select>

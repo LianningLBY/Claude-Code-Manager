@@ -1730,37 +1730,139 @@ async def test_project_instruction_symlink_hash_change_after_owner_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_task_isolation_rejects_skills_revision_change_before_model_input(
+async def test_task_isolation_retries_cold_start_skills_drift_before_model_input(
     isolated_task_boundary,
 ):
     boundary = isolated_task_boundary(9953)
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 147, 0)
     server.ensure_started = AsyncMock()
+    skill_calls = 0
+    thread_calls = 0
 
-    async def request(method, _params, **_kwargs):
+    async def request(method, params, **_kwargs):
+        nonlocal skill_calls, thread_calls
         if method == "config/read":
             return _ambient_mcp_response()
         if method == "skills/list":
-            return _empty_skills_response(boundary.cwd)
+            skill_calls += 1
+            response = _empty_skills_response(boundary.cwd)
+            if skill_calls >= 4:
+                response["data"][0]["skills"] = [{
+                    "path": "/opt/late-skill/SKILL.md",
+                    "enabled": True,
+                }]
+            return response
         if method == "thread/start":
-            server._skills_revision += 1
-            return _task_isolated_thread_response("thread-skills-race")
+            thread_calls += 1
+            return _task_isolated_thread_response(
+                f"thread-skills-race-{thread_calls}",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "thread/delete":
+            assert params == {"threadId": "thread-skills-race-1"}
+            return {}
+        if method == "turn/start":
+            assert params["threadId"] == "thread-skills-race-2"
+            return {"turn": {"id": "turn-skills-race-2"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="run only after refreshing the exact skill deny-list",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=9953,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        disable_autonomous_features=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_ssh_disable_network=True,
+    )
+
+    assert thread_id == "thread-skills-race-2"
+    assert thread_calls == 2
+    thread_configs = [
+        call.args[1]["config"]
+        for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    ]
+    assert thread_configs[0]["skills"]["config"] == []
+    assert thread_configs[1]["skills"]["config"] == [{
+        "path": "/opt/late-skill/SKILL.md",
+        "enabled": False,
+    }]
+    assert [
+        call.args[0] for call in server._request.await_args_list
+    ].count("thread/delete") == 1
+    assert [
+        call.args[0] for call in server._request.await_args_list
+    ].count("turn/start") == 1
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-skills-race-2", "status": "completed"},
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_bounds_persistent_skills_drift_and_cleans_threads(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9954)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    skill_calls = 0
+    thread_calls = 0
+    deleted_threads = []
+
+    async def request(method, params, **_kwargs):
+        nonlocal skill_calls, thread_calls
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            skill_calls += 1
+            response = _empty_skills_response(boundary.cwd)
+            if skill_calls >= 3:
+                generation = "a" if skill_calls < 6 else "b"
+                response["data"][0]["skills"] = [{
+                    "path": f"/opt/late-{generation}/SKILL.md",
+                    "enabled": True,
+                }]
+            return response
+        if method == "thread/start":
+            thread_calls += 1
+            return _task_isolated_thread_response(
+                f"thread-persistent-skills-race-{thread_calls}",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "thread/delete":
+            deleted_threads.append(params["threadId"])
+            return {}
         raise AssertionError(f"unexpected request: {method}")
 
     server._request = AsyncMock(side_effect=request)
     with pytest.raises(
         CodexRequiredMcpPreTurnError,
-        match="Task isolation profile was not proven",
+        match="configuration or skills changed before turn ownership",
     ):
         await server.start_turn(
-            prompt="must not run",
+            prompt="must never reach model input",
             cwd=boundary.cwd,
             model="gpt-5.6-sol",
             effort="high",
             resume_session_id=None,
             git_env=None,
-            task_id=9953,
+            task_id=9954,
             disable_project_config=True,
             disable_user_mcp=True,
             disable_autonomous_features=True,
@@ -1771,6 +1873,15 @@ async def test_task_isolation_rejects_skills_revision_change_before_model_input(
             task_private_tmpdir=boundary.scratch,
             task_ssh_disable_network=True,
         )
+
+    assert deleted_threads == [
+        "thread-persistent-skills-race-1",
+        "thread-persistent-skills-race-2",
+    ]
+    assert not any(
+        call.args[0] == "turn/start"
+        for call in server._request.await_args_list
+    )
 
 
 @pytest.mark.asyncio
@@ -1890,7 +2001,7 @@ async def test_task_isolation_rechecks_inventory_after_thread_binding(
             on_thread_started=on_thread_started,
         )
 
-    on_thread_started.assert_awaited_once_with("thread-task-rebind")
+    on_thread_started.assert_not_awaited()
     assert [call.args[0] for call in server._request.await_args_list] == [
         "config/read",
         "skills/list",
@@ -4832,7 +4943,7 @@ async def test_turn_owner_hook_runs_after_final_tool_free_preflight():
 
     with pytest.raises(
         CodexRequiredMcpPreTurnError,
-        match="configuration or skills changed before turn ownership",
+        match="skills inventory changed before turn/start",
     ):
         await server.start_turn(
             prompt="must not start after stale preflight",

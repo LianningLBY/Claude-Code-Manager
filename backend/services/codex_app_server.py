@@ -352,6 +352,10 @@ class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
     """Required task context failed before admission, so exec replay is safe."""
 
 
+class _CodexIsolatedSkillsDriftError(CodexRequiredMcpPreTurnError):
+    """An isolated empty thread was admitted from a stale skills inventory."""
+
+
 class CodexThreadHomeMismatchError(CodexAppServerError):
     """A thread was routed to a different account without an explicit rebind."""
 
@@ -3855,6 +3859,7 @@ class CodexAppServer:
         on_turn_prepared: (
             Callable[[CodexTurnProcess, str], Awaitable[None]] | None
         ) = None,
+        _isolated_admission_retry_count: int = 0,
     ) -> tuple[CodexTurnProcess, str]:
         managed_runtime_prestarted = False
         managed_network_process: asyncio.subprocess.Process | None = None
@@ -4241,6 +4246,85 @@ class CodexAppServer:
         isolated_skills_inventory_fingerprint: str | None = None
         isolated_ambient_effective_config: dict[str, Any] | None = None
         isolated_dynamic_disabled_features: frozenset[str] = frozenset()
+
+        async def retry_isolated_admission_after_skills_drift(
+            thread_id: str,
+            error: _CodexIsolatedSkillsDriftError,
+        ) -> tuple[CodexTurnProcess, str]:
+            """Delete one empty thread and rebuild its exact skill deny-list."""
+
+            if resume_session_id:
+                # A resumed id owns durable history and must never be deleted
+                # as compensation for a local admission race.
+                raise error
+
+            logger.warning(
+                "Recycling empty Codex thread after isolated skills drift "
+                "home=%s thread=%s retry=%s",
+                self.codex_home,
+                thread_id,
+                _isolated_admission_retry_count,
+            )
+            delete_request = asyncio.create_task(self._request(
+                "thread/delete",
+                {"threadId": thread_id},
+                expected_process=isolated_process,
+            ))
+            cancelled = False
+            while not delete_request.done():
+                try:
+                    await asyncio.shield(delete_request)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    continue
+            try:
+                delete_request.result()
+            except Exception as cleanup_error:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex could not release an empty isolated thread after "
+                    "its skills inventory changed"
+                ) from cleanup_error
+            finally:
+                self._known_threads.discard(thread_id)
+                self._contexts_by_thread.pop(thread_id, None)
+
+            if cancelled:
+                raise asyncio.CancelledError
+            if _isolated_admission_retry_count >= 1:
+                raise error
+
+            return await self.start_turn(
+                prompt=prompt,
+                cwd=cwd,
+                model=model,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                git_env=git_env,
+                task_id=task_id,
+                mcp_specs=mcp_specs,
+                disable_project_config=disable_project_config,
+                disable_user_mcp=disable_user_mcp,
+                skill_context=skill_context,
+                codex_service_tier=codex_service_tier,
+                sandbox_mode=sandbox_mode,
+                task_ssh_protected_paths=task_ssh_protected_paths,
+                task_ssh_allowed_read_paths=task_ssh_allowed_read_paths,
+                task_git_read_paths=task_git_read_paths,
+                task_git_boundary_fingerprint=task_git_boundary_fingerprint,
+                task_private_tmpdir=task_private_tmpdir,
+                task_ssh_disable_network=task_ssh_disable_network,
+                task_managed_network_proxy=task_managed_network_proxy,
+                disable_autonomous_features=disable_autonomous_features,
+                network_isolated=network_isolated,
+                output_schema=output_schema,
+                tools_disabled=tools_disabled,
+                mcp_only=mcp_only,
+                on_thread_started=on_thread_started,
+                on_turn_prepared=on_turn_prepared,
+                _isolated_admission_retry_count=(
+                    _isolated_admission_retry_count + 1
+                ),
+            )
         try:
             thread_config: dict[str, Any] = (
                 render_codex_mcp_config(mcp_specs) if mcp_specs else {}
@@ -4718,7 +4802,15 @@ class CodexAppServer:
                     if isolated_ambient_config_sections.get(key)
                     != current_sections.get(key)
                 )
-                raise CodexRequiredMcpPreTurnError(
+                error_type = (
+                    _CodexIsolatedSkillsDriftError
+                    if (
+                        not config_changed
+                        and (skills_changed or revision_changed)
+                    )
+                    else CodexRequiredMcpPreTurnError
+                )
+                raise error_type(
                     "Codex isolated ambient configuration or skills changed "
                     f"{phase} (config_sections={changed_sections}, "
                     f"skills={skills_changed}, revision={revision_changed})"
@@ -5157,9 +5249,14 @@ class CodexAppServer:
                     tool_free_skills_revision is None
                     or self._skills_revision != tool_free_skills_revision
                 ):
-                    raise ValueError(
+                    raise _CodexIsolatedSkillsDriftError(
                         "skills inventory changed during admission"
                     )
+            except _CodexIsolatedSkillsDriftError as exc:
+                return await retry_isolated_admission_after_skills_drift(
+                    thread_id,
+                    exc,
+                )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex tool-free profile was not proven by the "
@@ -5192,9 +5289,14 @@ class CodexAppServer:
                     tool_free_skills_revision is None
                     or self._skills_revision != tool_free_skills_revision
                 ):
-                    raise ValueError(
+                    raise _CodexIsolatedSkillsDriftError(
                         "skills inventory changed during Task admission"
                     )
+            except _CodexIsolatedSkillsDriftError as exc:
+                return await retry_isolated_admission_after_skills_drift(
+                    thread_id,
+                    exc,
+                )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex Task isolation profile was not proven by the "
@@ -5234,20 +5336,27 @@ class CodexAppServer:
         require_stable_task_filesystem_boundary("after thread admission")
         require_isolated_runtime_generation("after thread admission")
         require_managed_network_generation("after thread admission")
-        self._known_threads.add(thread_id)
-        if on_thread_started is not None:
-            # A caller that owns durable lifecycle state can bind the exact
-            # native identity before any model turn is admitted. In
-            # particular, Monitor uses this hook to survive a process crash
-            # between thread/start and turn/start without guessing a rollout.
-            await on_thread_started(thread_id)
-        # Re-read after thread/start and any durable thread-id binding. Codex
-        # deep-merges ambient config into the request-local layer, so any
-        # config or skills change invalidates the local isolation proof.
-        await require_stable_isolated_ambient_state("before turn ownership")
+        # Re-read before publishing the native id. Codex 0.147 may finish
+        # background plugin discovery only after the first thread/start. If
+        # that changes the exact skill deny-list, compensate the still-empty
+        # thread and repeat admission once with a newly stabilized inventory.
+        try:
+            await require_stable_isolated_ambient_state(
+                "before turn ownership"
+            )
+        except _CodexIsolatedSkillsDriftError as exc:
+            return await retry_isolated_admission_after_skills_drift(
+                thread_id,
+                exc,
+            )
         require_isolated_runtime_generation("before turn ownership")
         require_managed_network_generation("before turn ownership")
         require_stable_instruction_sources("before turn ownership")
+        self._known_threads.add(thread_id)
+        if on_thread_started is not None:
+            # A caller that owns durable lifecycle state binds the exact native
+            # identity after all pure admission checks and before model input.
+            await on_thread_started(thread_id)
         # A native Goal can continue after an older CCM version detached its
         # process adapter. Standard chat may recover that exact Goal by
         # preparing a new CCM owner and steering the pending user input into

@@ -4333,6 +4333,11 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     tmp_path,
 ):
     monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    attachment = upload_dir / "notes.md"
+    attachment.write_text("trusted attachment", encoding="utf-8")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(
         "backend.services.task_agent_isolation."
         "validate_claude_task_isolation_settings",
@@ -4376,6 +4381,7 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
             cwd=str(tmp_path),
             provider="claude",
             config_dir=str(tmp_path / "claude-task-ssh-home"),
+            attachment_paths=(str(attachment),),
         )
 
     argv = list(exec_mock.await_args.args)
@@ -4402,6 +4408,7 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     assert argv[argv.index("--setting-sources") + 1] == ""
     assert settings_data["sandbox"]["failIfUnavailable"] is True
     assert settings_data["sandbox"]["network"]["allowedDomains"] == []
+    assert str(attachment.resolve()) in settings_data["sandbox"]["filesystem"]["allowRead"]
     assert any(
         "task-ssh-guard-hook-" in hook.get("command", "")
         for entry in settings_data["hooks"]["PreToolUse"]
@@ -4410,6 +4417,71 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     policy_path = Path(argv[argv.index("--append-system-prompt-file") + 1])
     assert "ccm_ssh.list_connections" in policy_path.read_text()
     assert "known_hosts" in policy_path.read_text()
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_admin_claude_turn_bypasses_task_sandbox_but_keeps_ssh_mcp(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    async with db_factory() as db:
+        inst = Instance(name="admin-unrestricted-claude")
+        profile = _managed_ssh_profile("admin-unrestricted-ssh")
+        db.add_all([inst, profile])
+        await db.flush()
+        task = Task(
+            title="admin unrestricted",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+        task_id, instance_id = task.id, inst.id
+
+    process = _make_mock_process()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    with (
+        patch(
+            "backend.services.task_agent_isolation."
+            "validate_claude_task_isolation_settings"
+        ) as validate,
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as exec_mock,
+    ):
+        await im.launch(
+            instance_id=instance_id,
+            prompt="inspect production",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            config_dir=str(tmp_path / "admin-home"),
+            initiating_user_role="admin",
+            execution_mode="unrestricted",
+        )
+
+    validate.assert_not_called()
+    argv = list(exec_mock.await_args.args)
+    assert "--settings" not in argv
+    config_path = Path(argv[argv.index("--mcp-config") + 1])
+    try:
+        config = json.loads(config_path.read_text())
+        assert "ccm_ssh" in config["mcpServers"]
+    finally:
+        config_path.unlink(missing_ok=True)
     await asyncio.sleep(0.1)
 
 
@@ -4489,6 +4561,15 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
         "GIT_COMMITTER_NAME": "Task Committer",
         "GIT_COMMITTER_EMAIL": "committer@example.com",
     }
+    assert not {
+        "GIT_SSH_COMMAND",
+        "GIT_ASKPASS",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    } & kwargs["git_env"].keys()
+    assert kwargs["git_env"]["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert "ccm_ssh.list_connections" in kwargs["skill_context"]
+    assert "known_hosts" in kwargs["skill_context"]
     assert not {
         "GIT_SSH_COMMAND",
         "GIT_ASKPASS",
@@ -4823,15 +4904,59 @@ async def test_codex_app_server_receives_ssh_mcp_without_global_main_mcp(
         "GIT_COMMITTER_NAME": "Task Committer",
         "GIT_COMMITTER_EMAIL": "committer@example.com",
     }
-    assert not {
-        "GIT_SSH_COMMAND",
-        "GIT_ASKPASS",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-    } & kwargs["git_env"].keys()
-    assert kwargs["git_env"]["GIT_CONFIG_GLOBAL"] == os.devnull
-    assert "ccm_ssh.list_connections" in kwargs["skill_context"]
-    assert "known_hosts" in kwargs["skill_context"]
+
+
+@pytest.mark.asyncio
+async def test_admin_codex_ssh_turn_uses_unrestricted_profile(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    async with db_factory() as db:
+        inst = Instance(name="admin-codex-ssh")
+        profile = _managed_ssh_profile("admin-codex-profile")
+        db.add_all([inst, profile])
+        await db.flush()
+        task = Task(
+            title="Admin Codex SSH",
+            status="executing",
+            provider="codex",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+        task_id, instance_id = task.id, inst.id
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(return_value=45_679)
+    await im.launch(
+        instance_id=instance_id,
+        prompt="inspect production",
+        task_id=task_id,
+        cwd=str(tmp_path),
+        provider="codex",
+        config_dir=str(tmp_path / "admin-codex-home"),
+        initiating_user_role="super_admin",
+        execution_mode="unrestricted",
+    )
+
+    kwargs = im._launch_codex_app_server.await_args.kwargs
+    assert kwargs["sandbox_mode"] == "danger-full-access"
+    assert kwargs["task_ssh_protected_paths"] == ()
+    assert kwargs["disable_project_config"] is False
+    assert kwargs["disable_user_mcp"] is False
+    assert kwargs["disable_autonomous_features"] is False
+    assert any(spec.name == "ccm_ssh" for spec in kwargs["mcp_specs"])
 
 
 @pytest.mark.asyncio

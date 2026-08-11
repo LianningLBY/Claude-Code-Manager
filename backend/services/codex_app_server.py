@@ -5679,7 +5679,18 @@ class CodexAppServer:
                 for tool in spec.enabled_tools
             ) if mcp_only else frozenset(),
             allowed_mcp_servers=(
-                frozenset(explicit_mcp_servers)
+                frozenset({
+                    *explicit_mcp_servers,
+                    # Codex 0.147 exposes its bundled, runtime-projected
+                    # code-mode host as the internal MCP server ``codex``.
+                    # Task isolation has already disabled ambient user/project
+                    # MCP and verified the effective inventory, so this name
+                    # cannot be supplied by an untrusted config.  It is
+                    # admitted only for the filesystem-isolated Task profile;
+                    # MCP-only Browser and tool-free review profiles retain
+                    # their exact external-server allowlists.
+                    *(("codex",) if task_ssh_protected_paths and not mcp_only else ()),
+                })
                 if task_ssh_protected_paths or mcp_only
                 else None
             ),

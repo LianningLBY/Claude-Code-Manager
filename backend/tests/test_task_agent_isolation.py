@@ -365,6 +365,21 @@ def _sandbox_loading_canary_result():
     )
 
 
+def test_sandbox_loading_canary_accepts_claude_2_1_168_bwrap_error():
+    from backend.services.task_agent_isolation import (
+        _validate_sandbox_loading_canary,
+    )
+
+    _validate_sandbox_loading_canary(SimpleNamespace(
+        returncode=1,
+        stdout="",
+        stderr=(
+            "error: bubblewrap is required for subprocess env scrubbing and "
+            "isolation. Install with: sudo apt-get install -y bubblewrap"
+        ),
+    ))
+
+
 def test_protected_path_variants_expand_environment_variables(
     tmp_path,
     monkeypatch,

@@ -1597,6 +1597,9 @@ async def test_chat_send_enqueues_message(client, session_factory):
     assert kwargs["priority"] == PRIORITY_USER
     assert kwargs["source"] == "user"
     assert isinstance(kwargs["source_log_id"], int)
+    assert kwargs["initiating_user_id"] is None
+    assert kwargs["initiating_user_role"] == "super_admin"
+    assert kwargs["execution_mode"] == "unrestricted"
 
     # User message broadcast to task channel before enqueue
     task_broadcasts = [
@@ -1819,10 +1822,58 @@ async def test_service_token_sender_prefix_is_display_only(session_factory):
     assert json.loads(stored.raw_json) == {
         "raw_content": "[BUG] keep this raw",
         "sender_name": "Admin",
+        "execution_principal": {
+            "user_id": None,
+            "role": "super_admin",
+            "mode": "unrestricted",
+        },
     }
     event = mock_broadcaster.broadcast.call_args.args[1]
     assert event["content"] == "[Admin] [BUG] keep this raw"
     assert event["raw_content"] == "[BUG] keep this raw"
+
+
+@pytest.mark.asyncio
+async def test_member_chat_turn_is_durably_sandboxed(session_factory):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, send_chat_message
+    async with session_factory() as db:
+        task = Task(
+            title="Member sandbox",
+            description="d",
+            target_repo="/tmp",
+            session_id="member-sandbox-session",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        mock_d = _mock_dispatcher()
+        request = SimpleNamespace(state=SimpleNamespace(
+            user_id=None,
+            user_role="member",
+            auth_type="jwt",
+        ))
+        broadcaster = MagicMock()
+        broadcaster.broadcast = AsyncMock()
+        with patch("backend.main.dispatcher", mock_d), patch(
+            "backend.main.broadcaster", broadcaster,
+        ), patch(
+            "backend.api.chat.require_task_access",
+            new_callable=AsyncMock,
+        ):
+            await send_chat_message(
+                task.id,
+                ChatMessage(message="run safely"),
+                request,
+                db,
+            )
+
+    kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert kwargs["initiating_user_id"] is None
+    assert kwargs["initiating_user_role"] == "member"
+    assert kwargs["execution_mode"] == "sandbox"
 
 
 @pytest.mark.asyncio

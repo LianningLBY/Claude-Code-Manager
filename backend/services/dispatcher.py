@@ -584,6 +584,13 @@ class QueuedMessage:
     # The API persists a visible user row before queue admission.  Keep its
     # exact id so compaction can exclude the current request from history.
     source_log_id: int | None = field(compare=False, default=None)
+    # Exact account that admitted this logical turn.  Runtime authority follows
+    # the initiating user, never the long-lived Task, queue worker, or system
+    # process executing it later.
+    initiating_user_id: int | None = field(compare=False, default=None)
+    initiating_user_role: str = field(compare=False, default="member")
+    execution_mode: str = field(compare=False, default="sandbox")
+    attachment_paths: tuple[str, ...] = field(compare=False, default=())
     # Durable Plan-application outbox identity. Repeated HTTP recovery and
     # startup recovery may request admission, but only one in-memory item is
     # accepted for this key.
@@ -17968,6 +17975,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         allow_new_session: bool | None = None,
         context_retry_permit: ContextRetryPermit | None = None,
         queue_admission_fence: QueueAdmissionFence | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        attachment_paths: tuple[str, ...] = (),
     ) -> bool:
         """Enqueue a message for the main agent of a task.
 
@@ -17992,6 +18003,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             expected_task_routing=expected_task_routing,
             monitor_session_id=monitor_session_id,
             source_log_id=source_log_id,
+            initiating_user_id=initiating_user_id,
+            initiating_user_role=initiating_user_role,
+            execution_mode=execution_mode,
+            attachment_paths=tuple(attachment_paths),
             delivery_key=delivery_key,
             current_message=prompt if current_message is None else current_message,
             allow_new_session=(
@@ -18425,6 +18440,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 model_override=payload.get("model_override"),
                 expected_task_routing=expected_routing,
                 source_log_id=source_log_id,
+                initiating_user_id=payload.get("initiating_user_id"),
+                initiating_user_role=str(
+                    payload.get("initiating_user_role", "member")
+                ),
+                execution_mode=str(payload.get("execution_mode", "sandbox")),
+                attachment_paths=tuple(payload.get("attachment_paths") or ()),
                 current_message=payload.get("current_message"),
                 allow_new_session=bool(
                     payload.get("allow_new_session", False)
@@ -19716,6 +19737,12 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             expected_task_routing=expected_routing,
             monitor_session_id=payload.get("monitor_session_id"),
             source_log_id=payload.get("source_log_id"),
+            initiating_user_id=payload.get("initiating_user_id"),
+            initiating_user_role=str(
+                payload.get("initiating_user_role", "member")
+            ),
+            execution_mode=str(payload.get("execution_mode", "sandbox")),
+            attachment_paths=tuple(payload.get("attachment_paths") or ()),
             delivery_key=receipt_key,
             worker_turn_handoff_id=payload.get(
                 "worker_turn_handoff_id"
@@ -22027,6 +22054,33 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if not task:
                 logger.warning(f"Task {task_id} not found, skipping queued message")
                 return
+            from backend.models.user import User
+
+            if msg.execution_mode not in {"sandbox", "unrestricted"}:
+                raise QueuedMessageRoutingMismatchError(
+                    "Queued message has an invalid execution mode"
+                )
+            if msg.initiating_user_id is None:
+                principal_role = msg.initiating_user_role
+            else:
+                principal = await db.get(User, msg.initiating_user_id)
+                if principal is None or not principal.is_active:
+                    raise QueuedMessageRoutingMismatchError(
+                        "Queued message initiator is no longer active"
+                    )
+                principal_role = principal.role
+            expected_execution_mode = (
+                "unrestricted"
+                if principal_role in {"admin", "super_admin"}
+                else "sandbox"
+            )
+            if (
+                principal_role != msg.initiating_user_role
+                or expected_execution_mode != msg.execution_mode
+            ):
+                raise QueuedMessageRoutingMismatchError(
+                    "Queued message initiator role changed after admission"
+                )
             if await active_worker_task_termination_receipt(db, task_id):
                 raise QueuedMessagePrelaunchError(
                     "Task has an active Worker termination receipt"
@@ -22645,6 +22699,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 source_log_id=msg.source_log_id,
                 current_message=msg.current_message,
                 queue_timestamp=msg.timestamp,
+                initiating_user_id=msg.initiating_user_id,
+                initiating_user_role=msg.initiating_user_role,
+                execution_mode=msg.execution_mode,
+                attachment_paths=msg.attachment_paths,
             )
             inst_id = inst.id
             task_provider = (task.provider or "claude").lower()

@@ -14,6 +14,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from backend.api.deps import (
     get_current_user_id,
+    get_current_user_role,
     require_internal_service,
     require_task_access,
     require_task_control,
@@ -158,6 +159,11 @@ class ChatMessage(BaseModel):
     )
     worker_turn_handoff_retry_count: int | None = Field(default=None, ge=0)
     worker_turn_handoff_from_generation: int | None = Field(default=None, ge=0)
+    # Manager -> Worker only.  The Worker authenticates the internal-service
+    # request and freezes this origin principal into its own durable outbox.
+    execution_user_id: int | None = None
+    execution_user_role: str | None = None
+    execution_mode: str | None = None
 
     @model_validator(mode="after")
     def validate_plan_attachment_generation(self):
@@ -172,6 +178,19 @@ class ChatMessage(BaseModel):
             value is not None for value in handoff
         ):
             raise ValueError("Worker turn handoff fields must be provided together")
+        principal = (self.execution_user_role, self.execution_mode)
+        if any(value is not None for value in principal):
+            if self.worker_turn_handoff_id is None or not all(principal):
+                raise ValueError(
+                    "Execution principal is valid only for a Worker handoff"
+                )
+            expected_mode = (
+                "unrestricted"
+                if self.execution_user_role in {"admin", "super_admin"}
+                else "sandbox"
+            )
+            if self.execution_mode != expected_mode:
+                raise ValueError("Execution principal role/mode mismatch")
         return self
 
 
@@ -697,6 +716,20 @@ async def send_chat_message(
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
+    if body.worker_turn_handoff_id is not None:
+        initiating_user_id = None
+        initiating_user_role = body.execution_user_role or "member"
+        execution_mode = body.execution_mode or "sandbox"
+        originating_user_id = body.execution_user_id
+    else:
+        initiating_user_id = get_current_user_id(request)
+        initiating_user_role = get_current_user_role(request)
+        execution_mode = (
+            "unrestricted"
+            if initiating_user_role in ("admin", "super_admin")
+            else "sandbox"
+        )
+        originating_user_id = initiating_user_id
     if task.status == "waiting_capability":
         raise HTTPException(
             409,
@@ -1210,6 +1243,11 @@ async def send_chat_message(
 
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
+    log_metadata["execution_principal"] = {
+        "user_id": originating_user_id,
+        "role": initiating_user_role,
+        "mode": execution_mode,
+    }
     if attachments:
         log_metadata["attachments"] = attachments
         log_metadata["file_paths"] = all_paths
@@ -1296,6 +1334,9 @@ async def send_chat_message(
         "queue_timestamp": queue_timestamp,
         "allow_new_session": False,
         "delivery_key": application_receipt_key,
+        "initiating_user_id": initiating_user_id,
+        "initiating_user_role": initiating_user_role,
+        "execution_mode": execution_mode,
     }
     if body.worker_turn_handoff_id is not None:
         worker_queue_payload.update({
@@ -1468,6 +1509,10 @@ async def send_chat_message(
                 expected_task_routing=admitted_routing,
                 source_log_id=user_log.id,
                 queue_timestamp=queue_timestamp,
+                initiating_user_id=initiating_user_id,
+                initiating_user_role=initiating_user_role,
+                execution_mode=execution_mode,
+                attachment_paths=tuple(all_paths),
             )
     except (TaskStartPausedError, RuntimeError) as exc:
         if application_receipt is None:
@@ -2860,6 +2905,13 @@ async def _send_worker_chat(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": observed.retry_count,
             "worker_turn_handoff_from_generation": observed.turn_generation,
+            "execution_user_id": get_current_user_id(request),
+            "execution_user_role": get_current_user_role(request),
+            "execution_mode": (
+                "unrestricted"
+                if get_current_user_role(request) in ("admin", "super_admin")
+                else "sandbox"
+            ),
         }
         worker_request_digest = _plan_delivery_digest(worker_request_body)
 

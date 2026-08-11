@@ -634,6 +634,12 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 按邮箱和 `Request.client.host` 限速；多进程/多副本部署还应在反向代理或网关
 配置共享限流，因为应用内状态按进程隔离。
 
+Task 的运行权限按每一回合的实际发起账号决定：管理员和超级管理员发起的普通
+Task 回合使用 unrestricted 环境；Member 发起的回合进入 fail-closed sandbox。
+发起者身份会随消息持久化并在启动前复验，重试不会借后台 system 身份提权。
+Task SSH Profile 和 grant 仅由管理员配置；Member sandbox 只映射当前消息已验证
+的附件和授权能力，不会开放其他 Task 或整个 uploads 目录。
+
 ### PTY 模式
 
 | 环境变量 | 默认值 | 说明 |

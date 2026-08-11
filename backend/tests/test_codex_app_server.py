@@ -624,7 +624,6 @@ def test_codex_runtime_read_paths_rejects_untrusted_code_mode_host(
     "mcp_identity",
     [
         {"server": "ambient"},
-        {"server": "codex"},
         {},
         {"server": "ccm_ssh", "serverName": "ambient"},
     ],
@@ -673,6 +672,38 @@ async def test_task_isolation_interrupts_unbound_mcp_tool_call(
     assert context.tool_policy_violation is not None
     assert "unauthorized MCP" in context.tool_policy_violation
     server._interrupt_turn_context.assert_awaited_once_with(context)
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_allows_verified_internal_codex_code_mode(
+    isolated_task_boundary,
+):
+    server = CodexAppServer("codex")
+    boundary = isolated_task_boundary(998)
+    process, thread_id = await _start_task_isolated_mcp_test_turn(
+        server,
+        boundary,
+    )
+    context = server._contexts_by_thread[thread_id]
+    assert context.allowed_mcp_servers == frozenset({"ccm_ssh", "codex"})
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-task-mcp-guard",
+        "item": {
+            "id": "verified-code-mode",
+            "type": "mcpToolCall",
+            "server": "codex",
+            "tool": "codex",
+        },
+    })
+    assert context.tool_policy_violation is None
+
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-task-mcp-guard", "status": "completed"},
+    })
+    assert await process.wait() == 0
 
 
 @pytest.mark.asyncio

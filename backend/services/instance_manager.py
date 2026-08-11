@@ -1410,6 +1410,10 @@ class InstanceManager:
         codex_service_tier: str = "default",
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
         sequential_turn_token: object | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        attachment_paths: tuple[str, ...] = (),
     ) -> int:
         """Admit one turn and spend continuation authority on every attempt.
 
@@ -1447,6 +1451,10 @@ class InstanceManager:
                 codex_service_tier=codex_service_tier,
                 on_launch_admitted=on_launch_admitted,
                 sequential_turn_token=sequential_turn_token,
+                initiating_user_id=initiating_user_id,
+                initiating_user_role=initiating_user_role,
+                execution_mode=execution_mode,
+                attachment_paths=attachment_paths,
             )
         finally:
             self.revoke_sequential_turn_continuation(
@@ -1473,6 +1481,10 @@ class InstanceManager:
         enabled_skills: dict | None = None,
         system_prompt_mode: str | None = None,
         source_log_id: int | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        attachment_paths: tuple[str, ...] = (),
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
@@ -1577,6 +1589,10 @@ class InstanceManager:
                                 codex_service_tier=codex_service_tier,
                                 on_launch_admitted=settled_on_launch_admitted,
                                 sequential_turn_token=sequential_turn_token,
+                                initiating_user_id=initiating_user_id,
+                                initiating_user_role=initiating_user_role,
+                                execution_mode=execution_mode,
+                                attachment_paths=attachment_paths,
                             )
                     except BaseException:
                         # A token which did not reach the durable provider
@@ -2389,6 +2405,10 @@ class InstanceManager:
         codex_service_tier: str = "default",
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
         sequential_turn_token: object | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        attachment_paths: tuple[str, ...] = (),
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -2484,12 +2504,46 @@ class InstanceManager:
         task_ssh_broker_only = False
         task_ssh_protected_path_values: tuple[str, ...] = ()
         task_git_credential_read_path_values: tuple[str, ...] = ()
+        task_attachment_read_path_values: tuple[str, ...] = ()
         task_git_metadata_read_path_values: tuple[str, ...] = ()
         task_git_metadata_identity_fingerprint: tuple[
             tuple[object, ...], ...
         ] = ()
         task_private_tmpdir = None
         delivery_task = False
+        if execution_mode not in {"sandbox", "unrestricted"}:
+            raise LaunchSupersededError("Invalid Task execution mode")
+        unrestricted_admin_turn = bool(
+            execution_mode == "unrestricted"
+            and initiating_user_role in {"admin", "super_admin"}
+        )
+        validated_attachment_paths: tuple[str, ...] = ()
+        if attachment_paths:
+            from backend.api.uploads import UPLOAD_DIR
+
+            upload_root = UPLOAD_DIR.resolve(strict=True)
+            validated: list[str] = []
+            for raw_path in attachment_paths:
+                candidate = Path(raw_path)
+                if candidate.is_symlink():
+                    raise LaunchSupersededError("Task attachment is a symlink")
+                try:
+                    resolved = candidate.resolve(strict=True)
+                    resolved.relative_to(upload_root)
+                except (FileNotFoundError, ValueError) as exc:
+                    raise LaunchSupersededError(
+                        "Task attachment is no longer a managed upload"
+                    ) from exc
+                if not resolved.is_file():
+                    raise LaunchSupersededError(
+                        "Task attachment is not a regular file"
+                    )
+                validated.append(str(resolved))
+            validated_attachment_paths = tuple(validated)
+        if execution_mode == "unrestricted" and not unrestricted_admin_turn:
+            raise LaunchSupersededError(
+                "Only an administrator may launch an unrestricted Task turn"
+            )
         async with self.db_factory() as db:
             if await db.get(Instance, instance_id) is None:
                 raise InstanceNotFoundError(
@@ -2771,7 +2825,10 @@ class InstanceManager:
                     task_ssh_capabilities = set(
                         task_ssh_runtime.capabilities
                     )
-                    task_ssh_broker_only = task_ssh_runtime.broker_only
+                    task_ssh_broker_only = (
+                        task_ssh_runtime.broker_only
+                        and not unrestricted_admin_turn
+                    )
                     explicit_git_paths = (
                         ()
                         if task_ssh_broker_only or browser_review_task
@@ -2781,15 +2838,16 @@ class InstanceManager:
                     # provider-account, and scoped runtime credentials. A Task
                     # with grants additionally loses direct network access and
                     # reaches SSH only through the broker MCP.
-                    task_ssh_protected_path_values = (
-                        await task_ssh_protected_paths(
-                            db,
-                            task=task,
-                            working_directory=cwd,
-                            include_direct_git_credentials=True,
-                            allowed_credential_paths=explicit_git_paths,
+                    if not unrestricted_admin_turn:
+                        task_ssh_protected_path_values = (
+                            await task_ssh_protected_paths(
+                                db,
+                                task=task,
+                                working_directory=cwd,
+                                include_direct_git_credentials=True,
+                                allowed_credential_paths=explicit_git_paths,
+                            )
                         )
-                    )
                     if not task_ssh_broker_only:
                         from backend.services.task_agent_isolation import (
                             require_git_credentials_outside_protected_paths,
@@ -2805,6 +2863,9 @@ class InstanceManager:
                                 ),
                             )
                         )
+                    task_attachment_read_path_values = (
+                        validated_attachment_paths
+                    )
                 if browser_review_task:
                     if task_ssh_broker_only or task_ssh_capabilities:
                         raise LaunchSupersededError(
@@ -2911,7 +2972,7 @@ class InstanceManager:
                 logger.warning("Could not enforce 0700 on CODEX_HOME %s", config_dir)
             self._config_dirs[instance_id] = config_dir
 
-        if task_id is not None and config_dir:
+        if task_id is not None and config_dir and not unrestricted_admin_turn:
             from backend.services.task_ssh_access import (
                 _protected_path_variants,
             )
@@ -2931,7 +2992,29 @@ class InstanceManager:
         claude_isolation_settings_path = None
         claude_isolation_tools: tuple[str, ...] | None = None
         claude_delivery_git_boundary = None
-        if provider == "claude" and task_id and not pr_review_task:
+        if (
+            provider == "claude"
+            and task_id
+            and not pr_review_task
+            and not delivery_task
+        ):
+            from backend.services.mcp_config import generate_mcp_config
+
+            mcp_config_path = generate_mcp_config(
+                task_id,
+                enabled_skills or {},
+                task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
+                task_incarnation_id=task_incarnation_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                task_status=task_status,
+            )
+        if (
+            provider == "claude"
+            and task_id
+            and not pr_review_task
+            and not unrestricted_admin_turn
+        ):
             from backend.services.task_agent_isolation import (
                 CLAUDE_TASK_BUILTIN_TOOLS,
                 generate_claude_task_isolation_settings,
@@ -2991,23 +3074,15 @@ class InstanceManager:
                     expected_git_boundary=claude_delivery_git_boundary,
                 )
             else:
-                from backend.services.mcp_config import generate_mcp_config
-
-                mcp_config_path = generate_mcp_config(
-                    task_id,
-                    enabled_skills or {},
-                    task_ssh_capabilities=tuple(sorted(task_ssh_capabilities)),
-                    task_incarnation_id=task_incarnation_id,
-                    task_retry_count=task_retry_count,
-                    task_turn_generation=task_turn_generation,
-                    task_status=task_status,
-                )
                 claude_isolation_tools = CLAUDE_TASK_BUILTIN_TOOLS
                 claude_isolation_settings_path = (
                     generate_claude_task_isolation_settings(
                         task_id,
                         task_ssh_protected_path_values,
                         allowed_read_paths=task_git_credential_read_path_values,
+                        read_only_allow_paths=(
+                            task_attachment_read_path_values
+                        ),
                         ssh_capabilities=task_ssh_capabilities,
                         disable_direct_network=task_ssh_broker_only,
                     )
@@ -3366,7 +3441,10 @@ class InstanceManager:
                             else ()
                         ),
                         task_ssh_allowed_read_paths=(
-                            task_git_credential_read_path_values
+                            tuple(dict.fromkeys((
+                                *task_git_credential_read_path_values,
+                                *task_attachment_read_path_values,
+                            )))
                             if codex_task_isolation_required
                             else ()
                         ),

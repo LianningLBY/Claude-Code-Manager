@@ -1411,6 +1411,7 @@ def generate_claude_task_isolation_settings(
     protected_paths: Iterable[str],
     *,
     allowed_read_paths: Iterable[str] = (),
+    read_only_allow_paths: Iterable[str] = (),
     ssh_capabilities: Iterable[str] = (),
     disable_direct_network: bool = False,
 ) -> Path:
@@ -1427,6 +1428,7 @@ def generate_claude_task_isolation_settings(
         filename="claude-security.json",
         protected_paths=protected_paths,
         allowed_read_paths=allowed_read_paths,
+        read_only_allow_paths=read_only_allow_paths,
         ssh_capabilities=ssh_capabilities,
         disable_direct_network=disable_direct_network,
         include_task_hooks=True,
@@ -1896,10 +1898,26 @@ def _validate_sandbox_loading_canary(
     result: subprocess.CompletedProcess[str],
 ) -> None:
     combined = "\n".join((result.stdout or "", result.stderr or "")).lower()
+    compact = combined.replace(".", "")
+    # Claude 2.1.168 fails before emitting stream-json when PATH deliberately
+    # hides bwrap.  Older builds emitted a zero-turn result and named
+    # failIfUnavailable.  Both are valid fail-closed outcomes: the local
+    # contract above has already verified the exact settings file and the CLI
+    # is invoked with --settings plus an empty setting source list.
+    recognized_unavailable = bool(
+        (
+            "sandbox required but unavailable" in combined
+            and "failifunavailable" in compact
+        )
+        or (
+            "bubblewrap is required for subprocess env scrubbing and isolation"
+            in combined
+            and "install" in combined
+        )
+    )
     if (
         result.returncode == 0
-        or "sandbox required but unavailable" not in combined
-        or "failifunavailable" not in combined.replace(".", "")
+        or not recognized_unavailable
     ):
         raise TaskAgentIsolationError(
             "Claude did not prove that sandbox.failIfUnavailable was loaded"
@@ -1919,6 +1937,11 @@ def _validate_sandbox_loading_canary(
         for event in events
         if isinstance(event, dict) and event.get("type") == "result"
     ]
+    if not results:
+        # Current Claude exits before the stream-json renderer is initialized.
+        # The outer bwrap has no network and stdin is /dev/null, so this path
+        # cannot have crossed a provider boundary or consumed a model turn.
+        return
     if len(results) != 1:
         raise TaskAgentIsolationError(
             "Claude sandbox loading canary did not prove zero turns"

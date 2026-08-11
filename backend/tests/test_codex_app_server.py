@@ -10693,7 +10693,7 @@ async def test_app_server_spawn_uses_independent_session(tmp_path):
 
     assert spawn.await_args.kwargs["start_new_session"] is True
     assert spawn.await_args.args == (
-        "codex",
+        server.binary,
         "app-server",
         "--enable",
         "fast_mode",

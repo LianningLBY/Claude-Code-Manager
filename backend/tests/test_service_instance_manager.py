@@ -7223,8 +7223,9 @@ async def test_task_isolation_pre_turn_failure_never_falls_back_to_exec(
         server._actual_tier_proxy = proxy
 
     missing_thread_responses = [
-        {"config": {"mcp_servers": {}}},
         {"data": [{"cwd": "/tmp", "skills": [], "errors": []}]},
+        {"data": [{"cwd": "/tmp", "skills": [], "errors": []}]},
+        {"config": {"mcp_servers": {}}},
         {"config": {"mcp_servers": {}}},
         {"data": [{"cwd": "/tmp", "skills": [], "errors": []}]},
         thread_response,
@@ -7273,7 +7274,14 @@ async def test_task_isolation_pre_turn_failure_never_falls_back_to_exec(
         request.assert_not_awaited()
     elif failure_mode == "missing-thread":
         ensure_started.assert_awaited_once()
-        assert request.await_count == 5
+        assert [call.args[0] for call in request.await_args_list] == [
+            "skills/list",
+            "skills/list",
+            "config/read",
+            "config/read",
+            "skills/list",
+            "thread/start",
+        ]
     exec_mock.assert_not_awaited()
 
 

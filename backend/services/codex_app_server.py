@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import signal
 import stat
@@ -557,7 +558,7 @@ def _codex_runtime_read_paths(
     *,
     projection_root: str | os.PathLike[str] | None = None,
 ) -> tuple[str, ...]:
-    """Materialize the exact Codex executable outside protected account homes."""
+    """Materialize the allow-listed Codex runtime outside protected homes."""
 
     expanded = os.path.expanduser(str(binary))
     has_separator = any(
@@ -589,14 +590,62 @@ def _codex_runtime_read_paths(
         else Path.home() / ".cache" / "claude-code-manager" / "codex-runtime"
     )
     root = Path(os.path.abspath(os.path.expanduser(os.fspath(requested_root))))
+    executable_suffix = (
+        ".exe" if resolved.name.lower().endswith(".exe") else ""
+    )
+    components: list[tuple[Path, os.stat_result, str]] = [
+        (resolved, source_info, f"codex{executable_suffix}"),
+    ]
+    code_mode_host = resolved.with_name(
+        f"codex-code-mode-host{executable_suffix}"
+    )
+    try:
+        code_mode_host_info = code_mode_host.lstat()
+    except FileNotFoundError:
+        # Older Codex releases execute shell commands in-process and do not
+        # ship the code-mode host. Preserve their single-file projection.
+        pass
+    except OSError:
+        return ()
+    else:
+        if (
+            stat.S_ISLNK(code_mode_host_info.st_mode)
+            or not stat.S_ISREG(code_mode_host_info.st_mode)
+            or code_mode_host_info.st_uid != source_info.st_uid
+            or not os.access(code_mode_host, os.X_OK)
+        ):
+            # A present but untrusted companion must fail closed. Otherwise
+            # the projected Codex binary could execute a substituted sibling.
+            return ()
+        components.append(
+            (
+                code_mode_host,
+                code_mode_host_info,
+                f"codex-code-mode-host{executable_suffix}",
+            )
+        )
+
+    identity_material = "\0".join(
+        "\0".join(
+            (
+                str(source),
+                str(info.st_dev),
+                str(info.st_ino),
+                str(info.st_mode),
+                str(info.st_size),
+                str(info.st_mtime_ns),
+            )
+        )
+        for source, info, _projection_name in components
+    )
     identity = hashlib.sha256(
-        (
-            f"{resolved}\0{source_info.st_dev}\0{source_info.st_ino}\0"
-            f"{source_info.st_size}\0{source_info.st_mtime_ns}"
-        ).encode("utf-8")
+        identity_material.encode("utf-8")
     ).hexdigest()[:32]
     release_dir = root / identity
-    projection = release_dir / "codex"
+    projections = tuple(
+        (source, info, release_dir / projection_name)
+        for source, info, projection_name in components
+    )
     try:
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         release_dir.mkdir(mode=0o700, exist_ok=True)
@@ -611,25 +660,33 @@ def _codex_runtime_read_paths(
             ):
                 return ()
             directory.chmod(0o700)
-        if not projection.exists():
-            temporary = release_dir / f".codex-{uuid.uuid4().hex}"
-            try:
-                os.link(resolved, temporary)
-                os.replace(temporary, projection)
-            finally:
-                temporary.unlink(missing_ok=True)
-        projected_info = projection.lstat()
+        projected_infos: list[os.stat_result] = []
+        for source, _source_info, projection in projections:
+            if not projection.exists():
+                temporary = release_dir / (
+                    f".{projection.name}-{secrets.token_hex(16)}"
+                )
+                try:
+                    os.link(source, temporary)
+                    os.replace(temporary, projection)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            projected_infos.append(projection.lstat())
     except OSError:
         return ()
-    if (
-        stat.S_ISLNK(projected_info.st_mode)
-        or not stat.S_ISREG(projected_info.st_mode)
-        or projected_info.st_uid != effective_uid
-        or not os.access(projection, os.X_OK)
-        or not os.path.samefile(resolved, projection)
-    ):
-        return ()
-    return (str(projection),)
+    for (
+        (source, _source_info, projection),
+        projected_info,
+    ) in zip(projections, projected_infos, strict=True):
+        if (
+            stat.S_ISLNK(projected_info.st_mode)
+            or not stat.S_ISREG(projected_info.st_mode)
+            or projected_info.st_uid != effective_uid
+            or not os.access(projection, os.X_OK)
+            or not os.path.samefile(source, projection)
+        ):
+            return ()
+    return tuple(str(projection) for _, _, projection in projections)
 
 
 def _task_ssh_permission_config(
@@ -1777,10 +1834,10 @@ class CodexAppServer:
         require_actual_tier_proof: bool = False,
     ) -> None:
         # Permission profiles default-deny the host filesystem. Codex 0.147
-        # re-execs the canonical standalone binary for sandboxed shell calls,
-        # which may be outside ``:minimal`` (for example below ~/.codex).
-        # Launch through a hard-linked, credential-free projection so the
-        # process re-execs that admitted path rather than the denied source.
+        # re-execs its standalone binary and may spawn the adjacent code-mode
+        # host for sandboxed shell calls. Launch through a hard-linked,
+        # credential-free, allow-listed runtime projection so every required
+        # executable resolves inside the admitted directory.
         self._runtime_read_paths = _codex_runtime_read_paths(binary)
         self.binary = (
             self._runtime_read_paths[0]

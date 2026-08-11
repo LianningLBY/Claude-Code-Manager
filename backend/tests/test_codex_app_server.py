@@ -536,11 +536,17 @@ def test_task_ssh_profile_collapses_only_redundant_nested_denies(tmp_path):
     assert filesystem_with_read_override[str(selected_credential)] == "read"
 
 
-def test_codex_runtime_read_paths_resolves_only_executable_file(tmp_path):
+def test_codex_runtime_read_paths_projects_allow_listed_release_files(tmp_path):
     release = tmp_path / "releases" / "0.147.0" / "bin" / "codex"
     release.parent.mkdir(parents=True)
     release.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     release.chmod(0o755)
+    code_mode_host = release.with_name("codex-code-mode-host")
+    code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    code_mode_host.chmod(0o755)
+    untrusted_sibling = release.with_name("untrusted-helper")
+    untrusted_sibling.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    untrusted_sibling.chmod(0o755)
     current = tmp_path / "current-codex"
     current.symlink_to(release)
     projection_root = tmp_path / "projection"
@@ -549,11 +555,16 @@ def test_codex_runtime_read_paths_resolves_only_executable_file(tmp_path):
         str(current),
         projection_root=projection_root,
     )
-    assert len(runtime_paths) == 1
-    projection = Path(runtime_paths[0])
+    assert len(runtime_paths) == 2
+    projection, projected_code_mode_host = map(Path, runtime_paths)
     assert projection.parent.parent == projection_root
+    assert projected_code_mode_host.parent == projection.parent
+    assert projection.name == "codex"
+    assert projected_code_mode_host.name == "codex-code-mode-host"
     assert projection != release.resolve()
     assert projection.samefile(release)
+    assert projected_code_mode_host.samefile(code_mode_host)
+    assert not (projection.parent / untrusted_sibling.name).exists()
 
     release.chmod(0o644)
     assert _codex_runtime_read_paths(
@@ -563,6 +574,48 @@ def test_codex_runtime_read_paths_resolves_only_executable_file(tmp_path):
     assert _codex_runtime_read_paths(
         str(tmp_path / "missing"),
         projection_root=projection_root,
+    ) == ()
+
+
+def test_codex_runtime_read_paths_supports_release_without_code_mode_host(
+    tmp_path,
+):
+    release = tmp_path / "releases" / "0.144.6" / "bin" / "codex"
+    release.parent.mkdir(parents=True)
+    release.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    release.chmod(0o755)
+
+    runtime_paths = _codex_runtime_read_paths(
+        str(release),
+        projection_root=tmp_path / "projection",
+    )
+
+    assert len(runtime_paths) == 1
+    assert Path(runtime_paths[0]).samefile(release)
+
+
+@pytest.mark.parametrize("helper_kind", ["symlink", "not-executable"])
+def test_codex_runtime_read_paths_rejects_untrusted_code_mode_host(
+    tmp_path,
+    helper_kind,
+):
+    release = tmp_path / "release" / "bin" / "codex"
+    release.parent.mkdir(parents=True)
+    release.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    release.chmod(0o755)
+    helper = release.with_name("codex-code-mode-host")
+    if helper_kind == "symlink":
+        target = tmp_path / "outside-helper"
+        target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        target.chmod(0o755)
+        helper.symlink_to(target)
+    else:
+        helper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        helper.chmod(0o644)
+
+    assert _codex_runtime_read_paths(
+        str(release),
+        projection_root=tmp_path / "projection",
     ) == ()
 
 
@@ -3830,8 +3883,7 @@ async def test_real_codex_managed_public_network_extended_boundary(
             pytest.fail("CCM_REAL_CODEX_NATIVE_BINARY is not a regular file")
         codex_executable = str(native_source)
     runtime_read_paths = _codex_runtime_read_paths(codex_executable)
-    assert len(runtime_read_paths) == 1
-    runtime_path = runtime_read_paths[0]
+    assert runtime_read_paths
     source_denied_parent = next(
         (
             parent
@@ -3898,7 +3950,7 @@ async def test_real_codex_managed_public_network_extended_boundary(
                         if source_denied_parent is not None
                         else {}
                     ),
-                    runtime_path: "read",
+                    **{path: "read" for path in runtime_read_paths},
                 },
                 "network": network,
             },
@@ -4247,8 +4299,7 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
     )
     codex_executable = shutil.which("codex") or "codex"
     runtime_read_paths = _codex_runtime_read_paths(codex_executable)
-    assert len(runtime_read_paths) == 1
-    runtime_path = runtime_read_paths[0]
+    assert runtime_read_paths
     profile = "ccm_delivery_workspace_v1"
     monkeypatch.setenv("GH_TOKEN", "must-not-enter-delivery-shell")
     monkeypatch.setenv("GITHUB_TOKEN", "must-not-enter-delivery-shell")
@@ -4262,7 +4313,7 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
                     ":root": "deny",
                     ":minimal": "read",
                     str(workspace.resolve()): "write",
-                    runtime_path: "read",
+                    **{path: "read" for path in runtime_read_paths},
                 },
                 "network": {
                     "enabled": False,

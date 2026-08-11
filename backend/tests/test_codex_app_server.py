@@ -29,6 +29,7 @@ from backend.services.codex_app_server import (
     CodexThreadHomeMismatchError,
     CodexThreadIdentityMismatchError,
     CodexThreadNotIdleError,
+    CodexThreadRuntimeRecycleError,
     CodexThreadTerminalStateError,
     CodexTurnProcess,
     _audit_isolated_request_config,
@@ -570,6 +571,7 @@ def test_codex_runtime_read_paths_resolves_only_executable_file(tmp_path):
     "mcp_identity",
     [
         {"server": "ambient"},
+        {"server": "codex"},
         {},
         {"server": "ccm_ssh", "serverName": "ambient"},
     ],
@@ -726,6 +728,8 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network(
     assert config["features"]["plugins"] is False
     assert config["features"]["hooks"] is False
     assert config["features"]["skill_mcp_dependency_install"] is False
+    assert config["features"]["code_mode"] is False
+    assert config["features"]["code_mode_host"] is False
     assert config["orchestrator"]["skills"] == {"enabled": False}
     assert config["skills"] == {
         "include_instructions": False,
@@ -1966,6 +1970,19 @@ async def test_task_isolation_rechecks_inventory_after_thread_binding(
             return original if config_reads < 3 else changed
         if method == "skills/list":
             return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": "thread-task-rebind",
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": "thread-task-rebind"}}
         if method == "thread/resume":
             return _task_isolated_thread_response(
                 "thread-task-rebind",
@@ -2003,6 +2020,10 @@ async def test_task_isolation_rechecks_inventory_after_thread_binding(
 
     on_thread_started.assert_not_awaited()
     assert [call.args[0] for call in server._request.await_args_list] == [
+        "thread/goal/get",
+        "thread/read",
+        "thread/archive",
+        "thread/unarchive",
         "config/read",
         "skills/list",
         "config/read",
@@ -2011,6 +2032,368 @@ async def test_task_isolation_rechecks_inventory_after_thread_binding(
         "config/read",
         "skills/list",
     ]
+
+
+def _task_isolated_resume_kwargs(boundary, *, task_id: int, thread_id: str):
+    return {
+        "prompt": "continue with only the exact CCM MCP servers",
+        "cwd": boundary.cwd,
+        "model": "gpt-5.6-sol",
+        "effort": "high",
+        "resume_session_id": thread_id,
+        "git_env": None,
+        "task_id": task_id,
+        "mcp_specs": (_task_ssh_mcp_spec(task_id),),
+        "disable_project_config": True,
+        "disable_user_mcp": True,
+        "disable_autonomous_features": True,
+        "sandbox_mode": "workspace-write",
+        "task_ssh_protected_paths": ("/Users/operator/.ssh",),
+        "task_git_read_paths": boundary.git_read_paths,
+        "task_git_boundary_fingerprint": boundary.git_fingerprint,
+        "task_private_tmpdir": boundary.scratch,
+        "task_ssh_disable_network": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_isolated_resume_recycles_loaded_runtime_before_exact_resume(
+    isolated_task_boundary,
+):
+    task_id = 9961
+    thread_id = "thread-task-sticky-runtime"
+    boundary = isolated_task_boundary(task_id)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    calls = []
+
+    async def request(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": thread_id}}
+        if method == "thread/resume":
+            return _task_isolated_thread_response(
+                thread_id,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-task-sticky-runtime"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    _process, resumed_thread = await server.start_turn(
+        **_task_isolated_resume_kwargs(
+            boundary,
+            task_id=task_id,
+            thread_id=thread_id,
+        ),
+    )
+
+    assert resumed_thread == thread_id
+    methods = [method for method, _params in calls]
+    assert methods.index("thread/goal/get") < methods.index("thread/read")
+    assert methods.index("thread/read") < methods.index("thread/archive")
+    assert methods.index("thread/archive") < methods.index("thread/unarchive")
+    assert methods.index("thread/unarchive") < methods.index("thread/resume")
+    assert methods.index("thread/resume") < methods.index("turn/start")
+    resume_params = next(
+        params for method, params in calls if method == "thread/resume"
+    )
+    assert resume_params["config"]["features"]["code_mode"] is False
+    assert resume_params["config"]["features"]["code_mode_host"] is False
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_resume_recycles_loaded_runtime(
+    isolated_task_boundary,
+):
+    task_id = 9965
+    thread_id = "thread-delivery-sticky-runtime"
+    boundary = isolated_task_boundary(task_id)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+
+    async def request(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": thread_id}}
+        if method == "thread/resume":
+            return _network_isolated_thread_response(
+                boundary.cwd,
+                thread_id=thread_id,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-delivery-sticky-runtime"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    _process, resumed_thread = await server.start_turn(
+        prompt="continue delivery in the frozen workspace",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=thread_id,
+        git_env=None,
+        task_id=task_id,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        disable_autonomous_features=True,
+        sandbox_mode="workspace-write",
+        network_isolated=True,
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+    )
+
+    assert resumed_thread == thread_id
+    methods = [method for method, _params in calls]
+    assert methods.index("thread/goal/get") < methods.index("thread/read")
+    assert methods.index("thread/read") < methods.index("thread/archive")
+    assert methods.index("thread/archive") < methods.index("thread/unarchive")
+    assert methods.index("thread/unarchive") < methods.index("thread/resume")
+    resume_params = next(
+        params for method, params in calls if method == "thread/resume"
+    )
+    assert resume_params["config"]["features"]["code_mode"] is False
+    assert resume_params["config"]["features"]["code_mode_host"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("goal", "thread_status", "expected_state"),
+    [
+        (None, {"type": "active"}, "active"),
+        ({"status": "paused"}, {"type": "idle"}, "goal:paused"),
+        ({}, {"type": "idle"}, "goal:unknown"),
+    ],
+)
+async def test_task_isolated_resume_refuses_recycle_without_idle_proof(
+    isolated_task_boundary,
+    goal,
+    thread_status,
+    expected_state,
+):
+    task_id = 9962
+    thread_id = "thread-task-active-runtime"
+    boundary = isolated_task_boundary(task_id)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    methods = []
+
+    async def request(method, params, **_kwargs):
+        methods.append(method)
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": goal}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": thread_status,
+                },
+            }
+        if method == "thread/resume":
+            return _task_isolated_thread_response(
+                thread_id,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "must-not-start"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    with pytest.raises(CodexThreadNotIdleError, match=expected_state):
+        await server.start_turn(
+            **_task_isolated_resume_kwargs(
+                boundary,
+                task_id=task_id,
+                thread_id=thread_id,
+            ),
+        )
+
+    assert "thread/archive" not in methods
+    assert "thread/unarchive" not in methods
+    assert "thread/resume" not in methods
+    assert "turn/start" not in methods
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing_method",
+    ["thread/archive", "thread/unarchive"],
+)
+async def test_task_isolated_resume_recycle_failure_is_uncertain_and_fail_closed(
+    isolated_task_boundary,
+    failing_method,
+):
+    task_id = 9963
+    thread_id = "thread-task-recycle-failure"
+    boundary = isolated_task_boundary(task_id)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    methods = []
+
+    async def request(method, params, **_kwargs):
+        methods.append(method)
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == failing_method:
+            raise RuntimeError(f"{method} failed")
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": thread_id}}
+        if method == "thread/resume":
+            return _task_isolated_thread_response(
+                thread_id,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "must-not-start"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    with pytest.raises(
+        CodexThreadRuntimeRecycleError,
+        match="recycle outcome is uncertain",
+    ):
+        await server.start_turn(
+            **_task_isolated_resume_kwargs(
+                boundary,
+                task_id=task_id,
+                thread_id=thread_id,
+            ),
+        )
+
+    assert "thread/resume" not in methods
+    assert "turn/start" not in methods
+
+
+@pytest.mark.asyncio
+async def test_task_isolated_resume_retry_recycles_after_preflight_failure(
+    isolated_task_boundary,
+):
+    task_id = 9964
+    thread_id = "thread-task-retry-runtime"
+    boundary = isolated_task_boundary(task_id)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    methods = []
+    resume_attempts = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal resume_attempts
+        methods.append(method)
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": thread_id}}
+        if method == "thread/resume":
+            resume_attempts += 1
+            permission_profile = params["config"]["default_permissions"]
+            if resume_attempts == 1:
+                permission_profile = "stale-loaded-profile"
+            return _task_isolated_thread_response(
+                thread_id,
+                permission_profile=permission_profile,
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-task-retry-runtime"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    kwargs = _task_isolated_resume_kwargs(
+        boundary,
+        task_id=task_id,
+        thread_id=thread_id,
+    )
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="profile was not proven",
+    ):
+        await server.start_turn(**kwargs)
+
+    _process, resumed_thread = await server.start_turn(**kwargs)
+
+    assert resumed_thread == thread_id
+    assert methods.count("thread/goal/get") == 2
+    assert methods.count("thread/read") == 2
+    assert methods.count("thread/archive") == 2
+    assert methods.count("thread/unarchive") == 2
+    assert methods.count("thread/resume") == 2
+    assert methods.count("turn/start") == 1
 
 
 @pytest.mark.asyncio
@@ -11046,6 +11429,121 @@ async def test_registry_terminal_resume_preserves_exact_home_owner(tmp_path):
             resume_session_id=thread_id,
             task_id=301,
         )
+
+
+@pytest.mark.asyncio
+async def test_registry_preserves_owner_when_task_recycle_effect_is_uncertain(
+    tmp_path,
+    isolated_task_boundary,
+):
+    task_id = 9966
+    thread_id = "thread-task-recycle-owner"
+    boundary = isolated_task_boundary(task_id)
+    home = normalize_codex_home(tmp_path / "recycle-owner")
+    registry = CodexAppServerRegistry("codex")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    methods = []
+
+    async def request(method, params, **_kwargs):
+        methods.append(method)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/archive":
+            return {}
+        if method == "thread/unarchive":
+            raise RuntimeError("unarchive response was lost")
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    registry._servers[home] = server
+
+    with pytest.raises(CodexRequiredMcpError, match="recycle"):
+        await registry.start_turn(
+            codex_home=home,
+            **_task_isolated_resume_kwargs(
+                boundary,
+                task_id=task_id,
+                thread_id=thread_id,
+            ),
+        )
+
+    assert methods == [
+        "thread/goal/get",
+        "thread/read",
+        "thread/archive",
+        "thread/unarchive",
+    ]
+    assert registry._thread_owners[thread_id] == home
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
+
+
+@pytest.mark.asyncio
+async def test_registry_preserves_owner_when_task_recycle_is_cancelled(
+    tmp_path,
+    isolated_task_boundary,
+):
+    task_id = 9967
+    thread_id = "thread-task-recycle-cancelled-owner"
+    boundary = isolated_task_boundary(task_id)
+    home = normalize_codex_home(tmp_path / "cancelled-recycle-owner")
+    registry = CodexAppServerRegistry("codex")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    archive_started = asyncio.Event()
+    release_archive = asyncio.Event()
+    methods = []
+
+    async def request(method, params, **_kwargs):
+        methods.append(method)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "idle"},
+                },
+            }
+        if method == "thread/archive":
+            archive_started.set()
+            await release_archive.wait()
+            return {}
+        if method == "thread/unarchive":
+            return {"thread": {"id": thread_id}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    registry._servers[home] = server
+    launch = asyncio.create_task(registry.start_turn(
+        codex_home=home,
+        **_task_isolated_resume_kwargs(
+            boundary,
+            task_id=task_id,
+            thread_id=thread_id,
+        ),
+    ))
+    await archive_started.wait()
+    launch.cancel()
+    release_archive.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await launch
+
+    assert "thread/unarchive" in methods
+    assert registry._thread_owners[thread_id] == home
+    assert thread_id not in registry._starting_threads
+    assert home not in registry._starting
 
 
 @pytest.mark.asyncio

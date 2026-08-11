@@ -190,6 +190,8 @@ _NETWORK_ISOLATED_DISABLED_FEATURES = frozenset({
     "browser_use_external",
     "browser_use_full_cdp_access",
     "computer_use",
+    "code_mode",
+    "code_mode_host",
     "default_mode_request_user_input",
     "deferred_executor",
     "enable_fanout",
@@ -354,6 +356,30 @@ class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
 
 class _CodexIsolatedSkillsDriftError(CodexRequiredMcpPreTurnError):
     """An isolated empty thread was admitted from a stale skills inventory."""
+
+
+class CodexThreadRuntimeRecycleError(CodexRequiredMcpError):
+    """A thread runtime recycle may have changed native external state."""
+
+    def __init__(self, thread_id: str, detail: str) -> None:
+        super().__init__(
+            f"Codex thread {thread_id} runtime recycle outcome is uncertain: "
+            f"{detail}"
+        )
+        self.thread_id = thread_id
+        self.route_mutation_possible = True
+
+
+class CodexThreadRuntimeRecycleCancelled(asyncio.CancelledError):
+    """Cancellation observed after a runtime recycle mutation was attempted."""
+
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(
+            f"Codex thread {thread_id} runtime recycle was cancelled after "
+            "native state mutation began"
+        )
+        self.thread_id = thread_id
+        self.route_mutation_possible = True
 
 
 class CodexThreadHomeMismatchError(CodexAppServerError):
@@ -4816,6 +4842,75 @@ class CodexAppServer:
                     f"skills={skills_changed}, revision={revision_changed})"
                 )
 
+        task_resume_runtime_recycled = False
+        if resume_session_id and (task_ssh_protected_paths or network_isolated):
+            # ``thread/resume`` applies request-local MCP, feature and skill
+            # overrides only while loading an unloaded rollout. Codex keeps a
+            # loaded thread's MCP clients and code-mode host alive and merely
+            # logs that new overrides were ignored. Prove this exact native
+            # thread is quiescent, then unload/reload it before taking any
+            # ambient inventory snapshot or sending model input.
+            #
+            # The registry already holds the per-thread start reservation
+            # across this method. Goal + thread/read is the stronger native
+            # idle proof: an empty CCM context map alone cannot rule out an
+            # autonomous Goal left by an older process generation.
+            require_stable_task_filesystem_boundary(
+                "before isolated resume runtime recycle"
+            )
+            require_isolated_runtime_generation(
+                "before isolated resume runtime recycle"
+            )
+            require_managed_network_generation(
+                "before isolated resume runtime recycle"
+            )
+            try:
+                await self.require_thread_routing_quiescence(
+                    str(resume_session_id),
+                )
+            except CodexThreadTerminalStateError as exc:
+                # systemError is authoritative evidence that no turn is
+                # running. It is the one terminal state for which the
+                # existing archive/unarchive recovery is safe. Unknown,
+                # notLoaded and all non-idle Goal states remain closed.
+                if exc.state != "systemError":
+                    raise
+            try:
+                await self.recycle_thread_runtime(str(resume_session_id))
+                task_resume_runtime_recycled = True
+            except CodexThreadRuntimeRecycleCancelled:
+                raise
+            except asyncio.CancelledError as exc:
+                raise CodexThreadRuntimeRecycleCancelled(
+                    str(resume_session_id)
+                ) from exc
+            except CodexThreadRuntimeRecycleError:
+                raise
+            except Exception as exc:
+                # Archive is a native mutation boundary. Once recycle is
+                # attempted, an RPC error or lost acknowledgement cannot be
+                # classified as replay-safe merely because turn/start has not
+                # happened yet.
+                raise CodexThreadRuntimeRecycleError(
+                    str(resume_session_id),
+                    str(exc) or type(exc).__name__,
+                ) from exc
+            require_stable_task_filesystem_boundary(
+                "after isolated resume runtime recycle"
+            )
+            require_isolated_runtime_generation(
+                "after isolated resume runtime recycle"
+            )
+            require_managed_network_generation(
+                "after isolated resume runtime recycle"
+            )
+            logger.info(
+                "Recycled idle Codex Task runtime before exact resume "
+                "task=%s thread=%s",
+                task_id,
+                resume_session_id,
+            )
+
         if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:
                 stable_skills = await read_stable_skills_snapshot()
@@ -5193,6 +5288,17 @@ class CodexAppServer:
         status = thread.get("status") if isinstance(thread, dict) else None
         status_type = self._thread_status_type(status)
         if resume_session_id and status_type == "systemError":
+            if task_resume_runtime_recycled:
+                # The Task resume already consumed its single safe pre-turn
+                # recycle. Repeating it would hide a persistent terminal
+                # state instead of proving a fresh isolated runtime.
+                raise CodexThreadTerminalStateError(
+                    thread_id,
+                    status_type,
+                    operation=f"{thread_method} turn admission",
+                    recovery_attempted=True,
+                    detail="fresh isolated resume remained terminal",
+                )
             # systemError is an authoritative no-running-turn state, but Codex
             # will not admit a follow-up until the loaded runtime is refreshed.
             # Recycle this exact thread once; never replay through exec and never
@@ -7963,7 +8069,12 @@ class CodexAppServerRegistry:
         except BaseException as exc:
             if isinstance(
                 exc,
-                (CodexThreadNotIdleError, CodexThreadTerminalStateError),
+                (
+                    CodexThreadNotIdleError,
+                    CodexThreadTerminalStateError,
+                    CodexThreadRuntimeRecycleError,
+                    CodexThreadRuntimeRecycleCancelled,
+                ),
             ):
                 # thread start/resume already resolved this exact native
                 # thread in the selected home. Preserve the route even though

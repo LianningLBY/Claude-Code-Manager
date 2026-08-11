@@ -463,6 +463,75 @@ async def _seed_project_preparation_claim(db_factory, *, suffix: str):
         return task.id, instance.id
 
 
+async def _seed_pending_browser_child_dispatch(db_factory, *, suffix: str):
+    """Seed the ready Browser-child shape that expires the reserved Instance."""
+
+    from backend.models.test_harness import TestHarnessRun
+    from backend.services.test_harness_children import TestHarnessChildService
+
+    run_id = hashlib.sha256(f"dispatch-run-{suffix}".encode()).hexdigest()[:32]
+    job_id = hashlib.sha256(f"dispatch-job-{suffix}".encode()).hexdigest()[:32]
+    async with db_factory() as db:
+        instance = Instance(
+            name=f"dispatch-browser-instance-{suffix}",
+            status="idle",
+        )
+        owner = Task(
+            title=f"dispatch-browser-owner-{suffix}",
+            description="owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+        )
+        db.add_all([instance, owner])
+        await db.flush()
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Review the page"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="a" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="preparing",
+            )
+        )
+        await db.commit()
+        instance_id = instance.id
+        owner_id = owner.id
+
+    service = TestHarnessChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id=job_id,
+        harness_run_id=run_id,
+        child_values={
+            "title": f"dispatch-browser-child-{suffix}",
+            "description": "Review one frozen target",
+            "priority": 0,
+            "max_retries": 0,
+            "mode": "auto",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "default",
+            "effort_level": "high",
+            "enabled_skills": {"browser-review": job_id},
+            "archived": True,
+        },
+    )
+    await service.activate(binding.id)
+    return instance_id, child.id
+
+
 async def _seed_transport_race_scope(db_factory, *, suffix: str):
     """Seed an executing generation with a canonical unlaunched source."""
 
@@ -528,7 +597,10 @@ async def test_claim_plan_run_returns_exact_persisted_generation(db_factory):
         instance_id = instance.id
         run_id = run.id
 
-        claimed = await dispatcher._claim_plan_run(db, instance=instance)
+        claimed = await dispatcher._claim_plan_run(
+            db,
+            instance_id=instance_id,
+        )
 
     assert claimed == (run_id, 1)
     async with db_factory() as db:
@@ -7900,6 +7972,38 @@ async def test_spawn_oserror_requeues_exact_queued_message(
     finally:
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_runtime_recycle_uncertainty_fails_without_queued_replay(
+    db_factory,
+    monkeypatch,
+):
+    """Native archive mutation is never equivalent to a pre-spawn failure."""
+
+    from backend.services.codex_app_server import (
+        CodexThreadRuntimeRecycleError,
+    )
+
+    dispatcher, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory, monkeypatch
+    )
+    failure = CodexThreadRuntimeRecycleError(
+        "thread-recycle-uncertain",
+        "thread/unarchive acknowledgement timed out",
+    )
+    dispatcher.instance_manager.launch = AsyncMock(side_effect=failure)
+
+    with pytest.raises(CodexThreadRuntimeRecycleError):
+        await dispatcher._process_queued_message(task_id, msg)
+
+    dispatcher.instance_manager.launch.assert_awaited_once()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.get(LogEntry, task.turn_source_log_id)
+    assert task.status == "failed"
+    assert source.actual_transport is None
+    assert "runtime recycle outcome is uncertain" in task.error_message
 
 
 @pytest.mark.asyncio
@@ -15845,6 +15949,122 @@ async def test_start_waits_for_inflight_queued_admission_before_snapshot(
                 await asyncio.gather(task, return_exceptions=True)
         if d.is_running:
             await d.stop()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_loop_browser_child_keeps_reserved_instance_identity(
+    db_factory,
+):
+    """Browser dequeue expiry must not detach the reserved Instance identity."""
+
+    instance_id, child_id = await _seed_pending_browser_child_dispatch(
+        db_factory,
+        suffix="detached-instance",
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._running = True
+    dispatcher._prefer_plan_runs = False
+    dispatcher._ensure_min_idle_instances = AsyncMock()
+    dispatcher._dispatch_worker_tasks = AsyncMock()
+    dispatcher._dispatch_worker_plan_runs = AsyncMock()
+    lifecycle_started = asyncio.Event()
+
+    async def record_lifecycle(claimed_instance_id, task, _git_env):
+        assert claimed_instance_id == instance_id
+        assert task.id == child_id
+        lifecycle_started.set()
+        dispatcher._running = False
+        dispatcher.wake()
+
+    dispatcher._run_task_lifecycle = AsyncMock(side_effect=record_lifecycle)
+    loop = asyncio.create_task(dispatcher._dispatch_loop())
+    try:
+        await asyncio.wait_for(lifecycle_started.wait(), timeout=1)
+        await asyncio.wait_for(loop, timeout=1)
+    finally:
+        dispatcher._running = False
+        dispatcher.wake()
+        if not loop.done():
+            loop.cancel()
+            await asyncio.gather(loop, return_exceptions=True)
+
+    dispatcher._run_task_lifecycle.assert_awaited_once()
+    async with db_factory() as db:
+        child = await db.get(Task, child_id)
+        assert child.status == "in_progress"
+        assert child.instance_id == instance_id
+
+
+@pytest.mark.asyncio
+async def test_browser_child_expiry_then_plan_claim_uses_reserved_scalar(
+    db_factory,
+):
+    """A blocked Browser claim may expire ORM state before Plan fallback."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+    from backend.services.task_queue import TaskQueue
+    from sqlalchemy import inspect as sqlalchemy_inspect
+
+    instance_id, child_id = await _seed_pending_browser_child_dispatch(
+        db_factory,
+        suffix="expired-plan-fallback",
+    )
+    async with db_factory() as db:
+        binding = await db.scalar(
+            select(TestHarnessChildBinding).where(
+                TestHarnessChildBinding.child_task_id == child_id
+            )
+        )
+        assert binding is not None
+        owner = await db.get(Task, binding.owner_task_id)
+        assert owner is not None
+        owner.retry_count += 1
+        plan = Plan(
+            title="Plan after expired Browser claim",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="initial",
+            status="queued",
+            generation=0,
+            pipeline_config={},
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = await db.get(Instance, instance_id)
+        assert instance is not None
+        reserved_instance_id = instance.id
+        task = await TaskQueue(db).dequeue(
+            instance_id=reserved_instance_id,
+        )
+        assert task is None
+        assert "id" in sqlalchemy_inspect(instance).expired_attributes
+
+        claimed = await dispatcher._claim_plan_run(
+            db,
+            instance_id=reserved_instance_id,
+        )
+
+    assert claimed == (run_id, 1)
+    async with db_factory() as db:
+        child = await db.get(Task, child_id)
+        claimed_run = await db.get(PlanAgentRun, run_id)
+        claimed_instance = await db.get(Instance, instance_id)
+        assert child.status == "pending"
+        assert claimed_run.status == "running"
+        assert claimed_run.instance_id == instance_id
+        assert claimed_instance.status == "running"
+        assert claimed_instance.current_plan_run_id == run_id
 
 
 @pytest.mark.asyncio

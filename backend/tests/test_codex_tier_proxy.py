@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 import json
 import os
 from pathlib import Path
@@ -83,7 +84,6 @@ async def test_fast_proxy_requires_request_and_actual_priority():
         return httpx.Response(
             200,
             headers={
-                "content-type": "text/event-stream",
                 "connection": "keep-alive",
             },
             content=_sse(tier="priority"),
@@ -116,7 +116,9 @@ async def test_fast_proxy_requires_request_and_actual_priority():
         assert seen["body"]["service_tier"] == "priority"
         assert seen["request"].headers["authorization"] == "Bearer do-not-log"
         assert "x-hop" not in seen["request"].headers
+        assert seen["request"].headers["accept"] == "text/event-stream"
         assert seen["request"].headers["accept-encoding"] == "identity"
+        assert response.headers["content-type"] == "text/event-stream"
         assert response.headers["connection"] == "close"
     finally:
         await proxy.close()
@@ -201,12 +203,14 @@ async def test_standard_proxy_does_not_depend_on_responses_sse_prelude():
 
 
 @pytest.mark.asyncio
-async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter():
+@pytest.mark.parametrize("reported_tier", ["default", "auto", None])
+async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter(
+    reported_tier: str | None,
+):
     async def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            headers={"content-type": "text/event-stream"},
-            content=_sse(tier="default"),
+            content=_sse(tier=reported_tier),
         )
 
     proxy = await _running_proxy(handler)
@@ -220,7 +224,81 @@ async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter():
             )
         assert response.status_code == 502
         assert b"response.created" not in response.content
-        with pytest.raises(CodexTierProofError, match="actual service tier"):
+        with pytest.raises(
+            CodexTierProofError,
+            match="actual service tier",
+        ) as exc_info:
+            await proxy.wait_for_actual_tier(
+                "thread-1",
+                "turn-1",
+                "priority",
+                timeout=0.2,
+            )
+        message = str(exc_info.value)
+        assert "requested=priority" in message
+        assert f"upstream_actual={reported_tier!r}" in message
+        assert "Fast was not honored" in message
+    finally:
+        await proxy.close()
+
+
+@pytest.mark.asyncio
+async def test_fast_proxy_rejects_non_sse_success_without_releasing_body():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=b'{"secret_upstream_error":"not an SSE stream"}',
+        )
+
+    proxy = await _running_proxy(handler)
+    proxy.set_thread_tier("thread-1", "priority")
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.post(
+                f"{proxy.local_base_url}/responses",
+                headers={"x-client-request-id": "thread-1"},
+                json=_request_body(),
+            )
+        assert response.status_code == 502
+        assert b"secret_upstream_error" not in response.content
+        with pytest.raises(
+            CodexTierProofError,
+            match="ended before response.created",
+        ):
+            await proxy.wait_for_actual_tier(
+                "thread-1",
+                "turn-1",
+                "priority",
+                timeout=0.2,
+            )
+    finally:
+        await proxy.close()
+
+
+@pytest.mark.asyncio
+async def test_fast_proxy_rejects_compressed_sse_before_releasing_body():
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            content=gzip.compress(_sse(tier="priority")),
+        )
+
+    proxy = await _running_proxy(handler)
+    proxy.set_thread_tier("thread-1", "priority")
+    try:
+        async with httpx.AsyncClient(trust_env=False) as client:
+            response = await client.post(
+                f"{proxy.local_base_url}/responses",
+                headers={"x-client-request-id": "thread-1"},
+                json=_request_body(),
+            )
+        assert response.status_code == 502
+        assert b"response.created" not in response.content
+        with pytest.raises(
+            CodexTierProofError,
+            match="Compressed Responses stream cannot be audited",
+        ):
             await proxy.wait_for_actual_tier(
                 "thread-1",
                 "turn-1",

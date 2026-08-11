@@ -402,7 +402,11 @@ def _connection_tokens(headers: dict[str, str]) -> set[str]:
     }
 
 
-def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
+def _filter_request_headers(
+    headers: dict[str, str],
+    *,
+    expect_sse: bool = False,
+) -> dict[str, str]:
     blocked = _HOP_BY_HOP | _connection_tokens(headers) | {
         "host",
         "content-length",
@@ -419,6 +423,8 @@ def _filter_request_headers(headers: dict[str, str]) -> dict[str, str]:
     # response is still required, but this prevents normal upstreams from
     # selecting one.
     filtered["accept-encoding"] = "identity"
+    if expect_sse:
+        filtered["accept"] = "text/event-stream"
     return filtered
 
 
@@ -434,6 +440,26 @@ def _filter_response_headers(headers: httpx.Headers) -> list[tuple[str, str]]:
         if name.lower() not in blocked
         and name.lower() not in _SENSITIVE_HEADERS
     ]
+
+
+def _verified_sse_response_headers(
+    headers: httpx.Headers,
+) -> list[tuple[str, str]]:
+    """Normalize a byte-verified Responses stream for the Codex client.
+
+    The ChatGPT Codex backend can omit the SSE MIME header even though the
+    response body is a valid Responses event stream.  The proxy proves the
+    framing and service tier from the buffered body before calling this
+    helper, so the downstream header can safely be canonicalized here.
+    """
+
+    filtered = [
+        (name, value)
+        for name, value in _filter_response_headers(headers)
+        if name.lower() != "content-type"
+    ]
+    filtered.append(("Content-Type", "text/event-stream"))
+    return filtered
 
 
 def _split_sse_events(buffer: bytearray) -> tuple[list[bytes], bytearray]:
@@ -1258,7 +1284,10 @@ class CodexActualTierProxy:
             request = client.build_request(
                 method,
                 upstream_url,
-                headers=_filter_request_headers(headers),
+                headers=_filter_request_headers(
+                    headers,
+                    expect_sse=identity is not None,
+                ),
                 content=body,
             )
             upstream = await client.send(request, stream=True)
@@ -1416,11 +1445,6 @@ class CodexActualTierProxy:
             raise CodexTierProofError(
                 "Compressed Responses stream cannot be audited"
             )
-        content_type = upstream.headers.get("content-type", "").lower()
-        if "text/event-stream" not in content_type:
-            raise CodexTierProofError(
-                "Upstream did not return a Responses SSE stream"
-            )
 
         iterator = _iter_response_raw(upstream)
         untouched = bytearray()
@@ -1470,8 +1494,9 @@ class CodexActualTierProxy:
                 ):
                     raise CodexTierProofError(
                         "Upstream actual service tier mismatch: "
-                        "expected priority, "
-                        f"got {reported_tier!r}"
+                        "requested=priority, "
+                        f"upstream_actual={reported_tier!r}; "
+                        "Fast was not honored"
                     )
                 actual = (
                     reported_tier
@@ -1517,7 +1542,7 @@ class CodexActualTierProxy:
         await self._send_stream_headers(
             writer,
             upstream.status_code,
-            list(_filter_response_headers(upstream.headers)),
+            _verified_sse_response_headers(upstream.headers),
         )
         writer.write(untouched)
         await writer.drain()

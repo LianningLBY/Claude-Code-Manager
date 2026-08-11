@@ -4864,37 +4864,52 @@ class CodexAppServer:
             require_managed_network_generation(
                 "before isolated resume runtime recycle"
             )
+            runtime_needs_recycle = True
             try:
                 await self.require_thread_routing_quiescence(
                     str(resume_session_id),
                 )
             except CodexThreadTerminalStateError as exc:
+                if exc.state == "notLoaded":
+                    # A fresh app-server has no live MCP client, code-mode
+                    # host, or autonomous turn for an unloaded rollout. The
+                    # upcoming exact thread/resume will load it with this
+                    # request's newly audited isolation config, so mutating
+                    # archive state here is both unnecessary and less safe.
+                    runtime_needs_recycle = False
+                    logger.info(
+                        "Codex isolated resume runtime is already unloaded "
+                        "task=%s thread=%s",
+                        task_id,
+                        resume_session_id,
+                    )
                 # systemError is authoritative evidence that no turn is
-                # running. It is the one terminal state for which the
-                # existing archive/unarchive recovery is safe. Unknown,
-                # notLoaded and all non-idle Goal states remain closed.
-                if exc.state != "systemError":
+                # running. It is the one loaded terminal state for which the
+                # existing archive/unarchive recovery is safe. Unknown and
+                # all non-idle Goal states remain closed.
+                elif exc.state != "systemError":
                     raise
-            try:
-                await self.recycle_thread_runtime(str(resume_session_id))
-                task_resume_runtime_recycled = True
-            except CodexThreadRuntimeRecycleCancelled:
-                raise
-            except asyncio.CancelledError as exc:
-                raise CodexThreadRuntimeRecycleCancelled(
-                    str(resume_session_id)
-                ) from exc
-            except CodexThreadRuntimeRecycleError:
-                raise
-            except Exception as exc:
-                # Archive is a native mutation boundary. Once recycle is
-                # attempted, an RPC error or lost acknowledgement cannot be
-                # classified as replay-safe merely because turn/start has not
-                # happened yet.
-                raise CodexThreadRuntimeRecycleError(
-                    str(resume_session_id),
-                    str(exc) or type(exc).__name__,
-                ) from exc
+            if runtime_needs_recycle:
+                try:
+                    await self.recycle_thread_runtime(str(resume_session_id))
+                    task_resume_runtime_recycled = True
+                except CodexThreadRuntimeRecycleCancelled:
+                    raise
+                except asyncio.CancelledError as exc:
+                    raise CodexThreadRuntimeRecycleCancelled(
+                        str(resume_session_id)
+                    ) from exc
+                except CodexThreadRuntimeRecycleError:
+                    raise
+                except Exception as exc:
+                    # Archive is a native mutation boundary. Once recycle is
+                    # attempted, an RPC error or lost acknowledgement cannot
+                    # be classified as replay-safe merely because turn/start
+                    # has not happened yet.
+                    raise CodexThreadRuntimeRecycleError(
+                        str(resume_session_id),
+                        str(exc) or type(exc).__name__,
+                    ) from exc
             require_stable_task_filesystem_boundary(
                 "after isolated resume runtime recycle"
             )
@@ -4904,12 +4919,13 @@ class CodexAppServer:
             require_managed_network_generation(
                 "after isolated resume runtime recycle"
             )
-            logger.info(
-                "Recycled idle Codex Task runtime before exact resume "
-                "task=%s thread=%s",
-                task_id,
-                resume_session_id,
-            )
+            if task_resume_runtime_recycled:
+                logger.info(
+                    "Recycled idle Codex Task runtime before exact resume "
+                    "task=%s thread=%s",
+                    task_id,
+                    resume_session_id,
+                )
 
         if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:

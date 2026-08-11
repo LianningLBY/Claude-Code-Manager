@@ -440,7 +440,7 @@ Codex 版本兼容基线（2026-07-24）：
 | 测试 | 验证内容 |
 |------|---------|
 | `test_start_turn_injects_mcp_config_into_new_thread` | `thread/start` 收到 task-scoped `config.mcp_servers.ccm_skills` |
-| `test_task_isolated_resume_recycles_loaded_runtime_before_exact_resume` / `test_network_isolated_delivery_resume_recycles_loaded_runtime` | 旧 loaded Task 与 Delivery thread 每次 resume 都先以 Goal + `thread/read=idle` 证明静止并 settle archive→unarchive，再以关闭 code-mode host 的精确隔离配置恢复 |
+| `test_task_isolated_resume_recycles_loaded_runtime_before_exact_resume` / `test_network_isolated_delivery_resume_recycles_loaded_runtime` / `test_task_isolated_resume_loads_not_loaded_runtime_without_recycle` | 旧 loaded Task 与 Delivery thread 每次 resume 都先以 Goal + `thread/read=idle` 证明静止并 settle archive→unarchive；新 app-server 中已 `notLoaded` 的 rollout 不做多余 native mutation，直接以关闭 code-mode host 的精确隔离配置加载 |
 | `test_task_isolated_resume_refuses_recycle_without_idle_proof` / `test_task_isolated_resume_recycle_failure_is_uncertain_and_fail_closed` / `test_registry_preserves_owner_when_task_recycle_effect_is_uncertain` | active/未知 runtime 在 mutation 前拒绝；archive 发出后的失败属于不确定结果，保留 exact-home owner、禁止 `thread/resume`/`turn/start` 与 queued replay |
 | `test_task_isolated_resume_retry_recycles_after_preflight_failure` / `test_registry_preserves_owner_when_task_recycle_is_cancelled` | replay-safe 的 response audit 失败可在下一次 admission 重新加载；recycle mutation 期间取消则保留 owner 并 fail closed |
 | `test_task_isolation_interrupts_unbound_mcp_tool_call` / `test_task_ssh_profile_denies_host_keys_and_direct_network` | Task profile 关闭 `code_mode`/`code_mode_host`；调用级 MCP server identity 只允许显式 CCM server，`codex` broker、缺失或歧义身份继续 fail closed |

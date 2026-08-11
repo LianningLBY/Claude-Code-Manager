@@ -2124,6 +2124,65 @@ async def test_task_isolated_resume_recycles_loaded_runtime_before_exact_resume(
 
 
 @pytest.mark.asyncio
+async def test_task_isolated_resume_loads_not_loaded_runtime_without_recycle(
+    isolated_task_boundary,
+):
+    task_id = 9966
+    thread_id = "thread-task-unloaded-runtime"
+    boundary = isolated_task_boundary(task_id)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    calls = []
+
+    async def request(method, params, **_kwargs):
+        calls.append((method, params))
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/goal/get":
+            return {"goal": None}
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": "notLoaded"},
+                },
+            }
+        if method == "thread/resume":
+            return _task_isolated_thread_response(
+                thread_id,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-task-unloaded-runtime"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    _process, resumed_thread = await server.start_turn(
+        **_task_isolated_resume_kwargs(
+            boundary,
+            task_id=task_id,
+            thread_id=thread_id,
+        ),
+    )
+
+    assert resumed_thread == thread_id
+    methods = [method for method, _params in calls]
+    assert methods.index("thread/read") < methods.index("thread/resume")
+    assert "thread/archive" not in methods
+    assert "thread/unarchive" not in methods
+    assert methods.index("thread/resume") < methods.index("turn/start")
+    resume_params = next(
+        params for method, params in calls if method == "thread/resume"
+    )
+    assert resume_params["config"]["features"]["code_mode"] is False
+    assert resume_params["config"]["features"]["code_mode_host"] is False
+
+
+@pytest.mark.asyncio
 async def test_network_isolated_delivery_resume_recycles_loaded_runtime(
     isolated_task_boundary,
 ):

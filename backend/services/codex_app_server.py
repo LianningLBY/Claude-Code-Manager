@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import stat
 import time
@@ -521,6 +522,86 @@ def _nearest_concrete_parent_permission(
     return nearest_permission
 
 
+def _codex_runtime_read_paths(
+    binary: str,
+    *,
+    projection_root: str | os.PathLike[str] | None = None,
+) -> tuple[str, ...]:
+    """Materialize the exact Codex executable outside protected account homes."""
+
+    expanded = os.path.expanduser(str(binary))
+    has_separator = any(
+        separator and separator in expanded
+        for separator in (os.sep, os.altsep)
+    )
+    candidate = expanded if has_separator else shutil.which(expanded)
+    if not candidate:
+        return ()
+    try:
+        resolved = Path(candidate).resolve(strict=True)
+        source_info = resolved.stat()
+    except (OSError, RuntimeError):
+        return ()
+    if (
+        not stat.S_ISREG(source_info.st_mode)
+        or not os.access(resolved, os.X_OK)
+    ):
+        return ()
+    effective_uid = (
+        os.geteuid()
+        if hasattr(os, "geteuid")
+        else source_info.st_uid
+    )
+
+    requested_root = (
+        Path(projection_root)
+        if projection_root is not None
+        else Path.home() / ".cache" / "claude-code-manager" / "codex-runtime"
+    )
+    root = Path(os.path.abspath(os.path.expanduser(os.fspath(requested_root))))
+    identity = hashlib.sha256(
+        (
+            f"{resolved}\0{source_info.st_dev}\0{source_info.st_ino}\0"
+            f"{source_info.st_size}\0{source_info.st_mtime_ns}"
+        ).encode("utf-8")
+    ).hexdigest()[:32]
+    release_dir = root / identity
+    projection = release_dir / "codex"
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        release_dir.mkdir(mode=0o700, exist_ok=True)
+        if root.resolve(strict=True) != root:
+            return ()
+        for directory in (root, release_dir):
+            directory_info = directory.lstat()
+            if (
+                stat.S_ISLNK(directory_info.st_mode)
+                or not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != effective_uid
+            ):
+                return ()
+            directory.chmod(0o700)
+        if not projection.exists():
+            temporary = release_dir / f".codex-{uuid.uuid4().hex}"
+            try:
+                os.link(resolved, temporary)
+                os.replace(temporary, projection)
+            finally:
+                temporary.unlink(missing_ok=True)
+        projected_info = projection.lstat()
+    except OSError:
+        return ()
+    if (
+        stat.S_ISLNK(projected_info.st_mode)
+        or not stat.S_ISREG(projected_info.st_mode)
+        or projected_info.st_uid != effective_uid
+        or not os.access(projection, os.X_OK)
+        or not os.path.samefile(resolved, projection)
+    ):
+        return ()
+    return (str(projection),)
+
+
 def _task_ssh_permission_config(
     *,
     cwd: str,
@@ -531,6 +612,7 @@ def _task_ssh_permission_config(
     disable_network: bool,
     managed_network_proxy: bool,
     sandbox_mode: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build a request-local Codex profile that hides host credentials."""
 
@@ -583,6 +665,18 @@ def _task_ssh_permission_config(
         # Codex permission profiles use longest-path matching. Keeping the
         # denied parent alongside this exact file read entry prevents ambient
         # siblings or later-created credentials from becoming visible.
+        filesystem[path] = "read"
+    for value in runtime_read_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if (
+            path == "/"
+            or not os.path.isfile(path)
+            or not os.access(path, os.X_OK)
+        ):
+            raise ValueError("Codex runtime projection is not an executable file")
+        # Codex 0.147 re-execs its canonical standalone binary for shell
+        # commands. The binary commonly lives below a protected CODEX_HOME,
+        # so reopen only this exact file after installing the parent deny.
         filesystem[path] = "read"
     for value in git_read_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))
@@ -637,6 +731,7 @@ def _audit_task_isolation_permission_config(
     disable_network: bool,
     managed_network_proxy: bool,
     sandbox_mode: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> None:
     """Reject any widening of the request-local Task filesystem profile."""
 
@@ -649,6 +744,7 @@ def _audit_task_isolation_permission_config(
         disable_network=disable_network,
         managed_network_proxy=managed_network_proxy,
         sandbox_mode=sandbox_mode,
+        runtime_read_paths=runtime_read_paths,
     )
     if profile != expected:
         raise ValueError("Task isolation permission profile changed before admission")
@@ -675,6 +771,7 @@ def _network_isolated_permission_config(
     cwd: str,
     git_read_paths: Sequence[str],
     private_tmpdir: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     workspace = os.path.abspath(cwd)
     scratch = os.path.abspath(private_tmpdir)
@@ -688,6 +785,15 @@ def _network_isolated_permission_config(
         path = os.path.abspath(os.path.expanduser(str(value)))
         if path == "/":
             raise ValueError("Delivery linked Git read path cannot be root")
+        filesystem[path] = "read"
+    for value in runtime_read_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if (
+            path == "/"
+            or not os.path.isfile(path)
+            or not os.access(path, os.X_OK)
+        ):
+            raise ValueError("Codex runtime projection is not an executable file")
         filesystem[path] = "read"
     if scratch in {"/", workspace}:
         raise ValueError("Delivery scratch path must be an external leaf")
@@ -707,11 +813,13 @@ def _audit_network_isolated_permission_config(
     cwd: str,
     git_read_paths: Sequence[str],
     private_tmpdir: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> None:
     expected = _network_isolated_permission_config(
         cwd=cwd,
         git_read_paths=git_read_paths,
         private_tmpdir=private_tmpdir,
+        runtime_read_paths=runtime_read_paths,
     )
     if profile != expected:
         raise ValueError("Delivery filesystem profile changed before admission")
@@ -1638,7 +1746,17 @@ class CodexAppServer:
         actual_tier_proxy_route: CodexTierProxyRoute | None = None,
         require_actual_tier_proof: bool = False,
     ) -> None:
-        self.binary = binary
+        # Permission profiles default-deny the host filesystem. Codex 0.147
+        # re-execs the canonical standalone binary for sandboxed shell calls,
+        # which may be outside ``:minimal`` (for example below ~/.codex).
+        # Launch through a hard-linked, credential-free projection so the
+        # process re-execs that admitted path rather than the denied source.
+        self._runtime_read_paths = _codex_runtime_read_paths(binary)
+        self.binary = (
+            self._runtime_read_paths[0]
+            if self._runtime_read_paths
+            else binary
+        )
         self.request_timeout = request_timeout
         self.codex_home = normalize_codex_home(codex_home)
         self._env_remove = {
@@ -3998,12 +4116,14 @@ class CodexAppServer:
                 cwd=cwd,
                 git_read_paths=task_git_read_paths,
                 private_tmpdir=str(task_private_tmpdir.path),
+                runtime_read_paths=self._runtime_read_paths,
             )
             _audit_network_isolated_permission_config(
                 network_permission_config,
                 cwd=cwd,
                 git_read_paths=task_git_read_paths,
                 private_tmpdir=str(task_private_tmpdir.path),
+                runtime_read_paths=self._runtime_read_paths,
             )
         tool_free_permission_profile = (
             f"{_TOOL_FREE_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
@@ -4083,6 +4203,7 @@ class CodexAppServer:
                         disable_network=task_ssh_disable_network,
                         managed_network_proxy=task_managed_network_proxy,
                         sandbox_mode=sandbox_mode,
+                        runtime_read_paths=self._runtime_read_paths,
                     )
                 else:
                     _audit_network_isolated_permission_config(
@@ -4090,6 +4211,7 @@ class CodexAppServer:
                         cwd=cwd,
                         git_read_paths=task_git_read_paths,
                         private_tmpdir=str(task_private_tmpdir.path),
+                        runtime_read_paths=self._runtime_read_paths,
                     )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
@@ -4327,6 +4449,7 @@ class CodexAppServer:
                 disable_network=task_ssh_disable_network,
                 managed_network_proxy=task_managed_network_proxy,
                 sandbox_mode=sandbox_mode,
+                runtime_read_paths=self._runtime_read_paths,
             )
             _audit_task_isolation_permission_config(
                 task_permission_config,
@@ -4338,6 +4461,7 @@ class CodexAppServer:
                 disable_network=task_ssh_disable_network,
                 managed_network_proxy=task_managed_network_proxy,
                 sandbox_mode=sandbox_mode,
+                runtime_read_paths=self._runtime_read_paths,
             )
             _deep_merge_config(
                 thread_config,
@@ -4803,6 +4927,7 @@ class CodexAppServer:
                     cwd=cwd,
                     git_read_paths=task_git_read_paths,
                     private_tmpdir=str(task_private_tmpdir.path),
+                    runtime_read_paths=self._runtime_read_paths,
                 )
             )
             isolated_disabled_features = _NETWORK_ISOLATED_DISABLED_FEATURES
@@ -4817,6 +4942,7 @@ class CodexAppServer:
                 disable_network=task_ssh_disable_network,
                 managed_network_proxy=task_managed_network_proxy,
                 sandbox_mode=sandbox_mode,
+                runtime_read_paths=self._runtime_read_paths,
             )
             isolated_disabled_features = _NETWORK_ISOLATED_DISABLED_FEATURES
         if isolated_permission_profile_id is not None:

@@ -32,6 +32,7 @@ from backend.services.codex_app_server import (
     CodexThreadTerminalStateError,
     CodexTurnProcess,
     _audit_isolated_request_config,
+    _codex_runtime_read_paths,
     _format_process_exit,
     _harden_ambient_shell_environment_policy,
     _network_isolated_permission_config,
@@ -484,6 +485,10 @@ def test_task_ssh_profile_collapses_only_redundant_nested_denies(tmp_path):
     api_accounts = ccm_home / "api-accounts"
     workspace_credential = workspace / ".git" / "credentials"
     workspace_secret = workspace / "secrets" / "token"
+    codex_runtime = ccm_home / "packages" / "standalone" / "bin" / "codex"
+    codex_runtime.parent.mkdir(parents=True)
+    codex_runtime.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    codex_runtime.chmod(0o755)
 
     profile = _task_ssh_permission_config(
         cwd=str(workspace),
@@ -499,12 +504,14 @@ def test_task_ssh_profile_collapses_only_redundant_nested_denies(tmp_path):
         disable_network=True,
         managed_network_proxy=False,
         sandbox_mode="workspace-write",
+        runtime_read_paths=(str(codex_runtime),),
     )
     filesystem = profile["filesystem"]
 
     assert filesystem[str(workspace)] == "write"
     assert filesystem[str(workspace / ".git")] == "deny"
     assert filesystem[str(ccm_home)] == "deny"
+    assert filesystem[str(codex_runtime)] == "read"
     assert str(api_accounts) not in filesystem
     assert str(workspace_credential) not in filesystem
     # The writable workspace is the nearest boundary, so this deny is not
@@ -526,6 +533,36 @@ def test_task_ssh_profile_collapses_only_redundant_nested_denies(tmp_path):
     assert filesystem_with_read_override[str(ccm_home)] == "deny"
     assert str(api_accounts) not in filesystem_with_read_override
     assert filesystem_with_read_override[str(selected_credential)] == "read"
+
+
+def test_codex_runtime_read_paths_resolves_only_executable_file(tmp_path):
+    release = tmp_path / "releases" / "0.147.0" / "bin" / "codex"
+    release.parent.mkdir(parents=True)
+    release.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    release.chmod(0o755)
+    current = tmp_path / "current-codex"
+    current.symlink_to(release)
+    projection_root = tmp_path / "projection"
+
+    runtime_paths = _codex_runtime_read_paths(
+        str(current),
+        projection_root=projection_root,
+    )
+    assert len(runtime_paths) == 1
+    projection = Path(runtime_paths[0])
+    assert projection.parent.parent == projection_root
+    assert projection != release.resolve()
+    assert projection.samefile(release)
+
+    release.chmod(0o644)
+    assert _codex_runtime_read_paths(
+        str(current),
+        projection_root=projection_root,
+    ) == ()
+    assert _codex_runtime_read_paths(
+        str(tmp_path / "missing"),
+        projection_root=projection_root,
+    ) == ()
 
 
 @pytest.mark.asyncio
@@ -3233,23 +3270,23 @@ async def test_real_codex_managed_public_network_extended_boundary(
     workspace.mkdir()
     scratch.mkdir()
     codex_executable = shutil.which("codex") or "codex"
-    probe_binary: Path | None = None
     native_override = os.environ.get("CCM_REAL_CODEX_NATIVE_BINARY")
     if native_override:
         native_source = Path(native_override).resolve(strict=True)
         if not native_source.is_file():
             pytest.fail("CCM_REAL_CODEX_NATIVE_BINARY is not a regular file")
-        # An npm-installed Codex native binary normally lives below $HOME.
-        # The profile deliberately hides that tree, so expose the exact same
-        # inode through the admitted workspace (or copy it across filesystems)
-        # before asking Codex to re-exec itself inside bubblewrap.
-        probe_binary = workspace / ".ccm-real-codex"
-        try:
-            os.link(native_source, probe_binary)
-        except OSError:
-            shutil.copy2(native_source, probe_binary)
-        probe_binary.chmod(0o755)
-        codex_executable = str(probe_binary)
+        codex_executable = str(native_source)
+    runtime_read_paths = _codex_runtime_read_paths(codex_executable)
+    assert len(runtime_read_paths) == 1
+    runtime_path = runtime_read_paths[0]
+    source_denied_parent = next(
+        (
+            parent
+            for parent in Path(codex_executable).resolve().parents
+            if parent.name == ".codex"
+        ),
+        None,
+    )
     host_secret.write_text("host-secret", encoding="utf-8")
     slash_tmp_secret.write_text("slash-tmp-secret", encoding="utf-8")
     profile = "ccm_task_managed_network_v1_real_probe"
@@ -3303,6 +3340,12 @@ async def test_real_codex_managed_public_network_extended_boundary(
                     ":minimal": "read",
                     str(workspace.resolve()): "write",
                     str(scratch.resolve()): "write",
+                    **(
+                        {str(source_denied_parent): "deny"}
+                        if source_denied_parent is not None
+                        else {}
+                    ),
+                    runtime_path: "read",
                 },
                 "network": network,
             },
@@ -3356,6 +3399,12 @@ async def test_real_codex_managed_public_network_extended_boundary(
             '":minimal" = "read"',
             f'{json.dumps(str(workspace.resolve()))} = "write"',
             f'{json.dumps(str(scratch.resolve()))} = "write"',
+            *(
+                [f'{json.dumps(str(source_denied_parent))} = "deny"']
+                if source_denied_parent is not None
+                else []
+            ),
+            f'{json.dumps(runtime_path)} = "read"',
             "",
             f"[permissions.{profile}.network]",
             "enabled = true",
@@ -3407,12 +3456,13 @@ async def test_real_codex_managed_public_network_extended_boundary(
         codex_executable,
         codex_home=codex_home,
     )
+    assert server.binary == runtime_path
 
     async def execute(command: list[str]) -> dict:
         completed = await asyncio.to_thread(
             subprocess.run,
             [
-                codex_executable,
+                server.binary,
                 "--enable",
                 "network_proxy",
                 "sandbox",
@@ -3617,8 +3667,6 @@ async def test_real_codex_managed_public_network_extended_boundary(
         abstract_listener.close()
         unix_listener.close()
         slash_tmp_secret.unlink(missing_ok=True)
-        if probe_binary is not None:
-            probe_binary.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
@@ -3644,6 +3692,10 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
         f"gitdir: {tmp_path / 'git-metadata'}\n",
         encoding="utf-8",
     )
+    codex_executable = shutil.which("codex") or "codex"
+    runtime_read_paths = _codex_runtime_read_paths(codex_executable)
+    assert len(runtime_read_paths) == 1
+    runtime_path = runtime_read_paths[0]
     profile = "ccm_delivery_workspace_v1"
     monkeypatch.setenv("GH_TOKEN", "must-not-enter-delivery-shell")
     monkeypatch.setenv("GITHUB_TOKEN", "must-not-enter-delivery-shell")
@@ -3657,6 +3709,7 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
                     ":root": "deny",
                     ":minimal": "read",
                     str(workspace.resolve()): "write",
+                    runtime_path: "read",
                 },
                 "network": {
                     "enabled": False,
@@ -3682,6 +3735,7 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
             '":root" = "deny"',
             '":minimal" = "read"',
             f'{json.dumps(str(workspace.resolve()))} = "write"',
+            f'{json.dumps(runtime_path)} = "read"',
             "",
             f"[permissions.{profile}.network]",
             "enabled = false",
@@ -3696,7 +3750,7 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
         encoding="utf-8",
     )
     server = CodexAppServer(
-        shutil.which("codex") or "codex",
+        codex_executable,
         codex_home=codex_home,
     )
     try:
@@ -3844,10 +3898,12 @@ async def test_real_codex_linked_git_projection_allows_read_commands_not_commit(
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
     profile_id = "ccm_linked_git_probe"
+    codex_executable = shutil.which("codex") or "codex"
     profile = _network_isolated_permission_config(
         cwd=str(workspace.resolve()),
         git_read_paths=boundary.read_paths,
         private_tmpdir=str(scratch.path),
+        runtime_read_paths=_codex_runtime_read_paths(codex_executable),
     )
     config_lines = [
         f'default_permissions = "{profile_id}"',
@@ -3883,7 +3939,7 @@ async def test_real_codex_linked_git_projection_allows_read_commands_not_commit(
         encoding="utf-8",
     )
     server = CodexAppServer(
-        shutil.which("codex") or "codex",
+        codex_executable,
         codex_home=codex_home,
     )
 

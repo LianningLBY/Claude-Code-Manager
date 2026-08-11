@@ -2684,7 +2684,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     {providerLabel}
                   </span>
                   <FastModeBadge task={task} />
-                  {!deliveryReadOnly && <TaskSSHAccessBadge task={task} />}
                 </>
               )}
               {backgroundActive && (
@@ -2722,6 +2721,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               )}
             </div>
           </div>
+          {!deliveryReadOnly && task.mode !== 'plan' && (
+            <TaskSSHAccessBadge task={task} />
+          )}
           <div
             data-testid="chat-header-actions"
             className="flex shrink-0 items-center gap-0.5 sm:gap-1"

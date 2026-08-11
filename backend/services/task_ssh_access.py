@@ -702,13 +702,28 @@ async def replace_task_ssh_grants(
             "Task Project changed while SSH grants were being updated; retry",
         )
     if requested_inputs:
-        if locked_task.status in {
+        active_statuses = {
             "in_progress",
             "executing",
             "merging",
             "migrating",
             "waiting_capability",
-        } or locked_task.instance_id is not None:
+        }
+        terminal_statuses = {
+            "completed",
+            "failed",
+            "cancelled",
+            "conflict",
+            "superseded",
+        }
+        # Terminal Tasks retain their last ``instance_id`` for history after
+        # the Instance releases ``current_task_id``.  Treat that stale link as
+        # inactive; the reverse-owner check below remains authoritative and
+        # still rejects any Instance that actually owns this Task.
+        if locked_task.status in active_statuses or (
+            locked_task.instance_id is not None
+            and locked_task.status not in terminal_statuses
+        ):
             raise TaskSSHAccessError(
                 409,
                 "Managed SSH grants cannot be added while the Task has an "

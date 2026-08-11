@@ -73,7 +73,7 @@ CODEX_TERMINAL_FAILURE_STATUSES = frozenset(
 )
 # Keep Worker app-server/serde behavior identical to the Manager revision.
 # Do not use npm "latest": a retry must not silently upgrade the protocol.
-WORKER_CODEX_CLI_VERSION = "0.144.6"
+WORKER_CODEX_CLI_VERSION = "0.147.0"
 _DESTROYED_ACCOUNT_AUDIT_FIELDS = (
     "email", "provider", "status", "account_id",
 )

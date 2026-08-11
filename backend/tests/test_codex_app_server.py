@@ -33,6 +33,7 @@ from backend.services.codex_app_server import (
     CodexTurnProcess,
     _audit_isolated_request_config,
     _format_process_exit,
+    _harden_ambient_shell_environment_policy,
     _network_isolated_permission_config,
     _parse_codex_app_server_version,
     codex_project_trust_target,
@@ -183,6 +184,60 @@ def _empty_skills_response(cwd: str = "/workspace/project") -> dict:
 def _mark_managed_network_runtime_safe(server: CodexAppServer) -> None:
     server._runtime_version = (0, 146, 0)
     server._runtime_version_process = server._process
+
+
+def test_harden_ambient_shell_environment_policy_uses_canonical_filters():
+    effective_config = {
+        "shell_environment_policy": {
+            "filters": {"AMBIENT_*": "include"},
+            "exclude": ["AMBIENT_*"],
+            "include_only": [],
+        },
+    }
+    thread_config = {
+        "shell_environment_policy": {
+            "inherit": "none",
+            "exclude": ["SECRET_*", "TOKEN_*"],
+            "include_only": [],
+            "set": {},
+        },
+    }
+
+    _harden_ambient_shell_environment_policy(
+        effective_config,
+        thread_config,
+    )
+
+    policy = thread_config["shell_environment_policy"]
+    assert policy["filters"] == {
+        "AMBIENT_*": "exclude",
+        "SECRET_*": "exclude",
+        "TOKEN_*": "exclude",
+    }
+    assert "exclude" not in policy
+    assert "include_only" not in policy
+    assert effective_config["shell_environment_policy"] == {
+        "filters": {"AMBIENT_*": "include"},
+    }
+
+
+def test_harden_ambient_shell_environment_policy_preserves_legacy_runtime():
+    thread_config = {
+        "shell_environment_policy": {
+            "exclude": ["SECRET_*"],
+            "include_only": [],
+        },
+    }
+
+    _harden_ambient_shell_environment_policy(
+        {"shell_environment_policy": {"exclude": []}},
+        thread_config,
+    )
+
+    assert thread_config["shell_environment_policy"] == {
+        "exclude": ["SECRET_*"],
+        "include_only": [],
+    }
 
 
 @pytest.mark.parametrize(
@@ -668,11 +723,22 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     _mark_managed_network_runtime_safe(server)
+    server._runtime_version = (0, 147, 0)
     server.ensure_started = AsyncMock()
 
     async def request(method, params, **_kwargs):
         if method == "config/read":
-            return _ambient_mcp_response()
+            response = _ambient_mcp_response()
+            response["config"]["shell_environment_policy"] = {
+                "inherit": "all",
+                "ignore_default_excludes": False,
+                "exclude": [],
+                "include_only": [],
+                "experimental_use_profile": False,
+                "set": {},
+                "filters": {"AMBIENT_*": "include"},
+            }
+            return response
         if method == "skills/list":
             return _empty_skills_response(boundary.cwd)
         if method == "thread/start":
@@ -713,6 +779,10 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
         if call.args[0] == "thread/start"
     )
     config = thread_params["config"]
+    assert all(
+        call.args[0] != "plugin/list"
+        for call in server._request.await_args_list
+    )
     permission_profile = config["default_permissions"]
     assert permission_profile.startswith("ccm_task_managed_network_v1_")
     assert len(permission_profile) == (
@@ -740,6 +810,7 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
     shell_policy = config["shell_environment_policy"]
     assert shell_policy["inherit"] == "none"
     assert shell_policy["ignore_default_excludes"] is False
+    assert shell_policy["filters"]["AMBIENT_*"] == "exclude"
     assert {
         "AUTH_TOKEN",
         "CCM_*",
@@ -753,7 +824,13 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
         "CODEX_*",
         "AWS_*",
         "GOOGLE_*",
-    } == set(shell_policy["exclude"])
+    } == {
+        pattern
+        for pattern, action in shell_policy["filters"].items()
+        if pattern != "AMBIENT_*" and action == "exclude"
+    }
+    assert "exclude" not in shell_policy
+    assert "include_only" not in shell_policy
     assert "sandbox" not in thread_params
     assert "sandboxPolicy" not in server._request.await_args_list[-1].args[1]
 
@@ -4442,6 +4519,184 @@ async def test_turn_owner_hook_failure_prevents_model_admission():
         "thread/start"
     ]
     assert not server.has_active_thread("thread-owner-hook-failure")
+
+
+@pytest.mark.asyncio
+async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 147, 0)
+    server.ensure_started = AsyncMock()
+    skill_calls = 0
+    thread_calls = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal skill_calls, thread_calls
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            skill_calls += 1
+            if skill_calls == 1:
+                # A revision change during a forced read discards the prior
+                # evidence; later canonical-equivalent reads may stabilize.
+                server._handle_notification("skills/changed", {})
+            response = _empty_skills_response("/tmp")
+            skills = [
+                {"path": "/opt/skills/z/SKILL.md", "enabled": True},
+                {"path": "/opt/skills/a/SKILL.md", "enabled": True},
+            ]
+            if skill_calls % 2:
+                skills.reverse()
+            response["data"][0]["skills"] = skills
+            return response
+        if method == "thread/start":
+            thread_calls += 1
+            return _tool_free_thread_response(
+                f"thread-stable-skills-snapshot-{thread_calls}",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {
+                "turn": {"id": f"turn-stable-skills-snapshot-{thread_calls}"},
+            }
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with patch(
+        "backend.services.codex_app_server."
+        "_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT",
+        1.0,
+    ):
+        process, thread_id = await server.start_turn(
+            prompt="remain tool-free with the current skills snapshot",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=907,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+        )
+
+    assert [
+        call.args[0] for call in server._request.await_args_list[:3]
+    ] == ["skills/list", "skills/list", "skills/list"]
+    assert all(
+        call.args[0] != "plugin/list"
+        for call in server._request.await_args_list
+    )
+    assert thread_id == "thread-stable-skills-snapshot-1"
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-stable-skills-snapshot-1",
+            "status": "completed",
+        },
+    })
+    assert await process.wait() == 0
+
+    second_process, second_thread_id = await server.start_turn(
+        prompt="capture another current skills snapshot",
+        cwd="/tmp/../tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=909,
+        sandbox_mode="read-only",
+        disable_autonomous_features=True,
+        tools_disabled=True,
+    )
+
+    assert all(
+        call.args[0] != "plugin/list"
+        for call in server._request.await_args_list
+    )
+    assert second_thread_id == "thread-stable-skills-snapshot-2"
+    server._handle_notification("turn/completed", {
+        "threadId": second_thread_id,
+        "turn": {
+            "id": "turn-stable-skills-snapshot-2",
+            "status": "completed",
+        },
+    })
+    assert await second_process.wait() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_kind", ["inventory", "revision"])
+async def test_codex_0147_skills_snapshot_fails_closed_when_never_stable(
+    change_kind,
+):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 147, 0)
+    server.ensure_started = AsyncMock()
+    skill_calls = 0
+
+    async def request(method, _params, **_kwargs):
+        nonlocal skill_calls
+        if method == "skills/list":
+            skill_calls += 1
+            response = _empty_skills_response("/tmp")
+            if change_kind == "revision":
+                server._handle_notification("skills/changed", {})
+            else:
+                response["data"][0]["skills"] = [{
+                    "path": f"/opt/skills/{skill_calls}/SKILL.md",
+                    "enabled": True,
+                }]
+            return response
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with (
+        patch(
+            "backend.services.codex_app_server."
+            "_ISOLATED_SKILLS_SNAPSHOT_MAX_READS",
+            3,
+        ),
+        patch(
+            "backend.services.codex_app_server."
+            "_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT",
+            1.0,
+        ),
+    ):
+        with pytest.raises(
+            CodexRequiredMcpPreTurnError,
+            match=(
+                "could not audit ambient instructions and inherited "
+                "MCP/config/skills"
+            ),
+        ) as exc_info:
+            await server.start_turn(
+                prompt="must not start with an unstable skills inventory",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=908,
+                sandbox_mode="read-only",
+                disable_autonomous_features=True,
+                tools_disabled=True,
+            )
+
+    assert skill_calls == 3
+    assert all(
+        call.args[0] != "plugin/list"
+        for call in server._request.await_args_list
+    )
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert "did not stabilize after 3 forced skill reads" in str(
+        exc_info.value.__cause__
+    )
+    assert not any(
+        call.args[0] == "thread/start"
+        for call in server._request.await_args_list
+    )
 
 
 @pytest.mark.asyncio

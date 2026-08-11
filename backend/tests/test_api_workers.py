@@ -1953,7 +1953,7 @@ async def test_provisioner_system_init_installs_codex_and_login_runtime(
 
     script = ssh.run.await_args.args[0]
     assert "setup_22.x" in script
-    assert 'CODEX_CLI_VERSION="0.144.6"' in script
+    assert 'CODEX_CLI_VERSION="0.147.0"' in script
     assert '@openai/codex@$CODEX_CLI_VERSION' in script
     assert '"codex-cli $CODEX_CLI_VERSION"' in script
     assert "xvfb xauth xdotool" in script

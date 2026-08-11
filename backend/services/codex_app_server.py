@@ -78,6 +78,15 @@ _GOAL_RECONCILE_INTERVAL = 5.0
 # Native sub-agents are otherwise allowed to run for hours.  Reaching this
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
+# Codex 0.147 exposes no RPC that proves background plugin discovery settled;
+# calling ``plugin/list`` can itself schedule more background work. Isolated
+# preflight therefore never calls it. Two consecutive forced, canonical skill
+# snapshots capture the current inventory without triggering plugin refresh.
+# This is not a plugin-settled proof: safety still comes from disabling plugin
+# features plus the existing thread/ownership/turn fingerprint and revision
+# fences. Bound both reads and wall time so a moving inventory fails closed.
+_ISOLATED_SKILLS_SNAPSHOT_MAX_READS = 8
+_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT = 10.0
 
 
 def _format_process_exit(returncode: int | None) -> str:
@@ -772,6 +781,59 @@ def _require_ambient_keys_overridden(
         )
 
 
+def _harden_ambient_shell_environment_policy(
+    effective_config: dict[str, Any],
+    thread_config: dict[str, Any],
+) -> None:
+    """Use Codex's canonical filter table when the runtime exposes it.
+
+    Codex 0.147 serializes ``shell_environment_policy.filters`` in
+    ``config/read`` alongside resolved legacy aliases.  The canonical table
+    cannot be combined with the legacy ``exclude`` / ``include_only`` arrays,
+    so normalize both the audit snapshot and request-local policy before
+    auditing the deep merge.  Ambient filter keys are explicitly overridden
+    as excludes to keep isolated turns fail-closed.
+    """
+
+    ambient = effective_config.get("shell_environment_policy")
+    if not isinstance(ambient, dict) or "filters" not in ambient:
+        return
+    request = thread_config.get("shell_environment_policy")
+    if not isinstance(request, dict):
+        raise ValueError("isolated shell environment policy is malformed")
+
+    ambient_filters = ambient.get("filters")
+    if ambient_filters is None:
+        ambient_filters = {}
+    if not isinstance(ambient_filters, dict) or any(
+        not isinstance(pattern, str)
+        or action not in {"include", "exclude"}
+        for pattern, action in ambient_filters.items()
+    ):
+        raise ValueError("ambient shell environment filters are malformed")
+
+    canonical_filters = {
+        pattern: "exclude" for pattern in ambient_filters
+    }
+    ambient.pop("exclude", None)
+    ambient.pop("include_only", None)
+    for legacy_key, action in (
+        ("exclude", "exclude"),
+        ("include_only", "include"),
+    ):
+        patterns = request.pop(legacy_key, [])
+        if not isinstance(patterns, list) or any(
+            not isinstance(pattern, str) for pattern in patterns
+        ):
+            raise ValueError(
+                f"isolated shell environment {legacy_key} is malformed"
+            )
+        canonical_filters.update({
+            pattern: action for pattern in patterns
+        })
+    request["filters"] = canonical_filters
+
+
 def _harden_ambient_feature_config(
     effective_config: dict[str, Any],
     thread_config: dict[str, Any],
@@ -1076,7 +1138,7 @@ def _tool_free_disabled_skill_config(
             continue
         seen.add(canonical)
         disabled.append({"path": canonical, "enabled": False})
-    return disabled
+    return sorted(disabled, key=lambda item: item["path"])
 
 
 def _canonical_app_server_service_tier(value: Any) -> str | None:
@@ -4016,6 +4078,7 @@ class CodexAppServer:
         required_context = bool(skill_context.strip())
         tool_free_skills_revision: int | None = None
         isolated_ambient_config_fingerprint: str | None = None
+        isolated_ambient_config_sections: dict[str, str] | None = None
         isolated_skills_inventory_fingerprint: str | None = None
         isolated_ambient_effective_config: dict[str, Any] | None = None
         isolated_dynamic_disabled_features: frozenset[str] = frozenset()
@@ -4351,6 +4414,71 @@ class CodexAppServer:
                 },
             )
 
+        async def read_stable_skills_snapshot(
+        ) -> tuple[list[dict[str, Any]], str, int] | None:
+            """Capture two matching current Codex 0.147 skill inventories."""
+
+            runtime_version = self._runtime_version
+            if runtime_version is None or runtime_version < (0, 147, 0):
+                return None
+            reads = 0
+            try:
+                async with asyncio.timeout(
+                    _ISOLATED_SKILLS_SNAPSHOT_TIMEOUT
+                ):
+                    previous_fingerprint: str | None = None
+                    previous_revision: int | None = None
+                    while reads < _ISOLATED_SKILLS_SNAPSHOT_MAX_READS:
+                        reads += 1
+                        revision_before = self._skills_revision
+                        skills_inventory = await read_skills_inventory()
+                        revision_after = self._skills_revision
+                        disabled_skills = _tool_free_disabled_skill_config(
+                            skills_inventory,
+                            cwd=cwd,
+                        )
+                        fingerprint = _canonical_json_fingerprint(
+                            disabled_skills,
+                            label="Codex disabled skills inventory",
+                        )
+                        # Let notifications already queued behind the RPC
+                        # response run before accepting this read.
+                        await asyncio.sleep(0)
+                        revision_drained = self._skills_revision
+                        if (
+                            revision_before != revision_after
+                            or revision_after != revision_drained
+                        ):
+                            previous_fingerprint = None
+                            previous_revision = None
+                            logger.info(
+                                "Resetting Codex isolated skills snapshot "
+                                "after inventory refresh home=%s read=%s",
+                                self.codex_home,
+                                reads,
+                            )
+                            continue
+                        if (
+                            previous_fingerprint == fingerprint
+                            and previous_revision == revision_before
+                        ):
+                            return (
+                                disabled_skills,
+                                fingerprint,
+                                revision_drained,
+                            )
+                        previous_fingerprint = fingerprint
+                        previous_revision = revision_drained
+            except TimeoutError as exc:
+                raise ValueError(
+                    "Codex isolated skills inventory did not stabilize "
+                    f"within {_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT:g} seconds"
+                ) from exc
+            raise ValueError(
+                "Codex isolated skills inventory did not stabilize after "
+                f"{reads} forced skill reads"
+            )
+
         def require_no_ambient_instruction_config(
             effective_config: dict[str, Any],
         ) -> None:
@@ -4372,6 +4500,7 @@ class CodexAppServer:
                 return
             if (
                 isolated_ambient_config_fingerprint is None
+                or isolated_ambient_config_sections is None
                 or isolated_skills_inventory_fingerprint is None
                 or tool_free_skills_revision is None
             ):
@@ -4386,10 +4515,13 @@ class CodexAppServer:
                     label="effective Codex configuration",
                 )
                 current_skills = await read_skills_inventory()
-                _tool_free_disabled_skill_config(current_skills, cwd=cwd)
-                current_skills_fingerprint = _canonical_json_fingerprint(
+                current_disabled_skills = _tool_free_disabled_skill_config(
                     current_skills,
-                    label="Codex skills inventory",
+                    cwd=cwd,
+                )
+                current_skills_fingerprint = _canonical_json_fingerprint(
+                    current_disabled_skills,
+                    label="Codex disabled skills inventory",
                 )
             except Exception as exc:
                 raise CodexRequiredMcpPreTurnError(
@@ -4397,20 +4529,43 @@ class CodexAppServer:
                     "configuration and skills "
                     f"{phase}"
                 ) from exc
-            if (
+            config_changed = (
                 current_config_fingerprint
                 != isolated_ambient_config_fingerprint
-                or current_skills_fingerprint
+            )
+            skills_changed = (
+                current_skills_fingerprint
                 != isolated_skills_inventory_fingerprint
-                or self._skills_revision != tool_free_skills_revision
-            ):
+            )
+            revision_changed = (
+                self._skills_revision != tool_free_skills_revision
+            )
+            if config_changed or skills_changed or revision_changed:
+                current_sections = {
+                    key: _canonical_json_fingerprint(
+                        value,
+                        label=f"effective Codex configuration section {key}",
+                    )
+                    for key, value in effective_config.items()
+                }
+                changed_sections = sorted(
+                    key
+                    for key in (
+                        set(isolated_ambient_config_sections)
+                        | set(current_sections)
+                    )
+                    if isolated_ambient_config_sections.get(key)
+                    != current_sections.get(key)
+                )
                 raise CodexRequiredMcpPreTurnError(
                     "Codex isolated ambient configuration or skills changed "
-                    + phase
+                    f"{phase} (config_sections={changed_sections}, "
+                    f"skills={skills_changed}, revision={revision_changed})"
                 )
 
         if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:
+                stable_skills = await read_stable_skills_snapshot()
                 effective_config = await read_effective_config()
                 require_no_ambient_instruction_config(effective_config)
                 isolated_ambient_effective_config = copy.deepcopy(
@@ -4429,6 +4584,13 @@ class CodexAppServer:
                         label="effective Codex configuration",
                     )
                 )
+                isolated_ambient_config_sections = {
+                    key: _canonical_json_fingerprint(
+                        value,
+                        label=f"effective Codex configuration section {key}",
+                    )
+                    for key, value in effective_config.items()
+                }
                 inherited_mcp = _effective_mcp_inventory({
                     "config": effective_config,
                 })
@@ -4448,19 +4610,30 @@ class CodexAppServer:
                     isolated_mcp.update(explicit_mcp_servers)
                 thread_config["mcp_servers"] = isolated_mcp
 
-                skills_inventory = await read_skills_inventory()
-                disabled_skills = _tool_free_disabled_skill_config(
-                    skills_inventory,
-                    cwd=cwd,
-                )
-                isolated_skills_inventory_fingerprint = (
-                    _canonical_json_fingerprint(
+                if stable_skills is None:
+                    skills_inventory = await read_skills_inventory()
+                    disabled_skills = _tool_free_disabled_skill_config(
                         skills_inventory,
-                        label="Codex skills inventory",
+                        cwd=cwd,
                     )
-                )
+                    isolated_skills_inventory_fingerprint = (
+                        _canonical_json_fingerprint(
+                            disabled_skills,
+                            label="Codex disabled skills inventory",
+                        )
+                    )
+                    tool_free_skills_revision = self._skills_revision
+                else:
+                    (
+                        disabled_skills,
+                        isolated_skills_inventory_fingerprint,
+                        tool_free_skills_revision,
+                    ) = stable_skills
+                    if self._skills_revision != tool_free_skills_revision:
+                        raise ValueError(
+                            "Codex skills changed after stable reconciliation"
+                        )
                 thread_config["skills"]["config"] = disabled_skills
-                tool_free_skills_revision = self._skills_revision
             except Exception as exc:
                 if task_ssh_protected_paths:
                     message = (
@@ -4615,6 +4788,10 @@ class CodexAppServer:
                     "Codex isolated ambient merge inputs were not captured"
                 )
             try:
+                _harden_ambient_shell_environment_policy(
+                    isolated_ambient_effective_config,
+                    thread_config,
+                )
                 _audit_ambient_isolation_merge_inputs(
                     isolated_ambient_effective_config,
                     thread_config,

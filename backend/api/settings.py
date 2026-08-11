@@ -28,6 +28,12 @@ from backend.services.plan_pipeline_settings import effective_plan_pipeline_conf
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
+# Capacity has two authorities that must move together: the durable singleton
+# row and the in-process Dispatcher.  A database row lock is insufficient for
+# SQLite and would not protect the runtime value, so serialize the complete
+# update in this process.
+_capacity_settings_lock = asyncio.Lock()
+
 
 async def _get_or_create(db: AsyncSession) -> GlobalSettings:
     row = await db.get(GlobalSettings, 1)
@@ -145,7 +151,10 @@ async def get_capacity_settings(
     db: AsyncSession = Depends(get_db),
 ):
     require_admin(request)
-    return await _capacity_response(db, await _get_or_create(db))
+    # Do not expose the brief commit -> runtime-apply interval to a concurrent
+    # reader as a self-contradictory response.
+    async with _capacity_settings_lock:
+        return await _capacity_response(db, await _get_or_create(db))
 
 
 @router.put("/capacity", response_model=CapacitySettingsResponse)
@@ -157,31 +166,37 @@ async def update_capacity_settings(
     require_admin(request)
     from backend.main import broadcaster, dispatcher
 
-    row = await _get_or_create(db)
     override = body.max_concurrent_instances
 
-    async def persist_and_apply() -> None:
+    async def persist_apply_and_respond() -> CapacitySettingsResponse:
         # DB is the restart authority, but the running Dispatcher must converge
         # before this request is allowed to unwind.  Shield the pair so client
         # cancellation cannot leave the process on the old value indefinitely.
-        row.max_concurrent_instances = override
-        await db.commit()
-        await dispatcher.apply_capacity_override(override)
+        async with _capacity_settings_lock:
+            row = await _get_or_create(db)
+            row.max_concurrent_instances = override
+            await db.commit()
+            await dispatcher.apply_capacity_override(override)
+            response = await _capacity_response(db, row)
+            await broadcaster.broadcast(
+                "system",
+                {
+                    "event": "capacity_settings_changed",
+                    "max_concurrent_instances": (
+                        response.max_concurrent_instances
+                    ),
+                },
+            )
+            return response
 
-    update_task = asyncio.create_task(persist_and_apply())
+    update_task = asyncio.create_task(persist_apply_and_respond())
     try:
-        await asyncio.shield(update_task)
+        return await asyncio.shield(update_task)
     except asyncio.CancelledError:
-        await update_task
+        # Let the DB/runtime pair finish converging before the request-scoped
+        # session is closed by dependency teardown.
+        await asyncio.shield(update_task)
         raise
-    await broadcaster.broadcast(
-        "system",
-        {
-            "event": "capacity_settings_changed",
-            "max_concurrent_instances": dispatcher.max_concurrent_instances,
-        },
-    )
-    return await _capacity_response(db, row)
 
 
 @router.get("/runtime", response_model=RuntimeSettingsResponse)

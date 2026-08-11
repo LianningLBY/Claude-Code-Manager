@@ -86,6 +86,9 @@ COMBINED_BROWSER_MAIN_REVISION = "4e8a1c6d9b20"
 BROWSER_OPERATION_RECEIPT_REVISION = "6f3b9d2a7c10"
 PR_REVIEW_MERGE_METHOD_REVISION = "1a7c9e4d2b60"
 PR_REVIEW_BASE_REF_REVISION = "2b8d4f6a1c90"
+PR_LOOP_REVISION = "a3f7c2d8e1b4"
+CAPACITY_OVERRIDE_REVISION = "a4d8e2f6b1c3"
+CAPACITY_PR_LOOP_MERGE_REVISION = "c5e7a9d1f3b6"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -96,7 +99,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = PR_REVIEW_BASE_REF_REVISION
+CURRENT_HEAD_REVISION = CAPACITY_PR_LOOP_MERGE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -7430,8 +7433,19 @@ class TestPublishedMigrationHistory:
 
         assert script.get_heads() == [CURRENT_HEAD_REVISION]
         assert script.get_current_head() == CURRENT_HEAD_REVISION
-        assert (
+        assert set(
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+        ) == {PR_LOOP_REVISION, CAPACITY_OVERRIDE_REVISION}
+        assert (
+            script.get_revision(PR_LOOP_REVISION).down_revision
+            == PR_REVIEW_BASE_REF_REVISION
+        )
+        assert (
+            script.get_revision(CAPACITY_OVERRIDE_REVISION).down_revision
+            == WORKER_PLAN_IMPORT_RECEIPT_REVISION
+        )
+        assert (
+            script.get_revision(PR_REVIEW_BASE_REF_REVISION).down_revision
             == PR_REVIEW_MERGE_METHOD_REVISION
         )
         assert (

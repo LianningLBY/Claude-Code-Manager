@@ -34,6 +34,7 @@ cd frontend && npx tsc --noEmit
 | 测试 | 验证内容 |
 |------|---------|
 | `test_protected_paths_cover_all_git_credential_sources` | 已存在的 repo `.git/credentials` 继续进入 deny 列表；不存在的叶子路径不生成 Bubblewrap 挂载，父 `.git` deny 保持不变 |
+| `test_codex_app_server.py::test_task_ssh_profile_collapses_only_redundant_nested_denies` | 父目录已 deny 时折叠冗余子 deny，避免 Bubblewrap 在只读父挂载中创建子挂载点；若中间 workspace 已重新开放则保留子 deny，精确只读例外仍可覆盖父 deny |
 
 #### `test_tmp_space_manager.py` — `/tmp` 压力保护
 

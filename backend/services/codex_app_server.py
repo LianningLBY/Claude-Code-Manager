@@ -497,6 +497,30 @@ def _tool_free_permission_config() -> dict[str, Any]:
     }
 
 
+def _nearest_concrete_parent_permission(
+    filesystem: dict[str, str],
+    path: str,
+) -> str | None:
+    """Return the longest matching concrete parent permission for ``path``."""
+
+    nearest_permission: str | None = None
+    nearest_depth = -1
+    for boundary, permission in filesystem.items():
+        if not os.path.isabs(boundary) or boundary == path:
+            continue
+        try:
+            if os.path.commonpath((path, boundary)) != boundary:
+                continue
+        except ValueError:
+            # Different drives are never ancestors of one another.
+            continue
+        depth = len(Path(boundary).parts)
+        if depth > nearest_depth:
+            nearest_permission = permission
+            nearest_depth = depth
+    return nearest_permission
+
+
 def _task_ssh_permission_config(
     *,
     cwd: str,
@@ -532,10 +556,23 @@ def _task_ssh_permission_config(
     # either way default-deny the entry and re-open only the discovery-proven
     # read paths below.
     filesystem[os.path.join(workspace, ".git")] = "deny"
-    for value in protected_paths:
-        path = os.path.abspath(os.path.expanduser(str(value)))
+    normalized_protected_paths = sorted(
+        {
+            os.path.abspath(os.path.expanduser(str(value)))
+            for value in protected_paths
+        },
+        key=lambda path: (len(Path(path).parts), path),
+    )
+    for path in normalized_protected_paths:
         if path == "/":
             raise ValueError("Task SSH protected path cannot be filesystem root")
+        # Codex materializes every concrete permission boundary as a sandbox
+        # mount. A child deny below an already-denied parent is redundant and
+        # can fail before exec when Bubblewrap tries to create its mountpoint
+        # inside the read-only parent. Keep the child when a nearer read/write
+        # boundary reopened the tree (for example, a secret inside workspace).
+        if _nearest_concrete_parent_permission(filesystem, path) == "deny":
+            continue
         filesystem[path] = "deny"
     for value in allowed_read_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))

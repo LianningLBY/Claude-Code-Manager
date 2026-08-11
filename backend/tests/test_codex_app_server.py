@@ -36,6 +36,7 @@ from backend.services.codex_app_server import (
     _harden_ambient_shell_environment_policy,
     _network_isolated_permission_config,
     _parse_codex_app_server_version,
+    _task_ssh_permission_config,
     codex_project_trust_target,
     codex_untrusted_project_config,
     codex_untrusted_project_override,
@@ -474,6 +475,57 @@ async def _start_task_isolated_mcp_test_turn(
         task_ssh_disable_network=True,
         disable_autonomous_features=True,
     )
+
+
+def test_task_ssh_profile_collapses_only_redundant_nested_denies(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    ccm_home = tmp_path / ".ccm"
+    api_accounts = ccm_home / "api-accounts"
+    workspace_credential = workspace / ".git" / "credentials"
+    workspace_secret = workspace / "secrets" / "token"
+
+    profile = _task_ssh_permission_config(
+        cwd=str(workspace),
+        protected_paths=(
+            str(api_accounts),
+            str(ccm_home),
+            str(workspace_credential),
+            str(workspace_secret),
+        ),
+        allowed_read_paths=(),
+        git_read_paths=(),
+        private_tmpdir=str(scratch),
+        disable_network=True,
+        managed_network_proxy=False,
+        sandbox_mode="workspace-write",
+    )
+    filesystem = profile["filesystem"]
+
+    assert filesystem[str(workspace)] == "write"
+    assert filesystem[str(workspace / ".git")] == "deny"
+    assert filesystem[str(ccm_home)] == "deny"
+    assert str(api_accounts) not in filesystem
+    assert str(workspace_credential) not in filesystem
+    # The writable workspace is the nearest boundary, so this deny is not
+    # redundant and must remain enforceable.
+    assert filesystem[str(workspace_secret)] == "deny"
+
+    selected_credential = ccm_home / "selected-credential"
+    profile_with_read_override = _task_ssh_permission_config(
+        cwd=str(workspace),
+        protected_paths=(str(ccm_home), str(api_accounts)),
+        allowed_read_paths=(str(selected_credential),),
+        git_read_paths=(),
+        private_tmpdir=str(scratch),
+        disable_network=True,
+        managed_network_proxy=False,
+        sandbox_mode="read-only",
+    )
+    filesystem_with_read_override = profile_with_read_override["filesystem"]
+    assert filesystem_with_read_override[str(ccm_home)] == "deny"
+    assert str(api_accounts) not in filesystem_with_read_override
+    assert filesystem_with_read_override[str(selected_credential)] == "read"
 
 
 @pytest.mark.asyncio

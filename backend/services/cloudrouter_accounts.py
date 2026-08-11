@@ -41,7 +41,7 @@ APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
 # Keep this aligned with the Codex CLI version pinned by scripts/setup.sh and
 # WorkerProvisioner.  Apex exposes the native Codex model catalog endpoint,
 # which requires the caller version in order to filter compatible models.
-APEX_CODEX_CLIENT_VERSION = "0.144.6"
+APEX_CODEX_CLIENT_VERSION = "0.147.0"
 API_PROVIDER_CLOUDROUTER = "cloudrouter"
 API_PROVIDER_APEX = "apex"
 APEX_CODEX_PROVIDER = "apexrouter"

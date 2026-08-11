@@ -140,7 +140,7 @@ async def test_worker_bootstrap_and_setup_pin_same_exact_codex_cli_version():
         setup_version.group(1)
         == worker_version.group(1)
         == WORKER_CODEX_CLI_VERSION
-        == "0.144.6"
+        == "0.147.0"
     )
 
     assert '@openai/codex@${CODEX_CLI_VERSION}' in setup_script

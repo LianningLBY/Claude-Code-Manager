@@ -62,7 +62,7 @@ if [ ! -f "$APPLY_SECCOMP" ] || [ -L "$APPLY_SECCOMP" ] || [ ! -x "$APPLY_SECCOM
     echo "Claude apply-seccomp helper installation could not be verified" >&2
     exit 1
 fi
-CODEX_CLI_VERSION="0.144.6"
+CODEX_CLI_VERSION="0.147.0"
 if [ "$(codex --version 2>/dev/null | head -1)" != "codex-cli ${CODEX_CLI_VERSION}" ]; then
     sudo npm install -g "@openai/codex@${CODEX_CLI_VERSION}"
 fi

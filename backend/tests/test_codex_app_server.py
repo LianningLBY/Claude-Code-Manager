@@ -33,6 +33,7 @@ from backend.services.codex_app_server import (
     CodexTurnProcess,
     _audit_isolated_request_config,
     _format_process_exit,
+    _harden_ambient_shell_environment_policy,
     _network_isolated_permission_config,
     _parse_codex_app_server_version,
     codex_project_trust_target,
@@ -183,6 +184,60 @@ def _empty_skills_response(cwd: str = "/workspace/project") -> dict:
 def _mark_managed_network_runtime_safe(server: CodexAppServer) -> None:
     server._runtime_version = (0, 146, 0)
     server._runtime_version_process = server._process
+
+
+def test_harden_ambient_shell_environment_policy_uses_canonical_filters():
+    effective_config = {
+        "shell_environment_policy": {
+            "filters": {"AMBIENT_*": "include"},
+            "exclude": ["AMBIENT_*"],
+            "include_only": [],
+        },
+    }
+    thread_config = {
+        "shell_environment_policy": {
+            "inherit": "none",
+            "exclude": ["SECRET_*", "TOKEN_*"],
+            "include_only": [],
+            "set": {},
+        },
+    }
+
+    _harden_ambient_shell_environment_policy(
+        effective_config,
+        thread_config,
+    )
+
+    policy = thread_config["shell_environment_policy"]
+    assert policy["filters"] == {
+        "AMBIENT_*": "exclude",
+        "SECRET_*": "exclude",
+        "TOKEN_*": "exclude",
+    }
+    assert "exclude" not in policy
+    assert "include_only" not in policy
+    assert effective_config["shell_environment_policy"] == {
+        "filters": {"AMBIENT_*": "include"},
+    }
+
+
+def test_harden_ambient_shell_environment_policy_preserves_legacy_runtime():
+    thread_config = {
+        "shell_environment_policy": {
+            "exclude": ["SECRET_*"],
+            "include_only": [],
+        },
+    }
+
+    _harden_ambient_shell_environment_policy(
+        {"shell_environment_policy": {"exclude": []}},
+        thread_config,
+    )
+
+    assert thread_config["shell_environment_policy"] == {
+        "exclude": ["SECRET_*"],
+        "include_only": [],
+    }
 
 
 @pytest.mark.parametrize(
@@ -668,13 +723,33 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     _mark_managed_network_runtime_safe(server)
+    server._runtime_version = (0, 147, 0)
     server.ensure_started = AsyncMock()
+    skill_reads = 0
 
     async def request(method, params, **_kwargs):
+        nonlocal skill_reads
         if method == "config/read":
-            return _ambient_mcp_response()
+            response = _ambient_mcp_response()
+            response["config"]["shell_environment_policy"] = {
+                "inherit": "all",
+                "ignore_default_excludes": False,
+                "exclude": [],
+                "include_only": [],
+                "experimental_use_profile": False,
+                "set": {},
+                "filters": {"AMBIENT_*": "include"},
+            }
+            return response
         if method == "skills/list":
-            return _empty_skills_response(boundary.cwd)
+            skill_reads += 1
+            response = _empty_skills_response(boundary.cwd)
+            response["responseMetadata"] = {
+                "refreshGeneration": skill_reads,
+            }
+            return response
+        if method == "plugin/list":
+            return {"marketplaceLoadErrors": []}
         if method == "thread/start":
             profile = params["config"]["default_permissions"]
             return _task_isolated_thread_response(
@@ -713,6 +788,16 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
         if call.args[0] == "thread/start"
     )
     config = thread_params["config"]
+    assert any(
+        call.args == (
+            "plugin/list",
+            {
+                "cwds": [boundary.cwd],
+                "forceRefetch": False,
+            },
+        )
+        for call in server._request.await_args_list
+    )
     permission_profile = config["default_permissions"]
     assert permission_profile.startswith("ccm_task_managed_network_v1_")
     assert len(permission_profile) == (
@@ -740,6 +825,7 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
     shell_policy = config["shell_environment_policy"]
     assert shell_policy["inherit"] == "none"
     assert shell_policy["ignore_default_excludes"] is False
+    assert shell_policy["filters"]["AMBIENT_*"] == "exclude"
     assert {
         "AUTH_TOKEN",
         "CCM_*",
@@ -753,7 +839,13 @@ async def test_ordinary_task_uses_exact_managed_public_network_profile(
         "CODEX_*",
         "AWS_*",
         "GOOGLE_*",
-    } == set(shell_policy["exclude"])
+    } == {
+        pattern
+        for pattern, action in shell_policy["filters"].items()
+        if pattern != "AMBIENT_*" and action == "exclude"
+    }
+    assert "exclude" not in shell_policy
+    assert "include_only" not in shell_policy
     assert "sandbox" not in thread_params
     assert "sandboxPolicy" not in server._request.await_args_list[-1].args[1]
 

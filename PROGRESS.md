@@ -1074,3 +1074,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **Browser 锁序与回队列**：queue claim/defer/retry 统一按 parent owner Task → binding → child Task 写入，Browser child CAS miss 会回滚整个 binding 变更；Dispatcher 的 active→pending 路径在同一事务释放 `running → ready` claim，runtime reap 使用 binding → child → Instance，避免与 stop/delete 形成跨数据库死锁或留下 `pending/running` 悬挂状态。
 - **重放安全**：安全回队列的只读分类在 writer 内重复验证。若 provider transport 在分类后抢先提交，typed unsafe 结果转入普通 terminal fence，最终持久化 Task `failed`、binding `completed`、Instance `idle`；Browser 的冻结 launch profile 只允许 fresh launch，structured context preflight 不再压缩、换 prompt 或重启。
 - **验证**：最终只读审查未发现剩余 P0/P1/P2。后端全量 `6323 passed, 4 skipped`（0 failed）；Browser 竞态专项 `4 passed`，TaskQueue/child/stale cleanup 独立矩阵 `219 passed`。Alembic 往返/历史矩阵 `204 passed`，唯一 head `6f3b9d2a7c10`；前端 `62 files / 756 tests passed`，TypeScript 与 production build（4761 modules）通过；`compileall`、`git diff --check` 通过。四项 skip 与 bundle size/弃用 warning 均为既有非阻塞项。
+
+### 2026-08-11 — 按发起角色执行 Task，并修复 Member 沙箱兼容（commit a876207）
+
+- **阶段一：角色运行边界**：每个聊天回合把实际发起账号、角色和 `sandbox/unrestricted` 模式写入 source log 与 durable queue；后台启动前复验账号仍 active 且角色未变化。管理员/超级管理员普通回合不套 Task provider 沙箱，Member 及无可信用户主体的内部回合继续 fail closed；Manager→Worker handoff 同步冻结原始 principal，重试不借 system 身份提权。
+- **阶段二：Task 300/315 故障链**：Codex Member 隔离只准入经 inventory 验证的内置 `codex` code-mode MCP，继续拒绝 ambient MCP；Claude canary 兼容 2.1.168 在缺失 bwrap 时的新零模型错误协议；聊天附件启动前复验为 uploads 根下的非 symlink 普通文件，并只投影 exact 文件读取权限。管理员回合仍保留 task-scoped `ccm_ssh`，Task SSH Profile/grant 的管理员配置边界不变。
+- **验证**：Chat/Worker principal 链路 `385 passed`；隔离与运行服务矩阵首次执行到 `1141 passed, 3 skipped` 后仅遇到测试并发覆盖固定 settings 文件，隔离文件单独复跑 `41 passed`；新增相关定向测试全部通过。Python `compileall`、TypeScript `tsc --noEmit`、`git diff --check` 通过。后端全量被 main 同样可复现的既有 SQLite migration downgrade trigger 错误阻断（`trg_task_ssh_effect_project_share_insert` 在 batch rename 时引用暂时不存在的 `tasks`），未混入无关 migration 修复。尚未重启生产服务；Task 300/315 的旧 turn 必须在重启后由用户明确重发，避免自动重复副作用。

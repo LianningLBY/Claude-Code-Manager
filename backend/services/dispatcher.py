@@ -4888,7 +4888,7 @@ class GlobalDispatcher:
         self,
         db,
         *,
-        instance: Instance,
+        instance_id: int,
     ) -> tuple[int, int] | None:
         """Claim one local first-class PlanRun and its exact Instance owner."""
 
@@ -4939,7 +4939,7 @@ class GlobalDispatcher:
             )
             .values(
                 status="running",
-                instance_id=instance.id,
+                instance_id=instance_id,
                 generation=claimed_generation,
                 last_execution_started_at=now,
                 updated_at=now,
@@ -4948,7 +4948,7 @@ class GlobalDispatcher:
         claimed_instance = await db.execute(
             update(Instance)
             .where(
-                Instance.id == instance.id,
+                Instance.id == instance_id,
                 reusable_idle_predicate(),
             )
             .values(
@@ -4972,7 +4972,7 @@ class GlobalDispatcher:
                 self.db_factory,
                 run_id=run.id,
                 generation=claimed_generation,
-                instance_id=instance.id,
+                instance_id=instance_id,
             )
         except BaseException as exc:
             # Ownership is already durable. Converge this exact generation
@@ -4981,7 +4981,7 @@ class GlobalDispatcher:
             # ``running`` claim.
             cleanup, cleanup_cancellation = await _settle_despite_cancellation(
                 self._cleanup_plan_run_owner(
-                    instance_id=instance.id,
+                    instance_id=instance_id,
                     run_id=run.id,
                     generation=claimed_generation,
                     terminal_error=(
@@ -5207,6 +5207,8 @@ class GlobalDispatcher:
                 # instance_id by the same CAS that moves it out of pending.
                 while self._running:
                     instance = None
+                    reserved_instance_id: int | None = None
+                    reserved_instance_name: str | None = None
                     claim_token = None
                     task = None
                     plan_run_claim: tuple[int, int] | None = None
@@ -5222,6 +5224,13 @@ class GlobalDispatcher:
                                 ) = await self._reserve_idle_instance(db)
                                 if instance is None or claim_token is None:
                                     break
+                                # TaskQueue.dequeue() may commit and explicitly
+                                # expire every ORM object in this session. Keep
+                                # the durable reservation identity as scalars
+                                # before any claim path can do that; no Instance
+                                # ORM object may cross the session boundary.
+                                reserved_instance_id = instance.id
+                                reserved_instance_name = instance.name
                                 queue = TaskQueue(db)
                                 now = time.monotonic()
                                 self._account_routing_not_before = {
@@ -5232,19 +5241,19 @@ class GlobalDispatcher:
                                 if self._prefer_plan_runs:
                                     plan_run_claim = await self._claim_plan_run(
                                         db,
-                                        instance=instance,
+                                        instance_id=reserved_instance_id,
                                     )
                                 if plan_run_claim is None:
                                     task = await queue.dequeue(
                                         exclude_ids=set(
                                             self._account_routing_not_before
                                         ),
-                                        instance_id=instance.id,
+                                        instance_id=reserved_instance_id,
                                     )
                                 if task is None and plan_run_claim is None:
                                     plan_run_claim = await self._claim_plan_run(
                                         db,
-                                        instance=instance,
+                                        instance_id=reserved_instance_id,
                                     )
 
                         if task is None and plan_run_claim is None:
@@ -5256,17 +5265,17 @@ class GlobalDispatcher:
                                 "Dispatching Plan Run %s generation %s to instance %s",
                                 run_id,
                                 run_generation,
-                                instance.id,
+                                reserved_instance_id,
                             )
                             lifecycle = asyncio.create_task(
                                 self._run_plan_run_lifecycle(
-                                    instance.id,
+                                    reserved_instance_id,
                                     run_id,
                                     run_generation,
                                 )
                             )
                             setattr(lifecycle, "_ccm_plan_run_id", run_id)
-                            self._running_tasks[instance.id] = lifecycle
+                            self._running_tasks[reserved_instance_id] = lifecycle
                             self._prefer_plan_runs = False
                             lifecycle_registered = True
                             continue
@@ -5310,18 +5319,20 @@ class GlobalDispatcher:
                             "Dispatching task %s (%s) to instance %s (%s)",
                             task.id,
                             task.title,
-                            instance.id,
-                            instance.name,
+                            reserved_instance_id,
+                            reserved_instance_name,
                         )
                         lifecycle = asyncio.create_task(
-                            self._run_task_lifecycle(instance.id, task, git_env)
+                            self._run_task_lifecycle(
+                                reserved_instance_id, task, git_env
+                            )
                         )
                         # Task.instance_id remains as historical execution
                         # metadata after a turn, while Instances are reusable.
                         # Bind this lifecycle to its exact Task so a later Plan
                         # on the same slot cannot block the old Task's chat.
                         setattr(lifecycle, "_ccm_task_id", task.id)
-                        self._running_tasks[instance.id] = lifecycle
+                        self._running_tasks[reserved_instance_id] = lifecycle
                         self._prefer_plan_runs = True
                         lifecycle_registered = True
                     except TaskStartPausedError:
@@ -5332,7 +5343,7 @@ class GlobalDispatcher:
                             "project preparation"
                         )
                     except asyncio.CancelledError as cancellation:
-                        if task is not None and instance is not None:
+                        if task is not None and reserved_instance_id is not None:
                             finalizer, delayed_cancellation = (
                                 await _settle_despite_cancellation(
                                     self._finalize_fresh_lifecycle_replay_safely(
@@ -5351,16 +5362,19 @@ class GlobalDispatcher:
                             finalizer.result()
                             if delayed_cancellation is not None:
                                 cancellation = delayed_cancellation
-                        if plan_run_claim is not None and instance is not None:
+                        if (
+                            plan_run_claim is not None
+                            and reserved_instance_id is not None
+                        ):
                             await self._cleanup_plan_run_owner(
-                                instance_id=instance.id,
+                                instance_id=reserved_instance_id,
                                 run_id=plan_run_claim[0],
                                 generation=plan_run_claim[1],
                             )
                         raise cancellation
                     except Exception as exc:
                         logger.exception("Failed to prepare a claimed task for launch")
-                        if task is not None and instance is not None:
+                        if task is not None and reserved_instance_id is not None:
                             await self._finalize_fresh_lifecycle_replay_safely(
                                 self._task_lifecycle_generation(task),
                                 pending_reason=f"launch preparation failed: {exc}",
@@ -5370,9 +5384,12 @@ class GlobalDispatcher:
                                 ),
                                 allow_unbound_prelaunch=True,
                             )
-                        if plan_run_claim is not None and instance is not None:
+                        if (
+                            plan_run_claim is not None
+                            and reserved_instance_id is not None
+                        ):
                             await self._cleanup_plan_run_owner(
-                                instance_id=instance.id,
+                                instance_id=reserved_instance_id,
                                 run_id=plan_run_claim[0],
                                 generation=plan_run_claim[1],
                             )
@@ -5380,9 +5397,12 @@ class GlobalDispatcher:
                         # Once registered, _running_tasks is the admission
                         # guard.  Otherwise this releases a failed/no-task
                         # reservation so another caller can use the slot.
-                        if instance is not None and claim_token is not None:
+                        if (
+                            reserved_instance_id is not None
+                            and claim_token is not None
+                        ):
                             await self._release_instance_reservation(
-                                instance.id, claim_token
+                                reserved_instance_id, claim_token
                             )
 
                     if not lifecycle_registered:
@@ -23495,6 +23515,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     if settlement_cancellation is not None:
                         raise settlement_cancellation
             except asyncio.CancelledError as cancellation:
+                from backend.services.codex_app_server import (
+                    CodexThreadRuntimeRecycleCancelled,
+                )
+
+                recycle_outcome_uncertain = isinstance(
+                    cancellation, CodexThreadRuntimeRecycleCancelled
+                )
                 # Before the provider boundary, a durable Plan/Worker envelope
                 # can safely reopen this exact G. Ordinary messages have no
                 # restart outbox, so leaving their admitted Task as executing
@@ -23519,6 +23546,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if (
                     not worker_handoff_boundary["crossed"]
                     and source_preflight_proven
+                    and not recycle_outcome_uncertain
                     and (
                         msg.delivery_key is not None
                         or msg.worker_turn_handoff_id is not None
@@ -23565,7 +23593,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         )
 
                 reason = (
-                    "Queued turn was interrupted after its provider-effect "
+                    "Codex thread runtime recycle was interrupted after native "
+                    "route mutation; automatic replay was blocked"
+                    if recycle_outcome_uncertain
+                    else "Queued turn was interrupted after its provider-effect "
                     "boundary; automatic replay was blocked"
                     if (
                         worker_handoff_boundary["crossed"]
@@ -23615,6 +23646,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     CodexAppServerBusyError,
                     CodexServiceTierUnavailableError,
                     CodexThreadHomeMismatchError,
+                    CodexThreadRuntimeRecycleError,
                     CodexThreadTerminalStateError,
                 )
                 from backend.services.cloudrouter_accounts import (
@@ -23760,6 +23792,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     and source_preflight_proven
                     and handoff_prelaunch_proven
                     and capability_prelaunch_proven
+                    and not isinstance(exc, CodexThreadRuntimeRecycleError)
                     and not (
                         msg.capability_resume_outbox_id is not None
                         and permanent_prelaunch

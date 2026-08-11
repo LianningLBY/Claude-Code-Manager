@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import re
+import secrets
+import shutil
 import signal
 import stat
 import time
@@ -189,6 +191,8 @@ _NETWORK_ISOLATED_DISABLED_FEATURES = frozenset({
     "browser_use_external",
     "browser_use_full_cdp_access",
     "computer_use",
+    "code_mode",
+    "code_mode_host",
     "default_mode_request_user_input",
     "deferred_executor",
     "enable_fanout",
@@ -351,6 +355,34 @@ class CodexRequiredMcpPreTurnError(CodexRequiredMcpError):
     """Required task context failed before admission, so exec replay is safe."""
 
 
+class _CodexIsolatedSkillsDriftError(CodexRequiredMcpPreTurnError):
+    """An isolated empty thread was admitted from a stale skills inventory."""
+
+
+class CodexThreadRuntimeRecycleError(CodexRequiredMcpError):
+    """A thread runtime recycle may have changed native external state."""
+
+    def __init__(self, thread_id: str, detail: str) -> None:
+        super().__init__(
+            f"Codex thread {thread_id} runtime recycle outcome is uncertain: "
+            f"{detail}"
+        )
+        self.thread_id = thread_id
+        self.route_mutation_possible = True
+
+
+class CodexThreadRuntimeRecycleCancelled(asyncio.CancelledError):
+    """Cancellation observed after a runtime recycle mutation was attempted."""
+
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(
+            f"Codex thread {thread_id} runtime recycle was cancelled after "
+            "native state mutation began"
+        )
+        self.thread_id = thread_id
+        self.route_mutation_possible = True
+
+
 class CodexThreadHomeMismatchError(CodexAppServerError):
     """A thread was routed to a different account without an explicit rebind."""
 
@@ -497,6 +529,166 @@ def _tool_free_permission_config() -> dict[str, Any]:
     }
 
 
+def _nearest_concrete_parent_permission(
+    filesystem: dict[str, str],
+    path: str,
+) -> str | None:
+    """Return the longest matching concrete parent permission for ``path``."""
+
+    nearest_permission: str | None = None
+    nearest_depth = -1
+    for boundary, permission in filesystem.items():
+        if not os.path.isabs(boundary) or boundary == path:
+            continue
+        try:
+            if os.path.commonpath((path, boundary)) != boundary:
+                continue
+        except ValueError:
+            # Different drives are never ancestors of one another.
+            continue
+        depth = len(Path(boundary).parts)
+        if depth > nearest_depth:
+            nearest_permission = permission
+            nearest_depth = depth
+    return nearest_permission
+
+
+def _codex_runtime_read_paths(
+    binary: str,
+    *,
+    projection_root: str | os.PathLike[str] | None = None,
+) -> tuple[str, ...]:
+    """Materialize the allow-listed Codex runtime outside protected homes."""
+
+    expanded = os.path.expanduser(str(binary))
+    has_separator = any(
+        separator and separator in expanded
+        for separator in (os.sep, os.altsep)
+    )
+    candidate = expanded if has_separator else shutil.which(expanded)
+    if not candidate:
+        return ()
+    try:
+        resolved = Path(candidate).resolve(strict=True)
+        source_info = resolved.stat()
+    except (OSError, RuntimeError):
+        return ()
+    if (
+        not stat.S_ISREG(source_info.st_mode)
+        or not os.access(resolved, os.X_OK)
+    ):
+        return ()
+    effective_uid = (
+        os.geteuid()
+        if hasattr(os, "geteuid")
+        else source_info.st_uid
+    )
+
+    requested_root = (
+        Path(projection_root)
+        if projection_root is not None
+        else Path.home() / ".cache" / "claude-code-manager" / "codex-runtime"
+    )
+    root = Path(os.path.abspath(os.path.expanduser(os.fspath(requested_root))))
+    executable_suffix = (
+        ".exe" if resolved.name.lower().endswith(".exe") else ""
+    )
+    components: list[tuple[Path, os.stat_result, str]] = [
+        (resolved, source_info, f"codex{executable_suffix}"),
+    ]
+    code_mode_host = resolved.with_name(
+        f"codex-code-mode-host{executable_suffix}"
+    )
+    try:
+        code_mode_host_info = code_mode_host.lstat()
+    except FileNotFoundError:
+        # Older Codex releases execute shell commands in-process and do not
+        # ship the code-mode host. Preserve their single-file projection.
+        pass
+    except OSError:
+        return ()
+    else:
+        if (
+            stat.S_ISLNK(code_mode_host_info.st_mode)
+            or not stat.S_ISREG(code_mode_host_info.st_mode)
+            or code_mode_host_info.st_uid != source_info.st_uid
+            or not os.access(code_mode_host, os.X_OK)
+        ):
+            # A present but untrusted companion must fail closed. Otherwise
+            # the projected Codex binary could execute a substituted sibling.
+            return ()
+        components.append(
+            (
+                code_mode_host,
+                code_mode_host_info,
+                f"codex-code-mode-host{executable_suffix}",
+            )
+        )
+
+    identity_material = "\0".join(
+        "\0".join(
+            (
+                str(source),
+                str(info.st_dev),
+                str(info.st_ino),
+                str(info.st_mode),
+                str(info.st_size),
+                str(info.st_mtime_ns),
+            )
+        )
+        for source, info, _projection_name in components
+    )
+    identity = hashlib.sha256(
+        identity_material.encode("utf-8")
+    ).hexdigest()[:32]
+    release_dir = root / identity
+    projections = tuple(
+        (source, info, release_dir / projection_name)
+        for source, info, projection_name in components
+    )
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        release_dir.mkdir(mode=0o700, exist_ok=True)
+        if root.resolve(strict=True) != root:
+            return ()
+        for directory in (root, release_dir):
+            directory_info = directory.lstat()
+            if (
+                stat.S_ISLNK(directory_info.st_mode)
+                or not stat.S_ISDIR(directory_info.st_mode)
+                or directory_info.st_uid != effective_uid
+            ):
+                return ()
+            directory.chmod(0o700)
+        projected_infos: list[os.stat_result] = []
+        for source, _source_info, projection in projections:
+            if not projection.exists():
+                temporary = release_dir / (
+                    f".{projection.name}-{secrets.token_hex(16)}"
+                )
+                try:
+                    os.link(source, temporary)
+                    os.replace(temporary, projection)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            projected_infos.append(projection.lstat())
+    except OSError:
+        return ()
+    for (
+        (source, _source_info, projection),
+        projected_info,
+    ) in zip(projections, projected_infos, strict=True):
+        if (
+            stat.S_ISLNK(projected_info.st_mode)
+            or not stat.S_ISREG(projected_info.st_mode)
+            or projected_info.st_uid != effective_uid
+            or not os.access(projection, os.X_OK)
+            or not os.path.samefile(source, projection)
+        ):
+            return ()
+    return tuple(str(projection) for _, _, projection in projections)
+
+
 def _task_ssh_permission_config(
     *,
     cwd: str,
@@ -507,6 +699,7 @@ def _task_ssh_permission_config(
     disable_network: bool,
     managed_network_proxy: bool,
     sandbox_mode: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Build a request-local Codex profile that hides host credentials."""
 
@@ -532,10 +725,23 @@ def _task_ssh_permission_config(
     # either way default-deny the entry and re-open only the discovery-proven
     # read paths below.
     filesystem[os.path.join(workspace, ".git")] = "deny"
-    for value in protected_paths:
-        path = os.path.abspath(os.path.expanduser(str(value)))
+    normalized_protected_paths = sorted(
+        {
+            os.path.abspath(os.path.expanduser(str(value)))
+            for value in protected_paths
+        },
+        key=lambda path: (len(Path(path).parts), path),
+    )
+    for path in normalized_protected_paths:
         if path == "/":
             raise ValueError("Task SSH protected path cannot be filesystem root")
+        # Codex materializes every concrete permission boundary as a sandbox
+        # mount. A child deny below an already-denied parent is redundant and
+        # can fail before exec when Bubblewrap tries to create its mountpoint
+        # inside the read-only parent. Keep the child when a nearer read/write
+        # boundary reopened the tree (for example, a secret inside workspace).
+        if _nearest_concrete_parent_permission(filesystem, path) == "deny":
+            continue
         filesystem[path] = "deny"
     for value in allowed_read_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))
@@ -546,6 +752,18 @@ def _task_ssh_permission_config(
         # Codex permission profiles use longest-path matching. Keeping the
         # denied parent alongside this exact file read entry prevents ambient
         # siblings or later-created credentials from becoming visible.
+        filesystem[path] = "read"
+    for value in runtime_read_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if (
+            path == "/"
+            or not os.path.isfile(path)
+            or not os.access(path, os.X_OK)
+        ):
+            raise ValueError("Codex runtime projection is not an executable file")
+        # Codex 0.147 re-execs its canonical standalone binary for shell
+        # commands. The binary commonly lives below a protected CODEX_HOME,
+        # so reopen only this exact file after installing the parent deny.
         filesystem[path] = "read"
     for value in git_read_paths:
         path = os.path.abspath(os.path.expanduser(str(value)))
@@ -600,6 +818,7 @@ def _audit_task_isolation_permission_config(
     disable_network: bool,
     managed_network_proxy: bool,
     sandbox_mode: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> None:
     """Reject any widening of the request-local Task filesystem profile."""
 
@@ -612,6 +831,7 @@ def _audit_task_isolation_permission_config(
         disable_network=disable_network,
         managed_network_proxy=managed_network_proxy,
         sandbox_mode=sandbox_mode,
+        runtime_read_paths=runtime_read_paths,
     )
     if profile != expected:
         raise ValueError("Task isolation permission profile changed before admission")
@@ -638,6 +858,7 @@ def _network_isolated_permission_config(
     cwd: str,
     git_read_paths: Sequence[str],
     private_tmpdir: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> dict[str, Any]:
     workspace = os.path.abspath(cwd)
     scratch = os.path.abspath(private_tmpdir)
@@ -651,6 +872,15 @@ def _network_isolated_permission_config(
         path = os.path.abspath(os.path.expanduser(str(value)))
         if path == "/":
             raise ValueError("Delivery linked Git read path cannot be root")
+        filesystem[path] = "read"
+    for value in runtime_read_paths:
+        path = os.path.abspath(os.path.expanduser(str(value)))
+        if (
+            path == "/"
+            or not os.path.isfile(path)
+            or not os.access(path, os.X_OK)
+        ):
+            raise ValueError("Codex runtime projection is not an executable file")
         filesystem[path] = "read"
     if scratch in {"/", workspace}:
         raise ValueError("Delivery scratch path must be an external leaf")
@@ -670,11 +900,13 @@ def _audit_network_isolated_permission_config(
     cwd: str,
     git_read_paths: Sequence[str],
     private_tmpdir: str,
+    runtime_read_paths: Sequence[str] = (),
 ) -> None:
     expected = _network_isolated_permission_config(
         cwd=cwd,
         git_read_paths=git_read_paths,
         private_tmpdir=private_tmpdir,
+        runtime_read_paths=runtime_read_paths,
     )
     if profile != expected:
         raise ValueError("Delivery filesystem profile changed before admission")
@@ -1601,7 +1833,17 @@ class CodexAppServer:
         actual_tier_proxy_route: CodexTierProxyRoute | None = None,
         require_actual_tier_proof: bool = False,
     ) -> None:
-        self.binary = binary
+        # Permission profiles default-deny the host filesystem. Codex 0.147
+        # re-execs its standalone binary and may spawn the adjacent code-mode
+        # host for sandboxed shell calls. Launch through a hard-linked,
+        # credential-free, allow-listed runtime projection so every required
+        # executable resolves inside the admitted directory.
+        self._runtime_read_paths = _codex_runtime_read_paths(binary)
+        self.binary = (
+            self._runtime_read_paths[0]
+            if self._runtime_read_paths
+            else binary
+        )
         self.request_timeout = request_timeout
         self.codex_home = normalize_codex_home(codex_home)
         self._env_remove = {
@@ -3700,6 +3942,7 @@ class CodexAppServer:
         on_turn_prepared: (
             Callable[[CodexTurnProcess, str], Awaitable[None]] | None
         ) = None,
+        _isolated_admission_retry_count: int = 0,
     ) -> tuple[CodexTurnProcess, str]:
         managed_runtime_prestarted = False
         managed_network_process: asyncio.subprocess.Process | None = None
@@ -3961,12 +4204,14 @@ class CodexAppServer:
                 cwd=cwd,
                 git_read_paths=task_git_read_paths,
                 private_tmpdir=str(task_private_tmpdir.path),
+                runtime_read_paths=self._runtime_read_paths,
             )
             _audit_network_isolated_permission_config(
                 network_permission_config,
                 cwd=cwd,
                 git_read_paths=task_git_read_paths,
                 private_tmpdir=str(task_private_tmpdir.path),
+                runtime_read_paths=self._runtime_read_paths,
             )
         tool_free_permission_profile = (
             f"{_TOOL_FREE_PERMISSION_PROFILE_PREFIX}{uuid.uuid4().hex}"
@@ -4046,6 +4291,7 @@ class CodexAppServer:
                         disable_network=task_ssh_disable_network,
                         managed_network_proxy=task_managed_network_proxy,
                         sandbox_mode=sandbox_mode,
+                        runtime_read_paths=self._runtime_read_paths,
                     )
                 else:
                     _audit_network_isolated_permission_config(
@@ -4053,6 +4299,7 @@ class CodexAppServer:
                         cwd=cwd,
                         git_read_paths=task_git_read_paths,
                         private_tmpdir=str(task_private_tmpdir.path),
+                        runtime_read_paths=self._runtime_read_paths,
                     )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
@@ -4082,6 +4329,85 @@ class CodexAppServer:
         isolated_skills_inventory_fingerprint: str | None = None
         isolated_ambient_effective_config: dict[str, Any] | None = None
         isolated_dynamic_disabled_features: frozenset[str] = frozenset()
+
+        async def retry_isolated_admission_after_skills_drift(
+            thread_id: str,
+            error: _CodexIsolatedSkillsDriftError,
+        ) -> tuple[CodexTurnProcess, str]:
+            """Delete one empty thread and rebuild its exact skill deny-list."""
+
+            if resume_session_id:
+                # A resumed id owns durable history and must never be deleted
+                # as compensation for a local admission race.
+                raise error
+
+            logger.warning(
+                "Recycling empty Codex thread after isolated skills drift "
+                "home=%s thread=%s retry=%s",
+                self.codex_home,
+                thread_id,
+                _isolated_admission_retry_count,
+            )
+            delete_request = asyncio.create_task(self._request(
+                "thread/delete",
+                {"threadId": thread_id},
+                expected_process=isolated_process,
+            ))
+            cancelled = False
+            while not delete_request.done():
+                try:
+                    await asyncio.shield(delete_request)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    continue
+            try:
+                delete_request.result()
+            except Exception as cleanup_error:
+                raise CodexRequiredMcpPreTurnError(
+                    "Codex could not release an empty isolated thread after "
+                    "its skills inventory changed"
+                ) from cleanup_error
+            finally:
+                self._known_threads.discard(thread_id)
+                self._contexts_by_thread.pop(thread_id, None)
+
+            if cancelled:
+                raise asyncio.CancelledError
+            if _isolated_admission_retry_count >= 1:
+                raise error
+
+            return await self.start_turn(
+                prompt=prompt,
+                cwd=cwd,
+                model=model,
+                effort=effort,
+                resume_session_id=resume_session_id,
+                git_env=git_env,
+                task_id=task_id,
+                mcp_specs=mcp_specs,
+                disable_project_config=disable_project_config,
+                disable_user_mcp=disable_user_mcp,
+                skill_context=skill_context,
+                codex_service_tier=codex_service_tier,
+                sandbox_mode=sandbox_mode,
+                task_ssh_protected_paths=task_ssh_protected_paths,
+                task_ssh_allowed_read_paths=task_ssh_allowed_read_paths,
+                task_git_read_paths=task_git_read_paths,
+                task_git_boundary_fingerprint=task_git_boundary_fingerprint,
+                task_private_tmpdir=task_private_tmpdir,
+                task_ssh_disable_network=task_ssh_disable_network,
+                task_managed_network_proxy=task_managed_network_proxy,
+                disable_autonomous_features=disable_autonomous_features,
+                network_isolated=network_isolated,
+                output_schema=output_schema,
+                tools_disabled=tools_disabled,
+                mcp_only=mcp_only,
+                on_thread_started=on_thread_started,
+                on_turn_prepared=on_turn_prepared,
+                _isolated_admission_retry_count=(
+                    _isolated_admission_retry_count + 1
+                ),
+            )
         try:
             thread_config: dict[str, Any] = (
                 render_codex_mcp_config(mcp_specs) if mcp_specs else {}
@@ -4290,6 +4616,7 @@ class CodexAppServer:
                 disable_network=task_ssh_disable_network,
                 managed_network_proxy=task_managed_network_proxy,
                 sandbox_mode=sandbox_mode,
+                runtime_read_paths=self._runtime_read_paths,
             )
             _audit_task_isolation_permission_config(
                 task_permission_config,
@@ -4301,6 +4628,7 @@ class CodexAppServer:
                 disable_network=task_ssh_disable_network,
                 managed_network_proxy=task_managed_network_proxy,
                 sandbox_mode=sandbox_mode,
+                runtime_read_paths=self._runtime_read_paths,
             )
             _deep_merge_config(
                 thread_config,
@@ -4557,10 +4885,103 @@ class CodexAppServer:
                     if isolated_ambient_config_sections.get(key)
                     != current_sections.get(key)
                 )
-                raise CodexRequiredMcpPreTurnError(
+                error_type = (
+                    _CodexIsolatedSkillsDriftError
+                    if (
+                        not config_changed
+                        and (skills_changed or revision_changed)
+                    )
+                    else CodexRequiredMcpPreTurnError
+                )
+                raise error_type(
                     "Codex isolated ambient configuration or skills changed "
                     f"{phase} (config_sections={changed_sections}, "
                     f"skills={skills_changed}, revision={revision_changed})"
+                )
+
+        task_resume_runtime_recycled = False
+        if resume_session_id and (task_ssh_protected_paths or network_isolated):
+            # ``thread/resume`` applies request-local MCP, feature and skill
+            # overrides only while loading an unloaded rollout. Codex keeps a
+            # loaded thread's MCP clients and code-mode host alive and merely
+            # logs that new overrides were ignored. Prove this exact native
+            # thread is quiescent, then unload/reload it before taking any
+            # ambient inventory snapshot or sending model input.
+            #
+            # The registry already holds the per-thread start reservation
+            # across this method. Goal + thread/read is the stronger native
+            # idle proof: an empty CCM context map alone cannot rule out an
+            # autonomous Goal left by an older process generation.
+            require_stable_task_filesystem_boundary(
+                "before isolated resume runtime recycle"
+            )
+            require_isolated_runtime_generation(
+                "before isolated resume runtime recycle"
+            )
+            require_managed_network_generation(
+                "before isolated resume runtime recycle"
+            )
+            runtime_needs_recycle = True
+            try:
+                await self.require_thread_routing_quiescence(
+                    str(resume_session_id),
+                )
+            except CodexThreadTerminalStateError as exc:
+                if exc.state == "notLoaded":
+                    # A fresh app-server has no live MCP client, code-mode
+                    # host, or autonomous turn for an unloaded rollout. The
+                    # upcoming exact thread/resume will load it with this
+                    # request's newly audited isolation config, so mutating
+                    # archive state here is both unnecessary and less safe.
+                    runtime_needs_recycle = False
+                    logger.info(
+                        "Codex isolated resume runtime is already unloaded "
+                        "task=%s thread=%s",
+                        task_id,
+                        resume_session_id,
+                    )
+                # systemError is authoritative evidence that no turn is
+                # running. It is the one loaded terminal state for which the
+                # existing archive/unarchive recovery is safe. Unknown and
+                # all non-idle Goal states remain closed.
+                elif exc.state != "systemError":
+                    raise
+            if runtime_needs_recycle:
+                try:
+                    await self.recycle_thread_runtime(str(resume_session_id))
+                    task_resume_runtime_recycled = True
+                except CodexThreadRuntimeRecycleCancelled:
+                    raise
+                except asyncio.CancelledError as exc:
+                    raise CodexThreadRuntimeRecycleCancelled(
+                        str(resume_session_id)
+                    ) from exc
+                except CodexThreadRuntimeRecycleError:
+                    raise
+                except Exception as exc:
+                    # Archive is a native mutation boundary. Once recycle is
+                    # attempted, an RPC error or lost acknowledgement cannot
+                    # be classified as replay-safe merely because turn/start
+                    # has not happened yet.
+                    raise CodexThreadRuntimeRecycleError(
+                        str(resume_session_id),
+                        str(exc) or type(exc).__name__,
+                    ) from exc
+            require_stable_task_filesystem_boundary(
+                "after isolated resume runtime recycle"
+            )
+            require_isolated_runtime_generation(
+                "after isolated resume runtime recycle"
+            )
+            require_managed_network_generation(
+                "after isolated resume runtime recycle"
+            )
+            if task_resume_runtime_recycled:
+                logger.info(
+                    "Recycled idle Codex Task runtime before exact resume "
+                    "task=%s thread=%s",
+                    task_id,
+                    resume_session_id,
                 )
 
         if restricted_tools or network_isolated or task_ssh_protected_paths:
@@ -4766,6 +5187,7 @@ class CodexAppServer:
                     cwd=cwd,
                     git_read_paths=task_git_read_paths,
                     private_tmpdir=str(task_private_tmpdir.path),
+                    runtime_read_paths=self._runtime_read_paths,
                 )
             )
             isolated_disabled_features = _NETWORK_ISOLATED_DISABLED_FEATURES
@@ -4780,6 +5202,7 @@ class CodexAppServer:
                 disable_network=task_ssh_disable_network,
                 managed_network_proxy=task_managed_network_proxy,
                 sandbox_mode=sandbox_mode,
+                runtime_read_paths=self._runtime_read_paths,
             )
             isolated_disabled_features = _NETWORK_ISOLATED_DISABLED_FEATURES
         if isolated_permission_profile_id is not None:
@@ -4938,6 +5361,17 @@ class CodexAppServer:
         status = thread.get("status") if isinstance(thread, dict) else None
         status_type = self._thread_status_type(status)
         if resume_session_id and status_type == "systemError":
+            if task_resume_runtime_recycled:
+                # The Task resume already consumed its single safe pre-turn
+                # recycle. Repeating it would hide a persistent terminal
+                # state instead of proving a fresh isolated runtime.
+                raise CodexThreadTerminalStateError(
+                    thread_id,
+                    status_type,
+                    operation=f"{thread_method} turn admission",
+                    recovery_attempted=True,
+                    detail="fresh isolated resume remained terminal",
+                )
             # systemError is an authoritative no-running-turn state, but Codex
             # will not admit a follow-up until the loaded runtime is refreshed.
             # Recycle this exact thread once; never replay through exec and never
@@ -4994,9 +5428,14 @@ class CodexAppServer:
                     tool_free_skills_revision is None
                     or self._skills_revision != tool_free_skills_revision
                 ):
-                    raise ValueError(
+                    raise _CodexIsolatedSkillsDriftError(
                         "skills inventory changed during admission"
                     )
+            except _CodexIsolatedSkillsDriftError as exc:
+                return await retry_isolated_admission_after_skills_drift(
+                    thread_id,
+                    exc,
+                )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex tool-free profile was not proven by the "
@@ -5029,9 +5468,14 @@ class CodexAppServer:
                     tool_free_skills_revision is None
                     or self._skills_revision != tool_free_skills_revision
                 ):
-                    raise ValueError(
+                    raise _CodexIsolatedSkillsDriftError(
                         "skills inventory changed during Task admission"
                     )
+            except _CodexIsolatedSkillsDriftError as exc:
+                return await retry_isolated_admission_after_skills_drift(
+                    thread_id,
+                    exc,
+                )
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex Task isolation profile was not proven by the "
@@ -5071,20 +5515,27 @@ class CodexAppServer:
         require_stable_task_filesystem_boundary("after thread admission")
         require_isolated_runtime_generation("after thread admission")
         require_managed_network_generation("after thread admission")
-        self._known_threads.add(thread_id)
-        if on_thread_started is not None:
-            # A caller that owns durable lifecycle state can bind the exact
-            # native identity before any model turn is admitted. In
-            # particular, Monitor uses this hook to survive a process crash
-            # between thread/start and turn/start without guessing a rollout.
-            await on_thread_started(thread_id)
-        # Re-read after thread/start and any durable thread-id binding. Codex
-        # deep-merges ambient config into the request-local layer, so any
-        # config or skills change invalidates the local isolation proof.
-        await require_stable_isolated_ambient_state("before turn ownership")
+        # Re-read before publishing the native id. Codex 0.147 may finish
+        # background plugin discovery only after the first thread/start. If
+        # that changes the exact skill deny-list, compensate the still-empty
+        # thread and repeat admission once with a newly stabilized inventory.
+        try:
+            await require_stable_isolated_ambient_state(
+                "before turn ownership"
+            )
+        except _CodexIsolatedSkillsDriftError as exc:
+            return await retry_isolated_admission_after_skills_drift(
+                thread_id,
+                exc,
+            )
         require_isolated_runtime_generation("before turn ownership")
         require_managed_network_generation("before turn ownership")
         require_stable_instruction_sources("before turn ownership")
+        self._known_threads.add(thread_id)
+        if on_thread_started is not None:
+            # A caller that owns durable lifecycle state binds the exact native
+            # identity after all pure admission checks and before model input.
+            await on_thread_started(thread_id)
         # A native Goal can continue after an older CCM version detached its
         # process adapter. Standard chat may recover that exact Goal by
         # preparing a new CCM owner and steering the pending user input into
@@ -7691,7 +8142,12 @@ class CodexAppServerRegistry:
         except BaseException as exc:
             if isinstance(
                 exc,
-                (CodexThreadNotIdleError, CodexThreadTerminalStateError),
+                (
+                    CodexThreadNotIdleError,
+                    CodexThreadTerminalStateError,
+                    CodexThreadRuntimeRecycleError,
+                    CodexThreadRuntimeRecycleCancelled,
+                ),
             ):
                 # thread start/resume already resolved this exact native
                 # thread in the selected home. Preserve the route even though

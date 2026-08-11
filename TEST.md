@@ -29,6 +29,13 @@ cd frontend && npx tsc --noEmit
 
 测试使用内存 SQLite，不依赖真实数据库或外部服务。
 
+#### `test_task_ssh_sharing.py` — Task 凭据沙箱边界
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_protected_paths_cover_all_git_credential_sources` | 已存在的 repo `.git/credentials` 继续进入 deny 列表；不存在的叶子路径不生成 Bubblewrap 挂载，父 `.git` deny 保持不变 |
+| `test_codex_app_server.py::test_task_ssh_profile_collapses_only_redundant_nested_denies` | 父目录已 deny 时折叠冗余子 deny，避免 Bubblewrap 在只读父挂载中创建子挂载点；若中间 workspace 已重新开放则保留子 deny，精确只读例外仍可覆盖父 deny |
+
 #### `test_tmp_space_manager.py` — `/tmp` 压力保护
 
 测试在 pytest 隔离目录中注入容量/inode 读数；全局测试环境关闭真实宿主
@@ -433,6 +440,10 @@ Codex 版本兼容基线（2026-07-24）：
 | 测试 | 验证内容 |
 |------|---------|
 | `test_start_turn_injects_mcp_config_into_new_thread` | `thread/start` 收到 task-scoped `config.mcp_servers.ccm_skills` |
+| `test_task_isolated_resume_recycles_loaded_runtime_before_exact_resume` / `test_network_isolated_delivery_resume_recycles_loaded_runtime` / `test_task_isolated_resume_loads_not_loaded_runtime_without_recycle` | 旧 loaded Task 与 Delivery thread 每次 resume 都先以 Goal + `thread/read=idle` 证明静止并 settle archive→unarchive；新 app-server 中已 `notLoaded` 的 rollout 不做多余 native mutation，直接以关闭 code-mode host 的精确隔离配置加载 |
+| `test_task_isolated_resume_refuses_recycle_without_idle_proof` / `test_task_isolated_resume_recycle_failure_is_uncertain_and_fail_closed` / `test_registry_preserves_owner_when_task_recycle_effect_is_uncertain` | active/未知 runtime 在 mutation 前拒绝；archive 发出后的失败属于不确定结果，保留 exact-home owner、禁止 `thread/resume`/`turn/start` 与 queued replay |
+| `test_task_isolated_resume_retry_recycles_after_preflight_failure` / `test_registry_preserves_owner_when_task_recycle_is_cancelled` | replay-safe 的 response audit 失败可在下一次 admission 重新加载；recycle mutation 期间取消则保留 owner 并 fail closed |
+| `test_task_isolation_interrupts_unbound_mcp_tool_call` / `test_task_ssh_profile_denies_host_keys_and_direct_network` | Task profile 关闭 `code_mode`/`code_mode_host`；调用级 MCP server identity 只允许显式 CCM server，`codex` broker、缺失或歧义身份继续 fail closed |
 | `test_start_turn_uses_native_resume_and_turn_start` | `thread/resume` 同时合并 MCP 配置和线程级 Git 环境，不互相覆盖 |
 | `test_concurrent_task_threads_keep_mcp_context_isolated` | 同一 app-server 并发任务保留各自 `task_id`，配置对象不串线 |
 | `test_required_mcp_thread_rejection_is_explicit` | required MCP 的 thread admission 失败转为可安全重试的 `CodexRequiredMcpPreTurnError` |
@@ -747,6 +758,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_plan_phase` | plan 模式进入 plan_review |
 | `test_concurrent_task_consumers_reserve_distinct_idle_instances` | 不同 task 的 queued-message consumer 同时选 instance 时原子预留，分配到不同 idle worker |
 | `test_reserve_idle_instance_excludes_only_integer_running_keys` | 远端 Worker 的字符串 lifecycle key 不进入本地 `Instance.id` 整数 SQL 过滤 |
+| `test_dispatch_loop_browser_child_keeps_reserved_instance_identity` | Browser 子任务领取时即使 `dequeue()` commit/expire 当前 Session，Dispatcher 仍只用预先快照的 Instance 标量身份启动生命周期并释放 reservation，不访问 detached ORM 对象 |
+| `test_browser_child_expiry_then_plan_claim_uses_reserved_scalar` | Browser child 竞争导致 `rollback()+expire_all()` 后若回退领取 Plan，仍只以预快照 `instance_id` 完成双向 owner claim，不触发 `MissingGreenlet` |
+| `test_runtime_recycle_uncertainty_fails_without_queued_replay` | Codex archive mutation 结果不确定时，即使没有 process/transport 证据也将 Task fail closed，消息不进入 5 秒自动重排队 |
 | `test_instance_contention_requeues_exact_message` | 底层 `InstanceAlreadyRunningError` 防线触发时，原 `QueuedMessage` 重排队且不丢用户消息 |
 
 ##### `test_service_update.py` / `UpdateButton.test.tsx` — 安全更新与自动提醒

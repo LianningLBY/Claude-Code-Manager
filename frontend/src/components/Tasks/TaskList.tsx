@@ -38,6 +38,19 @@ const statusColors: Record<string, string> = {
   cancelled: 'bg-gray-500',
 };
 
+// Keep this aligned with backend/api/tasks.py::_MANUAL_RETRYABLE_STATUSES.
+// Active background output and controller-owned task modes have separate
+// lifecycle controls and cannot be retried through the public Task action.
+const manualRetryableStatuses = new Set(['failed', 'cancelled', 'conflict', 'completed']);
+
+function canRetryTask(task: Task): boolean {
+  return !task.background_active
+    && task.mode !== 'plan'
+    && task.mode !== 'delivery_loop'
+    && task.delivery_run_id == null
+    && manualRetryableStatuses.has(task.status);
+}
+
 export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
   const projectMap = useMemo(() => {
     const map: Record<number, { name: string; color: string | null }> = {};
@@ -358,7 +371,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                         <XCircle size={14} /> Cancel
                       </button>
                     )}
-                    {t.status === 'failed' && (
+                    {canRetryTask(t) && (
                       <button
                         onClick={() => { handleRetry(t); setMenuOpenId(null); }}
                         className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-blue-400 hover:bg-gray-800 text-left"

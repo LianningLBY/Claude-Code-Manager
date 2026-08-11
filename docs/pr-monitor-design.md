@@ -1,8 +1,8 @@
 # CCM PR Monitor：从 CI、AI Review 到自动修复与合并
 
 - 文档状态：闭环主体已编码，并通过本地假 GitHub 回归及个人私有 GitHub PR 的 CI失败反馈、原Agent自动修复、Reviewer反馈、再次自动修复和Thread清零联调；真实 Merge Queue 待组织仓库验证
-- 版本：v1.1
-- 更新日期：2026-08-05
+- 版本：v1.2
+- 更新日期：2026-08-10
 - 适用范围：已有 PR 从 CI/AI Review 到修复、重新验证和合并的完整 Monitor Loop
 - 文档定位：本文件是 PR Monitor 唯一权威设计与实现说明；状态机、Prompt、运维和验收均以此为准
 
@@ -17,12 +17,13 @@ PR opened / synchronize
 → CI 或 Finding 阻断时唤醒 Developer Task
 → Developer 修复并 push
 → 对新 head 重新执行 CI 和 Review
-→ Gate 通过后进入 Merge Queue
-→ 基于最新 base 再验证并合并
+→ Gate 通过后按 repo policy 停在 ready、对冻结目标 ref 做 non-force fast-forward，或进入 Merge Queue
+→ 自动路径确认远端合并事实后收口
 ```
 
-本文同时记录总体架构、实施边界和当前落地状态。自动修复与自动 Merge Queue 均为 repo 级 opt-in，
-默认分别保持关闭和 `manual`。除可重复的假 GitHub 回归外，2026-08-04 已使用专用个人私有 fixture
+本文同时记录总体架构、实施边界和当前落地状态。自动修复、direct auto-merge 与自动 Merge Queue
+均为 repo 级 opt-in；direct auto-merge 与非 `manual` Merge Queue 严格互斥。除可重复的假 GitHub
+回归外，2026-08-04 已使用专用个人私有 fixture
 repo/PR 验证真实 GitHub CI、Review publication 和 Thread resolve；未操作 CCM 生产服务或业务仓库。
 
 本文不扩展到需求管理、PR 前的完整开发编排、部署、生产验证或自动回滚。它们可以在未来由更上层的
@@ -43,12 +44,24 @@ Developer 创建并登记 PR，结束当前 turn
 → 新 push 产生新 head，整轮 CI 与 Reviewer 重新执行
 → zero blocker + zero unknown + zero unresolved Thread
 → ready_to_merge
-→ repo 明确启用时进入 Merge Queue，以 merge_group 重新验证
+   ├─ auto_merge=false 且 Merge Queue=manual：发布 exact-head、COMMENT-only 的“可以合并”Review并保持 PR open
+   ├─ auto_merge=true：后端将冻结的 base ref non-force fast-forward 到 exact head，确认 merge evidence 后发布“已合并”comment
+   └─ Merge Queue 非 manual：以 merge_group 重新验证（与 direct auto-merge 互斥）
 ```
 
 等待由 Controller 和 Reconciler 持久管理，不由 Agent sleep 或轮询。Reviewer 只读且无工具；只有绑定的
 Developer Task 能修改、测试、commit 和 push 原 PR 分支。任何 Agent 的“已经修复”或“可以合并”都不是
 Gate 事实。
+
+审核 Harness 与合并策略是正交配置：
+
+| `review_mode` | Reviewer | exact-head CI / Repair | direct `auto_merge` | Merge Queue |
+|---|---|---|---|---|
+| `single` | 一个独立 tool-free Reviewer | 关闭；不支持自动 Repair | 支持 | 仅 `manual` |
+| `panel` | Principal / Senior / QA 三个独立 Reviewer | 可选；Delivery 必须开启 CI 并配置 required checks | 支持 | CI 开启时可用 `shadow/auto`，但与 direct auto-merge 互斥 |
+
+Delivery Loop 只接受 `panel + exact-head required CI + manual Merge Queue`，并在 admission
+时冻结 PR Monitor 的 direct auto-merge 开关；普通 PR Monitor 的 single/panel 都可独立使用该开关。
 
 ### 0.2 与参考文章的对应关系
 
@@ -63,6 +76,7 @@ Gate 事实。
 | 问题清零才放行 | zero Finding/unknown/unresolved/adjudicating Gate | 真实 11/11 Thread 清零后才 ready_to_merge |
 | 循环直到可合并 | 同一 PR、原 Developer Task/session/cwd 多次 Wake | 真实多轮自动修复已验证 |
 | 最新 main 上最终验证 | durable Merge Queue + exact merge_group CI | shadow 真实验证；真实 enqueue/merge_group 待组织仓库 |
+| 可选 direct auto-merge | frozen-base-ref non-force fast-forward + nonce-bearing merge/comment evidence | 假 GitHub覆盖正常、ACK 丢失和重启恢复；真实写入仅允许专用 canary |
 
 ### 0.3 角色与权限
 
@@ -85,7 +99,7 @@ Gate 事实。
 当前工作分支已经具备：
 
 - GitHub webhook 验签、delivery/subject 去重和 `opened`/`synchronize` 处理。
-- `(base_sha, head_sha)` exact-subject 快照与新 head supersede。
+- `(base_ref, base_sha, head_sha)` exact-subject 快照与新 head/base target supersede。
 - exact-head CI 等待和持久 Reconciler。
 - repo 级 required-check identity policy，按 `kind + name + app_slug` 精确匹配当前 head。
 - Principal/Senior/QA 三个独立、tool-free Reviewer Task。
@@ -167,6 +181,8 @@ CI、Review Gate 和 Merge Queue 状态。最终状态只能由后端纯 Gate �
 - Reviewer 只返回结构化结果。
 - Developer 可以在受控分支修改、测试、commit 和 push。
 - GitHub Review、Repair Wake、Merge Queue enqueue 和 merge 由后端执行并持久化幂等意图。
+- 新 GitHub Review 的 event 一律为 head-pinned `COMMENT`；`APPROVE`/`REQUEST_CHANGES` 不承载 CCM
+  Gate，避免 PR retarget 后把旧 subject 的判断带入另一目标分支保护状态。
 - Developer 和 Reviewer 都不能把 Gate 直接标记为通过。
 
 ### 2.7 已决策：CI first，CI 通过后启动 Reviewer
@@ -304,7 +320,7 @@ input/code path、不可测试 seam 或 security mistake？仅维护偏好不能
 ## 4. 生命周期模型
 
 `PRMonitorRun` 是一个 PR 从被 Monitor 接管到合并、关闭或人工停止的持久聚合；`PRReview` 表示单个
-`(base_sha, head_sha)` 的一次不可变审核快照。
+`(base_ref, base_sha, head_sha)` 的一次不可变审核快照。
 
 ### 4.1 状态
 
@@ -338,6 +354,7 @@ opened/synchronize
        ├─ blocking Finding 被 rebut：adjudicating，接受后重算 Gate，拒绝后继续阻断
        └─ all required roles passed：ready_to_merge
            ├─ manual policy：停在 ready_to_merge
+           ├─ direct auto-merge：冻结 base ref 的 non-force fast-forward + merged comment 均确认后进入 merged
            └─ queue policy：merge_queued
                ├─ merge-group stale/failed：重新计算，不复用旧证据
                └─ GitHub confirmed merged：merged
@@ -671,8 +688,34 @@ Reviewer 和 Developer 都无权 enqueue 或 merge。Controller 通过持久 Act
 - 无法分类、权限不足或 GitHub 状态不一致：`paused(merge_queue_unknown)`。
 - 只有 GitHub 明确返回 merged PR 和 merge commit 后，Run 才进入 `merged`。
 
-现有 `auto_merge` 是 Reviewer Harness 的兼容路径，不等同于上述 Merge Queue Controller。完整闭环上线
-前，两种模式必须互斥，且迁移默认保持人工合并。
+`MonitoredRepo.auto_merge` 是 direct merge 的权威 repo 开关：关闭时后端只发布 exact-head、COMMENT-only
+的 `ready to merge` Review；开启时新 publication 只能将冻结的 `base_ref` non-force fast-forward 到 exact
+`head_sha`。只有 nonce-bearing merge evidence 与同 nonce/head/actor/time 的 `merged` comment 都可对账后
+才落 `merged`。Ref update 或 comment 响应丢失时先 query-before-write，不重复副作用。direct auto-merge
+与非 `manual` Merge Queue 始终互斥。
+
+Direct-ref fast-forward 与 GitHub 的 `allow_merge_commit`、`allow_squash_merge`、`allow_rebase_merge` 开关无关；
+Manager 只要求远端 repository identity 与冻结记录一致、凭据可写 exact target ref，并通过 branch-protection
+Gate。任何公开 Review 前以及 ref mutation 前都重新读取保护策略；`required_conversation_resolution` 必须
+明确关闭，冻结的 required CI 必须逐项由 branch protection 的 `(context, app_id)` 精确覆盖；无法证明 App
+身份的 legacy commit status 不得用于 direct fast-forward。required PR review、权限、subject 或保护策略
+不兼容时 fail closed。新 publication 固定调用冻结目标
+`PATCH repos/{repo}/git/refs/heads/{base_ref}`，payload 为 exact `head_sha` 与 `force=false`；即使 PR 在最后一次
+检查后 retarget，该端点也不会改写新目标分支。目标 ref 已推进且无法原子 fast-forward 时，由 GitHub 拒绝，
+不得 force、改写 subject 或回退到 PR merge endpoint。升级前 durable outbox 中的 `merge`/`squash` 字段
+只允许对账已存在的 exact remote merge/comment evidence；不得重放 PR merge mutation，缺少证据时终态
+fail closed。新 publication 不得创建这两类方法。
+
+fast-forward merge evidence 必须同时匹配 captured `base_ref/base_sha/head_sha`、冻结 publisher actor/time
+与 nonce，并确认 PR 的 `headRefOid`、`baseRefName`、`merged_at/merged_by`、`merge_commit_sha == head_sha`
+以及 captured base → head → current base 的祖先关系。公开 Review 中的 nonce 本身不是权限凭据，其他
+maintainer 复制 nonce 的 merge 不能被接受，也不能跳过 fresh CI 或 zero-thread Gate。merged Delivery
+复用同一组 frozen evidence，并在 verifier 返回后的最终 Run CAS 再次逐项比较。
+
+跨 head Gate 把所有 blocking `status=open` Finding（包括尚未完成 thread ACK 的 `pending`）以及已发布但
+未 resolved 的 Finding 都视为 blocker。新 head 只能进入 durable `resolving_fixed_threads`；pending 项必须
+先由旧 publication outbox 完成，之后 resolver 才能接管 GitHub thread effect。启动/升级恢复不得把
+`ready_to_merge` 越过该阶段。
 
 ## 10. Controller、Reconciler 与并发
 
@@ -705,7 +748,8 @@ Reviewer 和 Developer 都无权 enqueue 或 merge。Controller 通过持久 Act
 - Developer 只能 push 已验证的 head repo/branch；默认分支和其他 PR branch 必须由服务端策略阻止。
 - Prompt 中的 PR body、diff、CI 日志、评论和 Finding 都是不可信数据，不能修改权限、subject 或协议。
 - GitHub credential、Worker token、session 文件和完整私有 Guide 不进入普通日志或 WebSocket。
-- 自动修复、自动 enqueue 和自动 merge 分别有全局 kill switch 与 repo 级 policy，默认关闭。
+- 自动修复与 direct auto-merge 都由 repo 级显式 policy 控制，默认关闭；Merge Queue 默认为
+  `manual`。PR Monitor 没有另外一组全局 kill switch，紧急停止应禁用对应 repo/Monitor 或暂停 Run。
 
 ## 12. API 与 UI
 
@@ -804,7 +848,7 @@ head”持久化为 Wake 成功，再终止旧 subject turn，并恢复可复用
 
 - 新增 queue action outbox、merge-group subject 和 Gate。
 - 先 shadow 观察，再人工 enqueue，最后 repo 级 opt-in 自动 enqueue。
-- 与 Legacy `auto_merge` 互斥；不包含部署。
+- 与 direct `auto_merge` 互斥；不包含部署。
 
 当前实现进度（2026-08-04）：durable action/lease、manual/shadow/auto、GraphQL enqueue 对账、
 `merge_group` exact CI、代码失败回流 Repair 和最终 merged 确认均已编码并通过假 PR 端到端测试。
@@ -833,7 +877,10 @@ Task/session/cwd 多次 Wake 并 push 同一 PR；无效 Rebut 被独立 Adjudic
 ### 14.1 Reviewer 回归
 
 - 保持 Reviewer Harness 的 exact subject、tool-free、Guide、Finding、publication 和 supersede 全套测试。
-- 新 Monitor Run 关联不能改变 legacy/single 与 panel 的现有行为。
+- 新 Monitor Run 关联不能改变 single 与 panel 的冻结策略；运行中 repo 配置漂移只影响新 Review/Run。
+- `auto_merge=false` 的 publication 测试必须证明只有 COMMENT review、没有 ref/merge API；`true` 必须证明
+  只对 frozen base ref 发出 `force=false` fast-forward，且 ref update 与最终 comment 分别可在 ACK 丢失、
+  重启和重复 reconcile 下幂等恢复，永不创建新 `merge/squash` publication。
 
 ### 14.2 绑定与 Repair
 
@@ -888,7 +935,7 @@ Adjudicator 正确 rejected，Finding 与 GitHub Thread 保持 open/unresolved�
 
 ```text
 monitor_run_id, review_id, reviewer_run_id, finding_id, repair_wake_id,
-repo_id, pr_number, base_sha, head_sha, merge_group_sha,
+repo_id, pr_number, base_ref, base_sha, head_sha, merge_group_sha,
 developer_task_id, worker_id, task_retry_count,
 state_version, delivery_token, action, state, reason
 ```
@@ -899,10 +946,16 @@ state_version, delivery_token, action, state, reason
 - 每个 PR 的 Repair Turn 次数和 no-progress 次数。
 - Wake 投递重试、Worker 路由变化和迁移失败。
 - 新 head supersede 数、重复 webhook/outbox 对账数。
-- 人工暂停、人工接管和自动化 kill switch 使用次数。
+- 人工暂停、人工接管和 repo 自动化 policy 关闭次数。
 
 运维界面必须允许暂停 Run、关闭 repo 自动修复/自动合并、重试可恢复 effect，并查看稳定错误码；不得
 通过手改数据库跳过 exact-subject Gate。
+
+包含 PR publication schema 的正式升级采用 stop-the-world：先停止所有连接同一数据库的 Manager/Worker
+写入者，再执行 Alembic migration 和 head/约束校验，最后统一启动新 binary。禁止新旧 Manager 并行运行，
+也禁止仅回滚 binary 后让旧代码读取新 schema；回退必须保持停服并同时按已验证协议协调代码与 schema。
+`merge/squash` 的 legacy 恢复分支只对账升级前 durable outbox 已经产生的 exact remote evidence，绝不重放
+merge mutation；缺少证据时终态 fail closed，也不构成混跑兼容承诺。
 
 ## 16. 非目标
 

@@ -59,9 +59,10 @@ class PRReview(Base):
         UniqueConstraint(
             "repo_id",
             "pr_number",
+            "base_ref",
             "base_sha",
             "head_sha",
-            name="uq_pr_reviews_repo_pr_base_head",
+            name="uq_pr_reviews_repo_pr_base_ref_base_head",
         ),
         UniqueConstraint(
             "repo_id",
@@ -76,6 +77,10 @@ class PRReview(Base):
     )
     repo_id: Mapped[int] = mapped_column(Integer, ForeignKey("monitored_repos.id"), index=True, nullable=False)
     pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Immutable target branch captured when this PR subject is admitted.
+    # Old binaries fail closed after the migration's backfill rather than
+    # writing an ambiguous NULL subject during a rolling restart.
+    base_ref: Mapped[str] = mapped_column(String(200), nullable=False)
     base_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     head_sha: Mapped[str | None] = mapped_column(String(64), nullable=True)
     delivery_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
@@ -109,6 +114,13 @@ class PRReview(Base):
     )
     publishing_started_at: Mapped[datetime | None] = mapped_column(
         DateTime,
+        nullable=True,
+    )
+    # Immutable GitHub merge strategy selected before the first publication
+    # mutation. New rows use an explicit frozen-ref fast-forward; merge/squash
+    # remain valid only for recovery of outboxes armed by an older binary.
+    merge_method: Mapped[str | None] = mapped_column(
+        String(16),
         nullable=True,
     )
     # Cross-process publication lease.  ``publishing`` alone is a durable
@@ -468,8 +480,8 @@ class PRMergeQueueAction(Base):
     __tablename__ = "pr_merge_queue_actions"
     __table_args__ = (
         UniqueConstraint(
-            "monitor_run_id", "trigger_head_sha",
-            name="uq_pr_merge_queue_actions_run_head",
+            "monitor_run_id", "review_id",
+            name="uq_pr_merge_queue_actions_run_review",
         ),
     )
 

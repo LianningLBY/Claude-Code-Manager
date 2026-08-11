@@ -59,6 +59,7 @@ async def _seed_queue_action(
         monitor_run_id=run.id,
         repo_id=repo.id,
         pr_number=number,
+        base_ref="main",
         base_sha=base_sha,
         head_sha=head_sha,
         pr_title=name,
@@ -97,6 +98,9 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
         repo_full_name="fake/queue", webhook_secret="s" * 64,
         review_mode="panel", wait_for_ci=True,
         required_checks=[{"kind": "check_run", "name": "tests", "app_slug": "github-actions"}],
+        # The queue subject is frozen on the Review. A later repository
+        # default edit must not redirect merge-group discovery.
+        default_branch="release",
         merge_queue_mode="auto",
     )
     db_session.add(repo)
@@ -109,6 +113,7 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     await db_session.flush()
     review = PRReview(
         monitor_run_id=run.id, repo_id=repo.id, pr_number=12,
+        base_ref="main",
         base_sha=BASE, head_sha=HEAD, pr_title="queue", pr_author="bot",
         pr_url="https://example.invalid/fake/queue/pull/12", status="commented",
     )
@@ -126,18 +131,19 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
         return {
             "state": "MERGED" if merged else "OPEN",
             "mergedAt": "2026-08-04T00:00:00Z" if merged else None,
+            "baseRefName": "main",
             "baseRefOid": BASE,
             "headRefOid": HEAD,
             "isDraft": False,
             "mergeCommit": {"oid": MERGE} if merged else None,
         }
 
-    async def fake_enqueue(_repo, _number, base_sha, head_sha):
-        assert (base_sha, head_sha) == (BASE, HEAD)
-        return QueueEntry("MQ1", "QUEUED", BASE, HEAD)
+    async def fake_enqueue(_repo, _number, base_ref, base_sha, head_sha):
+        assert (base_ref, base_sha, head_sha) == ("main", BASE, HEAD)
+        return QueueEntry("MQ1", "QUEUED", "main", BASE, HEAD)
 
     async def fake_entry(_repo, _number):
-        return QueueEntry("MQ1", "AWAITING_CHECKS", BASE, HEAD)
+        return QueueEntry("MQ1", "AWAITING_CHECKS", "main", BASE, HEAD)
 
     async def fake_group(_repo, *, default_branch, pr_number):
         assert (default_branch, pr_number) == ("main", 12)
@@ -175,8 +181,13 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("remote_base_ref", "remote_base_sha"),
+    (("main", "d" * 40), ("release", BASE)),
+    ids=("base-sha-drift", "base-ref-drift-same-shas"),
+)
 async def test_merge_queue_pauses_when_remote_base_changes_without_head_change(
-    db_session, db_factory, monkeypatch
+    db_session, db_factory, monkeypatch, remote_base_ref, remote_base_sha
 ):
     repo = MonitoredRepo(
         repo_full_name="fake/base-drift", webhook_secret="s" * 64,
@@ -192,6 +203,7 @@ async def test_merge_queue_pauses_when_remote_base_changes_without_head_change(
     await db_session.flush()
     review = PRReview(
         monitor_run_id=run.id, repo_id=repo.id, pr_number=13,
+        base_ref="main",
         base_sha=BASE, head_sha=HEAD, pr_title="queue", pr_author="bot",
         pr_url="https://example.invalid/fake/base-drift/pull/13",
         status="commented",
@@ -206,7 +218,8 @@ async def test_merge_queue_pauses_when_remote_base_changes_without_head_change(
     async def fake_pr_view(_number, _repo):
         return {
             "state": "OPEN", "mergedAt": None,
-            "baseRefOid": "d" * 40, "headRefOid": HEAD,
+            "baseRefName": remote_base_ref,
+            "baseRefOid": remote_base_sha, "headRefOid": HEAD,
             "isDraft": False, "mergeCommit": None,
         }
 
@@ -252,6 +265,7 @@ async def test_merge_queue_ci_read_failure_does_not_starve_later_actions(
         await db_session.flush()
         review = PRReview(
             monitor_run_id=run.id, repo_id=repo.id, pr_number=index,
+            base_ref="main",
             base_sha=base_sha, head_sha=head_sha, pr_title="queue",
             pr_author="bot", pr_url=f"https://example.invalid/pull/{index}",
             status="commented",
@@ -275,6 +289,7 @@ async def test_merge_queue_ci_read_failure_does_not_starve_later_actions(
         repo, run, _action = next(row for row in rows if row[1].pr_number == number)
         return {
             "state": "OPEN", "mergedAt": None,
+            "baseRefName": "main",
             "baseRefOid": run.current_base_sha,
             "headRefOid": run.current_head_sha,
             "isDraft": False, "mergeCommit": None,
@@ -293,6 +308,7 @@ async def test_merge_queue_ci_read_failure_does_not_starve_later_actions(
         return QueueEntry(
             action.github_queue_entry_id or f"MQ-{number}",
             "AWAITING_CHECKS",
+            "main",
             run.current_base_sha,
             run.current_head_sha,
         )
@@ -327,12 +343,15 @@ async def test_queue_reconciler_recovers_missing_webhook_and_remote_rebuild(
 
     async def fake_pr_view(_number, _repo_name):
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE,
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
     async def fake_entry(_repo_name, _number):
-        return QueueEntry(remote["entry"], "AWAITING_CHECKS", BASE, HEAD)
+        return QueueEntry(
+            remote["entry"], "AWAITING_CHECKS", "main", BASE, HEAD
+        )
 
     async def fake_group(_repo_name, **_kwargs):
         return (
@@ -382,7 +401,8 @@ async def test_queue_entry_disappearance_rechecks_and_records_racing_merge(
         return {
             "state": "MERGED" if merged else "OPEN",
             "mergedAt": "2026-08-04T00:00:00Z" if merged else None,
-            "baseRefOid": BASE, "headRefOid": HEAD, "isDraft": False,
+            "baseRefName": "main", "baseRefOid": BASE,
+            "headRefOid": HEAD, "isDraft": False,
             "mergeCommit": {"oid": MERGE} if merged else None,
         }
 
@@ -410,7 +430,8 @@ async def test_queue_entry_disappearance_pauses_when_pr_remains_open(
 
     async def fake_pr_view(_number, _repo_name):
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE,
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
@@ -439,12 +460,15 @@ async def test_queue_blocked_remote_states_pause_fail_closed(
 
     async def fake_pr_view(_number, _repo_name):
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE,
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
     async def fake_entry(_repo_name, _number):
-        return QueueEntry("MQ-blocked", remote_state, BASE, HEAD)
+        return QueueEntry(
+            "MQ-blocked", remote_state, "main", BASE, HEAD
+        )
 
     monkeypatch.setattr("backend.services.pr_review_service._gh_pr_view", fake_pr_view)
     monkeypatch.setattr("backend.services.pr_merge_queue._read_queue_entry", fake_entry)
@@ -479,13 +503,16 @@ async def test_later_lost_lease_cannot_rollback_earlier_action_progress(
             (BASE, HEAD) if number == 35 else ("d" * 40, "e" * 40)
         )
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": base_sha,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": base_sha,
             "headRefOid": head_sha, "isDraft": False, "mergeCommit": None,
         }
 
     async def fake_entry(_repo_name, number):
         assert number == 35
-        return QueueEntry("MQ-35", "AWAITING_CHECKS", BASE, HEAD)
+        return QueueEntry(
+            "MQ-35", "AWAITING_CHECKS", "main", BASE, HEAD
+        )
 
     async def fake_group(_repo_name, **_kwargs):
         return MERGE, "refs/heads/gh-readonly-queue/main/pr-35-group"
@@ -524,17 +551,20 @@ async def test_enqueue_lease_uses_database_clock_and_covers_confirmation(
 
     async def fake_pr_view(_number, _repo_name):
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE,
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
-    async def fake_enqueue(_repo_name, _number, base_sha, head_sha):
-        assert (base_sha, head_sha) == (BASE, HEAD)
+    async def fake_enqueue(
+        _repo_name, _number, base_ref, base_sha, head_sha
+    ):
+        assert (base_ref, base_sha, head_sha) == ("main", BASE, HEAD)
         async with db_factory() as observer:
             claimed = await observer.get(PRMergeQueueAction, action.id)
             assert claimed.status == "enqueuing"
             assert claimed.lease_expires_at == database_now + timedelta(minutes=10)
-        return QueueEntry("MQ-37", "QUEUED", BASE, HEAD)
+        return QueueEntry("MQ-37", "QUEUED", "main", BASE, HEAD)
 
     monkeypatch.setattr("backend.services.pr_merge_queue._database_now", fake_clock)
     monkeypatch.setattr("backend.services.pr_review_service._gh_pr_view", fake_pr_view)
@@ -548,7 +578,14 @@ async def test_enqueue_lease_uses_database_clock_and_covers_confirmation(
 
 
 @pytest.mark.asyncio
-async def test_enqueue_rechecks_base_before_mutation(monkeypatch):
+@pytest.mark.parametrize(
+    ("remote_base_ref", "remote_base_sha"),
+    (("main", "d" * 40), ("release", BASE)),
+    ids=("base-sha-drift", "base-ref-drift-same-shas"),
+)
+async def test_enqueue_rechecks_base_before_mutation(
+    monkeypatch, remote_base_ref, remote_base_sha
+):
     calls = []
 
     async def no_existing(_repo_name, _number):
@@ -560,7 +597,8 @@ async def test_enqueue_rechecks_base_before_mutation(monkeypatch):
         assert "baseRefOid" in query
         assert "enqueuePullRequest" not in query
         return {"data": {"repository": {"pullRequest": {
-            "id": "PR-node", "baseRefOid": "d" * 40,
+            "id": "PR-node", "baseRefName": remote_base_ref,
+            "baseRefOid": remote_base_sha,
             "headRefOid": HEAD,
         }}}}
 
@@ -571,7 +609,7 @@ async def test_enqueue_rechecks_base_before_mutation(monkeypatch):
         "backend.services.pr_review_service._gh_api_value", fake_gh
     )
     with pytest.raises(ValueError, match="exact queued subject"):
-        await _enqueue("fake/base-race", 41, BASE, HEAD)
+        await _enqueue("fake/base-race", 41, "main", BASE, HEAD)
     assert len(calls) == 1
 
 
@@ -581,7 +619,7 @@ async def test_new_wrong_subject_entry_is_dequeued_but_manual_entry_is_not(
 ):
     queue_reads = iter((
         None,
-        QueueEntry("MQ-new", "QUEUED", "d" * 40, HEAD),
+        QueueEntry("MQ-new", "QUEUED", "main", "d" * 40, HEAD),
         None,
     ))
     mutations = []
@@ -602,7 +640,8 @@ async def test_new_wrong_subject_entry_is_dequeued_but_manual_entry_is_not(
                 "mergeQueueEntry": {"id": "MQ-new"}
             }}}
         return {"data": {"repository": {"pullRequest": {
-            "id": "PR-node", "baseRefOid": BASE, "headRefOid": HEAD,
+            "id": "PR-node", "baseRefName": "main",
+            "baseRefOid": BASE, "headRefOid": HEAD,
         }}}}
 
     monkeypatch.setattr(
@@ -612,11 +651,11 @@ async def test_new_wrong_subject_entry_is_dequeued_but_manual_entry_is_not(
         "backend.services.pr_review_service._gh_api_value", fake_gh
     )
     with pytest.raises(ValueError, match="new entry was removed"):
-        await _enqueue("fake/post-mutation-race", 42, BASE, HEAD)
+        await _enqueue("fake/post-mutation-race", 42, "main", BASE, HEAD)
     assert mutations == ["enqueue", ("dequeue", "PR-node")]
 
     async def manual_entry(_repo_name, _number):
-        return QueueEntry("MQ-manual", "QUEUED", BASE, HEAD)
+        return QueueEntry("MQ-manual", "QUEUED", "main", BASE, HEAD)
 
     async def unexpected_gh(*_args, **_kwargs):
         raise AssertionError("a pre-existing manual entry must not be mutated")
@@ -627,7 +666,7 @@ async def test_new_wrong_subject_entry_is_dequeued_but_manual_entry_is_not(
     monkeypatch.setattr(
         "backend.services.pr_review_service._gh_api_value", unexpected_gh
     )
-    existing = await _enqueue("fake/manual", 43, BASE, HEAD)
+    existing = await _enqueue("fake/manual", 43, "main", BASE, HEAD)
     assert existing.id == "MQ-manual"
     assert existing.created_by_call is False
 
@@ -642,7 +681,8 @@ async def test_failed_wrong_subject_cleanup_pauses_high_risk_action(
 
     async def fake_pr_view(_number, _repo_name):
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE,
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
@@ -684,7 +724,8 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
 
     async def fake_pr_view(_number, _repo_name):
         return {
-            "state": "OPEN", "mergedAt": None, "baseRefOid": BASE,
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE,
             "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
         }
 
@@ -705,7 +746,7 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
             changed_run.state_version += 1
             await concurrent.commit()
         return QueueEntry(
-            "MQ-owned", "QUEUED", BASE, HEAD, True, "PR-owned"
+            "MQ-owned", "QUEUED", "main", BASE, HEAD, True, "PR-owned"
         )
 
     async def fake_dequeue(_repo_name, _number, pull_request_id, entry_id):

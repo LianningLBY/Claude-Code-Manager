@@ -18,6 +18,12 @@ from backend.services.task_sharing import (
     _writable_share_block_reason,
     lock_task_share_authority,
 )
+from backend.services.project_share_admission import (
+    ProjectShareAdmissionError,
+    lock_project_share_authority,
+    project_has_active_share,
+    require_project_agents_quiescent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,17 +74,12 @@ async def _lock_project_share_authority(
 ) -> Project:
     """Lock Project before target/grant rows, including on SQLite."""
 
-    locked = await db.execute(
-        update(Project)
-        .where(Project.id == project_id)
-        .values(id=Project.id)
-    )
-    if locked.rowcount != 1:
-        raise HTTPException(404, "Project not found")
-    project = await db.get(Project, project_id, populate_existing=True)
-    if project is None:
-        raise HTTPException(404, "Project not found")
-    return project
+    try:
+        return await lock_project_share_authority(db, project_id)
+    except ProjectShareAdmissionError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(404, "Project not found") from exc
 
 
 async def _can_share_project(user_id: int | None, user_role: str, project_id: int, db: AsyncSession) -> bool:
@@ -113,9 +114,29 @@ async def share_project(project_id: int, body: ShareBody, request: Request, db: 
         raise HTTPException(404, "Project not found")
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to share this project")
-    await _lock_project_share_authority(project_id, db)
+    project = await _lock_project_share_authority(project_id, db)
     if not await _can_share_project(user_id, user_role, project_id, db):
         raise HTTPException(403, "No permission to share this project")
+    if not await project_has_active_share(db, project_id):
+        try:
+            await require_project_agents_quiescent(db, project)
+        except ProjectShareAdmissionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+    # Lock current Tasks in a stable order. Grant replacement takes the same
+    # Task lock, closing the share-vs-grant race on databases with row locks.
+    await db.execute(
+        select(Task.id)
+        .where(Task.project_id == project_id)
+        .order_by(Task.id)
+        .with_for_update()
+    )
+    from backend.services.task_ssh_access import project_has_task_ssh_grants
+
+    if await project_has_task_ssh_grants(db, project_id):
+        raise HTTPException(
+            409,
+            "Remove SSH grants from this Project's Tasks before sharing it",
+        )
     await _lock_share_target(body.target_type, body.target_id, db)
     existing = await db.execute(
         select(TeamProjectShare)
@@ -237,9 +258,19 @@ async def share_task(task_id: int, body: ShareBody, request: Request, db: AsyncS
     # while this request waited for the Task -> grant lock order.
     if not await _can_share_task(user_id, user_role, task, db):
         raise HTTPException(403, "No permission to share this task")
+    from backend.api.tasks import _require_not_isolated_browser_child
+
+    await _require_not_isolated_browser_child(db, task, action="shared")
     blocked = _writable_share_block_reason(task)
     if blocked is not None:
         raise HTTPException(409, blocked)
+    from backend.services.task_ssh_access import task_has_any_ssh_grants
+
+    if await task_has_any_ssh_grants(db, task_id):
+        raise HTTPException(
+            409,
+            "Remove this Task's SSH grants before sharing it",
+        )
     await _lock_share_target(body.target_type, body.target_id, db)
     # Verify target has Project access
     if task.project_id:

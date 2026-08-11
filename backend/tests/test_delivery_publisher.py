@@ -39,6 +39,7 @@ from backend.services.delivery_controller import (
     DeliveryPublisherNoEffectPreflightError,
     DeliveryPublisherPermanentError,
     DeliverySubjectChanged,
+    PublishedPullRequest,
 )
 from backend.services.delivery_publisher import (
     DeliveryGitError,
@@ -60,6 +61,7 @@ PATCH = "4" * 64
 HEAD2 = "7" * 40
 TREE2 = "8" * 40
 PATCH2 = "9" * 64
+MERGE_PUBLISHED_AT = datetime(2026, 8, 1, 0, 0, 0)
 
 
 @pytest.mark.asyncio
@@ -134,13 +136,15 @@ class FakeGit:
     async def remote_ref_sha(self, subject, branch: str) -> str | None:
         return self.remote_refs.get(branch)
 
-    async def push_exact(self, subject) -> None:
+    async def push_exact(self, subject):
         self.push_calls += 1
         if self.push_error is not None:
             raise self.push_error
         self.remote_refs[subject.delivery_branch] = subject.head_sha
         if self.push_response_lost:
             raise DeliveryGitError("response lost")
+        from backend.services.delivery_publisher import PushResult
+        return PushResult()
 
 
 @dataclass
@@ -212,7 +216,12 @@ def _pull(
     return payload
 
 
-async def _delivery_scope(db_session, *, suffix: str):
+async def _delivery_scope(
+    db_session,
+    *,
+    suffix: str,
+    auto_merge: bool = False,
+):
     repo_name = f"acme/delivery-{suffix}"
     project = Project(
         name=f"publisher-{suffix}",
@@ -234,7 +243,7 @@ async def _delivery_scope(db_session, *, suffix: str):
         worker_id=None,
         webhook_secret="secret",
         enabled=True,
-        auto_merge=False,
+        auto_merge=auto_merge,
         review_mode="panel",
         wait_for_ci=True,
         required_checks=required_checks,
@@ -245,8 +254,8 @@ async def _delivery_scope(db_session, *, suffix: str):
     await db_session.flush()
     policy = {
         "schema_version": 1,
-        "terminal": "ready_to_merge",
-        "auto_merge": False,
+        "terminal": "merged" if auto_merge else "ready_to_merge",
+        "auto_merge": auto_merge,
         "max_cycles": 10,
         "max_no_progress": 3,
         "provider": "codex",
@@ -382,6 +391,7 @@ async def _ready_delivery_scope(db_session, db_factory, *, suffix: str):
         review = PRReview(
             repo_id=monitored_repo.id,
             pr_number=pr_data["number"],
+            base_ref=pr_data["base_ref"],
             base_sha=pr_data["base_sha"],
             head_sha=pr_data["head_sha"],
             delivery_id=pr_data["delivery_id"],
@@ -437,6 +447,98 @@ async def _ready_delivery_scope(db_session, db_factory, *, suffix: str):
         await db.commit()
         monitor_version = monitor.state_version
     return run, repo, git, github, publisher, pull_request, monitor_id, monitor_version
+
+
+async def _merged_delivery_scope(db_session, db_factory, *, suffix: str):
+    run, _project, repo = await _delivery_scope(
+        db_session,
+        suffix=suffix,
+        auto_merge=True,
+    )
+    nonce = "e" * 48
+    review_task = Task(
+        title="Merged Delivery reviewer",
+        description="Exact merged review evidence.",
+        mode="auto",
+        status="completed",
+        metadata_={
+            "pr_review_id": None,
+            "pr_base_ref": "main",
+            "pr_base_sha": BASE,
+            "pr_head_sha": HEAD,
+            "pr_auto_merge": True,
+            "pr_action_nonce": nonce,
+        },
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(review_task)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=17,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        delivery_id=f"delivery:{run.id}:{HEAD}",
+        pr_title="Deliver exact head",
+        pr_author="delivery-bot",
+        pr_url=f"https://github.com/{repo.repo_full_name}/pull/17",
+        task_id=review_task.id,
+        status="merged",
+        action_nonce=nonce,
+        action_taken="approved_merged",
+        publishing_actor="ccm-bot",
+        publishing_started_at=MERGE_PUBLISHED_AT,
+        merge_method="fast-forward",
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(review)
+    await db_session.flush()
+    review_task.metadata_ = {
+        **(review_task.metadata_ or {}),
+        "pr_review_id": review.id,
+    }
+    monitor = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=17,
+        status="merged",
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        current_review_id=review.id,
+        head_repo_full_name=repo.repo_full_name,
+        head_branch=run.delivery_branch,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(monitor)
+    await db_session.flush()
+    review.monitor_run_id = monitor.id
+    run.pr_number = 17
+    run.pr_url = review.pr_url
+    run.pr_monitor_run_id = monitor.id
+    run.phase = "monitoring"
+    run.activity = "waiting"
+    run.wait_reason = "pr_monitor"
+    await db_session.commit()
+    pull_request = PublishedPullRequest(
+        repo_id=repo.id,
+        pr_number=17,
+        url=review.pr_url,
+        base_sha=BASE,
+        head_sha=HEAD,
+        head_branch=run.delivery_branch,
+        head_repo_full_name=repo.repo_full_name,
+    )
+    # A successful merge may advance main and delete the delivery branch.
+    git = FakeGit(
+        repo.repo_full_name,
+        {"main": HEAD2, run.delivery_branch: None},
+    )
+    publisher = GitHubDeliveryPublisher(
+        db_factory,
+        git=git,
+        github=FakeGitHub(),
+    )
+    return run, repo, publisher, pull_request, monitor.id, monitor.state_version, nonce
 
 
 @pytest.mark.asyncio
@@ -1117,9 +1219,11 @@ async def test_monitor_creation_is_exact_and_idempotent(db_session, db_factory):
     async def create_review(db, monitored_repo, pr_data):
         nonlocal create_calls
         create_calls += 1
+        assert pr_data["base_ref"] == run.base_branch
         review = PRReview(
             repo_id=monitored_repo.id,
             pr_number=pr_data["number"],
+            base_ref=pr_data["base_ref"],
             base_sha=pr_data["base_sha"],
             head_sha=pr_data["head_sha"],
             delivery_id=pr_data["delivery_id"],
@@ -1169,9 +1273,132 @@ async def test_monitor_creation_is_exact_and_idempotent(db_session, db_factory):
     async with db_factory() as db:
         reviews = list((await db.execute(select(PRReview))).scalars())
         assert len(reviews) == 1
+        assert reviews[0].base_ref == run.base_branch
         assert reviews[0].base_sha == BASE
         assert reviews[0].head_sha == HEAD
         assert reviews[0].monitor_run_id == first
+
+
+@pytest.mark.asyncio
+async def test_monitor_creator_isolates_same_sha_review_for_different_base_ref(
+    db_session,
+    db_factory,
+):
+    """A webhook Review for another target branch is never adopted."""
+
+    run, _project, repo = await _delivery_scope(
+        db_session,
+        suffix="monitor-base-ref-isolation",
+    )
+    git = FakeGit(repo.repo_full_name, {"main": BASE, run.delivery_branch: HEAD})
+    pr_payload = _pull(
+        branch=run.delivery_branch,
+        repo_full_name=repo.repo_full_name,
+    )
+    github = FakeGitHub(pulls=[pr_payload])
+    wrong_ref_review = PRReview(
+        repo_id=repo.id,
+        pr_number=pr_payload["number"],
+        base_ref="release/1.x",
+        base_sha=BASE,
+        head_sha=HEAD,
+        delivery_id="github-webhook-other-base",
+        pr_title=pr_payload["title"],
+        pr_author=pr_payload["user"]["login"],
+        pr_url=pr_payload["html_url"],
+        status="waiting_ci",
+        action_nonce="5" * 48,
+    )
+    db_session.add(wrong_ref_review)
+    await db_session.commit()
+
+    created_payloads: list[dict] = []
+
+    async def create_review(db, monitored_repo, pr_data):
+        created_payloads.append(dict(pr_data))
+        review = PRReview(
+            repo_id=monitored_repo.id,
+            pr_number=pr_data["number"],
+            base_ref=pr_data["base_ref"],
+            base_sha=pr_data["base_sha"],
+            head_sha=pr_data["head_sha"],
+            delivery_id=pr_data["delivery_id"],
+            pr_title=pr_data["title"],
+            pr_author=pr_data["author"],
+            pr_url=pr_data["url"],
+            status="waiting_ci",
+            action_nonce="6" * 48,
+        )
+        db.add(review)
+        await db.flush()
+        await attach_review_to_run(
+            db,
+            repo=monitored_repo,
+            review=review,
+            pr_data=pr_data,
+        )
+        return review
+
+    publisher = GitHubDeliveryPublisher(
+        db_factory,
+        git=git,
+        github=github,
+        review_creator=create_review,
+    )
+    pull_request = await publisher.ensure_pull_request(
+        run_id=run.id,
+        idempotency_key=_key(run),
+        fence=await _fence(db_factory, run),
+    )
+    monitor_id = await publisher.ensure_monitor(
+        run_id=run.id,
+        pull_request=pull_request,
+        idempotency_key=_key(run, monitor=True),
+        fence=await _fence(db_factory, run),
+    )
+
+    assert len(created_payloads) == 1
+    assert created_payloads[0]["base_ref"] == "main"
+    assert created_payloads[0]["base_sha"] == BASE
+    assert created_payloads[0]["head_sha"] == HEAD
+    async with db_factory() as db:
+        reviews = list(
+            (
+                await db.execute(
+                    select(PRReview)
+                    .where(PRReview.repo_id == repo.id)
+                    .order_by(PRReview.id.asc())
+                )
+            ).scalars()
+        )
+        assert len(reviews) == 2
+        other_base, exact = reviews
+        assert (
+            other_base.base_ref,
+            other_base.base_sha,
+            other_base.head_sha,
+            other_base.delivery_id,
+            other_base.monitor_run_id,
+        ) == (
+            "release/1.x",
+            BASE,
+            HEAD,
+            "github-webhook-other-base",
+            None,
+        )
+        assert (
+            exact.base_ref,
+            exact.base_sha,
+            exact.head_sha,
+            exact.delivery_id,
+            exact.monitor_run_id,
+        ) == (
+            "main",
+            BASE,
+            HEAD,
+            f"delivery:{run.id}:{HEAD}",
+            monitor_id,
+        )
 
 
 @pytest.mark.asyncio
@@ -1191,6 +1418,7 @@ async def test_webhook_review_is_atomically_adopted_before_cancelled_run_policy_
     review = PRReview(
         repo_id=repo.id,
         pr_number=payload["number"],
+        base_ref="main",
         base_sha=BASE,
         head_sha=HEAD,
         delivery_id="github-webhook-delivery-opaque",
@@ -1283,6 +1511,7 @@ async def test_webhook_adoption_serializes_with_legacy_finding_action_writer(
     review = PRReview(
         repo_id=repo.id,
         pr_number=payload["number"],
+        base_ref="main",
         base_sha=BASE,
         head_sha=HEAD,
         delivery_id="github-webhook-adoption-writer-race",
@@ -1435,6 +1664,7 @@ async def test_webhook_review_with_legacy_finding_effect_is_not_adopted(
     review = PRReview(
         repo_id=repo.id,
         pr_number=payload["number"],
+        base_ref="main",
         base_sha=BASE,
         head_sha=HEAD,
         delivery_id=f"github-webhook-{legacy_effect}",
@@ -1563,6 +1793,7 @@ async def test_webhook_review_with_active_legacy_publication_is_not_adopted(
     review = PRReview(
         repo_id=repo.id,
         pr_number=payload["number"],
+        base_ref="main",
         base_sha=BASE,
         head_sha=HEAD,
         delivery_id="github-webhook-legacy-publication",
@@ -1638,6 +1869,7 @@ async def test_new_cycle_head_creates_review_and_advances_same_monitor_run(
         review = PRReview(
             repo_id=monitored_repo.id,
             pr_number=pr_data["number"],
+            base_ref=pr_data["base_ref"],
             base_sha=pr_data["base_sha"],
             head_sha=pr_data["head_sha"],
             delivery_id=pr_data["delivery_id"],
@@ -1788,6 +2020,293 @@ async def test_new_cycle_head_creates_review_and_advances_same_monitor_run(
 
 
 @pytest.mark.asyncio
+async def test_merged_verifier_uses_exact_nonce_without_requiring_live_refs(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    (
+        run,
+        repo,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+        nonce,
+    ) = await _merged_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="merged-exact",
+    )
+    evidence_calls: list[dict] = []
+
+    async def exact_merge_evidence(
+        *,
+        repo_name,
+        pr_number,
+        base_ref,
+        base_sha,
+        head_sha,
+        nonce,
+        actor,
+        publishing_started_at,
+        merge_method,
+    ):
+        # Keep this explicit signature in the regression: unlike a permissive
+        # AsyncMock, it raises immediately if Delivery drops the frozen base_ref
+        # argument while wiring the real merge-evidence helper.
+        evidence_calls.append(
+            {
+                "repo_name": repo_name,
+                "pr_number": pr_number,
+                "base_ref": base_ref,
+                "base_sha": base_sha,
+                "head_sha": head_sha,
+                "nonce": nonce,
+                "actor": actor,
+                "publishing_started_at": publishing_started_at,
+                "merge_method": merge_method,
+            }
+        )
+        return True
+
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_find_merge_evidence",
+        exact_merge_evidence,
+    )
+    # Repository edits affect only newly admitted Runs.  This exact Run keeps
+    # the auto-merge terminal frozen in its hashed policy snapshot.
+    repo.auto_merge = False
+    await db_session.commit()
+
+    verified = await publisher.verify_merged(
+        run_id=run.id,
+        pull_request=pull_request,
+        monitor_run_id=monitor_id,
+        expected_monitor_state_version=monitor_version,
+    )
+
+    assert verified == pull_request
+    assert evidence_calls == [
+        {
+            "repo_name": repo.repo_full_name,
+            "pr_number": 17,
+            "base_ref": "main",
+            "base_sha": BASE,
+            "head_sha": HEAD,
+            "nonce": nonce,
+            "actor": "ccm-bot",
+            "publishing_started_at": MERGE_PUBLISHED_AT,
+            "merge_method": "fast-forward",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_merged_verifier_rejects_same_sha_review_for_different_base_ref(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    (
+        run,
+        _repo,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+        _nonce,
+    ) = await _merged_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="merged-other-base-ref",
+    )
+    async with db_factory() as db:
+        monitor = await db.get(PRMonitorRun, monitor_id, populate_existing=True)
+        review = await db.get(
+            PRReview,
+            monitor.current_review_id,
+            populate_existing=True,
+        )
+        assert (review.base_sha, review.head_sha) == (BASE, HEAD)
+        review.base_ref = "release/1.x"
+        await db.commit()
+
+    evidence = AsyncMock(side_effect=AssertionError("remote evidence must not run"))
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_find_merge_evidence",
+        evidence,
+    )
+
+    with pytest.raises(DeliverySubjectChanged, match="merged snapshot"):
+        await publisher.verify_merged(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
+    evidence.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_merged_verifier_rejects_missing_remote_merge_evidence(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    (
+        run,
+        _repo,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+        _nonce,
+    ) = await _merged_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="merged-missing",
+    )
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_find_merge_evidence",
+        AsyncMock(return_value=False),
+    )
+
+    with pytest.raises(DeliverySubjectChanged, match="merge evidence"):
+        await publisher.verify_merged(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
+
+
+@pytest.mark.asyncio
+async def test_merged_verifier_pauses_for_terminal_evidence_mismatch(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    (
+        run,
+        _repo,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+        _nonce,
+    ) = await _merged_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="merged-terminal-mismatch",
+    )
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_find_merge_evidence",
+        AsyncMock(
+            side_effect=GhError(
+                "GitHub merge commit evidence is malformed or mismatched"
+            )
+        ),
+    )
+
+    with pytest.raises(DeliverySubjectChanged, match="evidence is invalid"):
+        await publisher.verify_merged(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
+
+
+@pytest.mark.asyncio
+async def test_merged_verifier_preserves_transient_evidence_error_for_retry(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    (
+        run,
+        _repo,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+        _nonce,
+    ) = await _merged_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="merged-transient-error",
+    )
+    transient = GhError("GitHub API request failed: HTTP 503")
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_find_merge_evidence",
+        AsyncMock(side_effect=transient),
+    )
+
+    # GhError is deliberately not converted to DeliverySubjectChanged: the
+    # controller's generic fault path leaves the Run waiting for a retry.
+    with pytest.raises(GhError) as caught:
+        await publisher.verify_merged(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
+    assert caught.value is transient
+
+
+@pytest.mark.asyncio
+async def test_merged_verifier_rechecks_exact_monitor_generation(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    (
+        run,
+        _repo,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+        _nonce,
+    ) = await _merged_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="merged-race",
+    )
+
+    async def race_merge_evidence(**_kwargs):
+        async with db_factory() as db:
+            monitor = await db.get(
+                PRMonitorRun,
+                monitor_id,
+                populate_existing=True,
+            )
+            monitor.state_version += 1
+            await db.commit()
+        return True
+
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_find_merge_evidence",
+        AsyncMock(side_effect=race_merge_evidence),
+    )
+
+    with pytest.raises(DeliverySubjectChanged, match="merged snapshot"):
+        await publisher.verify_merged(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
+
+
+@pytest.mark.asyncio
 async def test_ready_verifier_proves_exact_remote_pr_without_writes(
     db_session, db_factory
 ):
@@ -1801,6 +2320,10 @@ async def test_ready_verifier_proves_exact_remote_pr_without_writes(
         monitor_id,
         monitor_version,
     ) = await _ready_delivery_scope(db_session, db_factory, suffix="ready-exact")
+    # Repository edits affect only newly admitted Runs.  This exact Run keeps
+    # the manual terminal frozen in its hashed policy snapshot.
+    repo.auto_merge = True
+    await db_session.commit()
 
     verified = await publisher.verify_ready_to_merge(
         run_id=run.id,
@@ -1831,6 +2354,88 @@ async def test_ready_verifier_proves_exact_remote_pr_without_writes(
         assert monitors[0].state_version == monitor_version
         assert monitors[0].status == "ready_to_merge"
         assert reviews[0].id == monitors[0].current_review_id
+
+
+@pytest.mark.asyncio
+async def test_ready_verifier_rejects_same_sha_review_for_different_base_ref(
+    db_session,
+    db_factory,
+):
+    (
+        run,
+        _repo,
+        git,
+        github,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+    ) = await _ready_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="ready-other-local-base-ref",
+    )
+    async with db_factory() as db:
+        monitor = await db.get(PRMonitorRun, monitor_id, populate_existing=True)
+        review = await db.get(
+            PRReview,
+            monitor.current_review_id,
+            populate_existing=True,
+        )
+        assert (review.base_sha, review.head_sha) == (BASE, HEAD)
+        review.base_ref = "release/1.x"
+        await db.commit()
+    verify_calls = git.verify_calls
+    get_calls = github.get_calls
+
+    with pytest.raises(DeliverySubjectChanged, match="ready snapshot"):
+        await publisher.verify_ready_to_merge(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
+
+    assert git.verify_calls == verify_calls
+    assert github.get_calls == get_calls
+
+
+@pytest.mark.asyncio
+async def test_ready_verifier_rejects_remote_retarget_with_same_shas(
+    db_session,
+    db_factory,
+):
+    (
+        run,
+        repo,
+        _git,
+        github,
+        publisher,
+        pull_request,
+        monitor_id,
+        monitor_version,
+    ) = await _ready_delivery_scope(
+        db_session,
+        db_factory,
+        suffix="ready-remote-retarget",
+    )
+    github.pulls[:] = [
+        _pull(
+            branch=run.delivery_branch,
+            repo_full_name=repo.repo_full_name,
+            base_branch="release/1.x",
+            base_sha=BASE,
+            head_sha=HEAD,
+        )
+    ]
+
+    with pytest.raises(DeliverySubjectChanged, match="locally ready subject"):
+        await publisher.verify_ready_to_merge(
+            run_id=run.id,
+            pull_request=pull_request,
+            monitor_run_id=monitor_id,
+            expected_monitor_state_version=monitor_version,
+        )
 
 
 @pytest.mark.asyncio

@@ -160,9 +160,17 @@ async def shared_chat(
         task = await db.get(Task, task_id)
         if not task:
             raise HTTPException(404, "Task not found")
-        from backend.api.tasks import _require_not_delivery_owned_task
+        from backend.api.tasks import (
+            _require_not_delivery_owned_task,
+            _require_not_isolated_browser_child,
+        )
 
         _require_not_delivery_owned_task(
+            task,
+            action="sent shared-access chat messages",
+        )
+        await _require_not_isolated_browser_child(
+            db,
             task,
             action="sent shared-access chat messages",
         )

@@ -144,10 +144,12 @@ async def _manager_termination_receipt(session_factory, task_id: int):
 
 @pytest.fixture(autouse=True)
 def _verified_base_guidance(monkeypatch):
-    async def prepare(repo, pr_data):
+    async def prepare(repo, pr_data, *, base_ref=None):
+        frozen_base_ref = base_ref or repo.default_branch
         return {
             "repo_name": repo.repo_full_name,
             "pr_number": pr_data["number"],
+            "base_ref": frozen_base_ref,
             "base_sha": str(pr_data["base_sha"]).lower(),
             "head_sha": str(pr_data["head_sha"]).lower(),
             "guidance": {
@@ -159,14 +161,15 @@ def _verified_base_guidance(monkeypatch):
                 "title": pr_data["title"],
                 "body": "",
                 "author": pr_data["author"],
-                "base_ref": "main",
+                "base_ref": frozen_base_ref,
                 "head_ref": "feature",
                 "files": [],
                 "patch": "diff --git a/a b/a\n",
             },
         }
 
-    async def verify(_repo, _pr_data):
+    async def verify(_repo, _pr_data, *, base_ref=None):
+        del base_ref
         return None
 
     monkeypatch.setattr(
@@ -206,6 +209,7 @@ async def _seed_actionable_finding(
         review = PRReview(
             repo_id=repo_id,
             pr_number=pr_number,
+            base_ref="main",
             base_sha=BASE_SHA_1,
             head_sha=HEAD_SHA_1,
             pr_title="Fix captured finding",
@@ -307,7 +311,7 @@ async def _seed_confirmable_api_action(
             {
                 "state": "closed",
                 "draft": False,
-                "base": {"sha": BASE_SHA_1},
+                "base": {"ref": "main", "sha": BASE_SHA_1},
                 "head": {
                     "sha": HEAD_SHA_1,
                     "ref": "feature/fix",
@@ -321,7 +325,7 @@ async def _seed_confirmable_api_action(
             {
                 "state": "open",
                 "draft": True,
-                "base": {"sha": BASE_SHA_1},
+                "base": {"ref": "main", "sha": BASE_SHA_1},
                 "head": {
                     "sha": HEAD_SHA_1,
                     "ref": "feature/fix",
@@ -335,7 +339,7 @@ async def _seed_confirmable_api_action(
             {
                 "state": "open",
                 "draft": False,
-                "base": {"sha": BASE_SHA_1},
+                "base": {"ref": "main", "sha": BASE_SHA_1},
                 "head": {
                     "sha": HEAD_SHA_1,
                     "ref": "feature..escape",
@@ -584,6 +588,7 @@ def _sign(secret: str, body: bytes) -> str:
 
 def _open_pr_snapshot(
     *,
+    base_ref: str = "main",
     base_sha: str = BASE_SHA_1,
     head_sha: str = HEAD_SHA_1,
     merged_at: str | None = None,
@@ -591,6 +596,7 @@ def _open_pr_snapshot(
     return {
         "state": "OPEN",
         "mergedAt": merged_at,
+        "baseRefName": base_ref,
         "baseRefOid": base_sha,
         "headRefOid": head_sha,
         "isDraft": False,
@@ -692,6 +698,7 @@ async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler
             monitor_run_id=run.id,
             repo_id=repo["id"],
             pr_number=42,
+            base_ref="main",
             base_sha=BASE_SHA_1,
             head_sha=HEAD_SHA_1,
             pr_title="remote repair",
@@ -762,6 +769,7 @@ async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
         await db.flush()
         review = PRReview(
             monitor_run_id=run.id, repo_id=repo["id"], pr_number=43,
+            base_ref="main",
             base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
             pr_title="resume queue", pr_author="alice",
             pr_url="https://github.com/owner/resume/pull/43",
@@ -784,6 +792,7 @@ async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
     async def exact_pr(_number, _repo_name):
         return {
             "state": "OPEN", "mergedAt": None,
+            "baseRefName": "main",
             "baseRefOid": BASE_SHA_1, "headRefOid": HEAD_SHA_1,
             "isDraft": False, "mergeCommit": None,
         }
@@ -793,6 +802,7 @@ async def test_resume_merge_queue_returns_conflict_when_remote_state_unknown(
             raise RuntimeError("queue read unavailable")
         return SimpleNamespace(
             id="MQ-resume", state="QUEUED",
+            base_ref="main",
             base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
         )
 
@@ -917,6 +927,97 @@ async def test_create_repo_success(client):
     assert data["review_effort"] == "high"
     # Detail response: full (unmasked) webhook secret
     assert len(data["webhook_secret"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_panel_review_mode_allows_direct_auto_merge(client):
+    created = await _create_repo(
+        client,
+        "owner/panel-auto-merge",
+        review_mode="panel",
+        auto_merge=True,
+    )
+    assert created["review_mode"] == "panel"
+    assert created["auto_merge"] is True
+    assert created["merge_queue_mode"] == "manual"
+
+    updated = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"auto_merge": False},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["review_mode"] == "panel"
+    assert updated.json()["auto_merge"] is False
+
+
+@pytest.mark.asyncio
+async def test_direct_auto_merge_rejects_legacy_status_check_on_create(client):
+    response = await client.post("/api/pr-monitor/repos", json={
+        "repo_full_name": "owner/status-auto-merge",
+        "review_mode": "panel",
+        "wait_for_ci": True,
+        "required_checks": [{
+            "name": "tests",
+            "app_slug": "ci-bot",
+            "kind": "status",
+        }],
+        "auto_merge": True,
+    })
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "auto_merge requires app-bound check_run required checks"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_auto_merge_rejects_legacy_status_check_on_update(client):
+    created = await _create_repo(
+        client,
+        "owner/status-auto-merge-update",
+        review_mode="panel",
+        wait_for_ci=True,
+        required_checks=[{
+            "name": "tests",
+            "app_slug": "ci-bot",
+            "kind": "status",
+        }],
+    )
+
+    response = await client.put(
+        f"/api/pr-monitor/repos/{created['id']}",
+        json={"auto_merge": True},
+    )
+    current = await client.get(f"/api/pr-monitor/repos/{created['id']}")
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "auto_merge requires app-bound check_run required checks"
+    )
+    assert current.status_code == 200
+    assert current.json()["auto_merge"] is False
+
+
+@pytest.mark.asyncio
+async def test_direct_auto_merge_remains_mutually_exclusive_with_merge_queue(
+    client,
+):
+    response = await client.post("/api/pr-monitor/repos", json={
+        "repo_full_name": "owner/panel-auto-merge-queue",
+        "review_mode": "panel",
+        "wait_for_ci": True,
+        "required_checks": [{
+            "name": "tests",
+            "app_slug": "github-actions",
+            "kind": "check_run",
+        }],
+        "auto_merge": True,
+        "merge_queue_mode": "auto",
+    })
+    assert response.status_code == 400
+    assert response.json()["detail"] == (
+        "auto_merge and Merge Queue are mutually exclusive"
+    )
 
 
 @pytest.mark.asyncio
@@ -1102,6 +1203,22 @@ async def test_bind_developer_reads_remote_subject_inside_task_barrier(
             head_branch="feature",
         )
         db.add(run)
+        await db.flush()
+        review = PRReview(
+            monitor_run_id=run.id,
+            repo_id=repo["id"],
+            pr_number=42,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="Bind barrier",
+            pr_author="alice",
+            pr_url="https://github.com/owner/bind-barrier/pull/42",
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run.current_review_id = review.id
         await db.commit()
         task_id = task.id
         run_id = run.id
@@ -1170,8 +1287,26 @@ async def test_resume_repair_rejects_remote_subject_change(
         )
         db.add(run)
         await db.flush()
+        review = PRReview(
+            monitor_run_id=run.id,
+            repo_id=repo["id"],
+            pr_number=42,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="Resume repair drift",
+            pr_author="alice",
+            pr_url=(
+                "https://github.com/owner/resume-repair-drift/pull/42"
+            ),
+            status="commented",
+        )
+        db.add(review)
+        await db.flush()
+        run.current_review_id = review.id
         wake = PRRepairWake(
             monitor_run_id=run.id,
+            review_id=review.id,
             developer_task_id=task.id,
             trigger_base_sha=BASE_SHA_1,
             trigger_head_sha=HEAD_SHA_1,
@@ -1214,6 +1349,7 @@ async def test_delete_repo(client, session_factory):
         review = PRReview(
             repo_id=created["id"], pr_number=1, pr_title="t",
             pr_author="a", pr_url="http://x", status="error",
+            base_ref="main",
             base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
         )
         db.add(review)
@@ -1279,6 +1415,7 @@ async def test_delete_repo_rejects_active_review(client, session_factory):
         review = PRReview(
             repo_id=created["id"],
             pr_number=1,
+            base_ref="main",
             pr_title="active",
             pr_author="alice",
             pr_url="https://example.test/pr/1",
@@ -1365,9 +1502,12 @@ async def test_webhook_valid_signature_creates_review_and_task(client, session_f
         assert review.action_nonce == action_nonce
         assert task.metadata_ == {
             "pr_review_id": review_id,
+            "pr_base_ref": "main",
             "pr_base_sha": BASE_SHA_1,
             "pr_head_sha": HEAD_SHA_1,
             "pr_auto_merge": False,
+            "pr_wait_for_ci": False,
+            "pr_required_checks": [],
             "pr_action_nonce": action_nonce,
         }
 
@@ -1595,6 +1735,107 @@ async def test_webhook_duplicate_opened_same_head_ignored(client):
     data = resp.json()
     assert data["status"] == "ignored"
     assert data["reason"] == "PR snapshot already reviewed"
+
+
+@pytest.mark.asyncio
+async def test_webhook_same_shas_new_base_ref_is_not_duplicate(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/base-retarget")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/base-retarget"),
+    )
+    assert opened.json()["status"] == "accepted"
+    old_review_id = opened.json()["review_id"]
+
+    async with session_factory() as db:
+        stored_repo = await db.get(MonitoredRepo, repo["id"])
+        stored_repo.default_branch = "release/2026"
+        await db.commit()
+
+    retargeted = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            "owner/base-retarget",
+            action="synchronize",
+            base="release/2026",
+        ),
+    )
+    assert retargeted.status_code == 200, retargeted.text
+    assert retargeted.json()["status"] == "accepted"
+    new_review_id = retargeted.json()["review_id"]
+    assert new_review_id != old_review_id
+
+    async with session_factory() as db:
+        old = await db.get(PRReview, old_review_id)
+        new = await db.get(PRReview, new_review_id)
+        assert old.status == "superseded"
+        assert old.base_ref == "main"
+        assert old.base_sha == new.base_sha == BASE_SHA_1
+        assert old.head_sha == new.head_sha == HEAD_SHA_1
+        assert new.base_ref == "release/2026"
+
+
+@pytest.mark.asyncio
+async def test_webhook_edited_base_retarget_persists_durable_supersede(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/edited-retarget")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/edited-retarget"),
+    )
+    assert opened.json()["status"] == "accepted"
+    old_review_id = opened.json()["review_id"]
+
+    async with session_factory() as db:
+        stored_repo = await db.get(MonitoredRepo, repo["id"])
+        stored_repo.default_branch = "release/2026"
+        await db.commit()
+    payload = _pr_payload(
+        "owner/edited-retarget",
+        action="edited",
+        base="release/2026",
+    )
+    payload["changes"] = {"base": {"ref": {"from": "main"}}}
+
+    with patch(
+        "backend.services.task_termination."
+        "terminate_authoritative_task_generation",
+        side_effect=RuntimeError("simulated process crash"),
+    ):
+        with pytest.raises(RuntimeError, match="simulated process crash"):
+            await _post_webhook(
+                client,
+                repo["webhook_secret"],
+                payload,
+            )
+
+    async with session_factory() as db:
+        old = await db.get(PRReview, old_review_id)
+        reviews = list((await db.execute(
+            select(PRReview).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 42,
+            )
+        )).scalars())
+        assert reviews == [old]
+        assert old.status == "superseding"
+        assert old.base_ref == "main"
+        assert old.superseding_snapshot["pr_data"]["base_ref"] == (
+            "release/2026"
+        )
+        prepared = old.superseding_snapshot["prepared_context"]
+        assert prepared["base_ref"] == "release/2026"
+        assert prepared["material"]["base_ref"] == "release/2026"
+        assert old.superseding_token is not None
+        assert old.superseding_started_at is not None
 
 
 @pytest.mark.asyncio
@@ -2737,6 +2978,7 @@ async def test_pr_review_snapshot_unique_constraint(db_session):
     common = {
         "repo_id": repo.id,
         "pr_number": 42,
+        "base_ref": "main",
         "base_sha": BASE_SHA_1,
         "head_sha": HEAD_SHA_3,
         "pr_title": "Title",
@@ -3465,9 +3707,12 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
         action_nonce = old_task.metadata_["pr_action_nonce"]
         assert old_task.metadata_ == {
             "pr_review_id": old_review_id,
+            "pr_base_ref": "main",
             "pr_base_sha": BASE_SHA_1,
             "pr_head_sha": HEAD_SHA_1,
             "pr_auto_merge": False,
+            "pr_wait_for_ci": False,
+            "pr_required_checks": [],
             "pr_action_nonce": action_nonce,
             "pr_review_superseded": True,
         }
@@ -3709,9 +3954,12 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
         action_nonce = old_task.metadata_["pr_action_nonce"]
         assert old_task.metadata_ == {
             "pr_review_id": old_review_id,
+            "pr_base_ref": "main",
             "pr_base_sha": BASE_SHA_1,
             "pr_head_sha": HEAD_SHA_1,
             "pr_auto_merge": False,
+            "pr_wait_for_ci": False,
+            "pr_required_checks": [],
             "pr_action_nonce": action_nonce,
             "pr_review_superseded": True,
         }

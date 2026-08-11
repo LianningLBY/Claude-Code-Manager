@@ -2409,13 +2409,19 @@ async def cancel_plan_run(
     run = await db.get(PlanAgentRun, run_id)
     if run is None or run.plan_id is None:
         raise HTTPException(404, "Plan Run not found")
+    frozen_plan_id = run.plan_id
     async with (
         _stop_plan_run_lifecycle_after_fence(run_id) as lifecycle_stop,
-        plan_operation_lock(run.plan_id),
+        plan_operation_lock(frozen_plan_id),
     ):
-        plan = await _require_plan(request, db, run.plan_id, control=True)
+        plan = await _require_plan(request, db, frozen_plan_id, control=True)
         await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         run = await db.get(PlanAgentRun, run_id, populate_existing=True)
+        if run is None:
+            raise HTTPException(
+                409,
+                "Worker Plan Run mirror changed before cancellation",
+            )
         if run.status == "cancelled":
             return await run_resource(db, run)
         worker_id = run.worker_id
@@ -2428,7 +2434,6 @@ async def cancel_plan_run(
                 apply_worker_terminal_after_cancellation_race,
                 fence_worker_mirror_cancellation,
                 finalize_worker_mirror_cancellation,
-                settle_worker_dispatch_receipt,
                 snapshot_worker_dispatch_receipt,
             )
 
@@ -2452,6 +2457,11 @@ async def cancel_plan_run(
                 with_for_update=True,
                 populate_existing=True,
             )
+            if run is None or plan is None:
+                raise HTTPException(
+                    409,
+                    "Worker Plan Run mirror changed before cancellation",
+                )
             dispatch_receipts = list(
                 (
                     await db.execute(
@@ -2478,9 +2488,7 @@ async def cancel_plan_run(
                 else run.generation
             )
             if (
-                run is None
-                or plan is None
-                or run.plan_id != plan.id
+                run.plan_id != plan.id
                 or run.worker_id != worker_id
                 or plan.worker_id != worker_id
                 or plan.active_run_id != run.id
@@ -2540,26 +2548,27 @@ async def cancel_plan_run(
                             409,
                             "Worker Plan Run has no exact remote identity",
                         )
-                    settle_worker_dispatch_receipt(
-                        receipt=current_receipt,
-                        plan=plan,
-                        run=run,
-                        generation=target_generation,
-                        reason="not_launched",
-                        remote_status=None,
-                    )
                 # This transaction owns Run -> Plan -> receipt while publishing
                 # the terminal mirror, so a concurrent boundary callback sees
                 # the settled fence and cannot issue its import POST.
-                run = await _finish_plan_cancel_mutation(
-                    cancel_worker_mirror_run_after_ack(
-                        db,
-                        plan=plan,
-                        run=run,
-                    ),
-                    lifecycle_stop=lifecycle_stop,
-                    dispatcher=dispatcher,
-                )
+                try:
+                    run = await _finish_plan_cancel_mutation(
+                        cancel_worker_mirror_run_after_ack(
+                            db,
+                            plan=plan,
+                            run=run,
+                            receipt_settlement_reason="not_launched",
+                            receipt_remote_status=None,
+                        ),
+                        lifecycle_stop=lifecycle_stop,
+                        dispatcher=dispatcher,
+                    )
+                except WorkerPlanDispatchConflict as exc:
+                    # ``cancel_worker_mirror_run_after_ack`` deliberately ends
+                    # the stale WAL snapshot before its Run-first writer fence.
+                    # If on_remote_possible commits in that window, its receipt
+                    # is authoritative and this pre-import proof is stale.
+                    raise HTTPException(409, str(exc)) from exc
             else:
                 expected_generation = target_generation
                 expected_plan_id = plan.id
@@ -2666,7 +2675,7 @@ async def cancel_plan_run(
         plan, run = await _finish_local_plan_run_cancellation(
             db,
             run_id=run_id,
-            plan_id=plan.id,
+            plan_id=frozen_plan_id,
             owned_instance_id=owned_instance_id,
             target_generation=target_generation,
         )

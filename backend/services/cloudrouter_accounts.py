@@ -35,9 +35,16 @@ CLAUDE_BASE_URL = "https://console.cloudrouter.online"
 CODEX_BASE_URL = "https://console.cloudrouter.online/v1"
 MODELS_URL = f"{CODEX_BASE_URL}/models"
 USAGE_URL = f"{CODEX_BASE_URL}/usage"
-APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
 APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
 APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
+LEGACY_APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
+LEGACY_APEX_ENDPOINTS = {
+    "claude_base_url": None,
+    "codex_base_url": LEGACY_APEX_CODEX_BASE_URL,
+    "models_url": f"{LEGACY_APEX_CODEX_BASE_URL}/models",
+    "usage_url": f"{LEGACY_APEX_CODEX_BASE_URL}/usage",
+}
 # Keep this aligned with the Codex CLI version pinned by scripts/setup.sh and
 # WorkerProvisioner.  Apex exposes the native Codex model catalog endpoint,
 # which requires the caller version in order to filter compatible models.
@@ -1580,7 +1587,14 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Mismatched API provider metadata: {account_id}"
             )
-        if data.get("endpoints") != spec.endpoints:
+        migrate_legacy_apex_endpoints = (
+            api_provider == API_PROVIDER_APEX
+            and data.get("endpoints") == LEGACY_APEX_ENDPOINTS
+        )
+        if (
+            data.get("endpoints") != spec.endpoints
+            and not migrate_legacy_apex_endpoints
+        ):
             raise CloudRouterUnsafePathError(f"Modified fixed endpoints: {account_id}")
         name = data.get("name")
         models = data.get("models")
@@ -1656,6 +1670,20 @@ class CloudRouterAccountStore:
                 )
             _require_owned_regular(path / "codex" / "config.toml", 0o600)
             self._validate_runtime_configuration(account)
+        if migrate_legacy_apex_endpoints:
+            data["endpoints"] = dict(spec.endpoints)
+            try:
+                _atomic_private_json(
+                    metadata_path,
+                    data,
+                    maximum=MAX_METADATA_BYTES,
+                )
+            except CloudRouterAccountError:
+                raise
+            except OSError as exc:
+                raise CloudRouterUnsafePathError(
+                    f"Could not migrate fixed endpoints: {account_id}",
+                ) from exc
         return account
 
     @staticmethod
@@ -1784,12 +1812,36 @@ class CloudRouterAccountStore:
             "model_providers": expected_providers,
         }
         legacy_apex_codex = None
+        legacy_apex_endpoint_codex = None
+        legacy_apex_endpoint_legacy_codex = None
         if account.api_provider == API_PROVIDER_APEX:
             legacy_apex_codex = {
                 "model_provider": LEGACY_APEX_CODEX_PROVIDER,
                 "model_providers": {
                     LEGACY_APEX_CODEX_PROVIDER: {
                         **expected_provider,
+                        "name": LEGACY_APEX_LABEL,
+                    },
+                },
+            }
+            legacy_endpoint_provider = {
+                **expected_provider,
+                "base_url": LEGACY_APEX_CODEX_BASE_URL,
+            }
+            legacy_apex_endpoint_codex = {
+                "model_provider": spec.codex_provider,
+                "model_providers": {
+                    spec.codex_provider: legacy_endpoint_provider,
+                    LEGACY_APEX_CODEX_PROVIDER: {
+                        **legacy_endpoint_provider,
+                    },
+                },
+            }
+            legacy_apex_endpoint_legacy_codex = {
+                "model_provider": LEGACY_APEX_CODEX_PROVIDER,
+                "model_providers": {
+                    LEGACY_APEX_CODEX_PROVIDER: {
+                        **legacy_endpoint_provider,
                         "name": LEGACY_APEX_LABEL,
                     },
                 },
@@ -1821,11 +1873,29 @@ class CloudRouterAccountStore:
             legacy_apex_codex is not None
             and codex == legacy_apex_codex
         )
-        if codex != expected_codex and not migrate_legacy_apex:
+        migrate_legacy_apex_endpoint = (
+            (
+                legacy_apex_endpoint_codex is not None
+                and codex == legacy_apex_endpoint_codex
+            )
+            or (
+                legacy_apex_endpoint_legacy_codex is not None
+                and codex == legacy_apex_endpoint_legacy_codex
+            )
+        )
+        if (
+            codex != expected_codex
+            and not migrate_legacy_apex
+            and not migrate_legacy_apex_endpoint
+        ):
             raise CloudRouterUnsafePathError(
                 f"Modified Codex API routing: {account.id}",
             )
-        if projects is not None or migrate_legacy_apex:
+        if (
+            projects is not None
+            or migrate_legacy_apex
+            or migrate_legacy_apex_endpoint
+        ):
             try:
                 _atomic_private_write(
                     account.root / "codex" / "config.toml",

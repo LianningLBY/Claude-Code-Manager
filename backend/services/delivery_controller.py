@@ -73,6 +73,9 @@ from backend.services.delivery_workspace import (
     DeliveryWorkspaceManager,
     DeliveryWorkspaceSnapshot,
 )
+from backend.services.test_harness_owner_fence import (
+    no_active_test_harness_owner_graph_predicate,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -301,6 +304,15 @@ class DeliveryPublisher(Protocol):
         expected_monitor_state_version: int,
     ) -> PublishedPullRequest: ...
 
+    async def verify_merged(
+        self,
+        *,
+        run_id: int,
+        pull_request: PublishedPullRequest,
+        monitor_run_id: int,
+        expected_monitor_state_version: int,
+    ) -> PublishedPullRequest: ...
+
 
 class UnavailableDeliveryPublisher:
     async def ensure_pull_request(
@@ -346,6 +358,24 @@ class UnavailableDeliveryPublisher:
             "Delivery ready-to-merge verifier is not configured"
         )
 
+    async def verify_merged(
+        self,
+        *,
+        run_id: int,
+        pull_request: PublishedPullRequest,
+        monitor_run_id: int,
+        expected_monitor_state_version: int,
+    ) -> PublishedPullRequest:
+        del (
+            run_id,
+            pull_request,
+            monitor_run_id,
+            expected_monitor_state_version,
+        )
+        raise DeliveryPublisherUnavailable(
+            "Delivery merged verifier is not configured"
+        )
+
 
 @dataclass(frozen=True, slots=True)
 class _Lease:
@@ -373,6 +403,8 @@ class _RunContext:
     head_tree_sha: str | None
     title: str
     requirements: str
+    auto_merge: bool
+    terminal: str
 
 
 def _utcnow() -> datetime:
@@ -592,6 +624,72 @@ class DeliveryController:
             and historical.pid is None
             and historical.status != "running"
         )
+
+    @staticmethod
+    async def _fence_developer_task_graph_locked(
+        db: AsyncSession,
+        task: Task,
+    ) -> bool:
+        """Win the Task writer race only when its Harness graph is idle.
+
+        Delivery reuses one developer Task across cycles.  A terminal Task is
+        also a valid owner for a user-started Test Harness run, so changing its
+        status without this CAS would strand the Run/Workspace/Browser graph
+        on an owner identity that can no longer be cancelled or reconciled.
+
+        Harness admission writes the exact owner Task before inserting its
+        graph.  This no-op UPDATE is therefore the portable first-writer gate:
+        PostgreSQL/MySQL take the row lock and SQLite WAL takes the writer
+        reservation.  The correlated graph predicate then gives either the
+        Harness admission or this Delivery transition one deterministic
+        winner without performing cross-session cleanup while Delivery locks
+        are held.
+        """
+
+        predicates = [
+            Task.id == task.id,
+            (
+                Task.incarnation_id.is_(None)
+                if task.incarnation_id is None
+                else Task.incarnation_id == task.incarnation_id
+            ),
+            Task.status == task.status,
+            Task.retry_count == task.retry_count,
+            Task.turn_generation == task.turn_generation,
+            (
+                Task.instance_id.is_(None)
+                if task.instance_id is None
+                else Task.instance_id == task.instance_id
+            ),
+            (
+                Task.started_at.is_(None)
+                if task.started_at is None
+                else Task.started_at == task.started_at
+            ),
+            (
+                Task.completed_at.is_(None)
+                if task.completed_at is None
+                else Task.completed_at == task.completed_at
+            ),
+            (
+                Task.pty_background_generation.is_(None)
+                if task.pty_background_generation is None
+                else Task.pty_background_generation == task.pty_background_generation
+            ),
+            Task.delivery_run_id == task.delivery_run_id,
+            Task.delivery_role == task.delivery_role,
+            Task.mode == task.mode,
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
+            no_active_test_harness_owner_graph_predicate(),
+        ]
+        fenced = await db.execute(
+            update(Task)
+            .where(*predicates)
+            .values(status=task.status)
+            .execution_options(synchronize_session=False)
+        )
+        return fenced.rowcount == 1
 
     async def _terminal_task_generation_settled(
         self,
@@ -1023,6 +1121,13 @@ class DeliveryController:
                 if isinstance(run.policy_snapshot, dict)
                 else None
             )
+            policy = run.policy_snapshot
+            auto_merge = (
+                policy.get("auto_merge") if isinstance(policy, dict) else None
+            )
+            terminal = (
+                policy.get("terminal") if isinstance(policy, dict) else None
+            )
             frozen_repo_full_name = (
                 monitor_policy.get("repo_full_name")
                 if isinstance(monitor_policy, dict)
@@ -1032,6 +1137,11 @@ class DeliveryController:
                 project is None
                 or not project.local_path
                 or repo is None
+                or not isinstance(policy, dict)
+                or value_hash(policy) != run.policy_hash
+                or type(auto_merge) is not bool
+                or terminal
+                != ("merged" if auto_merge else "ready_to_merge")
                 or repo.project_id != project.id
                 or not isinstance(frozen_repo_full_name, str)
                 or not frozen_repo_full_name
@@ -1058,6 +1168,8 @@ class DeliveryController:
                 head_tree_sha=run.head_tree_sha,
                 title=run.title,
                 requirements=run.requirements,
+                auto_merge=auto_merge,
+                terminal=terminal,
             )
 
     async def _drive(self, lease: _Lease) -> bool:
@@ -1414,6 +1526,9 @@ class DeliveryController:
                     "Developer Task is not an idle controller-owned generation"
                 )
             if not await self._developer_task_settled_locked(db, task):
+                await db.rollback()
+                return False
+            if not await self._fence_developer_task_graph_locked(db, task):
                 await db.rollback()
                 return False
             generation = run.turn_count + 1
@@ -1796,6 +1911,9 @@ class DeliveryController:
             if not await self._developer_task_settled_locked(db, task):
                 await db.rollback()
                 return False
+            if not await self._fence_developer_task_graph_locked(db, task):
+                await db.rollback()
+                return False
             if snapshot.worktree_path != run.workspace_path:
                 raise DeliverySubjectChanged("Developer completed in another workspace")
             if run.base_sha != snapshot.base_sha:
@@ -2058,6 +2176,12 @@ class DeliveryController:
                             "Developer Task changed before Review budget failure"
                         )
                     if not await self._developer_task_settled_locked(db, task):
+                        await db.rollback()
+                        return False
+                    if not await self._fence_developer_task_graph_locked(
+                        db,
+                        task,
+                    ):
                         await db.rollback()
                         return False
                     complete_cycle(cycle, status="failed")
@@ -3014,10 +3138,21 @@ class DeliveryController:
                 {
                     "id": review.id,
                     "monitor_run_id": review.monitor_run_id,
+                    "repo_id": review.repo_id,
+                    "pr_number": review.pr_number,
                     "status": review.status,
                     "action_taken": review.action_taken,
+                    "base_ref": review.base_ref,
                     "base_sha": review.base_sha,
                     "head_sha": review.head_sha,
+                    "delivery_id": review.delivery_id,
+                    "pr_url": review.pr_url,
+                    "task_id": review.task_id,
+                    "action_nonce": review.action_nonce,
+                    "publishing_actor": review.publishing_actor,
+                    "publishing_started_at": review.publishing_started_at,
+                    "merge_method": review.merge_method,
+                    "completed_at": review.completed_at,
                     "summary": review.review_summary,
                 }
                 if review is not None
@@ -3057,7 +3192,7 @@ class DeliveryController:
                 review_snapshot=review_snapshot,
             )
             return False
-        if status == "ready_to_merge":
+        if status == context.terminal:
             if (
                 not isinstance(run_binding["pr_number"], int)
                 or run_binding["pr_number"] <= 0
@@ -3068,7 +3203,55 @@ class DeliveryController:
                 or not isinstance(context.head_sha, str)
             ):
                 raise DeliverySubjectChanged(
-                    "ready_to_merge Delivery PR binding is incomplete"
+                    f"{context.terminal} Delivery PR binding is incomplete"
+                )
+            if (
+                review_snapshot is None
+                or review_snapshot["monitor_run_id"]
+                != monitor_snapshot["id"]
+                or review_snapshot["repo_id"] != context.monitored_repo_id
+                or review_snapshot["pr_number"] != run_binding["pr_number"]
+                or review_snapshot["base_ref"] != context.base_branch
+                or review_snapshot["base_sha"] != context.base_sha
+                or review_snapshot["head_sha"] != context.head_sha
+                or review_snapshot["delivery_id"]
+                != f"delivery:{context.run_id}:{context.head_sha}"
+                or not isinstance(review_snapshot["pr_url"], str)
+                or review_snapshot["pr_url"].rstrip("/")
+                != run_binding["pr_url"].rstrip("/")
+                or review_snapshot["completed_at"] is None
+                or (
+                    context.auto_merge
+                    and (
+                        review_snapshot["status"] != "merged"
+                        or review_snapshot["action_taken"]
+                        != "approved_merged"
+                        or not isinstance(
+                            review_snapshot["publishing_actor"], str
+                        )
+                        or not review_snapshot["publishing_actor"]
+                        or not isinstance(
+                            review_snapshot["publishing_started_at"], datetime
+                        )
+                        or review_snapshot["merge_method"]
+                        not in {"merge", "squash", "fast-forward"}
+                    )
+                )
+                or (
+                    not context.auto_merge
+                    and (
+                        review_snapshot["status"],
+                        review_snapshot["action_taken"],
+                    )
+                    not in {
+                        ("approved", "lgtm_comment"),
+                        ("commented", "review_comments"),
+                    }
+                )
+            ):
+                raise DeliverySubjectChanged(
+                    f"{context.terminal} Delivery terminal lacks its exact "
+                    "Review evidence"
                 )
             expected_pull_request = PublishedPullRequest(
                 repo_id=context.monitored_repo_id,
@@ -3079,7 +3262,12 @@ class DeliveryController:
                 head_branch=context.delivery_branch,
                 head_repo_full_name=repo_full_name,
             )
-            verified_pull_request = await self.publisher.verify_ready_to_merge(
+            verifier = (
+                self.publisher.verify_merged
+                if context.auto_merge
+                else self.publisher.verify_ready_to_merge
+            )
+            verified_pull_request = await verifier(
                 run_id=context.run_id,
                 pull_request=expected_pull_request,
                 monitor_run_id=int(monitor_snapshot["id"]),
@@ -3089,7 +3277,7 @@ class DeliveryController:
             )
             if verified_pull_request != expected_pull_request:
                 raise DeliverySubjectChanged(
-                    "Ready verifier returned a different PR subject"
+                    "Terminal verifier returned a different PR subject"
                 )
             async with self.db_factory() as db:
                 run = await lock_run(db, lease.run_id)
@@ -3110,9 +3298,36 @@ class DeliveryController:
                         .execution_options(populate_existing=True)
                     )
                 ).scalar_one_or_none()
+                terminal_review = (
+                    (
+                        await db.execute(
+                            select(PRReview)
+                            .where(
+                                PRReview.id == monitor.current_review_id
+                            )
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if monitor is not None
+                    and monitor.current_review_id is not None
+                    else None
+                )
                 if (
                     run.phase != "monitoring"
                     or run.activity != "waiting"
+                    or not isinstance(run.policy_snapshot, dict)
+                    or value_hash(run.policy_snapshot) != run.policy_hash
+                    or run.policy_snapshot.get("auto_merge")
+                    is not context.auto_merge
+                    or run.policy_snapshot.get("terminal")
+                    != context.terminal
+                    or run.project_id != context.project_id
+                    or run.developer_task_id != context.developer_task_id
+                    or run.monitored_repo_id != context.monitored_repo_id
+                    or run.current_cycle_id != context.cycle_id
+                    or run.delivery_branch != context.delivery_branch
+                    or run.base_branch != context.base_branch
                     or run.pr_monitor_run_id != monitor_snapshot["id"]
                     or run.pr_number != verified_pull_request.pr_number
                     or run.pr_url != verified_pull_request.url
@@ -3121,7 +3336,7 @@ class DeliveryController:
                     or monitor is None
                     or monitor.id != monitor_snapshot["id"]
                     or monitor.state_version != monitor_snapshot["state_version"]
-                    or monitor.status != "ready_to_merge"
+                    or monitor.status != context.terminal
                     or monitor.repo_id != verified_pull_request.repo_id
                     or monitor.pr_number != verified_pull_request.pr_number
                     or monitor.current_base_sha != verified_pull_request.base_sha
@@ -3133,11 +3348,59 @@ class DeliveryController:
                     != verified_pull_request.head_repo_full_name.lower()
                     or task is None
                     or task.status not in _TASK_REUSABLE_STATUSES
+                    or (
+                        terminal_review is None
+                        or review_snapshot is None
+                        or terminal_review.id != review_snapshot["id"]
+                        or terminal_review.monitor_run_id != monitor.id
+                        or terminal_review.repo_id
+                        != verified_pull_request.repo_id
+                        or terminal_review.pr_number
+                        != verified_pull_request.pr_number
+                        or terminal_review.base_ref != context.base_branch
+                        or terminal_review.base_ref
+                        != review_snapshot["base_ref"]
+                        or terminal_review.base_sha
+                        != verified_pull_request.base_sha
+                        or terminal_review.base_sha
+                        != review_snapshot["base_sha"]
+                        or terminal_review.head_sha
+                        != verified_pull_request.head_sha
+                        or terminal_review.head_sha
+                        != review_snapshot["head_sha"]
+                        or terminal_review.delivery_id
+                        != f"delivery:{run.id}:{run.head_sha}"
+                        or terminal_review.delivery_id
+                        != review_snapshot["delivery_id"]
+                        or terminal_review.pr_url.rstrip("/")
+                        != verified_pull_request.url.rstrip("/")
+                        or terminal_review.pr_url
+                        != review_snapshot["pr_url"]
+                        or terminal_review.status
+                        != review_snapshot["status"]
+                        or terminal_review.action_taken
+                        != review_snapshot["action_taken"]
+                        or terminal_review.task_id
+                        != review_snapshot["task_id"]
+                        or terminal_review.action_nonce
+                        != review_snapshot["action_nonce"]
+                        or terminal_review.publishing_actor
+                        != review_snapshot["publishing_actor"]
+                        or terminal_review.publishing_started_at
+                        != review_snapshot["publishing_started_at"]
+                        or terminal_review.merge_method
+                        != review_snapshot["merge_method"]
+                        or terminal_review.completed_at
+                        != review_snapshot["completed_at"]
+                    )
                 ):
                     raise DeliverySubjectChanged(
-                        "ready_to_merge subject changed before completion"
+                        f"{context.terminal} subject changed before completion"
                     )
                 if not await self._developer_task_settled_locked(db, task):
+                    await db.rollback()
+                    return False
+                if not await self._fence_developer_task_graph_locked(db, task):
                     await db.rollback()
                     return False
                 await apply_run_event(
@@ -3149,6 +3412,8 @@ class DeliveryController:
                     metadata={
                         "base_sha": monitor.current_base_sha,
                         "head_sha": monitor.current_head_sha,
+                        "monitor_status": monitor.status,
+                        "auto_merge": context.auto_merge,
                     },
                 )
                 task.status = "completed"
@@ -3201,6 +3466,12 @@ class DeliveryController:
                             "Developer Task changed before Monitor budget failure"
                         )
                     if not await self._developer_task_settled_locked(db, task):
+                        await db.rollback()
+                        return False
+                    if not await self._fence_developer_task_graph_locked(
+                        db,
+                        task,
+                    ):
                         await db.rollback()
                         return False
                     await apply_run_event(
@@ -3282,18 +3553,18 @@ class DeliveryController:
         async with self.db_factory() as db:
             run = await lock_run(db, lease.run_id)
             self._assert_lease(run, lease)
-            review = (
-                await db.execute(
-                    select(PRReview)
-                    .where(PRReview.id == review_snapshot["id"])
-                    .with_for_update()
-                    .execution_options(populate_existing=True)
-                )
-            ).scalar_one_or_none()
             monitor = (
                 await db.execute(
                     select(PRMonitorRun)
                     .where(PRMonitorRun.id == monitor_snapshot["id"])
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            review = (
+                await db.execute(
+                    select(PRReview)
+                    .where(PRReview.id == review_snapshot["id"])
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
@@ -3309,6 +3580,7 @@ class DeliveryController:
                 or review.monitor_run_id != monitor_snapshot["id"]
                 or review.status != "error"
                 or review.action_taken != "error"
+                or review.base_ref != run.base_branch
                 or review.base_sha != monitor_snapshot["base_sha"]
                 or review.head_sha != monitor_snapshot["head_sha"]
                 or review.review_summary != review_snapshot["summary"]
@@ -3334,6 +3606,9 @@ class DeliveryController:
                 await db.rollback()
                 return
             if not await self._developer_task_settled_locked(db, task):
+                await db.rollback()
+                return
+            if not await self._fence_developer_task_graph_locked(db, task):
                 await db.rollback()
                 return
             message = (
@@ -3417,6 +3692,9 @@ class DeliveryController:
                 await db.rollback()
                 return False
             if not await self._developer_task_settled_locked(db, task):
+                await db.rollback()
+                return False
+            if not await self._fence_developer_task_graph_locked(db, task):
                 await db.rollback()
                 return False
             if run.current_cycle_id is not None:

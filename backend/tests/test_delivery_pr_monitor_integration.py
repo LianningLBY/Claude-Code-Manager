@@ -30,6 +30,7 @@ async def _delivery_review(
     suffix: str,
     merge_queue_mode: str = "manual",
     auto_repair: bool = True,
+    auto_merge: bool = False,
 ) -> tuple[MonitoredRepo, PRMonitorRun, PRReview, DeliveryRun]:
     project = Project(name=f"delivery-monitor-{suffix}")
     db_session.add(project)
@@ -39,7 +40,7 @@ async def _delivery_review(
         project_id=project.id,
         webhook_secret="s" * 64,
         review_mode="panel",
-        auto_merge=False,
+        auto_merge=auto_merge,
         auto_repair=auto_repair,
         max_repair_attempts=3,
         merge_queue_mode=merge_queue_mode,
@@ -65,8 +66,8 @@ async def _delivery_review(
     await db_session.flush()
     policy = {
         "schema_version": 1,
-        "terminal": "ready_to_merge",
-        "auto_merge": False,
+        "terminal": "merged" if auto_merge else "ready_to_merge",
+        "auto_merge": auto_merge,
         "pr_monitor": {
             "repo_id": repo.id,
             "repo_full_name": repo.repo_full_name,
@@ -103,6 +104,7 @@ async def _delivery_review(
         monitor_run_id=monitor.id,
         repo_id=repo.id,
         pr_number=8,
+        base_ref="main",
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
         delivery_id=f"delivery:{delivery.id}:{HEAD_SHA}",
@@ -153,6 +155,7 @@ async def test_delivery_task_never_receives_legacy_pr_repair_wake(db_session):
         monitor_run_id=run.id,
         repo_id=repo.id,
         pr_number=8,
+        base_ref="main",
         base_sha=run.current_base_sha,
         head_sha=run.current_head_sha,
         pr_title="blocked",
@@ -246,6 +249,7 @@ async def test_delivery_panel_tasks_use_frozen_no_auto_merge_policy(db_session):
     repo.auto_merge = True
     review.status = "waiting_ci"
     context = {
+        "base_ref": "main",
         "guidance": {"CLAUDE.md": None, "PROGRESS.md": None},
         "material": {
             "number": review.pr_number,
@@ -277,5 +281,53 @@ async def test_delivery_panel_tasks_use_frozen_no_auto_merge_policy(db_session):
     assert len(reviewer_tasks) == len(pr_review_panel.REVIEWER_ROLES)
     assert all(
         task.metadata_.get("pr_auto_merge") is False
+        for task in reviewer_tasks
+    )
+
+
+@pytest.mark.asyncio
+async def test_delivery_panel_tasks_use_frozen_auto_merge_policy(db_session):
+    repo, _monitor, review, _delivery = await _delivery_review(
+        db_session,
+        suffix="waiting-ci-auto-merge",
+        auto_merge=True,
+    )
+    # The mutable row drifting narrower must not change an already admitted
+    # Run's exact publication terminal.
+    repo.auto_merge = False
+    review.status = "waiting_ci"
+    context = {
+        "base_ref": "main",
+        "guidance": {"CLAUDE.md": None, "PROGRESS.md": None},
+        "material": {
+            "number": review.pr_number,
+            "title": review.pr_title,
+            "body": "",
+            "author": review.pr_author,
+            "base_ref": "main",
+            "head_ref": "feature",
+            "files": [],
+            "patch": "",
+            "changed_file_contents": [],
+        },
+    }
+
+    await pr_review_panel._add_panel_tasks(
+        db_session,
+        repo=repo,
+        review=review,
+        context=context,
+    )
+
+    reviewer_tasks = list(
+        (
+            await db_session.execute(
+                select(Task).where(Task.tags.contains(["pr-review"]))
+            )
+        ).scalars()
+    )
+    assert len(reviewer_tasks) == len(pr_review_panel.REVIEWER_ROLES)
+    assert all(
+        task.metadata_.get("pr_auto_merge") is True
         for task in reviewer_tasks
     )

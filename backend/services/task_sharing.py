@@ -13,6 +13,11 @@ from backend.models.task import Task
 from backend.models.project import Project
 from backend.models.task_share import TaskShare, ProjectShare
 from backend.services.pr_review_runtime import is_pr_sandbox_task
+from backend.services.project_share_admission import (
+    lock_project_share_authority,
+    project_has_active_share,
+    require_project_agents_quiescent,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +50,12 @@ async def lock_task_share_authority(db: AsyncSession, task: Task) -> bool:
 
 
 def _writable_share_block_reason(task: Task) -> str | None:
+    metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+    if metadata.get("isolated_browser_agent") is True:
+        return (
+            "Isolated Browser Agent Tasks cannot be shared as writable chat "
+            "sessions; use their Harness owner"
+        )
     if task.mode == "delivery_loop" or task.delivery_run_id is not None:
         return (
             "Delivery-owned Tasks cannot be shared as writable remote chat "
@@ -80,11 +91,21 @@ async def share_task(
     targets: list of {"open_id": str, "name": str, "ccm_url": str}
     Returns list of created share records (as dicts).
     """
-    task = await db.get(Task, task_id)
+    task = (
+        await db.execute(
+            select(Task).where(Task.id == task_id).with_for_update()
+        )
+    ).scalar_one_or_none()
     if not task:
         raise ValueError(f"Task {task_id} not found")
     if not await lock_task_share_authority(db, task):
         raise ValueError(f"Task {task_id} changed while sharing")
+    from backend.services.task_ssh_access import task_has_any_ssh_grants
+
+    if await task_has_any_ssh_grants(db, task_id):
+        raise ValueError(
+            "Remove this Task's SSH grants before sharing it"
+        )
     blocked = _writable_share_block_reason(task)
     if blocked is not None:
         raise ValueError(blocked)
@@ -234,11 +255,34 @@ async def share_project(
     db: AsyncSession,
     project_id: int,
     targets: list[dict],
+    *,
+    instance_manager=None,
+    dispatcher=None,
 ) -> list[dict]:
     """Share a project (and all its current tasks) with members."""
-    project = await db.get(Project, project_id)
-    if not project:
-        raise ValueError(f"Project {project_id} not found")
+    project = await lock_project_share_authority(db, project_id)
+    # Only the visibility transition needs a bare-Agent veto. Once any Team
+    # or Feishu share is active, adding/retrying another recipient remains
+    # idempotent and must not reject a future legitimately isolated runtime.
+    if not await project_has_active_share(db, project_id):
+        await require_project_agents_quiescent(
+            db,
+            project,
+            instance_manager=instance_manager,
+            dispatcher=dispatcher,
+        )
+    await db.execute(
+        select(Task.id)
+        .where(Task.project_id == project_id)
+        .order_by(Task.id)
+        .with_for_update()
+    )
+    from backend.services.task_ssh_access import project_has_task_ssh_grants
+
+    if await project_has_task_ssh_grants(db, project_id):
+        raise ValueError(
+            "Remove SSH grants from this Project's Tasks before sharing it"
+        )
 
     created = []
     for target in targets:

@@ -67,6 +67,7 @@ from backend.schemas.pr_monitor import (
     PRMonitorRunResponse,
     PRRepairWakeResponse,
     PRMergeQueueActionResponse,
+    required_checks_support_direct_auto_merge,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,6 +243,7 @@ async def _find_processed_review(
     db: AsyncSession,
     repo_id: int,
     pr_number: int,
+    base_ref: str,
     base_sha: str,
     head_sha: str,
     delivery_id: str | None,
@@ -251,6 +253,7 @@ async def _find_processed_review(
         and_(
             PRReview.repo_id == repo_id,
             PRReview.pr_number == pr_number,
+            PRReview.base_ref == base_ref,
             PRReview.base_sha == base_sha,
             PRReview.head_sha == head_sha,
         )
@@ -574,10 +577,15 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
         raise HTTPException(400, "auto_repair requires review_mode=panel")
     if body.wait_for_ci and not body.required_checks:
         raise HTTPException(400, "wait_for_ci requires at least one required check")
-    if body.auto_merge and body.review_mode != "single":
-        raise HTTPException(400, "legacy auto_merge requires review_mode=single")
+    if body.auto_merge and not required_checks_support_direct_auto_merge(
+        body.required_checks
+    ):
+        raise HTTPException(
+            400,
+            "auto_merge requires app-bound check_run required checks",
+        )
     if body.auto_merge and body.merge_queue_mode != "manual":
-        raise HTTPException(400, "legacy auto_merge and Merge Queue are mutually exclusive")
+        raise HTTPException(400, "auto_merge and Merge Queue are mutually exclusive")
     if body.merge_queue_mode != "manual" and (
         body.review_mode != "panel" or not body.wait_for_ci
     ):
@@ -698,10 +706,15 @@ async def update_repo(
             raise HTTPException(400, "wait_for_ci requires at least one required check")
         effective_auto_merge = update_data.get("auto_merge", repo.auto_merge)
         effective_merge_queue = update_data.get("merge_queue_mode", repo.merge_queue_mode)
-        if effective_auto_merge and effective_mode != "single":
-            raise HTTPException(400, "legacy auto_merge requires review_mode=single")
+        if effective_auto_merge and not required_checks_support_direct_auto_merge(
+            effective_checks
+        ):
+            raise HTTPException(
+                400,
+                "auto_merge requires app-bound check_run required checks",
+            )
         if effective_auto_merge and effective_merge_queue != "manual":
-            raise HTTPException(400, "legacy auto_merge and Merge Queue are mutually exclusive")
+            raise HTTPException(400, "auto_merge and Merge Queue are mutually exclusive")
         if effective_merge_queue != "manual" and (
             effective_mode != "panel" or not effective_wait
         ):
@@ -1514,18 +1527,23 @@ async def submit_finding_rebuttal(
         snapshot.get("state") != "OPEN"
         or snapshot.get("merged_at") is not None
         or snapshot.get("is_draft") is not False
+        or snapshot.get("base_ref") != review.base_ref
         or snapshot.get("base_sha") != review.base_sha
         or snapshot.get("head_sha") != review.head_sha
     ):
         raise HTTPException(409, "GitHub PR subject changed before adjudication")
-    context = await prepare_pr_review_context(repo, {
-        "number": review.pr_number,
-        "base_sha": review.base_sha,
-        "head_sha": review.head_sha,
-        "title": review.pr_title,
-        "author": review.pr_author,
-        "url": review.pr_url,
-    })
+    context = await prepare_pr_review_context(
+        repo,
+        {
+            "number": review.pr_number,
+            "base_sha": review.base_sha,
+            "head_sha": review.head_sha,
+            "title": review.pr_title,
+            "author": review.pr_author,
+            "url": review.pr_url,
+        },
+        base_ref=review.base_ref,
+    )
     # Context preparation may perform remote reads.  Refresh the GitHub
     # subject once more before entering the portable database writer fence;
     # holding SQLite's global writer slot across network I/O would block
@@ -1537,6 +1555,7 @@ async def submit_finding_rebuttal(
         snapshot.get("state") != "OPEN"
         or snapshot.get("merged_at") is not None
         or snapshot.get("is_draft") is not False
+        or snapshot.get("base_ref") != review.base_ref
         or snapshot.get("base_sha") != review.base_sha
         or snapshot.get("head_sha") != review.head_sha
     ):
@@ -1590,6 +1609,7 @@ async def submit_finding_rebuttal(
             or run.current_review_id != review.id
             or run.current_base_sha != review.base_sha
             or run.current_head_sha != review.head_sha
+            or review.base_ref != context.get("base_ref")
             or finding.base_sha != review.base_sha
             or finding.head_sha != review.head_sha
             or run.developer_task_id != developer.id
@@ -1703,11 +1723,31 @@ async def bind_monitor_developer(
                 .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
                 .with_for_update()
             )).scalar_one_or_none()
+            review = (
+                (await db.execute(
+                    select(PRReview)
+                    .where(
+                        PRReview.id == run.current_review_id,
+                        PRReview.repo_id == repo_id,
+                        PRReview.monitor_run_id == run.id,
+                    )
+                    .with_for_update()
+                )).scalar_one_or_none()
+                if run is not None and run.current_review_id is not None
+                else None
+            )
             task = (await db.execute(
                 select(Task).where(Task.id == task_id).with_for_update()
             )).scalar_one_or_none()
             if repo is None or run is None or task is None:
                 raise HTTPException(404, "Repository, Run, or Developer Task not found")
+            if (
+                review is None
+                or review.monitor_run_id != run.id
+                or review.base_sha != run.current_base_sha
+                or review.head_sha != run.current_head_sha
+            ):
+                raise HTTPException(409, "PR Monitor Gate subject is incomplete")
             await _require_pr_monitor_access(request, db, repo)
             await require_task_control(request, task, db)
             await _require_legacy_pr_effect_allowed(
@@ -1765,6 +1805,7 @@ async def bind_monitor_developer(
                 snapshot.get("state") != "OPEN"
                 or snapshot.get("merged_at") is not None
                 or snapshot.get("is_draft") is not False
+                or snapshot.get("base_ref") != review.base_ref
                 or snapshot.get("base_sha") != run.current_base_sha
                 or snapshot.get("head_sha") != run.current_head_sha
             ):
@@ -1786,6 +1827,7 @@ async def bind_monitor_developer(
             run.state_version += 1
             shadows = list((await db.execute(select(PRRepairWake).where(
                 PRRepairWake.monitor_run_id == run.id,
+                PRRepairWake.review_id == review.id,
                 PRRepairWake.trigger_head_sha == run.current_head_sha,
                 PRRepairWake.status == "shadow",
             ).with_for_update())).scalars())
@@ -1950,15 +1992,36 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
             raise HTTPException(409, "Enable the PR monitor before resuming a Run")
         if run.status != "paused":
             raise HTTPException(409, "Only a paused PR Monitor Run can be resumed")
+        review = (
+            (await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == run.current_review_id,
+                    PRReview.repo_id == repo.id,
+                    PRReview.monitor_run_id == run.id,
+                )
+                .with_for_update()
+            )).scalar_one_or_none()
+            if run.current_review_id is not None
+            else None
+        )
+        if (
+            review is None
+            or review.base_sha != run.current_base_sha
+            or review.head_sha != run.current_head_sha
+        ):
+            raise HTTPException(409, "PR Monitor Gate subject is incomplete")
 
         current_action = (await db.execute(select(PRMergeQueueAction).where(
             PRMergeQueueAction.monitor_run_id == run.id,
+            PRMergeQueueAction.review_id == review.id,
             PRMergeQueueAction.trigger_base_sha == run.current_base_sha,
             PRMergeQueueAction.trigger_head_sha == run.current_head_sha,
             PRMergeQueueAction.status == "paused",
         ).order_by(desc(PRMergeQueueAction.id)).with_for_update())).scalars().first()
         current_wake = (await db.execute(select(PRRepairWake).where(
             PRRepairWake.monitor_run_id == run.id,
+            PRRepairWake.review_id == review.id,
             PRRepairWake.trigger_base_sha == run.current_base_sha,
             PRRepairWake.trigger_head_sha == run.current_head_sha,
             PRRepairWake.status.in_(("shadow", "failed")),
@@ -1979,6 +2042,7 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 snapshot.get("state") != "OPEN"
                 or snapshot.get("merged_at") is not None
                 or snapshot.get("is_draft") is not False
+                or snapshot.get("base_ref") != review.base_ref
                 or snapshot.get("base_sha") != current_action.trigger_base_sha
                 or snapshot.get("head_sha") != current_action.trigger_head_sha
             ):
@@ -1994,7 +2058,8 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                     "Remote Merge Queue state could not be confirmed",
                 ) from exc
             if entry is not None and (
-                entry.base_sha != current_action.trigger_base_sha
+                entry.base_ref != review.base_ref
+                or entry.base_sha != current_action.trigger_base_sha
                 or entry.head_sha != current_action.trigger_head_sha
             ):
                 raise HTTPException(409, "Remote Merge Queue entry is for another subject")
@@ -2004,7 +2069,7 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 try:
                     merge_group = await _read_merge_group_ref(
                         repo.repo_full_name,
-                        default_branch=repo.default_branch,
+                        default_branch=review.base_ref,
                         pr_number=run.pr_number,
                     )
                 except Exception as exc:
@@ -2054,6 +2119,7 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
                 snapshot.get("state") != "OPEN"
                 or snapshot.get("merged_at") is not None
                 or snapshot.get("is_draft") is not False
+                or snapshot.get("base_ref") != review.base_ref
                 or snapshot.get("base_sha") != current_wake.trigger_base_sha
                 or snapshot.get("head_sha") != current_wake.trigger_head_sha
             ):
@@ -2069,11 +2135,6 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
         else:
             if current_wake is not None:
                 current_wake.status = "shadow"
-            review = (
-                await db.get(PRReview, run.current_review_id)
-                if run.current_review_id is not None
-                else None
-            )
             blockers = []
             if review is not None:
                 blockers = list((await db.execute(select(PRFinding.id).where(
@@ -2161,8 +2222,7 @@ async def enqueue_monitor_merge(
                 select(PRMergeQueueAction)
                 .where(
                     PRMergeQueueAction.monitor_run_id == run.id,
-                    PRMergeQueueAction.trigger_head_sha
-                    == run.current_head_sha,
+                    PRMergeQueueAction.review_id == review.id,
                 )
                 .with_for_update()
             )
@@ -2267,6 +2327,24 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         return {"status": "ignored", "reason": f"event type: {event_type}"}
 
     action = payload.get("action", "")
+    if action == "edited":
+        changes = payload.get("changes")
+        base_change = changes.get("base") if isinstance(changes, dict) else None
+        ref_change = (
+            base_change.get("ref") if isinstance(base_change, dict) else None
+        )
+        previous_ref = (
+            ref_change.get("from") if isinstance(ref_change, dict) else None
+        )
+        if not isinstance(previous_ref, str) or not previous_ref:
+            return {
+                "status": "ignored",
+                "reason": "edited event did not retarget the PR base",
+            }
+        # A base retarget is a new immutable review subject even when GitHub
+        # reports the same base/head commit OIDs. Reuse synchronize's durable
+        # supersede/termination protocol.
+        action = "synchronize"
     if action not in ("opened", "synchronize"):
         return {"status": "ignored", "reason": f"action: {action}"}
 
@@ -2338,6 +2416,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         db,
         repo_id,
         pr_number,
+        base_branch,
         base_sha,
         head_sha,
         delivery_id,
@@ -2362,6 +2441,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
         replacement_data = {
             "number": pr_number,
+            "base_ref": base_branch,
             "base_sha": base_sha,
             "head_sha": head_sha,
             "delivery_id": delivery_id,
@@ -2427,6 +2507,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 db,
                 repo_id,
                 pr_number,
+                base_branch,
                 base_sha,
                 head_sha,
                 delivery_id,
@@ -2498,6 +2579,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                         db,
                         repo_id,
                         pr_number,
+                        base_branch,
                         base_sha,
                         head_sha,
                         delivery_id,
@@ -2873,6 +2955,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
     review_data = {
         "number": pr_number,
+        "base_ref": base_branch,
         "base_sha": base_sha,
         "head_sha": head_sha,
         "delivery_id": delivery_id,
@@ -2917,6 +3000,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             db,
             repo_id,
             pr_number,
+            base_branch,
             base_sha,
             head_sha,
             delivery_id,
@@ -2972,6 +3056,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 db,
                 repo_id,
                 pr_number,
+                base_branch,
                 base_sha,
                 head_sha,
                 delivery_id,

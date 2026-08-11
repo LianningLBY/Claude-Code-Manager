@@ -151,6 +151,13 @@ class Task(Base):
     goal_max_turns: Mapped[int] = mapped_column(Integer, default=30)  # goal mode: max turns before auto-fail
     goal_turns_used: Mapped[int] = mapped_column(Integer, default=0)  # goal mode: turns completed so far
     goal_last_reason: Mapped[str | None] = mapped_column(Text, nullable=True)  # goal mode: evaluator's latest judgment reason
+    pr_loop_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    pr_loop_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pr_loop_repo: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    pr_loop_state: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    pr_loop_max_turns: Mapped[int] = mapped_column(Integer, default=10)
+    pr_loop_turns_used: Mapped[int] = mapped_column(Integer, default=0)
+    pr_loop_poll_interval: Mapped[int] = mapped_column(Integer, default=60)
     plan_content: Mapped[str | None] = mapped_column(Text, nullable=True)  # Claude's proposed plan
     plan_approved: Mapped[bool | None] = mapped_column(default=None)  # None=pending, True=approved, False=rejected
     # Independent Plan Task relationship and application audit.  Always relate
@@ -351,6 +358,13 @@ def _configure_task_properties():
     )
     Task.delivery_outcome = column_property(
         select(delivery_runs.c.outcome)
+        .where(delivery_runs.c.id == Task.delivery_run_id)
+        .limit(1)
+        .correlate(Task.__table__)
+        .scalar_subquery()
+    )
+    Task.delivery_terminal = column_property(
+        select(delivery_runs.c.policy_snapshot["terminal"].as_string())
         .where(delivery_runs.c.id == Task.delivery_run_id)
         .limit(1)
         .correlate(Task.__table__)

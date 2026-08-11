@@ -6,16 +6,25 @@ import asyncio
 import os
 import sys
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
 
 from backend.models.discussion import Discussion, DiscussionAgent, DiscussionEvent
+from backend.models.project import Project
+from backend.models.team_share import TeamProjectShare
+from backend.models.user import User
 from backend.services import discussion_service
 from backend.services.discussion_service import (
     DiscussionProcessCleanupError,
+    DiscussionSecurityError,
     DiscussionService,
+)
+from backend.services.project_share_admission import (
+    ProjectShareAdmissionError,
+    lock_project_share_authority,
+    require_project_agents_quiescent,
 )
 
 
@@ -48,6 +57,34 @@ async def _wait_for_process(
             return process
         await asyncio.sleep(0.01)
     raise AssertionError("discussion subprocess was not registered")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["active", "closing"])
+async def test_active_and_closing_discussions_veto_first_project_share(
+    db_factory,
+    status,
+):
+    async with db_factory() as db:
+        project = Project(name=f"discussion-share-lease-{status}", status="ready")
+        db.add(project)
+        await db.flush()
+        db.add(Discussion(
+            title=f"{status} provider lease",
+            project_id=project.id,
+            status=status,
+        ))
+        await db.commit()
+        project_id = project.id
+
+    async with db_factory() as db:
+        project = await lock_project_share_authority(db, project_id)
+        with pytest.raises(
+            ProjectShareAdmissionError,
+            match="active or closing Project Discussion",
+        ):
+            await require_project_agents_quiescent(db, project)
+        await db.rollback()
 
 
 @pytest.mark.asyncio
@@ -260,12 +297,20 @@ async def test_shutdown_cancels_and_reaps_facilitator(monkeypatch):
         "create_subprocess_exec",
         spawn_sleeper,
     )
+    service._prepare_claude_security_context = AsyncMock(
+        return_value=(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            {},
+            os.path.abspath(os.sep),
+        )
+    )
     facilitator = asyncio.create_task(
         service._run_facilitator_process(
             SimpleNamespace(
                 id=11,
                 facilitator_model="model",
                 facilitator_session_id=None,
+                project_id=None,
             ),
             "prompt",
         )
@@ -371,3 +416,435 @@ async def test_spawn_failure_rolls_back_running_claim(db_factory):
     assert current.status == "error"
     assert current.pid is None
     assert service._consumers == {}
+
+
+@pytest.mark.asyncio
+async def test_discussion_provider_route_is_admin_only_and_scrubbed(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(discussion_service.settings, "auth_token", "configured")
+    monkeypatch.setenv("AUTH_TOKEN", "manager-token")
+    monkeypatch.setenv("DATABASE_URL", "sqlite:///manager-secret.db")
+    monkeypatch.setenv("SMTP_PASSWORD", "smtp-secret")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "provider-key")
+
+    async with db_factory() as db:
+        admin = User(
+            email="discussion-admin@example.test",
+            name="Discussion Admin",
+            password_hash="hash",
+            role="admin",
+            is_active=True,
+        )
+        db.add(admin)
+        await db.flush()
+        discussion = Discussion(
+            title="isolated",
+            creator_user_id=admin.id,
+        )
+        db.add(discussion)
+        await db.commit()
+        await db.refresh(discussion)
+        discussion_id = discussion.id
+
+    projection_dir = tmp_path / "projection"
+    projection_dir.mkdir()
+    projection = SimpleNamespace(
+        config_dir=projection_dir,
+        oauth_access_token=None,
+    )
+    prepare = MagicMock(return_value=projection)
+    monkeypatch.setattr(
+        discussion_service,
+        "prepare_claude_auth_projection",
+        prepare,
+    )
+
+    def apply_projection(env, selected):
+        assert selected is projection
+        env["CLAUDE_CONFIG_DIR"] = str(projection_dir)
+
+    monkeypatch.setattr(
+        discussion_service,
+        "apply_claude_auth_projection",
+        apply_projection,
+    )
+    protected = AsyncMock(return_value=("/manager/secret",))
+    monkeypatch.setattr(
+        discussion_service,
+        "task_ssh_protected_paths",
+        protected,
+    )
+    isolation = tmp_path / "isolation.json"
+    isolation.write_text("{}", encoding="utf-8")
+    generate = MagicMock(return_value=isolation)
+    validate = MagicMock()
+    monkeypatch.setattr(
+        discussion_service,
+        "generate_claude_read_only_isolation_settings",
+        generate,
+    )
+    monkeypatch.setattr(
+        discussion_service,
+        "validate_claude_task_isolation_settings",
+        validate,
+    )
+
+    service = DiscussionService(db_factory, _Broadcaster())
+    command, env, cwd = await service._prepare_claude_security_context(
+        discussion_service._DiscussionClaudeSecurityContext(
+            discussion_id=discussion_id,
+            namespace="discussion-facilitator",
+            identifier=discussion_id,
+            model="claude-opus-4-6",
+            resume_session_id=None,
+            repository_cwd="/project/repo",
+            binding="discussion-generation-a",
+        )
+    )
+
+    assert "--dangerously-skip-permissions" not in command
+    assert command[command.index("--permission-mode") + 1] == "plan"
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert command[command.index("--tools") + 1] == "Glob,Grep,Read"
+    assert env["ANTHROPIC_API_KEY"] == "provider-key"
+    assert "AUTH_TOKEN" not in env
+    assert "DATABASE_URL" not in env
+    assert "SMTP_PASSWORD" not in env
+    assert cwd == os.path.abspath(os.sep)
+    protected.assert_awaited_once()
+    generate.assert_called_once_with(
+        "discussion-facilitator",
+        discussion_id,
+        ("/manager/secret",),
+    )
+    validate.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_member_discussion_rejected_before_auth_projection(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(discussion_service.settings, "auth_token", "configured")
+    async with db_factory() as db:
+        member = User(
+            email="discussion-member@example.test",
+            name="Discussion Member",
+            password_hash="hash",
+            role="member",
+            is_active=True,
+        )
+        db.add(member)
+        await db.flush()
+        discussion = Discussion(
+            title="member-owned",
+            creator_user_id=member.id,
+        )
+        db.add(discussion)
+        await db.commit()
+        await db.refresh(discussion)
+        discussion_id = discussion.id
+
+    prepare = MagicMock()
+    monkeypatch.setattr(
+        discussion_service,
+        "prepare_claude_auth_projection",
+        prepare,
+    )
+    service = DiscussionService(db_factory, _Broadcaster())
+
+    with pytest.raises(DiscussionSecurityError, match="active admins"):
+        await service._prepare_claude_security_context(
+            discussion_service._DiscussionClaudeSecurityContext(
+                discussion_id=discussion_id,
+                namespace="discussion-facilitator",
+                identifier=discussion_id,
+                model="model",
+                resume_session_id=None,
+                repository_cwd=None,
+                binding="member-row",
+            )
+        )
+    prepare.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_legacy_discussion_without_creator_rejected_before_auth_projection(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(discussion_service.settings, "auth_token", "configured")
+    async with db_factory() as db:
+        discussion = Discussion(
+            title="legacy-unowned",
+            creator_user_id=None,
+        )
+        db.add(discussion)
+        await db.commit()
+        await db.refresh(discussion)
+        discussion_id = discussion.id
+
+    prepare = MagicMock()
+    monkeypatch.setattr(
+        discussion_service,
+        "prepare_claude_auth_projection",
+        prepare,
+    )
+    service = DiscussionService(db_factory, _Broadcaster())
+
+    with pytest.raises(DiscussionSecurityError, match="active admins"):
+        await service._prepare_claude_security_context(
+            discussion_service._DiscussionClaudeSecurityContext(
+                discussion_id=discussion_id,
+                namespace="discussion-facilitator",
+                identifier=discussion_id,
+                model="model",
+                resume_session_id=None,
+                repository_cwd=None,
+                binding="legacy-unowned",
+            )
+        )
+    prepare.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auth_disabled_discussion_rejected_before_provider_effect(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(discussion_service.settings, "auth_token", "")
+    prepare = MagicMock()
+    monkeypatch.setattr(
+        discussion_service,
+        "prepare_claude_auth_projection",
+        prepare,
+    )
+    service = DiscussionService(db_factory, _Broadcaster())
+
+    with pytest.raises(DiscussionSecurityError, match="security admission"):
+        await service._prepare_claude_security_context(
+            discussion_service._DiscussionClaudeSecurityContext(
+                discussion_id=1,
+                namespace="discussion-facilitator",
+                identifier=1,
+                model="model",
+                resume_session_id=None,
+                repository_cwd=None,
+                binding="no-auth",
+            )
+        )
+    prepare.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preclaimed_agent_becomes_visible_error_when_final_share_gate_vetoes(
+    db_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(discussion_service.settings, "auth_token", "configured")
+    async with db_factory() as db:
+        project = Project(name="discussion-final-share-gate", status="ready")
+        db.add(project)
+        await db.flush()
+        discussion = Discussion(
+            title="final share gate",
+            project_id=project.id,
+            status="active",
+        )
+        db.add(discussion)
+        await db.flush()
+        agent = DiscussionAgent(
+            discussion_id=discussion.id,
+            role_name="reviewer",
+            system_prompt="review",
+            status="running",
+            pid=None,
+        )
+        db.add(agent)
+        db.add(TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=993,
+            shared_by=0,
+        ))
+        await db.commit()
+        project_id = project.id
+        discussion_id = discussion.id
+        agent_id = agent.id
+
+    spawn = AsyncMock()
+    monkeypatch.setattr(
+        discussion_service.asyncio,
+        "create_subprocess_exec",
+        spawn,
+    )
+    service = DiscussionService(db_factory, _Broadcaster())
+
+    with pytest.raises(DiscussionSecurityError, match="shared"):
+        await service._run_and_consume(
+            agent_id,
+            discussion_id,
+            ["-p", "review"],
+            {},
+            security_context=discussion_service._DiscussionClaudeSecurityContext(
+                discussion_id=discussion_id,
+                namespace="discussion-agent",
+                identifier=agent_id,
+                model="model",
+                resume_session_id=None,
+                repository_cwd=None,
+                binding="preclaimed-final-share-gate",
+                project_id=project_id,
+            ),
+        )
+
+    spawn.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(DiscussionAgent, agent_id)
+        assert current.status == "error"
+        assert current.pid is None
+
+
+@pytest.mark.asyncio
+async def test_stop_agent_waits_for_consumer_finalization(db_factory):
+    async with db_factory() as db:
+        discussion = Discussion(title="delete fence")
+        db.add(discussion)
+        await db.flush()
+        agent = DiscussionAgent(
+            discussion_id=discussion.id,
+            role_name="reviewer",
+            system_prompt="review",
+            status="running",
+        )
+        db.add(agent)
+        await db.commit()
+        agent_id = agent.id
+        discussion_id = discussion.id
+
+    service = DiscussionService(db_factory, _Broadcaster())
+    consumer = asyncio.create_task(
+        service._run_and_consume(
+            agent_id,
+            discussion_id,
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            {},
+        )
+    )
+    service._consumers[agent_id] = consumer
+    await _wait_for_process(service, agent_id)
+
+    await asyncio.wait_for(service.stop_agent(agent_id), timeout=5)
+
+    assert consumer.done()
+    assert agent_id not in service._consumers
+    assert agent_id not in service._processes
+    async with db_factory() as db:
+        current = await db.get(DiscussionAgent, agent_id)
+    assert current.status == "idle"
+    assert current.pid is None
+
+
+@pytest.mark.asyncio
+async def test_delete_barrier_blocks_stale_agent_launch(db_factory):
+    async with db_factory() as db:
+        discussion = Discussion(title="delete admission fence")
+        db.add(discussion)
+        await db.flush()
+        agent = DiscussionAgent(
+            discussion_id=discussion.id,
+            role_name="reviewer",
+            system_prompt="review",
+            status="idle",
+        )
+        db.add(agent)
+        await db.commit()
+        discussion_id = discussion.id
+        agent_id = agent.id
+
+    service = DiscussionService(db_factory, _Broadcaster())
+    service.cleanup_runtime = AsyncMock()
+    launches: list[int] = []
+    service._launch_agent_with_prompt = (
+        lambda launched, *_args, **_kwargs: launches.append(launched.id)
+    )
+    barrier_entered = asyncio.Event()
+    permit_delete = asyncio.Event()
+
+    async def delete_graph():
+        async with db_factory() as db:
+            async with service.deletion_barrier(discussion_id, db):
+                barrier_entered.set()
+                await permit_delete.wait()
+                current_agent = await db.get(DiscussionAgent, agent_id)
+                current_discussion = await db.get(Discussion, discussion_id)
+                await db.delete(current_agent)
+                await db.delete(current_discussion)
+                await db.commit()
+
+    async def trigger_after_barrier():
+        await barrier_entered.wait()
+        async with db_factory() as db:
+            await service.trigger_agent(db, agent_id)
+
+    deleting = asyncio.create_task(delete_graph())
+    await barrier_entered.wait()
+    triggering = asyncio.create_task(trigger_after_barrier())
+    await asyncio.sleep(0)
+    assert not triggering.done()
+
+    permit_delete.set()
+    await deleting
+    result = await asyncio.gather(triggering, return_exceptions=True)
+
+    assert len(result) == 1
+    assert isinstance(result[0], DiscussionSecurityError)
+    assert launches == []
+
+
+@pytest.mark.asyncio
+async def test_delete_barrier_finishes_quiesce_before_delivering_cancellation(
+    db_factory,
+):
+    async with db_factory() as db:
+        discussion = Discussion(title="cancelled delete fence")
+        db.add(discussion)
+        await db.commit()
+        await db.refresh(discussion)
+        discussion_id = discussion.id
+
+    service = DiscussionService(db_factory, _Broadcaster())
+    quiesce_started = asyncio.Event()
+    permit_quiesce = asyncio.Event()
+    cleanup = AsyncMock()
+    service.cleanup_runtime = cleanup
+
+    async def slow_stop_facilitator(_discussion_id):
+        quiesce_started.set()
+        await permit_quiesce.wait()
+
+    service.stop_facilitator = slow_stop_facilitator
+    entered_body = False
+
+    async def delete_with_barrier():
+        nonlocal entered_body
+        async with db_factory() as db:
+            async with service.deletion_barrier(discussion_id, db):
+                entered_body = True
+
+    deleting = asyncio.create_task(delete_with_barrier())
+    await quiesce_started.wait()
+    deleting.cancel()
+    await asyncio.sleep(0)
+
+    assert not deleting.done()
+    permit_quiesce.set()
+    with pytest.raises(asyncio.CancelledError):
+        await deleting
+
+    cleanup.assert_awaited_once_with(discussion_id, [])
+    assert entered_body is False
+    assert not service._get_lock(discussion_id).locked()

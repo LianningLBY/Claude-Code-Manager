@@ -15,6 +15,9 @@ import backend.api.workers as workers_api
 from backend.models.worker import Worker
 
 
+pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
+
+
 async def _insert_ready_worker(session_factory) -> Worker:
     async with session_factory() as db:
         worker = Worker(

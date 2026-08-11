@@ -13,9 +13,10 @@ from pydantic import (
 from backend.config import settings
 from backend.schemas.capability import AutoCapabilityPolicy
 from backend.schemas.plan import PlanPipelineConfig
+from backend.schemas.task_ssh_grant import TaskSSHGrantInput
 
 
-TaskMode = Literal["auto", "plan", "loop", "goal"]
+TaskMode = Literal["auto", "plan", "loop", "goal", "pr_loop"]
 
 
 class UserSkillSnapshotPayload(BaseModel):
@@ -25,6 +26,14 @@ class UserSkillSnapshotPayload(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     description: str = ""
     content: str = ""
+
+
+class FrontendReviewConfig(BaseModel):
+    """Task-scoped frontend review workflow selected by the composer UI."""
+
+    mode: Literal["goal"] = "goal"
+    profile: Literal["standard", "exhaustive"] = "standard"
+    max_iterations: int = Field(default=5, ge=1, le=10)
 
 
 def _normalize_task_provider(value: object) -> str:
@@ -50,6 +59,13 @@ def _normalize_attention_tag(value: object) -> object:
 class TaskCreate(BaseModel):
     # Internal Manager→Worker forwarding only: Manager allocates the global ID.
     id: int | None = None
+    # Internal Manager→Worker identity fence. Worker mirrors reuse the exact
+    # logical incarnation so every later remote mutation can reject Task-id
+    # ABA. Public callers cannot combine this with an explicit id.
+    source_incarnation_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
     # None = 本机执行；有值 = 创建后由 Dispatcher 转发到该 Worker
     worker_id: int | None = None
     # TaskMigrator 在目标机重建 task 时带上（跨机 --resume 续聊）
@@ -78,6 +94,9 @@ class TaskCreate(BaseModel):
     goal_condition: str | None = None  # goal only: natural-language completion condition
     goal_max_turns: int = 30  # goal only: max turns before auto-fail
     goal_evaluator_model: str | None = None  # goal only: evaluator model (default haiku)
+    pr_loop_max_turns: int = 10  # pr_loop only: max fix rounds
+    pr_loop_poll_interval: int = 60  # pr_loop only: seconds between GitHub API polls
+    frontend_review: FrontendReviewConfig | None = None
     # API callers that omit provider follow the deployment-wide default.
     provider: str = Field(
         default_factory=lambda: settings.default_provider,
@@ -100,6 +119,7 @@ class TaskCreate(BaseModel):
     file_paths: list[str] | None = None
     attachments: list[dict] | None = None  # [{url, name, is_image}, ...]
     secret_ids: list[int] | None = None
+    ssh_grants: list[TaskSSHGrantInput] | None = Field(default=None, max_length=50)
     clone_from_task_id: int | None = None
     # Internal/Plan endpoints use these fields to preserve independent Plan
     # relationships across Manager→Worker copies. Public creation validates the
@@ -125,6 +145,9 @@ class TaskCreate(BaseModel):
 
     @model_validator(mode='after')
     def validate_mode_fields(self):
+        if self.frontend_review is not None:
+            self.mode = 'goal'
+            self.goal_max_turns = self.frontend_review.max_iterations
         if self.delivery_run_id is not None or self.delivery_role is not None:
             raise ValueError(
                 "delivery_run_id and delivery_role are reserved for the "
@@ -143,8 +166,10 @@ class TaskCreate(BaseModel):
             raise ValueError('description is required for non-loop tasks')
         if self.mode == 'loop' and not self.todo_file_path:
             raise ValueError('todo_file_path is required for loop tasks')
-        if self.mode == 'goal' and not self.goal_condition:
+        if self.mode == 'goal' and not self.goal_condition and self.frontend_review is None:
             raise ValueError('goal_condition is required for goal tasks')
+        if self.mode == 'pr_loop' and not self.description:
+            raise ValueError('description is required for pr_loop tasks')
         return self
 
 
@@ -162,7 +187,7 @@ class TaskMigrationImport(TaskCreate):
     # Accept the reserved wire value so the internal endpoint can reject it
     # with a lifecycle conflict (409) instead of letting schema validation
     # disguise an attempted Delivery ownership migration as malformed input.
-    mode: Literal["auto", "plan", "loop", "goal", "delivery_loop"] = "auto"
+    mode: Literal["auto", "plan", "loop", "goal", "delivery_loop", "pr_loop"] = "auto"
     # Keep Manager and destination Worker retry generations monotonic. This is
     # intentionally internal-only; public task creation always starts at zero.
     retry_count: int = Field(default=0, ge=0)
@@ -286,6 +311,8 @@ class TaskUpdate(BaseModel):
     goal_condition: str | None = None
     goal_max_turns: int | None = None
     goal_evaluator_model: str | None = None
+    pr_loop_max_turns: int | None = None
+    pr_loop_poll_interval: int | None = None
     enable_workflows: bool | None = None
     enabled_skills: dict | None = None
     selected_user_skills: list[int] | None = None
@@ -325,6 +352,14 @@ class TaskUpdate(BaseModel):
         return self
 
 
+class InternalTaskSkillsUpdate(BaseModel):
+    """Narrow payload accepted from the Task-scoped skills MCP server."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled_skills: dict
+
+
 class TaskResponse(BaseModel):
     id: int
     worker_id: int | None = None
@@ -351,6 +386,7 @@ class TaskResponse(BaseModel):
     delivery_phase: str | None = None
     delivery_activity: str | None = None
     delivery_outcome: str | None = None
+    delivery_terminal: str | None = None
     todo_file_path: str | None
     loop_progress: str | None
     max_iterations: int
@@ -360,6 +396,13 @@ class TaskResponse(BaseModel):
     goal_max_turns: int
     goal_turns_used: int
     goal_last_reason: str | None
+    pr_loop_url: str | None
+    pr_loop_number: int | None
+    pr_loop_repo: str | None
+    pr_loop_state: str | None
+    pr_loop_max_turns: int
+    pr_loop_turns_used: int
+    pr_loop_poll_interval: int
     plan_content: str | None
     plan_approved: bool | None
     plan_target_task_id: int | None = None
@@ -423,6 +466,12 @@ class TaskResponse(BaseModel):
         from backend.services.command_registry import ensure_default_skills
         self.enabled_skills = ensure_default_skills(self.enabled_skills)
         return self
+
+
+class TaskMigrationImportResponse(TaskResponse):
+    """Internal migration acknowledgement with the immutable identity fence."""
+
+    incarnation_id: str = Field(pattern=r"^[0-9a-f]{32}$")
 
 
 class TaskTerminationSnapshot(TaskResponse):

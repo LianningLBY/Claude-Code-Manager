@@ -223,6 +223,40 @@ class TestClaudePool:
         result = pool.select()
         assert result in [str(tmp_path / "claude-1"), str(tmp_path / "claude-2")]
 
+    @pytest.mark.asyncio
+    async def test_access_token_projection_refresh_uses_exact_pool_account(
+        self,
+        pool,
+        tmp_path,
+    ):
+        pool._refresh_oauth = AsyncMock(return_value={"accessToken": "fresh"})
+
+        refreshed = await pool.ensure_oauth_access_token(
+            tmp_path / "claude-1",
+            minimum_remaining_seconds=300.0,
+        )
+
+        assert refreshed is True
+        pool._refresh_oauth.assert_awaited_once()
+        account, credential_path = pool._refresh_oauth.await_args.args
+        assert account.id == "acc-1"
+        assert credential_path == tmp_path / "claude-1" / ".credentials.json"
+        assert pool._refresh_oauth.await_args.kwargs == {
+            "minimum_remaining_seconds": 300.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_access_token_projection_rejects_unmanaged_or_disabled_home(
+        self,
+        pool,
+        tmp_path,
+    ):
+        pool._refresh_oauth = AsyncMock(return_value={"accessToken": "fresh"})
+
+        assert not await pool.ensure_oauth_access_token(tmp_path / "unknown")
+        assert not await pool.ensure_oauth_access_token(tmp_path / "claude-3")
+        pool._refresh_oauth.assert_not_awaited()
+
     def test_select_excludes_disabled(self, pool, tmp_path):
         # acc-3 is disabled, should never be selected
         for _ in range(20):

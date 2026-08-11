@@ -8,6 +8,12 @@ from backend.config import settings
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
 
+def _validate_branch_name(value: str) -> str:
+    if not value or "\x00" in value or "\n" in value or "\r" in value:
+        raise ValueError("default_branch must be one non-empty line")
+    return value
+
+
 class RequiredCheckPolicy(BaseModel):
     """Stable identity of one required GitHub check/status producer."""
 
@@ -31,6 +37,33 @@ class RequiredCheckPolicy(BaseModel):
         return value
 
 
+def required_checks_support_direct_auto_merge(value: object) -> bool:
+    """Return whether configured CI policies retain an App identity.
+
+    Empty policies remain valid for repositories that do not ask PR Monitor
+    to gate on configured CI.  When policies are present, direct ref updates
+    can only prove branch-protection coverage for app-bound check runs.
+    """
+
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if isinstance(item, RequiredCheckPolicy):
+            if item.kind != "check_run":
+                return False
+            continue
+        if not isinstance(item, dict):
+            return False
+        if item.get("kind") != "check_run":
+            return False
+        if not all(
+            isinstance(item.get(field), str) and bool(item[field].strip())
+            for field in ("name", "app_slug")
+        ):
+            return False
+    return True
+
+
 class MonitoredRepoCreate(BaseModel):
     repo_full_name: str
     project_id: int | None = None
@@ -47,7 +80,7 @@ class MonitoredRepoCreate(BaseModel):
     auto_repair: bool = False
     max_repair_attempts: int = Field(default=3, ge=1, le=20)
     merge_queue_mode: str = "manual"
-    default_branch: str = "main"
+    default_branch: str = Field(default="main", min_length=1, max_length=100)
     allowed_authors: list[str] = []
 
     @field_validator("repo_full_name")
@@ -73,6 +106,11 @@ class MonitoredRepoCreate(BaseModel):
             raise ValueError("merge_queue_mode must be manual, shadow, or auto")
         return v
 
+    @field_validator("default_branch")
+    @classmethod
+    def validate_default_branch(cls, value: str) -> str:
+        return _validate_branch_name(value)
+
 
 class MonitoredRepoUpdate(BaseModel):
     project_id: int | None = None
@@ -86,7 +124,11 @@ class MonitoredRepoUpdate(BaseModel):
     auto_repair: bool | None = None
     max_repair_attempts: int | None = Field(default=None, ge=1, le=20)
     merge_queue_mode: str | None = None
-    default_branch: str | None = None
+    default_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+    )
     allowed_authors: list[str] | None = None
     enabled: bool | None = None
 
@@ -123,6 +165,11 @@ class MonitoredRepoUpdate(BaseModel):
         if v is not None and v not in {"manual", "shadow", "auto"}:
             raise ValueError("merge_queue_mode must be manual, shadow, or auto")
         return v
+
+    @field_validator("default_branch")
+    @classmethod
+    def validate_default_branch(cls, value: str | None) -> str | None:
+        return _validate_branch_name(value) if value is not None else None
 
 
 class MonitoredRepoResponse(BaseModel):
@@ -196,6 +243,7 @@ class PRReviewResponse(BaseModel):
     monitor_run_id: int | None = None
     repo_id: int
     pr_number: int
+    base_ref: str | None = None
     base_sha: str | None
     head_sha: str | None
     delivery_id: str | None
@@ -206,6 +254,7 @@ class PRReviewResponse(BaseModel):
     status: str
     review_summary: str | None
     action_taken: str | None
+    merge_method: str | None = None
     ci_status: str | None = None
     ci_summary: str | None = None
     ci_details: dict | None = None

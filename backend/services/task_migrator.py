@@ -44,6 +44,10 @@ from backend.services.task_queue import (
     PR_REVIEW_SUPERSEDED_METADATA_KEY,
     task_retry_not_superseded_predicate,
 )
+from backend.services.test_harness_owner_fence import (
+    has_active_test_harness_owner_graph,
+    no_active_test_harness_owner_graph_predicate,
+)
 from backend.services.worker_proxy import get_task_operation_lock
 from backend.services.worker_relay import has_worker_execution_quarantine
 from backend.services.worker_routing_config import WORKER_ROUTING_SAFE_STATUSES
@@ -111,6 +115,7 @@ class MigrationTaskGeneration:
     """Exact Manager-side Task generation owned by one migration attempt."""
 
     task_id: int
+    incarnation_id: str | None
     worker_id: int | None
     status: str
     retry_count: int
@@ -123,6 +128,7 @@ class MigrationTaskGeneration:
 def migration_task_generation(task: Task) -> MigrationTaskGeneration:
     return MigrationTaskGeneration(
         task_id=task.id,
+        incarnation_id=task.incarnation_id,
         worker_id=task.worker_id,
         status=task.status,
         retry_count=task.retry_count,
@@ -142,6 +148,7 @@ def migration_generation_predicates(
 ) -> tuple:
     return (
         Task.id == generation.task_id,
+        _nullable_eq(Task.incarnation_id, generation.incarnation_id),
         (
             Task.worker_id.is_(None)
             if generation.worker_id is None
@@ -723,11 +730,22 @@ class TaskMigrator:
                     task_retry_not_superseded_predicate(),
                     _no_active_capability_resume_outbox_predicate(),
                     no_active_worker_task_termination_predicate(),
+                    no_active_test_harness_owner_graph_predicate(),
                 )
                 .values(status="migrating")
             )
             if result.rowcount != 1:
                 await db.rollback()
+                if await has_active_test_harness_owner_graph(
+                    db,
+                    observed.task_id,
+                ):
+                    await db.rollback()
+                    raise MigrationError(
+                        "Task owns an active Test Harness, Workspace Review, "
+                        "or Browser Agent graph; wait for it to finish before "
+                        "migrating the Task"
+                    )
                 current = await db.get(Task, observed.task_id)
                 if current is None:
                     raise MigrationError("task 不存在")
@@ -1431,8 +1449,17 @@ class TaskMigrator:
             if requested_source_status in WORKER_ROUTING_SAFE_STATUSES
             else "cancelled"
         )
+        source_incarnation_id = task.incarnation_id
+        if (
+            not isinstance(source_incarnation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", source_incarnation_id) is None
+        ):
+            raise MigrationError(
+                "源 Task 缺少可验证的 immutable incarnation identity"
+            )
         payload = {
             "id": task.id,
+            "source_incarnation_id": source_incarnation_id,
             "worker_id": None,
             "source_status": source_status,
             "title": task.title,
@@ -1486,6 +1513,10 @@ class TaskMigrator:
             if not isinstance(created, dict):
                 raise MigrationError(
                     "目标 Worker 导入 task 未返回有效对象"
+                )
+            if created.get("incarnation_id") != source_incarnation_id:
+                raise MigrationError(
+                    "目标 Worker 未确认导入 task 的 exact incarnation identity"
                 )
             if created.get("status") != source_status:
                 raise MigrationError("目标 Worker 导入 task 未保持不可调度状态")

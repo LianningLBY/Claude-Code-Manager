@@ -2,11 +2,12 @@
 
 import asyncio
 import base64
+from copy import deepcopy
 import hashlib
 import json
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 import pytest_asyncio
@@ -71,17 +72,31 @@ def _make_repo(**overrides) -> MonitoredRepo:
 def _snapshot(
     *,
     state="OPEN",
+    base_ref="main",
     base_sha=PR_DATA["base_sha"],
     head_sha=PR_DATA["head_sha"],
     is_draft=False,
     merged_at=None,
+    merged_by=None,
+    merge_commit_sha=None,
 ):
     return {
         "state": state,
+        "baseRefName": base_ref,
         "baseRefOid": base_sha,
         "headRefOid": head_sha,
         "isDraft": is_draft,
         "mergedAt": merged_at,
+        "mergedBy": (
+            {"login": merged_by}
+            if merged_by is not None
+            else None
+        ),
+        "mergeCommit": (
+            {"oid": merge_commit_sha}
+            if merge_commit_sha is not None
+            else None
+        ),
     }
 
 
@@ -112,6 +127,25 @@ def _comment_response(
         "body": body,
         "user": {"login": ACTOR},
         "submitted_at": "2026-07-31T00:00:01Z",
+    }
+
+
+def _merged_issue_comment_response(
+    *,
+    head_sha=PR_DATA["head_sha"],
+    nonce=ACTION_NONCE,
+    actor=ACTOR,
+    created_at="2026-07-31T00:00:01Z",
+):
+    return {
+        "id": 93,
+        "body": pr_review_service._merged_comment_body(
+            nonce=nonce,
+            head_sha=head_sha,
+        ),
+        "user": {"login": actor},
+        "created_at": created_at,
+        "html_url": "https://github.com/owner/repo/pull/7#issuecomment-93",
     }
 
 
@@ -167,6 +201,7 @@ def _prepared_context(
     return {
         "repo_name": "owner/repo",
         "pr_number": PR_DATA["number"],
+        "base_ref": "main",
         "base_sha": PR_DATA["base_sha"],
         "head_sha": PR_DATA["head_sha"],
         "guidance": guidance or {
@@ -194,11 +229,13 @@ def _publisher_kwargs(**overrides) -> dict:
     values = {
         "repo_name": "owner/repo",
         "pr_number": PR_DATA["number"],
+        "base_ref": "main",
         "base_sha": PR_DATA["base_sha"],
         "head_sha": PR_DATA["head_sha"],
         "result": "lgtm_comment",
         "review_body": "",
         "auto_merge": False,
+        "merge_method": None,
         "nonce": ACTION_NONCE,
         "actor": ACTOR,
         "current_actor": ACTOR,
@@ -206,7 +243,102 @@ def _publisher_kwargs(**overrides) -> dict:
         "ensure_current": AsyncMock(return_value=True),
     }
     values.update(overrides)
+    if "merge_method" not in overrides:
+        values["merge_method"] = (
+            "fast-forward" if values["auto_merge"] else None
+        )
     return values
+
+
+def _direct_ref_repo_info(**overrides) -> dict:
+    values = {
+        "full_name": "owner/repo",
+        "archived": False,
+        "disabled": False,
+        "permissions": {"push": True},
+    }
+    values.update(overrides)
+    return values
+
+
+def _safe_direct_merge_protection(**overrides) -> dict:
+    values = {
+        "required_status_checks": {
+            "strict": True,
+            "contexts": ["tests"],
+            "checks": [{"context": "tests", "app_id": 1}],
+        },
+        "enforce_admins": {"enabled": True},
+        "allow_force_pushes": {"enabled": False},
+        "allow_deletions": {"enabled": False},
+        "required_conversation_resolution": {"enabled": False},
+        "required_pull_request_reviews": {
+            "bypass_pull_request_allowances": {
+                "users": [],
+                "teams": [],
+                "apps": [],
+            },
+        },
+        "required_linear_history": {"enabled": False},
+    }
+    values.update(overrides)
+    return values
+
+
+def _exact_ci_coverage(*, app_id: int = 1) -> tuple[list[dict], dict]:
+    required = [{
+        "kind": "check_run",
+        "name": "tests",
+        "app_slug": "github-actions",
+    }]
+    return required, {
+        "head_sha": PR_DATA["head_sha"],
+        "required": required,
+        "observed": [{
+            **required[0],
+            "state": "passed",
+            "app_id": app_id,
+        }],
+    }
+
+
+def _standard_collaborator_permission(
+    *,
+    role="write",
+    actor=ACTOR,
+    user_type="User",
+) -> dict:
+    permissions = {"push": True}
+    if role == "maintain":
+        permissions["maintain"] = True
+    if role == "admin":
+        permissions["admin"] = True
+    return {
+        "permission": "write" if role == "maintain" else role,
+        "role_name": role,
+        "user": {
+            "login": actor,
+            "type": user_type,
+            "role_name": role,
+            "permissions": permissions,
+        },
+    }
+
+
+def _ahead_compare_response(ancestor: str, descendant: str) -> dict:
+    return {
+        "url": (
+            "https://api.github.com/repos/owner/repo/compare/"
+            f"{ancestor}...{descendant}"
+        ),
+        "base_commit": {"sha": ancestor},
+        "merge_base_commit": {"sha": ancestor},
+        "status": "ahead",
+        "ahead_by": 1,
+        "behind_by": 0,
+        "total_commits": 1,
+        "commits": [{"sha": descendant}],
+    }
 
 
 @pytest_asyncio.fixture
@@ -249,6 +381,7 @@ async def _make_review(
         ),
         metadata_={
             "pr_auto_merge": auto_merge,
+            "pr_base_ref": "main",
             "pr_action_nonce": nonce,
         },
     )
@@ -257,6 +390,7 @@ async def _make_review(
     review = PRReview(
         repo_id=repo.id,
         pr_number=PR_DATA["number"],
+        base_ref="main",
         base_sha=PR_DATA["base_sha"],
         head_sha=PR_DATA["head_sha"],
         delivery_id=PR_DATA["delivery_id"],
@@ -311,8 +445,40 @@ async def _arm_publishing(
     review.publishing_retry_count = task.retry_count
     review.publishing_task_started_at = task.started_at
     review.publishing_started_at = PUBLISHING_STARTED_AT
+    review.merge_method = (
+        "merge"
+        if (task.metadata_ or {}).get("pr_auto_merge") is True
+        and action == "approved_merged"
+        else None
+    )
     await db.commit()
     await db.refresh(review)
+
+
+async def _bind_delivery_review(
+    db,
+    *,
+    delivery_run: DeliveryRun,
+    review: PRReview,
+) -> PRMonitorRun:
+    """Create the exact durable Run/Monitor/Review ownership triangle."""
+
+    monitor = PRMonitorRun(
+        repo_id=review.repo_id,
+        pr_number=review.pr_number,
+        current_base_sha=review.base_sha,
+        current_head_sha=review.head_sha,
+        current_review_id=review.id,
+        status="reviewing",
+    )
+    db.add(monitor)
+    await db.flush()
+    review.monitor_run_id = monitor.id
+    delivery_run.pr_monitor_run_id = monitor.id
+    await db.commit()
+    await db.refresh(review)
+    await db.refresh(delivery_run)
+    return monitor
 
 
 # ---------------------------------------------------------------------------
@@ -745,9 +911,12 @@ async def test_create_pr_review_task_prefetches_guidance_and_freezes_nonce(
     assert task.tags == ["pr-review"]
     assert task.metadata_ == {
         "pr_review_id": review.id,
+        "pr_base_ref": "main",
         "pr_base_sha": PR_DATA["base_sha"],
         "pr_head_sha": PR_DATA["head_sha"],
         "pr_auto_merge": False,
+        "pr_wait_for_ci": False,
+        "pr_required_checks": [],
         "pr_action_nonce": ACTION_NONCE,
     }
     assert "Always test." in task.description
@@ -1127,8 +1296,7 @@ async def test_gh_api_json_fails_closed(
 @pytest.mark.asyncio
 async def test_publish_changes_review_uses_pinned_commit_nonce_and_json():
     gh_view = AsyncMock(return_value=_snapshot())
-    api = AsyncMock(return_value=_review_response(
-        state="CHANGES_REQUESTED",
+    api = AsyncMock(return_value=_comment_response(
         body=f"Fix the race.\n\nCCM review nonce: {ACTION_NONCE}",
     ))
     find_review = AsyncMock(return_value=None)
@@ -1156,21 +1324,21 @@ async def test_publish_changes_review_uses_pinned_commit_nonce_and_json():
     assert result == ("commented", "review_comments")
     find_review.assert_awaited_once()
     find_merge.assert_not_awaited()
-    kwargs["ensure_current"].assert_awaited_once()
+    assert kwargs["ensure_current"].await_count == 2
     assert api.await_args.args == ("repos/owner/repo/pulls/7/reviews",)
     assert api.await_args.kwargs == {
         "method": "POST",
         "payload": {
             "body": f"Fix the race.\n\nCCM review nonce: {ACTION_NONCE}",
             "commit_id": PR_DATA["head_sha"],
-            "event": "REQUEST_CHANGES",
+            "event": "COMMENT",
         },
     }
 
 
 @pytest.mark.asyncio
-async def test_publish_lgtm_creates_backend_approval():
-    api = AsyncMock(return_value=_review_response())
+async def test_publish_lgtm_creates_non_authorizing_backend_comment():
+    api = AsyncMock(return_value=_comment_response())
     find_review = AsyncMock(return_value=None)
     find_merge = AsyncMock()
     kwargs = _publisher_kwargs(
@@ -1198,26 +1366,25 @@ async def test_publish_lgtm_creates_backend_approval():
     assert result == ("approved", "lgtm_comment")
     find_merge.assert_not_awaited()
     payload = api.await_args.kwargs["payload"]
-    assert payload["event"] == "APPROVE"
+    assert payload["event"] == "COMMENT"
     assert payload["commit_id"] == PR_DATA["head_sha"]
     assert f"CCM review nonce: {ACTION_NONCE}" in payload["body"]
+    assert "ready to merge" in payload["body"]
+    assert PR_DATA["head_sha"] in payload["body"]
     assert "agent body" not in payload["body"]
 
 
 @pytest.mark.asyncio
-async def test_publish_self_approval_falls_back_to_validated_comment():
-    api = AsyncMock(side_effect=[
-        GhError("Can not approve your own pull request"),
-        _comment_response(),
-    ])
-    find_review = AsyncMock(side_effect=[None, None])
+async def test_publish_comment_does_not_retry_an_impossible_self_approval_error():
+    api = AsyncMock(side_effect=GhError("Can not approve your own pull request"))
+    find_review = AsyncMock(return_value=None)
     find_merge = AsyncMock()
     kwargs = _publisher_kwargs()
     with (
-        patch.object(
-            pr_review_service,
-            "_gh_pr_view",
-            AsyncMock(side_effect=[_snapshot(), _snapshot()]),
+            patch.object(
+                pr_review_service,
+                "_gh_pr_view",
+                AsyncMock(return_value=_snapshot()),
         ),
         patch.object(pr_review_service, "_gh_api_json", api),
         patch.object(
@@ -1231,39 +1398,31 @@ async def test_publish_self_approval_falls_back_to_validated_comment():
             find_merge,
         ),
     ):
-        result = await pr_review_service._publish_review_action(**kwargs)
-    assert result == ("approved", "lgtm_comment")
-    assert api.await_args_list[1].args == (
-        "repos/owner/repo/pulls/7/reviews",
-    )
-    assert api.await_args_list[1].kwargs["method"] == "POST"
-    assert api.await_args_list[1].kwargs["payload"]["event"] == "COMMENT"
-    assert (
-        api.await_args_list[1].kwargs["payload"]["commit_id"]
-        == PR_DATA["head_sha"]
-    )
-    assert kwargs["ensure_current"].await_count == 2
+        with pytest.raises(GhError, match="Can not approve"):
+            await pr_review_service._publish_review_action(**kwargs)
+    assert api.await_count == 1
+    assert api.await_args.kwargs["payload"]["event"] == "COMMENT"
+    assert kwargs["ensure_current"].await_count == 1
     find_merge.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_publish_self_request_changes_preserves_findings_in_comment():
-    api = AsyncMock(side_effect=[
-        GhError("Review Can not request changes on your own pull request"),
-        _comment_response(body=(
-            "blocking findings\n\nCCM review nonce: " + ACTION_NONCE
-        )),
-    ])
-    find_review = AsyncMock(side_effect=[None, None])
+async def test_publish_finding_comment_does_not_retry_state_change_error():
+    api = AsyncMock(
+        side_effect=GhError(
+            "Review Can not request changes on your own pull request"
+        )
+    )
+    find_review = AsyncMock(return_value=None)
     kwargs = _publisher_kwargs(
         result="review_comments",
         review_body="blocking findings",
     )
     with (
-        patch.object(
-            pr_review_service,
-            "_gh_pr_view",
-            AsyncMock(side_effect=[_snapshot(), _snapshot()]),
+            patch.object(
+                pr_review_service,
+                "_gh_pr_view",
+                AsyncMock(return_value=_snapshot()),
         ),
         patch.object(pr_review_service, "_gh_api_json", api),
         patch.object(
@@ -1272,28 +1431,35 @@ async def test_publish_self_request_changes_preserves_findings_in_comment():
             find_review,
         ),
     ):
-        result = await pr_review_service._publish_review_action(**kwargs)
-    assert result == ("commented", "review_comments")
-    payload = api.await_args_list[1].kwargs["payload"]
+        with pytest.raises(GhError, match="request changes"):
+            await pr_review_service._publish_review_action(**kwargs)
+    assert api.await_count == 1
+    payload = api.await_args.kwargs["payload"]
     assert payload["event"] == "COMMENT"
     assert payload["commit_id"] == PR_DATA["head_sha"]
     assert "blocking findings" in payload["body"]
     assert f"CCM review nonce: {ACTION_NONCE}" in payload["body"]
-    assert kwargs["ensure_current"].await_count == 2
+    assert kwargs["ensure_current"].await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_publish_auto_merge_pins_head_and_confirms_merge():
+async def test_publish_auto_merge_pins_slash_base_ref_and_confirms_merge():
+    base_ref = "release/2026"
     api = AsyncMock(side_effect=[
-        _review_response(),
-        {"merged": True, "message": "Pull Request successfully merged"},
+        _comment_response(),
+        {
+            "ref": f"refs/heads/{base_ref}",
+            "object": {"type": "commit", "sha": PR_DATA["head_sha"]},
+        },
     ])
-    gh_view = AsyncMock(return_value=_snapshot())
+    gh_view = AsyncMock(return_value=_snapshot(base_ref=base_ref))
     find_review = AsyncMock(return_value=None)
     find_merge = AsyncMock(side_effect=[False, True])
+    publish_merged_comment = AsyncMock()
     kwargs = _publisher_kwargs(
         result="approved_merged",
         auto_merge=True,
+        base_ref=base_ref,
     )
     with (
         patch.object(pr_review_service, "_gh_pr_view", gh_view),
@@ -1308,22 +1474,1400 @@ async def test_publish_auto_merge_pins_head_and_confirms_merge():
             "_find_merge_evidence",
             find_merge,
         ),
+        patch.object(
+            pr_review_service,
+            "_publish_merged_comment",
+            publish_merged_comment,
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_direct_merge_protection",
+            AsyncMock(),
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
     ):
         result = await pr_review_service._publish_review_action(**kwargs)
     assert result == ("merged", "approved_merged")
     merge_call = api.await_args_list[1]
-    assert merge_call.args == ("repos/owner/repo/pulls/7/merge",)
-    assert merge_call.kwargs["method"] == "PUT"
+    assert merge_call.args == (
+        "repos/owner/repo/git/refs/heads/release%2F2026",
+    )
+    assert merge_call.kwargs["method"] == "PATCH"
     assert merge_call.kwargs["payload"]["sha"] == PR_DATA["head_sha"]
-    assert ACTION_NONCE in merge_call.kwargs["payload"]["commit_message"]
+    assert merge_call.kwargs["payload"]["force"] is False
+    assert not any(
+        call_.args[0] == "repos/owner/repo/pulls/7/merge"
+        for call_ in api.await_args_list
+    )
     assert find_merge.await_count == 2
-    assert kwargs["ensure_current"].await_count == 2
+    assert kwargs["ensure_current"].await_count == 3
+    publish_merged_comment.assert_awaited_once_with(
+        repo_name="owner/repo",
+        pr_number=PR_DATA["number"],
+        base_ref=base_ref,
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+        nonce=ACTION_NONCE,
+        actor=ACTOR,
+        current_actor=ACTOR,
+        publishing_started_at=PUBLISHING_STARTED_AT,
+        merge_method="fast-forward",
+        ensure_current=kwargs["ensure_current"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_squash_outbox_without_evidence_never_replays_merge():
+    api = AsyncMock()
+    kwargs = _publisher_kwargs(
+        result="approved_merged",
+        auto_merge=True,
+        merge_method="squash",
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value="APPROVED"),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        pytest.raises(GhError, match="automatic replay is disabled") as raised,
+    ):
+        await pr_review_service._publish_review_action(**kwargs)
+    assert pr_review_service._terminal_publication_error(raised.value)
+    api.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_blocking_review_does_not_require_merge_method():
+    kwargs = _publisher_kwargs(
+        result="review_comments",
+        review_body="Blocking issue.",
+        auto_merge=True,
+        merge_method=None,
+    )
+    with patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value="CHANGES_REQUESTED"),
+        ), patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ):
+        assert await pr_review_service._publish_review_action(**kwargs) == (
+            "commented",
+            "review_comments",
+        )
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_revalidates_frozen_required_ci_before_put():
+    api = AsyncMock()
+    ci = AsyncMock(return_value=(
+        "failed",
+        "Failed: tests (github-actions)",
+        {"head_sha": PR_DATA["head_sha"]},
+    ))
+    kwargs = _publisher_kwargs(
+        result="approved_merged",
+        auto_merge=True,
+        wait_for_ci=True,
+        required_checks=[{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+        ensure_zero_threads=AsyncMock(return_value=True),
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value="APPROVED"),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        patch(
+            "backend.services.pr_review_panel.fetch_exact_head_ci",
+            ci,
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_direct_merge_protection",
+            AsyncMock(),
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
+    ):
+        with pytest.raises(GhError, match="required CI is not passed"):
+            await pr_review_service._publish_review_action(**kwargs)
+
+    ci.assert_awaited_once_with(
+        "owner/repo",
+        PR_DATA["head_sha"],
+        kwargs["required_checks"],
+    )
+    api.assert_not_awaited()
+    kwargs["ensure_zero_threads"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_ci_pass_after_review_ack_does_not_repeat_review():
+    api = AsyncMock(return_value={
+        "ref": "refs/heads/main",
+        "object": {"type": "commit", "sha": PR_DATA["head_sha"]},
+    })
+    ci = AsyncMock(return_value=(
+        "passed",
+        "1 required exact-head CI checks passed",
+        {"head_sha": PR_DATA["head_sha"]},
+    ))
+    find_merge = AsyncMock(side_effect=[False, True])
+    publish_comment = AsyncMock()
+    kwargs = _publisher_kwargs(
+        result="approved_merged",
+        auto_merge=True,
+        wait_for_ci=True,
+        required_checks=[{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+        ensure_zero_threads=AsyncMock(return_value=True),
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value="APPROVED"),
+        ),
+        patch.object(pr_review_service, "_find_merge_evidence", find_merge),
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        patch.object(
+            pr_review_service,
+            "_publish_merged_comment",
+            publish_comment,
+        ),
+        patch(
+            "backend.services.pr_review_panel.fetch_exact_head_ci",
+            ci,
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_direct_merge_protection",
+            AsyncMock(),
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
+    ):
+        result = await pr_review_service._publish_review_action(**kwargs)
+
+    assert result == ("merged", "approved_merged")
+    api.assert_awaited_once()
+    assert api.await_args.args == (
+        "repos/owner/repo/git/refs/heads/main",
+    )
+    assert api.await_args.kwargs["method"] == "PATCH"
+    ci.assert_awaited_once()
+    kwargs["ensure_zero_threads"].assert_awaited_once()
+    publish_comment.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pre_merge_zero_thread_gate_rejects_open_unpublished_blocker(
+    db_session,
+    repo,
+):
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=PR_DATA["number"],
+        current_base_sha=PR_DATA["base_sha"],
+        current_head_sha=PR_DATA["head_sha"],
+        status="reviewing",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=PR_DATA["number"],
+        base_ref="main",
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+        pr_title=PR_DATA["title"],
+        pr_author=PR_DATA["author"],
+        pr_url=PR_DATA["url"],
+        status="publishing",
+        pending_action="approved_merged",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    reviewer = PRReviewerRun(
+        pr_review_id=review.id,
+        role="qa_engineer",
+        provider="claude",
+        status="changes_required",
+        prompt_policy_hash="1" * 64,
+        guide_pack_hash="2" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    db_session.add(PRFinding(
+        pr_review_id=review.id,
+        reviewer_run_id=reviewer.id,
+        fingerprint="3" * 64,
+        role="qa_engineer",
+        severity="high",
+        category="correctness",
+        path="app.py",
+        line=8,
+        title="not yet published blocker",
+        evidence="The state transition is unsafe.",
+        impact="The merge would preserve the bug.",
+        required_fix="Fix the transition.",
+        test="Exercise the failure interleaving.",
+        status="open",
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+        thread_nonce="4" * 48,
+        thread_status="pending",
+    ))
+    await db_session.commit()
+
+    assert not await pr_review_service._publication_has_zero_blocking_threads(
+        db_session,
+        review_id=review.id,
+        monitor_run_id=run.id,
+        head_sha=PR_DATA["head_sha"],
+        expected_pending_action="approved_merged",
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_auto_merge_reconciles_lost_merge_ack_before_comment():
+    api = AsyncMock(side_effect=[
+        _comment_response(),
+        GhError("merge response timed out"),
+    ])
+    find_merge = AsyncMock(side_effect=[False, True])
+    publish_merged_comment = AsyncMock()
+    kwargs = _publisher_kwargs(
+        result="approved_merged",
+        auto_merge=True,
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            find_merge,
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_merged_comment",
+            publish_merged_comment,
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_direct_merge_protection",
+            AsyncMock(),
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
+    ):
+        result = await pr_review_service._publish_review_action(**kwargs)
+
+    assert result == ("merged", "approved_merged")
+    assert api.await_count == 2
+    assert find_merge.await_count == 2
+    publish_merged_comment.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_publish_existing_merge_evidence_still_requires_merged_comment():
+    api = AsyncMock()
+    gh_view = AsyncMock(return_value=_snapshot())
+    publish_merged_comment = AsyncMock()
+    kwargs = _publisher_kwargs(
+        result="approved_merged",
+        auto_merge=True,
+    )
+    with (
+        patch.object(pr_review_service, "_gh_pr_view", gh_view),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value="APPROVED"),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_merged_comment",
+            publish_merged_comment,
+        ),
+    ):
+        result = await pr_review_service._publish_review_action(**kwargs)
+
+    assert result == ("merged", "approved_merged")
+    api.assert_not_awaited()
+    gh_view.assert_not_awaited()
+    publish_merged_comment.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_find_review_evidence_ignores_forged_nonce_marker():
+    forged = {
+        **_comment_response(),
+        "id": 94,
+        "user": {"login": "untrusted-user"},
+    }
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(return_value=[[forged]]),
+    ):
+        evidence = await pr_review_service._find_review_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            head_sha=PR_DATA["head_sha"],
+            result="lgtm_comment",
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+        )
+
+    assert evidence is None
+
+
+@pytest.mark.asyncio
+async def test_find_review_evidence_accepts_valid_among_forged_markers():
+    forged = {
+        **_comment_response(),
+        "id": 94,
+        "user": {"login": "untrusted-user"},
+    }
+    valid = _review_response()
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(return_value=[[forged, valid]]),
+    ):
+        evidence = await pr_review_service._find_review_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            head_sha=PR_DATA["head_sha"],
+            result="lgtm_comment",
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+        )
+
+    assert evidence == "APPROVED"
+
+
+@pytest.mark.parametrize(
+    "merge_preferences",
+    [
+        {"allow_merge_commit": True, "allow_squash_merge": True},
+        {"allow_merge_commit": False, "allow_squash_merge": True},
+        {
+            "allow_merge_commit": False,
+            "allow_squash_merge": False,
+            "allow_rebase_merge": True,
+        },
+        {},
+    ],
+)
+def test_select_safe_merge_method_uses_direct_ref_capability_not_preferences(
+    merge_preferences,
+):
+    repo_info = _direct_ref_repo_info(**merge_preferences)
+    assert pr_review_service._select_safe_merge_method(
+        repo_info,
+        expected_repo_name="OWNER/REPO",
+    ) == "fast-forward"
+
+
+@pytest.mark.parametrize(
+    "repo_info",
+    [
+        None,
+        {},
+        _direct_ref_repo_info(full_name=None),
+        _direct_ref_repo_info(archived=None),
+        _direct_ref_repo_info(disabled=0),
+        _direct_ref_repo_info(permissions=None),
+        _direct_ref_repo_info(permissions={}),
+        _direct_ref_repo_info(permissions={"push": 1}),
+    ],
+)
+def test_select_safe_merge_method_fails_closed_on_malformed_capability(
+    repo_info,
+):
+    with pytest.raises(
+        pr_review_service.GhRepositoryCapabilityError,
+        match="response is malformed",
+    ):
+        pr_review_service._select_safe_merge_method(
+            repo_info,
+            expected_repo_name="owner/repo",
+        )
+
+
+@pytest.mark.parametrize(
+    ("repo_info", "match"),
+    [
+        (
+            _direct_ref_repo_info(full_name="other/repo"),
+            "repository identity mismatched",
+        ),
+        (_direct_ref_repo_info(archived=True), "archived or disabled"),
+        (_direct_ref_repo_info(disabled=True), "archived or disabled"),
+        (
+            _direct_ref_repo_info(permissions={"push": False}),
+            "lacks push permission",
+        ),
+    ],
+)
+def test_select_safe_merge_method_rejects_unavailable_direct_ref(
+    repo_info,
+    match,
+):
+    with pytest.raises(
+        pr_review_service.GhRepositoryCapabilityError,
+        match=match,
+    ):
+        pr_review_service._select_safe_merge_method(
+            repo_info,
+            expected_repo_name="owner/repo",
+        )
+
+
+@pytest.mark.asyncio
+async def test_freeze_safe_merge_method_binds_repository_capability_response():
+    api = AsyncMock(return_value=_direct_ref_repo_info())
+    with patch.object(pr_review_service, "_gh_api_json", api):
+        assert await pr_review_service._freeze_safe_merge_method(
+            "owner/repo"
+        ) == "fast-forward"
+    api.assert_awaited_once_with("repos/owner/repo")
+
+
+@pytest.mark.asyncio
+async def test_freeze_safe_merge_method_preserves_retryable_api_error_class():
+    transport_error = GhError("temporary GitHub API timeout")
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_api_json",
+            AsyncMock(side_effect=transport_error),
+        ),
+        pytest.raises(GhError) as raised,
+    ):
+        await pr_review_service._freeze_safe_merge_method("owner/repo")
+    assert raised.value is transport_error
+    assert not isinstance(
+        raised.value,
+        pr_review_service.GhRepositoryCapabilityError,
+    )
+
+
+@pytest.mark.parametrize("role", ("write", "maintain", "admin"))
+@pytest.mark.parametrize(
+    "merge_method",
+    ("merge", "squash", "fast-forward"),
+)
+def test_direct_merge_protection_accepts_only_standard_non_bypass_roles(
+    role,
+    merge_method,
+):
+    protection = _safe_direct_merge_protection()
+    if merge_method == "fast-forward":
+        protection["required_pull_request_reviews"] = None
+    pr_review_service._validate_direct_merge_protection(
+        protection,
+        _standard_collaborator_permission(role=role),
+        [],
+        actor=ACTOR,
+        merge_method=merge_method,
+    )
+
+
+@pytest.mark.parametrize(
+    "unsafe_case",
+    (
+        "active_ruleset",
+        "non_strict_checks",
+        "empty_checks",
+        "admins_not_enforced",
+        "force_pushes",
+        "branch_deletion",
+        "conversation_resolution",
+        "malformed_conversation_resolution",
+        "missing_bypass_allowances",
+        "nonempty_bypass_allowances",
+        "linear_merge_commit",
+        "fast_forward_required_reviews",
+        "custom_role",
+        "actor_mismatch",
+        "non_user_actor",
+    ),
+)
+def test_direct_merge_protection_fails_closed_for_unsafe_controls(unsafe_case):
+    protection = deepcopy(_safe_direct_merge_protection())
+    permission = _standard_collaborator_permission()
+    rules = []
+    merge_method = "merge"
+    if unsafe_case == "active_ruleset":
+        rules = [{"type": "required_status_checks"}]
+    elif unsafe_case == "non_strict_checks":
+        protection["required_status_checks"]["strict"] = False
+    elif unsafe_case == "empty_checks":
+        protection["required_status_checks"]["contexts"] = []
+        protection["required_status_checks"]["checks"] = []
+    elif unsafe_case == "admins_not_enforced":
+        protection["enforce_admins"]["enabled"] = False
+    elif unsafe_case == "force_pushes":
+        protection["allow_force_pushes"]["enabled"] = True
+    elif unsafe_case == "branch_deletion":
+        protection["allow_deletions"]["enabled"] = True
+    elif unsafe_case == "conversation_resolution":
+        protection["required_conversation_resolution"]["enabled"] = True
+    elif unsafe_case == "malformed_conversation_resolution":
+        protection["required_conversation_resolution"] = None
+    elif unsafe_case == "missing_bypass_allowances":
+        protection["required_pull_request_reviews"] = {}
+    elif unsafe_case == "nonempty_bypass_allowances":
+        protection["required_pull_request_reviews"][
+            "bypass_pull_request_allowances"
+        ]["apps"] = [{"slug": "merge-bot"}]
+    elif unsafe_case == "linear_merge_commit":
+        protection["required_linear_history"]["enabled"] = True
+    elif unsafe_case == "fast_forward_required_reviews":
+        merge_method = "fast-forward"
+    elif unsafe_case == "custom_role":
+        permission["permission"] = "write"
+        permission["role_name"] = "release-manager"
+        permission["user"]["role_name"] = "release-manager"
+    elif unsafe_case == "actor_mismatch":
+        permission = _standard_collaborator_permission(actor="other-bot")
+    elif unsafe_case == "non_user_actor":
+        permission = _standard_collaborator_permission(user_type="Bot")
+
+    with pytest.raises(GhError, match="protection policy is unsafe"):
+        pr_review_service._validate_direct_merge_protection(
+            protection,
+            permission,
+            rules,
+            actor=ACTOR,
+            merge_method=merge_method,
+        )
+
+
+def test_direct_merge_protection_binds_frozen_ci_to_protected_app():
+    protection = _safe_direct_merge_protection()
+    protection["required_pull_request_reviews"] = None
+    required, exact_ci = _exact_ci_coverage()
+    pr_review_service._validate_direct_merge_protection(
+        protection,
+        _standard_collaborator_permission(),
+        [],
+        actor=ACTOR,
+        merge_method="fast-forward",
+        frozen_required_checks=required,
+        exact_ci=exact_ci,
+        head_sha=PR_DATA["head_sha"],
+    )
+
+
+@pytest.mark.parametrize("mismatch", ("context", "app", "status_policy"))
+def test_direct_merge_protection_rejects_unprotected_frozen_ci(mismatch):
+    protection = _safe_direct_merge_protection()
+    protection["required_pull_request_reviews"] = None
+    required, exact_ci = _exact_ci_coverage()
+    if mismatch == "context":
+        protection["required_status_checks"]["checks"][0]["context"] = "lint"
+    elif mismatch == "app":
+        protection["required_status_checks"]["checks"][0]["app_id"] = 2
+    else:
+        required[0]["kind"] = "status"
+        exact_ci["required"][0]["kind"] = "status"
+        exact_ci["observed"][0]["kind"] = "status"
+    with pytest.raises(GhError, match="protection policy is unsafe"):
+        pr_review_service._validate_direct_merge_protection(
+            protection,
+            _standard_collaborator_permission(),
+            [],
+            actor=ACTOR,
+            merge_method="fast-forward",
+            frozen_required_checks=required,
+            exact_ci=exact_ci,
+            head_sha=PR_DATA["head_sha"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_require_direct_merge_protection_reads_exact_classic_controls():
+    classic = _safe_direct_merge_protection()
+    permission = _standard_collaborator_permission()
+    json_read = AsyncMock(side_effect=[classic, permission])
+    rules_read = AsyncMock(return_value=[])
+    with (
+        patch.object(pr_review_service, "_gh_api_json", json_read),
+        patch.object(pr_review_service, "_gh_api_value", rules_read),
+    ):
+        await pr_review_service._require_direct_merge_protection(
+            repo_name="owner/repo",
+            base_ref="release/2026",
+            actor=ACTOR,
+            merge_method="squash",
+        )
+
+    assert [call.args[0] for call in json_read.await_args_list] == [
+        "repos/owner/repo/branches/release%2F2026/protection",
+        f"repos/owner/repo/collaborators/{ACTOR}/permission",
+    ]
+    rules_read.assert_awaited_once_with(
+        "repos/owner/repo/rules/branches/release%2F2026?per_page=1&page=1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_require_direct_merge_protection_rejects_unverifiable_rulesets():
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_api_json",
+            AsyncMock(side_effect=[
+                _safe_direct_merge_protection(),
+                _standard_collaborator_permission(),
+            ]),
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_api_value",
+            AsyncMock(side_effect=GhError("gh: Not Found (HTTP 404)")),
+        ),
+    ):
+        with pytest.raises(GhError, match="could not be verified"):
+            await pr_review_service._require_direct_merge_protection(
+                repo_name="owner/repo",
+                base_ref="main",
+                actor=ACTOR,
+                merge_method="merge",
+            )
+
+
+@pytest.mark.asyncio
+async def test_commit_ancestry_requires_exact_ahead_compare_response():
+    ancestor = "1" * 40
+    descendant = "2" * 40
+    api = AsyncMock(return_value=_ahead_compare_response(ancestor, descendant))
+    with patch.object(pr_review_service, "_gh_api_json", api):
+        await pr_review_service._require_commit_ancestor(
+            repo_name="owner/repo",
+            ancestor=ancestor,
+            descendant=descendant,
+        )
+    api.assert_awaited_once_with(
+        f"repos/owner/repo/compare/{ancestor}...{descendant}?per_page=1&page=1",
+        max_output_bytes=pr_review_service._MAX_GH_COMPARE_RESPONSE_BYTES,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ("diverged", "wrong_url", "wrong_merge_base", "truncated_count"),
+)
+async def test_commit_ancestry_rejects_ambiguous_compare_response(mutation):
+    ancestor = "1" * 40
+    descendant = "2" * 40
+    response = _ahead_compare_response(ancestor, descendant)
+    if mutation == "diverged":
+        response["status"] = "diverged"
+    elif mutation == "wrong_url":
+        response["url"] = "https://api.github.com/repos/other/repo/compare/x...y"
+    elif mutation == "wrong_merge_base":
+        response["merge_base_commit"]["sha"] = "3" * 40
+    elif mutation == "truncated_count":
+        response["ahead_by"] = 2
+        response["total_commits"] = 1
+    with patch.object(
+        pr_review_service,
+        "_gh_api_json",
+        AsyncMock(return_value=response),
+    ):
+        with pytest.raises(GhError, match="ancestry"):
+            await pr_review_service._require_commit_ancestor(
+                repo_name="owner/repo",
+                ancestor=ancestor,
+                descendant=descendant,
+            )
+
+
+@pytest.mark.asyncio
+async def test_safe_base_chain_proves_captured_actual_and_head_edges():
+    captured = "1" * 40
+    actual = "2" * 40
+    head = "3" * 40
+    ancestor = AsyncMock()
+    with patch.object(
+        pr_review_service,
+        "_require_commit_ancestor",
+        ancestor,
+    ):
+        await pr_review_service._require_safe_base_chain(
+            repo_name="owner/repo",
+            captured_base=captured,
+            actual_base=actual,
+            head_sha=head,
+        )
+    assert ancestor.await_args_list == [
+        call(
+            repo_name="owner/repo",
+            ancestor=captured,
+            descendant=actual,
+        ),
+        call(
+            repo_name="owner/repo",
+            ancestor=actual,
+            descendant=head,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("merge_method", "parents"),
+    [
+        ("merge", [PR_DATA["base_sha"], PR_DATA["head_sha"]]),
+        ("squash", [PR_DATA["base_sha"]]),
+    ],
+)
+async def test_find_merge_evidence_binds_exact_subject_actor_time_and_method(
+    merge_method,
+    parents,
+):
+    merge_sha = "9" * 40
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(
+                state="MERGED",
+                merged_at="2026-07-31T00:00:01Z",
+                merged_by=ACTOR,
+                merge_commit_sha=merge_sha,
+            )),
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_api_json",
+            AsyncMock(return_value={
+                "sha": merge_sha,
+                "commit": {
+                    "message": (
+                        "Automated review\n\n"
+                        f"CCM review nonce: {ACTION_NONCE}"
+                    ),
+                },
+                "parents": [{"sha": sha} for sha in parents],
+            }),
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
+    ):
+        assert await pr_review_service._find_merge_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="main",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+            merge_method=merge_method,
+        )
+
+
+@pytest.mark.asyncio
+async def test_find_fast_forward_merge_evidence_binds_frozen_subject():
+    base_ref = "release/2026"
+    current_base = "7" * 40
+    gh_view = AsyncMock(return_value=_snapshot(
+        state="MERGED",
+        base_ref=base_ref,
+        base_sha=current_base,
+        merged_at="2026-07-31T00:00:01Z",
+        merged_by=ACTOR,
+        merge_commit_sha=PR_DATA["head_sha"],
+    ))
+    ancestor = AsyncMock()
+    commit_read = AsyncMock()
+    with (
+        patch.object(pr_review_service, "_gh_pr_view", gh_view),
+        patch.object(pr_review_service, "_require_commit_ancestor", ancestor),
+        patch.object(pr_review_service, "_gh_api_json", commit_read),
+    ):
+        assert await pr_review_service._find_merge_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref=base_ref,
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+            merge_method="fast-forward",
+        )
+
+    gh_view.assert_awaited_once_with(PR_DATA["number"], "owner/repo")
+    assert ancestor.await_args_list == [
+        call(
+            repo_name="owner/repo",
+            ancestor=PR_DATA["base_sha"],
+            descendant=PR_DATA["head_sha"],
+        ),
+        call(
+            repo_name="owner/repo",
+            ancestor=PR_DATA["head_sha"],
+            descendant=current_base,
+        ),
+    ]
+    # Fast-forward evidence is the exact PR snapshot plus ancestry; it must
+    # never be reconciled through a legacy merge-commit message lookup.
+    commit_read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("snapshot_override", "started_at", "match"),
+    [
+        ({"base_ref": "main"}, PUBLISHING_STARTED_AT, "matching merge evidence"),
+        ({"head_sha": "8" * 40}, PUBLISHING_STARTED_AT, "matching merge evidence"),
+        ({"merged_by": "other-bot"}, PUBLISHING_STARTED_AT, "matching merge evidence"),
+        (
+            {"merged_at": "2026-07-30T23:59:54Z"},
+            PUBLISHING_STARTED_AT,
+            "matching merge evidence",
+        ),
+        (
+            {"merge_commit_sha": "9" * 40},
+            PUBLISHING_STARTED_AT,
+            "malformed or mismatched",
+        ),
+    ],
+)
+async def test_find_fast_forward_merge_evidence_rejects_subject_drift(
+    snapshot_override,
+    started_at,
+    match,
+):
+    snapshot_values = {
+        "state": "MERGED",
+        "base_ref": "release/2026",
+        "base_sha": "7" * 40,
+        "merged_at": "2026-07-31T00:00:01Z",
+        "merged_by": ACTOR,
+        "merge_commit_sha": PR_DATA["head_sha"],
+    }
+    snapshot_values.update(snapshot_override)
+    ancestor = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(**snapshot_values)),
+        ),
+        patch.object(pr_review_service, "_require_commit_ancestor", ancestor),
+        pytest.raises(GhError, match=match),
+    ):
+        await pr_review_service._find_merge_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="release/2026",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=started_at,
+            merge_method="fast-forward",
+        )
+    ancestor.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_find_fast_forward_merge_evidence_rejects_unproven_frozen_base():
+    rejected = GhError("GitHub PR base ancestry is unsafe for direct auto-merge")
+    ancestor = AsyncMock(side_effect=rejected)
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(
+                state="MERGED",
+                base_ref="release/2026",
+                base_sha=PR_DATA["head_sha"],
+                merged_at="2026-07-31T00:00:01Z",
+                merged_by=ACTOR,
+                merge_commit_sha=PR_DATA["head_sha"],
+            )),
+        ),
+        patch.object(pr_review_service, "_require_commit_ancestor", ancestor),
+        pytest.raises(GhError, match="base ancestry is unsafe"),
+    ):
+        await pr_review_service._find_merge_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="release/2026",
+            base_sha="8" * 40,
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+            merge_method="fast-forward",
+        )
+    ancestor.assert_awaited_once_with(
+        repo_name="owner/repo",
+        ancestor="8" * 40,
+        descendant=PR_DATA["head_sha"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_find_merge_evidence_rejects_public_nonce_copied_by_other_actor():
+    merge_sha = "9" * 40
+    commit = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(
+                state="MERGED",
+                merged_at="2026-07-31T00:00:01Z",
+                merged_by="untrusted-maintainer",
+                merge_commit_sha=merge_sha,
+            )),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", commit),
+    ):
+        with pytest.raises(GhError, match="without matching merge evidence"):
+            await pr_review_service._find_merge_evidence(
+                repo_name="owner/repo",
+                pr_number=PR_DATA["number"],
+                base_ref="main",
+                base_sha=PR_DATA["base_sha"],
+                head_sha=PR_DATA["head_sha"],
+                nonce=ACTION_NONCE,
+                actor=ACTOR,
+                publishing_started_at=PUBLISHING_STARTED_AT,
+                merge_method="merge",
+            )
+    commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_find_merge_evidence_rejects_same_sha_base_retarget():
+    merge_sha = "9" * 40
+    commit = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(
+                state="MERGED",
+                base_ref="release/2026",
+                merged_at="2026-07-31T00:00:01Z",
+                merged_by=ACTOR,
+                merge_commit_sha=merge_sha,
+            )),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", commit),
+        pytest.raises(GhError, match="without matching merge evidence"),
+    ):
+        await pr_review_service._find_merge_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="main",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+            merge_method="merge",
+        )
+
+    commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_find_merge_evidence_rejects_wrong_captured_base_parent():
+    merge_sha = "9" * 40
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(
+                state="MERGED",
+                merged_at="2026-07-31T00:00:01Z",
+                merged_by=ACTOR,
+                merge_commit_sha=merge_sha,
+            )),
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_api_json",
+            AsyncMock(return_value={
+                "sha": merge_sha,
+                "commit": {
+                    "message": f"CCM review nonce: {ACTION_NONCE}",
+                },
+                "parents": [
+                    {"sha": "8" * 40},
+                    {"sha": PR_DATA["head_sha"]},
+                ],
+            }),
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(side_effect=GhError(
+                "GitHub PR base ancestry is unsafe for direct auto-merge"
+            )),
+        ),
+    ):
+        with pytest.raises(GhError, match="base ancestry is unsafe"):
+            await pr_review_service._find_merge_evidence(
+                repo_name="owner/repo",
+                pr_number=PR_DATA["number"],
+                base_ref="main",
+                base_sha=PR_DATA["base_sha"],
+                head_sha=PR_DATA["head_sha"],
+                nonce=ACTION_NONCE,
+                actor=ACTOR,
+                publishing_started_at=PUBLISHING_STARTED_AT,
+                merge_method="merge",
+            )
+
+
+def test_merged_comment_evidence_pins_actor_head_nonce_and_time():
+    valid = _merged_issue_comment_response()
+    assert pr_review_service._validate_merged_comment_evidence(
+        valid,
+        head_sha=PR_DATA["head_sha"],
+        nonce=ACTION_NONCE,
+        actor=ACTOR,
+        publishing_started_at=PUBLISHING_STARTED_AT,
+    ) == 93
+
+    invalid_values = [
+        {**valid, "user": {"login": "another-bot"}},
+        _merged_issue_comment_response(head_sha="c" * 40),
+        _merged_issue_comment_response(nonce="d" * 48),
+        _merged_issue_comment_response(created_at="2026-07-30T23:59:00Z"),
+    ]
+    for invalid in invalid_values:
+        with pytest.raises(GhError, match="malformed or mismatched"):
+            pr_review_service._validate_merged_comment_evidence(
+                invalid,
+                head_sha=PR_DATA["head_sha"],
+                nonce=ACTION_NONCE,
+                actor=ACTOR,
+                publishing_started_at=PUBLISHING_STARTED_AT,
+            )
+
+
+@pytest.mark.asyncio
+async def test_find_merged_comment_evidence_ignores_forged_marker():
+    forged = _merged_issue_comment_response(actor="untrusted-user")
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(return_value=[[forged]]),
+    ):
+        evidence = await pr_review_service._find_merged_comment_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+        )
+
+    assert evidence is None
+
+
+@pytest.mark.asyncio
+async def test_find_merged_comment_evidence_accepts_valid_among_forged_markers():
+    forged = {
+        **_merged_issue_comment_response(actor="untrusted-user"),
+        "id": 94,
+    }
+    valid = _merged_issue_comment_response()
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(return_value=[[forged, valid]]),
+    ):
+        evidence = await pr_review_service._find_merged_comment_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+        )
+
+    assert evidence == valid["id"]
+
+
+@pytest.mark.asyncio
+async def test_publish_merged_comment_is_exact_and_reconciles_lost_ack():
+    find_comment = AsyncMock(side_effect=[None, 93])
+    find_merge = AsyncMock(return_value=True)
+    api = AsyncMock(side_effect=GhError("comment response timed out"))
+    ensure_current = AsyncMock(return_value=True)
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_merged_comment_evidence",
+            find_comment,
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            find_merge,
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+    ):
+        await pr_review_service._publish_merged_comment(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="main",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            current_actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+            merge_method="merge",
+            ensure_current=ensure_current,
+        )
+
+    assert find_comment.await_count == 2
+    find_merge.assert_awaited_once()
+    ensure_current.assert_awaited_once()
+    api.assert_awaited_once()
+    assert api.await_args.args == ("repos/owner/repo/issues/7/comments",)
+    assert api.await_args.kwargs["method"] == "POST"
+    comment_body = api.await_args.kwargs["payload"]["body"]
+    assert "merged the exact reviewed head" in comment_body
+    assert PR_DATA["head_sha"] in comment_body
+    assert ACTION_NONCE in comment_body
+
+
+@pytest.mark.asyncio
+async def test_publish_merged_comment_existing_evidence_skips_writes():
+    api = AsyncMock()
+    find_merge = AsyncMock(return_value=True)
+    ensure_current = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_merged_comment_evidence",
+            AsyncMock(return_value=93),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            find_merge,
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+    ):
+        await pr_review_service._publish_merged_comment(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="main",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            current_actor="rotated-bot",
+            publishing_started_at=PUBLISHING_STARTED_AT,
+            merge_method="merge",
+            ensure_current=ensure_current,
+        )
+
+    api.assert_not_awaited()
+    find_merge.assert_awaited_once()
+    ensure_current.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_merge_actor_rotation_stays_recoverable():
+    find_merge = AsyncMock(return_value=True)
+    ensure_current = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_merged_comment_evidence",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            find_merge,
+        ),
+    ):
+        with pytest.raises(GhError, match="merged comment identity changed") as exc:
+            await pr_review_service._publish_merged_comment(
+                repo_name="owner/repo",
+                pr_number=PR_DATA["number"],
+                base_ref="main",
+                base_sha=PR_DATA["base_sha"],
+                head_sha=PR_DATA["head_sha"],
+                nonce=ACTION_NONCE,
+                actor=ACTOR,
+                current_actor="rotated-bot",
+                publishing_started_at=PUBLISHING_STARTED_AT,
+                merge_method="merge",
+                ensure_current=ensure_current,
+            )
+
+    assert not pr_review_service._terminal_publication_error(exc.value)
+    find_merge.assert_awaited_once()
+    ensure_current.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_merge_actor_rotation_keeps_durable_outbox_pending(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(
+        db_session,
+        repo,
+        auto_merge=True,
+    )
+    await _arm_publishing(
+        db_session,
+        review,
+        task,
+        action="approved_merged",
+    )
+    lease_token = "9" * 48
+    review.publishing_lease_token = lease_token
+    review.publishing_lease_expires_at = (
+        datetime.utcnow() + timedelta(minutes=5)
+    )
+    await db_session.commit()
+    review_id = review.id
+    repo_name = repo.repo_full_name
+
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value="rotated-bot"),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value="APPROVED"),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            AsyncMock(return_value=True),
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merged_comment_evidence",
+            AsyncMock(return_value=None),
+        ),
+    ):
+        await pr_review_service._resume_publishing_review_under_lease(
+            db_session,
+            review_id,
+            repo_name,
+            lease_token=lease_token,
+        )
+
+    refreshed = await db_session.get(
+        PRReview,
+        review_id,
+        populate_existing=True,
+    )
+    assert refreshed.status == "publishing"
+    assert refreshed.pending_action == "approved_merged"
+    assert refreshed.publishing_actor == ACTOR
+    assert refreshed.publishing_lease_token is None
+    assert "merged comment identity changed" in refreshed.review_summary
 
 
 @pytest.mark.asyncio
 async def test_publish_existing_nonce_evidence_does_not_repeat_write():
     api = AsyncMock()
-    gh_view = AsyncMock()
+    gh_view = AsyncMock(return_value=_snapshot())
     find_merge = AsyncMock()
     kwargs = _publisher_kwargs()
     with (
@@ -1344,8 +2888,40 @@ async def test_publish_existing_nonce_evidence_does_not_repeat_write():
 
     assert result == ("approved", "lgtm_comment")
     api.assert_not_awaited()
-    gh_view.assert_not_awaited()
+    gh_view.assert_awaited_once()
     find_merge.assert_not_awaited()
+    kwargs["ensure_current"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", ("lgtm_comment", "review_comments"))
+async def test_recovered_review_evidence_rejects_same_sha_base_retarget(result):
+    api = AsyncMock()
+    kwargs = _publisher_kwargs(
+        result=result,
+        review_body="Blocking evidence" if result == "review_comments" else "",
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            AsyncMock(return_value=(
+                "CHANGES_REQUESTED"
+                if result == "review_comments"
+                else "APPROVED"
+            )),
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot(base_ref="release/2026")),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        pytest.raises(GhError, match="snapshot changed"),
+    ):
+        await pr_review_service._publish_review_action(**kwargs)
+
+    api.assert_not_awaited()
     kwargs["ensure_current"].assert_not_awaited()
 
 
@@ -1355,6 +2931,11 @@ async def test_publish_rotated_actor_reconciles_old_actor_evidence():
     kwargs = _publisher_kwargs(current_actor="replacement-bot")
     with (
         patch.object(pr_review_service, "_gh_api_json", api),
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ),
         patch.object(
             pr_review_service,
             "_find_review_evidence",
@@ -1510,6 +3091,226 @@ async def test_check_review_reads_exact_terminal_body_and_publishes(
     assert publish.await_args.kwargs["actor"] == ACTOR
     assert callable(publish.await_args.kwargs["ensure_current"])
     assert no_broadcast.broadcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_check_review_retries_transient_identity_read(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(db_session, repo)
+    review_id = review.id
+    task_id = task.id
+    retry_count = task.retry_count
+    repo_name = repo.repo_full_name
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="lgtm_comment",
+        body="No blocking findings.",
+    )
+    identity = AsyncMock(
+        side_effect=[GhError("GitHub API timeout"), ACTOR, ACTOR]
+    )
+    publish = AsyncMock(return_value=("approved", "lgtm_comment"))
+    with (
+        patch.object(pr_review_service, "_gh_authenticated_login", identity),
+        patch.object(pr_review_service, "_publish_review_action", publish),
+    ):
+        await check_and_update_review(
+            db_session,
+            review_id,
+            repo_name,
+            terminal_task_id=task_id,
+            terminal_task_retry_count=retry_count,
+        )
+        await db_session.refresh(review)
+        assert review.status == "reviewing"
+        publish.assert_not_awaited()
+
+        await check_and_update_review(
+            db_session,
+            review_id,
+            repo_name,
+            terminal_task_id=task_id,
+            terminal_task_retry_count=retry_count,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "approved"
+    assert identity.await_count == 3
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_auto_merge_rebase_only_arms_fast_forward_publication(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(
+        db_session,
+        repo,
+        auto_merge=True,
+    )
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="approved_merged",
+        body="No blocking findings.",
+    )
+    actor = AsyncMock(return_value=ACTOR)
+
+    async def publish_after_direct_ref_claim(**kwargs):
+        await db_session.refresh(review)
+        assert review.status == "publishing"
+        assert review.merge_method == "fast-forward"
+        assert kwargs["merge_method"] == "fast-forward"
+        return "merged", "approved_merged"
+
+    publish = AsyncMock(side_effect=publish_after_direct_ref_claim)
+    repo_capability = AsyncMock(return_value=_direct_ref_repo_info(
+        allow_merge_commit=False,
+        allow_squash_merge=False,
+        allow_rebase_merge=True,
+    ))
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_api_json",
+            repo_capability,
+        ),
+        patch.object(pr_review_service, "_gh_authenticated_login", actor),
+        patch.object(pr_review_service, "_publish_review_action", publish),
+    ):
+        await check_and_update_review(
+            db_session,
+            review.id,
+            repo.repo_full_name,
+            terminal_task_id=task.id,
+            terminal_task_retry_count=task.retry_count,
+        )
+    await db_session.refresh(review)
+    assert review.status == "merged"
+    assert review.action_taken == "approved_merged"
+    assert review.merge_method == "fast-forward"
+    repo_capability.assert_awaited_once_with("repos/owner/repo")
+    assert actor.await_count == 2
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_auto_merge_retries_transient_capability_read(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(db_session, repo, auto_merge=True)
+    review_id = review.id
+    task_id = task.id
+    retry_count = task.retry_count
+    repo_name = repo.repo_full_name
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="approved_merged",
+        body="No blocking findings.",
+    )
+    freeze = AsyncMock(side_effect=[
+        GhError("GitHub API HTTP 503"),
+        "fast-forward",
+    ])
+    publish = AsyncMock(return_value=("merged", "approved_merged"))
+    with (
+        patch.object(pr_review_service, "_freeze_safe_merge_method", freeze),
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value=ACTOR),
+        ),
+        patch.object(pr_review_service, "_publish_review_action", publish),
+    ):
+        await check_and_update_review(
+            db_session,
+            review_id,
+            repo_name,
+            terminal_task_id=task_id,
+            terminal_task_retry_count=retry_count,
+        )
+        await db_session.refresh(review)
+        assert review.status == "reviewing"
+        assert review.action_taken is None
+        publish.assert_not_awaited()
+
+        await check_and_update_review(
+            db_session,
+            review_id,
+            repo_name,
+            terminal_task_id=task_id,
+            terminal_task_retry_count=retry_count,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "merged"
+    assert review.merge_method == "fast-forward"
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_check_auto_merge_blocker_publishes_on_rebase_only_repository(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    """Merge capabilities cannot suppress a blocking review publication."""
+
+    review, task = await _make_review(
+        db_session,
+        repo,
+        auto_merge=True,
+    )
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="review_comments",
+        body="A blocking correctness issue remains.",
+    )
+    freeze = AsyncMock(side_effect=AssertionError(
+        "blocking reviews must not inspect auto-merge capability"
+    ))
+    publish = AsyncMock(return_value=("commented", "review_comments"))
+    with (
+        patch.object(
+            pr_review_service,
+            "_freeze_safe_merge_method",
+            freeze,
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value=ACTOR),
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
+    ):
+        await check_and_update_review(
+            db_session,
+            review.id,
+            repo.repo_full_name,
+            terminal_task_id=task.id,
+            terminal_task_retry_count=task.retry_count,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "commented"
+    assert review.action_taken == "review_comments"
+    assert review.merge_method is None
+    freeze.assert_not_awaited()
+    assert publish.await_args.kwargs["merge_method"] is None
 
 
 @pytest.mark.asyncio
@@ -1713,6 +3514,13 @@ async def test_delivery_durable_publication_never_resumes_approved_merged(
         "pr_monitor": {
             "repo_id": repo.id,
             "repo_full_name": repo.repo_full_name,
+            "review_mode": "panel",
+            "wait_for_ci": True,
+            "required_checks": [{
+                "kind": "check_run",
+                "name": "tests",
+                "app_slug": "github-actions",
+            }],
         },
     }
     run = DeliveryRun(
@@ -1742,7 +3550,21 @@ async def test_delivery_durable_publication_never_resumes_approved_merged(
         repo,
         auto_merge=True,
     )
+    task.metadata_ = {
+        **task.metadata_,
+        "pr_wait_for_ci": True,
+        "pr_required_checks": [{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+    }
     review.delivery_id = f"delivery:{run.id}:{PR_DATA['head_sha']}"
+    await _bind_delivery_review(
+        db_session,
+        delivery_run=run,
+        review=review,
+    )
     await _arm_publishing(
         db_session,
         review,
@@ -1781,6 +3603,126 @@ async def test_delivery_durable_publication_never_resumes_approved_merged(
     assert "Durable PR publication state is invalid" in review.review_summary
     identity.assert_not_awaited()
     publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delivery_durable_publication_resumes_frozen_auto_merge(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    """A frozen Delivery auto-merge policy authorizes exact recovery."""
+
+    project = Project(
+        name="delivery-auto-merge-publication",
+        local_path="/srv/repos/delivery-auto-merge-publication",
+        git_url="git@github.com:owner/repo.git",
+        has_remote=True,
+        default_branch="main",
+        status="ready",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    policy = {
+        "schema_version": 1,
+        "terminal": "merged",
+        "auto_merge": True,
+        "pr_monitor": {
+            "repo_id": repo.id,
+            "repo_full_name": repo.repo_full_name,
+            "review_mode": "panel",
+            "wait_for_ci": True,
+            "required_checks": [{
+                "kind": "check_run",
+                "name": "tests",
+                "app_slug": "github-actions",
+            }],
+        },
+    }
+    run = DeliveryRun(
+        admission_scope="system",
+        idempotency_key="service-pr-review-auto-merge-publication",
+        request_hash="e" * 64,
+        project_id=project.id,
+        monitored_repo_id=repo.id,
+        title="Delivery auto-merge publication recovery",
+        requirements="Merge and publish the durable outcome.",
+        requirements_hash="2" * 64,
+        policy_snapshot=policy,
+        policy_hash=value_hash(policy),
+        base_branch="main",
+        delivery_branch="ccm/delivery/auto-merge-publication",
+        base_sha=PR_DATA["base_sha"],
+        head_sha=PR_DATA["head_sha"],
+        pr_number=PR_DATA["number"],
+        phase="monitoring",
+        activity="waiting",
+        wait_reason="pr_monitor",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review, task = await _make_review(
+        db_session,
+        repo,
+        auto_merge=True,
+    )
+    task.metadata_ = {
+        **task.metadata_,
+        "pr_wait_for_ci": True,
+        "pr_required_checks": [{
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }],
+    }
+    review.delivery_id = f"delivery:{run.id}:{PR_DATA['head_sha']}"
+    await _bind_delivery_review(
+        db_session,
+        delivery_run=run,
+        review=review,
+    )
+    await _arm_publishing(
+        db_session,
+        review,
+        task,
+        action="approved_merged",
+    )
+    lease_token = "2" * 48
+    review.publishing_lease_token = lease_token
+    review.publishing_lease_expires_at = datetime.utcnow() + timedelta(minutes=5)
+    await db_session.commit()
+
+    publish = AsyncMock(return_value=("merged", "approved_merged"))
+    identity = AsyncMock(return_value=ACTOR)
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            identity,
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
+    ):
+        await pr_review_service._resume_publishing_review_under_lease(
+            db_session,
+            review.id,
+            repo.repo_full_name,
+            lease_token=lease_token,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "merged"
+    assert review.action_taken == "approved_merged"
+    assert review.completed_at is not None
+    assert review.pending_action is None
+    assert review.publishing_lease_token is None
+    identity.assert_awaited_once()
+    publish.assert_awaited_once()
+    assert publish.await_args.kwargs["result"] == "approved_merged"
+    assert publish.await_args.kwargs["auto_merge"] is True
 
 
 @pytest.mark.asyncio
@@ -1993,7 +3935,7 @@ async def test_recover_publishing_pr_reviews_reuses_nonce_without_write(
         review_id = review.id
 
     api = AsyncMock()
-    gh_view = AsyncMock()
+    gh_view = AsyncMock(return_value=_snapshot())
     find_review = AsyncMock(return_value="APPROVED")
     with (
         patch.object(
@@ -2027,7 +3969,179 @@ async def test_recover_publishing_pr_reviews_reuses_nonce_without_write(
         assert stored.publishing_actor is None
     find_review.assert_awaited_once()
     api.assert_not_awaited()
-    gh_view.assert_not_awaited()
+    gh_view.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recovery_uses_frozen_review_base_ref_after_repo_config_drift(
+    session_factory,
+    no_broadcast,
+):
+    async with session_factory() as db:
+        repo = _make_repo(default_branch="main")
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo)
+        await _arm_publishing(db, review, task)
+        repo.default_branch = "release/next"
+        await db.commit()
+
+    publish = AsyncMock(return_value=("approved", "lgtm_comment"))
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value=ACTOR),
+        ),
+        patch.object(pr_review_service, "_publish_review_action", publish),
+    ):
+        assert await pr_review_service.recover_publishing_pr_reviews(
+            session_factory
+        ) == 1
+
+    publish.assert_awaited_once()
+    assert publish.await_args.kwargs["base_ref"] == "main"
+
+
+@pytest.mark.asyncio
+async def test_recover_migration_window_merge_outbox_after_lost_merge_ack(
+    session_factory,
+    no_broadcast,
+):
+    """An old binary's post-migration NULL outbox is frozen and reconciled."""
+
+    async with session_factory() as db:
+        repo = _make_repo(auto_merge=True)
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(
+            db,
+            repo,
+            auto_merge=True,
+        )
+        await _arm_publishing(
+            db,
+            review,
+            task,
+            action="approved_merged",
+        )
+        # Simulate the online migration window: the migration backfill already
+        # ran, then an old binary inserted its otherwise complete implicit
+        # merge-commit outbox and left the new column NULL.
+        review.merge_method = None
+        await db.commit()
+        review_id = review.id
+
+    merge_sha = "9" * 40
+
+    async def github_api(path, *, method="GET", payload=None, **_kwargs):
+        if path == f"repos/owner/repo/commits/{merge_sha}":
+            assert method == "GET"
+            assert payload is None
+            return {
+                "sha": merge_sha,
+                "commit": {
+                    "message": (
+                        "Automated review\n\n"
+                        f"CCM review nonce: {ACTION_NONCE}"
+                    ),
+                },
+                "parents": [
+                    {"sha": PR_DATA["base_sha"]},
+                    {"sha": PR_DATA["head_sha"]},
+                ],
+            }
+        if path == "repos/owner/repo/issues/7/comments":
+            assert method == "POST"
+            assert payload == {
+                "body": pr_review_service._merged_comment_body(
+                    nonce=ACTION_NONCE,
+                    head_sha=PR_DATA["head_sha"],
+                ),
+            }
+            return _merged_issue_comment_response()
+        raise AssertionError(f"unexpected GitHub mutation/read: {path}")
+
+    api = AsyncMock(side_effect=github_api)
+    gh_view = AsyncMock(return_value=_snapshot(
+        state="MERGED",
+        merged_at="2026-07-31T00:00:01Z",
+        merged_by=ACTOR,
+        merge_commit_sha=merge_sha,
+    ))
+    find_review = AsyncMock(return_value="APPROVED")
+    find_comment = AsyncMock(return_value=None)
+    find_merge = AsyncMock(wraps=pr_review_service._find_merge_evidence)
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value=ACTOR),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", api),
+        patch.object(pr_review_service, "_gh_pr_view", gh_view),
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            find_review,
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merge_evidence",
+            find_merge,
+        ),
+        patch.object(
+            pr_review_service,
+            "_find_merged_comment_evidence",
+            find_comment,
+        ),
+        patch.object(
+            pr_review_service,
+            "_require_safe_base_chain",
+            AsyncMock(),
+        ),
+    ):
+        recovered = await pr_review_service.recover_publishing_pr_reviews(
+            session_factory
+        )
+
+    assert recovered == 1
+    async with session_factory() as db:
+        stored = await db.get(PRReview, review_id)
+        assert stored.status == "merged"
+        assert stored.action_taken == "approved_merged"
+        assert stored.pending_action is None
+        assert stored.merge_method == "merge"
+        assert stored.publishing_actor == ACTOR
+        assert stored.publishing_started_at == PUBLISHING_STARTED_AT
+
+    assert find_review.await_args.kwargs == {
+        "repo_name": "owner/repo",
+        "pr_number": PR_DATA["number"],
+        "head_sha": PR_DATA["head_sha"],
+        "result": "approved_merged",
+        "nonce": ACTION_NONCE,
+        "actor": ACTOR,
+        "publishing_started_at": PUBLISHING_STARTED_AT,
+    }
+    assert find_merge.await_count == 2
+    for call in find_merge.await_args_list:
+            assert call.kwargs == {
+                "repo_name": "owner/repo",
+                "pr_number": PR_DATA["number"],
+                "base_ref": "main",
+                "base_sha": PR_DATA["base_sha"],
+            "head_sha": PR_DATA["head_sha"],
+            "nonce": ACTION_NONCE,
+            "actor": ACTOR,
+            "publishing_started_at": PUBLISHING_STARTED_AT,
+            "merge_method": "merge",
+        }
+    assert gh_view.await_count == 2
+    assert find_comment.await_count == 1
+    assert not any("pulls/7/merge" in call.args[0] for call in api.await_args_list)
 
 
 @pytest.mark.asyncio
@@ -2124,9 +4238,10 @@ async def test_publication_lease_fences_concurrent_processes(
             task_id=task_id,
             retry_count=retry_count,
             task_started_at=started_at,
-            nonce=ACTION_NONCE,
-            lease_token=first_token,
-            expected_delivery_id=PR_DATA["delivery_id"],
+                nonce=ACTION_NONCE,
+                lease_token=first_token,
+                expected_delivery_id=PR_DATA["delivery_id"],
+                base_ref="main",
         )
 
 
@@ -2175,9 +4290,10 @@ async def test_publication_guard_rejects_delivery_ownership_change(
             task_id=task_id,
             retry_count=retry_count,
             task_started_at=started_at,
-            nonce=ACTION_NONCE,
-            lease_token=lease_token,
-            expected_delivery_id=legacy_delivery_id,
+                nonce=ACTION_NONCE,
+                lease_token=lease_token,
+                expected_delivery_id=legacy_delivery_id,
+                base_ref="main",
         )
 
 
@@ -2215,9 +4331,10 @@ async def test_publication_guard_rejects_active_manager_termination_receipt(
             task_id=task_id,
             retry_count=retry_count,
             task_started_at=started_at,
-            nonce=ACTION_NONCE,
-            lease_token=lease_token,
-            expected_delivery_id=PR_DATA["delivery_id"],
+                nonce=ACTION_NONCE,
+                lease_token=lease_token,
+                expected_delivery_id=PR_DATA["delivery_id"],
+                base_ref="main",
         )
 
     authenticated_login = AsyncMock(return_value=ACTOR)
@@ -2325,6 +4442,7 @@ async def test_full_recovery_projects_terminal_error_to_monitor_once(
             monitor_run_id=monitor.id,
             repo_id=repo.id,
             pr_number=PR_DATA["number"],
+            base_ref="main",
             base_sha=PR_DATA["base_sha"],
             head_sha=PR_DATA["head_sha"],
             delivery_id=PR_DATA["delivery_id"],
@@ -2673,6 +4791,96 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
     assert new.head_sha == replacement["head_sha"]
 
 
+@pytest.mark.asyncio
+async def test_recover_superseding_intent_different_base_ref_is_not_self_target(
+    session_factory,
+    no_broadcast,
+):
+    from backend.services.task_termination import TaskTerminationResult
+
+    replacement = {
+        **PR_DATA,
+        "base_ref": "release/2026",
+        "delivery_id": "delivery-base-retarget",
+    }
+    context = _prepared_context()
+    context["base_ref"] = replacement["base_ref"]
+    context["material"]["base_ref"] = replacement["base_ref"]
+    async with session_factory() as db:
+        repo = _make_repo(default_branch="release/2026")
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(
+            db,
+            repo,
+            task_status="pending",
+        )
+        task_id = task.id
+        review_id = review.id
+        review.status = "superseding"
+        review.superseding_snapshot = {
+            "version": 2,
+            "pr_data": replacement,
+            "prepared_context": context,
+        }
+        review.superseding_token = "2" * 48
+        review.superseding_started_at = (
+            datetime.utcnow() - timedelta(minutes=5)
+        )
+        await db.commit()
+
+    terminated_ids = []
+
+    async def terminate(task_id_arg, db, **_kwargs):
+        terminated_ids.append(task_id_arg)
+        current = await db.get(Task, task_id_arg)
+        previous = current.status
+        current.status = "completed"
+        current.completed_at = datetime.utcnow()
+        await db.commit()
+        return TaskTerminationResult(
+            task_id=task_id_arg,
+            previous_status=previous,
+            terminal_status="completed",
+            transitioned=True,
+            stopped=False,
+            cleared_messages=0,
+            retry_count=current.retry_count,
+            turn_generation=current.turn_generation,
+            instance_id=current.instance_id,
+            started_at=current.started_at,
+            completed_at=current.completed_at,
+            pty_background_generation=None,
+        )
+
+    with patch(
+        "backend.services.task_termination."
+        "terminate_authoritative_task_generation",
+        side_effect=terminate,
+    ):
+        recovered = await pr_review_service.recover_superseding_pr_reviews(
+            session_factory,
+            grace_seconds=0,
+        )
+
+    assert recovered == 1
+    assert terminated_ids == [task_id]
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo.id)
+        )).scalars())
+        assert len(reviews) == 2
+        old = next(review for review in reviews if review.id == review_id)
+        new = next(review for review in reviews if review.id != review_id)
+        assert old.status == "superseded"
+        assert old.base_ref == "main"
+        assert new.status == "reviewing"
+        assert new.base_ref == "release/2026"
+        assert old.base_sha == new.base_sha == PR_DATA["base_sha"]
+        assert old.head_sha == new.head_sha == PR_DATA["head_sha"]
+
+
 def _thread_finding(*, line=12):
     return PRFinding(
         id=41,
@@ -2693,6 +4901,55 @@ def _thread_finding(*, line=12):
         base_sha=PR_DATA["base_sha"],
         head_sha=PR_DATA["head_sha"],
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_valid", (False, True))
+async def test_finding_marker_forgery_cannot_block_ack_reconciliation(
+    include_valid,
+):
+    finding = _thread_finding()
+    marker_body = pr_review_service._finding_thread_body(finding)
+    forged = {
+        "id": 90,
+        "body": marker_body,
+        "user": {"login": "untrusted-user"},
+        "html_url": "https://github.test/comment/90",
+        "commit_id": PR_DATA["head_sha"],
+        "path": finding.path,
+    }
+    valid = {
+        "id": 91,
+        "body": marker_body,
+        "user": {"login": ACTOR},
+        "html_url": "https://github.test/comment/91",
+        "commit_id": PR_DATA["head_sha"],
+        "path": finding.path,
+    }
+    post = AsyncMock(return_value=valid)
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_api_value",
+            AsyncMock(return_value=[[forged, *([valid] if include_valid else [])]]),
+        ),
+        patch.object(pr_review_service, "_gh_api_json", post),
+    ):
+        result = await pr_review_service._publish_one_finding_thread(
+            repo_name="owner/repo",
+            pr_number=7,
+            finding=finding,
+            actor=ACTOR,
+            ensure_current=AsyncMock(return_value=True),
+        )
+
+    assert result == (
+        "published_inline",
+        91,
+        "https://github.test/comment/91",
+        None,
+    )
+    assert post.await_count == (0 if include_valid else 1)
 
 
 @pytest.mark.asyncio
@@ -2757,6 +5014,7 @@ async def test_finding_publication_survives_exact_guard_rollback(db_session):
     review = PRReview(
         repo_id=repo.id,
         pr_number=7,
+        base_ref="main",
         base_sha=PR_DATA["base_sha"],
         head_sha=PR_DATA["head_sha"],
         pr_title="fixture",

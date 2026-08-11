@@ -2,6 +2,7 @@
 import pytest
 from unittest.mock import patch, AsyncMock
 
+from backend.models.discussion import Discussion
 from backend.models.project import Project
 
 
@@ -114,6 +115,73 @@ async def test_delete_project(client, mock_bg_tasks):
 async def test_delete_project_not_found(client):
     resp = await client.delete("/api/projects/9999")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discussion_status", ["active", "closing"])
+async def test_delete_project_rejects_provider_capable_discussion_lease(
+    client,
+    mock_bg_tasks,
+    session_factory,
+    discussion_status,
+):
+    created = await client.post(
+        "/api/projects",
+        json={"name": f"project-delete-{discussion_status}-discussion"},
+    )
+    project_id = created.json()["id"]
+    async with session_factory() as db:
+        discussion = Discussion(
+            title=f"{discussion_status} deletion lease",
+            project_id=project_id,
+            status=discussion_status,
+        )
+        db.add(discussion)
+        await db.commit()
+
+    response = await client.delete(f"/api/projects/{project_id}")
+
+    assert response.status_code == 409
+    assert "active or closing Discussion" in response.json()["detail"]
+    async with session_factory() as db:
+        assert await db.get(Project, project_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_delete_project_requires_closed_discussion_to_be_deleted_first(
+    client,
+    mock_bg_tasks,
+    session_factory,
+):
+    created = await client.post(
+        "/api/projects",
+        json={"name": "project-delete-closed-discussion"},
+    )
+    project_id = created.json()["id"]
+    async with session_factory() as db:
+        discussion = Discussion(
+            title="closed deletion lease",
+            project_id=project_id,
+            status="closed",
+        )
+        db.add(discussion)
+        await db.commit()
+        discussion_id = discussion.id
+
+    rejected = await client.delete(f"/api/projects/{project_id}")
+    assert rejected.status_code == 409
+    assert "Delete Discussion" in rejected.json()["detail"]
+    async with session_factory() as db:
+        assert await db.get(Project, project_id) is not None
+        assert await db.get(Discussion, discussion_id) is not None
+
+    cleaned = await client.delete(f"/api/discussions/{discussion_id}")
+    assert cleaned.status_code == 200
+    deleted = await client.delete(f"/api/projects/{project_id}")
+    assert deleted.status_code == 200
+    async with session_factory() as db:
+        assert await db.get(Discussion, discussion_id) is None
+        assert await db.get(Project, project_id) is None
 
 
 @pytest.mark.asyncio

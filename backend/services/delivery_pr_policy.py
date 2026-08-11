@@ -28,12 +28,18 @@ class DeliveryPRPolicyError(RuntimeError):
     """A review claims Delivery ownership but cannot prove its frozen policy."""
 
 
+class DeliveryPREffectNotReady(DeliveryPRPolicyError):
+    """The exact Delivery policy exists but its Monitor binding is not durable yet."""
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenDeliveryPRPolicy:
     run_id: int
     policy_hash: str
     auto_merge: bool
     terminal: str
+    wait_for_ci: bool
+    required_checks: list[dict]
 
 
 def has_reserved_delivery_marker(review: PRReview | None) -> bool:
@@ -155,6 +161,7 @@ async def frozen_delivery_pr_policy(
     review: PRReview,
     *,
     monitor_run_id: int | None = None,
+    require_effect_ready: bool = False,
 ) -> FrozenDeliveryPRPolicy | None:
     """Return the validated policy for a Delivery-owned review.
 
@@ -164,8 +171,10 @@ async def frozen_delivery_pr_policy(
     value inside that namespace fails closed: callers must not silently fall
     back to mutable repository policy after ownership was asserted.
     ``pr_monitor_run_id`` is allowed to be null during the publisher's
-    create/attach transaction, but once present it must match the caller's
-    exact Monitor Run.
+    create/attach transaction.  GitHub effect callers must pass
+    ``require_effect_ready=True``; that stricter boundary accepts only the
+    exact, active ``monitoring/waiting`` Run after its Monitor/Review binding
+    is durable.
     """
 
     delivery_id = review.delivery_id
@@ -186,6 +195,8 @@ async def frozen_delivery_pr_policy(
         raise DeliveryPRPolicyError("Delivery review lost its owning Run")
     if (
         run.monitored_repo_id != review.repo_id
+        or review.base_ref != run.base_branch
+        or run.base_sha != review.base_sha
         or run.head_sha != marker_head
         or review.head_sha != marker_head
         or (run.pr_number is not None and run.pr_number != review.pr_number)
@@ -195,8 +206,52 @@ async def frozen_delivery_pr_policy(
         )
     ):
         raise DeliveryPRPolicyError(
-            "Delivery review no longer matches its Run/PR/head subject"
+            "Delivery review no longer matches its Run/PR/base/head subject"
         )
+
+    if require_effect_ready:
+        if (
+            run.outcome is None
+            and run.phase == "publishing"
+            and run.activity == "running"
+            and run.pr_monitor_run_id is None
+        ):
+            # Review creation/attachment and the Delivery Run binding are two
+            # durable transactions.  A very fast reviewer (or restart between
+            # them) must wait instead of turning that normal commit gap into a
+            # terminal Review error.
+            raise DeliveryPREffectNotReady(
+                "Delivery Monitor binding is not durable yet"
+            )
+        if (
+            monitor_run_id is None
+            or review.monitor_run_id != monitor_run_id
+            or run.pr_monitor_run_id != monitor_run_id
+            or run.pr_number != review.pr_number
+            or run.phase != "monitoring"
+            or run.activity != "waiting"
+            or run.outcome is not None
+        ):
+            raise DeliveryPRPolicyError(
+                "Delivery Run is not the active bound Monitor owner"
+            )
+        monitor = await db.get(
+            PRMonitorRun,
+            monitor_run_id,
+            populate_existing=True,
+        )
+        if (
+            monitor is None
+            or monitor.repo_id != review.repo_id
+            or monitor.pr_number != review.pr_number
+            or monitor.status != "reviewing"
+            or monitor.current_review_id != review.id
+            or monitor.current_base_sha != review.base_sha
+            or monitor.current_head_sha != review.head_sha
+        ):
+            raise DeliveryPRPolicyError(
+                "Delivery Monitor/Review subject is not the exact active binding"
+            )
 
     policy = run.policy_snapshot
     if not isinstance(policy, dict) or value_hash(policy) != run.policy_hash:
@@ -204,24 +259,43 @@ async def frozen_delivery_pr_policy(
     auto_merge = policy.get("auto_merge")
     terminal = policy.get("terminal")
     monitor_policy = policy.get("pr_monitor")
+    wait_for_ci = (
+        monitor_policy.get("wait_for_ci")
+        if isinstance(monitor_policy, dict)
+        else None
+    )
+    required_checks = (
+        monitor_policy.get("required_checks")
+        if isinstance(monitor_policy, dict)
+        else None
+    )
     if (
-        auto_merge is not False
-        or terminal != "ready_to_merge"
+        type(auto_merge) is not bool
+        or terminal
+        != ("merged" if auto_merge else "ready_to_merge")
         or not isinstance(monitor_policy, dict)
         or monitor_policy.get("repo_id") != review.repo_id
+        or monitor_policy.get("review_mode") != "panel"
+        or wait_for_ci is not True
+        or not isinstance(required_checks, list)
+        or not required_checks
+        or any(not isinstance(item, dict) for item in required_checks)
     ):
         raise DeliveryPRPolicyError(
-            "Delivery policy does not authorize a manual ready-to-merge Gate"
+            "Delivery policy has an invalid merge terminal"
         )
     return FrozenDeliveryPRPolicy(
         run_id=run.id,
         policy_hash=run.policy_hash,
-        auto_merge=False,
-        terminal="ready_to_merge",
+        auto_merge=auto_merge,
+        terminal=terminal,
+        wait_for_ci=wait_for_ci,
+        required_checks=required_checks,
     )
 
 
 __all__ = [
+    "DeliveryPREffectNotReady",
     "DeliveryPRPolicyError",
     "FrozenDeliveryPRPolicy",
     "frozen_delivery_pr_policy",

@@ -665,6 +665,7 @@ async def test_pr_monitor_detail_reviews_and_mutations_require_exact_worker_owne
         review = PRReview(
             repo_id=repo.id,
             pr_number=7,
+            base_ref="main",
             head_sha="a" * 40,
             pr_title="Private PR",
             pr_author="private-author",
@@ -779,6 +780,38 @@ async def test_discussion_events_require_discussion_owner(secured_client):
     assert outsider.status_code == 403
     assert owner.status_code == 200
     assert owner.json()[0]["content"] == "private event"
+
+
+@pytest.mark.asyncio
+async def test_discussion_agent_workloads_are_admin_only(secured_client):
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="discussion-workload-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        await _add_worker(
+            db,
+            name="discussion-member-worker",
+            owner_user_id=member_id,
+        )
+        await db.commit()
+
+    member_create = await client.post(
+        "/api/discussions",
+        headers=_headers(member_token),
+        json={"title": "must not launch"},
+    )
+    admin_create = await client.post(
+        "/api/discussions",
+        headers={"Authorization": "Bearer security-service-token"},
+        json={"title": "admin discussion"},
+    )
+
+    assert member_create.status_code == 403
+    assert member_create.json()["detail"] == "Admin only"
+    assert admin_create.status_code == 201
 
 
 @pytest.mark.asyncio

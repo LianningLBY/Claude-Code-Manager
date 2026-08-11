@@ -334,25 +334,33 @@ async def create_pr_review_panel(
     prepared_context: dict | None = None,
 ) -> PRReview:
     from backend.services.pr_review_service import (
+        _frozen_pr_base_ref,
+        _valid_base_ref,
         _validate_review_identifiers,
         prepare_pr_review_context,
     )
 
     pr_number, repo_name, base_sha, head_sha = _validate_review_identifiers(repo, pr_data)
     context = prepared_context or await prepare_pr_review_context(repo, pr_data)
+    base_ref = _frozen_pr_base_ref(repo, pr_data)
     if (
         context.get("repo_name") != repo_name
         or context.get("pr_number") != pr_number
+        or context.get("base_ref") != base_ref
         or context.get("base_sha") != base_sha
         or context.get("head_sha") != head_sha
         or not isinstance(context.get("guidance"), dict)
         or not isinstance(context.get("material"), dict)
+        or context["material"].get("base_ref") != context.get("base_ref")
     ):
         raise ValueError("prepared PR review context does not match the panel snapshot")
+    if not _valid_base_ref(base_ref):
+        raise ValueError("prepared PR review context has an invalid base ref")
     nonce = secrets.token_hex(24)
     review = PRReview(
         repo_id=repo.id,
         pr_number=pr_number,
+        base_ref=base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
         delivery_id=pr_data.get("delivery_id"),
@@ -377,12 +385,20 @@ async def create_waiting_ci_review(
     ci_summary: str,
     ci_details: dict,
 ) -> PRReview:
-    from backend.services.pr_review_service import _validate_review_identifiers
+    from backend.services.pr_review_service import (
+        _frozen_pr_base_ref,
+        _valid_base_ref,
+        _validate_review_identifiers,
+    )
 
     pr_number, _repo_name, base_sha, head_sha = _validate_review_identifiers(repo, pr_data)
+    base_ref = _frozen_pr_base_ref(repo, pr_data)
+    if not _valid_base_ref(base_ref):
+        raise ValueError("invalid PR base ref")
     review = PRReview(
         repo_id=repo.id,
         pr_number=pr_number,
+        base_ref=base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
         delivery_id=pr_data.get("delivery_id"),
@@ -412,12 +428,21 @@ async def _add_panel_tasks(
     from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
     from backend.services.pr_review_service import _get_or_create_pr_monitor_project
 
-    if review.base_sha is None or review.head_sha is None or review.action_nonce is None:
+    if (
+        review.base_ref is None
+        or review.base_sha is None
+        or review.head_sha is None
+        or review.action_nonce is None
+        or context.get("base_ref") != review.base_ref
+        or not isinstance(context.get("material"), dict)
+        or context["material"].get("base_ref") != review.base_ref
+    ):
         raise ValueError("panel review snapshot is incomplete")
     repo_name = repo.repo_full_name
     pr_number = review.pr_number
     base_sha = review.base_sha
     head_sha = review.head_sha
+    base_ref = review.base_ref
     nonce = review.action_nonce
     delivery_policy = await frozen_delivery_pr_policy(db, review)
     frozen_auto_merge = (
@@ -425,6 +450,16 @@ async def _add_panel_tasks(
         if delivery_policy is not None
         else bool(repo.auto_merge)
     )
+    frozen_wait_for_ci = (
+        delivery_policy.wait_for_ci
+        if delivery_policy is not None
+        else bool(repo.wait_for_ci)
+    )
+    frozen_required_checks = json.loads(json.dumps(
+        delivery_policy.required_checks
+        if delivery_policy is not None
+        else (repo.required_checks or [])
+    ))
     provider = (repo.provider or "claude").lower()
     model = repo.review_model or (settings.default_codex_model if provider == "codex" else None)
     project_id = await _get_or_create_pr_monitor_project(db)
@@ -463,9 +498,12 @@ async def _add_panel_tasks(
                 "pr_review_id": review.id,
                 "pr_reviewer_run_id": run.id,
                 "pr_reviewer_role": role,
+                "pr_base_ref": base_ref,
                 "pr_base_sha": base_sha,
                 "pr_head_sha": head_sha,
                 "pr_auto_merge": frozen_auto_merge,
+                "pr_wait_for_ci": frozen_wait_for_ci,
+                "pr_required_checks": frozen_required_checks,
                 "pr_action_nonce": nonce,
             },
             provider=provider,
@@ -600,6 +638,10 @@ async def fetch_exact_head_ci(
             item_state = item.get("status")
             conclusion = item.get("conclusion")
             details_url = item.get("details_url")
+            app = item.get("app")
+            app_id = app.get("id") if isinstance(app, dict) else None
+            if type(app_id) is not int or app_id <= 0:
+                app_id = None
             if item_state != "completed":
                 state_value = "pending"
                 pending.append(label)
@@ -623,6 +665,7 @@ async def fetch_exact_head_ci(
                 "conclusion": conclusion,
                 "details_url": details_url if isinstance(details_url, str) else None,
                 "github_id": item["id"],
+                "app_id": app_id,
                 "output": output_evidence,
             })
         else:
@@ -682,7 +725,13 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                 if review is None or review.status != "waiting_ci":
                     continue
                 repo = await db.get(MonitoredRepo, review.repo_id, populate_existing=True)
-                if repo is None or not repo.enabled or review.base_sha is None or review.head_sha is None:
+                if (
+                    repo is None
+                    or not repo.enabled
+                    or review.base_ref is None
+                    or review.base_sha is None
+                    or review.head_sha is None
+                ):
                     continue
                 pr_data = {
                     "number": review.pr_number,
@@ -711,8 +760,16 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                             reason_kind="ci_failed",
                         )
                     continue
-                await verify_pr_review_snapshot_current(repo, pr_data)
-                context = await prepare_pr_review_context(repo, pr_data)
+                await verify_pr_review_snapshot_current(
+                    repo,
+                    pr_data,
+                    base_ref=review.base_ref,
+                )
+                context = await prepare_pr_review_context(
+                    repo,
+                    pr_data,
+                    base_ref=review.base_ref,
+                )
                 # Context preparation is network-bound. Drop the old read
                 # snapshot before locking so disable/synchronize commits made
                 # during that call cannot survive in the ORM identity map.
@@ -724,31 +781,44 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )).scalar_one_or_none()
+                # Discover the parent id without locking the Review.  All
+                # writers that can touch both lifecycle rows use the canonical
+                # PRMonitorRun -> PRReview order after the repository barrier;
+                # this is required on PostgreSQL/MySQL even though SQLite does
+                # not expose the deadlock in WAL tests.
+                monitor_run_id = await db.scalar(
+                    select(PRReview.monitor_run_id).where(
+                        PRReview.id == review_id,
+                        PRReview.status == "waiting_ci",
+                    )
+                )
+                locked_run = (
+                    (await db.execute(
+                        select(PRMonitorRun)
+                        .where(PRMonitorRun.id == monitor_run_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )).scalar_one_or_none()
+                    if monitor_run_id is not None
+                    else None
+                )
                 locked = (await db.execute(
                     select(PRReview)
                     .where(PRReview.id == review_id, PRReview.status == "waiting_ci")
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )).scalar_one_or_none()
-                locked_run = (
-                    (await db.execute(
-                        select(PRMonitorRun)
-                        .where(PRMonitorRun.id == locked.monitor_run_id)
-                        .with_for_update()
-                        .execution_options(populate_existing=True)
-                    )).scalar_one_or_none()
-                    if locked is not None and locked.monitor_run_id is not None
-                    else None
-                )
                 if (
                     locked_repo is None
                     or not locked_repo.enabled
                     or locked_repo.review_mode != "panel"
                     or not locked_repo.wait_for_ci
                     or locked is None
+                    or locked.base_ref != context.get("base_ref")
                     or locked.base_sha != pr_data["base_sha"]
                     or locked.head_sha != pr_data["head_sha"]
                     or locked_run is None
+                    or locked.monitor_run_id != locked_run.id
                     or locked_run.status != "waiting_ci"
                     or locked_run.current_review_id != locked.id
                     or locked_run.current_base_sha != locked.base_sha
@@ -760,7 +830,11 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                 # subject once more while holding the same repository/run
                 # barrier used by disable and synchronize before creating any
                 # reviewer Tasks.
-                await verify_pr_review_snapshot_current(locked_repo, pr_data)
+                await verify_pr_review_snapshot_current(
+                    locked_repo,
+                    pr_data,
+                    base_ref=locked.base_ref,
+                )
                 existing = (await db.execute(
                     select(PRReviewerRun.id).where(PRReviewerRun.pr_review_id == review_id)
                 )).scalar_one_or_none()
@@ -954,10 +1028,12 @@ async def check_and_update_reviewer_run(
 ) -> bool:
     from backend.services import pr_review_service
 
-    # Discover the parent id without trusting a possibly stale identity-map
-    # object, then serialize every completion in Review -> Run -> Task order.
-    # A second process that loaded ``pending`` before the first committed must
-    # refresh all three rows after acquiring the Review lock.
+    # Discover immutable ids and the terminal Task generation without taking
+    # any row lock.  ``_guard_exact_terminal_task`` deliberately rolls the
+    # read snapshot back and acquires the Task writer fence first; every lock
+    # taken afterwards must therefore follow the cross-service order
+    # Task -> PRMonitorRun -> PRReview -> PRReviewerRun.  This matches Delivery
+    # terminalization on PostgreSQL/MySQL and keeps the SQLite WAL fence.
     review_id = (await db.execute(
         select(PRReviewerRun.pr_review_id).where(
             PRReviewerRun.id == reviewer_run_id,
@@ -966,38 +1042,16 @@ async def check_and_update_reviewer_run(
     )).scalar_one_or_none()
     if review_id is None:
         return False
-    review = (await db.execute(
-        select(PRReview)
-        .where(PRReview.id == review_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    run = (await db.execute(
-        select(PRReviewerRun)
-        .where(PRReviewerRun.id == reviewer_run_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
-    task = (await db.execute(
-        select(Task)
-        .where(Task.id == task_id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
-    )).scalar_one_or_none()
+    monitor_run_id = await db.scalar(
+        select(PRReview.monitor_run_id).where(PRReview.id == review_id)
+    )
+    task = await db.get(Task, task_id, populate_existing=True)
     if (
-        review is None
-        or run is None
-        or task is None
-        or run.pr_review_id != review.id
-        or run.task_id != task.id
-        or run.status not in {"pending", "reviewing"}
-        or review.status != "reviewing"
+        task is None
         or task.status != "completed"
         or task.retry_count != retry_count
         or task.started_at is None
         or task.pty_background_generation is not None
-        or review.base_sha is None
-        or review.head_sha is None
     ):
         return False
     if not await _guard_exact_terminal_task(
@@ -1007,6 +1061,18 @@ async def check_and_update_reviewer_run(
     ):
         await db.rollback()
         return False
+    monitor_run = (
+        (
+            await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.id == monitor_run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if monitor_run_id is not None
+        else None
+    )
     review = (await db.execute(
         select(PRReview)
         .where(PRReview.id == review_id)
@@ -1029,6 +1095,16 @@ async def check_and_update_reviewer_run(
         review is None
         or run is None
         or task is None
+        or (
+            review.monitor_run_id is not None
+            and (
+                monitor_run is None
+                or review.monitor_run_id != monitor_run.id
+                or monitor_run.current_review_id != review.id
+                or monitor_run.current_base_sha != review.base_sha
+                or monitor_run.current_head_sha != review.head_sha
+            )
+        )
         or run.pr_review_id != review.id
         or run.task_id != task.id
         or run.status not in {"pending", "reviewing"}
@@ -1042,6 +1118,30 @@ async def check_and_update_reviewer_run(
     ):
         await db.rollback()
         return False
+    # A Delivery Review can be created in the transaction immediately before
+    # the Controller durably binds its Monitor Run.  Keep this reviewer
+    # generation recoverable until that exact binding is visible; otherwise a
+    # fast final reviewer could arm a GitHub outbox for an unowned/failed Run.
+    from backend.services.delivery_pr_policy import (
+        DeliveryPREffectNotReady,
+        DeliveryPRPolicyError,
+        frozen_delivery_pr_policy,
+    )
+
+    try:
+        await frozen_delivery_pr_policy(
+            db,
+            review,
+            monitor_run_id=review.monitor_run_id,
+            require_effect_ready=True,
+        )
+    except DeliveryPREffectNotReady:
+        await db.rollback()
+        return False
+    except DeliveryPRPolicyError:
+        # Deterministically malformed/terminal ownership is finalized below
+        # through the normal Review error path after parsing the exact result.
+        pass
     claimed = await db.execute(
         update(PRReviewerRun)
         .where(
@@ -1129,15 +1229,11 @@ async def check_and_update_reviewer_run(
         await _commit_review_error(db, review)
         return True
     try:
-        from backend.services.delivery_pr_policy import (
-            DeliveryPRPolicyError,
-            frozen_delivery_pr_policy,
-        )
-
         delivery_policy = await frozen_delivery_pr_policy(
             db,
             review,
             monitor_run_id=review.monitor_run_id,
+            require_effect_ready=True,
         )
     except DeliveryPRPolicyError as exc:
         review.status = "error"
@@ -1151,11 +1247,14 @@ async def check_and_update_reviewer_run(
             "error",
         )
         return True
-    if delivery_policy is not None and frozen_auto_merge is not False:
+    if (
+        delivery_policy is not None
+        and frozen_auto_merge is not delivery_policy.auto_merge
+    ):
         review.status = "error"
         review.action_taken = "error"
         review.review_summary = (
-            "Delivery-owned reviews cannot publish an auto-merge action"
+            "Delivery-owned review merge policy does not match its frozen Run"
         )
         review.completed_at = datetime.utcnow()
         await _commit_review_error(db, review)
@@ -1166,8 +1265,92 @@ async def check_and_update_reviewer_run(
         )
         return True
     action = "review_comments" if blockers else ("approved_merged" if frozen_auto_merge else "lgtm_comment")
+    waiting_for_threads = False
+    monitor_run = None
+    if not blockers and review.monitor_run_id is not None:
+        monitor_run = await db.get(
+            PRMonitorRun,
+            review.monitor_run_id,
+            populate_existing=True,
+        )
+        if (
+            monitor_run is None
+            or monitor_run.current_review_id != review.id
+            or monitor_run.current_base_sha != review.base_sha
+            or monitor_run.current_head_sha != review.head_sha
+        ):
+            review.status = "error"
+            review.action_taken = "error"
+            review.review_summary = "Panel Monitor Run subject changed before publication"
+            review.completed_at = datetime.utcnow()
+            await _commit_review_error(db, review)
+            return True
+        waiting_for_threads = (
+            await db.execute(
+                select(PRFinding.id)
+                .join(PRReview, PRReview.id == PRFinding.pr_review_id)
+                .where(
+                    PRReview.monitor_run_id == monitor_run.id,
+                    PRReview.id != review.id,
+                    PRFinding.severity.in_(tuple(BLOCKING_SEVERITIES)),
+                    or_(
+                        PRFinding.status == "open",
+                        PRFinding.thread_status.in_((
+                            "published_inline",
+                            "published_fallback",
+                        )),
+                    ),
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none() is not None
+    merge_method = None
+    if action == "approved_merged":
+        try:
+            merge_method = await pr_review_service._freeze_safe_merge_method(
+                (await db.get(MonitoredRepo, review.repo_id)).repo_full_name
+            )
+        except pr_review_service.GhRepositoryCapabilityError as exc:
+            review.status = "error"
+            review.action_taken = "error"
+            review.review_summary = (
+                "Unable to freeze a safe GitHub merge method: "
+                f"{str(exc)[:500]}"
+            )
+            review.completed_at = datetime.utcnow()
+            await _commit_review_error(db, review)
+            await pr_review_service._broadcast_review_update(
+                review.id,
+                "error",
+                "error",
+            )
+            return True
+        except pr_review_service.GhError:
+            # The exact panel generation remains durably recoverable in
+            # ``reviewing``; rollback all tentative Gate/Finding changes and
+            # let periodic recovery retry the transient GitHub read.
+            await db.rollback()
+            return False
+        except Exception as exc:
+            review.status = "error"
+            review.action_taken = "error"
+            review.review_summary = (
+                "Unable to freeze a safe GitHub merge method: "
+                f"{str(exc)[:500]}"
+            )
+            review.completed_at = datetime.utcnow()
+            await _commit_review_error(db, review)
+            await pr_review_service._broadcast_review_update(
+                review.id,
+                "error",
+                "error",
+            )
+            return True
     try:
         actor = await pr_review_service._gh_authenticated_login()
+    except pr_review_service.GhError:
+        await db.rollback()
+        return False
     except Exception as exc:
         review.status = "error"
         review.action_taken = "error"
@@ -1185,15 +1368,33 @@ async def check_and_update_reviewer_run(
         return True
     review.task_id = task.id
     review.status = "publishing"
-    review.pending_action = action
+    review.pending_action = (
+        pr_review_service._waiting_for_threads_action(action)
+        if waiting_for_threads
+        else action
+    )
     review.pending_review_body = body
     review.publishing_actor = actor
     review.publishing_retry_count = task.retry_count
     review.publishing_task_started_at = task.started_at
     review.publishing_started_at = datetime.utcnow()
-    review.review_summary = "Reviewer panel Gate evaluated; GitHub publication pending"
+    review.merge_method = merge_method
+    review.review_summary = (
+        "Reviewer panel Gate passed; waiting for prior Finding threads to resolve"
+        if waiting_for_threads
+        else "Reviewer panel Gate evaluated; GitHub publication pending"
+    )
+    if waiting_for_threads:
+        assert monitor_run is not None
+        monitor_run.status = "resolving_fixed_threads"
+        monitor_run.state_version += 1
     await db.commit()
     await pr_review_service._broadcast_review_update(review.id, "publishing", None)
+    if waiting_for_threads:
+        # The Finding resolver owns the only transition from the explicit wait
+        # stage back to its original publication action.  In particular, do not
+        # acquire a publication lease or probe/write GitHub here.
+        return True
     await pr_review_service._resume_publishing_review(
         db,
         review.id,
@@ -1208,8 +1409,14 @@ async def fail_reviewer_run(
     *,
     reviewer_run_id: int,
     task_id: int,
+    expected_status: str,
+    retry_count: int,
+    expected_started_at: datetime | None,
+    expected_completed_at: datetime | None,
     error: str,
 ) -> int | None:
+    if expected_status not in {"completed", "failed", "cancelled", "conflict"}:
+        return None
     review_id = await db.scalar(
         select(PRReviewerRun.pr_review_id).where(
             PRReviewerRun.id == reviewer_run_id,
@@ -1218,42 +1425,39 @@ async def fail_reviewer_run(
     )
     if review_id is None:
         return None
-    review = (
-        await db.execute(
-            select(PRReview)
-            .where(PRReview.id == review_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    run = (
-        await db.execute(
-            select(PRReviewerRun)
-            .where(PRReviewerRun.id == reviewer_run_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
+    monitor_run_id = await db.scalar(
+        select(PRReview.monitor_run_id).where(PRReview.id == review_id)
+    )
     task = await db.get(Task, task_id, populate_existing=True)
     if (
-        review is None
-        or run is None
-        or task is None
-        or run.pr_review_id != review.id
-        or run.task_id != task_id
-        or run.status not in {"pending", "reviewing"}
-        or review.status not in {"reviewing", "error"}
-        or (review.status == "error" and review.action_taken != "error")
+        task is None
+        or task.status != expected_status
+        or task.retry_count != retry_count
+        or task.started_at != expected_started_at
+        or task.completed_at != expected_completed_at
+        or task.pty_background_generation is not None
     ):
         await db.rollback()
         return None
     if not await _guard_exact_terminal_task(
         db,
         task,
-        statuses={"completed", "failed", "cancelled", "conflict"},
+        statuses={expected_status},
     ):
         await db.rollback()
         return None
+    monitor_run = (
+        (
+            await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.id == monitor_run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if monitor_run_id is not None
+        else None
+    )
     review = (
         await db.execute(
             select(PRReview)
@@ -1275,12 +1479,25 @@ async def fail_reviewer_run(
         review is None
         or run is None
         or task is None
+        or (
+            review.monitor_run_id is not None
+            and (
+                monitor_run is None
+                or review.monitor_run_id != monitor_run.id
+                or monitor_run.current_review_id != review.id
+                or monitor_run.current_base_sha != review.base_sha
+                or monitor_run.current_head_sha != review.head_sha
+            )
+        )
         or run.pr_review_id != review.id
         or run.task_id != task.id
         or run.status not in {"pending", "reviewing"}
         or review.status not in {"reviewing", "error"}
         or (review.status == "error" and review.action_taken != "error")
-        or task.status not in {"completed", "failed", "cancelled", "conflict"}
+        or task.status != expected_status
+        or task.retry_count != retry_count
+        or task.started_at != expected_started_at
+        or task.completed_at != expected_completed_at
         or task.pty_background_generation is not None
     ):
         await db.rollback()
@@ -1316,6 +1533,8 @@ async def recover_panel_reviews(db_factory) -> int:
                 Task.id,
                 Task.status,
                 Task.retry_count,
+                Task.started_at,
+                Task.completed_at,
                 Task.worker_id,
             )
             .join(Task, Task.id == PRReviewerRun.task_id)
@@ -1329,7 +1548,16 @@ async def recover_panel_reviews(db_factory) -> int:
             .order_by(PRReviewerRun.id)
         )).all())
     recovered = 0
-    for run_id, review_id, task_id, status, retry_count, worker_id in rows:
+    for (
+        run_id,
+        review_id,
+        task_id,
+        status,
+        retry_count,
+        started_at,
+        completed_at,
+        worker_id,
+    ) in rows:
         # Match the online Dispatcher order: Task operation -> Review action.
         # The service callbacks themselves do not reacquire this non-reentrant
         # lock because their online callers already hold it.
@@ -1352,6 +1580,10 @@ async def recover_panel_reviews(db_factory) -> int:
                             db,
                             reviewer_run_id=run_id,
                             task_id=task_id,
+                            expected_status=status,
+                            retry_count=retry_count,
+                            expected_started_at=started_at,
+                            expected_completed_at=completed_at,
                             error=f"Reviewer task ended with status={status}",
                         )
                         if changed_review_id is None:

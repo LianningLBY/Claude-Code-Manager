@@ -34,6 +34,9 @@ from backend.models.pr_monitor import (  # noqa: F401
     PRReviewerRun,
 )
 from backend.models.worker import Worker  # noqa: F401
+from backend.models.ssh_profile import SSHProfile  # noqa: F401
+from backend.models.task_ssh_grant import TaskSSHGrant  # noqa: F401
+from backend.models.task_ssh_effect import TaskSSHEffectReceipt  # noqa: F401
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt  # noqa: F401
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt  # noqa: F401
 from backend.models.skill_lesson import SkillLesson, SkillUsage  # noqa: F401
@@ -44,6 +47,16 @@ from backend.models.task_share import TaskShare, ProjectShare, SharedTaskReceive
 from backend.models.user import User  # noqa: F401
 from backend.models.team_share import TeamProjectShare, TeamTaskShare  # noqa: F401
 from backend.models.user_group import UserGroup, UserGroupMember  # noqa: F401
+from backend.models.workspace_review import WorkspaceReviewRun  # noqa: F401
+from backend.models.test_harness import (  # noqa: F401
+    TestHarnessAttempt,
+    TestHarnessChildBinding,
+    TestHarnessEvent,
+    TestHarnessEvidence,
+    TestHarnessFinding,
+    TestHarnessRun,
+    TestHarnessSandboxLease,
+)
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep  # noqa: F401
 from backend.models.plan import Plan, PlanVersion, PlanInputRequest, PlanApplication, PlanLegacyTaskLink  # noqa: F401
 from backend.models.capability import (  # noqa: F401

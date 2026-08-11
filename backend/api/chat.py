@@ -36,7 +36,7 @@ from backend.api.uploads import (
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_creation import stage_task_record
 from backend.services.chat_event_identity import persisted_chat_event
-from backend.services.task_queue import task_is_pr_review_superseded
+from backend.services.task_queue import TaskQueue, task_is_pr_review_superseded
 from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER,
     PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
@@ -52,6 +52,10 @@ from backend.services.worker_relay import (
 from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
     no_active_worker_task_termination_predicate,
+)
+from backend.services.test_harness_owner_fence import (
+    has_active_test_harness_owner_graph,
+    no_active_test_harness_owner_graph_predicate,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,6 +173,33 @@ class ChatMessage(BaseModel):
         ):
             raise ValueError("Worker turn handoff fields must be provided together")
         return self
+
+
+class FrontendReviewGoalMessage(BaseModel):
+    """Start a repeatable frontend review from an existing Task chat."""
+
+    message: str = Field(min_length=1)
+    image_paths: list[str] | None = None
+    file_paths: list[str] | None = None
+    secret_ids: list[int] | None = None
+    profile: Literal["standard", "exhaustive"] = "standard"
+    max_iterations: int = Field(default=5, ge=1, le=10)
+    expected_routing: TaskRoutingExpectation | None = None
+
+    @model_validator(mode="after")
+    def normalize_message(self):
+        self.message = self.message.strip()
+        if not self.message:
+            raise ValueError("message is required")
+        return self
+
+
+class FrontendReviewGoalCapabilities(BaseModel):
+    """Whether an existing Task can safely edit a local Git worktree."""
+
+    available: bool
+    reason: str | None = None
+    repo_path: str | None = None
 
 
 def _worker_turn_handoff_request_identity(
@@ -679,10 +710,16 @@ async def send_chat_message(
         )
     from backend.api.tasks import (
         _require_expected_task_routing,
+        _require_not_isolated_browser_child,
         _require_not_delivery_owned_task,
     )
 
     _require_not_delivery_owned_task(task, action="sent direct chat messages")
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="sent direct chat messages",
+    )
     if task.mode == "plan":
         raise HTTPException(
             409,
@@ -787,7 +824,13 @@ async def send_chat_message(
                 "Plan Tasks do not accept direct chat messages; revise the "
                 "Plan or create an execution Task instead",
             )
+        await _require_not_isolated_browser_child(
+            db,
+            task,
+            action="sent direct chat messages",
+        )
         from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
             _require_pr_review_chat_allowed,
@@ -801,6 +844,17 @@ async def send_chat_message(
                 request
             ),
         )
+        if task.status in _MANUAL_RETRYABLE_STATUSES:
+            from backend.services.frontend_review_goal import (
+                frontend_review_goal_terminal_updates,
+            )
+
+            restore_updates = frontend_review_goal_terminal_updates(task)
+            if restore_updates:
+                for field, value in restore_updates.items():
+                    setattr(task, field, value)
+                await db.commit()
+                await db.refresh(task)
         admitted_routing = _require_expected_task_routing(
             task,
             body.expected_routing,
@@ -1054,6 +1108,17 @@ async def send_chat_message(
     # enabled skills are advertised by the launch-time skill directory; merely
     # enabling one must not be represented as a fresh user invocation.
     prompt_parts = [model_message]
+    review_routing_prompt: str | None = None
+    if not command:
+        from backend.services.workspace_review_intent import (
+            workspace_browser_review_routing_prompt,
+        )
+
+        review_routing_prompt = workspace_browser_review_routing_prompt(
+            model_message,
+        )
+        if review_routing_prompt:
+            prompt_parts.append(review_routing_prompt)
     if command:
         # $command detected: inject command prompt and set temporary skills
         prompt_parts.append(command.prompt_template)
@@ -1071,6 +1136,20 @@ async def send_chat_message(
         file_list = "\n".join(f"- {p}" for p in all_paths)
         prompt_parts.append(f"请用 Read 工具查看以下文件：\n{file_list}")
     prompt = "\n\n".join(prompt_parts)
+    workspace_review_baseline_run_id: str | None = None
+    if review_routing_prompt is not None:
+        from backend.models.test_harness import TestHarnessRun
+
+        baseline = await db.execute(
+            select(TestHarnessRun.id)
+            .where(TestHarnessRun.task_id == task_id)
+            .order_by(
+                TestHarnessRun.created_at.desc(),
+                TestHarnessRun.id.desc(),
+            )
+            .limit(1)
+        )
+        workspace_review_baseline_run_id = baseline.scalar_one_or_none()
     if approved_plans:
         from backend.services.plan_tasks import build_approved_plan_prompt
 
@@ -1153,19 +1232,26 @@ async def send_chat_message(
         is_error=False,
     )
     # This no-op write is the final cross-process admission barrier.  Manager
-    # and Worker termination receipt staging both lock the same Task row before
-    # publishing ``active_task_id``.  Whichever transaction wins is therefore
-    # observed here; a receipt can never be crossed by a newly durable message.
+    # and Worker termination receipt staging plus local Harness admission all
+    # lock the same Task row. Whichever transaction wins is therefore observed
+    # here; neither boundary can be crossed by a newly durable message/receipt.
     message_gate = await db.execute(
         sa_update(Task)
         .where(
             Task.id == task_id,
             no_active_worker_task_termination_predicate(),
+            no_active_test_harness_owner_graph_predicate(),
         )
         .values(status=Task.status)
     )
     if message_gate.rowcount != 1:
         await db.rollback()
+        if await has_active_test_harness_owner_graph(db, task_id):
+            raise HTTPException(
+                409,
+                "Task owns an active Test Harness, Workspace Review, or "
+                "Browser Agent graph",
+            )
         raise HTTPException(
             409,
             "Task has an active Worker termination receipt",
@@ -1189,6 +1275,10 @@ async def send_chat_message(
         "applied_plan_version_ids": [
             version.id for _plan, version in approved_versions
         ],
+        "workspace_review_expected": review_routing_prompt is not None,
+        "workspace_review_baseline_run_id": (
+            workspace_review_baseline_run_id
+        ),
     }
     if application_receipt_key is not None:
         response["plan_application_receipt_key"] = application_receipt_key
@@ -1472,6 +1562,282 @@ async def send_chat_message(
     return response
 
 
+@router.get(
+    "/{task_id}/frontend-review-goal/capabilities",
+    response_model=FrontendReviewGoalCapabilities,
+)
+async def get_frontend_review_goal_capabilities(
+    task_id: int,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Inspect the Task's real resume cwd without mutating the repository."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+
+    from backend.services.frontend_review_goal import (
+        inspect_frontend_review_local_repository,
+    )
+
+    return await inspect_frontend_review_local_repository(task, db)
+
+
+@router.post(
+    "/{task_id}/frontend-review-goal",
+    response_model=TaskResponse,
+)
+async def start_frontend_review_goal(
+    task_id: int,
+    body: FrontendReviewGoalMessage,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn an idle existing Task into a repeatable Browser Review Goal."""
+
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    await require_task_control(request, task, db)
+    if body.secret_ids:
+        from backend.api.deps import require_admin
+
+        require_admin(request)
+
+    await db.rollback()
+    async with get_task_operation_lock(task_id):
+        db.expire_all()
+        current = await db.get(Task, task_id)
+        if current is None:
+            raise HTTPException(404, "Task not found")
+        await require_task_control(request, current, db)
+
+        from backend.api.tasks import (
+            _MANUAL_RETRYABLE_STATUSES,
+            _require_expected_task_routing,
+            _require_no_pending_worker_routing,
+            _retry_local_task_safely,
+        )
+        from backend.services.task_creation import (
+            validate_task_service_tier_configuration,
+        )
+
+        _require_expected_task_routing(
+            current,
+            body.expected_routing,
+            effective_model=current.model,
+        )
+        if task_is_pr_review_superseded(current):
+            raise HTTPException(
+                409,
+                "This PR review task was superseded by a newer push",
+            )
+        if current.worker_id is not None:
+            raise HTTPException(
+                400,
+                "Frontend Review Goal currently requires a Manager-local Task",
+            )
+        if current.shared_from_id is not None:
+            raise HTTPException(
+                400,
+                "Frontend Review Goal cannot start from a shared Task",
+            )
+        _require_no_pending_worker_routing(current)
+        if not current.session_id:
+            raise HTTPException(
+                400,
+                "Run the task once before starting a Frontend Review Goal",
+            )
+        if current.status not in _MANUAL_RETRYABLE_STATUSES:
+            raise HTTPException(
+                409,
+                f"Task status {current.status} is not idle; wait for it to finish",
+            )
+        if current.pty_background_generation is not None:
+            raise HTTPException(
+                409,
+                "Task still has active Claude PTY background output",
+            )
+        if int(current.active_sub_agents or 0) > 0:
+            raise HTTPException(
+                409,
+                "Task still has active Monitor or Sub-Agent sessions",
+            )
+        from backend.services.frontend_review_goal import (
+            inspect_frontend_review_local_repository,
+        )
+
+        repository_capability = await inspect_frontend_review_local_repository(
+            current,
+            db,
+        )
+        if not repository_capability["available"]:
+            raise HTTPException(
+                409,
+                repository_capability["reason"]
+                or "无法确认可修改的本地 Git 仓库",
+            )
+        from backend.models.project import Project
+
+        project = await db.get(Project, current.project_id) if current.project_id else None
+        from backend.services.workspace_review import workspace_review_capability
+
+        review_capability = workspace_review_capability(current, project)
+        if not review_capability["available"]:
+            raise HTTPException(
+                409,
+                review_capability["reason"]
+                or "Project 尚未确认可信 Preview 配置",
+            )
+        try:
+            validate_task_service_tier_configuration(
+                provider=current.provider,
+                model=current.model,
+                codex_service_tier=current.codex_service_tier,
+                mode="goal",
+                goal_evaluator_model=current.goal_evaluator_model,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_ACTIVATION_METADATA_KEY,
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+            frontend_review_goal_restore_snapshot,
+        )
+
+        review_config = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: {
+                "mode": "goal",
+                "profile": body.profile,
+                "max_iterations": body.max_iterations,
+            },
+        })
+        if review_config is None:  # Pydantic already validates; fail closed.
+            raise HTTPException(422, "Invalid Frontend Review Goal configuration")
+        all_paths = body.file_paths or body.image_paths or []
+        metadata = deepcopy(current.metadata_ or {})
+        metadata[FRONTEND_REVIEW_METADATA_KEY] = review_config
+        metadata[FRONTEND_REVIEW_ACTIVATION_METADATA_KEY] = {
+            "message": body.message,
+            "file_paths": list(all_paths),
+            "secret_ids": list(body.secret_ids or []),
+            "restore": frontend_review_goal_restore_snapshot(current),
+        }
+        task_updates = {
+            "mode": "goal",
+            "goal_condition": build_frontend_review_goal_condition(body.message),
+            "goal_max_turns": review_config["max_iterations"],
+            "goal_turns_used": 0,
+            "goal_last_reason": None,
+            "retry_count": 0,
+            "metadata_": metadata,
+        }
+
+        display_content = body.message
+        sender_display_name = await _sender_display_name(request, db)
+        if sender_display_name:
+            display_content = f"[{sender_display_name}] {body.message}"
+        image_exts = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+        attachments = [{
+            "url": f"/api/uploads/{os.path.basename(path)}",
+            "name": os.path.basename(path),
+            "is_image": os.path.splitext(path)[1].lower() in image_exts,
+        } for path in all_paths]
+
+        from backend.main import dispatcher
+        from backend.services.dispatcher import (
+            TaskStartConflictError,
+            TaskStartPausedError,
+        )
+
+        if dispatcher is None:
+            raise HTTPException(503, "Dispatcher is unavailable")
+        from backend.services.test_harness_owner_fence import (
+            test_harness_owner_identity,
+        )
+
+        expected_harness_owner = test_harness_owner_identity(current)
+        try:
+            async with dispatcher.task_start_guard(
+                require_idle_task_id=task_id,
+            ):
+                queue = TaskQueue(db)
+                activated = await _retry_local_task_safely(
+                    task_id,
+                    queue,
+                    db,
+                    expected_identity=expected_harness_owner,
+                    task_updates=task_updates,
+                    commit=False,
+                )
+                if activated is None:
+                    raise HTTPException(409, "Task disappeared during Goal activation")
+                log_metadata: dict[str, Any] = {
+                    "source": "frontend-review-goal",
+                    "raw_content": body.message,
+                }
+                if attachments:
+                    log_metadata.update({
+                        "attachments": attachments,
+                        "file_paths": list(all_paths),
+                    })
+                if sender_display_name:
+                    log_metadata["sender_name"] = sender_display_name
+                user_log = LogEntry(
+                    instance_id=None,
+                    task_id=task_id,
+                    event_type="user_message",
+                    role="user",
+                    content=display_content,
+                    raw_json=json.dumps(log_metadata, ensure_ascii=False),
+                    is_error=False,
+                )
+                db.add(user_log)
+                await db.commit()
+                await db.refresh(user_log)
+                await db.refresh(activated)
+        except TaskStartPausedError as exc:
+            raise HTTPException(
+                409,
+                "服务即将重启，暂时不能启动循环审查，请稍后重试",
+            ) from exc
+        except TaskStartConflictError as exc:
+            raise HTTPException(
+                409,
+                "Task 已有一条消息等待执行，请等待完成后再启动循环审查",
+            ) from exc
+
+    from backend.main import broadcaster
+
+    image_urls = [
+        attachment["url"]
+        for attachment in attachments
+        if attachment["is_image"]
+    ]
+    event = persisted_chat_event(user_log, {
+        "event_type": "user_message",
+        "role": "user",
+        "content": display_content,
+        "source": "frontend-review-goal",
+        "raw_content": body.message,
+        "image_urls": image_urls,
+        "attachments": attachments,
+    })
+    if sender_display_name:
+        event["sender_name"] = sender_display_name
+    await broadcaster.broadcast(f"task:{task_id}", event)
+    from backend.services.task_events import broadcast_status_change
+
+    await broadcast_status_change(task_id, "pending")
+    dispatcher.wake()
+    return activated
+
+
 @router.get("/{task_id}/worker-turn-handoffs/{handoff_id}")
 async def get_worker_turn_handoff_receipt(
     task_id: int,
@@ -1590,9 +1956,13 @@ async def list_codex_fork_anchors(
     if not source:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, source, db)
-    from backend.api.tasks import _require_not_delivery_owned_task
+    from backend.api.tasks import (
+        _require_not_delivery_owned_task,
+        _require_not_isolated_browser_child,
+    )
 
     _require_not_delivery_owned_task(source, action="forked")
+    await _require_not_isolated_browser_child(db, source, action="forked")
     if (source.provider or "claude").lower() != "codex":
         raise HTTPException(400, "Only Codex sessions support native forks")
     if not source.session_id:
@@ -1653,9 +2023,13 @@ async def fork_codex_task(
     if not source:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, source, db)
-    from backend.api.tasks import _require_not_delivery_owned_task
+    from backend.api.tasks import (
+        _require_not_delivery_owned_task,
+        _require_not_isolated_browser_child,
+    )
 
     _require_not_delivery_owned_task(source, action="forked")
+    await _require_not_isolated_browser_child(db, source, action="forked")
     if source.mode == "plan" or source.canonical_plan_id is not None:
         raise HTTPException(
             409,
@@ -3358,12 +3732,15 @@ async def _store_injected_message(
     *,
     db: AsyncSession,
     broadcaster,
-    task: Task,
+    task_id: int,
+    task_retry_count: int,
+    task_turn_generation: int,
     raw_content: str,
     display_content: str,
     sender_display_name: str | None,
     uploads: list[ValidatedUploadAttachment],
     instance_id: int | None,
+    generation_audit_matched: bool,
 ) -> None:
     attachments = [upload.public_dict() for upload in uploads]
     file_paths = [upload.path for upload in uploads]
@@ -3373,6 +3750,11 @@ async def _store_injected_message(
     raw_metadata: dict[str, Any] = {
         "source": "inject",
         "raw_content": raw_content,
+        "generation_audit": (
+            "matched"
+            if generation_audit_matched
+            else "changed_after_transport"
+        ),
     }
     if attachments:
         raw_metadata.update({
@@ -3384,9 +3766,9 @@ async def _store_injected_message(
         raw_metadata["sender_name"] = sender_display_name
     entry = LogEntry(
         instance_id=instance_id,
-        task_id=task.id,
-        task_retry_count=task.retry_count,
-        task_turn_generation=task.turn_generation,
+        task_id=task_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
         turn_scope="foreground",
         event_type="user_message",
         role="user",
@@ -3412,7 +3794,98 @@ async def _store_injected_message(
     })
     if sender_display_name:
         event["sender_name"] = sender_display_name
-    await broadcaster.broadcast(f"task:{task.id}", event)
+    await broadcaster.broadcast(f"task:{task_id}", event)
+
+
+async def _audit_and_store_injected_message(
+    *,
+    db: AsyncSession,
+    broadcaster,
+    request: Request,
+    task_id: int,
+    task_retry_count: int,
+    task_turn_generation: int,
+    task_session_id: str,
+    task_instance_id: int | None,
+    task_provider_db_value: str | None,
+    raw_content: str,
+    uploads: list[ValidatedUploadAttachment],
+) -> None:
+    """Durably audit a transport side effect against its admitted generation.
+
+    The transport acknowledgement happens without a database transaction held.
+    Reacquire the Task row only after that acknowledgement and persist the user
+    message in the same short transaction.  A generation that changed in the
+    transport window is audit evidence, not a reason to erase an already
+    delivered message or return a retryable response.
+    """
+
+    generation_audit = await db.execute(
+        sa_update(Task)
+        .where(
+            Task.id == task_id,
+            Task.retry_count == task_retry_count,
+            Task.turn_generation == task_turn_generation,
+            (
+                Task.instance_id.is_(None)
+                if task_instance_id is None
+                else Task.instance_id == task_instance_id
+            ),
+            Task.session_id == task_session_id,
+            (
+                Task.provider.is_(None)
+                if task_provider_db_value is None
+                else Task.provider == task_provider_db_value
+            ),
+        )
+        .values(status=Task.status)
+    )
+    generation_audit_matched = generation_audit.rowcount == 1
+    if not generation_audit_matched:
+        logger.warning(
+            "Task %s generation changed after its live injection transport "
+            "acknowledged retry=%s turn=%s session=%s; preserving the "
+            "delivered-message audit under the admitted generation",
+            task_id,
+            task_retry_count,
+            task_turn_generation,
+            task_session_id,
+        )
+
+    display_content, sender_display_name = await _inject_display_content(
+        request,
+        db,
+        raw_content,
+    )
+    await _store_injected_message(
+        db=db,
+        broadcaster=broadcaster,
+        task_id=task_id,
+        task_retry_count=task_retry_count,
+        task_turn_generation=task_turn_generation,
+        raw_content=raw_content,
+        display_content=display_content,
+        sender_display_name=sender_display_name,
+        uploads=uploads,
+        instance_id=task_instance_id,
+        generation_audit_matched=generation_audit_matched,
+    )
+
+
+async def _settle_injected_message_audit(operation) -> None:
+    """Finish the audit after transport success even if HTTP is cancelled."""
+
+    audit_task = asyncio.create_task(operation)
+    delayed_cancel: asyncio.CancelledError | None = None
+    while not audit_task.done():
+        try:
+            await asyncio.shield(audit_task)
+        except asyncio.CancelledError as exc:
+            if delayed_cancel is None:
+                delayed_cancel = exc
+    audit_task.result()
+    if delayed_cancel is not None:
+        raise delayed_cancel
 
 
 @router.get("/{task_id}/inject-capabilities")
@@ -3425,9 +3898,17 @@ async def inject_capabilities(
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_access(request, task, db)
-    from backend.api.tasks import _require_not_delivery_owned_task
+    from backend.api.tasks import (
+        _require_not_delivery_owned_task,
+        _require_not_isolated_browser_child,
+    )
 
     _require_not_delivery_owned_task(task, action="received direct injection")
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="received direct injection",
+    )
     return {
         "attachment_protocol": 1,
         "codex_native_inputs": True,
@@ -3464,6 +3945,13 @@ async def inject_message(
         from backend.api.tasks import _require_not_delivery_owned_task
 
         _require_not_delivery_owned_task(
+            task,
+            action="received direct injection",
+        )
+        from backend.api.tasks import _require_not_isolated_browser_child
+
+        await _require_not_isolated_browser_child(
+            db,
             task,
             action="received direct injection",
         )
@@ -3513,27 +4001,42 @@ async def inject_message(
 
         uploads = _validated_inject_attachments(body)
 
-        # Hold the Task write lock through the transport steer and injected
-        # LogEntry commit.  A concurrent termination admission either wins
-        # before this exact SQL gate (and injection is refused) or waits until
-        # the already-admitted injection is durably recorded.
+        # Capture the immutable admission generation before ending this DB
+        # transaction.  The in-process operation lock stays held across the
+        # transport and audit, while these scalar values keep both operations
+        # tied to the exact foreground generation admitted here.
+        admitted_task_id = task.id
+        admitted_status = task.status
+        admitted_retry_count = task.retry_count
+        admitted_turn_generation = task.turn_generation
+        admitted_instance_id = task.instance_id
+        admitted_session_id = task.session_id
+        admitted_provider_db_value = task.provider
+        admitted_provider = (task.provider or "claude").lower()
+
+        # Take a short exact-generation admission gate, then COMMIT it before
+        # awaiting the provider.  The PTY consumer may need to persist an
+        # assistant/tool event before it can read the later queue-operation
+        # acknowledgement; retaining this row lock across the await would make
+        # the API wait for the consumer while the consumer waits for this API.
         injection_gate = await db.execute(
             sa_update(Task)
             .where(
-                Task.id == task_id,
+                Task.id == admitted_task_id,
                 Task.status.in_(("in_progress", "executing")),
-                Task.status == task.status,
-                Task.retry_count == task.retry_count,
-                Task.turn_generation == task.turn_generation,
+                Task.status == admitted_status,
+                Task.retry_count == admitted_retry_count,
+                Task.turn_generation == admitted_turn_generation,
                 (
                     Task.instance_id.is_(None)
-                    if task.instance_id is None
-                    else Task.instance_id == task.instance_id
+                    if admitted_instance_id is None
+                    else Task.instance_id == admitted_instance_id
                 ),
+                Task.session_id == admitted_session_id,
                 (
-                    Task.session_id.is_(None)
-                    if task.session_id is None
-                    else Task.session_id == task.session_id
+                    Task.provider.is_(None)
+                    if admitted_provider_db_value is None
+                    else Task.provider == admitted_provider_db_value
                 ),
                 Task.worker_id.is_(None),
                 Task.shared_from_id.is_(None),
@@ -3548,15 +4051,18 @@ async def inject_message(
                 "Task state changed or it has an active Worker termination "
                 "receipt",
             )
+        # This is the critical lock-release boundary.  Never move it below a
+        # provider transport await: enqueue -> assistant -> remove is a normal
+        # Claude JSONL sequence, and the assistant event uses the same Task row.
+        await db.commit()
 
         from backend.main import instance_manager, broadcaster
 
-        provider = (task.provider or "claude").lower()
         transport_content = _inject_transport_content(
             body.message,
             uploads,
         )
-        if provider == "codex":
+        if admitted_provider == "codex":
             from backend.config import settings
 
             if not settings.codex_app_server_enabled:
@@ -3566,7 +4072,7 @@ async def inject_message(
                 )
             if uploads:
                 ok = await instance_manager.inject_codex_message(
-                    task.session_id,
+                    admitted_session_id,
                     transport_content,
                     input_items=_codex_inject_input_items(
                         transport_content,
@@ -3575,7 +4081,7 @@ async def inject_message(
                 )
             else:
                 ok = await instance_manager.inject_codex_message(
-                    task.session_id,
+                    admitted_session_id,
                     transport_content,
                 )
             unavailable_detail = (
@@ -3583,8 +4089,8 @@ async def inject_message(
                 "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"
                 "模式直接发普通消息"
             )
-        elif provider == "claude":
-            if not instance_manager.has_pty_session(task.session_id):
+        elif admitted_provider == "claude":
+            if not instance_manager.has_pty_session(admitted_session_id):
                 raise HTTPException(
                     400,
                     (
@@ -3597,14 +4103,22 @@ async def inject_message(
             try:
                 if uploads:
                     ok = await instance_manager.inject_pty_message(
-                        task.session_id,
+                        admitted_session_id,
                         transport_content,
                         require_host_file_access=True,
+                        task_id=admitted_task_id,
+                        task_retry_count=admitted_retry_count,
+                        task_turn_generation=admitted_turn_generation,
+                        expected_instance_id=admitted_instance_id,
                     )
                 else:
                     ok = await instance_manager.inject_pty_message(
-                        task.session_id,
+                        admitted_session_id,
                         transport_content,
+                        task_id=admitted_task_id,
+                        task_retry_count=admitted_retry_count,
+                        task_turn_generation=admitted_turn_generation,
+                        expected_instance_id=admitted_instance_id,
                     )
             except Exception as exc:
                 from backend.services.instance_manager import (
@@ -3628,26 +4142,30 @@ async def inject_message(
         else:
             raise HTTPException(
                 400,
-                f"Provider {provider} 不支持执行中注入",
+                f"Provider {admitted_provider} 不支持执行中注入",
             )
 
         if not ok:
             raise HTTPException(409, unavailable_detail)
 
-        display_content, sender_display_name = await _inject_display_content(
-            request,
-            db,
-            body.message,
-        )
-        await _store_injected_message(
-            db=db,
-            broadcaster=broadcaster,
-            task=task,
-            raw_content=body.message,
-            display_content=display_content,
-            sender_display_name=sender_display_name,
-            uploads=uploads,
-            instance_id=task.instance_id,
+        # The model has accepted the input.  From this point on, cancellation
+        # must not leave an invisible side effect that a client will retry.
+        # Re-audit the exact generation and persist its user-message record in
+        # one short transaction, even when that generation changed meanwhile.
+        await _settle_injected_message_audit(
+            _audit_and_store_injected_message(
+                db=db,
+                broadcaster=broadcaster,
+                request=request,
+                task_id=admitted_task_id,
+                task_retry_count=admitted_retry_count,
+                task_turn_generation=admitted_turn_generation,
+                task_session_id=admitted_session_id,
+                task_instance_id=admitted_instance_id,
+                task_provider_db_value=admitted_provider_db_value,
+                raw_content=body.message,
+                uploads=uploads,
+            )
         )
         return {
             "ok": True,
@@ -3828,6 +4346,7 @@ async def distill_task(
                 codex_account_id=(task.metadata_ or {}).get(
                     "codex_account_id"
                 ),
+                task_id=task.id,
                 instance_manager=instance_manager,
                 cloudrouter_store=cloudrouter_store,
             )

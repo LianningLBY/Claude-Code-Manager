@@ -133,7 +133,12 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         auth_header = request.headers.get("Authorization", "")
-        token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+        header_token = (
+            auth_header.removeprefix("Bearer ")
+            if auth_header.startswith("Bearer ")
+            else ""
+        )
+        token = header_token
 
         if not token:
             token = request.query_params.get("token", "")
@@ -141,8 +146,96 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         if not token:
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
-        # Legacy token → resolve to default admin account
-        if token == settings.auth_token:
+        from backend.services.internal_service_auth import (
+            InternalServiceTokenError,
+            authenticate_internal_service_token,
+            is_internal_service_token,
+        )
+
+        if is_internal_service_token(token):
+            # Query parameters are routinely logged by proxies. Scoped child
+            # credentials are accepted only through the Bearer header.
+            if token != header_token:
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "Internal service bearer header required"},
+                )
+            try:
+                claims = authenticate_internal_service_token(
+                    token,
+                    method=request.method,
+                    path=path,
+                )
+            except InternalServiceTokenError as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"detail": exc.detail},
+                )
+            if (
+                claims.task_id is not None
+                and claims.task_incarnation_id is None
+            ):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": (
+                            "Internal service credential lacks an exact "
+                            "Task incarnation"
+                        )
+                    },
+                )
+            if (
+                claims.task_id is not None
+                and claims.task_incarnation_id is not None
+            ):
+                # Revocation is only a fast in-process signal. This durable
+                # lookup is authoritative on every request and survives a
+                # Manager restart or integer Task-id reuse/import.
+                from sqlalchemy import select
+
+                from backend.database import async_session
+                from backend.models.task import Task
+
+                task_identity_predicates = [
+                    Task.id == claims.task_id,
+                    Task.incarnation_id == claims.task_incarnation_id,
+                ]
+                if claims.task_retry_count is not None:
+                    task_identity_predicates.extend((
+                        Task.retry_count == claims.task_retry_count,
+                        Task.turn_generation
+                        == claims.task_turn_generation,
+                        Task.status == claims.task_status,
+                    ))
+                async with async_session() as db:
+                    bound_task = await db.scalar(
+                        select(Task.id)
+                        .where(*task_identity_predicates)
+                        .limit(1)
+                    )
+                if bound_task is None:
+                    stale_detail = (
+                        "Internal service SSH Task generation is stale"
+                        if claims.audience == "ccm_ssh"
+                        else (
+                            "Internal service Task generation is stale"
+                            if claims.task_retry_count is not None
+                            else "Internal service Task incarnation is stale"
+                        )
+                    )
+                    return JSONResponse(
+                        status_code=401,
+                        content={
+                            "detail": stale_detail
+                        },
+                    )
+            request.state.user_id = None
+            request.state.user_role = "internal_service"
+            request.state.auth_type = "internal_service"
+            request.state.internal_service_claims = claims
+        # The deployment token remains a login/recovery credential, but is no
+        # longer copied into Task-launched MCP configuration.
+        elif token == settings.auth_token:
             if maintenance_only and maintenance_path:
                 # Do not touch a potentially incompatible database merely to
                 # authorize the narrowly scoped deployment recovery surface.
@@ -218,7 +311,7 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         # Enforce admin-only access to process-wide Instance/Dispatcher state,
         # and admin-only mutations for the remaining system settings.
         role = getattr(request.state, "user_role", "member")
-        if role not in ("admin", "super_admin"):
+        if role not in ("admin", "super_admin", "internal_service"):
             if any(
                 path.startswith(prefix)
                 for prefix in self.ADMIN_ONLY_ALL_METHOD_PREFIXES

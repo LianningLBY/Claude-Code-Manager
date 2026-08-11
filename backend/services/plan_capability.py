@@ -1082,9 +1082,9 @@ class PlanCapabilityExecutor:
                 raise PlanCapabilityCancellationUnconfirmed(
                     "Plan Run disappeared while cancellation was in progress"
                 )
-            owned_instance_id = run.instance_id
-            runtime_may_be_active = (
+            runtime_was_maybe_active = (
                 run.status in {"running", "cancelling"}
+                or run.instance_id is not None
                 or run.last_execution_started_at is not None
             )
             if run.status in ACTIVE_RUN_STATUSES or run.status == "cancelling":
@@ -1117,6 +1117,17 @@ class PlanCapabilityExecutor:
                 )
             else:
                 await db.commit()
+
+            # The fence refreshes the Run after its atomic UPDATE.  A local
+            # dispatcher claim may have won after the SELECT above, so stop
+            # decisions must use this exact post-fence owner/generation rather
+            # than the stale pre-fence ORM snapshot.
+            owned_instance_id = run.instance_id
+            runtime_may_be_active = (
+                runtime_was_maybe_active
+                or run.instance_id is not None
+                or run.last_execution_started_at is not None
+            )
 
         selected_stopper = stop_callback or self._stop_callback
         if (

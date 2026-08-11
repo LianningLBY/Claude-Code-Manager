@@ -2814,6 +2814,80 @@ class TestFullMirrorBackend:
         async with db_factory() as db:
             assert (await db.get(Task, task_id)).background_active is False
 
+    async def test_autonomous_completion_preserves_marker_when_harness_cleanup_fails(
+        self,
+        db_factory,
+    ):
+        """A terminal sentinel cannot outrun failed Browser graph cleanup."""
+
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "harness-cleanup-background-session"
+        generation = "harness-cleanup-background-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        @asynccontextmanager
+        async def failing_owner_stop_fence(*_args, **_kwargs):
+            raise RuntimeError("Harness cleanup could not be proven")
+            yield  # pragma: no cover
+
+        harness_service = SimpleNamespace(
+            owner_stop_fence=failing_owner_stop_fence
+        )
+        broadcaster = MagicMock()
+        broadcaster.broadcast = AsyncMock()
+        im = InstanceManager(
+            db_factory,
+            broadcaster,
+            test_harness_service=harness_service,
+        )
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        session = Session()
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.terminal_seen = True
+        watcher = state.watcher
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="Harness cleanup could not be proven",
+            ):
+                await im._try_complete_pty_background_generation(state)
+
+            assert im._pty_background_states[(task_id, session_id)] is state
+            assert state.done.is_set() is False
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "completed"
+                assert task.pty_background_generation == generation
+            broadcaster.broadcast.assert_not_awaited()
+        finally:
+            state.outcome = "test-cleanup"
+            im._discard_pty_background_state(
+                (task_id, session_id),
+                generation,
+            )
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
+
     async def test_new_autonomous_turn_invalidates_previous_turn_sentinel(
         self, db_factory
     ):

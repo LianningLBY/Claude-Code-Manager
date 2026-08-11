@@ -20,6 +20,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.models.delivery import (
     DELIVERY_CYCLE_ACTIVE_STATUSES,
     DeliveryCycle,
@@ -30,6 +31,7 @@ from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
 from backend.models.task import Task
+from backend.schemas.pr_monitor import required_checks_support_direct_auto_merge
 from backend.services.delivery_reducer import (
     DeliveryReducerEvent,
     DeliveryState,
@@ -39,6 +41,7 @@ from backend.services.task_creation import (
     prepare_task_create_values,
     resolve_task_runtime_defaults,
     stage_task_record,
+    validate_task_service_tier_configuration,
 )
 
 
@@ -69,10 +72,24 @@ class DeliveryUnavailableError(DeliveryError):
 _BRANCH_COMPONENT_RE = re.compile(r"[^a-z0-9._-]+")
 _HASH_RE = re.compile(r"[0-9a-f]{64}\Z")
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
+_DELIVERY_PROVIDERS = frozenset({"claude", "codex"})
 _SCP_GITHUB_RE = re.compile(
     r"(?:[^/@:]+@)?github\.com:(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?/?\Z",
     re.IGNORECASE,
 )
+
+
+def _configured_delivery_providers() -> frozenset[str]:
+    """Return the Delivery routes enabled for this deployment."""
+
+    configured = {
+        item.strip().lower()
+        for item in (settings.provider_options or "").split(",")
+        if item.strip().lower() in _DELIVERY_PROVIDERS
+    }
+    # Preserve the historical dual-provider behavior for empty/invalid legacy
+    # values, matching Plan execution and the provider catalog.
+    return frozenset(configured or _DELIVERY_PROVIDERS)
 
 
 def _github_repo_from_url(value: object) -> str | None:
@@ -475,19 +492,32 @@ async def create_delivery_run(
     if admission_disabled_reason is not None:
         raise DeliveryUnavailableError(admission_disabled_reason)
 
-    if requested_provider != "codex":
+    if requested_provider not in _DELIVERY_PROVIDERS:
         raise DeliveryUnsupportedScopeError(
-            "Delivery Loop V1 supports the Codex provider only"
+            "Delivery Loop supports the Claude and Codex providers only"
+        )
+    configured_providers = _configured_delivery_providers()
+    if requested_provider not in configured_providers:
+        raise DeliveryValidationError(
+            f"Delivery provider '{requested_provider}' is not enabled by "
+            "provider_options"
         )
     try:
         resolved_provider, resolved_model, resolved_effort = (
             resolve_task_runtime_defaults(
-                provider="codex",
+                provider=requested_provider,
                 model=(
                     None if requested_model in {None, "default"} else requested_model
                 ),
                 effort_level=requested_effort,
             )
+        )
+        validate_task_service_tier_configuration(
+            provider=resolved_provider,
+            model=resolved_model,
+            codex_service_tier=spec.codex_service_tier,
+            mode="delivery_loop",
+            goal_evaluator_model=None,
         )
     except ValueError as exc:
         raise DeliveryValidationError(str(exc)) from exc
@@ -516,6 +546,16 @@ async def create_delivery_run(
     ).scalar_one_or_none()
     if repo is None:
         raise DeliveryNotFoundError("Monitored repository not found")
+    repo_provider = (repo.provider or "").strip().lower()
+    if repo_provider not in _DELIVERY_PROVIDERS:
+        raise DeliveryValidationError(
+            "PR Monitor provider must be 'claude' or 'codex'"
+        )
+    if repo_provider not in configured_providers:
+        raise DeliveryValidationError(
+            f"PR Monitor provider '{repo_provider}' is not enabled by "
+            "provider_options"
+        )
     if project.worker_id is not None or repo.worker_id is not None:
         raise DeliveryUnsupportedScopeError(
             "Delivery Loop V1 supports local projects only"
@@ -537,9 +577,9 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Project GitHub remote must exactly match the monitored repository"
         )
-    if repo.auto_merge or (repo.merge_queue_mode or "manual") != "manual":
+    if (repo.merge_queue_mode or "manual") != "manual":
         raise DeliveryValidationError(
-            "Delivery Loop V1 requires manual merge and Merge Queue disabled"
+            "Delivery Loop requires Merge Queue disabled"
         )
     if (
         (repo.review_mode or "single") != "panel"
@@ -549,6 +589,13 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Delivery Loop requires PR Monitor panel review with exact-head "
             "required CI checks"
+        )
+    if repo.auto_merge and not required_checks_support_direct_auto_merge(
+        repo.required_checks
+    ):
+        raise DeliveryValidationError(
+            "Delivery auto-merge requires app-bound check_run required CI "
+            "policies"
         )
     source_todo: ProjectTodo | None = None
     if spec.source_todo_id is not None:
@@ -585,10 +632,11 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Delivery base branch must match the PR Monitor default branch"
         )
+    auto_merge = bool(repo.auto_merge)
     policy = {
         "schema_version": 1,
-        "terminal": "ready_to_merge",
-        "auto_merge": False,
+        "terminal": "merged" if auto_merge else "ready_to_merge",
+        "auto_merge": auto_merge,
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
         "provider": resolved_provider,

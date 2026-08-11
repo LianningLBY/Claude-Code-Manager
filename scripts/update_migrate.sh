@@ -1478,6 +1478,52 @@ if ! assert_deployment_lease_owner >&9 2>&1; then
     exit 1
 fi
 
+require_local_claude_isolation_prerequisites() {
+    [ "$(uname -s 2>/dev/null)" = "Linux" ] || return 0
+    local missing=()
+    command -v bwrap >/dev/null 2>&1 || missing+=("bubblewrap (bwrap)")
+    command -v socat >/dev/null 2>&1 || missing+=("socat")
+    local seccomp_arch=""
+    case "$(uname -m 2>/dev/null)" in
+        x86_64|amd64) seccomp_arch="x64" ;;
+        aarch64|arm64) seccomp_arch="arm64" ;;
+        *) missing+=("apply-seccomp (unsupported architecture)") ;;
+    esac
+    local npm_root=""
+    local apply_seccomp=""
+    if [ -n "$seccomp_arch" ]; then
+        if command -v npm >/dev/null 2>&1; then
+            npm_root="$(npm root -g 2>/dev/null || true)"
+        fi
+        if [ -n "$npm_root" ] && [ "${npm_root#/}" != "$npm_root" ]; then
+            apply_seccomp="${npm_root}/@anthropic-ai/sandbox-runtime/vendor/seccomp/${seccomp_arch}/apply-seccomp"
+        fi
+        if [ -z "$apply_seccomp" ] || [ ! -f "$apply_seccomp" ] || \
+           [ -L "$apply_seccomp" ] || [ ! -x "$apply_seccomp" ]; then
+            missing+=("matching apply-seccomp")
+        fi
+    fi
+    [ "${#missing[@]}" -eq 0 ] && return 0
+    echo "CCM deployment prerequisite check failed: missing ${missing[*]}." >&9
+    echo "Install them before retrying; for Ubuntu/Debian:" >&9
+    echo "  sudo apt-get install -y bubblewrap socat" >&9
+    echo "  sudo npm install -g @anthropic-ai/sandbox-runtime@0.0.71" >&9
+    echo "The updater will not run sudo or install host packages automatically." >&9
+    return 1
+}
+
+# Rollback paths must remain usable to recover an older release. New-code
+# migration/restart, however, may not stop or swap the service unless Linux can
+# satisfy the local Claude Task isolation contract.
+if { [ "$MODE" = "migrate" ] || [ "$MODE" = "restart" ]; } && \
+   ! require_local_claude_isolation_prerequisites; then
+    trap - EXIT HUP INT TERM
+    publish_terminal "failed" \
+        "缺少本地 Claude 隔离依赖（bubblewrap/socat/apply-seccomp）；服务未停止，请安装后重试" \
+        "deployment_prerequisites" || true
+    exit 1
+fi
+
 # Arm recovery before stop.  A failed systemctl call is not proof that the
 # process survived the request.
 write_status "stopping" "正在停止服务..." "stop_service" || exit 1

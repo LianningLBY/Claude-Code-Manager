@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from datetime import datetime
@@ -9,18 +10,24 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import text, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
+from backend.database import Base
 from backend.models.instance import Instance
-from backend.models.plan import Plan
+from backend.models.plan import Plan, PlanInputRequest
 from backend.models.plan_agent import (
     PlanAgentRun,
     PlanAgentRuntimeReceipt,
     PlanAgentStep,
 )
 from backend.services.dispatcher import GlobalDispatcher
-from backend.services.plan_service import cancel_run
+from backend.services.plan_service import answer_input_request, cancel_run
 
 
 def _dispatcher(db_factory) -> GlobalDispatcher:
@@ -166,6 +173,241 @@ async def test_ordinary_cancel_service_fences_generation_and_is_idempotent(db_fa
             await cancel_run(db, plan=plan, run=run)
 
         await _assert_fenced_owner_graph(db_factory, graph)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_cancel_writer_order_is_run_plan_input(
+    db_factory,
+    monkeypatch,
+):
+    graph = await _seed_run(
+        db_factory,
+        name="ordinary-cancel-lock-order",
+        status="waiting_user",
+    )
+    async with db_factory() as db:
+        input_request = PlanInputRequest(
+            plan_id=graph.plan_id,
+            run_id=graph.run_id,
+            source_step_id=graph.step_id,
+            requested_by="planner",
+            questions=[],
+            status="open",
+            idempotency_key=f"ordinary-cancel-order:{graph.run_id}",
+            opened_at=datetime.utcnow(),
+        )
+        db.add(input_request)
+        await db.flush()
+        run = await db.get(PlanAgentRun, graph.run_id)
+        assert run is not None
+        run.open_input_request_id = input_request.id
+        await db.commit()
+
+    original_execute = AsyncSession.execute
+    update_order: list[str] = []
+
+    async def traced_execute(self, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if getattr(statement, "is_update", False) and table is not None:
+            update_order.append(table.name)
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", traced_execute)
+    async with db_factory() as db:
+        plan = await db.get(Plan, graph.plan_id)
+        run = await db.get(PlanAgentRun, graph.run_id)
+        assert plan is not None and run is not None
+        result = await cancel_run(db, plan=plan, run=run)
+
+    assert result.status == "cancelling"
+    assert update_order[:3] == [
+        "plan_agent_runs",
+        "plans",
+        "plan_input_requests",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_answer_and_cancel_converge_without_cross_lock_deadlock(tmp_path):
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'plan-answer-cancel-wal.db'}",
+        connect_args={"timeout": 2},
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with factory() as setup:
+            plan = Plan(
+                title="answer-cancel-lock-order",
+                initial_request="Choose one exact writer",
+                pipeline_config={},
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                run_type="initial",
+                status="waiting_user",
+                current_stage="planner",
+                generation=0,
+                pipeline_config={},
+            )
+            setup.add(run)
+            await setup.flush()
+            step = PlanAgentStep(
+                run_id=run.id,
+                plan_id=plan.id,
+                generation=0,
+                step_type="planner",
+                round=1,
+                provider="codex",
+                status="completed",
+                finished_at=datetime.utcnow(),
+            )
+            setup.add(step)
+            await setup.flush()
+            input_request = PlanInputRequest(
+                plan_id=plan.id,
+                run_id=run.id,
+                source_step_id=step.id,
+                requested_by="planner",
+                questions=[],
+                status="open",
+                idempotency_key=f"answer-cancel:{run.id}",
+                opened_at=datetime.utcnow(),
+            )
+            setup.add(input_request)
+            await setup.flush()
+            plan.active_run_id = run.id
+            run.open_input_request_id = input_request.id
+            await setup.commit()
+            plan_id = plan.id
+            run_id = run.id
+            input_id = input_request.id
+
+        both_loaded = asyncio.Event()
+        loaded_count = 0
+
+        async def rendezvous() -> None:
+            nonlocal loaded_count
+            loaded_count += 1
+            if loaded_count == 2:
+                both_loaded.set()
+            await both_loaded.wait()
+
+        async def answer():
+            async with factory() as db:
+                plan = await db.get(Plan, plan_id)
+                run = await db.get(PlanAgentRun, run_id)
+                input_request = await db.get(PlanInputRequest, input_id)
+                assert plan is not None and run is not None and input_request is not None
+                await rendezvous()
+                try:
+                    return await answer_input_request(
+                        db,
+                        plan=plan,
+                        run=run,
+                        input_request=input_request,
+                        expected_generation=0,
+                        idempotency_key="answer-winner",
+                        answers=[],
+                        response_text=None,
+                        attachments=None,
+                        answered_by=7,
+                    )
+                except HTTPException as exc:
+                    return exc
+
+        async def cancel():
+            async with factory() as db:
+                plan = await db.get(Plan, plan_id)
+                run = await db.get(PlanAgentRun, run_id)
+                assert plan is not None and run is not None
+                await rendezvous()
+                return await cancel_run(db, plan=plan, run=run)
+
+        answered, cancelled = await asyncio.wait_for(
+            asyncio.gather(answer(), cancel()),
+            timeout=5,
+        )
+        assert cancelled.status == "cancelling"
+        assert not isinstance(answered, HTTPException) or answered.status_code == 409
+        async with factory() as db:
+            run = await db.get(PlanAgentRun, run_id)
+            input_request = await db.get(PlanInputRequest, input_id)
+            assert run is not None and input_request is not None
+            assert run.status == "cancelling"
+            assert run.generation == run.cancellation_target_generation + 1
+            if input_request.status == "answered":
+                assert run.cancellation_target_generation == 1
+                assert run.generation == 2
+            else:
+                assert input_request.status == "cancelled"
+                assert run.cancellation_target_generation == 0
+                assert run.generation == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_cancel_fences_claim_committed_after_stale_read(db_factory):
+    """The cancellation UPDATE records the generation it actually fences."""
+
+    async with db_factory() as cancelling_db:
+        plan = Plan(
+            title="ordinary-claim-cancel-interleaving",
+            initial_request="Cancel a concurrently claimed Plan",
+            pipeline_config={},
+        )
+        owner = Instance(name="ordinary-claim-cancel-owner", status="idle")
+        cancelling_db.add_all([plan, owner])
+        await cancelling_db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="initial",
+            status="queued",
+            current_stage="planner",
+            generation=0,
+            pipeline_config={},
+        )
+        cancelling_db.add(run)
+        await cancelling_db.flush()
+        plan.active_run_id = run.id
+        await cancelling_db.commit()
+        run_id = run.id
+        owner_id = owner.id
+
+        # Keep this session's G0 objects stale while the dispatcher commits
+        # the exact G1 owner through another session.
+        dispatcher = _dispatcher(db_factory)
+        async with db_factory() as claiming_db:
+            claiming_owner = await claiming_db.get(Instance, owner.id)
+            assert claiming_owner is not None
+            claimed = await dispatcher._claim_plan_run(
+                claiming_db,
+                instance=claiming_owner,
+            )
+        assert claimed == (run_id, 1)
+        assert run.status == "queued"
+        assert run.generation == 0
+
+        fenced = await cancel_run(cancelling_db, plan=plan, run=run)
+        assert fenced.status == "cancelling"
+        assert fenced.generation == 2
+        assert fenced.cancellation_target_generation == 1
+        assert fenced.instance_id == owner_id
+
+    async with db_factory() as db:
+        stored_owner = await db.get(Instance, owner_id)
+        assert stored_owner is not None
+        assert stored_owner.current_plan_run_id == run_id
+        assert stored_owner.status == "running"
 
 
 @pytest.mark.asyncio

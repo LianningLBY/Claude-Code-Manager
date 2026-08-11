@@ -14,9 +14,9 @@ class DeliveryRunCreate(BaseModel):
     requirements: str = Field(min_length=1, max_length=200_000)
     source_todo_id: int | None = Field(default=None, gt=0)
     base_branch: str | None = Field(default=None, min_length=1, max_length=200)
-    # V1 relies on Codex app-server sandbox controls.  Keep this literal in
-    # the public contract as well as enforcing it again in the service.
-    provider: Literal["codex"] = "codex"
+    # Both local coding providers use a fail-closed Delivery isolation
+    # profile.  Keep Codex as the wire-compatible default for older clients.
+    provider: Literal["claude", "codex"] = "codex"
     model: str | None = Field(default=None, max_length=100)
     codex_service_tier: Literal["default", "priority"] = "default"
     effort_level: str | None = Field(default=None, max_length=20)
@@ -70,6 +70,8 @@ class DeliveryRunResponse(BaseModel):
     phase: str
     activity: str
     outcome: str | None
+    # Frozen completion policy selected from the PR Monitor at admission.
+    terminal: Literal["ready_to_merge", "merged"] | None = None
     wait_reason: str | None
     pause_reason: str | None
     error_code: str | None

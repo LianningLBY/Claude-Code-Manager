@@ -1,5 +1,7 @@
 """Tests for RalphLoop — only lifecycle management, not the full _loop body."""
 import asyncio
+import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime
 
 import pytest
@@ -15,10 +17,19 @@ from backend.models.plan import (
     PlanVersion,
 )
 from backend.models.task import Task
+from backend.models.test_harness import (
+    TestHarnessChildBinding,
+    TestHarnessRun,
+)
 from backend.services.dispatcher import GlobalDispatcher
 from backend.services.instance_manager import LaunchSupersededError
 from backend.services.ralph_loop import RalphLoop
 from backend.services.task_queue import TaskQueue, task_generation_fence
+from backend.services.test_harness_children import (
+    CHILD_READY,
+    CHILD_RUNNING,
+    TestHarnessChildService,
+)
 from backend.services import worker_task_termination as termination
 
 
@@ -28,6 +39,95 @@ def _make_ralph_loop():
         instance_manager=MagicMock(),
         broadcaster=MagicMock(),
     )
+
+
+class _HarnessFenceStub:
+    def __init__(self, *, enter_error: Exception | None = None):
+        self.enter_error = enter_error
+        self.events: list[str] = []
+        self.calls: list[tuple[int, str, object]] = []
+        self.inside = False
+
+    @asynccontextmanager
+    async def owner_stop_fence(
+        self,
+        task_id,
+        *,
+        reason,
+        expected_identity,
+    ):
+        self.calls.append((task_id, reason, expected_identity))
+        self.events.append("enter")
+        if self.enter_error is not None:
+            raise self.enter_error
+        self.inside = True
+        try:
+            yield
+        finally:
+            self.inside = False
+            self.events.append("exit")
+
+
+async def _stage_ralph_browser_child(db_factory, instance_id: int):
+    run_id = uuid.uuid4().hex
+    job_id = uuid.uuid4().hex
+    async with db_factory() as db:
+        owner = Task(
+            title="Browser Harness owner",
+            description="owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            effort_level="high",
+        )
+        db.add(owner)
+        await db.flush()
+        db.add(
+            TestHarnessRun(
+                id=run_id,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                target_kind="fixed_url",
+                target_spec={"url": "https://example.com"},
+                test_plan={"objective": "Review the page"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="a" * 64,
+                root_run_id=run_id,
+                status="running",
+                stage="preparing",
+            )
+        )
+        await db.commit()
+        owner_id = owner.id
+
+    service = TestHarnessChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id=job_id,
+        harness_run_id=run_id,
+        child_values={
+            "title": "Isolated Browser Agent",
+            "description": "Review one frozen target",
+            "priority": 0,
+            "max_retries": 0,
+            "mode": "auto",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "default",
+            "effort_level": "high",
+            "enabled_skills": {"browser-review": job_id},
+            "archived": True,
+        },
+    )
+    await service.activate(binding.id)
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue(instance_id=instance_id)
+        assert claimed is not None and claimed.id == child.id
+    return claimed, binding.id
 
 
 async def _stage_active_worker_termination_receipt(
@@ -283,7 +383,10 @@ async def test_stop_returns_claimed_task_to_pending_before_it_returns(db_factory
 
     rl._launch_task_on_bound_account = blocked_launch
     await rl.start(instance_id)
-    await asyncio.wait_for(launch_entered.wait(), timeout=1)
+    # The first Ralph loop in this module lazily imports the application
+    # singleton graph before dequeueing. Keep the lifecycle assertion bounded
+    # without coupling it to import speed on slower CI runners.
+    await asyncio.wait_for(launch_entered.wait(), timeout=3)
 
     async with db_factory() as db:
         claimed = await db.get(Task, task_id)
@@ -523,6 +626,116 @@ async def test_ralph_dequeue_waits_for_shared_maintenance_gate(db_factory):
         await rl.stop(instance_id)
 
 
+@pytest.mark.asyncio
+async def test_ralph_yields_browser_child_to_dispatcher_without_hot_loop(
+    db_factory,
+):
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    instance_manager = MagicMock()
+    instance_manager.processes = {}
+    dispatcher = GlobalDispatcher(db_factory, instance_manager, broadcaster)
+    wake_seen = asyncio.Event()
+    dispatcher.wake = MagicMock(side_effect=wake_seen.set)
+    rl = RalphLoop(db_factory, instance_manager, broadcaster)
+
+    async with db_factory() as db:
+        instance = Instance(name="ralph-browser-yield")
+        db.add(instance)
+        await db.commit()
+        instance_id = instance.id
+
+    child, binding_id = await _stage_ralph_browser_child(
+        db_factory,
+        instance_id,
+    )
+    # Return the exact claim to Ralph's loop so the real dequeue path observes
+    # it and then proves that it is Dispatcher-only.
+    async with db_factory() as db:
+        assert await TaskQueue(db).defer(
+            child.id,
+            "stage Ralph handoff",
+            instance_id=instance_id,
+            generation_fence=task_generation_fence(child),
+        )
+
+    original_dequeue = TaskQueue.dequeue
+    dequeue_exclusions: list[set[int]] = []
+    excluded_retry_seen = asyncio.Event()
+
+    async def recording_dequeue(self, exclude_ids=None, **kwargs):
+        excluded = set(exclude_ids or ())
+        dequeue_exclusions.append(excluded)
+        result = await original_dequeue(
+            self,
+            exclude_ids=exclude_ids,
+            **kwargs,
+        )
+        if child.id in excluded:
+            excluded_retry_seen.set()
+        return result
+
+    with (
+        patch("backend.main.dispatcher", dispatcher),
+        patch.object(TaskQueue, "dequeue", new=recording_dequeue),
+    ):
+        producer = asyncio.create_task(rl._loop(instance_id))
+        try:
+            await asyncio.wait_for(wake_seen.wait(), timeout=3)
+            await asyncio.wait_for(excluded_retry_seen.wait(), timeout=3)
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    async with db_factory() as db:
+        durable_child = await db.get(Task, child.id)
+        binding = await db.get(TestHarnessChildBinding, binding_id)
+        assert durable_child.status == "pending"
+        assert durable_child.instance_id is None
+        assert binding.state == CHILD_READY
+        assert binding.claimed_retry_count is None
+        assert binding.claimed_instance_id is None
+    assert dequeue_exclusions[0] == set()
+    assert child.id in dequeue_exclusions[-1]
+    dispatcher.wake.assert_called_once_with()
+    instance_manager.launch.assert_not_called()
+    broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ralph_retains_browser_claim_when_binding_identity_drifts(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(name="ralph-browser-corrupt")
+        db.add(instance)
+        await db.commit()
+        instance_id = instance.id
+
+    child, binding_id = await _stage_ralph_browser_child(
+        db_factory,
+        instance_id,
+    )
+    async with db_factory() as db:
+        binding = await db.get(TestHarnessChildBinding, binding_id)
+        binding.launch_config_digest = "0" * 64
+        await db.commit()
+
+    instance_manager = MagicMock()
+    rl = RalphLoop(db_factory, instance_manager, MagicMock())
+    assert await rl._defer_isolated_browser_claim(instance_id, child) is False
+
+    async with db_factory() as db:
+        durable_child = await db.get(Task, child.id)
+        binding = await db.get(TestHarnessChildBinding, binding_id)
+        assert durable_child.status == "in_progress"
+        assert durable_child.instance_id == instance_id
+        assert binding.state == CHILD_RUNNING
+        assert binding.claimed_retry_count == child.retry_count
+        assert binding.claimed_instance_id == instance_id
+    instance_manager.launch.assert_not_called()
+
+
 async def _run_ralph_until_plan_failure(db_factory, instance_id):
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
@@ -704,12 +917,12 @@ async def test_ralph_exact_legacy_plan_carrier_keeps_compatible_launch(
         loop_task = asyncio.create_task(rl._loop(instance_id))
         try:
             await asyncio.wait_for(launched.wait(), timeout=1)
-            for _ in range(100):
+            for _ in range(300):
                 async with db_factory() as db:
                     current = await db.get(Task, task_id)
                     if current.status == "completed":
                         break
-                await asyncio.sleep(0)
+                await asyncio.sleep(0.01)
             else:
                 pytest.fail("Ralph legacy carrier did not complete")
         finally:
@@ -1466,6 +1679,115 @@ async def test_ralph_completion_adopts_marker_only_pty_handoff(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_ralph_completion_keeps_owner_evidence_when_harness_cleanup_fails(
+    db_factory,
+):
+    fence = _HarnessFenceStub(enter_error=RuntimeError("child cleanup failed"))
+    instance_manager = MagicMock()
+    rl = RalphLoop(
+        db_factory,
+        instance_manager,
+        MagicMock(),
+        test_harness_service=fence,
+    )
+    started_at = datetime(2026, 8, 1, 2, 3, 4)
+    async with db_factory() as db:
+        instance = Instance(
+            name="ralph-completion-fence-failure",
+            status="running",
+            pid=7001,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="completion must wait for children",
+            description="work",
+            status="in_progress",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        await db.refresh(task)
+        generation = task_generation_fence(task)
+        task_id = task.id
+        instance_id = instance.id
+
+    assert (
+        await rl._mark_completed_with_background_handoff(
+            task_id,
+            instance_id,
+            generation,
+        )
+        is None
+    )
+
+    async with db_factory() as db:
+        durable_task = await db.get(Task, task_id)
+        durable_instance = await db.get(Instance, instance_id)
+        assert durable_task.status == "in_progress"
+        assert durable_task.completed_at is None
+        assert durable_task.instance_id == instance_id
+        assert durable_instance.status == "running"
+        assert durable_instance.pid == 7001
+        assert durable_instance.current_task_id == task_id
+        assert durable_instance.started_at == started_at
+    instance_manager.stop.assert_not_called()
+    assert fence.events == ["enter"]
+
+
+@pytest.mark.asyncio
+async def test_ralph_completion_writes_only_inside_harness_fence(db_factory):
+    fence = _HarnessFenceStub()
+    rl = RalphLoop(
+        db_factory,
+        MagicMock(),
+        MagicMock(),
+        test_harness_service=fence,
+    )
+    async with db_factory() as db:
+        instance = Instance(name="ralph-completion-order")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="ordered completion",
+            description="work",
+            status="in_progress",
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        instance_id = instance.id
+        generation = task_generation_fence(task)
+
+    original_mark_completed = RalphLoop._mark_completed_generation
+
+    async def assert_fenced_mark_completed(db, *args, **kwargs):
+        assert fence.inside is True
+        return await original_mark_completed(db, *args, **kwargs)
+
+    with patch.object(
+        RalphLoop,
+        "_mark_completed_generation",
+        new=staticmethod(assert_fenced_mark_completed),
+    ):
+        resulting = await rl._mark_completed_with_background_handoff(
+            task_id,
+            instance_id,
+            generation,
+        )
+
+    assert resulting is not None
+    assert fence.events == ["enter", "exit"]
+    async with db_factory() as db:
+        assert (await db.get(Task, task_id)).status == "completed"
+
+
+@pytest.mark.asyncio
 async def test_ralph_completion_retries_when_marker_clears_quickly(db_factory):
     rl = RalphLoop(db_factory, MagicMock(), MagicMock())
     async with db_factory() as db:
@@ -1487,13 +1809,13 @@ async def test_ralph_completion_retries_when_marker_clears_quickly(db_factory):
         task.pty_background_generation = "short-lived-native-tail"
         await db.commit()
 
-    original_mark_completed = TaskQueue.mark_completed
+    original_mark_completed = RalphLoop._mark_completed_generation
     attempts = 0
 
-    async def mark_then_settle(self, *args, **kwargs):
+    async def mark_then_settle(db, *args, **kwargs):
         nonlocal attempts
         attempts += 1
-        changed = await original_mark_completed(self, *args, **kwargs)
+        changed = await original_mark_completed(db, *args, **kwargs)
         if attempts == 1:
             assert changed is False
             async with db_factory() as db:
@@ -1503,9 +1825,9 @@ async def test_ralph_completion_retries_when_marker_clears_quickly(db_factory):
         return changed
 
     with patch.object(
-        TaskQueue,
-        "mark_completed",
-        new=mark_then_settle,
+        RalphLoop,
+        "_mark_completed_generation",
+        new=staticmethod(mark_then_settle),
     ):
         resulting = await rl._mark_completed_with_background_handoff(
             task_id,
@@ -1597,6 +1919,65 @@ async def test_status_publication_yields_to_active_termination_receipt(
 
     assert published is False
     broadcaster.broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ralph_failure_keeps_owner_evidence_when_harness_cleanup_fails(
+    db_factory,
+):
+    fence = _HarnessFenceStub(enter_error=RuntimeError("browser child survived"))
+    instance_manager = MagicMock()
+    instance_manager.processes = {}
+    instance_manager.stop = AsyncMock()
+    rl = RalphLoop(
+        db_factory,
+        instance_manager,
+        MagicMock(),
+        test_harness_service=fence,
+    )
+    started_at = datetime(2026, 8, 2, 3, 4, 5)
+    async with db_factory() as db:
+        instance = Instance(
+            name="ralph-failure-fence-failure",
+            status="running",
+            pid=7002,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="failure must wait for children",
+            description="work",
+            status="executing",
+            instance_id=instance.id,
+            turn_generation=4,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+        instance_id = instance.id
+
+    await rl._fail_unexpected_claim(
+        instance_id,
+        task,
+        RuntimeError("provider bookkeeping failed"),
+    )
+
+    async with db_factory() as db:
+        durable_task = await db.get(Task, task_id)
+        durable_instance = await db.get(Instance, instance_id)
+        assert durable_task.status == "executing"
+        assert durable_task.completed_at is None
+        assert durable_task.instance_id == instance_id
+        assert durable_instance.status == "running"
+        assert durable_instance.pid == 7002
+        assert durable_instance.current_task_id == task_id
+        assert durable_instance.started_at == started_at
+    instance_manager.stop.assert_not_awaited()
+    assert fence.events == ["enter"]
 
 
 @pytest.mark.asyncio

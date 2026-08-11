@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import uuid
 from contextlib import AsyncExitStack
@@ -18,11 +19,14 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.task import Task
 from backend.models.instance import Instance
+from backend.models.test_harness import TestHarnessChildBinding
 from backend.schemas.task import (
     TaskActionRequest,
     PlanApprovalRequest,
     TaskCreate,
+    InternalTaskSkillsUpdate,
     TaskMigrationImport,
+    TaskMigrationImportResponse,
     TaskResponse,
     TaskRoutingExpectation,
     TaskTerminationRequest,
@@ -39,7 +43,9 @@ from backend.services.task_queue import (
     task_delete_fence,
 )
 from backend.services.task_creation import (
+    SOURCE_TASK_INCARNATION_METADATA_KEY,
     prepare_task_create_values,
+    purge_task_access_grants,
     stage_task_record,
     validate_task_service_tier_configuration,
 )
@@ -50,6 +56,17 @@ from backend.services.pr_review_runtime import (
 )
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
+)
+from backend.services.test_harness_owner_fence import (
+    TestHarnessOwnerIdentity,
+    TestHarnessOwnerGraphConflict,
+    no_active_test_harness_owner_graph_predicate,
+    require_no_active_test_harness_owner_graph,
+    test_harness_owner_identity,
+)
+from backend.services.skill_tool_rpc import (
+    SKILL_TOOL_RPC_NAMES,
+    execute_skill_tool_rpc,
 )
 from backend.services.task_termination import (
     TaskLaunchTerminationConflict,
@@ -109,9 +126,11 @@ from backend.services.auto_capability_policy import (
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
+    internal_task_incarnation_id,
     is_admin,
     require_admin,
     require_internal_service,
+    require_internal_task_incarnation,
     require_project_access,
     require_task_access,
     require_task_control,
@@ -125,6 +144,23 @@ _WORKER_ROUTING_CONFIG_FIELDS = frozenset({"provider", "model", "codex_service_t
 _WORKER_SKILL_CONFIG_FIELDS = frozenset(
     {"enabled_skills", "selected_user_skills", "metadata_"}
 )
+
+
+class InternalSkillToolCall(BaseModel):
+    """Strict payload accepted only from the frozen task Skills MCP wrapper."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool: Literal[
+        "ccm_command_help",
+        "ccm_read_skill",
+        "ccm_read_user_skill",
+        "ccm_create_skill",
+        "ccm_distill",
+        "ccm_enable_skill",
+        "ccm_disable_skill",
+    ]
+    arguments: dict = Field(default_factory=dict)
 _WORKER_CONFIG_SYNC_UNSAFE_FIELDS = frozenset(
     {"worker_id", "project_id", "target_repo"}
 )
@@ -177,6 +213,133 @@ def _require_not_delivery_owned_task(task: Task, *, action: str) -> None:
             f"Delivery-owned Tasks cannot be manually {action}; use Delivery Run"
             f"{suffix} controls so the Plan/Code/Review/PR evidence stays fenced",
         )
+
+
+async def _require_not_isolated_browser_child(
+    db: AsyncSession,
+    task: Task,
+    *,
+    action: str,
+) -> None:
+    """Keep every public mutation on the durable Browser owner, never child."""
+
+    from backend.services.test_harness_children import (
+        browser_child_public_mutation_error,
+    )
+
+    metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+    has_binding = metadata.get("isolated_browser_agent") is True
+    if not has_binding:
+        has_binding = (
+            await db.scalar(
+                select(TestHarnessChildBinding.id)
+                .where(TestHarnessChildBinding.child_task_id == task.id)
+                .limit(1)
+            )
+            is not None
+        )
+    detail = browser_child_public_mutation_error(
+        task,
+        has_binding=has_binding,
+    )
+    if detail is not None:
+        raise HTTPException(409, f"{detail}; it cannot be {action}")
+
+
+async def _require_no_active_harness_owner_graph(
+    db: AsyncSession,
+    task_id: int,
+) -> None:
+    try:
+        await require_no_active_test_harness_owner_graph(db, task_id)
+    except TestHarnessOwnerGraphConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+async def _require_migration_import_eligible(
+    db: AsyncSession,
+    task: Task,
+    body: TaskMigrationImport,
+) -> str | None:
+    """Validate one exact destination row before a Worker import refresh."""
+
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="migration-imported",
+    )
+    from backend.models.test_harness import TestHarnessRun
+    from backend.models.workspace_review import WorkspaceReviewRun
+
+    owns_harness_graph = (
+        await db.scalar(
+            select(TestHarnessChildBinding.id)
+            .where(TestHarnessChildBinding.owner_task_id == task.id)
+            .limit(1)
+        )
+        or await db.scalar(
+            select(TestHarnessRun.id)
+            .where(TestHarnessRun.task_id == task.id)
+            .limit(1)
+        )
+        or await db.scalar(
+            select(WorkspaceReviewRun.id)
+            .where(WorkspaceReviewRun.task_id == task.id)
+            .limit(1)
+        )
+    )
+    if owns_harness_graph is not None:
+        raise HTTPException(
+            409,
+            "Tasks with durable Browser Harness evidence cannot be "
+            "migration-imported",
+        )
+    _require_not_delivery_owned_task(task, action="migration-imported")
+    if task.mode == "plan" or task.canonical_plan_id is not None:
+        raise HTTPException(
+            409,
+            "Existing Plan carriers are immutable and cannot be "
+            "migration-imported",
+        )
+    if task.mode != body.mode:
+        raise HTTPException(
+            409,
+            "Migration import cannot change an existing Task mode",
+        )
+    if task.capability_policy is not None:
+        raise HTTPException(
+            409,
+            "Destination Task has an immutable local Auto capability policy "
+            "and cannot be migration-imported",
+        )
+    bound_source_incarnation = (task.metadata_ or {}).get(
+        SOURCE_TASK_INCARNATION_METADATA_KEY
+    )
+    if body.source_incarnation_id is None and (
+        not isinstance(task.incarnation_id, str)
+        or re.fullmatch(r"[0-9a-f]{32}", task.incarnation_id) is None
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task has no verifiable incarnation identity",
+        )
+    if bound_source_incarnation is not None and (
+        not isinstance(bound_source_incarnation, str)
+        or bound_source_incarnation != task.incarnation_id
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task has a corrupt source incarnation binding",
+        )
+    if (
+        bound_source_incarnation is not None
+        and body.source_incarnation_id != bound_source_incarnation
+    ):
+        raise HTTPException(
+            409,
+            "Destination Task is bound to a different source incarnation",
+        )
+    return bound_source_incarnation
 
 
 def _require_no_pending_worker_turn_handoff(task: Task) -> None:
@@ -756,6 +919,11 @@ async def create_task(
         # Task id.  Letting an ordinary JWT caller choose it makes identifier
         # reuse and cross-node identity collisions externally controllable.
         require_internal_service(request)
+    elif body.source_incarnation_id is not None:
+        raise HTTPException(
+            422,
+            "source_incarnation_id requires internal explicit-id forwarding",
+        )
     if body.mode == "plan":
         raise HTTPException(
             410,
@@ -768,6 +936,11 @@ async def create_task(
             "clone_from_task_id or the migration-import protocol",
         )
     if body.secret_ids:
+        require_admin(request)
+    if body.ssh_grants:
+        from backend.api.deps import require_managed_ssh_auth_configured
+
+        require_managed_ssh_auth_configured()
         require_admin(request)
     data = body.model_dump()
     data["created_by"] = user_id
@@ -837,6 +1010,11 @@ async def create_task(
     target_worker_id = data.get("worker_id")
     if project is None:
         await require_worker_target_access(request, target_worker_id, db)
+    if body.frontend_review is not None and target_worker_id is not None:
+        raise HTTPException(
+            400,
+            "Frontend Review Goal currently requires a Manager-local Project",
+        )
 
     try:
         normalized_policy = validate_auto_capability_task_scope(
@@ -862,7 +1040,9 @@ async def create_task(
     file_paths = data.pop("file_paths", None)
     attachments = data.pop("attachments", None)
     secret_ids = data.pop("secret_ids", None)
+    ssh_grants = data.pop("ssh_grants", None) or []
     clone_from_task_id = data.pop("clone_from_task_id", None)
+    frontend_review = data.pop("frontend_review", None)
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
     if user_skill_snapshots is not None:
         require_admin(request)
@@ -874,6 +1054,24 @@ async def create_task(
         meta["attachments"] = attachments
     if secret_ids:
         meta["secret_ids"] = secret_ids
+    if frontend_review is not None:
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+        )
+
+        normalized_frontend_review = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: frontend_review,
+        })
+        if normalized_frontend_review is None:  # defensive: schema validates this
+            raise HTTPException(422, "Invalid Frontend Review Goal configuration")
+        meta[FRONTEND_REVIEW_METADATA_KEY] = normalized_frontend_review
+        data["mode"] = "goal"
+        data["goal_max_turns"] = normalized_frontend_review["max_iterations"]
+        data["goal_condition"] = build_frontend_review_goal_condition(
+            data.get("goal_condition")
+        )
     if user_skill_snapshots is not None:
         from backend.services.skill_context import (
             USER_SKILL_SNAPSHOTS_METADATA_KEY,
@@ -1061,8 +1259,34 @@ async def create_task(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
 
+    from backend.services.task_ssh_access import (
+        TaskSSHAccessError,
+        prepare_task_ssh_grants,
+        task_ssh_grant_rows,
+    )
+
+    try:
+        prepared_ssh_grants = await prepare_task_ssh_grants(
+            db,
+            ssh_grants,
+            worker_id=data.get("worker_id"),
+            shared_from_id=data.get("shared_from_id"),
+            metadata=data.get("metadata_"),
+            project_id=data.get("project_id"),
+        )
+    except TaskSSHAccessError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
+
     if supersedes is None:
-        task = await queue.create(**data)
+        task = await stage_task_record(db, **data)
+        if prepared_ssh_grants:
+            db.add_all(task_ssh_grant_rows(
+                task.id,
+                prepared_ssh_grants,
+                created_by=user_id,
+            ))
+        await db.commit()
+        await db.refresh(task)
     else:
         superseded_id = supersedes.id
         metadata = dict(data.get("metadata_") or {})
@@ -1095,6 +1319,12 @@ async def create_task(
                         "Only a Plan awaiting review can be superseded",
                     )
                 staged = await stage_task_record(db, **data)
+                if prepared_ssh_grants:
+                    db.add_all(task_ssh_grant_rows(
+                        staged.id,
+                        prepared_ssh_grants,
+                        created_by=user_id,
+                    ))
                 if not await mark_plan_superseded(
                     db,
                     current_supersedes,
@@ -1138,7 +1368,11 @@ async def create_task(
     return task
 
 
-@router.post("/migration-import", response_model=TaskResponse, status_code=201)
+@router.post(
+    "/migration-import",
+    response_model=TaskMigrationImportResponse,
+    status_code=201,
+)
 async def import_migrated_task(
     request: Request,
     body: TaskMigrationImport,
@@ -1169,33 +1403,23 @@ async def import_migrated_task(
 
     existing = await db.get(Task, body.id)
     if existing is not None:
-        _require_not_delivery_owned_task(existing, action="migration-imported")
-        if existing.mode == "plan" or existing.canonical_plan_id is not None:
-            raise HTTPException(
-                409,
-                "Existing Plan carriers are immutable and cannot be "
-                "migration-imported",
-            )
-        if existing.mode != body.mode:
-            raise HTTPException(
-                409,
-                "Migration import cannot change an existing Task mode",
-            )
-        # Migration import may refresh an inert Worker copy, but it must never
-        # repurpose a same-id local Auto Task that carries immutable capability
-        # authority.  The wire schema deliberately omits the policy, so merely
-        # excluding that field from the UPDATE would retain it on the imported
-        # Worker mirror and bypass the local-only scope boundary.
-        if existing.capability_policy is not None:
-            raise HTTPException(
-                409,
-                "Destination Task has an immutable local Auto capability "
-                "policy and cannot be migration-imported",
-            )
+        await _require_migration_import_eligible(db, existing, body)
 
     data = body.model_dump()
+    # ``source_incarnation_id`` is a transport-only name.  New imports map it
+    # inside ``stage_task_record``; the UPDATE path must perform the same
+    # mapping explicitly because it writes Task columns directly.  An omitted
+    # source fence deliberately preserves the destination row's incarnation.
+    source_incarnation_id = data.pop("source_incarnation_id", None)
     source_status = data.pop("source_status")
     user_skill_snapshots = data.pop("user_skill_snapshots", None)
+    frontend_review = data.pop("frontend_review", None)
+    ssh_grants = data.pop("ssh_grants", None)
+    if ssh_grants:
+        raise HTTPException(
+            400,
+            "Managed SSH grants cannot be imported to a Worker",
+        )
     for transient_field in (
         "image_paths",
         "file_paths",
@@ -1212,8 +1436,39 @@ async def import_migrated_task(
     migration_metadata = {
         WORKER_MANAGED_TASK_METADATA_KEY: True,
     }
+    if existing is not None:
+        existing_binding = (existing.metadata_ or {}).get(
+            SOURCE_TASK_INCARNATION_METADATA_KEY
+        )
+        if existing_binding is not None:
+            migration_metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = (
+                existing_binding
+            )
+    if source_incarnation_id is not None:
+        migration_metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = (
+            source_incarnation_id
+        )
     if user_skill_snapshots is not None:
         migration_metadata[USER_SKILL_SNAPSHOTS_METADATA_KEY] = user_skill_snapshots
+    if frontend_review is not None:
+        from backend.services.frontend_review_goal import (
+            FRONTEND_REVIEW_METADATA_KEY,
+            build_frontend_review_goal_condition,
+            frontend_review_goal_config,
+        )
+
+        normalized_frontend_review = frontend_review_goal_config({
+            FRONTEND_REVIEW_METADATA_KEY: frontend_review,
+        })
+        if normalized_frontend_review is not None:
+            migration_metadata[FRONTEND_REVIEW_METADATA_KEY] = (
+                normalized_frontend_review
+            )
+            data["mode"] = "goal"
+            data["goal_max_turns"] = normalized_frontend_review["max_iterations"]
+            data["goal_condition"] = build_frontend_review_goal_condition(
+                data.get("goal_condition")
+            )
     data["metadata_"] = migration_metadata
     data.update(
         worker_id=None,
@@ -1248,9 +1503,13 @@ async def import_migrated_task(
     if existing is None:
         # The first visible state is already inert.  In particular there is no
         # pending commit and no dispatcher.wake() between create and cancel.
-        return await queue.create(**data)
+        return await queue.create(
+            source_incarnation_id=source_incarnation_id,
+            **data,
+        )
 
     old_status = existing.status
+    observed_incarnation_id = existing.incarnation_id
     existing_generation = _task_generation_fence(body.id, existing)
     if old_status in ("in_progress", "executing", "migrating"):
         raise HTTPException(
@@ -1259,20 +1518,70 @@ async def import_migrated_task(
         )
 
     values = {key: value for key, value in data.items() if key != "id"}
+    if source_incarnation_id is not None:
+        values["incarnation_id"] = source_incarnation_id
     # End every validation read before competing with receipt admission.  The
     # no-op/write CAS below must be the first statement of a fresh transaction
     # so a receipt that committed through another SQLite WAL connection cannot
     # turn this into BUSY_SNAPSHOT or be overwritten by the stale import.
     await db.rollback()
     async with get_task_operation_lock(body.id):
+        fence_predicates = (
+            *existing_generation,
+            (
+                Task.incarnation_id.is_(None)
+                if observed_incarnation_id is None
+                else Task.incarnation_id == observed_incarnation_id
+            ),
+            Task.mode != "delivery_loop",
+            Task.delivery_run_id.is_(None),
+            no_active_worker_task_termination_predicate(),
+        )
+        writer_fence = await db.execute(
+            sa_update(Task)
+            .where(*fence_predicates)
+            .values(id=Task.id)
+            .execution_options(synchronize_session=False)
+        )
+        if writer_fence.rowcount != 1:
+            await db.rollback()
+            if await active_worker_task_termination_receipt(db, body.id):
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Destination task has an active Worker termination receipt",
+                )
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task changed during migration import",
+            )
+        db.expire_all()
+        locked_existing = await db.get(
+            Task,
+            body.id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if locked_existing is None:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Destination task disappeared during migration import",
+        )
+        try:
+            await _require_migration_import_eligible(
+                db,
+                locked_existing,
+                body,
+            )
+        except HTTPException:
+            await db.rollback()
+            raise
+
         result = await db.execute(
             sa_update(Task)
-            .where(
-                *existing_generation,
-                Task.mode != "delivery_loop",
-                Task.delivery_run_id.is_(None),
-                no_active_worker_task_termination_predicate(),
-            )
+            .where(*fence_predicates)
             .values(**values)
             .execution_options(synchronize_session=False)
         )
@@ -1289,6 +1598,7 @@ async def import_migrated_task(
                 409,
                 "Destination task changed during migration import",
             )
+        await purge_task_access_grants(db, body.id)
         db.expire_all()
         task = await db.get(Task, body.id)
         if task is None:
@@ -1298,6 +1608,7 @@ async def import_migrated_task(
                 "Destination task disappeared during migration import",
             )
         publication_generation = _task_generation_fence(body.id, task)
+        resulting_incarnation_id = task.incarnation_id
         await db.commit()
 
         if old_status != source_status:
@@ -1310,6 +1621,11 @@ async def import_migrated_task(
                 sa_update(Task)
                 .where(
                     *publication_generation,
+                    (
+                        Task.incarnation_id.is_(None)
+                        if resulting_incarnation_id is None
+                        else Task.incarnation_id == resulting_incarnation_id
+                    ),
                     no_active_worker_task_termination_predicate(),
                 )
                 .values(status=source_status)
@@ -1371,6 +1687,7 @@ async def get_task(
     task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
+    await require_internal_task_incarnation(request, task_id, db)
     await require_task_access(request, task, db)
     return task
 
@@ -2229,6 +2546,10 @@ async def _update_local_task_with_routing_config(
                 safe_status_required=False,
                 allowed_statuses=_LOCAL_ROUTING_EDITABLE_STATUSES,
             )
+            await _require_no_active_harness_owner_graph(
+                queue.db,
+                task_id,
+            )
             if _routing_guard_generation_changed(current, observed):
                 await queue.db.rollback()
                 raise HTTPException(
@@ -2386,10 +2707,19 @@ async def _update_worker_task_with_routing_config(
             Task.codex_service_tier == previous.codex_service_tier,
         ]
         changed = await queue.db.execute(
-            sa_update(Task).where(*predicates).values(**normalized)
+            sa_update(Task)
+            .where(
+                *predicates,
+                no_active_test_harness_owner_graph_predicate(),
+            )
+            .values(**normalized)
         )
         if changed.rowcount != 1:
             await queue.db.rollback()
+            await _require_no_active_harness_owner_graph(
+                queue.db,
+                task_id,
+            )
             raise HTTPException(
                 409,
                 "Task Worker generation changed while routing config was "
@@ -2466,10 +2796,16 @@ async def _update_worker_task_with_skill_configuration(
             updated = await queue.update_task(
                 task_id,
                 operation_lock_held=True,
+                expected_incarnation_id=internal_task_incarnation_id(
+                    request,
+                    task_id,
+                ),
+                reject_active_harness_owner_graph=True,
                 **updates,
             )
         except (
             DurableWorkerTerminationConflict,
+            TestHarnessOwnerGraphConflict,
             TaskWaitingCapabilityConflict,
         ) as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -2506,10 +2842,16 @@ async def _update_worker_task_with_handoff_fence(
             updated = await queue.update_task(
                 task_id,
                 operation_lock_held=True,
+                expected_incarnation_id=internal_task_incarnation_id(
+                    request,
+                    task_id,
+                ),
+                reject_active_harness_owner_graph=True,
                 **updates,
             )
         except (
             DurableWorkerTerminationConflict,
+            TestHarnessOwnerGraphConflict,
             TaskWaitingCapabilityConflict,
         ) as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -2531,6 +2873,11 @@ async def update_task(
     await require_task_control(request, task, queue.db)
     _require_not_delivery_owned_task(task, action="edited")
     _require_not_waiting_capability(task, action="edited")
+    await _require_not_isolated_browser_child(
+        queue.db,
+        task,
+        action="edited",
+    )
     await _require_not_pr_review_task_mutation(
         queue.db,
         task_id,
@@ -2767,15 +3114,91 @@ async def update_task(
             )
         )
     try:
-        task = await queue.update_task(task_id, **updates)
+        task = await queue.update_task(
+            task_id,
+            expected_incarnation_id=internal_task_incarnation_id(
+                request,
+                task_id,
+            ),
+            reject_active_harness_owner_graph=True,
+            **updates,
+        )
     except (
         DurableWorkerTerminationConflict,
+        TestHarnessOwnerGraphConflict,
         TaskWaitingCapabilityConflict,
     ) as exc:
         raise HTTPException(409, str(exc)) from exc
     if not task:
         raise HTTPException(404, "Task not found")
     return task
+
+
+@router.put(
+    "/{task_id}/internal/enabled-skills",
+    response_model=TaskResponse,
+)
+async def update_task_enabled_skills_internal(
+    task_id: int,
+    body: InternalTaskSkillsUpdate,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Apply only the skill toggle exposed to the scoped skills MCP."""
+
+    require_internal_service(request)
+    await require_internal_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
+    return await update_task(
+        task_id,
+        TaskUpdate(enabled_skills=body.enabled_skills),
+        request,
+        queue,
+    )
+
+
+@router.post("/{task_id}/internal/skill-tools")
+async def execute_task_skill_tool_internal(
+    task_id: int,
+    body: InternalSkillToolCall,
+    request: Request,
+    queue: TaskQueue = Depends(_get_queue),
+):
+    """Execute the privileged half of one frozen Skills MCP tool call."""
+
+    require_internal_service(request)
+    task = await require_internal_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
+    # Keep the runtime allow-list duplicated at the typed HTTP boundary so a
+    # future schema edit cannot silently broaden the Manager effect surface.
+    if body.tool not in SKILL_TOOL_RPC_NAMES:
+        raise HTTPException(400, "Unsupported CCM skill tool")
+    if task is None:
+        task = await queue.get(task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    outcome = await execute_skill_tool_rpc(
+        task,
+        body.tool,
+        body.arguments,
+        queue.db,
+    )
+    if outcome.enabled_skills is not None:
+        await update_task(
+            task_id,
+            TaskUpdate(enabled_skills=outcome.enabled_skills),
+            request,
+            queue,
+        )
+    return {"result": outcome.result}
 
 
 async def _settle_task_launch_barrier(
@@ -2799,6 +3222,42 @@ async def _retry_local_task_safely(
     task_id: int,
     queue: TaskQueue,
     db: AsyncSession,
+    *,
+    expected_identity: TestHarnessOwnerIdentity,
+    task_updates: dict | None = None,
+    commit: bool = True,
+) -> Task | None:
+    """Retry only after closing every Harness owner from the old generation."""
+
+    from backend.services.test_harness import test_harness_service
+
+    # The Harness service uses an independent session while cancelling Runs
+    # and durable Browser children.  Release this request's read snapshot
+    # before waiting for that writer, then keep the owner fence until the new
+    # Task generation is durable so no stale-generation Run can materialize in
+    # between cleanup and retry.
+    await db.rollback()
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task was retried",
+        expected_identity=expected_identity,
+    ):
+        return await _retry_local_task_under_harness_owner_fence(
+            task_id,
+            queue,
+            db,
+            task_updates=task_updates,
+            commit=commit,
+        )
+
+
+async def _retry_local_task_under_harness_owner_fence(
+    task_id: int,
+    queue: TaskQueue,
+    db: AsyncSession,
+    *,
+    task_updates: dict | None = None,
+    commit: bool = True,
 ) -> Task | None:
     """Retry without discarding evidence of a possibly-live orphan process.
 
@@ -3011,6 +3470,8 @@ async def _retry_local_task_safely(
             expected_statuses=(observed_status,),
             generation_fence=observed_generation,
             rollback_on_miss=True,
+            task_updates=task_updates,
+            commit=commit,
         )
         if retried is None:
             raise HTTPException(
@@ -3066,6 +3527,7 @@ async def delete_task(
         raise HTTPException(404, "Task not found")
     _require_not_delivery_owned_task(task, action="deleted")
     _require_not_waiting_capability(task, action="deleted")
+    await _require_not_isolated_browser_child(db, task, action="deleted")
     await _require_no_pr_review_publication(db, task_id)
     await _require_not_pr_review_task_mutation(
         db,
@@ -3214,46 +3676,63 @@ async def delete_task(
         }
 
     deleted_local_plan_ids: list[int] = []
-    lifecycle_ids = set(
-        (
-            await db.execute(
-                select(Instance.id).where(Instance.current_task_id == task_id)
-            )
+    if not is_task_status_deletable(mode=task.mode, status=task.status):
+        raise HTTPException(
+            400, "Cannot delete task (not found or not in deletable state)"
         )
-        .scalars()
-        .all()
-    )
-    if task is not None and task.instance_id is not None:
-        task_side_instance = await db.get(Instance, task.instance_id)
-        if task_side_instance is not None and task_side_instance.current_task_id in (
-            None,
-            task_id,
-        ):
-            lifecycle_ids.add(task.instance_id)
-    # Do not wait on a lifecycle lock while retaining a read transaction:
-    # launch holds that lock while committing Task/Instance metadata.
+    from backend.services.test_harness import test_harness_service
+
+    expected_harness_owner = test_harness_owner_identity(task)
     await db.rollback()
-
-    # Serialize deletion with the complete launch/spawn/persist window. A
-    # terminal Task can otherwise disappear just before a child is registered;
-    # the launch would eventually abort, but shutdown in that gap would have no
-    # durable Task evidence.
-    async with AsyncExitStack() as stack:
-        for instance_id in sorted(lifecycle_ids):
-            await stack.enter_async_context(
-                instance_manager._instance_lifecycle_lock(instance_id)
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task was deleted",
+        expected_identity=expected_harness_owner,
+    ):
+        db.expire_all()
+        fenced_task = await db.get(Task, task_id)
+        if fenced_task is None:
+            raise HTTPException(409, "Task disappeared before deletion fence")
+        lifecycle_ids = set(
+            (
+                await db.execute(
+                    select(Instance.id).where(Instance.current_task_id == task_id)
+                )
             )
-
-        async def capture_delete_preflight(
-            preflight: TaskDeletePreflight,
-        ) -> bool:
-            deleted_local_plan_ids.extend(preflight.plan_ids)
-            return True
-
-        ok = await queue.delete(
-            task_id,
-            before_delete=capture_delete_preflight,
+            .scalars()
+            .all()
         )
+        if fenced_task.instance_id is not None:
+            task_side_instance = await db.get(Instance, fenced_task.instance_id)
+            if task_side_instance is not None and task_side_instance.current_task_id in (
+                None,
+                task_id,
+            ):
+                lifecycle_ids.add(fenced_task.instance_id)
+        # Do not wait on a lifecycle lock while retaining a read transaction:
+        # launch holds that lock while committing Task/Instance metadata.
+        await db.rollback()
+
+        # Serialize deletion with the complete launch/spawn/persist window. A
+        # terminal Task can otherwise disappear just before a child is registered;
+        # the launch would eventually abort, but shutdown in that gap would have no
+        # durable Task evidence.
+        async with AsyncExitStack() as stack:
+            for instance_id in sorted(lifecycle_ids):
+                await stack.enter_async_context(
+                    instance_manager._instance_lifecycle_lock(instance_id)
+                )
+
+            async def capture_delete_preflight(
+                preflight: TaskDeletePreflight,
+            ) -> bool:
+                deleted_local_plan_ids.extend(preflight.plan_ids)
+                return True
+
+            ok = await queue.delete(
+                task_id,
+                before_delete=capture_delete_preflight,
+            )
     if not ok:
         db.expire_all()
         current = await db.get(Task, task_id)
@@ -4352,6 +4831,7 @@ async def _stop_task_session_local_impl(
     task_id: int,
     db: AsyncSession,
     *,
+    expected_identity: TestHarnessOwnerIdentity,
     worker_termination_operation_id: str | None = None,
     worker_supersede: bool = False,
     worker_termination_execution_token: str | None = None,
@@ -4360,20 +4840,26 @@ async def _stop_task_session_local_impl(
     """Keep message admission closed until the stopped generation is final."""
 
     from backend.main import dispatcher
+    from backend.services.test_harness import test_harness_service
 
-    async with dispatcher.task_queue_cancellation_lease(task_id):
-        return await _stop_task_session_local_under_cancellation_lease(
-            task_id,
-            db,
-            worker_termination_operation_id=(
-                worker_termination_operation_id
-            ),
-            worker_termination_execution_token=(
-                worker_termination_execution_token
-            ),
-            worker_termination_state_version=worker_termination_state_version,
-            worker_supersede=worker_supersede,
-        )
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task session was stopped",
+        expected_identity=expected_identity,
+    ):
+        async with dispatcher.task_queue_cancellation_lease(task_id):
+            return await _stop_task_session_local_under_cancellation_lease(
+                task_id,
+                db,
+                worker_termination_operation_id=(
+                    worker_termination_operation_id
+                ),
+                worker_termination_execution_token=(
+                    worker_termination_execution_token
+                ),
+                worker_termination_state_version=worker_termination_state_version,
+                worker_supersede=worker_supersede,
+            )
 
 
 async def _stop_task_session_local_under_cancellation_lease(
@@ -4718,6 +5204,8 @@ async def _stop_task_session_local_under_cancellation_lease(
                 "ok": True,
                 "stopped": False,
                 "cleared_messages": cleared,
+                "task_status": active_task.status,
+                "background_active": False,
             }
         await db.rollback()
         raise HTTPException(400, "No running session found for this task")
@@ -4951,6 +5439,8 @@ async def _stop_task_session_local_under_cancellation_lease(
             "ok": True,
             "stopped": True,
             "cleared_messages": cleared,
+            "task_status": expected_status,
+            "background_active": False,
         }
 
     if observed_background_generation is not None:
@@ -5067,6 +5557,8 @@ async def _stop_task_session_local_under_cancellation_lease(
             "ok": True,
             "stopped": True,
             "cleared_messages": cleared,
+            "task_status": observed_status,
+            "background_active": False,
         }
 
     transitioned = observed_status in transitioning_statuses
@@ -5145,6 +5637,8 @@ async def _stop_task_session_local_under_cancellation_lease(
             "stopped": False,
             "cleared_messages": cleared,
             "note": "No running process found, task marked as completed",
+            "task_status": "completed",
+            "background_active": False,
         }
 
     guarded = await db.execute(
@@ -5177,6 +5671,8 @@ async def _stop_task_session_local_under_cancellation_lease(
             "ok": True,
             "stopped": False,
             "cleared_messages": cleared,
+            "task_status": active_task.status,
+            "background_active": False,
         }
     raise HTTPException(400, "No running session found for this task")
 
@@ -5479,6 +5975,7 @@ async def stop_task_session(
     if task:
         await require_task_control(request, task, db)
         _require_not_delivery_owned_task(task, action="stopped")
+        await _require_not_isolated_browser_child(db, task, action="stopped")
         await _require_no_pr_review_publication(db, task_id)
         await _require_not_pr_review_task_mutation(
             db,
@@ -5510,6 +6007,11 @@ async def stop_task_session(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="stopped")
+        await _require_not_isolated_browser_child(
+            db,
+            current,
+            action="stopped",
+        )
         await _require_no_pr_review_publication(db, task_id)
         await _require_not_pr_review_task_mutation(
             db,
@@ -5526,8 +6028,14 @@ async def stop_task_session(
                 409,
                 "Task has an active Worker termination receipt",
             )
+        expected_harness_owner = test_harness_owner_identity(current)
+        await db.rollback()
         return await _finish_task_operation(
-            _stop_task_session_local_impl(task_id, db)
+            _stop_task_session_local_impl(
+                task_id,
+                db,
+                expected_identity=expected_harness_owner,
+            )
         )
 
 
@@ -5535,6 +6043,7 @@ async def _cancel_local_task_impl(
     task_id: int,
     db: AsyncSession,
     *,
+    expected_identity: TestHarnessOwnerIdentity,
     worker_termination_operation_id: str | None = None,
     worker_termination_execution_token: str | None = None,
     worker_termination_state_version: int | None = None,
@@ -5542,19 +6051,25 @@ async def _cancel_local_task_impl(
     """Keep message admission closed until cancellation is authoritative."""
 
     from backend.main import dispatcher
+    from backend.services.test_harness import test_harness_service
 
-    async with dispatcher.task_queue_cancellation_lease(task_id):
-        return await _cancel_local_task_under_cancellation_lease(
-            task_id,
-            db,
-            worker_termination_operation_id=(
-                worker_termination_operation_id
-            ),
-            worker_termination_execution_token=(
-                worker_termination_execution_token
-            ),
-            worker_termination_state_version=worker_termination_state_version,
-        )
+    async with test_harness_service.owner_stop_fence(
+        task_id,
+        reason="Owner Task was cancelled",
+        expected_identity=expected_identity,
+    ):
+        async with dispatcher.task_queue_cancellation_lease(task_id):
+            return await _cancel_local_task_under_cancellation_lease(
+                task_id,
+                db,
+                worker_termination_operation_id=(
+                    worker_termination_operation_id
+                ),
+                worker_termination_execution_token=(
+                    worker_termination_execution_token
+                ),
+                worker_termination_state_version=worker_termination_state_version,
+            )
 
 
 async def _cancel_local_task_under_cancellation_lease(
@@ -5692,6 +6207,7 @@ async def _cancel_local_task_under_cancellation_lease(
         )
     ).scalar_one_or_none()
     active_statuses = (
+        "pending_activation",
         "pending",
         "in_progress",
         "executing",
@@ -6066,6 +6582,11 @@ async def cancel_task(
     if task:
         await require_task_control(request, task, db)
         _require_not_delivery_owned_task(task, action="cancelled")
+        await _require_not_isolated_browser_child(
+            db,
+            task,
+            action="cancelled",
+        )
         await _require_no_pr_review_publication(db, task_id)
         await _require_not_pr_review_task_mutation(
             db,
@@ -6093,6 +6614,11 @@ async def cancel_task(
             raise HTTPException(404, "Task not found")
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="cancelled")
+        await _require_not_isolated_browser_child(
+            db,
+            current,
+            action="cancelled",
+        )
         await _require_no_pr_review_publication(db, task_id)
         await _require_not_pr_review_task_mutation(
             db,
@@ -6109,7 +6635,15 @@ async def cancel_task(
                 409,
                 "Task has an active Worker termination receipt",
             )
-        return await _finish_task_operation(_cancel_local_task_impl(task_id, db))
+        expected_harness_owner = test_harness_owner_identity(current)
+        await db.rollback()
+        return await _finish_task_operation(
+            _cancel_local_task_impl(
+                task_id,
+                db,
+                expected_identity=expected_harness_owner,
+            )
+        )
 
 
 @router.post("/{task_id}/retry", response_model=TaskResponse)
@@ -6135,6 +6669,11 @@ async def retry_task(
         await require_task_control(request, current, db)
         _require_not_delivery_owned_task(current, action="retried")
         _require_not_waiting_capability(current, action="retried")
+        await _require_not_isolated_browser_child(
+            db,
+            current,
+            action="retried",
+        )
         if has_worker_execution_quarantine(current.metadata_):
             raise HTTPException(
                 409,
@@ -6176,46 +6715,67 @@ async def retry_task(
             )
 
         if current.worker_id is not None:
-            await _ensure_worker_routing_ready(
-                current,
-                operation_lock_held=True,
-            )
-            observed = worker_task_generation(current)
-            if observed is None:
-                raise HTTPException(409, "Task Worker assignment changed")
-            await _sync_worker_skill_selection_before_execution(current)
+            expected_harness_owner = test_harness_owner_identity(current)
             await db.rollback()
-            db.expire_all()
-            current = await db.get(Task, task_id)
-            if (
-                current is None
-                or worker_task_generation(
-                    current,
-                    expected_worker_id=observed.worker_id,
-                )
-                != observed
+            from backend.services.test_harness import test_harness_service
+
+            async with test_harness_service.owner_stop_fence(
+                task_id,
+                reason="Owner Task was retried",
+                expected_identity=expected_harness_owner,
             ):
-                raise HTTPException(
-                    409,
-                    "Task Worker generation changed while Skill selection was "
-                    "being synchronized",
+                db.expire_all()
+                current = await db.get(Task, task_id)
+                if current is None or current.worker_id is None:
+                    raise HTTPException(409, "Task Worker assignment changed")
+                await _ensure_worker_routing_ready(
+                    current,
+                    operation_lock_held=True,
                 )
-            result = await _proxy(
-                current,
-                "POST",
-                f"/api/tasks/{task_id}/retry",
-                body=body.model_dump(mode="json") if body is not None else None,
-                operation_lock_held=True,
-            )
-            return await _sync_task_from_worker_response(
-                db,
-                current,
-                result,
-                observed=observed,
-            )
+                observed = worker_task_generation(current)
+                if observed is None:
+                    raise HTTPException(409, "Task Worker assignment changed")
+                await _sync_worker_skill_selection_before_execution(current)
+                await db.rollback()
+                db.expire_all()
+                current = await db.get(Task, task_id)
+                if (
+                    current is None
+                    or worker_task_generation(
+                        current,
+                        expected_worker_id=observed.worker_id,
+                    )
+                    != observed
+                ):
+                    raise HTTPException(
+                        409,
+                        "Task Worker generation changed while Skill selection was "
+                        "being synchronized",
+                    )
+                result = await _proxy(
+                    current,
+                    "POST",
+                    f"/api/tasks/{task_id}/retry",
+                    body=(
+                        body.model_dump(mode="json") if body is not None else None
+                    ),
+                    operation_lock_held=True,
+                )
+                return await _sync_task_from_worker_response(
+                    db,
+                    current,
+                    result,
+                    observed=observed,
+                )
 
         _require_no_pending_worker_routing(current)
-        retried = await _retry_local_task_safely(task_id, queue, db)
+        expected_harness_owner = test_harness_owner_identity(current)
+        retried = await _retry_local_task_safely(
+            task_id,
+            queue,
+            db,
+            expected_identity=expected_harness_owner,
+        )
         if not retried:
             raise HTTPException(404, "Task not found")
         locked_task = await _lock_task_generation(
@@ -6306,6 +6866,11 @@ async def archive_task(
     if task:
         await require_task_control(request, task, db)
         _require_not_delivery_owned_task(task, action="archived")
+        await _require_not_isolated_browser_child(
+            db,
+            task,
+            action="archived",
+        )
     task = await queue.archive(task_id)
     if not task:
         raise HTTPException(404, "Task not found")

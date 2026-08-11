@@ -11,12 +11,19 @@ from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 
 from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.log_entry import LogEntry
-from backend.models.pr_monitor import MonitoredRepo, PRFinding, PRReview, PRReviewerRun
+from backend.models.pr_monitor import (
+    MonitoredRepo,
+    PRFinding,
+    PRMonitorRun,
+    PRReview,
+    PRReviewerRun,
+)
 from backend.models.task import Task
 from backend.services.task_creation import stage_task_record
 from backend.services.task_queue import (
@@ -90,6 +97,59 @@ _PUBLICATION_LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z")
 _PUBLICATION_LEASE_TTL = timedelta(minutes=3)
 _PUBLICATION_LEASE_RENEW_SECONDS = 30.0
 _PUBLICATION_MUTATION_GUARD = timedelta(seconds=45)
+# ``merge``/``squash`` remain readable only to reconcile evidence for a
+# publication outbox armed by an older binary; they must never replay the
+# base-mutable PR merge endpoint. New publications always use ``fast-forward``
+# so the only branch mutation names the frozen base ref explicitly and is
+# rejected by GitHub if that ref no longer fast-forwards to the reviewed head.
+_SAFE_MERGE_METHODS = frozenset({"merge", "squash", "fast-forward"})
+_STANDARD_GITHUB_ROLES = {
+    "write": "write",
+    # GitHub's collaborator endpoint exposes the modern role as
+    # role_name="maintain" while retaining the legacy permission="write".
+    "maintain": "write",
+    "admin": "admin",
+}
+
+# Publication substates live in the existing durable outbox column.  They are
+# deliberately explicit instead of overloading a Monitor Run status: recovery
+# must be able to distinguish "safe to publish now" from "the exact review
+# outcome is known, but an earlier GitHub Finding effect still has to clear".
+_WAITING_FOR_THREADS_ACTIONS = {
+    "waiting_threads:approved_merged": "approved_merged",
+    "waiting_threads:lgtm_comment": "lgtm_comment",
+}
+_NEEDS_IDENTITY_ACTIONS = {
+    "needs_identity:approved_merged": "approved_merged",
+}
+_PUBLICATION_ACTIONS = {
+    "approved_merged",
+    "lgtm_comment",
+    "review_comments",
+}
+_IDENTITY_TASK_ACTIVE_STATUSES = frozenset({"pending", "in_progress", "executing"})
+
+
+def _waiting_for_threads_action(action: str) -> str:
+    for pending, restored in _WAITING_FOR_THREADS_ACTIONS.items():
+        if restored == action:
+            return pending
+    raise ValueError("unsupported thread-wait publication action")
+
+
+def _restored_thread_action(pending_action: object) -> str | None:
+    return _WAITING_FOR_THREADS_ACTIONS.get(pending_action)
+
+
+def _needs_identity_action(action: str) -> str:
+    for pending, restored in _NEEDS_IDENTITY_ACTIONS.items():
+        if restored == action:
+            return pending
+    raise ValueError("unsupported identity publication action")
+
+
+def _restored_identity_action(pending_action: object) -> str | None:
+    return _NEEDS_IDENTITY_ACTIONS.get(pending_action)
 
 
 class GhError(Exception):
@@ -99,6 +159,16 @@ class GhError(Exception):
         super().__init__(message)
         low = message.lower()
         self.is_auth = any(marker in low for marker in GH_AUTH_ERROR_MARKERS)
+
+
+class GhRepositoryCapabilityError(GhError):
+    """A deterministic repository policy/schema rejection, not transport."""
+
+
+def _direct_ref_capability_error(detail: str) -> GhRepositoryCapabilityError:
+    return GhRepositoryCapabilityError(
+        f"GitHub repository direct-ref capability is unsafe: {detail}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +330,37 @@ def _validate_review_identifiers(
     if not _GITHUB_SHA_RE.fullmatch(head_sha):
         raise ValueError("invalid PR head SHA")
     return pr_number, repo_name, base_sha, head_sha
+
+
+def _valid_base_ref(value: object) -> bool:
+    return bool(
+        isinstance(value, str)
+        and 0 < len(value) <= 200
+        and "\x00" not in value
+        and "\n" not in value
+        and "\r" not in value
+    )
+
+
+def _frozen_pr_base_ref(
+    repo: MonitoredRepo,
+    pr_data: dict,
+    *,
+    explicit: str | None = None,
+) -> str:
+    """Resolve one immutable target branch without recovery-time drift."""
+
+    embedded = pr_data.get("base_ref")
+    if embedded is not None and explicit is not None and embedded != explicit:
+        raise ValueError("PR base ref does not match the frozen subject")
+    value = (
+        embedded
+        if embedded is not None
+        else (repo.default_branch if explicit is None else explicit)
+    )
+    if not _valid_base_ref(value):
+        raise ValueError("invalid PR base ref")
+    return value
 
 
 async def _gh_api_value(
@@ -974,6 +1075,7 @@ async def _fetch_pr_material(
     *,
     repo_name: str,
     pr_number: int,
+    base_ref: str,
     base_sha: str,
     head_sha: str,
 ) -> dict:
@@ -1011,6 +1113,7 @@ async def _fetch_pr_material(
     snapshot = _validated_pr_snapshot(metadata)
     _require_open_snapshot(
         snapshot,
+        base_ref=base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
     )
@@ -1054,6 +1157,7 @@ async def _fetch_pr_material(
     )
     _require_open_snapshot(
         final_snapshot,
+        base_ref=base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
     )
@@ -1073,6 +1177,8 @@ async def _fetch_pr_material(
 async def prepare_pr_review_context(
     repo: MonitoredRepo,
     pr_data: dict,
+    *,
+    base_ref: str | None = None,
 ) -> dict:
     """Prepare all model-visible input before any task/review mutation."""
 
@@ -1080,16 +1186,23 @@ async def prepare_pr_review_context(
         repo,
         pr_data,
     )
+    frozen_base_ref = _frozen_pr_base_ref(
+        repo,
+        pr_data,
+        explicit=base_ref,
+    )
     guidance = await _fetch_base_guidance(repo_name, base_sha)
     material = await _fetch_pr_material(
         repo_name=repo_name,
         pr_number=pr_number,
+        base_ref=frozen_base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
     )
     return {
         "repo_name": repo_name,
         "pr_number": pr_number,
+        "base_ref": frozen_base_ref,
         "base_sha": base_sha,
         "head_sha": head_sha,
         "guidance": guidance,
@@ -1100,6 +1213,8 @@ async def prepare_pr_review_context(
 async def verify_pr_review_snapshot_current(
     repo: MonitoredRepo,
     pr_data: dict,
+    *,
+    base_ref: str | None = None,
 ) -> None:
     """Fail unless GitHub still exposes the exact open webhook snapshot."""
 
@@ -1107,11 +1222,17 @@ async def verify_pr_review_snapshot_current(
         repo,
         pr_data,
     )
+    frozen_base_ref = _frozen_pr_base_ref(
+        repo,
+        pr_data,
+        explicit=base_ref,
+    )
     snapshot = _validated_pr_snapshot(
         await _gh_pr_view(pr_number, repo_name)
     )
     _require_open_snapshot(
         snapshot,
+        base_ref=frozen_base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
     )
@@ -1207,7 +1328,10 @@ async def _gh_pr_view(pr_number: int, repo_full_name: str) -> dict:
             "pr", "view", str(pr_number),
             "--repo", repo_full_name,
             "--json",
-            "state,mergedAt,baseRefOid,headRefOid,isDraft,mergeCommit",
+            (
+                "state,mergedAt,mergedBy,baseRefName,baseRefOid,"
+                "headRefOid,isDraft,mergeCommit"
+            ),
         )
     except GhError:
         raise
@@ -1228,10 +1352,17 @@ def _validated_pr_snapshot(pr_info: object) -> dict[str, object]:
     if not isinstance(pr_info, dict):
         raise GhError("Malformed gh PR response: expected an object")
     state = pr_info.get("state")
+    base_ref = pr_info.get("baseRefName")
     base_oid = pr_info.get("baseRefOid")
     head_oid = pr_info.get("headRefOid")
     is_draft = pr_info.get("isDraft")
     merged_at = pr_info.get("mergedAt")
+    merged_by = pr_info.get("mergedBy")
+    merged_actor = (
+        merged_by.get("login")
+        if isinstance(merged_by, dict)
+        else None
+    )
     merge_commit = pr_info.get("mergeCommit")
     merge_commit_sha = (
         merge_commit.get("oid")
@@ -1241,6 +1372,7 @@ def _validated_pr_snapshot(pr_info: object) -> dict[str, object]:
     if (
         not isinstance(state, str)
         or state.upper() not in {"OPEN", "CLOSED", "MERGED"}
+        or not _valid_base_ref(base_ref)
         or not isinstance(base_oid, str)
         or _GITHUB_SHA_RE.fullmatch(base_oid.lower()) is None
         or not isinstance(head_oid, str)
@@ -1261,14 +1393,24 @@ def _validated_pr_snapshot(pr_info: object) -> dict[str, object]:
             (state.upper() == "MERGED" or merged_at is not None)
             and merge_commit_sha is None
         )
+        or (
+            merged_by is not None
+            and (
+                not isinstance(merged_actor, str)
+                or not merged_actor
+                or len(merged_actor) > 200
+            )
+        )
     ):
         raise GhError("Malformed gh PR response fields")
     return {
         "state": state.upper(),
+        "base_ref": base_ref,
         "base_sha": base_oid.lower(),
         "head_sha": head_oid.lower(),
         "is_draft": is_draft,
         "merged_at": merged_at,
+        "merged_actor": merged_actor,
         "merge_commit_sha": (
             merge_commit_sha.lower()
             if isinstance(merge_commit_sha, str)
@@ -1277,9 +1419,67 @@ def _validated_pr_snapshot(pr_info: object) -> dict[str, object]:
     }
 
 
+def _select_safe_merge_method(
+    repo_info: object,
+    *,
+    expected_repo_name: str | None = None,
+) -> str:
+    """Validate direct-ref capability for a newly armed publication.
+
+    New publications never use GitHub's base-mutable PR merge endpoint, so the
+    repository's merge/squash/rebase preferences are not capabilities of the
+    selected protocol.  The relevant admission facts are that this is the
+    repository we queried, it can still accept writes, and the authenticated
+    identity has push access.  Require each fact with its documented JSON type
+    rather than treating a missing field as a permissive default.
+    """
+
+    if not isinstance(repo_info, dict):
+        raise _direct_ref_capability_error("response is malformed")
+    full_name = repo_info.get("full_name")
+    archived = repo_info.get("archived")
+    disabled = repo_info.get("disabled")
+    permissions = repo_info.get("permissions")
+    push = permissions.get("push") if isinstance(permissions, dict) else None
+    if (
+        not isinstance(full_name, str)
+        or _GITHUB_REPO_RE.fullmatch(full_name) is None
+        or type(archived) is not bool
+        or type(disabled) is not bool
+        or not isinstance(permissions, dict)
+        or type(push) is not bool
+    ):
+        raise _direct_ref_capability_error("response is malformed")
+    if (
+        expected_repo_name is not None
+        and (
+            _GITHUB_REPO_RE.fullmatch(expected_repo_name) is None
+            or full_name.lower() != expected_repo_name.lower()
+        )
+    ):
+        raise _direct_ref_capability_error("repository identity mismatched")
+    if archived or disabled:
+        raise _direct_ref_capability_error("repository is archived or disabled")
+    if push is not True:
+        raise _direct_ref_capability_error(
+            "publishing identity lacks push permission"
+        )
+    return "fast-forward"
+
+
+async def _freeze_safe_merge_method(repo_name: str) -> str:
+    """Read repository capabilities before any auto-merge publication write."""
+
+    return _select_safe_merge_method(
+        await _gh_api_json(f"repos/{repo_name}"),
+        expected_repo_name=repo_name,
+    )
+
+
 def _require_open_snapshot(
     snapshot: dict[str, object],
     *,
+    base_ref: str,
     base_sha: str,
     head_sha: str,
 ) -> None:
@@ -1288,10 +1488,498 @@ def _require_open_snapshot(
     if (
         snapshot["state"] != "OPEN"
         or snapshot["merged_at"] is not None
+        or snapshot["base_ref"] != base_ref
         or snapshot["base_sha"] != base_sha
         or snapshot["head_sha"] != head_sha
     ):
         raise GhError("GitHub PR snapshot changed before the backend action")
+
+
+def _direct_merge_policy_error(detail: str) -> GhError:
+    return GhError(f"Direct auto-merge protection policy is unsafe: {detail}")
+
+
+def _validate_direct_merge_protection(
+    protection: object,
+    permission: object,
+    effective_rules: object,
+    *,
+    actor: str,
+    merge_method: str,
+    frozen_required_checks: object = None,
+    exact_ci: object = None,
+    head_sha: str | None = None,
+) -> None:
+    """Validate the classic protection contract for a frozen-ref update."""
+
+    if not isinstance(effective_rules, list):
+        raise _direct_merge_policy_error(
+            "effective repository rules response is malformed"
+        )
+    if effective_rules:
+        # Ruleset bypass actors and force-update semantics are not represented
+        # by the classic branch-protection response.  This first version is
+        # deliberately classic-only rather than combining two policy systems
+        # and accidentally overlooking a bypass path.
+        raise _direct_merge_policy_error(
+            "active rulesets are unsupported; use classic branch protection only"
+        )
+    if not isinstance(protection, dict):
+        raise _direct_merge_policy_error(
+            "classic branch protection response is malformed"
+        )
+
+    required = protection.get("required_status_checks")
+    contexts = required.get("contexts") if isinstance(required, dict) else None
+    checks = required.get("checks") if isinstance(required, dict) else None
+    valid_contexts = bool(
+        isinstance(contexts, list)
+        and all(
+            isinstance(item, str)
+            and item
+            and len(item) <= 200
+            and "\x00" not in item
+            and "\n" not in item
+            and "\r" not in item
+            for item in contexts
+        )
+    )
+    valid_checks = bool(
+        isinstance(checks, list)
+        and all(
+            isinstance(item, dict)
+            and isinstance(item.get("context"), str)
+            and bool(item["context"])
+            and len(item["context"]) <= 200
+            and "\x00" not in item["context"]
+            and "\n" not in item["context"]
+            and "\r" not in item["context"]
+            and (
+                item.get("app_id") is None
+                or (
+                    type(item.get("app_id")) is int
+                    and item["app_id"] >= -1
+                )
+            )
+            for item in checks
+        )
+    )
+    if (
+        not isinstance(required, dict)
+        or required.get("strict") is not True
+        or not valid_contexts
+        or not valid_checks
+        or not contexts and not checks
+    ):
+        raise _direct_merge_policy_error(
+            "required status checks must be strict and non-empty"
+        )
+
+    coverage_values = (frozen_required_checks, exact_ci, head_sha)
+    if any(value is not None for value in coverage_values):
+        if (
+            not isinstance(frozen_required_checks, list)
+            or not frozen_required_checks
+            or not isinstance(exact_ci, dict)
+            or not isinstance(head_sha, str)
+            or _GITHUB_SHA_RE.fullmatch(head_sha) is None
+            or exact_ci.get("head_sha") != head_sha
+        ):
+            raise _direct_merge_policy_error(
+                "frozen required-check coverage evidence is malformed"
+            )
+        normalized: list[dict[str, str]] = []
+        identities: set[tuple[str, str, str]] = set()
+        for item in frozen_required_checks:
+            kind = item.get("kind") if isinstance(item, dict) else None
+            name = item.get("name") if isinstance(item, dict) else None
+            app_slug = item.get("app_slug") if isinstance(item, dict) else None
+            if (
+                kind != "check_run"
+                or not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(app_slug, str)
+                or not app_slug.strip()
+            ):
+                raise _direct_merge_policy_error(
+                    "direct fast-forward requires app-bound check-run policies"
+                )
+            identity = (kind, name.strip(), app_slug.strip().lower())
+            if identity in identities:
+                raise _direct_merge_policy_error(
+                    "frozen required-check coverage evidence is duplicated"
+                )
+            identities.add(identity)
+            normalized.append({
+                "kind": identity[0],
+                "name": identity[1],
+                "app_slug": identity[2],
+            })
+        observed = exact_ci.get("observed")
+        if exact_ci.get("required") != normalized or not isinstance(observed, list):
+            raise _direct_merge_policy_error(
+                "frozen required-check coverage evidence is mismatched"
+            )
+        observed_by_identity: dict[tuple[str, str, str], dict] = {}
+        for item in observed:
+            if not isinstance(item, dict):
+                raise _direct_merge_policy_error(
+                    "frozen required-check coverage evidence is malformed"
+                )
+            observed_kind = item.get("kind")
+            observed_name = item.get("name")
+            observed_slug = item.get("app_slug")
+            if (
+                observed_kind != "check_run"
+                or not isinstance(observed_name, str)
+                or not observed_name
+                or not isinstance(observed_slug, str)
+                or not observed_slug
+            ):
+                raise _direct_merge_policy_error(
+                    "frozen required-check coverage evidence is malformed"
+                )
+            identity = (
+                observed_kind,
+                observed_name,
+                observed_slug,
+            )
+            if identity in observed_by_identity:
+                raise _direct_merge_policy_error(
+                    "frozen required-check coverage evidence is duplicated"
+                )
+            observed_by_identity[identity] = item
+        if len(observed_by_identity) != len(identities):
+            raise _direct_merge_policy_error(
+                "frozen required-check coverage evidence is mismatched"
+            )
+        protected_checks = {
+            (item["context"], item["app_id"])
+            for item in checks
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("context"), str)
+                and type(item.get("app_id")) is int
+                and item["app_id"] > 0
+            )
+        }
+        for identity in identities:
+            item = observed_by_identity.get(identity)
+            app_id = item.get("app_id") if isinstance(item, dict) else None
+            if (
+                item is None
+                or item.get("state") != "passed"
+                or type(app_id) is not int
+                or app_id <= 0
+                or (identity[1], app_id) not in protected_checks
+            ):
+                raise _direct_merge_policy_error(
+                    "every frozen required check must be atomically enforced "
+                    "by matching branch protection"
+                )
+
+    enforce_admins = protection.get("enforce_admins")
+    if (
+        not isinstance(enforce_admins, dict)
+        or enforce_admins.get("enabled") is not True
+    ):
+        raise _direct_merge_policy_error(
+            "administrators must be subject to branch protection"
+        )
+    allow_force = protection.get("allow_force_pushes")
+    if (
+        not isinstance(allow_force, dict)
+        or allow_force.get("enabled") is not False
+    ):
+        raise _direct_merge_policy_error("force pushes must be disabled")
+    allow_deletions = protection.get("allow_deletions")
+    if (
+        not isinstance(allow_deletions, dict)
+        or allow_deletions.get("enabled") is not False
+    ):
+        raise _direct_merge_policy_error("branch deletion must be disabled")
+
+    conversations = protection.get("required_conversation_resolution")
+    if (
+        not isinstance(conversations, dict)
+        or type(conversations.get("enabled")) is not bool
+    ):
+        raise _direct_merge_policy_error(
+            "conversation-resolution protection is malformed"
+        )
+    if conversations["enabled"]:
+        # GitHub enforces this control on its PR merge mutation, not on a raw
+        # ref push. The frozen-ref protocol therefore cannot prove it honored
+        # the gate and must fail closed whenever it is enabled.
+        raise _direct_merge_policy_error(
+            "required conversation resolution is incompatible with "
+            "direct fast-forward"
+        )
+
+    pull_reviews = protection.get("required_pull_request_reviews")
+    if pull_reviews is not None:
+        if not isinstance(pull_reviews, dict):
+            raise _direct_merge_policy_error(
+                "pull-request review protection is malformed"
+            )
+        allowances = pull_reviews.get("bypass_pull_request_allowances")
+        if not isinstance(allowances, dict):
+            raise _direct_merge_policy_error(
+                "pull-request bypass allowances are malformed"
+            )
+        for kind in ("users", "teams", "apps"):
+            values = allowances.get(kind)
+            if not isinstance(values, list) or values:
+                raise _direct_merge_policy_error(
+                    "pull-request bypass allowances must be explicitly empty"
+                )
+        if merge_method == "fast-forward":
+            # PATCHing the frozen Git ref is deliberately not GitHub's
+            # base-mutable PR merge mutation. Repositories that require native
+            # approving reviews must use Merge Queue instead; the ref update
+            # would be rejected and CCM never grants itself a bypass.
+            raise _direct_merge_policy_error(
+                "fast-forward mode is incompatible with required GitHub "
+                "pull-request reviews"
+            )
+
+    linear = protection.get("required_linear_history")
+    if linear is not None and not isinstance(linear, dict):
+        raise _direct_merge_policy_error(
+            "linear-history protection is malformed"
+        )
+    if (
+        merge_method == "merge"
+        and isinstance(linear, dict)
+        and linear.get("enabled") is True
+    ):
+        raise _direct_merge_policy_error(
+            "merge commits conflict with required linear history"
+        )
+
+    if not isinstance(permission, dict):
+        raise _direct_merge_policy_error(
+            "publisher repository permission response is malformed"
+        )
+    role = permission.get("role_name")
+    user = permission.get("user")
+    permissions = user.get("permissions") if isinstance(user, dict) else None
+    if (
+        role not in _STANDARD_GITHUB_ROLES
+        or permission.get("permission") != _STANDARD_GITHUB_ROLES.get(role)
+        or not isinstance(user, dict)
+        or not isinstance(user.get("login"), str)
+        or user["login"].lower() != actor.lower()
+        or user.get("type") != "User"
+        or user.get("role_name") != role
+        or not isinstance(permissions, dict)
+        or permissions.get("push") is not True
+        or (
+            role == "admin"
+            and permissions.get("admin") is not True
+        )
+        or (
+            role == "maintain"
+            and permissions.get("maintain") is not True
+        )
+    ):
+        raise _direct_merge_policy_error(
+            "publisher must have a standard write, maintain, or admin role"
+        )
+
+
+def _github_not_found(exc: GhError) -> bool:
+    value = str(exc).strip().lower()
+    return (
+        "http 404" in value
+        or '"status":404' in value
+        or '"status": 404' in value
+        or value == "not found"
+    )
+
+
+async def _require_direct_merge_protection(
+    *,
+    repo_name: str,
+    base_ref: str,
+    actor: str,
+    merge_method: str,
+    frozen_required_checks: object = None,
+    exact_ci: object = None,
+    head_sha: str | None = None,
+) -> None:
+    if (
+        not isinstance(base_ref, str)
+        or not base_ref
+        or len(base_ref) > 200
+        or "\x00" in base_ref
+        or "\n" in base_ref
+        or "\r" in base_ref
+    ):
+        raise _direct_merge_policy_error("configured base branch is invalid")
+    branch = quote(base_ref, safe="")
+    username = quote(actor, safe="")
+    try:
+        protection = await _gh_api_json(
+            f"repos/{repo_name}/branches/{branch}/protection"
+        )
+    except GhError as exc:
+        if _github_not_found(exc):
+            raise _direct_merge_policy_error(
+                "the base branch has no classic protection"
+            ) from exc
+        raise
+    try:
+        permission = await _gh_api_json(
+            f"repos/{repo_name}/collaborators/{username}/permission"
+        )
+    except GhError as exc:
+        if _github_not_found(exc):
+            raise _direct_merge_policy_error(
+                "the publisher is not a standard repository collaborator"
+            ) from exc
+        raise
+    try:
+        effective_rules = await _gh_api_value(
+            f"repos/{repo_name}/rules/branches/{branch}?per_page=1&page=1"
+        )
+    except GhError as exc:
+        if _github_not_found(exc):
+            raise _direct_merge_policy_error(
+                "effective repository rules could not be verified"
+            ) from exc
+        raise
+    _validate_direct_merge_protection(
+        protection,
+        permission,
+        effective_rules,
+        actor=actor,
+        merge_method=merge_method,
+        frozen_required_checks=frozen_required_checks,
+        exact_ci=exact_ci,
+        head_sha=head_sha,
+    )
+
+
+async def _require_commit_ancestor(
+    *,
+    repo_name: str,
+    ancestor: str,
+    descendant: str,
+) -> None:
+    """Require one immutable GitHub commit to contain another."""
+
+    if ancestor == descendant:
+        return
+    endpoint = f"repos/{repo_name}/compare/{ancestor}...{descendant}"
+    value = await _gh_api_json(
+        f"{endpoint}?per_page=1&page=1",
+        max_output_bytes=_MAX_GH_COMPARE_RESPONSE_BYTES,
+    )
+    base_commit = value.get("base_commit")
+    merge_base = value.get("merge_base_commit")
+    commits = value.get("commits")
+    response_url = value.get("url")
+    status = value.get("status")
+    ahead_by = value.get("ahead_by")
+    behind_by = value.get("behind_by")
+    total_commits = value.get("total_commits")
+    if (
+        not isinstance(base_commit, dict)
+        or not isinstance(base_commit.get("sha"), str)
+        or _GITHUB_SHA_RE.fullmatch(base_commit["sha"].lower()) is None
+        or base_commit["sha"].lower() != ancestor
+        or not isinstance(merge_base, dict)
+        or not isinstance(merge_base.get("sha"), str)
+        or _GITHUB_SHA_RE.fullmatch(merge_base["sha"].lower()) is None
+        or not isinstance(response_url, str)
+        or not response_url.lower().rstrip("/").endswith(
+            f"/{endpoint}".lower()
+        )
+        or status not in {"ahead", "behind", "diverged", "identical"}
+        or type(ahead_by) is not int
+        or ahead_by < 0
+        or type(behind_by) is not int
+        or behind_by < 0
+        or type(total_commits) is not int
+        or total_commits < 0
+        or not isinstance(commits, list)
+        or len(commits) != 1
+        or not isinstance(commits[0], dict)
+        or not isinstance(commits[0].get("sha"), str)
+        or _GITHUB_SHA_RE.fullmatch(commits[0]["sha"].lower()) is None
+    ):
+        raise GhError("GitHub commit ancestry response is malformed")
+    if (
+        status != "ahead"
+        or merge_base["sha"].lower() != ancestor
+        or ahead_by <= 0
+        or behind_by != 0
+        or total_commits != ahead_by
+    ):
+        raise GhError(
+            "GitHub PR base ancestry is unsafe for direct auto-merge"
+        )
+
+
+async def _require_safe_base_chain(
+    *,
+    repo_name: str,
+    captured_base: str,
+    actual_base: str,
+    head_sha: str,
+) -> None:
+    await _require_commit_ancestor(
+        repo_name=repo_name,
+        ancestor=captured_base,
+        descendant=actual_base,
+    )
+    await _require_commit_ancestor(
+        repo_name=repo_name,
+        ancestor=actual_base,
+        descendant=head_sha,
+    )
+
+
+def _require_open_merge_head_snapshot(
+    snapshot: dict[str, object],
+    *,
+    base_ref: str,
+    head_sha: str,
+) -> str:
+    if snapshot["is_draft"]:
+        raise GhError("PR became draft before the backend action")
+    if (
+        snapshot["state"] != "OPEN"
+        or snapshot["merged_at"] is not None
+        or snapshot["base_ref"] != base_ref
+        or snapshot["head_sha"] != head_sha
+        or not isinstance(snapshot["base_sha"], str)
+    ):
+        raise GhError("GitHub PR snapshot changed before the backend action")
+    return snapshot["base_sha"]
+
+
+async def _require_safe_open_merge_snapshot(
+    snapshot: dict[str, object],
+    *,
+    repo_name: str,
+    base_ref: str,
+    captured_base: str,
+    head_sha: str,
+) -> str:
+    actual_base = _require_open_merge_head_snapshot(
+        snapshot,
+        base_ref=base_ref,
+        head_sha=head_sha,
+    )
+    await _require_safe_base_chain(
+        repo_name=repo_name,
+        captured_base=captured_base,
+        actual_base=actual_base,
+        head_sha=head_sha,
+    )
+    return actual_base
 
 
 def _validated_action_nonce(
@@ -1314,6 +2002,20 @@ def _review_body_with_evidence(body: str, nonce: str) -> str:
     clean = body.strip()
     suffix = f"CCM review nonce: {nonce}"
     return f"{clean}\n\n{suffix}" if clean else suffix
+
+
+def _approval_review_body(*, head_sha: str, auto_merge: bool) -> str:
+    """Render the public, exact-head recommendation before any merge effect."""
+
+    if auto_merge:
+        return (
+            "CCM automated review passed. Automatic merge is enabled for "
+            f"the exact reviewed head `{head_sha}`."
+        )
+    return (
+        "CCM automated review passed. The exact reviewed head "
+        f"`{head_sha}` is ready to merge."
+    )
 
 
 def _parse_github_datetime(value: object) -> datetime | None:
@@ -1421,25 +2123,40 @@ async def _find_review_evidence(
                 matches.append(item)
     if not matches:
         return None
-    states = {
-        _validate_review_evidence(
-            match,
-            expected_states=_expected_review_states(result),
-            expected_head=head_sha,
-            nonce=nonce,
-            actor=actor,
-            publishing_started_at=publishing_started_at,
-        )
-        for match in matches
-    }
-    if len(matches) > 1:
+    states: set[str] = set()
+    valid_count = 0
+    for match in matches:
+        try:
+            states.add(
+                _validate_review_evidence(
+                    match,
+                    expected_states=_expected_review_states(result),
+                    expected_head=head_sha,
+                    nonce=nonce,
+                    actor=actor,
+                    publishing_started_at=publishing_started_at,
+                )
+            )
+            valid_count += 1
+        except GhError:
+            # The nonce becomes public with the first Review attempt. Other
+            # PR participants can quote it in their own Review, so a marker is
+            # authoritative only when every frozen evidence field matches.
+            logger.warning(
+                "Ignoring untrusted review marker for PR %s#%s",
+                repo_name,
+                pr_number,
+            )
+    if not states:
+        return None
+    if valid_count > 1:
         # A pre-lease crash race in an older CCM may already have created
         # duplicate nonce-bearing reviews. Every copy must independently prove
         # the same head, actor, timestamp, and allowed state; after that the
         # action is confirmed rather than left permanently publishing.
         logger.warning(
             "Found %d valid GitHub review records for nonce %s",
-            len(matches),
+            valid_count,
             nonce,
         )
     return "APPROVED" if "APPROVED" in states else sorted(states)[0]
@@ -1449,9 +2166,24 @@ async def _find_merge_evidence(
     *,
     repo_name: str,
     pr_number: int,
+    base_ref: str,
+    base_sha: str,
     head_sha: str,
     nonce: str,
+    actor: str,
+    publishing_started_at: datetime,
+    merge_method: str,
 ) -> bool:
+    if (
+        not _valid_base_ref(base_ref)
+        or _GITHUB_SHA_RE.fullmatch(base_sha) is None
+        or _GITHUB_SHA_RE.fullmatch(head_sha) is None
+        or not isinstance(actor, str)
+        or not actor
+        or not isinstance(publishing_started_at, datetime)
+        or merge_method not in _SAFE_MERGE_METHODS
+    ):
+        raise GhError("Frozen GitHub merge evidence policy is invalid")
     snapshot = _validated_pr_snapshot(
         await _gh_pr_view(pr_number, repo_name)
     )
@@ -1460,11 +2192,43 @@ async def _find_merge_evidence(
     if (
         snapshot["state"] != "MERGED"
         or snapshot["merged_at"] is None
+        or snapshot["base_ref"] != base_ref
         or snapshot["head_sha"] != head_sha
+        or snapshot["merged_actor"] is None
+        or str(snapshot["merged_actor"]).lower() != actor.lower()
         or not isinstance(snapshot["merge_commit_sha"], str)
     ):
         raise GhError("GitHub PR changed without matching merge evidence")
+    merged_at = _parse_github_datetime(snapshot["merged_at"])
+    started_at = publishing_started_at.replace(
+        tzinfo=publishing_started_at.tzinfo or timezone.utc,
+    ).astimezone(timezone.utc)
+    if merged_at is None or merged_at < started_at - timedelta(seconds=5):
+        raise GhError("GitHub PR changed without matching merge evidence")
     merge_sha = snapshot["merge_commit_sha"]
+    if merge_method == "fast-forward":
+        # New CCM versions update the frozen target branch itself with a
+        # non-force fast-forward to the exact reviewed head.  GitHub then
+        # records the PR as merged.  Unlike the PR merge mutation, this write
+        # cannot be redirected by a concurrent base-ref edit because its REST
+        # endpoint contains the immutable base_ref.  The current base may
+        # advance later, so prove the reviewed head remains in its ancestry.
+        if merge_sha != head_sha or not isinstance(snapshot["base_sha"], str):
+            raise GhError(
+                "GitHub fast-forward merge evidence is malformed or mismatched"
+            )
+        await _require_commit_ancestor(
+            repo_name=repo_name,
+            ancestor=base_sha,
+            descendant=head_sha,
+        )
+        await _require_commit_ancestor(
+            repo_name=repo_name,
+            ancestor=head_sha,
+            descendant=snapshot["base_sha"],
+        )
+        return True
+
     commit = await _gh_api_json(f"repos/{repo_name}/commits/{merge_sha}")
     commit_sha = commit.get("sha")
     commit_data = commit.get("commit")
@@ -1474,21 +2238,236 @@ async def _find_merge_evidence(
         else None
     )
     parents = commit.get("parents")
+    parent_shas = (
+        [
+            parent.get("sha").lower()
+            for parent in parents
+            if (
+                isinstance(parent, dict)
+                and isinstance(parent.get("sha"), str)
+                and _GITHUB_SHA_RE.fullmatch(parent["sha"].lower())
+                is not None
+            )
+        ]
+        if isinstance(parents, list)
+        else []
+    )
     if (
         not isinstance(commit_sha, str)
         or commit_sha.lower() != merge_sha
         or not isinstance(message, str)
         or f"CCM review nonce: {nonce}" not in message
         or not isinstance(parents, list)
-        or not any(
-            isinstance(parent, dict)
-            and isinstance(parent.get("sha"), str)
-            and parent["sha"].lower() == head_sha
-            for parent in parents
+        or len(parent_shas) != len(parents)
+        or (
+            merge_method == "merge"
+            and (
+                len(parent_shas) != 2
+                or parent_shas[1] != head_sha
+            )
         )
+        or (merge_method == "squash" and len(parent_shas) != 1)
     ):
         raise GhError("GitHub merge commit evidence is malformed or mismatched")
+    actual_base = parent_shas[0]
+    await _require_safe_base_chain(
+        repo_name=repo_name,
+        captured_base=base_sha,
+        actual_base=actual_base,
+        head_sha=head_sha,
+    )
     return True
+
+
+def _merged_comment_marker(*, nonce: str, head_sha: str) -> str:
+    return (
+        "<!-- ccm-pr-outcome:merged;"
+        f"nonce:{nonce};head:{head_sha} -->"
+    )
+
+
+def _merged_comment_body(*, nonce: str, head_sha: str) -> str:
+    return (
+        "CCM automated review passed and merged the exact reviewed head "
+        f"`{head_sha}`.\n\n"
+        f"{_merged_comment_marker(nonce=nonce, head_sha=head_sha)}"
+    )
+
+
+def _validate_merged_comment_evidence(
+    response: dict,
+    *,
+    head_sha: str,
+    nonce: str,
+    actor: str,
+    publishing_started_at: datetime,
+) -> int:
+    comment_id = response.get("id")
+    body = response.get("body")
+    user = response.get("user")
+    created_at = _parse_github_datetime(response.get("created_at"))
+    started_at = publishing_started_at.replace(
+        tzinfo=publishing_started_at.tzinfo or timezone.utc,
+    ).astimezone(timezone.utc)
+    if (
+        type(comment_id) is not int
+        or comment_id <= 0
+        or not isinstance(body, str)
+        or _merged_comment_marker(nonce=nonce, head_sha=head_sha) not in body
+        or not isinstance(user, dict)
+        or not isinstance(user.get("login"), str)
+        or user["login"].lower() != actor.lower()
+        or created_at is None
+        # GitHub timestamps have lower precision than our database timestamp.
+        or created_at < started_at - timedelta(seconds=5)
+    ):
+        raise GhError(
+            "GitHub merged comment evidence is malformed or mismatched"
+        )
+    return comment_id
+
+
+async def _find_merged_comment_evidence(
+    *,
+    repo_name: str,
+    pr_number: int,
+    head_sha: str,
+    nonce: str,
+    actor: str,
+    publishing_started_at: datetime,
+) -> int | None:
+    value = await _gh_api_value(
+        f"repos/{repo_name}/issues/{pr_number}/comments?per_page=100",
+        max_output_bytes=_MAX_GH_REVIEWS_RESPONSE_BYTES,
+        paginate=True,
+    )
+    if not isinstance(value, list) or any(
+        not isinstance(page, list) for page in value
+    ):
+        raise GhError("GitHub issue comments response is malformed")
+    marker = _merged_comment_marker(nonce=nonce, head_sha=head_sha)
+    matches: list[dict] = []
+    for page in value:
+        for item in page:
+            if not isinstance(item, dict):
+                raise GhError(
+                    "GitHub issue comments response contains a malformed item"
+                )
+            body = item.get("body")
+            if isinstance(body, str) and marker in body:
+                matches.append(item)
+    if not matches:
+        return None
+    comment_ids: set[int] = set()
+    for match in matches:
+        try:
+            comment_ids.add(
+                _validate_merged_comment_evidence(
+                    match,
+                    head_sha=head_sha,
+                    nonce=nonce,
+                    actor=actor,
+                    publishing_started_at=publishing_started_at,
+                )
+            )
+        except GhError:
+            # The marker is public after the approval Review is published.
+            # A different PR participant can quote or copy it, so only
+            # evidence authored by the frozen publisher with the exact
+            # subject and publication time is authoritative.
+            logger.warning(
+                "Ignoring untrusted merged-comment marker for PR %s#%s",
+                repo_name,
+                pr_number,
+            )
+    if not comment_ids:
+        return None
+    if len(comment_ids) > 1:
+        # Older deployments could race before the durable publication lease
+        # existed. Every matching copy must independently prove the same
+        # actor, exact head, nonce, and publication time before convergence.
+        logger.warning(
+            "Found %d valid merged comments for PR outcome nonce %s",
+            len(comment_ids),
+            nonce,
+        )
+    return min(comment_ids)
+
+
+async def _publish_merged_comment(
+    *,
+    repo_name: str,
+    pr_number: int,
+    base_ref: str,
+    base_sha: str,
+    head_sha: str,
+    nonce: str,
+    actor: str,
+    current_actor: str,
+    publishing_started_at: datetime,
+    merge_method: str,
+    ensure_current: Callable[[], Awaitable[bool]],
+) -> None:
+    """Reconcile or publish the post-merge receipt for one exact PR head."""
+
+    evidence_kwargs = {
+        "repo_name": repo_name,
+        "pr_number": pr_number,
+        "head_sha": head_sha,
+        "nonce": nonce,
+        "actor": actor,
+        "publishing_started_at": publishing_started_at,
+    }
+    existing_comment = await _find_merged_comment_evidence(**evidence_kwargs)
+    # Re-prove the nonce-bearing merge immediately before claiming it in a
+    # public comment or accepting a recovered comment. A review approval or
+    # nonce-bearing comment alone is never merge evidence for the frozen base.
+    if not await _find_merge_evidence(
+        repo_name=repo_name,
+        pr_number=pr_number,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        nonce=nonce,
+        actor=actor,
+        publishing_started_at=publishing_started_at,
+        merge_method=merge_method,
+    ):
+        raise GhError(
+            "GitHub exact merge evidence is missing before merged comment"
+        )
+    if existing_comment is not None:
+        return
+    if current_actor.lower() != actor.lower():
+        raise GhError(
+            "GitHub merged comment identity changed before durable "
+            "evidence was found"
+        )
+    if not await ensure_current():
+        raise GhError("PR review publication generation is no longer current")
+    try:
+        response = await _gh_api_json(
+            f"repos/{repo_name}/issues/{pr_number}/comments",
+            method="POST",
+            payload={
+                "body": _merged_comment_body(
+                    nonce=nonce,
+                    head_sha=head_sha,
+                )
+            },
+        )
+        _validate_merged_comment_evidence(
+            response,
+            head_sha=head_sha,
+            nonce=nonce,
+            actor=actor,
+            publishing_started_at=publishing_started_at,
+        )
+    except GhError:
+        # The POST may have reached GitHub even when its ACK or response was
+        # lost. Reconcile the durable marker before allowing another write.
+        if await _find_merged_comment_evidence(**evidence_kwargs) is None:
+            raise
 
 
 def _is_self_review_state_error(exc: GhError) -> bool:
@@ -1583,10 +2562,30 @@ async def _find_finding_comment(
                 matches.append(item)
     if not matches:
         return None
-    evidence = [
-        _validate_finding_comment(item, finding=finding, actor=actor, inline=inline)
-        for item in matches
-    ]
+    evidence: list[tuple[int, str | None]] = []
+    for item in matches:
+        try:
+            evidence.append(
+                _validate_finding_comment(
+                    item,
+                    finding=finding,
+                    actor=actor,
+                    inline=inline,
+                )
+            )
+        except GhError:
+            # Finding markers are public after the first publication attempt.
+            # Other PR participants may quote them, so a marker-bearing comment
+            # is authoritative only when its frozen actor/head/location fields
+            # also match.  One forged copy must not suppress a valid ACK receipt
+            # or prevent a safe retry when no valid receipt exists.
+            logger.warning(
+                "Ignoring untrusted Finding marker for PR %s#%s",
+                repo_name,
+                pr_number,
+            )
+    if not evidence:
+        return None
     if len(evidence) > 1:
         logger.warning("Found duplicate GitHub Finding comments for %s", finding.fingerprint)
     return evidence[0]
@@ -1726,18 +2725,38 @@ async def _publish_review_action(
     *,
     repo_name: str,
     pr_number: int,
+    base_ref: str,
     base_sha: str,
     head_sha: str,
     result: str,
     review_body: str,
     auto_merge: bool,
+    merge_method: str | None,
     nonce: str,
     actor: str,
     current_actor: str,
     publishing_started_at: datetime,
     ensure_current: Callable[[], Awaitable[bool]],
+    wait_for_ci: bool = False,
+    required_checks: list[dict] | None = None,
+    ensure_zero_threads: Callable[[], Awaitable[bool]] | None = None,
 ) -> tuple[str, str]:
     """Reconcile or perform one durable, head-pinned GitHub publication."""
+
+    if (
+        (
+            result == "approved_merged"
+            and (
+                not auto_merge
+                or merge_method not in _SAFE_MERGE_METHODS
+            )
+        )
+        or (
+            result in {"review_comments", "lgtm_comment"}
+            and merge_method is not None
+        )
+    ):
+        raise GhError("Frozen GitHub merge method is invalid")
 
     review_endpoint = f"repos/{repo_name}/pulls/{pr_number}/reviews"
     review_state = await _find_review_evidence(
@@ -1760,23 +2779,44 @@ async def _publish_review_action(
         )
         _require_open_snapshot(
             initial,
+            base_ref=base_ref,
             base_sha=base_sha,
             head_sha=head_sha,
         )
         if not await ensure_current():
             raise GhError("PR review publication generation is no longer current")
 
+        if result == "approved_merged":
+            assert merge_method is not None
+            # Reject a statically unsafe publication before even its
+            # informational COMMENT is emitted. Re-check again immediately
+            # before the frozen-ref mutation because protection can change.
+            await _require_direct_merge_protection(
+                repo_name=repo_name,
+                base_ref=base_ref,
+                actor=actor,
+                merge_method=merge_method,
+            )
+
         if result == "review_comments":
-            event = "REQUEST_CHANGES"
+            # GitHub has no mutation that atomically binds a Review to an
+            # expected base ref.  Keep the public effect informational; CCM's
+            # durable Finding gate remains authoritative and a concurrent
+            # retarget cannot accidentally install a new branch-protection
+            # approval or change-request state.
+            event = "COMMENT"
             body = _review_body_with_evidence(review_body, nonce)
-            expected_states = {"CHANGES_REQUESTED"}
+            expected_states = {"COMMENTED"}
         elif result in {"lgtm_comment", "approved_merged"}:
-            event = "APPROVE"
+            event = "COMMENT"
             body = _review_body_with_evidence(
-                "LGTM - automated review passed",
+                _approval_review_body(
+                    head_sha=head_sha,
+                    auto_merge=auto_merge,
+                ),
                 nonce,
             )
-            expected_states = {"APPROVED"}
+            expected_states = {"COMMENTED"}
         else:
             raise GhError("unknown PR review recommendation")
 
@@ -1813,7 +2853,7 @@ async def _publish_review_action(
             )
             if review_state is not None:
                 pass
-            elif not _is_self_review_state_error(exc):
+            elif event == "COMMENT" or not _is_self_review_state_error(exc):
                 raise
             else:
                 # GitHub forbids approval and REQUEST_CHANGES on self-authored
@@ -1825,6 +2865,7 @@ async def _publish_review_action(
                 )
                 _require_open_snapshot(
                     guarded,
+                    base_ref=base_ref,
                     base_sha=base_sha,
                     head_sha=head_sha,
                 )
@@ -1835,8 +2876,13 @@ async def _publish_review_action(
                 fallback_text = (
                     review_body
                     if result == "review_comments"
-                    else "LGTM - automated review passed "
-                    "(self-PR, approval not permitted)"
+                    else (
+                        _approval_review_body(
+                            head_sha=head_sha,
+                            auto_merge=auto_merge,
+                        )
+                        + " (self-PR, approval not permitted)"
+                    )
                 )
                 fallback_body = _review_body_with_evidence(
                     fallback_text,
@@ -1873,71 +2919,170 @@ async def _publish_review_action(
                     if review_state is None:
                         raise
 
-    if result == "review_comments":
-        return "commented", "review_comments"
-
-    if not auto_merge:
+    if result in {"review_comments", "lgtm_comment"}:
+        # A recovered nonce-bearing Review proves only that a prior request
+        # reached GitHub.  Revalidate the complete open subject before the
+        # durable local terminal accepts it; a same-SHA base retarget must not
+        # be reported as ready or changes-requested for a different branch.
+        current = _validated_pr_snapshot(
+            await _gh_pr_view(pr_number, repo_name)
+        )
+        _require_open_snapshot(
+            current,
+            base_ref=base_ref,
+            base_sha=base_sha,
+            head_sha=head_sha,
+        )
+        if not await ensure_current():
+            raise GhError("PR review publication generation is no longer current")
+        if result == "review_comments":
+            return "commented", "review_comments"
         return "approved", "lgtm_comment"
 
-    if await _find_merge_evidence(
+    assert merge_method is not None
+    merge_evidence_kwargs = {
+        "repo_name": repo_name,
+        "pr_number": pr_number,
+        "base_ref": base_ref,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "nonce": nonce,
+        "actor": actor,
+        "publishing_started_at": publishing_started_at,
+        "merge_method": merge_method,
+    }
+    merge_confirmed = await _find_merge_evidence(**merge_evidence_kwargs)
+    if not merge_confirmed and merge_method != "fast-forward":
+        # A legacy outbox may represent either a merge whose acknowledgement
+        # was lost or an effect that never started. Only exact remote evidence
+        # can distinguish the safe first case. Replaying GitHub's PR merge API
+        # would re-read the PR's mutable base ref and could merge into a branch
+        # other than the frozen subject after a retarget race.
+        raise GhError(
+            "Legacy GitHub merge outbox has no exact merge evidence; "
+            "automatic replay is disabled"
+        )
+    if not merge_confirmed:
+        if current_actor.lower() != actor.lower():
+            raise GhError(
+                "GitHub publishing identity changed before durable merge "
+                "evidence was found"
+            )
+        guarded = _validated_pr_snapshot(
+            await _gh_pr_view(pr_number, repo_name)
+        )
+        _require_open_merge_head_snapshot(
+            guarded,
+            base_ref=base_ref,
+            head_sha=head_sha,
+        )
+        exact_ci = None
+        if wait_for_ci:
+            # CI is mutable even when the commit SHA is not.  Admission-time CI
+            # only authorizes reviewer execution; merge authorization requires
+            # a fresh read of the frozen identities before the ref update.
+            from backend.services.pr_review_panel import fetch_exact_head_ci
+
+            try:
+                ci_status, ci_summary, exact_ci = await fetch_exact_head_ci(
+                    repo_name,
+                    head_sha,
+                    required_checks,
+                )
+            except (GhError, ValueError) as exc:
+                raise GhError(
+                    f"Exact-head required CI could not be revalidated: {exc}"
+                ) from exc
+            if ci_status != "passed":
+                raise GhError(
+                    "Exact-head required CI is not passed before merge: "
+                    f"{ci_status}: {ci_summary}"
+                )
+        if (
+            ensure_zero_threads is not None
+            and not await ensure_zero_threads()
+        ):
+            raise GhError(
+                "Blocking Finding threads are not durably resolved before merge"
+            )
+        if not await ensure_current():
+            raise GhError(
+                "PR review publication generation is no longer current"
+            )
+        await _require_direct_merge_protection(
+            repo_name=repo_name,
+            base_ref=base_ref,
+            actor=actor,
+            merge_method=merge_method,
+            frozen_required_checks=(required_checks if wait_for_ci else None),
+            exact_ci=exact_ci,
+            head_sha=(head_sha if wait_for_ci else None),
+        )
+        # CI and thread reconciliation may take long enough for the base ref
+        # to move. Re-read the complete subject at the last possible boundary;
+        # the following non-force write explicitly names the frozen target ref.
+        final_open = _validated_pr_snapshot(
+            await _gh_pr_view(pr_number, repo_name)
+        )
+        await _require_safe_open_merge_snapshot(
+            final_open,
+            repo_name=repo_name,
+            base_ref=base_ref,
+            captured_base=base_sha,
+            head_sha=head_sha,
+        )
+        if not await ensure_current():
+            raise GhError(
+                "PR review publication generation is no longer current"
+            )
+        try:
+            assert merge_method == "fast-forward"
+            encoded_base = quote(base_ref, safe="")
+            updated = await _gh_api_json(
+                f"repos/{repo_name}/git/refs/heads/{encoded_base}",
+                method="PATCH",
+                payload={"sha": head_sha, "force": False},
+            )
+            updated_object = updated.get("object")
+            if (
+                updated.get("ref") != f"refs/heads/{base_ref}"
+                or not isinstance(updated_object, dict)
+                or updated_object.get("type") != "commit"
+                or not isinstance(updated_object.get("sha"), str)
+                or updated_object["sha"].lower() != head_sha
+            ):
+                raise GhError(
+                    "GitHub did not confirm the frozen base fast-forward"
+                )
+        except GhError as merge_exc:
+            merge_confirmed = await _find_merge_evidence(
+                **merge_evidence_kwargs
+            )
+            if not merge_confirmed:
+                raise merge_exc
+
+        if not merge_confirmed:
+            merge_confirmed = await _find_merge_evidence(
+                **merge_evidence_kwargs
+            )
+        if not merge_confirmed:
+            raise GhError(
+                "GitHub did not confirm the captured head was merged"
+            )
+
+    await _publish_merged_comment(
         repo_name=repo_name,
         pr_number=pr_number,
-        head_sha=head_sha,
-        nonce=nonce,
-    ):
-        return "merged", "approved_merged"
-
-    if current_actor.lower() != actor.lower():
-        raise GhError(
-            "GitHub publishing identity changed before durable merge "
-            "evidence was found"
-        )
-    guarded = _validated_pr_snapshot(
-        await _gh_pr_view(pr_number, repo_name)
-    )
-    _require_open_snapshot(
-        guarded,
+        base_ref=base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
-    )
-    if not await ensure_current():
-        raise GhError("PR review publication generation is no longer current")
-    try:
-        merge = await _gh_api_json(
-            f"repos/{repo_name}/pulls/{pr_number}/merge",
-            method="PUT",
-            payload={
-                "merge_method": "merge",
-                "sha": head_sha,
-                "commit_message": (
-                    "Automated review\n\n"
-                    f"CCM review nonce: {nonce}"
-                ),
-            },
-        )
-        if merge.get("merged") is not True:
-            message = merge.get("message")
-            raise GhError(
-                "GitHub did not confirm merge"
-                + (f": {message}" if isinstance(message, str) else "")
-            )
-    except GhError:
-        if await _find_merge_evidence(
-            repo_name=repo_name,
-            pr_number=pr_number,
-            head_sha=head_sha,
-            nonce=nonce,
-        ):
-            return "merged", "approved_merged"
-        raise
-
-    if not await _find_merge_evidence(
-        repo_name=repo_name,
-        pr_number=pr_number,
-        head_sha=head_sha,
         nonce=nonce,
-    ):
-        raise GhError("GitHub did not confirm the captured head was merged")
+        actor=actor,
+        current_actor=current_actor,
+        publishing_started_at=publishing_started_at,
+        merge_method=merge_method,
+        ensure_current=ensure_current,
+    )
     return "merged", "approved_merged"
 
 
@@ -2334,14 +3479,17 @@ async def create_pr_review_task(
         if prepared_context is not None
         else await prepare_pr_review_context(repo, pr_data)
     )
+    base_ref = _frozen_pr_base_ref(repo, pr_data)
     if (
         not isinstance(context, dict)
         or context.get("repo_name") != repo_name
         or context.get("pr_number") != pr_number
+        or context.get("base_ref") != base_ref
         or context.get("base_sha") != base_sha
         or context.get("head_sha") != head_sha
         or not isinstance(context.get("guidance"), dict)
         or not isinstance(context.get("material"), dict)
+        or context["material"].get("base_ref") != context.get("base_ref")
     ):
         raise ValueError("prepared PR review context does not match the snapshot")
     prompt = build_review_prompt(
@@ -2355,6 +3503,7 @@ async def create_pr_review_task(
     review = PRReview(
         repo_id=repo.id,
         pr_number=pr_data["number"],
+        base_ref=base_ref,
         base_sha=base_sha,
         head_sha=head_sha,
         delivery_id=pr_data.get("delivery_id"),
@@ -2385,9 +3534,15 @@ async def create_pr_review_task(
         tags=["pr-review"],
         metadata_={
             "pr_review_id": review.id,
+            "pr_base_ref": base_ref,
             "pr_base_sha": base_sha,
             "pr_head_sha": head_sha,
             "pr_auto_merge": frozen_auto_merge,
+            # Required-CI merge revalidation is a panel-only policy.  Freeze an
+            # explicit off/empty value for single-review recovery so mutable
+            # repository settings can never broaden an existing outbox row.
+            "pr_wait_for_ci": False,
+            "pr_required_checks": [],
             "pr_action_nonce": action_nonce,
         },
         provider=provider,
@@ -2593,15 +3748,31 @@ async def _check_and_update_review_locked(
         )
         return
 
-    # Resolve and freeze the writer identity before claiming the outbox. No
-    # external write occurs until the durable ``publishing`` row commits.
+    # Resolve and freeze the merge strategy and writer identity before
+    # claiming the outbox. These are read-only GitHub calls; no external write
+    # occurs until the durable ``publishing`` row commits.
+    merge_method = None
+    if terminal_result == "approved_merged":
+        try:
+            merge_method = await _freeze_safe_merge_method(repo_full_name)
+        except GhRepositoryCapabilityError as exc:
+            await finish_reviewing_error(
+                "Unable to freeze a safe GitHub merge method"
+                + (f": {exc}" if str(exc) else "")
+            )
+            return
+        except GhError:
+            # No external effect has been armed yet. Keep the completed exact
+            # generation in ``reviewing`` so periodic recovery can retry a
+            # transient GitHub capability read.
+            await db.rollback()
+            return
     try:
         actor = await _gh_authenticated_login()
-    except GhError as exc:
-        await finish_reviewing_error(
-            "Unable to resolve the GitHub publishing identity"
-            + (f": {exc}" if str(exc) else "")
-        )
+    except GhError:
+        # Authentication endpoint timeouts/5xx do not invalidate the reviewed
+        # subject. The durable reviewing generation is the retry boundary.
+        await db.rollback()
         return
     publishing_started_at = datetime.utcnow()
     claimed = await _commit_exact_review_update(
@@ -2620,6 +3791,7 @@ async def _check_and_update_review_locked(
             "publishing_retry_count": terminal_task_retry_count,
             "publishing_task_started_at": task_started_at,
             "publishing_started_at": publishing_started_at,
+            "merge_method": merge_method,
             "review_summary": (
                 "Agent recommendation verified; GitHub publication pending"
             ),
@@ -2747,6 +3919,10 @@ async def _commit_exact_review_update(
     values: dict,
     background_handoff_pending: Callable[[], bool] | None = None,
     expected_lease_token: str | None = None,
+    expected_pending_action: str | None = None,
+    expected_action_nonce: str | None = None,
+    expected_head_sha: str | None = None,
+    expected_merge_method: str | None = None,
 ) -> bool:
     """CAS a review while holding proof of the exact completed Task turn."""
 
@@ -2777,6 +3953,20 @@ async def _commit_exact_review_update(
                 PRReview.publishing_lease_expires_at > db_now,
             )
         )
+    if expected_pending_action is not None:
+        review_predicates.append(
+            PRReview.pending_action == expected_pending_action
+        )
+    if expected_action_nonce is not None:
+        review_predicates.append(
+            PRReview.action_nonce == expected_action_nonce
+        )
+    if expected_head_sha is not None:
+        review_predicates.append(PRReview.head_sha == expected_head_sha)
+    if expected_merge_method is not None:
+        review_predicates.append(
+            PRReview.merge_method == expected_merge_method
+        )
     changed = await db.execute(
         update(PRReview)
         .where(*review_predicates)
@@ -2800,6 +3990,585 @@ async def _commit_exact_review_update(
     return True
 
 
+def _frozen_task_ci_policy(
+    task: Task,
+    *,
+    panel_task: bool,
+) -> tuple[bool, list[dict]] | None:
+    """Read only the CI policy captured on the reviewer Task."""
+
+    metadata = task.metadata_ or {}
+    if panel_task:
+        wait_for_ci = metadata.get("pr_wait_for_ci")
+        required_checks = metadata.get("pr_required_checks")
+    else:
+        # Explicit values are written for all new single-review Tasks.  Defaults
+        # keep pre-upgrade single-review outboxes recoverable without ever
+        # enabling the panel-only merge gate.
+        wait_for_ci = metadata.get("pr_wait_for_ci", False)
+        required_checks = metadata.get("pr_required_checks", [])
+    if (
+        type(wait_for_ci) is not bool
+        or not isinstance(required_checks, list)
+        or any(not isinstance(item, dict) for item in required_checks)
+        or (wait_for_ci and not required_checks)
+    ):
+        return None
+    # Round-trip through JSON so later ORM expiration cannot mutate the frozen
+    # scalar snapshot used across GitHub awaits.
+    return wait_for_ci, json.loads(json.dumps(required_checks))
+
+
+async def _freeze_legacy_merge_outbox(
+    db: AsyncSession,
+    *,
+    review_id: int,
+) -> bool:
+    """Freeze the old publisher's implicit merge method with an exact CAS.
+
+    An old Manager can keep running briefly after the migration adds
+    ``merge_method`` and insert a newly armed ``approved_merged`` outbox with
+    NULL in that column.  That implementation had exactly one merge behavior:
+    GitHub's merge-commit method.  Recover it only when every durable field
+    proves the old authorization; this compatibility path must never mint a
+    new Delivery or ordinary PR merge capability from a partial/forged row.
+    """
+
+    review = await db.get(PRReview, review_id, populate_existing=True)
+    if (
+        review is None
+        or review.status != "publishing"
+        or review.pending_action != "approved_merged"
+        or review.merge_method is not None
+        or review.task_id is None
+        or review.action_taken is not None
+        or review.completed_at is not None
+        or (
+            isinstance(review.delivery_id, str)
+            and review.delivery_id.startswith("delivery:")
+        )
+        or type(review.publishing_retry_count) is not int
+        or review.publishing_retry_count < 0
+        or not isinstance(review.publishing_task_started_at, datetime)
+        or not isinstance(review.publishing_started_at, datetime)
+        or not isinstance(review.publishing_actor, str)
+        or not (0 < len(review.publishing_actor) <= 200)
+        or not isinstance(review.pending_review_body, str)
+        or "\x00" in review.pending_review_body
+        or len(review.pending_review_body.encode("utf-8"))
+        > _MAX_REVIEW_BODY_BYTES
+        or not isinstance(review.base_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(review.base_sha) is None
+        or not isinstance(review.head_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(review.head_sha) is None
+        or type(review.pr_number) is not int
+        or review.pr_number <= 0
+        or not isinstance(review.action_nonce, str)
+        or _ACTION_NONCE_RE.fullmatch(review.action_nonce) is None
+    ):
+        await db.rollback()
+        return False
+
+    # Freeze scalars before writer-fence rollbacks/refreshes expire ORM state.
+    task_id = review.task_id
+    retry_count = review.publishing_retry_count
+    task_started_at = review.publishing_task_started_at
+    action_nonce = review.action_nonce
+    delivery_id = review.delivery_id
+    actor = review.publishing_actor
+    publishing_started_at = review.publishing_started_at
+    base_sha = review.base_sha
+    head_sha = review.head_sha
+    body = review.pending_review_body
+    task = await db.get(Task, task_id, populate_existing=True)
+    if (
+        task is None
+        or task.status != "completed"
+        or task.retry_count != retry_count
+        or task.started_at != task_started_at
+        or not isinstance(task.completed_at, datetime)
+        or task.pty_background_generation is not None
+        or task.mode == "delivery_loop"
+        or task.delivery_run_id is not None
+        or (task.metadata_ or {}).get("pr_auto_merge") is not True
+        or _validated_action_nonce(task, review) != action_nonce
+    ):
+        await db.rollback()
+        return False
+
+    from backend.services.delivery_pr_policy import (
+        legacy_pr_effect_is_forbidden,
+    )
+
+    if await legacy_pr_effect_is_forbidden(
+        db,
+        review=review,
+        task=task,
+    ):
+        await db.rollback()
+        return False
+    if not await _locked_task_generation_exists(
+        db,
+        task_id=task_id,
+        retry_count=retry_count,
+        started_at=task_started_at,
+    ):
+        await db.rollback()
+        return False
+    # The writer fence makes this second metadata read authoritative for the
+    # transaction; an earlier unlocked snapshot cannot grant compatibility.
+    task = await db.get(Task, task_id, populate_existing=True)
+    if (
+        task is None
+        or task.status != "completed"
+        or task.retry_count != retry_count
+        or task.started_at != task_started_at
+        or not isinstance(task.completed_at, datetime)
+        or task.pty_background_generation is not None
+        or task.mode == "delivery_loop"
+        or task.delivery_run_id is not None
+        or (task.metadata_ or {}).get("pr_auto_merge") is not True
+        or _validated_action_nonce(task) != action_nonce
+    ):
+        await db.rollback()
+        return False
+
+    now = await _database_now(db)
+    delivery_predicate = (
+        PRReview.delivery_id.is_(None)
+        if delivery_id is None
+        else PRReview.delivery_id == delivery_id
+    )
+    changed = await db.execute(
+        update(PRReview)
+        .where(
+            PRReview.id == review_id,
+            PRReview.status == "publishing",
+            PRReview.pending_action == "approved_merged",
+            PRReview.merge_method.is_(None),
+            PRReview.task_id == task_id,
+            PRReview.action_taken.is_(None),
+            PRReview.completed_at.is_(None),
+            PRReview.publishing_retry_count == retry_count,
+            PRReview.publishing_task_started_at == task_started_at,
+            PRReview.publishing_actor == actor,
+            PRReview.publishing_started_at == publishing_started_at,
+            PRReview.base_sha == base_sha,
+            PRReview.head_sha == head_sha,
+            PRReview.pending_review_body == body,
+            PRReview.action_nonce == action_nonce,
+            delivery_predicate,
+            or_(
+                PRReview.publishing_lease_token.is_(None),
+                PRReview.publishing_lease_expires_at.is_(None),
+                PRReview.publishing_lease_expires_at <= now,
+            ),
+        )
+        .values(merge_method="merge")
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount == 1:
+        await db.commit()
+        return True
+
+    # A concurrent recovery may have won the exact CAS.  Start a fresh
+    # transaction and accept only that winner's frozen value; never infer it
+    # from this transaction's stale identity map.
+    await db.rollback()
+    winner = await db.scalar(
+        select(PRReview.merge_method).where(
+            PRReview.id == review_id,
+            PRReview.status == "publishing",
+            PRReview.pending_action == "approved_merged",
+            PRReview.task_id == task_id,
+            PRReview.action_nonce == action_nonce,
+        )
+    )
+    await db.rollback()
+    return winner == "merge"
+
+
+async def _publication_has_zero_blocking_threads(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    monitor_run_id: int,
+    head_sha: str,
+    expected_pending_action: str,
+) -> bool:
+    """Defensive, fresh zero-thread Gate immediately before merge mutation."""
+
+    try:
+        current = await db.execute(
+            select(PRReview.id)
+            .join(
+                PRMonitorRun,
+                PRMonitorRun.current_review_id == PRReview.id,
+            )
+            .where(
+                PRReview.id == review_id,
+                PRReview.monitor_run_id == monitor_run_id,
+                PRReview.status == "publishing",
+                PRReview.pending_action == expected_pending_action,
+                PRReview.head_sha == head_sha,
+                PRMonitorRun.id == monitor_run_id,
+                PRMonitorRun.status == "reviewing",
+                PRMonitorRun.current_head_sha == head_sha,
+            )
+        )
+        if current.scalar_one_or_none() != review_id:
+            return False
+        unresolved = await db.scalar(
+            select(PRFinding.id)
+            .join(PRReview, PRReview.id == PRFinding.pr_review_id)
+            .where(
+                PRReview.monitor_run_id == monitor_run_id,
+                PRFinding.severity.in_(("critical", "high", "medium")),
+                or_(
+                    PRFinding.status == "open",
+                    PRFinding.thread_status.in_((
+                        "published_inline",
+                        "published_fallback",
+                    )),
+                ),
+            )
+            .limit(1)
+        )
+        return unresolved is None
+    finally:
+        await db.rollback()
+
+
+def _identity_task_generation_state(task: Task | None) -> tuple[str, str | None]:
+    """Classify the current reviewer Task generation for rebuttal re-arming."""
+
+    if task is None:
+        return "invalid", "reviewer Task is missing"
+    if task.status in _IDENTITY_TASK_ACTIVE_STATUSES:
+        return "active", None
+    if task.status == "completed" and task.pty_background_generation is not None:
+        return "active", None
+    if task.status != "completed":
+        return "invalid", f"reviewer Task ended with status={task.status}"
+    if type(task.retry_count) is not int or task.retry_count < 0:
+        return "invalid", "reviewer Task retry generation is invalid"
+    if not isinstance(task.started_at, datetime):
+        return "invalid", "reviewer Task generation start timestamp is missing"
+    if not isinstance(task.completed_at, datetime):
+        return "invalid", "reviewer Task completion timestamp is missing"
+    if task_is_pr_review_superseded(task):
+        return "invalid", "reviewer Task generation was superseded"
+    return "publishable", None
+
+
+async def _fail_identity_pending_publication(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    monitor_run_id: int,
+    task: Task,
+    pending_action: str,
+    nonce: str,
+    head_sha: str,
+    summary: str,
+) -> bool:
+    """Fail one exact unusable rebuttal generation and pause its current Run."""
+
+    task_predicates = [
+        Task.id == task.id,
+        Task.status == task.status,
+        Task.retry_count == task.retry_count,
+        (
+            Task.started_at.is_(None)
+            if task.started_at is None
+            else Task.started_at == task.started_at
+        ),
+        (
+            Task.completed_at.is_(None)
+            if task.completed_at is None
+            else Task.completed_at == task.completed_at
+        ),
+        (
+            Task.instance_id.is_(None)
+            if task.instance_id is None
+            else Task.instance_id == task.instance_id
+        ),
+        (
+            Task.pty_background_generation.is_(None)
+            if task.pty_background_generation is None
+            else Task.pty_background_generation == task.pty_background_generation
+        ),
+        no_active_worker_task_termination_predicate(),
+    ]
+    fenced = await db.execute(
+        update(Task)
+        .where(*task_predicates)
+        .values(status=Task.status)
+        .execution_options(synchronize_session=False)
+    )
+    if fenced.rowcount != 1:
+        await db.rollback()
+        return False
+    monitor = (
+        await db.execute(
+            select(PRMonitorRun)
+            .where(PRMonitorRun.id == monitor_run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if monitor is None:
+        await db.rollback()
+        return False
+    changed = await db.execute(
+        update(PRReview)
+        .where(
+            PRReview.id == review_id,
+            PRReview.monitor_run_id == monitor_run_id,
+            PRReview.task_id == task.id,
+            PRReview.status == "publishing",
+            PRReview.pending_action == pending_action,
+            PRReview.action_nonce == nonce,
+            PRReview.head_sha == head_sha,
+            PRReview.publishing_actor.is_(None),
+            PRReview.publishing_retry_count.is_(None),
+            PRReview.publishing_task_started_at.is_(None),
+            PRReview.publishing_started_at.is_(None),
+            PRReview.merge_method.is_(None),
+            PRReview.publishing_lease_token.is_(None),
+            PRReview.publishing_lease_expires_at.is_(None),
+        )
+        .values(
+            status="error",
+            action_taken="error",
+            review_summary=summary[:2000],
+            completed_at=datetime.utcnow(),
+            pending_action=None,
+            pending_review_body=None,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        return False
+    from backend.services.pr_monitor_loop import record_review_error
+
+    await record_review_error(db, review_id=review_id)
+    await _broadcast_review_update(review_id, "error", "error")
+    return True
+
+
+async def _arm_identity_pending_publication(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    repo_full_name: str,
+) -> bool:
+    """Freeze a fresh completed Task generation and writer identity.
+
+    Accepted rebuttals can finish long after the original blocking publication,
+    so the old publication generation is intentionally not reused.  This
+    durable ``needs_identity`` stage is the crash boundary before any new Review
+    or merge side effect.
+    """
+
+    review = await db.get(PRReview, review_id, populate_existing=True)
+    if review is None or review.status != "publishing":
+        return False
+    pending_action = review.pending_action
+    restored_action = _restored_identity_action(pending_action)
+    if restored_action != "approved_merged" or review.task_id is None:
+        return False
+    task = await db.get(Task, review.task_id, populate_existing=True)
+    repo = await db.get(MonitoredRepo, review.repo_id, populate_existing=True)
+    run = (
+        await db.get(
+            PRMonitorRun,
+            review.monitor_run_id,
+            populate_existing=True,
+        )
+        if review.monitor_run_id is not None
+        else None
+    )
+    panel_task = (
+        await db.scalar(
+            select(PRReviewerRun.id).where(
+                PRReviewerRun.pr_review_id == review.id,
+                PRReviewerRun.task_id == review.task_id,
+            )
+        )
+    ) is not None
+    ci_policy = (
+        _frozen_task_ci_policy(task, panel_task=panel_task)
+        if task is not None
+        else None
+    )
+    nonce = _validated_action_nonce(task, review)
+    frozen_auto_merge = (
+        (task.metadata_ or {}).get("pr_auto_merge")
+        if task is not None
+        else None
+    )
+    from backend.services.delivery_pr_policy import (
+        DeliveryPRPolicyError,
+        frozen_delivery_pr_policy,
+    )
+
+    try:
+        delivery_policy = await frozen_delivery_pr_policy(
+            db,
+            review,
+            monitor_run_id=review.monitor_run_id,
+            require_effect_ready=True,
+        )
+    except DeliveryPRPolicyError:
+        delivery_policy = None
+        policy_valid = False
+    else:
+        policy_valid = (
+            delivery_policy is None
+            or (
+                delivery_policy.auto_merge is True
+                and ci_policy is not None
+                and delivery_policy.wait_for_ci == ci_policy[0]
+                and delivery_policy.required_checks == ci_policy[1]
+            )
+        )
+    stage_is_current = bool(
+        task is not None
+        and repo is not None
+        and run is not None
+        and repo.repo_full_name == repo_full_name
+        and repo.enabled is True
+        and panel_task
+        and nonce is not None
+        and type(frozen_auto_merge) is bool
+        and frozen_auto_merge is True
+        and ci_policy is not None
+        and policy_valid
+        and isinstance(review.pending_review_body, str)
+        and "\x00" not in review.pending_review_body
+        and len(review.pending_review_body.encode("utf-8"))
+        <= _MAX_REVIEW_BODY_BYTES
+        and isinstance(review.head_sha, str)
+        and _GITHUB_SHA_RE.fullmatch(review.head_sha) is not None
+        and run.status == "reviewing"
+        and run.current_review_id == review.id
+        and run.current_base_sha == review.base_sha
+        and run.current_head_sha == review.head_sha
+        and review.publishing_actor is None
+        and review.publishing_retry_count is None
+        and review.publishing_task_started_at is None
+        and review.publishing_started_at is None
+        and review.merge_method is None
+    )
+    if not stage_is_current:
+        await db.rollback()
+        return False
+    assert task is not None
+    assert review.head_sha is not None
+    assert review.monitor_run_id is not None
+    assert nonce is not None
+    generation_state, generation_error = _identity_task_generation_state(task)
+    if generation_state == "active":
+        await db.rollback()
+        return False
+    if generation_state == "invalid":
+        assert generation_error is not None
+        await _fail_identity_pending_publication(
+            db,
+            review_id=review.id,
+            monitor_run_id=review.monitor_run_id,
+            task=task,
+            pending_action=pending_action,
+            nonce=nonce,
+            head_sha=review.head_sha,
+            summary=(
+                "Accepted rebuttal could not arm automatic merge: "
+                f"{generation_error}"
+            ),
+        )
+        return False
+    assert generation_state == "publishable"
+    assert isinstance(task.retry_count, int)
+    assert isinstance(task.started_at, datetime)
+    task_id = task.id
+    retry_count = task.retry_count
+    task_started_at = task.started_at
+    head_sha = review.head_sha
+    monitor_run_id = review.monitor_run_id
+    await db.rollback()
+    if not await _publication_has_zero_blocking_threads(
+        db,
+        review_id=review_id,
+        monitor_run_id=monitor_run_id,
+        head_sha=head_sha,
+        expected_pending_action=pending_action,
+    ):
+        return False
+    try:
+        merge_method = await _freeze_safe_merge_method(repo_full_name)
+    except GhRepositoryCapabilityError as exc:
+        failed = await _commit_exact_review_update(
+            db,
+            review_id=review_id,
+            expected_status="publishing",
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=task_started_at,
+            expected_pending_action=pending_action,
+            expected_action_nonce=nonce,
+            expected_head_sha=head_sha,
+            values={
+                "status": "error",
+                "action_taken": "error",
+                "review_summary": str(exc)[:2000],
+                "completed_at": datetime.utcnow(),
+            },
+        )
+        if failed:
+            # This is a deterministic repository-policy failure, not a
+            # retryable identity/capability lookup.  Project it onto the exact
+            # Monitor generation immediately so the Run cannot stay wedged in
+            # ``reviewing`` until periodic recovery.
+            from backend.services.pr_monitor_loop import record_review_error
+
+            await record_review_error(db, review_id=review_id)
+        return False
+    except GhError:
+        # API/auth/transport failures can clear without changing the frozen
+        # subject. Keep needs_identity durable so startup/periodic recovery can
+        # retry instead of terminally pausing the Monitor Run.
+        return False
+    try:
+        actor = await _gh_authenticated_login()
+    except GhError:
+        return False
+    return await _commit_exact_review_update(
+        db,
+        review_id=review_id,
+        expected_status="publishing",
+        task_id=task_id,
+        retry_count=retry_count,
+        task_started_at=task_started_at,
+        expected_pending_action=pending_action,
+        expected_action_nonce=nonce,
+        expected_head_sha=head_sha,
+        values={
+            "pending_action": restored_action,
+            "publishing_actor": actor,
+            "publishing_retry_count": retry_count,
+            "publishing_task_started_at": task_started_at,
+            "publishing_started_at": datetime.utcnow(),
+            "merge_method": merge_method,
+            "review_summary": (
+                "Accepted rebuttal cleared all Finding threads; "
+                "automatic merge publication armed"
+            ),
+        },
+    )
+
+
 async def _publication_is_current(
     db: AsyncSession,
     *,
@@ -2810,6 +4579,8 @@ async def _publication_is_current(
     nonce: str,
     lease_token: str,
     expected_delivery_id: str | None,
+    base_ref: str,
+    merge_method: str | None = None,
     lease_lost: asyncio.Event | None = None,
 ) -> bool:
     """Fresh guard used immediately before each GitHub mutation."""
@@ -2819,7 +4590,7 @@ async def _publication_is_current(
             return False
         db_now = await _database_now(db)
         review_result = await db.execute(
-            select(PRReview.id).where(
+            select(PRReview).where(
                 PRReview.id == review_id,
                 PRReview.status == "publishing",
                 PRReview.task_id == task_id,
@@ -2830,10 +4601,43 @@ async def _publication_is_current(
                 PRReview.publishing_lease_expires_at
                 > db_now + _PUBLICATION_MUTATION_GUARD,
                 PRReview.delivery_id == expected_delivery_id,
+                PRReview.base_ref == base_ref,
+                (
+                    PRReview.merge_method.is_(None)
+                    if merge_method is None
+                    else PRReview.merge_method == merge_method
+                ),
             )
         )
-        if review_result.scalar_one_or_none() != review_id:
+        review = review_result.scalar_one_or_none()
+        if review is None:
             return False
+        if (
+            isinstance(expected_delivery_id, str)
+            and expected_delivery_id.startswith("delivery:")
+        ):
+            # A Task generation and Review lease prove only the publication
+            # outbox.  Delivery-owned effects also require a fresh proof that
+            # the exact owning Run is still the active monitoring/waiting
+            # owner.  Repeat this immediately before *every* GitHub mutation;
+            # a paused/failed/superseded Run must revoke an already-armed
+            # outbox without relying on eventual controller recovery.
+            from backend.services.delivery_pr_policy import (
+                DeliveryPRPolicyError,
+                frozen_delivery_pr_policy,
+            )
+
+            try:
+                delivery_policy = await frozen_delivery_pr_policy(
+                    db,
+                    review,
+                    monitor_run_id=review.monitor_run_id,
+                    require_effect_ready=True,
+                )
+            except DeliveryPRPolicyError:
+                return False
+            if delivery_policy is None:
+                return False
         return await _locked_task_generation_exists(
             db,
             task_id=task_id,
@@ -2853,7 +4657,16 @@ def _terminal_publication_error(exc: GhError) -> bool:
         "GitHub PR snapshot changed",
         "GitHub PR changed without matching merge evidence",
         "GitHub merge commit evidence is malformed or mismatched",
+        "GitHub merged comment evidence is malformed or mismatched",
+        "GitHub exact merge evidence is missing before merged comment",
         "GitHub publishing identity changed before durable",
+        "Frozen GitHub merge evidence policy is invalid",
+        "Frozen GitHub merge method is invalid",
+        "Frozen GitHub merge method is no longer allowed",
+        "Legacy GitHub merge outbox has no exact merge evidence",
+        "Direct auto-merge protection policy is unsafe",
+        "GitHub commit ancestry response is malformed",
+        "GitHub PR base ancestry is unsafe",
         "unknown PR review recommendation",
     ))
 
@@ -2934,6 +4747,7 @@ async def _acquire_publication_lease(
         .where(
             PRReview.id == review_id,
             PRReview.status == "publishing",
+            PRReview.pending_action.in_(tuple(_PUBLICATION_ACTIONS)),
             or_(
                 PRReview.publishing_lease_token.is_(None),
                 PRReview.publishing_lease_expires_at.is_(None),
@@ -3052,6 +4866,7 @@ async def _resume_publishing_review_under_lease(
     base_sha = review.base_sha
     head_sha = review.head_sha
     delivery_id = review.delivery_id
+    monitor_run_id = review.monitor_run_id
     repo = await db.get(
         MonitoredRepo,
         repo_id,
@@ -3062,12 +4877,30 @@ async def _resume_publishing_review_under_lease(
         if task_id is not None
         else None
     )
+    panel_task = (
+        await db.scalar(
+            select(PRReviewerRun.id).where(
+                PRReviewerRun.pr_review_id == review_id,
+                PRReviewerRun.task_id == task_id,
+            )
+        )
+    ) is not None
+    ci_policy = (
+        _frozen_task_ci_policy(task, panel_task=panel_task)
+        if task is not None
+        else None
+    )
     action = review.pending_action
     body = review.pending_review_body
     actor = review.publishing_actor
     retry_count = review.publishing_retry_count
     task_started_at = review.publishing_task_started_at
     publishing_started_at = review.publishing_started_at
+    merge_method = review.merge_method
+    # The publication subject is the immutable Review row, never the mutable
+    # repository configuration.  NULL is a rolling-upgrade state and fails
+    # closed until the migration backfill has completed.
+    base_ref = review.base_ref
     nonce = _validated_action_nonce(task, review)
     frozen_auto_merge = (
         (task.metadata_ or {}).get("pr_auto_merge")
@@ -3075,6 +4908,7 @@ async def _resume_publishing_review_under_lease(
         else None
     )
     from backend.services.delivery_pr_policy import (
+        DeliveryPREffectNotReady,
         DeliveryPRPolicyError,
         frozen_delivery_pr_policy,
     )
@@ -3084,8 +4918,21 @@ async def _resume_publishing_review_under_lease(
             db,
             review,
             monitor_run_id=review.monitor_run_id,
+            require_effect_ready=True,
         )
         delivery_policy_error = None
+    except DeliveryPREffectNotReady as exc:
+        # Review creation and Delivery Monitor binding are adjacent durable
+        # transactions.  A fast reviewer may reach this recovery point in the
+        # normal commit gap; keep the outbox pending so the exact binding can
+        # be observed on the next pass instead of terminalizing it as corrupt.
+        await _record_publication_pending(
+            db,
+            review_id=review_id,
+            summary=f"Delivery Monitor binding is not ready: {exc}",
+            lease_token=lease_token,
+        )
+        return
     except DeliveryPRPolicyError as exc:
         delivery_policy = None
         delivery_policy_error = str(exc)
@@ -3093,6 +4940,11 @@ async def _resume_publishing_review_under_lease(
         delivery_policy_error is None
         and repo is not None
         and repo.repo_full_name == repo_full_name
+        and isinstance(base_ref, str)
+        and 0 < len(base_ref) <= 200
+        and "\x00" not in base_ref
+        and "\n" not in base_ref
+        and "\r" not in base_ref
         and task is not None
         and task_id == task.id
         and action
@@ -3110,10 +4962,28 @@ async def _resume_publishing_review_under_lease(
         and nonce is not None
         and type(frozen_auto_merge) is bool
         and (
+            (
+                action == "approved_merged"
+                and frozen_auto_merge
+                and merge_method in _SAFE_MERGE_METHODS
+            )
+            or (
+                action == "review_comments"
+                and merge_method is None
+            )
+            or (
+                action == "lgtm_comment"
+                and not frozen_auto_merge
+                and merge_method is None
+            )
+        )
+        and ci_policy is not None
+        and (
             delivery_policy is None
             or (
-                frozen_auto_merge is False
-                and action != "approved_merged"
+                frozen_auto_merge == delivery_policy.auto_merge
+                and ci_policy[0] == delivery_policy.wait_for_ci
+                and ci_policy[1] == delivery_policy.required_checks
             )
         )
         and (
@@ -3149,10 +5019,14 @@ async def _resume_publishing_review_under_lease(
     assert isinstance(nonce, str)
     assert isinstance(actor, str)
     assert isinstance(frozen_auto_merge, bool)
+    assert merge_method is None or merge_method in _SAFE_MERGE_METHODS
     assert isinstance(action, str)
     assert isinstance(body, str)
     assert isinstance(base_sha, str)
     assert isinstance(head_sha, str)
+    assert isinstance(base_ref, str)
+    assert ci_policy is not None
+    frozen_wait_for_ci, frozen_required_checks = ci_policy
 
     async def ensure_current() -> bool:
         return await _publication_is_current(
@@ -3164,7 +5038,21 @@ async def _resume_publishing_review_under_lease(
             nonce=nonce,
             lease_token=lease_token,
             expected_delivery_id=delivery_id,
+            base_ref=base_ref,
+            merge_method=merge_method,
             lease_lost=lease_lost,
+        )
+
+    async def ensure_zero_threads() -> bool:
+        return bool(
+            monitor_run_id is not None
+            and await _publication_has_zero_blocking_threads(
+                db,
+                review_id=review_id,
+                monitor_run_id=monitor_run_id,
+                head_sha=head_sha,
+                expected_pending_action=action,
+            )
         )
 
     if not await ensure_current():
@@ -3187,16 +5075,21 @@ async def _resume_publishing_review_under_lease(
         new_status, action_taken = await _publish_review_action(
             repo_name=repo_full_name,
             pr_number=pr_number,
+            base_ref=base_ref,
             base_sha=base_sha,
             head_sha=head_sha,
             result=action,
             review_body=body,
             auto_merge=frozen_auto_merge,
+            merge_method=merge_method,
             nonce=nonce,
             actor=actor,
             current_actor=current_actor,
             publishing_started_at=publishing_started_at,
             ensure_current=ensure_current,
+            wait_for_ci=frozen_wait_for_ci,
+            required_checks=frozen_required_checks,
+            ensure_zero_threads=(ensure_zero_threads if panel_task else None),
         )
     except GhError as exc:
         logger.error(
@@ -3245,6 +5138,7 @@ async def _resume_publishing_review_under_lease(
             )
             return
 
+    preserve_merge_evidence = new_status == "merged"
     finalized = await _commit_exact_review_update(
         db,
         review_id=review_id,
@@ -3262,14 +5156,17 @@ async def _resume_publishing_review_under_lease(
             ),
             "pending_action": None,
             "pending_review_body": None,
-            "publishing_actor": None,
+            "publishing_actor": actor if preserve_merge_evidence else None,
             "publishing_retry_count": None,
             "publishing_task_started_at": None,
-            "publishing_started_at": None,
+            "publishing_started_at": (
+                publishing_started_at if preserve_merge_evidence else None
+            ),
             "publishing_lease_token": None,
             "publishing_lease_expires_at": None,
         },
         expected_lease_token=lease_token,
+        expected_merge_method=merge_method,
     )
     if not finalized:
         logger.warning(
@@ -3302,6 +5199,33 @@ async def _resume_publishing_review(
 ) -> None:
     """Lease, reconcile, and release one durable GitHub publication."""
 
+    pending_action = await db.scalar(
+        select(PRReview.pending_action).where(
+            PRReview.id == pr_review_id,
+            PRReview.status == "publishing",
+        )
+    )
+    await db.rollback()
+    if _restored_thread_action(pending_action) is not None:
+        # Only the exact zero-thread resolver may restore this durable stage.
+        return
+    if _restored_identity_action(pending_action) is not None:
+        armed = await _arm_identity_pending_publication(
+            db,
+            review_id=pr_review_id,
+            repo_full_name=repo_full_name,
+        )
+        if not armed:
+            return
+    if pending_action == "approved_merged":
+        # Close the online-migration window where an old binary can insert an
+        # otherwise valid outbox after the schema backfill has already run.
+        # The helper is deliberately fail-closed; normal new rows already
+        # carry their frozen method and are left untouched.
+        await _freeze_legacy_merge_outbox(
+            db,
+            review_id=pr_review_id,
+        )
     lease_token = await _acquire_publication_lease(db, pr_review_id)
     if lease_token is None:
         return
@@ -3397,6 +5321,51 @@ def _validated_superseding_snapshot(
         dict,
     ):
         return None
+    pr_data = dict(pr_data)
+    prepared_context = dict(prepared_context)
+    material = prepared_context.get("material")
+    guidance = prepared_context.get("guidance")
+    if not isinstance(material, dict) or not isinstance(guidance, dict):
+        return None
+
+    # Version 2 snapshots created before base-ref freezing stored the branch
+    # only inside the verified PR material. Normalize that durable evidence so
+    # recovery never falls back to the repo's mutable default_branch.
+    refs = [
+        pr_data.get("base_ref"),
+        prepared_context.get("base_ref"),
+        material.get("base_ref"),
+    ]
+    base_ref = next((item for item in refs if item is not None), None)
+    if (
+        not _valid_base_ref(base_ref)
+        or any(item is not None and item != base_ref for item in refs)
+    ):
+        return None
+
+    pr_number = pr_data.get("number")
+    base_sha = pr_data.get("base_sha")
+    head_sha = pr_data.get("head_sha")
+    repo_name = prepared_context.get("repo_name")
+    if (
+        not isinstance(pr_number, int)
+        or isinstance(pr_number, bool)
+        or pr_number <= 0
+        or not isinstance(repo_name, str)
+        or _GITHUB_REPO_RE.fullmatch(repo_name) is None
+        or not isinstance(base_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(base_sha.lower()) is None
+        or not isinstance(head_sha, str)
+        or _GITHUB_SHA_RE.fullmatch(head_sha.lower()) is None
+        or prepared_context.get("pr_number") != pr_number
+        or prepared_context.get("base_sha") != base_sha.lower()
+        or prepared_context.get("head_sha") != head_sha.lower()
+    ):
+        return None
+    pr_data["base_ref"] = base_ref
+    pr_data["base_sha"] = base_sha.lower()
+    pr_data["head_sha"] = head_sha.lower()
+    prepared_context["base_ref"] = base_ref
     return pr_data, prepared_context
 
 
@@ -3533,7 +5502,7 @@ async def recover_superseding_pr_reviews(
                             and _validated_superseding_snapshot(
                                 review.superseding_snapshot
                             )
-                            is not None
+                            == (pr_data, prepared_context)
                         )
                     ]
                     if {
@@ -3545,6 +5514,7 @@ async def recover_superseding_pr_reviews(
                         for review in current_reviews
                         if (
                             review.pr_number == pr_data.get("number")
+                            and review.base_ref == pr_data.get("base_ref")
                             and review.base_sha == pr_data.get("base_sha")
                             and review.head_sha == pr_data.get("head_sha")
                         )
@@ -3652,6 +5622,7 @@ async def recover_superseding_pr_reviews(
                             select(PRReview.id).where(
                                 PRReview.repo_id == repo_id,
                                 PRReview.pr_number == pr_data.get("number"),
+                                PRReview.base_ref == pr_data.get("base_ref"),
                                 PRReview.base_sha == pr_data.get("base_sha"),
                                 PRReview.head_sha == pr_data.get("head_sha"),
                             )

@@ -5,6 +5,10 @@ import json
 import os
 import shutil
 import signal
+import socket
+import subprocess
+import sys
+import threading
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,13 +31,22 @@ from backend.services.codex_app_server import (
     CodexThreadNotIdleError,
     CodexThreadTerminalStateError,
     CodexTurnProcess,
+    _audit_isolated_request_config,
     _format_process_exit,
+    _network_isolated_permission_config,
+    _parse_codex_app_server_version,
     codex_project_trust_target,
     codex_untrusted_project_config,
     codex_untrusted_project_override,
     normalize_codex_home,
 )
 from backend.services.mcp_config import McpServerSpec
+from backend.services.task_agent_isolation import (
+    discover_linked_worktree_git_read_boundary,
+)
+from backend.services.task_runtime_secrets import (
+    create_private_task_temp_dir,
+)
 from backend.services.codex_tier_proxy import (
     CodexActualTierProof,
     CodexTierProofError,
@@ -61,6 +74,55 @@ _CODEX_0_144_6_TURN_START_FIELDS = frozenset({
 })
 
 
+@pytest.fixture
+def isolated_task_boundary(tmp_path):
+    """Create real linked Git metadata plus one private TMP per mock turn."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    git("config", "user.name", "CCM Test")
+    git("config", "user.email", "ccm@example.invalid")
+    (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "baseline")
+    workspace = tmp_path / "workspace"
+    git("worktree", "add", "-qb", "task-boundary", str(workspace))
+    git_boundary = discover_linked_worktree_git_read_boundary(workspace)
+    assert git_boundary is not None
+    scratch_handles = []
+
+    def allocate(task_id: int, *, turn_generation: int = 1):
+        scratch = create_private_task_temp_dir(
+            task_id=task_id,
+            task_incarnation_id=f"{task_id:032x}"[-32:],
+            retry_count=0,
+            turn_generation=turn_generation,
+        )
+        scratch_handles.append(scratch)
+        return SimpleNamespace(
+            cwd=str(workspace.resolve()),
+            git_read_paths=git_boundary.read_paths,
+            git_fingerprint=git_boundary.identity_fingerprint,
+            scratch=scratch,
+        )
+
+    yield allocate
+
+    for scratch in scratch_handles:
+        scratch.cleanup()
+
+
 def _task_mcp_spec(task_id: int) -> McpServerSpec:
     return McpServerSpec(
         name="ccm_skills",
@@ -79,8 +141,79 @@ def _task_mcp_spec(task_id: int) -> McpServerSpec:
     )
 
 
+def _task_ssh_mcp_spec(task_id: int) -> McpServerSpec:
+    return McpServerSpec(
+        name="ccm_ssh",
+        command="python",
+        args=(
+            "-m",
+            "backend.mcp.ccm_ssh_server",
+            "--task-id",
+            str(task_id),
+        ),
+        cwd="/ccm",
+        required=True,
+        enabled_tools=("list_connections", "read_file"),
+        startup_timeout_sec=10,
+        tool_timeout_sec=60,
+    )
+
+
+def _ambient_mcp_response(
+    inventory: dict[str, dict] | None = None,
+) -> dict:
+    return {
+        "config": {
+            "mcp_servers": inventory or {},
+        },
+        "origins": {},
+    }
+
+
+def _empty_skills_response(cwd: str = "/workspace/project") -> dict:
+    return {
+        "data": [{
+            "cwd": cwd,
+            "skills": [],
+            "errors": [],
+        }],
+    }
+
+
+def _mark_managed_network_runtime_safe(server: CodexAppServer) -> None:
+    server._runtime_version = (0, 146, 0)
+    server._runtime_version_process = server._process
+
+
+@pytest.mark.parametrize(
+    ("rendered", "version", "expected"),
+    [
+        ("claude_code_manager/0.144.6 (Ubuntu 24.04)", (0, 144, 6), False),
+        ("claude_code_manager/0.146.0 (Ubuntu 24.04)", (0, 146, 0), True),
+        ("claude_code_manager/0.147.0 (linux; x86_64)", (0, 147, 0), True),
+        ("claude_code_manager/0.146.0-beta.1 (linux)", None, False),
+        ("ccm_probe/0.147.0 (linux)", None, False),
+        ("claude_code_manager/0.147.0", None, False),
+        (None, None, False),
+    ],
+)
+def test_managed_network_runtime_version_gate(rendered, version, expected):
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None)
+    server._process = process
+    server._runtime_version = _parse_codex_app_server_version(rendered)
+    server._runtime_version_process = process
+    assert server._runtime_version == version
+    assert server._managed_network_runtime_is_safe() is expected
+
+    server._runtime_version_process = SimpleNamespace(returncode=None)
+    assert server._managed_network_runtime_is_safe() is False
+
+
 def _tool_free_thread_response(
     thread_id: str = "thread-tool-free-test",
+    *,
+    permission_profile: str,
 ) -> dict:
     return {
         "thread": {
@@ -89,7 +222,7 @@ def _tool_free_thread_response(
         },
         "serviceTier": "default",
         "activePermissionProfile": {
-            "id": "ccm_pr_review_no_access_v1",
+            "id": permission_profile,
             "extends": None,
         },
         "runtimeWorkspaceRoots": [],
@@ -120,12 +253,39 @@ def _network_isolated_thread_response(
             "id": permission_profile,
             "extends": None,
         },
+        "instructionSources": [],
         "sandbox": {
             "type": "workspaceWrite",
             "writableRoots": writable_roots or [],
             "networkAccess": network_access,
             "excludeTmpdirEnvVar": True,
             "excludeSlashTmp": True,
+        },
+    }
+
+
+def _task_isolated_thread_response(
+    thread_id: str,
+    *,
+    permission_profile: str = "ccm_task_ssh_isolated_v1",
+    sandbox_type: str = "workspaceWrite",
+    network_access: bool = False,
+    instruction_sources: list[str] | None = None,
+) -> dict:
+    return {
+        "thread": {
+            "id": thread_id,
+            "status": {"type": "idle"},
+        },
+        "serviceTier": "default",
+        "activePermissionProfile": {
+            "id": permission_profile,
+            "extends": None,
+        },
+        "instructionSources": instruction_sources or [],
+        "sandbox": {
+            "type": sandbox_type,
+            "networkAccess": network_access,
         },
     }
 
@@ -139,21 +299,21 @@ async def _start_tool_free_test_turn(
 ) -> tuple[CodexTurnProcess, str]:
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {
-            "config": {"mcp_servers": {}},
-            "origins": {},
-        },
-        {
-            "data": [{
-                "cwd": "/tmp",
-                "skills": [],
-                "errors": [],
-            }],
-        },
-        _tool_free_thread_response(thread_id),
-        {"turn": {"id": turn_id}},
-    ])
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response("/tmp")
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                thread_id,
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": turn_id}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
     return await server.start_turn(
         prompt="review only the immutable supplied snapshot",
         cwd="/tmp",
@@ -166,6 +326,1626 @@ async def _start_tool_free_test_turn(
         disable_autonomous_features=True,
         tools_disabled=True,
     )
+
+
+async def _start_mcp_only_test_turn(
+    server: CodexAppServer,
+) -> tuple[CodexTurnProcess, str]:
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response("/tmp")
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                "thread-mcp-only",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-mcp-only"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    browser_spec = McpServerSpec(
+        name="ccm_browser_review",
+        command="python",
+        args=("-m", "backend.mcp.ccm_browser_review_server"),
+        cwd="/ccm",
+        required=True,
+        enabled_tools=("browser_open", "browser_inspect"),
+    )
+    return await server.start_turn(
+        prompt="use only the bound browser MCP",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=991,
+        mcp_specs=(browser_spec,),
+        disable_project_config=True,
+        sandbox_mode="read-only",
+        disable_autonomous_features=True,
+        mcp_only=True,
+    )
+
+
+async def _start_task_isolated_mcp_test_turn(
+    server: CodexAppServer,
+    boundary,
+) -> tuple[CodexTurnProcess, str]:
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-task-mcp-guard",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-task-mcp-guard"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    return await server.start_turn(
+        prompt="use only the authorized SSH broker",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=997,
+        mcp_specs=(_task_ssh_mcp_spec(997),),
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_ssh_disable_network=True,
+        disable_autonomous_features=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mcp_identity",
+    [
+        {"server": "ambient"},
+        {},
+        {"server": "ccm_ssh", "serverName": "ambient"},
+    ],
+)
+async def test_task_isolation_interrupts_unbound_mcp_tool_call(
+    mcp_identity,
+    isolated_task_boundary,
+):
+    server = CodexAppServer("codex")
+    boundary = isolated_task_boundary(997)
+    process, thread_id = await _start_task_isolated_mcp_test_turn(
+        server,
+        boundary,
+    )
+    context = server._contexts_by_thread[thread_id]
+    server._interrupt_turn_context = AsyncMock()
+
+    # The exact admitted server remains usable.
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-task-mcp-guard",
+        "item": {
+            "id": "authorized-call",
+            "type": "mcpToolCall",
+            "server": "ccm_ssh",
+            "tool": "list_connections",
+        },
+    })
+    assert context.tool_policy_violation is None
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-task-mcp-guard",
+        "item": {
+            "id": "unauthorized-call",
+            "type": "mcpToolCall",
+            "tool": "read_repository",
+            **mcp_identity,
+        },
+    })
+    abort_task = context.tool_policy_abort_task
+    assert abort_task is not None
+    await abort_task
+
+    assert await process.wait() == 1
+    assert context.tool_policy_violation is not None
+    assert "unauthorized MCP" in context.tool_policy_violation
+    server._interrupt_turn_context.assert_awaited_once_with(context)
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_profile_denies_host_keys_and_direct_network(
+    monkeypatch,
+    isolated_task_boundary,
+):
+    monkeypatch.setenv("CCM_TEST_ARBITRARY_SECRET", "must-not-leak")
+    monkeypatch.setenv("FEISHU_APP_SECRET", "must-not-leak")
+    monkeypatch.setenv("SMTP_PASSWORD", "must-not-leak")
+    monkeypatch.setenv("DATABASE_URL", "must-not-leak")
+    boundary = isolated_task_boundary(991)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-task-ssh",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-task-ssh"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="inspect the authorized server",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env={
+            "GIT_AUTHOR_NAME": "CCM",
+            "GIT_ASKPASS": "/manager/askpass-with-token",
+            "GIT_SSH_COMMAND": "ssh -i /manager/project-key",
+            "GH_TOKEN": "manager-gh-token",
+        },
+        task_id=991,
+        mcp_specs=(_task_ssh_mcp_spec(991),),
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=(
+            "/Users/operator/.ssh",
+            "/private/ccm/ssh-keys/profile.pem",
+        ),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_ssh_disable_network=True,
+        disable_autonomous_features=True,
+    )
+
+    config_calls = [
+        call for call in server._request.await_args_list
+        if call.args[0] == "config/read"
+    ]
+    skills_calls = [
+        call for call in server._request.await_args_list
+        if call.args[0] == "skills/list"
+    ]
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    turn_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "turn/start"
+    )
+    config_call = config_calls[0]
+    skills_call = skills_calls[0]
+    assert config_call.args == (
+        "config/read",
+        {"cwd": boundary.cwd, "includeLayers": False},
+    )
+    assert len(config_calls) == 4
+    assert all(call.args == config_call.args for call in config_calls)
+    assert skills_call.args == (
+        "skills/list",
+        {"cwds": [boundary.cwd], "forceReload": True},
+    )
+    assert len(skills_calls) == 4
+    thread_params = thread_call.args[1]
+    assert "sandbox" not in thread_params
+    config = thread_params["config"]
+    assert config["mcp_servers"]["ambient"] == {"enabled": False}
+    assert config["mcp_servers"]["ccm_ssh"]["command"] == "python"
+    assert {
+        name
+        for name, value in config["mcp_servers"].items()
+        if value.get("enabled", True)
+    } == {"ccm_ssh"}
+    assert list(config["projects"].values()) == [{"trust_level": "untrusted"}]
+    assert config["features"]["apps"] is False
+    assert config["features"]["multi_agent"] is False
+    assert config["features"]["plugins"] is False
+    assert config["features"]["hooks"] is False
+    assert config["features"]["skill_mcp_dependency_install"] is False
+    assert config["orchestrator"]["skills"] == {"enabled": False}
+    assert config["skills"] == {
+        "include_instructions": False,
+        "bundled": {"enabled": False},
+        "config": [],
+    }
+    profile_id = config["default_permissions"]
+    assert profile_id.startswith("ccm_task_ssh_isolated_v1_")
+    profile = config["permissions"][profile_id]
+    assert profile["filesystem"][":root"] == "deny"
+    assert profile["filesystem"][":minimal"] == "read"
+    assert profile["filesystem"][boundary.cwd] == "write"
+    assert profile["filesystem"]["/Users/operator/.ssh"] == "deny"
+    assert (
+        profile["filesystem"]["/private/ccm/ssh-keys/profile.pem"]
+        == "deny"
+    )
+    assert profile["filesystem"][str(boundary.scratch.path)] == "write"
+    assert all(
+        profile["filesystem"][path] == "read"
+        for path in boundary.git_read_paths
+    )
+    assert {
+        path
+        for path, mode in profile["filesystem"].items()
+        if mode == "write"
+    } == {boundary.cwd, str(boundary.scratch.path)}
+    assert profile["network"] == {
+        "enabled": False,
+        "allow_local_binding": False,
+    }
+    shell_policy = config["shell_environment_policy"]
+    assert shell_policy["inherit"] == "none"
+    assert shell_policy["ignore_default_excludes"] is False
+    assert shell_policy["exclude"] == [
+            "AUTH_TOKEN",
+            "CCM_*",
+            "GIT_*",
+            "GH_*",
+            "GITHUB_*",
+            "SSH_*",
+            "ANTHROPIC_*",
+            "CLAUDE_*",
+            "OPENAI_*",
+            "CODEX_*",
+            "AWS_*",
+            "GOOGLE_*",
+        ]
+    assert shell_policy["set"] == {
+            "PATH": os.defpath,
+            "HOME": str(Path.home()),
+            **({"LANG": os.environ["LANG"]} if os.environ.get("LANG") else {}),
+            **({"LANGUAGE": os.environ["LANGUAGE"]} if os.environ.get("LANGUAGE") else {}),
+            **({"TZ": os.environ["TZ"]} if os.environ.get("TZ") else {}),
+            "GIT_AUTHOR_NAME": "CCM",
+            "GIT_TERMINAL_PROMPT": "0",
+            "GCM_INTERACTIVE": "never",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GH_PROMPT_DISABLED": "1",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "TMPDIR": str(boundary.scratch.path),
+            "TMP": str(boundary.scratch.path),
+            "TEMP": str(boundary.scratch.path),
+            "CCM_TASK_SSH_GUARD": "1",
+            "SSH_AUTH_SOCK": "",
+            "SSH_AGENT_PID": "",
+            "SSH_ASKPASS": "",
+    }
+    assert not {
+        "CCM_TEST_ARBITRARY_SECRET",
+        "FEISHU_APP_SECRET",
+        "SMTP_PASSWORD",
+        "DATABASE_URL",
+    } & set(shell_policy["set"])
+    assert "sandboxPolicy" not in turn_call.args[1]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_task_uses_exact_managed_public_network_profile(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(993)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    _mark_managed_network_runtime_safe(server)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            profile = params["config"]["default_permissions"]
+            return _task_isolated_thread_response(
+                "thread-task-managed-network",
+                permission_profile=profile,
+                network_access=True,
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-task-managed-network"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="work in the repository",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=993,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_managed_network_proxy=True,
+        disable_autonomous_features=True,
+    )
+
+    thread_params = next(
+        call.args[1]
+        for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    config = thread_params["config"]
+    permission_profile = config["default_permissions"]
+    assert permission_profile.startswith("ccm_task_managed_network_v1_")
+    assert len(permission_profile) == (
+        len("ccm_task_managed_network_v1_") + 32
+    )
+    assert set(config["permissions"]) == {permission_profile}
+    profile = config["permissions"][permission_profile]
+    assert profile["network"] == {
+        "enabled": True,
+        "enable_socks5": False,
+        "enable_socks5_udp": False,
+        "allow_upstream_proxy": False,
+        "dangerously_allow_non_loopback_proxy": False,
+        "dangerously_allow_all_unix_sockets": False,
+        "mode": "full",
+        "domains": {"*": "allow"},
+        "unix_sockets": {},
+        "allow_local_binding": False,
+    }
+    assert config["features"]["network_proxy"] is True
+    assert isinstance(config["features"]["network_proxy"], bool)
+    assert "CCM_TASK_SSH_GUARD" not in config[
+        "shell_environment_policy"
+    ]["set"]
+    shell_policy = config["shell_environment_policy"]
+    assert shell_policy["inherit"] == "none"
+    assert shell_policy["ignore_default_excludes"] is False
+    assert {
+        "AUTH_TOKEN",
+        "CCM_*",
+        "GIT_*",
+        "GH_*",
+        "GITHUB_*",
+        "SSH_*",
+        "ANTHROPIC_*",
+        "CLAUDE_*",
+        "OPENAI_*",
+        "CODEX_*",
+        "AWS_*",
+        "GOOGLE_*",
+    } == set(shell_policy["exclude"])
+    assert "sandbox" not in thread_params
+    assert "sandboxPolicy" not in server._request.await_args_list[-1].args[1]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_task_managed_network_profile_id_is_unique_per_turn(
+    isolated_task_boundary,
+):
+    profile_ids: list[str] = []
+    generated = [
+        SimpleNamespace(hex="a" * 32),
+        SimpleNamespace(hex="1" * 32),
+        SimpleNamespace(hex="b" * 32),
+        SimpleNamespace(hex="2" * 32),
+    ]
+
+    with patch(
+        "backend.services.codex_app_server.uuid.uuid4",
+        side_effect=generated,
+    ):
+        for task_id in (9931, 9932):
+            boundary = isolated_task_boundary(task_id)
+            server = CodexAppServer("codex")
+            server._process = SimpleNamespace(pid=4321, returncode=None)
+            _mark_managed_network_runtime_safe(server)
+            server.ensure_started = AsyncMock()
+
+            async def request(method, params, **_kwargs):
+                if method == "config/read":
+                    return _ambient_mcp_response()
+                if method == "skills/list":
+                    return _empty_skills_response(boundary.cwd)
+                if method == "thread/start":
+                    profile_id = params["config"]["default_permissions"]
+                    profile_ids.append(profile_id)
+                    return _task_isolated_thread_response(
+                        f"thread-managed-{task_id}",
+                        permission_profile=profile_id,
+                        network_access=True,
+                    )
+                if method == "turn/start":
+                    return {"turn": {"id": f"turn-managed-{task_id}"}}
+                raise AssertionError(method)
+
+            server._request = AsyncMock(side_effect=request)
+            await server.start_turn(
+                prompt="use managed public network",
+                cwd=boundary.cwd,
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                disable_project_config=True,
+                disable_user_mcp=True,
+                sandbox_mode="workspace-write",
+                task_ssh_protected_paths=("/Users/operator/.ssh",),
+                task_git_read_paths=boundary.git_read_paths,
+                task_git_boundary_fingerprint=boundary.git_fingerprint,
+                task_private_tmpdir=boundary.scratch,
+                task_managed_network_proxy=True,
+                disable_autonomous_features=True,
+            )
+
+    assert profile_ids == [
+        f"ccm_task_managed_network_v1_{suffix}"
+        for suffix in ("a" * 32, "b" * 32)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_network_off_profile_id_is_unique_per_turn(
+    isolated_task_boundary,
+):
+    profile_ids: list[str] = []
+    generated = [
+        SimpleNamespace(hex="c" * 32),
+        SimpleNamespace(hex="1" * 32),
+        SimpleNamespace(hex="d" * 32),
+        SimpleNamespace(hex="2" * 32),
+    ]
+    with patch(
+        "backend.services.codex_app_server.uuid.uuid4",
+        side_effect=generated,
+    ):
+        for task_id in (99311, 99312):
+            boundary = isolated_task_boundary(task_id)
+            server = CodexAppServer("codex")
+            server._process = SimpleNamespace(pid=4321, returncode=None)
+            server.ensure_started = AsyncMock()
+
+            async def request(method, params, **_kwargs):
+                if method == "config/read":
+                    return _ambient_mcp_response()
+                if method == "skills/list":
+                    return _empty_skills_response(boundary.cwd)
+                if method == "thread/start":
+                    profile_id = params["config"]["default_permissions"]
+                    profile_ids.append(profile_id)
+                    return _task_isolated_thread_response(
+                        f"thread-network-off-{task_id}",
+                        permission_profile=profile_id,
+                    )
+                if method == "turn/start":
+                    return {"turn": {"id": f"turn-network-off-{task_id}"}}
+                raise AssertionError(method)
+
+            server._request = AsyncMock(side_effect=request)
+            await server.start_turn(
+                prompt="network off",
+                cwd=boundary.cwd,
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                disable_project_config=True,
+                disable_user_mcp=True,
+                sandbox_mode="workspace-write",
+                task_ssh_protected_paths=("/Users/operator/.ssh",),
+                task_git_read_paths=boundary.git_read_paths,
+                task_git_boundary_fingerprint=boundary.git_fingerprint,
+                task_private_tmpdir=boundary.scratch,
+                task_ssh_disable_network=True,
+                disable_autonomous_features=True,
+            )
+
+    assert profile_ids == [
+        f"ccm_task_ssh_isolated_v1_{suffix}"
+        for suffix in ("c" * 32, "d" * 32)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tool_free_profile_id_is_unique_per_turn():
+    profile_ids: list[str] = []
+    generated = [
+        SimpleNamespace(hex="e" * 32),
+        SimpleNamespace(hex="1" * 32),
+        SimpleNamespace(hex="f" * 32),
+        SimpleNamespace(hex="2" * 32),
+    ]
+    with patch(
+        "backend.services.codex_app_server.uuid.uuid4",
+        side_effect=generated,
+    ):
+        for task_id in (99321, 99322):
+            server = CodexAppServer("codex")
+            server._process = SimpleNamespace(pid=4321, returncode=None)
+            server.ensure_started = AsyncMock()
+
+            async def request(method, params, **_kwargs):
+                if method == "config/read":
+                    return _ambient_mcp_response()
+                if method == "skills/list":
+                    return _empty_skills_response("/tmp")
+                if method == "thread/start":
+                    profile_id = params["config"]["default_permissions"]
+                    profile_ids.append(profile_id)
+                    return _tool_free_thread_response(
+                        f"thread-tool-free-{task_id}",
+                        permission_profile=profile_id,
+                    )
+                if method == "turn/start":
+                    return {"turn": {"id": f"turn-tool-free-{task_id}"}}
+                raise AssertionError(method)
+
+            server._request = AsyncMock(side_effect=request)
+            await server.start_turn(
+                prompt="tool free",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=task_id,
+                sandbox_mode="read-only",
+                disable_autonomous_features=True,
+                tools_disabled=True,
+            )
+
+    assert profile_ids == [
+        f"ccm_pr_review_no_access_v1_{suffix}"
+        for suffix in ("e" * 32, "f" * 32)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    [
+        "web_search",
+        "allow_login_shell",
+        "features",
+        "permissions",
+        "mcp_servers",
+        "skills",
+        "tools",
+        "orchestrator",
+        "agents",
+        "memories",
+        "projects",
+        "shell_environment_policy",
+    ],
+)
+async def test_isolated_request_local_security_drift_fails_closed(field):
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response("/tmp")
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    audits = 0
+
+    def audit(config, **kwargs):
+        nonlocal audits
+        audits += 1
+        if audits == 2:
+            if field == "web_search":
+                config["web_search"] = "live"
+            elif field == "allow_login_shell":
+                config["allow_login_shell"] = True
+            elif field == "features":
+                config["features"]["network_proxy"] = True
+            elif field == "permissions":
+                config["permissions"]["attacker"] = {
+                    "filesystem": {"/": "write"},
+                }
+            elif field == "mcp_servers":
+                config["mcp_servers"]["attacker"] = {"enabled": True}
+            elif field == "skills":
+                config["skills"]["include_instructions"] = True
+            elif field == "tools":
+                config["tools"]["experimental_request_user_input"] = {
+                    "enabled": True,
+                }
+            elif field == "orchestrator":
+                config["orchestrator"]["mcp"] = {"enabled": True}
+            elif field == "agents":
+                config["agents"]["max_threads"] = 2
+            elif field == "memories":
+                config["memories"]["use_memories"] = True
+            elif field == "projects":
+                next(iter(config["projects"].values()))["trust_level"] = (
+                    "trusted"
+                )
+            elif field == "shell_environment_policy":
+                config["shell_environment_policy"]["inherit"] = "all"
+        return _audit_isolated_request_config(config, **kwargs)
+
+    with patch(
+        "backend.services.codex_app_server._audit_isolated_request_config",
+        side_effect=audit,
+    ):
+        with pytest.raises(
+            CodexRequiredMcpPreTurnError,
+            match="failed local audit",
+        ):
+            await server.start_turn(
+                prompt="must fail before model input",
+                cwd="/tmp",
+                model="gpt-5.6-sol",
+                effort="high",
+                resume_session_id=None,
+                git_env=None,
+                task_id=9933,
+                sandbox_mode="read-only",
+                disable_autonomous_features=True,
+                tools_disabled=True,
+            )
+
+    assert audits == 2
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_hostile_ambient_unknown_feature_and_old_profiles_are_neutralized(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9934)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = {
+        "config": {
+            "mcp_servers": {},
+            "features": {
+                "future_remote_escape": True,
+                "unified_exec": True,
+            },
+            "permissions": {
+                "ccm_task_ssh_isolated_v1": {
+                    "filesystem": {"/": "write"},
+                },
+                "ccm_task_ssh_isolated_v1_attacker": {
+                    "network": {"enabled": True},
+                },
+            },
+        },
+    }
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            config = params["config"]
+            profile_id = config["default_permissions"]
+            assert profile_id.startswith("ccm_task_ssh_isolated_v1_")
+            assert set(config["permissions"]) == {profile_id}
+            assert config["features"]["future_remote_escape"] is False
+            assert config["features"]["unified_exec"] is True
+            return _task_isolated_thread_response(
+                "thread-hostile-ambient-neutralized",
+                permission_profile=profile_id,
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-hostile-ambient-neutralized"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    await server.start_turn(
+        prompt="unknown remote feature must be false",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=9934,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_ssh_disable_network=True,
+        disable_autonomous_features=True,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ambient_override",
+    [
+        {"tools": {"future_remote_tool": {"enabled": True}}},
+        {"hooks": {"after_turn": ["/tmp/attacker"]}},
+        {"orchestrator": {"future_remote_agent": {"enabled": True}}},
+        {"shell_environment_policy": {"set": {"GH_TOKEN": "ambient"}}},
+    ],
+)
+async def test_uncovered_ambient_capability_or_shell_secret_fails_closed(
+    isolated_task_boundary,
+    ambient_override,
+):
+    boundary = isolated_task_boundary(9935)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient_config = {"mcp_servers": {}}
+    ambient_config.update(ambient_override)
+
+    async def request(method, _params, **_kwargs):
+        if method == "config/read":
+            return {"config": ambient_config}
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="could not be safely overridden",
+    ):
+        await server.start_turn(
+            prompt="must fail before thread admission",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9935,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            disable_autonomous_features=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response_override",
+    [
+        {"permission_profile": "attacker-selected-profile"},
+        {"network_access": False},
+        {"network_access": 1},
+    ],
+)
+async def test_ordinary_task_managed_network_requires_exact_thread_proof(
+    isolated_task_boundary,
+    response_override,
+):
+    boundary = isolated_task_boundary(9933)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    _mark_managed_network_runtime_safe(server)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            response_args = dict(response_override)
+            response_args.setdefault(
+                "permission_profile",
+                params["config"]["default_permissions"],
+            )
+            return _task_isolated_thread_response(
+                "thread-unproven-managed-network",
+                **response_args,
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not reach model input",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9933,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_managed_network_proxy=True,
+            disable_autonomous_features=True,
+        )
+
+    assert not any(
+        call.args[0] == "turn/start"
+        for call in server._request.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_auxiliary_credential_profile_preserves_read_only_sandbox(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(994)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-read-only-credentials",
+                permission_profile=params["config"]["default_permissions"],
+                sandbox_type="readOnly",
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-read-only-credentials"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.start_turn(
+        prompt="inspect without editing",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=994,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="read-only",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_ssh_disable_network=True,
+        disable_autonomous_features=True,
+    )
+
+    thread_params = next(
+        call.args[1]
+        for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    profile_id = thread_params["config"]["default_permissions"]
+    assert profile_id.startswith("ccm_task_ssh_isolated_v1_")
+    profile = thread_params["config"]["permissions"][profile_id]
+    assert profile["filesystem"][boundary.cwd] == "read"
+    assert profile["filesystem"]["/Users/operator/.ssh"] == "deny"
+    assert profile["filesystem"][str(boundary.scratch.path)] == "write"
+    assert all(
+        profile["filesystem"][path] == "read"
+        for path in boundary.git_read_paths
+    )
+    assert {
+        path
+        for path, mode in profile["filesystem"].items()
+        if mode == "write"
+    } == {str(boundary.scratch.path)}
+    assert profile["network"] == {
+        "enabled": False,
+        "allow_local_binding": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_task_ssh_profile_fails_before_model_input_when_not_admitted(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(992)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response(),
+        _empty_skills_response(boundary.cwd),
+        _ambient_mcp_response(),
+        _empty_skills_response(boundary.cwd),
+        {
+            "thread": {
+                "id": "thread-task-ssh-unproven",
+                "status": {"type": "idle"},
+            },
+            "serviceTier": "default",
+            "activePermissionProfile": {"id": ":workspace"},
+            "instructionSources": [],
+            "sandbox": {
+                "type": "workspaceWrite",
+                "networkAccess": False,
+            },
+        },
+    ])
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=992,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            disable_autonomous_features=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_ambient_mcp_name_collision(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(995)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value=_ambient_mcp_response({
+        "ccm_ssh": {"command": "/tmp/user-controlled-server"},
+    }))
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="audit and disable ambient MCP",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=995,
+            mcp_specs=(_task_ssh_mcp_spec(995),),
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+        )
+
+    server._request.assert_awaited_once_with(
+        "config/read",
+        {"cwd": boundary.cwd, "includeLayers": False},
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_ambient_global_instructions_before_model_input(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9951)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(return_value={
+        "config": {
+            "mcp_servers": {},
+            "developer_instructions": "read ~/.codex/auth.json",
+        },
+    })
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="audit and disable ambient MCP",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9951,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+        )
+
+    server._request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_external_instruction_source(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9952)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    response = _task_isolated_thread_response("thread-external-instructions")
+    response["instructionSources"] = ["/home/operator/.codex/AGENTS.md"]
+    server._request = AsyncMock(side_effect=[
+        _ambient_mcp_response(),
+        _empty_skills_response(boundary.cwd),
+        _ambient_mcp_response(),
+        _empty_skills_response(boundary.cwd),
+        response,
+    ])
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9952,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
+        "thread/start",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_project_instruction_symlink_hash_change_after_owner_fails_closed(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(99521)
+    claude_doc = Path(boundary.cwd) / "CLAUDE.md"
+    agents_doc = Path(boundary.cwd) / "AGENTS.md"
+    claude_doc.write_text("safe instructions\n", encoding="utf-8")
+    agents_doc.symlink_to("CLAUDE.md")
+    current_git_boundary = discover_linked_worktree_git_read_boundary(
+        boundary.cwd
+    )
+    assert current_git_boundary is not None
+    ambient = _ambient_mcp_response()
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-instruction-symlink",
+                permission_profile=params["config"]["default_permissions"],
+                instruction_sources=[str(agents_doc)],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    prepared = AsyncMock(
+        side_effect=lambda *_args: claude_doc.write_text(
+            "changed after owner\n",
+            encoding="utf-8",
+        )
+    )
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="instruction sources changed while publishing launch ownership",
+    ):
+        await server.start_turn(
+            prompt="must not see changed instructions",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=99521,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=current_git_boundary.read_paths,
+            task_git_boundary_fingerprint=(
+                current_git_boundary.identity_fingerprint
+            ),
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            on_turn_prepared=prepared,
+        )
+
+    prepared.assert_awaited_once()
+    assert not any(
+        call.args[0] == "turn/start"
+        for call in server._request.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rejects_skills_revision_change_before_model_input(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9953)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+
+    async def request(method, _params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            server._skills_revision += 1
+            return _task_isolated_thread_response("thread-skills-race")
+        raise AssertionError(f"unexpected request: {method}")
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="Task isolation profile was not proven",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9953,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rechecks_ambient_before_thread_admission(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9959)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    original = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    changed = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+        "late": {"url": "https://untrusted.invalid/mcp"},
+    })
+    config_reads = 0
+
+    async def request(method, _params, **_kwargs):
+        nonlocal config_reads
+        if method == "config/read":
+            config_reads += 1
+            return original if config_reads == 1 else changed
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed before thread admission",
+    ):
+        await server.start_turn(
+            prompt="must fail before thread side effects",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9959,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rechecks_inventory_after_thread_binding(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(996)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    original = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    changed = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+        "late": {"url": "https://untrusted.invalid/mcp"},
+    })
+    config_reads = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal config_reads
+        if method == "config/read":
+            config_reads += 1
+            return original if config_reads < 3 else changed
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/resume":
+            return _task_isolated_thread_response(
+                "thread-task-rebind",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    on_thread_started = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed before turn ownership",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id="thread-task-rebind",
+            git_env=None,
+            task_id=996,
+            mcp_specs=(_task_ssh_mcp_spec(996),),
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            on_thread_started=on_thread_started,
+        )
+
+    on_thread_started.assert_awaited_once_with("thread-task-rebind")
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
+        "thread/resume",
+        "config/read",
+        "skills/list",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_task_isolation_rechecks_inventory_after_launch_owner_commit(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(997)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    original = _ambient_mcp_response({
+        "ambient": {"command": "/bin/false"},
+    })
+    changed = _ambient_mcp_response({
+        "ambient": {"command": "/bin/true"},
+    })
+    config_reads = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal config_reads
+        if method == "config/read":
+            config_reads += 1
+            return original if config_reads < 4 else changed
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-task-owner",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    on_turn_prepared = AsyncMock()
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="changed while publishing launch ownership",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=997,
+            mcp_specs=(_task_ssh_mcp_spec(997),),
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            on_turn_prepared=on_turn_prepared,
+        )
+
+    on_turn_prepared.assert_awaited_once()
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
+        "thread/start",
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
+    ]
+    assert not boundary.scratch.path.exists()
+
+
+@pytest.mark.asyncio
+async def test_isolated_turn_rejects_process_drift_after_owner_commit(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(9971)
+    server = CodexAppServer("codex")
+    process_one = SimpleNamespace(pid=4321, returncode=None)
+    process_two = SimpleNamespace(pid=4322, returncode=None)
+    server._process = process_one
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-process-drift",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    async def replace_process_after_owner(_process, _thread_id):
+        server._process = process_two
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="runtime generation changed while publishing launch ownership",
+    ):
+        await server.start_turn(
+            prompt="must remain on the admitted runtime",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=9971,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            on_turn_prepared=replace_process_after_owner,
+        )
+
+    assert not any(
+        call.args[0] == "turn/start"
+        for call in server._request.await_args_list
+    )
+    assert not boundary.scratch.path.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed_control", ["HEAD", "branch-ref", "index"])
+async def test_task_isolation_rejects_linked_git_identity_change_before_model_input(
+    isolated_task_boundary,
+    changed_control,
+):
+    boundary = isolated_task_boundary(998)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    ambient = _ambient_mcp_response()
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return ambient
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            return _task_isolated_thread_response(
+                "thread-git-identity-race",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    async def mutate_after_owner_commit(_process, _thread_id):
+        if changed_control == "HEAD":
+            target = next(
+                Path(path)
+                for path in boundary.git_read_paths
+                if Path(path).name == "HEAD"
+            )
+            replacement = target.with_name("HEAD.replacement")
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+        elif changed_control == "branch-ref":
+            target = next(
+                Path(path)
+                for path in boundary.git_read_paths
+                if "refs/heads/task-boundary" in path
+            )
+            target.write_text("0" * 40 + "\n", encoding="ascii")
+        else:
+            target = next(
+                Path(path)
+                for path in boundary.git_read_paths
+                if Path(path).name == "index"
+            )
+            replacement = target.with_name("index.replacement")
+            replacement.write_bytes(target.read_bytes())
+            os.replace(replacement, target)
+
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="linked-worktree identity changed",
+    ):
+        await server.start_turn(
+            prompt="must not run",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=998,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_ssh_disable_network=True,
+            on_turn_prepared=mutate_after_owner_commit,
+        )
+
+    assert not boundary.scratch.path.exists()
+    assert not any(call.args[0] == "turn/start" for call in server._request.await_args_list)
 
 
 def _write_schema_filtering_app_server(path: Path) -> None:
@@ -395,7 +2175,7 @@ async def test_start_turn_recycles_system_error_once_before_idle_admission():
     calls = []
     resume_count = 0
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         nonlocal resume_count
         calls.append((method, params))
         if method == "thread/resume":
@@ -455,7 +2235,7 @@ async def test_start_turn_stops_after_one_persistent_system_error_recycle():
     server.ensure_started = AsyncMock()
     calls = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         calls.append((method, params))
         if method == "thread/resume":
             return {
@@ -532,7 +2312,7 @@ async def test_resume_rejects_different_thread_id_before_terminal_recycle():
     server.ensure_started = AsyncMock()
     calls = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         calls.append((method, params))
         return {
             "thread": {
@@ -571,7 +2351,7 @@ async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "model/list":
             return {
                 "data": [{
@@ -814,16 +2594,19 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
 
 @pytest.mark.asyncio
 async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
-    tmp_path,
+    isolated_task_boundary,
 ):
-    workspace = str(tmp_path.resolve())
+    boundary = isolated_task_boundary(909)
+    workspace = boundary.cwd
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "config/read":
             return {"config": {"mcp_servers": {}}}
+        if method == "skills/list":
+            return _empty_skills_response(workspace)
         if method == "thread/start":
             return _network_isolated_thread_response(
                 workspace,
@@ -848,9 +2631,23 @@ async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
         sandbox_mode="workspace-write",
         disable_autonomous_features=True,
         network_isolated=True,
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
     )
 
-    config_call, thread_call, turn_call = server._request.await_args_list
+    config_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "config/read"
+    )
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    turn_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "turn/start"
+    )
     assert config_call.args == (
         "config/read",
         {"cwd": workspace, "includeLayers": False},
@@ -867,18 +2664,23 @@ async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
     permission_profile = config["default_permissions"]
     assert permission_profile.startswith("ccm_delivery_workspace_v1_")
     assert len(permission_profile) == len("ccm_delivery_workspace_v1_") + 32
-    assert config["permissions"] == {
-        permission_profile: {
-            "filesystem": {
-                ":root": "deny",
-                ":minimal": "read",
-                workspace: "write",
-            },
-            "network": {
-                "enabled": False,
-                "allow_local_binding": False,
-            },
-        },
+    profile = config["permissions"][permission_profile]
+    assert profile["filesystem"][":root"] == "deny"
+    assert profile["filesystem"][":minimal"] == "read"
+    assert profile["filesystem"][workspace] == "write"
+    assert profile["filesystem"][str(boundary.scratch.path)] == "write"
+    assert all(
+        profile["filesystem"][path] == "read"
+        for path in boundary.git_read_paths
+    )
+    assert {
+        path
+        for path, mode in profile["filesystem"].items()
+        if mode == "write"
+    } == {workspace, str(boundary.scratch.path)}
+    assert profile["network"] == {
+        "enabled": False,
+        "allow_local_binding": False,
     }
     for feature in (
         "apps",
@@ -918,21 +2720,27 @@ async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
         "enabled": False,
     }
     shell_policy = config["shell_environment_policy"]
-    assert shell_policy["inherit"] == "core"
+    assert shell_policy["inherit"] == "none"
     assert shell_policy["ignore_default_excludes"] is False
-    assert shell_policy["exclude"] == [
-        "GIT_*",
-        "GH_*",
-        "GITHUB_*",
-        "SSH_*",
-    ]
-    assert shell_policy["set"] == {
+    assert shell_policy["include_only"] == []
+    assert shell_policy["experimental_use_profile"] is False
+    assert {"GIT_*", "GH_*", "GITHUB_*", "SSH_*"} <= set(
+        shell_policy["exclude"]
+    )
+    assert {
         "GIT_TERMINAL_PROMPT": "0",
         "GCM_INTERACTIVE": "never",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GH_PROMPT_DISABLED": "1",
-    }
+        "GIT_OPTIONAL_LOCKS": "0",
+        "TMPDIR": str(boundary.scratch.path),
+        "TMP": str(boundary.scratch.path),
+        "TEMP": str(boundary.scratch.path),
+        "SSH_AUTH_SOCK": "",
+        "SSH_AGENT_PID": "",
+        "SSH_ASKPASS": "",
+    }.items() <= shell_policy["set"].items()
     assert not any(
         "TOKEN" in name or "SECRET" in name or name.endswith("_KEY")
         for name in shell_policy["set"]
@@ -945,18 +2753,138 @@ async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
 
 
 @pytest.mark.asyncio
-async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
-    tmp_path,
+async def test_old_runtime_downgrades_managed_task_before_thread_start(
+    isolated_task_boundary,
 ):
-    workspace = str(tmp_path.resolve())
+    boundary = isolated_task_boundary(99301)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 144, 6)
+    server._runtime_version_process = server._process
+    server.ensure_started = AsyncMock()
+
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response(boundary.cwd)
+        if method == "thread/start":
+            profile_id = params["config"]["default_permissions"]
+            assert profile_id.startswith("ccm_task_ssh_isolated_v1_")
+            return _task_isolated_thread_response(
+                "thread-managed-downgraded",
+                permission_profile=profile_id,
+                network_access=False,
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-managed-downgraded"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    await server.start_turn(
+        prompt="network must fail closed",
+        cwd=boundary.cwd,
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=99301,
+        disable_project_config=True,
+        disable_user_mcp=True,
+        sandbox_mode="workspace-write",
+        task_ssh_protected_paths=("/Users/operator/.ssh",),
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
+        task_managed_network_proxy=True,
+        disable_autonomous_features=True,
+    )
+
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    config = thread_call.args[1]["config"]
+    profile_id = config["default_permissions"]
+    assert config["features"]["network_proxy"] is False
+    assert config["permissions"][profile_id]["network"] == {
+        "enabled": False,
+        "allow_local_binding": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_managed_network_rejects_process_drift_before_thread_start(
+    isolated_task_boundary,
+):
+    boundary = isolated_task_boundary(99302)
+    server = CodexAppServer("codex")
+    process_one = SimpleNamespace(pid=4321, returncode=None)
+    process_two = SimpleNamespace(pid=4322, returncode=None)
+    server._process = process_one
+    _mark_managed_network_runtime_safe(server)
+    server.ensure_started = AsyncMock()
+    skills_reads = 0
+
+    async def request(method, _params, **_kwargs):
+        nonlocal skills_reads
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            skills_reads += 1
+            if skills_reads == 2:
+                server._process = process_two
+                server._runtime_version = (0, 144, 6)
+                server._runtime_version_process = process_two
+            return _empty_skills_response(boundary.cwd)
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with pytest.raises(
+        CodexRequiredMcpPreTurnError,
+        match="runtime generation changed before thread admission",
+    ):
+        await server.start_turn(
+            prompt="must not cross app-server generations",
+            cwd=boundary.cwd,
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=99302,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            sandbox_mode="workspace-write",
+            task_ssh_protected_paths=("/Users/operator/.ssh",),
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            task_managed_network_proxy=True,
+            disable_autonomous_features=True,
+        )
+
+    assert not any(
+        call.args[0] in {"thread/start", "thread/resume", "turn/start"}
+        for call in server._request.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
+    isolated_task_boundary,
+):
+    first_boundary = isolated_task_boundary(912)
+    workspace = first_boundary.cwd
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
     profile_ids: list[str] = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "config/read":
             return {"config": {"mcp_servers": {}}}
+        if method == "skills/list":
+            return _empty_skills_response(workspace)
         if method == "thread/start":
             profile_id = params["config"]["default_permissions"]
             profile_ids.append(profile_id)
@@ -985,7 +2913,10 @@ async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
         "backend.services.codex_app_server.uuid.uuid4",
         side_effect=generated,
     ):
-        for task_id in (912, 913):
+        for task_id, boundary in (
+            (912, first_boundary),
+            (913, isolated_task_boundary(913)),
+        ):
             await server.start_turn(
                 prompt="implement only inside the managed worktree",
                 cwd=workspace,
@@ -999,6 +2930,9 @@ async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
                 sandbox_mode="workspace-write",
                 disable_autonomous_features=True,
                 network_isolated=True,
+                task_git_read_paths=boundary.git_read_paths,
+                task_git_boundary_fingerprint=boundary.git_fingerprint,
+                task_private_tmpdir=boundary.scratch,
             )
 
     assert profile_ids == [
@@ -1011,14 +2945,15 @@ async def test_network_isolated_delivery_profile_id_is_unique_per_turn(
 
 @pytest.mark.asyncio
 async def test_network_isolated_delivery_disables_inherited_mcp_by_name(
-    tmp_path,
+    isolated_task_boundary,
 ):
-    workspace = str(tmp_path.resolve())
+    boundary = isolated_task_boundary(910)
+    workspace = boundary.cwd
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "config/read":
             return {
                 "config": {
@@ -1028,6 +2963,8 @@ async def test_network_isolated_delivery_disables_inherited_mcp_by_name(
                     },
                 },
             }
+        if method == "skills/list":
+            return _empty_skills_response(workspace)
         if method == "thread/start":
             return _network_isolated_thread_response(
                 workspace,
@@ -1052,9 +2989,16 @@ async def test_network_isolated_delivery_disables_inherited_mcp_by_name(
         sandbox_mode="workspace-write",
         disable_autonomous_features=True,
         network_isolated=True,
+        task_git_read_paths=boundary.git_read_paths,
+        task_git_boundary_fingerprint=boundary.git_fingerprint,
+        task_private_tmpdir=boundary.scratch,
     )
 
-    thread_config = server._request.await_args_list[1].args[1]["config"]
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    thread_config = thread_call.args[1]["config"]
     profile_id = thread_config["default_permissions"]
     assert set(thread_config["permissions"]) == {profile_id}
     assert thread_config["mcp_servers"] == {
@@ -1079,18 +3023,21 @@ async def test_network_isolated_delivery_disables_inherited_mcp_by_name(
     ],
 )
 async def test_network_isolated_delivery_fails_before_turn_without_sandbox_proof(
-    tmp_path,
+    isolated_task_boundary,
     response_overrides,
     message,
 ):
-    workspace = str(tmp_path.resolve())
+    boundary = isolated_task_boundary(911)
+    workspace = boundary.cwd
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "config/read":
             return {"config": {"mcp_servers": {}}}
+        if method == "skills/list":
+            return _empty_skills_response(workspace)
         if method == "thread/start":
             response_kwargs = dict(response_overrides)
             response_kwargs.setdefault(
@@ -1119,12 +3066,430 @@ async def test_network_isolated_delivery_fails_before_turn_without_sandbox_proof
             sandbox_mode="workspace-write",
             disable_autonomous_features=True,
             network_isolated=True,
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
         )
 
     assert [call.args[0] for call in server._request.await_args_list] == [
         "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
         "thread/start",
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("CCM_RUN_REAL_CODEX_SANDBOX_TESTS") != "1"
+    or shutil.which("codex") is None
+    or not sys.platform.startswith("linux"),
+    reason="opt-in real Codex app-server sandbox probe",
+)
+async def test_real_codex_managed_public_network_extended_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    """Exercise managed HTTPS plus every known host-network escape boundary."""
+
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    host_secret = tmp_path / "host-secret.txt"
+    slash_tmp_secret = Path("/tmp") / (
+        f"ccm-managed-probe-secret-{os.getpid()}-{id(workspace)}"
+    )
+    codex_home.mkdir()
+    workspace.mkdir()
+    scratch.mkdir()
+    codex_executable = shutil.which("codex") or "codex"
+    probe_binary: Path | None = None
+    native_override = os.environ.get("CCM_REAL_CODEX_NATIVE_BINARY")
+    if native_override:
+        native_source = Path(native_override).resolve(strict=True)
+        if not native_source.is_file():
+            pytest.fail("CCM_REAL_CODEX_NATIVE_BINARY is not a regular file")
+        # An npm-installed Codex native binary normally lives below $HOME.
+        # The profile deliberately hides that tree, so expose the exact same
+        # inode through the admitted workspace (or copy it across filesystems)
+        # before asking Codex to re-exec itself inside bubblewrap.
+        probe_binary = workspace / ".ccm-real-codex"
+        try:
+            os.link(native_source, probe_binary)
+        except OSError:
+            shutil.copy2(native_source, probe_binary)
+        probe_binary.chmod(0o755)
+        codex_executable = str(probe_binary)
+    host_secret.write_text("host-secret", encoding="utf-8")
+    slash_tmp_secret.write_text("slash-tmp-secret", encoding="utf-8")
+    profile = "ccm_task_managed_network_v1_real_probe"
+    unix_path = workspace / "host.sock"
+    unix_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    unix_listener.bind(str(unix_path))
+    unix_listener.listen(1)
+    unix_listener.setblocking(False)
+
+    upstream_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    upstream_listener.bind(("127.0.0.1", 0))
+    upstream_listener.listen(8)
+    upstream_listener.setblocking(False)
+    upstream_port = upstream_listener.getsockname()[1]
+    poisoned_proxy = f"http://127.0.0.1:{upstream_port}"
+
+    loopback_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    loopback_listener.bind(("127.0.0.1", 0))
+    loopback_listener.listen(4)
+    loopback_listener.setblocking(False)
+    loopback_port = loopback_listener.getsockname()[1]
+
+    abstract_name = (
+        "\0ccm-managed-probe-"
+        f"{os.getpid()}-{loopback_port}"
+    )
+    abstract_listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    abstract_listener.bind(abstract_name)
+    abstract_listener.listen(4)
+    abstract_listener.setblocking(False)
+
+    network = {
+        "enabled": True,
+        "enable_socks5": False,
+        "enable_socks5_udp": False,
+        "allow_upstream_proxy": False,
+        "dangerously_allow_non_loopback_proxy": False,
+        "dangerously_allow_all_unix_sockets": False,
+        "mode": "full",
+        "domains": {"*": "allow"},
+        "unix_sockets": {},
+        "allow_local_binding": False,
+    }
+    profile_config = {
+        "features": {"network_proxy": True},
+        "default_permissions": profile,
+        "permissions": {
+            profile: {
+                "filesystem": {
+                    ":root": "deny",
+                    ":minimal": "read",
+                    str(workspace.resolve()): "write",
+                    str(scratch.resolve()): "write",
+                },
+                "network": network,
+            },
+        },
+        "shell_environment_policy": {
+            "inherit": "none",
+            "ignore_default_excludes": False,
+            "exclude": [
+                "AUTH_TOKEN",
+                "CCM_*",
+                "GIT_*",
+                "GH_*",
+                "GITHUB_*",
+                "SSH_*",
+                "ANTHROPIC_*",
+                "CLAUDE_*",
+                "OPENAI_*",
+                "CODEX_*",
+                "AWS_*",
+                "GOOGLE_*",
+            ],
+            "include_only": [],
+            "experimental_use_profile": False,
+            "set": {
+                "PATH": os.defpath,
+                "HOME": str(Path.home()),
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "never",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GH_PROMPT_DISABLED": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "SSH_AUTH_SOCK": "",
+                "SSH_AGENT_PID": "",
+                "SSH_ASKPASS": "",
+                "TMPDIR": str(scratch.resolve()),
+                "TMP": str(scratch.resolve()),
+                "TEMP": str(scratch.resolve()),
+            },
+        },
+    }
+    (codex_home / "config.toml").write_text(
+        "\n".join([
+            f'default_permissions = "{profile}"',
+            "",
+            "[features]",
+            "network_proxy = true",
+            "",
+            f"[permissions.{profile}.filesystem]",
+            '":root" = "deny"',
+            '":minimal" = "read"',
+            f'{json.dumps(str(workspace.resolve()))} = "write"',
+            f'{json.dumps(str(scratch.resolve()))} = "write"',
+            "",
+            f"[permissions.{profile}.network]",
+            "enabled = true",
+            "enable_socks5 = false",
+            "enable_socks5_udp = false",
+            "allow_upstream_proxy = false",
+            "dangerously_allow_non_loopback_proxy = false",
+            "dangerously_allow_all_unix_sockets = false",
+            'mode = "full"',
+            "allow_local_binding = false",
+            "",
+            f"[permissions.{profile}.network.domains]",
+            '"*" = "allow"',
+            "",
+            f"[permissions.{profile}.network.unix_sockets]",
+            "",
+            "[shell_environment_policy]",
+            'inherit = "none"',
+            "ignore_default_excludes = false",
+            "include_only = []",
+            "experimental_use_profile = false",
+            (
+                'exclude = ["AUTH_TOKEN", "CCM_*", "GIT_*", "GH_*", '
+                '"GITHUB_*", "SSH_*", "ANTHROPIC_*", "CLAUDE_*", '
+                '"OPENAI_*", "CODEX_*", "AWS_*", "GOOGLE_*"]'
+            ),
+            "",
+            "[shell_environment_policy.set]",
+            f"PATH = {json.dumps(os.defpath)}",
+            f"HOME = {json.dumps(str(Path.home()))}",
+            'GIT_TERMINAL_PROMPT = "0"',
+            'GCM_INTERACTIVE = "never"',
+            f"GIT_CONFIG_GLOBAL = {json.dumps(os.devnull)}",
+            'GIT_CONFIG_NOSYSTEM = "1"',
+            'GH_PROMPT_DISABLED = "1"',
+            'GIT_OPTIONAL_LOCKS = "0"',
+            'SSH_AUTH_SOCK = ""',
+            'SSH_AGENT_PID = ""',
+            'SSH_ASKPASS = ""',
+            f"TMPDIR = {json.dumps(str(scratch.resolve()))}",
+            f"TMP = {json.dumps(str(scratch.resolve()))}",
+            f"TEMP = {json.dumps(str(scratch.resolve()))}",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    server = CodexAppServer(
+        codex_executable,
+        codex_home=codex_home,
+    )
+
+    async def execute(command: list[str]) -> dict:
+        completed = await asyncio.to_thread(
+            subprocess.run,
+            [
+                codex_executable,
+                "--enable",
+                "network_proxy",
+                "sandbox",
+                "--permission-profile",
+                profile,
+                "--",
+                *command,
+            ],
+            cwd=workspace,
+            env={**os.environ, "CODEX_HOME": str(codex_home)},
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return {
+            "exitCode": completed.returncode,
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+        }
+
+    try:
+        await server.ensure_started()
+        assert server._runtime_version is not None
+        assert server._runtime_version >= (0, 146, 0)
+        assert server._runtime_version_process is server._process
+        assert profile_config["shell_environment_policy"]["inherit"] == "none"
+        thread_response = await server._request(
+            "thread/start",
+            {
+                "cwd": str(workspace.resolve()),
+                "approvalPolicy": "never",
+                "approvalsReviewer": "user",
+                "config": profile_config,
+            },
+        )
+        assert thread_response["activePermissionProfile"] == {
+            "id": profile,
+            "extends": None,
+        }
+        assert thread_response["sandbox"]["networkAccess"] is True
+        await server.shutdown()
+        for name in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            monkeypatch.setenv(name, poisoned_proxy)
+        monkeypatch.setenv("GH_TOKEN", "must-not-enter-sandbox")
+        monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/host-agent.sock")
+
+        # 1. Public HTTPS succeeds through Codex's loopback HTTP proxy. This
+        # also proves the poisoned deployment proxy was not used upstream.
+        public = await execute([
+            "/usr/bin/curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "10",
+            "https://example.com/",
+        ])
+        try:
+            poisoned_connection, _ = upstream_listener.accept()
+        except BlockingIOError:
+            poisoned_connection = None
+        else:
+            poisoned_connection.close()
+        assert public["exitCode"] == 0, {
+            **public,
+            "deployment_upstream_proxy_was_used": (
+                poisoned_connection is not None
+            ),
+        }
+        assert "Example Domain" in public["stdout"]
+
+        # 2. A client cannot bypass the managed proxy for direct public TCP.
+        bypass = await execute([
+            "/usr/bin/curl",
+            "--noproxy",
+            "*",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "2",
+            "--max-time",
+            "4",
+            "https://example.com/",
+        ])
+        assert bypass["exitCode"] != 0
+
+        # 3. Host loopback is not reachable through direct TCP.
+        loopback_connect = await execute([
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import socket; s=socket.socket(); "
+                f"s.settimeout(2); s.connect(('127.0.0.1', {loopback_port}))"
+            ),
+        ])
+        assert loopback_connect["exitCode"] != 0
+        with pytest.raises(BlockingIOError):
+            loopback_listener.accept()
+
+        # 4. Loopback binding is private to the sandbox network namespace.
+        # ``allow_local_binding`` governs whether the managed proxy may reach
+        # local/private hosts; it does not reject bind(2). The previous probe
+        # proves that this namespace cannot reach the host listener, while a
+        # listener and client inside the namespace can still communicate.
+        local_bind = await execute([
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import socket; l=socket.socket(); "
+                "l.bind(('127.0.0.1', 0)); l.listen(1); "
+                "c=socket.socket(); c.connect(l.getsockname()); "
+                "a,_=l.accept(); a.close(); c.close(); l.close()"
+            ),
+        ])
+        assert local_bind["exitCode"] == 0, local_bind
+
+        # 5. Workspace-visible pathname AF_UNIX sockets are denied.
+        unix_connect = await execute([
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import socket; s=socket.socket(socket.AF_UNIX); "
+                f"s.connect({str(unix_path)!r})"
+            ),
+        ])
+        assert unix_connect["exitCode"] != 0
+        with pytest.raises(BlockingIOError):
+            unix_listener.accept()
+
+        # 6. Linux abstract AF_UNIX sockets are denied independently.
+        abstract_connect = await execute([
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import socket; s=socket.socket(socket.AF_UNIX); "
+                f"s.connect({abstract_name!r})"
+            ),
+        ])
+        assert abstract_connect["exitCode"] != 0
+        with pytest.raises(BlockingIOError):
+            abstract_listener.accept()
+
+        # 7. UDP egress remains unavailable.
+        udp = await execute([
+            "/usr/bin/python3",
+            "-c",
+            (
+                "import socket; s=socket.socket(socket.AF_INET, "
+                "socket.SOCK_DGRAM); s.sendto(b'x', ('1.1.1.1', 53))"
+            ),
+        ])
+        assert udp["exitCode"] != 0
+
+        # 8. SOCKS is disabled; ALL_PROXY is the managed HTTP endpoint.
+        proxy_env = await execute([
+            "/bin/sh",
+            "-c",
+            'case "${ALL_PROXY:-}" in http://127.0.0.1:*) exit 0;; '
+            '*) printf "%s" "${ALL_PROXY:-}"; exit 1;; esac',
+        ])
+        assert proxy_env["exitCode"] == 0
+
+        # 9. The exact inherit=none policy supplies only safe runtime values.
+        environment = await execute([
+            "/bin/sh",
+            "-c",
+            (
+                f'test "$TMPDIR" = {str(scratch.resolve())!r} && '
+                'test -z "${GH_TOKEN+x}" && '
+                'test -z "${SSH_AUTH_SOCK}"'
+            ),
+        ])
+        assert environment["exitCode"] == 0, environment
+
+        # 10. Neither a sibling temporary secret nor another host file is read.
+        slash_tmp_read = await execute([
+            "/bin/cat",
+            str(slash_tmp_secret),
+        ])
+        host_read = await execute([
+            "/bin/cat",
+            str(host_secret),
+        ])
+        assert slash_tmp_read["exitCode"] != 0
+        assert host_read["exitCode"] != 0
+
+        with pytest.raises(BlockingIOError):
+            upstream_listener.accept()
+    finally:
+        await server.shutdown()
+        upstream_listener.close()
+        loopback_listener.close()
+        abstract_listener.close()
+        unix_listener.close()
+        slash_tmp_secret.unlink(missing_ok=True)
+        if probe_binary is not None:
+            probe_binary.unlink(missing_ok=True)
 
 
 @pytest.mark.asyncio
@@ -1298,48 +3663,185 @@ async def test_real_codex_delivery_permission_profile_blocks_host_reads(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("CCM_RUN_REAL_CODEX_SANDBOX_TESTS") != "1"
+    or shutil.which("codex") is None,
+    reason="opt-in real Codex linked-Git boundary probe",
+)
+async def test_real_codex_linked_git_projection_allows_read_commands_not_commit(
+    tmp_path,
+):
+    """Run Git itself inside the exact production filesystem projection."""
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    def git(*args: str, cwd: Path = repository) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    git("init", "-q")
+    git("config", "user.name", "CCM Test")
+    git("config", "user.email", "ccm@example.invalid")
+    (repository / "tracked.txt").write_text("baseline\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "baseline")
+    workspace = tmp_path / "workspace"
+    other_workspace = tmp_path / "other-workspace"
+    git("worktree", "add", "-qb", "task-probe", str(workspace))
+    git("worktree", "add", "-qb", "other-probe", str(other_workspace))
+    git("pack-refs", "--all", "--prune")
+    current_commit = git("rev-parse", "task-probe").stdout.strip()
+    current_ref = repository / ".git" / "refs" / "heads" / "task-probe"
+    current_ref.parent.mkdir(parents=True, exist_ok=True)
+    current_ref.write_text(current_commit + "\n", encoding="ascii")
+    other_loose_ref = repository / ".git" / "refs" / "heads" / "hidden-ref"
+    other_loose_ref.write_text(current_commit + "\n", encoding="ascii")
+    (workspace / "tracked.txt").write_text("changed\n", encoding="utf-8")
+
+    boundary = discover_linked_worktree_git_read_boundary(workspace)
+    assert boundary is not None
+    scratch = create_private_task_temp_dir(
+        task_id=914,
+        task_incarnation_id="9" * 32,
+        retry_count=0,
+        turn_generation=1,
+    )
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    profile_id = "ccm_linked_git_probe"
+    profile = _network_isolated_permission_config(
+        cwd=str(workspace.resolve()),
+        git_read_paths=boundary.read_paths,
+        private_tmpdir=str(scratch.path),
+    )
+    config_lines = [
+        f'default_permissions = "{profile_id}"',
+        "allow_login_shell = false",
+        "",
+        f"[permissions.{profile_id}.filesystem]",
+        *(
+            f"{json.dumps(path)} = {json.dumps(mode)}"
+            for path, mode in profile["filesystem"].items()
+        ),
+        "",
+        f"[permissions.{profile_id}.network]",
+        "enabled = false",
+        "allow_local_binding = false",
+        "",
+        "[shell_environment_policy]",
+        'inherit = "core"',
+        "ignore_default_excludes = false",
+        'exclude = ["GIT_*", "GH_*", "GITHUB_*", "SSH_*"]',
+        "",
+        "[shell_environment_policy.set]",
+        f"TMPDIR = {json.dumps(str(scratch.path))}",
+        f"TMP = {json.dumps(str(scratch.path))}",
+        f"TEMP = {json.dumps(str(scratch.path))}",
+        'GIT_OPTIONAL_LOCKS = "0"',
+        f"GIT_CONFIG_GLOBAL = {json.dumps(os.devnull)}",
+        'GIT_CONFIG_NOSYSTEM = "1"',
+        'GIT_TERMINAL_PROMPT = "0"',
+        "",
+    ]
+    (codex_home / "config.toml").write_text(
+        "\n".join(config_lines),
+        encoding="utf-8",
+    )
+    server = CodexAppServer(
+        shutil.which("codex") or "codex",
+        codex_home=codex_home,
+    )
+
+    async def command(script: str) -> dict:
+        return await server._request(
+            "command/exec",
+            {
+                "command": ["/bin/sh", "-c", script],
+                "cwd": str(workspace.resolve()),
+                "permissionProfile": profile_id,
+                "timeoutMs": 10_000,
+            },
+        )
+
+    original_head = (Path(boundary.git_dir) / "HEAD").read_bytes()
+    original_index = (Path(boundary.git_dir) / "index").read_bytes()
+    try:
+        await server.ensure_started()
+        readable = await command(
+            "git status --short && git diff -- tracked.txt >/dev/null "
+            "&& git log -1 --oneline >/dev/null"
+        )
+        assert readable["exitCode"] == 0, readable
+        assert "tracked.txt" in readable["stdout"]
+
+        committed = await command(
+            "git -c user.name=Probe -c user.email=probe@example.invalid "
+            "commit -am forbidden"
+        )
+        assert committed["exitCode"] != 0
+        assert git("rev-parse", "task-probe").stdout.strip() == current_commit
+        assert (Path(boundary.git_dir) / "HEAD").read_bytes() == original_head
+        assert (Path(boundary.git_dir) / "index").read_bytes() == original_index
+
+        hidden_paths = [
+            repository / ".git" / "config",
+            repository / ".git" / "packed-refs",
+            other_loose_ref,
+            repository / ".git" / "worktrees" / other_workspace.name / "HEAD",
+        ]
+        for hidden in hidden_paths:
+            denied = await command(f"cat {json.dumps(str(hidden))}")
+            assert denied["exitCode"] != 0
+
+        temp_write = await command(
+            'printf tmp-ok > "$TMPDIR/probe" && cat "$TMPDIR/probe"'
+        )
+        assert temp_write["exitCode"] == 0
+        assert temp_write["stdout"] == "tmp-ok"
+    finally:
+        await server.shutdown(reason="real linked Git boundary probe complete")
+        scratch.cleanup()
+
+    assert not scratch.path.exists()
+
+
+@pytest.mark.asyncio
 async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {
-            "config": {
-                "mcp_servers": {
-                    "ambient": {"command": "/bin/false"},
-                },
-            },
-            "origins": {},
-        },
-        {
-            "data": [{
-                "cwd": "/tmp",
-                "skills": [{
-                    "path": "/opt/codex/example/SKILL.md",
-                    "enabled": True,
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response({
+                "ambient": {"command": "/bin/false"},
+            })
+        if method == "skills/list":
+            return {
+                "data": [{
+                    "cwd": "/tmp",
+                    "skills": [{
+                        "path": "/opt/codex/example/SKILL.md",
+                        "enabled": True,
+                    }],
+                    "errors": [],
                 }],
-                "errors": [],
-            }],
-        },
-        {
-            "thread": {
-                "id": "thread-tool-free",
-                "status": {"type": "idle"},
-            },
-            "serviceTier": "default",
-            "activePermissionProfile": {
-                "id": "ccm_pr_review_no_access_v1",
-                "extends": None,
-            },
-            "runtimeWorkspaceRoots": [],
-            "instructionSources": [],
-            "sandbox": {
-                "type": "readOnly",
-                "networkAccess": False,
-            },
-        },
-        {"turn": {"id": "turn-tool-free"}},
-    ])
+            }
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                "thread-tool-free",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-tool-free"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
 
     await server.start_turn(
         prompt="use only the supplied snapshot",
@@ -1354,8 +3856,21 @@ async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
         tools_disabled=True,
     )
 
-    config_call, skills_call, thread_call, turn_call = (
-        server._request.await_args_list
+    config_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "config/read"
+    )
+    skills_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "skills/list"
+    )
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    turn_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "turn/start"
     )
     assert config_call.args == (
         "config/read",
@@ -1379,8 +3894,9 @@ async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
     assert config["mcp_servers"] == {
         "ambient": {"enabled": False},
     }
-    assert config["default_permissions"] == "ccm_pr_review_no_access_v1"
-    assert config["permissions"]["ccm_pr_review_no_access_v1"] == {
+    profile_id = config["default_permissions"]
+    assert profile_id.startswith("ccm_pr_review_no_access_v1_")
+    assert config["permissions"][profile_id] == {
         "filesystem": {"/": "deny"},
         "network": {
             "enabled": False,
@@ -1389,6 +3905,10 @@ async def test_tool_free_profile_clears_inherited_mcp_and_native_tools():
     }
     assert config["shell_environment_policy"] == {
         "inherit": "none",
+        "ignore_default_excludes": False,
+        "exclude": [],
+        "include_only": [],
+        "experimental_use_profile": False,
         "set": {},
     }
     assert config["orchestrator"] == {
@@ -1546,12 +4066,23 @@ async def test_tool_free_profile_requires_authoritative_thread_proof():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    unproven = _tool_free_thread_response("thread-unproven")
+    unproven = _tool_free_thread_response(
+        "thread-unproven",
+        permission_profile="unused-unproven-profile",
+    )
     unproven["activePermissionProfile"] = {
         "id": "read-only",
         "extends": None,
     }
     server._request = AsyncMock(side_effect=[
+        {"config": {"mcp_servers": {}}},
+        {
+            "data": [{
+                "cwd": "/tmp",
+                "skills": [],
+                "errors": [],
+            }],
+        },
         {"config": {"mcp_servers": {}}},
         {
             "data": [{
@@ -1583,6 +4114,8 @@ async def test_tool_free_profile_requires_authoritative_thread_proof():
     assert [call.args[0] for call in server._request.await_args_list] == [
         "config/read",
         "skills/list",
+        "config/read",
+        "skills/list",
         "thread/start",
     ]
 
@@ -1601,10 +4134,20 @@ async def test_tool_free_profile_never_resumes_persisted_dynamic_tools():
     assert methods == [
         "config/read",
         "skills/list",
+        "config/read",
+        "skills/list",
         "thread/start",
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
         "turn/start",
     ]
-    thread_params = server._request.await_args_list[2].args[1]
+    thread_params = next(
+        call.args[1]
+        for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
     assert "threadId" not in thread_params
     assert thread_params["dynamicTools"] == []
     assert thread_id == "thread-new-tool-free"
@@ -1675,6 +4218,77 @@ async def test_tool_free_profile_allows_only_audited_passive_items():
             "id": "turn-tool-free-test",
             "status": "completed",
         },
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_mcp_only_profile_keeps_bound_mcp_and_denies_ambient_capabilities():
+    server = CodexAppServer("codex")
+    process, thread_id = await _start_mcp_only_test_turn(server)
+
+    thread_params = next(
+        call.args[1]
+        for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    config = thread_params["config"]
+    assert config["mcp_servers"]["ambient"] == {"enabled": False}
+    assert config["mcp_servers"]["ccm_browser_review"]["required"] is True
+    assert config["orchestrator"]["mcp"] == {"enabled": True}
+    assert thread_params["environments"] == []
+    assert thread_params["runtimeWorkspaceRoots"] == []
+    assert thread_params["dynamicTools"] == []
+
+    context = server._contexts_by_thread[thread_id]
+    assert context.mcp_only is True
+    server._schedule_tool_free_violation = MagicMock()
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {
+            "id": "mcp-1",
+            "type": "mcpToolCall",
+            "server": "ccm_browser_review",
+            "tool": "browser_open",
+        },
+    })
+    server._handle_notification("item/mcpToolCall/progress", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "itemId": "mcp-1",
+        "server": "ccm_browser_review",
+    })
+    server._schedule_tool_free_violation.assert_not_called()
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {"id": "cmd-1", "type": "commandExecution"},
+    })
+    server._schedule_tool_free_violation.assert_called_once_with(
+        context,
+        "item/started item type 'commandExecution'",
+    )
+
+    server._schedule_tool_free_violation.reset_mock()
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {
+            "id": "mcp-rogue",
+            "type": "mcpToolCall",
+            "server": "ambient",
+            "tool": "read_file",
+        },
+    })
+    server._schedule_tool_free_violation.assert_called_once_with(
+        context,
+        "MCP server ['ambient']",
+    )
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-mcp-only", "status": "completed"},
     })
     assert await process.wait() == 0
 
@@ -1835,20 +4449,19 @@ async def test_turn_owner_hook_runs_after_final_tool_free_preflight():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {
-            "config": {"mcp_servers": {}},
-            "origins": {},
-        },
-        {
-            "data": [{
-                "cwd": "/tmp",
-                "skills": [],
-                "errors": [],
-            }],
-        },
-        _tool_free_thread_response("thread-final-preflight"),
-    ])
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response("/tmp")
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                "thread-final-preflight",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
     prepared = AsyncMock()
 
     async def invalidate_inventory(_thread_id):
@@ -1856,7 +4469,7 @@ async def test_turn_owner_hook_runs_after_final_tool_free_preflight():
 
     with pytest.raises(
         CodexRequiredMcpPreTurnError,
-        match="skills inventory changed before turn/start",
+        match="configuration or skills changed before turn ownership",
     ):
         await server.start_turn(
             prompt="must not start after stale preflight",
@@ -1877,7 +4490,11 @@ async def test_turn_owner_hook_runs_after_final_tool_free_preflight():
     assert [call.args[0] for call in server._request.await_args_list] == [
         "config/read",
         "skills/list",
+        "config/read",
+        "skills/list",
         "thread/start",
+        "config/read",
+        "skills/list",
     ]
     assert not server.has_active_thread("thread-final-preflight")
 
@@ -1887,20 +4504,19 @@ async def test_turn_owner_hook_skills_change_fails_closed_before_model_input():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {
-            "config": {"mcp_servers": {}},
-            "origins": {},
-        },
-        {
-            "data": [{
-                "cwd": "/tmp",
-                "skills": [],
-                "errors": [],
-            }],
-        },
-        _tool_free_thread_response("thread-owner-toctou"),
-    ])
+    async def request(method, params, **_kwargs):
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            return _empty_skills_response("/tmp")
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                "thread-owner-toctou",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
     prepared = AsyncMock(
         side_effect=lambda *_args: server._handle_notification(
             "skills/changed",
@@ -1930,7 +4546,13 @@ async def test_turn_owner_hook_skills_change_fails_closed_before_model_input():
     assert [call.args[0] for call in server._request.await_args_list] == [
         "config/read",
         "skills/list",
+        "config/read",
+        "skills/list",
         "thread/start",
+        "config/read",
+        "skills/list",
+        "config/read",
+        "skills/list",
     ]
     assert not server.has_active_thread("thread-owner-toctou")
 
@@ -1963,7 +4585,7 @@ async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
     )
     server._actual_tier_proxy = proxy
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "model/list":
             return {
                 "data": [{
@@ -2141,7 +4763,7 @@ async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
     server._actual_tier_proxy = proxy
     server.abandon_turn = AsyncMock(return_value=True)
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         if method == "model/list":
             return {
                 "data": [{
@@ -2188,7 +4810,7 @@ async def test_fast_proof_precedes_terminal_notification_that_wins_response_race
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "model/list":
             return {
                 "data": [{
@@ -2388,7 +5010,7 @@ async def test_loaded_thread_switches_service_tier_before_turn_start(
     server.ensure_started = AsyncMock()
     calls = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         calls.append((method, params))
         if method == "model/list":
             return {
@@ -2596,7 +5218,7 @@ async def test_fast_admission_waits_for_client_id_after_provisional_started():
     settings_seen = asyncio.Event()
     release_turn_identity = asyncio.Event()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "model/list":
             return {
                 "data": [{
@@ -2682,7 +5304,7 @@ async def test_fast_adoption_by_older_turn_is_interrupted_without_success_proof(
         emitted.append(event)
         original_feed(process, event)
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         calls.append((method, params))
         if method == "model/list":
             return {
@@ -2921,7 +5543,7 @@ async def test_recycle_thread_runtime_unarchives_despite_cancellation():
     release_archive = asyncio.Event()
     calls = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         calls.append((method, params))
         if method == "thread/archive":
             archive_started.set()
@@ -2968,7 +5590,7 @@ async def test_concurrent_task_threads_keep_mcp_context_isolated():
     server.ensure_started = AsyncMock()
     thread_configs: dict[str, dict] = {}
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             args = params["config"]["mcp_servers"]["ccm_skills"]["args"]
             task_id = args[args.index("--task-id") + 1]
@@ -3047,7 +5669,7 @@ async def test_turn_start_prefixes_task_skills_in_schema_backed_text_input(
     server.ensure_started = AsyncMock()
     turn_params = {}
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method in {"thread/start", "thread/resume"}:
             return {
                 "thread": {
@@ -3090,7 +5712,7 @@ async def test_explicit_context_turn_rejection_is_replay_safe():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -3183,7 +5805,7 @@ async def test_unknown_skill_context_turn_failure_is_not_replay_safe():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -3461,7 +6083,7 @@ async def test_existing_goal_turn_notification_rebinds_submission_id():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -3553,7 +6175,7 @@ async def test_response_first_native_turn_is_correlated_by_client_message_id():
     server.ensure_started = AsyncMock()
     calls = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         calls.append((method, params))
         if method == "thread/resume":
             return {
@@ -3666,7 +6288,7 @@ async def test_mapped_turn_rejects_contradictory_client_message_identity():
     server.ensure_started = AsyncMock()
     turn_params = {}
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -3748,7 +6370,7 @@ async def test_terminal_first_notification_settles_provisional_context():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -3799,7 +6421,7 @@ async def test_signal_interrupt_reconciles_and_pauses_existing_goal_turn():
     interrupt_ids: list[str] = []
     goal_statuses: list[str] = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -3863,7 +6485,7 @@ async def test_interrupt_continues_when_goals_feature_is_disabled():
     server.ensure_started = AsyncMock()
     interrupt_ids: list[str] = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -3924,7 +6546,7 @@ async def test_steer_retries_authoritative_active_turn_id():
     server.ensure_started = AsyncMock()
     steer_requests: list[dict] = []
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {
@@ -3993,7 +6615,7 @@ async def test_active_native_goal_keeps_process_across_continuation_turns():
     server.ensure_started = AsyncMock()
     goal_checks = 0
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         nonlocal goal_checks
         if method == "thread/start":
             return {
@@ -4088,7 +6710,7 @@ async def test_active_goal_rpc_failure_retries_without_false_success():
     server.ensure_started = AsyncMock()
     goal_checks = 0
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         nonlocal goal_checks
         if method == "thread/start":
             return {
@@ -4233,7 +6855,7 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -4345,7 +6967,7 @@ async def test_standard_resume_adopts_detached_active_goal_before_steering():
         assert thread_id == "thread-detached-goal"
         prepared = True
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         nonlocal goal_checks
         if method == "thread/resume":
             return {
@@ -4494,7 +7116,7 @@ async def test_interrupt_followed_goal_between_turns_pauses_and_closes():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -4613,9 +7235,9 @@ async def test_parameterless_request_omits_params_field():
     )
     sent = []
 
-    async def respond(message):
+    async def respond(message, **_kwargs):
         sent.append(message)
-        server._pending[message["id"]].set_result({
+        server._pending[message["id"]][1].set_result({
             "id": message["id"],
             "result": {"rateLimits": {}},
         })
@@ -4637,7 +7259,7 @@ async def test_request_cancelled_during_write_drops_pending_future():
     )
     write_entered = asyncio.Event()
 
-    async def blocked_write(_message):
+    async def blocked_write(_message, **_kwargs):
         write_entered.set()
         await asyncio.Event().wait()
 
@@ -4650,6 +7272,50 @@ async def test_request_cancelled_during_write_drops_pending_future():
     with pytest.raises(asyncio.CancelledError):
         await request
     assert server._pending == {}
+
+
+@pytest.mark.asyncio
+async def test_request_waiting_on_write_lock_never_crosses_process_generation():
+    server = CodexAppServer("codex")
+    stdin_one = SimpleNamespace(write=MagicMock(), drain=AsyncMock())
+    stdin_two = SimpleNamespace(write=MagicMock(), drain=AsyncMock())
+    process_one = SimpleNamespace(
+        pid=4321,
+        returncode=None,
+        stdin=stdin_one,
+    )
+    process_two = SimpleNamespace(
+        pid=4322,
+        returncode=None,
+        stdin=stdin_two,
+    )
+    server._process = process_one
+
+    await server._write_lock.acquire()
+    request = asyncio.create_task(server._request("thread/start", {}))
+    try:
+        for _ in range(10):
+            if server._pending:
+                break
+            await asyncio.sleep(0)
+        assert len(server._pending) == 1
+
+        # Model the old generation exiting while its request is queued, then
+        # a new app-server generation becoming current before the lock opens.
+        process_one.returncode = 1
+        server._finalize_transport_exit(process_one, 1, None)
+        server._process = process_two
+    finally:
+        server._write_lock.release()
+
+    with pytest.raises(
+        CodexAppServerError,
+        match="process generation changed before request write",
+    ):
+        await request
+    stdin_one.write.assert_not_called()
+    stdin_two.write.assert_not_called()
+    assert not server._pending
 
 
 @pytest.mark.asyncio
@@ -5071,7 +7737,7 @@ async def test_interacted_child_uses_thread_read_to_resolve_queue_only_race(
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -5138,7 +7804,7 @@ async def test_unsuccessful_parent_terminal_is_bounded_with_active_child(
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -5223,7 +7889,7 @@ async def test_interrupt_active_goal_descendant_without_visible_turn():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -5312,7 +7978,7 @@ async def test_descendant_terminal_deadline_holds_adapter_until_proven(
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -5393,7 +8059,7 @@ async def test_unconfirmed_descendant_abandon_escalates_transport_shutdown(
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -6399,7 +9065,7 @@ async def test_response_first_malformed_terminal_cannot_resurrect_context():
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -6461,7 +9127,7 @@ async def test_response_first_uncorrelated_terminal_interrupts_admitted_identity
     server._interrupt_turn_context = AsyncMock(side_effect=interrupt_after_admission)
     server.shutdown = AsyncMock()
 
-    async def request(method, params):
+    async def request(method, params, **_kwargs):
         if method == "thread/start":
             return {
                 "thread": {
@@ -6704,7 +9370,6 @@ async def test_reader_exit_does_not_leak_shared_stderr_to_tasks():
     assert context.descendant_guard_task is not None
     assert turn_process.returncode is None
     pending = asyncio.get_running_loop().create_future()
-    server._pending[99] = pending
 
     stdout = asyncio.StreamReader()
     stdout.feed_eof()
@@ -6712,6 +9377,7 @@ async def test_reader_exit_does_not_leak_shared_stderr_to_tasks():
         stdout=stdout,
         wait=AsyncMock(return_value=1),
     )
+    server._pending[99] = (fake_process, pending)
     await server._read_loop(fake_process)
 
     assert await turn_process.wait() == 1
@@ -6770,7 +9436,7 @@ async def test_reader_exit_zero_during_shutdown_is_not_reported_as_unexpected():
     )
     await peer_process.stdout.readline()
     pending = asyncio.get_running_loop().create_future()
-    server._pending[99] = pending
+    server._pending[99] = (app_process, pending)
     server._reader_task = asyncio.create_task(server._read_loop(app_process))
     server._stderr_task = asyncio.create_task(server._stderr_loop(app_process))
 
@@ -6944,6 +9610,81 @@ async def test_turn_process_timeout_cannot_be_relabelled_user_interrupt():
 
     assert await process.wait() == 130
     assert process.termination_kind == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_turn_process_wait_includes_runtime_cleanup_barrier():
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    async def interrupt():
+        return None
+
+    def cleanup() -> None:
+        cleanup_started.set()
+        release_cleanup.wait(timeout=5)
+
+    process = CodexTurnProcess(1, interrupt)
+    process.set_runtime_cleanup(cleanup)
+    process.finish(0)
+    waiter = asyncio.create_task(process.wait())
+    assert await asyncio.to_thread(cleanup_started.wait, 1)
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release_cleanup.set()
+    assert await asyncio.wait_for(waiter, timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_turn_process_cleanup_delays_waiter_cancellation():
+    cleanup_started = threading.Event()
+    release_cleanup = threading.Event()
+
+    async def interrupt():
+        return None
+
+    def cleanup() -> None:
+        cleanup_started.set()
+        release_cleanup.wait(timeout=5)
+
+    process = CodexTurnProcess(1, interrupt)
+    process.set_runtime_cleanup(cleanup)
+    process.finish(0)
+    waiter = asyncio.create_task(process.wait())
+    assert await asyncio.to_thread(cleanup_started.wait, 1)
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release_cleanup.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+
+
+def test_turn_process_submits_cleanup_before_event_loop_shutdown():
+    scratch = create_private_task_temp_dir(
+        task_id=899,
+        task_incarnation_id="8" * 32,
+        retry_count=0,
+        turn_generation=1,
+    )
+    scratch.bind_to_runtime()
+    path = scratch.path
+
+    async def finish_without_yielding() -> None:
+        async def interrupt():
+            return None
+
+        process = CodexTurnProcess(1, interrupt)
+        process.set_runtime_cleanup(scratch.cleanup)
+        process.finish(0)
+        # Deliberately return without yielding or awaiting process.wait().
+
+    asyncio.run(finish_without_yielding())
+
+    assert not path.exists()
 
 
 @pytest.mark.asyncio
@@ -7276,11 +10017,33 @@ async def test_reader_delivers_json_rpc_response_to_pending_request():
     )
     server = CodexAppServer("codex")
     pending = asyncio.get_running_loop().create_future()
-    server._pending[7] = pending
+    server._pending[7] = (fake_process, pending)
 
     await server._read_loop(fake_process)
 
     assert pending.result() == {"id": 7, "result": {"ok": True}}
+
+
+@pytest.mark.asyncio
+async def test_old_reader_cannot_resolve_or_fail_new_generation_request():
+    stdout = asyncio.StreamReader()
+    stdout.feed_data(b'{"id":7,"result":{"stale":true}}\n')
+    stdout.feed_eof()
+    process_one = SimpleNamespace(
+        stdout=stdout,
+        wait=AsyncMock(return_value=1),
+    )
+    process_two = SimpleNamespace(pid=4322, returncode=None)
+    server = CodexAppServer("codex")
+    pending = asyncio.get_running_loop().create_future()
+    server._pending[7] = (process_two, pending)
+
+    await server._read_loop(process_one)
+
+    assert not pending.done()
+    assert server._pending[7] == (process_two, pending)
+    server._pending.clear()
+    pending.cancel()
 
 
 @pytest.mark.asyncio
@@ -7563,7 +10326,7 @@ async def test_cancelled_turn_with_unconfirmed_interrupt_escalates_transport(
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
 
-    async def request(method, _params):
+    async def request(method, _params, **_kwargs):
         if method == "thread/resume":
             return {
                 "thread": {

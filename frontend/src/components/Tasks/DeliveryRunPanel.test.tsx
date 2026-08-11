@@ -43,6 +43,7 @@ function makeRun(overrides: Partial<DeliveryRun> = {}): DeliveryRun {
     phase: 'pre_review',
     activity: 'running',
     outcome: null,
+    terminal: 'ready_to_merge',
     wait_reason: null,
     pause_reason: null,
     error_code: null,
@@ -127,5 +128,21 @@ describe('DeliveryRunPanel', () => {
     expect(screen.queryByText(/next safe point/)).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pause' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument();
+  });
+
+  it('distinguishes a confirmed automatic merge from manual readiness', async () => {
+    vi.mocked(api.getDeliveryRun).mockResolvedValue(makeRun({
+      phase: 'done',
+      activity: 'terminal',
+      outcome: 'success',
+      terminal: 'merged',
+      completed_at: '2026-08-05T00:10:00Z',
+      allowed_actions: [],
+    }));
+
+    render(<DeliveryRunPanel runId={7} />);
+
+    expect(await screen.findByText('Merged')).toBeInTheDocument();
+    expect(screen.queryByText('Ready to Merge')).not.toBeInTheDocument();
   });
 });

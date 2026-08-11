@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     effort_options: str = "low,medium,high,xhigh,max"  # comma-separated
     host: str = "0.0.0.0"
     port: int = 8000
+    # Optional fixed Manager-local origin for MCP servers/hooks. When empty,
+    # the live ASGI listening address is learned from incoming requests.
+    internal_api_base_url: str = ""
     # Public base URL of this deployment (e.g. https://ccm.example.com),
     # used to display the GitHub webhook URL on the PR Monitor page.
     public_base_url: str = ""
@@ -75,26 +78,37 @@ class Settings(BaseSettings):
     plan_structured_output_whitespace_limit: int = 4_096
     plan_transcript_max_chars: int = 60_000
     plan_step_output_max_chars: int = 200_000
-    # Generic Plan/review capability admission. Dark by default; disabling it
-    # blocks only new admission, while already accepted work still recovers.
-    capability_core_enabled: bool = False
+    # Generic Plan/review capability admission. Enabled by default; disabling
+    # it blocks only new admission, while already accepted work still recovers.
+    capability_core_enabled: bool = True
     capability_coordinator_poll_interval_seconds: float = 2.0
     capability_coordinator_max_concurrency: int = 4
     capability_coordinator_scan_limit: int = 64
     capability_coordinator_initial_backoff_seconds: float = 1.0
     capability_coordinator_max_backoff_seconds: float = 60.0
-    # Model-requested Plan/Review admission is a separate opt-in from Human
-    # advisory capabilities and the Delivery Controller.
-    auto_capability_enabled: bool = False
+    # Model-requested Plan/Review admission has an independent global gate;
+    # each ordinary Task still requires an explicit capability policy.
+    auto_capability_enabled: bool = True
     # Autonomous Plan -> Code -> Review -> PR Monitor controller. Admission is
-    # dark by default because enabling it can push a branch and create a PR;
-    # V1 still stops before merge.
-    delivery_loop_enabled: bool = False
+    # enabled by default; each Run freezes the Monitor's ready/merged terminal.
+    delivery_loop_enabled: bool = True
     delivery_controller_poll_interval_seconds: float = 2.0
     delivery_controller_lease_seconds: int = 30
     delivery_controller_scan_limit: int = 32
     delivery_controller_reconcile_interval_seconds: float = 5.0
     git_ssh_key_path: str = ""  # Instance-level SSH key, fallback when project has none
+    # Browser-uploaded SSH Profile keys. Files are private host credentials;
+    # only opaque one-time upload tokens are returned to the frontend.
+    ssh_key_storage_dir: str = "~/.ccm/ssh-keys"
+    ssh_sftp_max_concurrency: int = 8
+    ssh_sftp_queue_timeout_seconds: float = 5.0
+    ssh_sftp_operation_timeout_seconds: float = 30.0
+    ssh_sftp_download_timeout_seconds: float = 120.0
+    ssh_sftp_channel_timeout_seconds: float = 15.0
+    # Task-scoped MCP credentials and Claude security settings live outside
+    # world-readable/shared temporary directories. Agent sandboxes deny this
+    # complete root after the trusted CLI has loaded its own files.
+    task_runtime_secret_dir: str = "~/.ccm/task-runtime-secrets"
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
     worker_enabled: bool = True
@@ -180,6 +194,32 @@ class Settings(BaseSettings):
     tmp_cleanup_usage_threshold: float = 0.80
     tmp_cleanup_interval_seconds: int = 3 * 3600
     tmp_cleanup_min_age_seconds: int = 6 * 3600
+
+    # --- Frontend Test Harness evidence ---
+    # Evidence is never stored in /tmp. Files are archived beneath this private
+    # Manager-owned root and referenced by relative storage keys in the DB.
+    test_harness_artifact_root: str = "~/.ccm/test-harness-artifacts"
+    test_harness_artifact_max_file_bytes: int = 20 * 1024 * 1024
+    test_harness_artifact_max_run_bytes: int = 256 * 1024 * 1024
+    test_harness_artifact_max_task_bytes: int = 2 * 1024 * 1024 * 1024
+    test_harness_artifact_max_total_bytes: int = 10 * 1024 * 1024 * 1024
+    test_harness_artifact_retention_days: int = 30
+    test_harness_artifact_cleanup_interval_seconds: int = 6 * 3600
+    browser_review_job_history_limit: int = 100
+
+    # --- Untrusted Git Test Harness sandbox ---
+    # Disabled by default. Capability is advertised only after the Docker
+    # daemon and the administrator-built image both pass an identity probe.
+    test_harness_sandbox_enabled: bool = False
+    test_harness_sandbox_docker_binary: str = "docker"
+    test_harness_sandbox_image: str = "ccm-test-harness-sandbox:local"
+    test_harness_sandbox_memory: str = "4g"
+    test_harness_sandbox_cpus: float = 2.0
+    test_harness_sandbox_pids_limit: int = 256
+    test_harness_sandbox_workspace_bytes: int = 3 * 1024 * 1024 * 1024
+    test_harness_sandbox_tmp_bytes: int = 512 * 1024 * 1024
+    test_harness_sandbox_preview_port: int = 4173
+    test_harness_sandbox_proxy_max_bytes: int = 1024 * 1024 * 1024
 
     # --- Backup service (auto-backup) ---
     backup_enabled: bool = False        # Set true to enable periodic DB backups

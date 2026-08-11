@@ -10,8 +10,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import backend.main as main_module
+import backend.api.plan_resources as plan_resources_module
 import backend.services.worker_proxy as worker_proxy_module
-from backend.models.plan import Plan, PlanVersion
+from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.api.plan_resources import _worker_run_import_digest
 from backend.models.plan_agent import (
     PlanAgentRun,
@@ -30,6 +31,7 @@ from backend.services.plan_service import (
 )
 from backend.services.worker_plan_dispatch import (
     fence_worker_mirror_cancellation,
+    mark_worker_dispatch_remote_possible,
     worker_mirror_run_is_clean,
 )
 from sqlalchemy import func, select
@@ -797,6 +799,53 @@ async def test_manager_mirror_keeps_durable_cancelling_without_strict_remote_ack
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing_on_plan_run_get",
+    (2, 3),
+    ids=("refresh-disappears", "locked-refresh-disappears"),
+)
+async def test_manager_cancel_fails_closed_when_run_disappears_during_refresh(
+    client,
+    session_factory,
+    monkeypatch,
+    missing_on_plan_run_get,
+):
+    graph = await _seed_worker_plan_run(session_factory)
+    original_get = AsyncSession.get
+    plan_run_gets = 0
+
+    async def disappear_on_refresh(self, entity, ident, *args, **kwargs):
+        nonlocal plan_run_gets
+        result = await original_get(self, entity, ident, *args, **kwargs)
+        if entity is PlanAgentRun and ident == graph.run_id:
+            plan_run_gets += 1
+            if plan_run_gets == missing_on_plan_run_get:
+                return None
+        return result
+
+    cancel_remote = AsyncMock()
+    stop_lifecycle = AsyncMock(return_value=True)
+    monkeypatch.setattr(AsyncSession, "get", disappear_on_refresh)
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(cancel_versioned_plan_run=cancel_remote),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(stop_plan_run_lifecycle=stop_lifecycle),
+    )
+
+    response = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "mirror changed before cancellation" in response.text
+    cancel_remote.assert_not_awaited()
+    stop_lifecycle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_retry_does_not_cancel_active_exact_recovery_and_rearms_sweep(
     client,
     session_factory,
@@ -1177,6 +1226,81 @@ async def test_preimport_manager_cancel_never_calls_worker_and_is_clean(
 
 
 @pytest.mark.asyncio
+async def test_preimport_cancel_remote_possible_winner_is_http_409(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A boundary winner after the stale pre-import read is not an API 500."""
+
+    graph = await _seed_worker_plan_run(
+        session_factory,
+        receipt_status="prepared",
+        run_status="running",
+    )
+    async with session_factory() as db:
+        receipt = (
+            await db.execute(
+                select(PlanAgentWorkerDispatchReceipt).where(
+                    PlanAgentWorkerDispatchReceipt.run_id == graph.run_id,
+                    PlanAgentWorkerDispatchReceipt.run_generation
+                    == graph.generation,
+                )
+            )
+        ).scalar_one()
+        receipt_id = receipt.id
+
+    real_cancel = plan_resources_module.cancel_worker_mirror_run_after_ack
+
+    async def race_remote_boundary(db, *, plan, run, **kwargs):
+        # The endpoint already classified this receipt as prepared. Simulate
+        # the dispatcher callback committing after that read but before the
+        # cancellation service's fresh Run-first writer transaction.
+        await mark_worker_dispatch_remote_possible(
+            session_factory,
+            receipt_id=receipt_id,
+            plan_id=graph.plan_id,
+            run_id=graph.run_id,
+            worker_id=graph.worker_id,
+            generation=graph.generation,
+            payload_digest=graph.payload_digest,
+        )
+        return await real_cancel(db, plan=plan, run=run, **kwargs)
+
+    monkeypatch.setattr(
+        plan_resources_module,
+        "cancel_worker_mirror_run_after_ack",
+        race_remote_boundary,
+    )
+    cancel_remote = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(cancel_versioned_plan_run=cancel_remote),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(stop_plan_run_lifecycle=AsyncMock(return_value=True)),
+    )
+
+    response = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
+
+    assert response.status_code == 409, response.text
+    assert "settlement contradicts" in response.text
+    cancel_remote.assert_not_awaited()
+    async with session_factory() as db:
+        plan = await db.get(Plan, graph.plan_id)
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipt = await db.get(PlanAgentWorkerDispatchReceipt, receipt_id)
+        assert plan is not None and plan.active_run_id == graph.run_id
+        assert run is not None and run.status == "running"
+        assert run.generation == graph.generation
+        assert receipt is not None and receipt.status == "remote_possible"
+        assert receipt.payload_digest == graph.payload_digest
+
+
+@pytest.mark.asyncio
 async def test_worker_mirror_cancel_locks_run_plan_then_dispatch_receipt(
     session_factory,
     monkeypatch,
@@ -1194,11 +1318,30 @@ async def test_worker_mirror_cancel_locks_run_plan_then_dispatch_receipt(
             status="prepared",
         )
         db.add(receipt)
+        input_request = PlanInputRequest(
+            plan_id=graph.plan_id,
+            run_id=graph.run_id,
+            worker_id=graph.worker_id,
+            worker_input_request_id=701,
+            source_step_id=700,
+            requested_by="planner",
+            questions=[],
+            status="open",
+            idempotency_key=f"worker-cancel-lock-order:{graph.run_id}",
+            opened_at=datetime.utcnow(),
+        )
+        db.add(input_request)
+        await db.flush()
+        run = await db.get(PlanAgentRun, graph.run_id)
+        assert run is not None
+        run.status = "waiting_user"
+        run.open_input_request_id = input_request.id
         await db.commit()
 
     original_get = AsyncSession.get
     original_execute = AsyncSession.execute
     locked_entities: list[type] = []
+    mutation_order: list[str] = []
 
     async def traced_get(self, entity, ident, **kwargs):
         if kwargs.get("with_for_update") and entity in {PlanAgentRun, Plan}:
@@ -1206,11 +1349,15 @@ async def test_worker_mirror_cancel_locks_run_plan_then_dispatch_receipt(
         return await original_get(self, entity, ident, **kwargs)
 
     async def traced_execute(self, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if getattr(statement, "is_update", False) and table is not None:
+            mutation_order.append(f"update:{table.name}")
         if getattr(statement, "_for_update_arg", None) is not None:
             descriptions = getattr(statement, "column_descriptions", ())
             entity = descriptions[0].get("entity") if descriptions else None
             if entity is PlanAgentWorkerDispatchReceipt:
                 locked_entities.append(entity)
+                mutation_order.append("lock:plan_agent_worker_dispatch_receipts")
         return await original_execute(self, statement, *args, **kwargs)
 
     monkeypatch.setattr(AsyncSession, "get", traced_get)
@@ -1232,6 +1379,13 @@ async def test_worker_mirror_cancel_locks_run_plan_then_dispatch_receipt(
         PlanAgentRun,
         Plan,
         PlanAgentWorkerDispatchReceipt,
+    ]
+    assert mutation_order[:5] == [
+        "update:plan_agent_runs",
+        "update:plans",
+        "lock:plan_agent_worker_dispatch_receipts",
+        "update:plan_input_requests",
+        "update:plan_agent_runs",
     ]
 
 

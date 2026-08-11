@@ -39,6 +39,12 @@ MODELS = {
 }
 
 
+def test_apex_gateway_uses_apexin_endpoint():
+    assert APEX_CODEX_BASE_URL == "https://api.apexin.ai/v1"
+    assert APEX_MODELS_URL == "https://api.apexin.ai/v1/models"
+    assert APEX_USAGE_URL == "https://api.apexin.ai/v1/usage"
+
+
 def test_api_auth_kind_is_limited_to_registered_gateways():
     assert cloudrouter_module.is_api_auth_kind("cloudrouter_api")
     assert cloudrouter_module.is_api_auth_kind("apex_api")
@@ -163,6 +169,44 @@ async def test_add_apex_builds_private_codex_only_home_without_leaking_key(
     assert str(root / "key-helper") in codex_config
     assert "lck-test-secret" not in codex_config
     assert os.popen(str(root / "key-helper")).read() == "lck-test-secret"
+
+
+@pytest.mark.asyncio
+async def test_legacy_apex_endpoint_is_migrated_to_apexin(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    legacy_base_url = "https://35-75-22-186.sslip.io/v1"
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"] = {
+        "claude_base_url": None,
+        "codex_base_url": legacy_base_url,
+        "models_url": f"{legacy_base_url}/models",
+        "usage_url": f"{legacy_base_url}/usage",
+    }
+    metadata_path.write_text(json.dumps(metadata))
+    config_path = account.root / "codex" / "config.toml"
+    config_path.write_text(
+        config_path.read_text().replace(APEX_CODEX_BASE_URL, legacy_base_url)
+    )
+
+    assert [item.id for item in store.reload()] == [account.id]
+    migrated_metadata = json.loads(metadata_path.read_text())
+    assert migrated_metadata["endpoints"]["codex_base_url"] == APEX_CODEX_BASE_URL
+    migrated_config = tomllib.loads(config_path.read_text())
+    assert {
+        provider["base_url"]
+        for provider in migrated_config["model_providers"].values()
+    } == {APEX_CODEX_BASE_URL}
 
 
 @pytest.mark.asyncio

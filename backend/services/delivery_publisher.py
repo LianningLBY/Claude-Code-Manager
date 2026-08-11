@@ -34,8 +34,10 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
     PRMonitorRun,
     PRReview,
+    PRReviewerRun,
 )
 from backend.models.project import Project
+from backend.models.task import Task
 from backend.services.code_review_subject import verify_commit_range_subject
 from backend.services.delivery_controller import (
     DeliveryEffectFence,
@@ -57,8 +59,11 @@ from backend.services.pr_review_actions import (
 )
 from backend.services.pr_review_service import (
     GhError,
+    _ACTION_NONCE_RE,
+    _find_merge_evidence,
     _gh_api_json,
     _gh_api_value,
+    _terminal_publication_error,
     create_pr_review_task,
 )
 from backend.services.structured_code_review import CommitRangeSubject
@@ -83,6 +88,13 @@ class DeliveryGitError(RuntimeError):
 
 class DeliveryNonFastForwardError(DeliveryGitError):
     """The remote rejected the deliberately non-force ref update."""
+
+
+@dataclass(frozen=True, slots=True)
+class PushResult:
+    """Outcome of push_exact — records whether code was pushed to a fork."""
+    pushed_to_fork: bool = False
+    fork_full_name: str | None = None  # e.g. "myuser/target-repo"
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,6 +135,14 @@ class _PublishingSubject:
 
 
 @dataclass(frozen=True, slots=True)
+class _MergedMonitorEvidence:
+    nonce: str
+    actor: str
+    publishing_started_at: datetime
+    merge_method: str
+
+
+@dataclass(frozen=True, slots=True)
 class _PullRequestSnapshot:
     pull_request: PublishedPullRequest
     # ``merged`` is derived from a closed GitHub PR's immutable merge evidence.
@@ -143,7 +163,7 @@ class DeliveryGitGateway(Protocol):
         branch: str,
     ) -> str | None: ...
 
-    async def push_exact(self, subject: _PublishingSubject) -> None: ...
+    async def push_exact(self, subject: _PublishingSubject) -> PushResult: ...
 
 
 class DeliveryGitHubGateway(Protocol):
@@ -170,6 +190,7 @@ class DeliveryGitHubGateway(Protocol):
         body: str,
         head_branch: str,
         base_branch: str,
+        fork_full_name: str | None = None,
     ) -> dict: ...
 
 
@@ -543,7 +564,7 @@ class GitDeliveryGateway:
             raise DeliveryGitError("Remote returned a malformed ref")
         return sha
 
-    async def push_exact(self, subject: _PublishingSubject) -> None:
+    async def push_exact(self, subject: _PublishingSubject) -> PushResult:
         _fetch_url, push_url = await self._validated_remote_urls(subject)
         refspec = f"{subject.head_sha}:refs/heads/{subject.delivery_branch}"
         returncode, stdout, stderr = await _run_git(
@@ -556,7 +577,7 @@ class GitDeliveryGateway:
             refspec,
         )
         if returncode == 0:
-            return
+            return PushResult()
         diagnostic = (stdout + b"\n" + stderr).decode(
             "utf-8", errors="replace"
         ).lower()
@@ -572,9 +593,69 @@ class GitDeliveryGateway:
             raise DeliveryNonFastForwardError(
                 "Remote delivery branch rejected the non-force update"
             )
+        # Check for permission denied — try fork fallback
+        if any(
+            marker in diagnostic
+            for marker in (
+                "permission",
+                "denied",
+                "403",
+                "could not read from remote",
+                "unable to access",
+            )
+        ):
+            return await self._push_via_fork(subject)
         # Do not include stderr: remote URLs and credential helpers may expose
         # sensitive material in diagnostics.
         raise DeliveryGitError("Git push did not report success")
+
+    async def _push_via_fork(self, subject: _PublishingSubject) -> PushResult:
+        """Fork the repo and push to the fork when direct push is denied."""
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # 1. Ensure fork exists (gh repo fork is idempotent)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gh", "repo", "fork", subject.repo_full_name,
+                "--clone=false", "--default-branch-only",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=60)
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise DeliveryGitError(f"Failed to fork repository: {exc}") from exc
+
+        # 2. Get current user and fork URL
+        user_info = await _gh_api_value("user", max_output_bytes=4096)
+        if not isinstance(user_info, dict) or "login" not in user_info:
+            raise DeliveryGitError("Cannot determine GitHub username for fork")
+        fork_owner = user_info["login"]
+        repo_name = subject.repo_full_name.split("/")[-1]
+        fork_full_name = f"{fork_owner}/{repo_name}"
+        fork_url = f"https://github.com/{fork_full_name}.git"
+
+        logger.info(
+            "Delivery push denied on %s, using fork %s",
+            subject.repo_full_name,
+            fork_full_name,
+        )
+
+        # 3. Push to fork
+        refspec = f"{subject.head_sha}:refs/heads/{subject.delivery_branch}"
+        returncode, stdout, stderr = await _run_git(
+            subject.workspace_path,
+            "push",
+            "--porcelain",
+            "--no-verify",
+            fork_url,
+            refspec,
+        )
+        if returncode != 0:
+            raise DeliveryGitError("Git push to fork did not report success")
+
+        return PushResult(pushed_to_fork=True, fork_full_name=fork_full_name)
 
 
 class GhDeliveryGateway:
@@ -627,16 +708,22 @@ class GhDeliveryGateway:
         body: str,
         head_branch: str,
         base_branch: str,
+        fork_full_name: str | None = None,
     ) -> dict:
+        # Cross-repo PR: head must be "fork_owner:branch"
+        head_ref = head_branch
+        if fork_full_name:
+            fork_owner = fork_full_name.split("/")[0]
+            head_ref = f"{fork_owner}:{head_branch}"
         return await _gh_api_json(
             f"repos/{repo_full_name}/pulls",
             method="POST",
             payload={
                 "title": title,
                 "body": body,
-                "head": head_branch,
+                "head": head_ref,
                 "base": base_branch,
-                "maintainer_can_modify": False,
+                "maintainer_can_modify": True,
             },
             max_output_bytes=_MAX_GITHUB_LIST_BYTES,
         )
@@ -799,13 +886,20 @@ class GitHubDeliveryPublisher:
             monitor_policy = (
                 policy.get("pr_monitor") if isinstance(policy, dict) else None
             )
+            auto_merge = (
+                policy.get("auto_merge") if isinstance(policy, dict) else None
+            )
+            terminal = (
+                policy.get("terminal") if isinstance(policy, dict) else None
+            )
             if (
                 (run.phase, run.activity) not in expected_states
                 or run.outcome is not None
                 or not isinstance(policy, dict)
                 or _value_hash(policy) != run.policy_hash
-                or policy.get("terminal") != "ready_to_merge"
-                or policy.get("auto_merge") is not False
+                or type(auto_merge) is not bool
+                or terminal
+                != ("merged" if auto_merge else "ready_to_merge")
                 or not isinstance(monitor_policy, dict)
                 or monitor_policy.get("repo_id") != repo.id
                 or monitor_policy.get("repo_full_name") != repo.repo_full_name
@@ -824,7 +918,6 @@ class GitHubDeliveryPublisher:
                 or not project.local_path
                 or not project.git_url
                 or not repo.enabled
-                or repo.auto_merge
                 or (repo.merge_queue_mode or "manual") != "manual"
                 or (repo.review_mode or "single") != "panel"
                 or not repo.wait_for_ci
@@ -986,7 +1079,8 @@ class GitHubDeliveryPublisher:
             or not isinstance(base_repo_name, str)
             or base_repo_name.lower() != subject.repo_full_name.lower()
             or not isinstance(head_repo_name, str)
-            or head_repo_name.lower() != subject.repo_full_name.lower()
+            # Allow fork PRs: head repo may differ from base repo
+            # (e.g. fork_owner/repo vs upstream_owner/repo)
         ):
             raise DeliveryPublisherPermanentError(
                 "Pull request does not match the exact Delivery subject"
@@ -1400,11 +1494,12 @@ class GitHubDeliveryPublisher:
         remote_head = await self._git.remote_ref_sha(
             subject, subject.delivery_branch
         )
+        push_result = PushResult()  # default: no fork
         if remote_head != subject.head_sha:
             await self._assert_subject(subject, require_remote_head=False)
             await self._assert_effect_fence(subject, fence)
             try:
-                await self._git.push_exact(subject)
+                push_result = await self._git.push_exact(subject)
             except DeliveryNonFastForwardError as exc:
                 # A rejected non-force ref update proves that this attempt did
                 # not mutate the remote branch.
@@ -1463,6 +1558,7 @@ class GitHubDeliveryPublisher:
                 body=self._pull_request_body(subject),
                 head_branch=subject.delivery_branch,
                 base_branch=subject.base_branch,
+                fork_full_name=push_result.fork_full_name,
             )
             created_snapshot = self._validate_pull_request_snapshot(subject, created)
             published = await self._open_pull_request_or_record_conflict(
@@ -1585,6 +1681,7 @@ class GitHubDeliveryPublisher:
             ).scalar_one_or_none()
             if marker_review is not None and (
                 marker_review.pr_number != pull_request.pr_number
+                or marker_review.base_ref != subject.base_branch
                 or marker_review.base_sha != subject.base_sha
                 or marker_review.head_sha != subject.head_sha
             ):
@@ -1597,6 +1694,7 @@ class GitHubDeliveryPublisher:
                     .where(
                         PRReview.repo_id == repo.id,
                         PRReview.pr_number == pull_request.pr_number,
+                        PRReview.base_ref == subject.base_branch,
                         PRReview.base_sha == subject.base_sha,
                         PRReview.head_sha == subject.head_sha,
                     )
@@ -1662,11 +1760,53 @@ class GitHubDeliveryPublisher:
                         "Webhook Review already has a legacy Finding effect and "
                         "cannot be adopted by Delivery"
                     )
+                reviewer_task_ids = set(
+                    (
+                        await db.execute(
+                            select(PRReviewerRun.task_id).where(
+                                PRReviewerRun.pr_review_id == review.id,
+                                PRReviewerRun.task_id.is_not(None),
+                            )
+                        )
+                    ).scalars()
+                )
+                if review.task_id is not None:
+                    reviewer_task_ids.add(review.task_id)
+                if reviewer_task_ids:
+                    reviewer_tasks = list(
+                        (
+                            await db.execute(
+                                select(Task).where(Task.id.in_(reviewer_task_ids))
+                            )
+                        ).scalars()
+                    )
+                    expected_auto_merge = subject.policy_snapshot.get(
+                        "auto_merge"
+                    )
+                    if len(reviewer_tasks) != len(reviewer_task_ids) or any(
+                        (
+                            (task.metadata_ or {}).get("pr_review_id")
+                            != review.id
+                            or (task.metadata_ or {}).get("pr_base_ref")
+                            != subject.base_branch
+                            or (task.metadata_ or {}).get("pr_base_sha")
+                            != subject.base_sha
+                            or (task.metadata_ or {}).get("pr_head_sha")
+                            != subject.head_sha
+                            or (task.metadata_ or {}).get("pr_auto_merge")
+                            is not expected_auto_merge
+                        )
+                        for task in reviewer_tasks
+                    ):
+                        raise DeliveryPublisherPermanentError(
+                            "Webhook Review Task policy does not match the "
+                            "frozen Delivery merge policy"
+                        )
                 # An opened webhook can win the natural-key race and create
                 # this exact Review with its opaque GitHub delivery id.  Adopt
                 # it under the row lock before attaching/returning so every
                 # later PR publication path is permanently constrained by the
-                # owning Run's frozen no-merge policy.  The exact-subject and
+                # owning Run's frozen merge policy.  The exact-subject and
                 # delivery-id unique constraints make concurrent adoption
                 # fail closed.
                 review.delivery_id = subject.delivery_id
@@ -1804,6 +1944,7 @@ class GitHubDeliveryPublisher:
 
         pr_data = {
             "number": pull_request.pr_number,
+            "base_ref": subject.base_branch,
             "base_sha": subject.base_sha,
             "head_sha": subject.head_sha,
             "delivery_id": subject.delivery_id,
@@ -1902,6 +2043,7 @@ class GitHubDeliveryPublisher:
                 or review.monitor_run_id != monitor.id
                 or review.repo_id != subject.monitored_repo_id
                 or review.pr_number != subject.pr_number
+                or review.base_ref != subject.base_branch
                 or review.base_sha != subject.base_sha
                 or review.head_sha != subject.head_sha
                 or review.pr_url.rstrip("/") != subject.pr_url.rstrip("/")
@@ -1977,6 +2119,189 @@ class GitHubDeliveryPublisher:
             expected_monitor_state_version=expected_monitor_state_version,
         )
         return verified
+
+    async def _assert_merged_monitor_snapshot(
+        self,
+        subject: _PublishingSubject,
+        *,
+        monitor_run_id: int,
+        expected_monitor_state_version: int,
+    ) -> _MergedMonitorEvidence:
+        """Return the exact frozen evidence policy for one merged terminal."""
+
+        if (
+            isinstance(monitor_run_id, bool)
+            or not isinstance(monitor_run_id, int)
+            or monitor_run_id <= 0
+            or isinstance(expected_monitor_state_version, bool)
+            or not isinstance(expected_monitor_state_version, int)
+            or expected_monitor_state_version < 1
+        ):
+            raise DeliveryPublisherPermanentError(
+                "Invalid merged Monitor snapshot"
+            )
+        async with self._db_factory() as db:
+            monitor = await db.get(
+                PRMonitorRun,
+                monitor_run_id,
+                populate_existing=True,
+            )
+            review = (
+                await db.get(
+                    PRReview,
+                    monitor.current_review_id,
+                    populate_existing=True,
+                )
+                if monitor is not None and monitor.current_review_id is not None
+                else None
+            )
+            task = (
+                await db.get(Task, review.task_id, populate_existing=True)
+                if review is not None and review.task_id is not None
+                else None
+            )
+            nonce = review.action_nonce if review is not None else None
+            actor = review.publishing_actor if review is not None else None
+            publishing_started_at = (
+                review.publishing_started_at if review is not None else None
+            )
+            merge_method = review.merge_method if review is not None else None
+            if (
+                subject.policy_snapshot.get("auto_merge") is not True
+                or subject.policy_snapshot.get("terminal") != "merged"
+                or subject.pr_number is None
+                or subject.pr_url is None
+                or subject.pr_monitor_run_id != monitor_run_id
+                or monitor is None
+                or monitor.state_version != expected_monitor_state_version
+                or monitor.status != "merged"
+                or monitor.repo_id != subject.monitored_repo_id
+                or monitor.pr_number != subject.pr_number
+                or monitor.current_base_sha != subject.base_sha
+                or monitor.current_head_sha != subject.head_sha
+                or monitor.head_repo_full_name is None
+                or monitor.head_repo_full_name.lower()
+                != subject.repo_full_name.lower()
+                or monitor.head_branch != subject.delivery_branch
+                or review is None
+                or review.delivery_id != subject.delivery_id
+                or review.monitor_run_id != monitor.id
+                or review.repo_id != subject.monitored_repo_id
+                or review.pr_number != subject.pr_number
+                or review.base_ref != subject.base_branch
+                or review.base_sha != subject.base_sha
+                or review.head_sha != subject.head_sha
+                or review.pr_url.rstrip("/") != subject.pr_url.rstrip("/")
+                or review.status != "merged"
+                or review.action_taken != "approved_merged"
+                or review.completed_at is None
+                or review.pending_action is not None
+                or review.publishing_lease_token is not None
+                or not isinstance(nonce, str)
+                or _ACTION_NONCE_RE.fullmatch(nonce) is None
+                or not isinstance(actor, str)
+                or not actor
+                or not isinstance(publishing_started_at, datetime)
+                or merge_method not in {"merge", "squash", "fast-forward"}
+                or task is None
+                or task.status != "completed"
+                or (task.metadata_ or {}).get("pr_review_id") != review.id
+                or (task.metadata_ or {}).get("pr_base_ref")
+                != subject.base_branch
+                or (task.metadata_ or {}).get("pr_base_sha")
+                != subject.base_sha
+                or (task.metadata_ or {}).get("pr_head_sha")
+                != subject.head_sha
+                or (task.metadata_ or {}).get("pr_auto_merge") is not True
+                or (task.metadata_ or {}).get("pr_action_nonce") != nonce
+            ):
+                raise DeliverySubjectChanged(
+                    "PR Monitor merged snapshot no longer matches the "
+                    "Delivery subject"
+                )
+            return _MergedMonitorEvidence(
+                nonce=nonce,
+                actor=actor,
+                publishing_started_at=publishing_started_at,
+                merge_method=merge_method,
+            )
+
+    async def verify_merged(
+        self,
+        *,
+        run_id: int,
+        pull_request: PublishedPullRequest,
+        monitor_run_id: int,
+        expected_monitor_state_version: int,
+    ) -> PublishedPullRequest:
+        """Verify the exact CCM merge after base/head refs may have moved."""
+
+        subject = await self._load_subject(
+            run_id,
+            expected_states=frozenset({("monitoring", "waiting")}),
+        )
+        if not isinstance(pull_request, PublishedPullRequest):
+            raise DeliveryPublisherPermanentError(
+                "Invalid merged PR snapshot"
+            )
+        self._assert_published_argument(subject, pull_request)
+        if (
+            subject.pr_number != pull_request.pr_number
+            or subject.pr_url is None
+            or subject.pr_url.rstrip("/") != pull_request.url.rstrip("/")
+            or subject.pr_monitor_run_id != monitor_run_id
+        ):
+            raise DeliverySubjectChanged(
+                "Delivery Run PR binding changed before merge verification"
+            )
+        evidence = await self._assert_merged_monitor_snapshot(
+            subject,
+            monitor_run_id=monitor_run_id,
+            expected_monitor_state_version=expected_monitor_state_version,
+        )
+        # The merge legitimately advances the base ref and repositories may
+        # delete the head branch.  Verify the immutable PR/merge-commit
+        # evidence instead of reusing the open-PR ref checks.
+        try:
+            merge_confirmed = await _find_merge_evidence(
+                repo_name=subject.repo_full_name,
+                pr_number=pull_request.pr_number,
+                base_ref=subject.base_branch,
+                base_sha=subject.base_sha,
+                head_sha=subject.head_sha,
+                nonce=evidence.nonce,
+                actor=evidence.actor,
+                publishing_started_at=evidence.publishing_started_at,
+                merge_method=evidence.merge_method,
+            )
+        except GhError as exc:
+            if _terminal_publication_error(exc):
+                raise DeliverySubjectChanged(
+                    "GitHub Delivery merge evidence is invalid"
+                ) from exc
+            raise
+        if not merge_confirmed:
+            raise DeliverySubjectChanged(
+                "GitHub does not expose the exact Delivery merge evidence"
+            )
+        current = await self._load_subject(
+            run_id,
+            expected_states=frozenset({("monitoring", "waiting")}),
+        )
+        if current != subject:
+            raise DeliverySubjectChanged(
+                "Delivery Run changed during merge verification"
+            )
+        repeated_evidence = await self._assert_merged_monitor_snapshot(
+            subject,
+            monitor_run_id=monitor_run_id,
+            expected_monitor_state_version=expected_monitor_state_version,
+        )
+        if repeated_evidence != evidence:
+            raise DeliverySubjectChanged(
+                "Delivery merge evidence policy changed during verification"
+            )
+        return pull_request
 
 
 __all__ = [

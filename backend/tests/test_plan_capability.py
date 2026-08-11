@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.models.capability import CapabilityExecution, CapabilityInvocation
@@ -536,50 +537,101 @@ async def test_capability_cancel_between_planner_and_reviewer_claims(
 
 @pytest.mark.asyncio
 async def test_capability_claim_and_cancel_race_has_no_cross_aggregate_deadlock(
-    db_session,
-    db_factory,
+    tmp_path,
+    monkeypatch,
 ):
-    """Run claim never writes Execution, so concurrent cancellation converges."""
+    """A WAL claim between cancellation's read and UPDATE is fenced exactly."""
 
-    _task, invocation = await _create_invocation(db_session)
-    started = await PlanCapabilityExecutor().ensure_started(
-        db_session,
-        invocation_id=invocation.id,
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
     )
-    assert started.run_id is not None
-    owner = Instance(name="claim-cancel-race-slot", status="idle")
-    db_session.add(owner)
-    await db_session.commit()
-    owner_id = owner.id
-    dispatcher = _dispatcher(db_factory)
 
-    async def claim():
-        async with db_factory() as db:
-            instance = await db.get(Instance, owner_id)
-            assert instance is not None
-            return await dispatcher._claim_plan_run(db, instance=instance)
+    from backend.database import Base
 
-    async def cancel():
-        async with db_factory() as db:
-            return await PlanCapabilityExecutor(
-                stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
-            ).cancel(db, invocation_id=invocation.id)
-
-    claimed, cancelled = await asyncio.wait_for(
-        asyncio.gather(claim(), cancel()),
-        timeout=5,
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'capability-claim-cancel-wal.db'}",
+        connect_args={"timeout": 1},
     )
-    assert claimed is None or claimed[0] == started.run_id
-    assert cancelled.status == "cancelled"
-    async with db_factory() as db:
-        execution = await db.get(CapabilityExecution, started.execution_id)
-        run = await db.get(PlanAgentRun, started.run_id)
-        owner = await db.get(Instance, owner_id)
-        assert execution is not None and execution.handle_generation == 0
-        assert run is not None and run.status == "cancelled"
-        assert run.cancellation_target_generation in {0, 1}
-        assert run.instance_id is None
-        assert owner is not None and owner.current_plan_run_id is None
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+        db_factory = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with db_factory() as setup:
+            _task, invocation = await _create_invocation(setup)
+            started = await PlanCapabilityExecutor().ensure_started(
+                setup,
+                invocation_id=invocation.id,
+            )
+            assert started.run_id is not None
+            owner = Instance(name="claim-cancel-race-slot", status="idle")
+            setup.add(owner)
+            await setup.commit()
+            owner_id = owner.id
+            invocation_id = invocation.id
+            execution_id = started.execution_id
+            run_id = started.run_id
+
+        dispatcher = _dispatcher(db_factory)
+        real_fence = adapter_module.fence_capability_run_cancellation
+        cancellation_read_generation = asyncio.Event()
+        allow_cancellation_update = asyncio.Event()
+
+        async def interleaved_fence(db, *, plan, run):
+            # ``cancel()`` owns a G0 WAL read snapshot. Commit G1 through a
+            # distinct connection before its fresh-writer cancellation CAS.
+            assert run.generation == 0
+            assert run.status == "queued"
+            cancellation_read_generation.set()
+            await allow_cancellation_update.wait()
+            return await real_fence(db, plan=plan, run=run)
+
+        monkeypatch.setattr(
+            adapter_module,
+            "fence_capability_run_cancellation",
+            interleaved_fence,
+        )
+
+        async def claim():
+            async with db_factory() as db:
+                instance = await db.get(Instance, owner_id)
+                assert instance is not None
+                return await dispatcher._claim_plan_run(db, instance=instance)
+
+        async def cancel():
+            async with db_factory() as db:
+                return await PlanCapabilityExecutor(
+                    stop_callback=dispatcher.stop_capability_plan_run_lifecycle,
+                ).cancel(db, invocation_id=invocation_id)
+
+        cancellation = asyncio.create_task(cancel())
+        await asyncio.wait_for(cancellation_read_generation.wait(), timeout=2)
+        try:
+            claimed = await asyncio.wait_for(claim(), timeout=2)
+        finally:
+            allow_cancellation_update.set()
+        cancelled = await asyncio.wait_for(cancellation, timeout=5)
+
+        assert claimed == (run_id, 1)
+        assert cancelled.status == "cancelled"
+        async with db_factory() as db:
+            execution = await db.get(CapabilityExecution, execution_id)
+            run = await db.get(PlanAgentRun, run_id)
+            owner = await db.get(Instance, owner_id)
+            assert execution is not None and execution.handle_generation == 0
+            assert run is not None and run.status == "cancelled"
+            assert run.generation == 2
+            assert run.cancellation_target_generation == 1
+            assert run.instance_id is None
+            assert owner is not None and owner.current_plan_run_id is None
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1277,6 +1329,67 @@ async def test_capability_cancel_fence_rejects_waiting_input_answer(db_session):
                 answered_by=7,
             )
     assert getattr(raised.value, "status_code", None) == 409
+
+
+@pytest.mark.asyncio
+async def test_capability_answer_writer_order_is_core_run_input(
+    db_session,
+    monkeypatch,
+):
+    _task, invocation = await _create_invocation(db_session)
+    executor = PlanCapabilityExecutor()
+    await executor.ensure_started(db_session, invocation_id=invocation.id)
+    _execution, run, plan = await _handled_run(db_session, invocation.id)
+    input_request = PlanInputRequest(
+        plan_id=plan.id,
+        run_id=run.id,
+        source_step_id=1,
+        requested_by="planner",
+        questions=[],
+        status="open",
+        idempotency_key=f"cap-answer-order:{run.id}",
+        opened_at=datetime.utcnow(),
+    )
+    db_session.add(input_request)
+    await db_session.flush()
+    run.status = "waiting_user"
+    run.open_input_request_id = input_request.id
+    await db_session.commit()
+    waiting = await executor.observe(db_session, invocation_id=invocation.id)
+    assert waiting.status == "waiting_user"
+    generation = run.generation
+
+    original_execute = AsyncSession.execute
+    update_order: list[str] = []
+
+    async def traced_execute(self, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if getattr(statement, "is_update", False) and table is not None:
+            update_order.append(table.name)
+        return await original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", traced_execute)
+    async with plan_operation_lock(plan.id):
+        answered = await answer_input_request(
+            db_session,
+            plan=plan,
+            run=run,
+            input_request=input_request,
+            expected_generation=generation,
+            idempotency_key="capability-answer-order",
+            answers=[],
+            response_text=None,
+            attachments=None,
+            answered_by=7,
+        )
+
+    assert answered.status == "answered"
+    assert update_order[:4] == [
+        "capability_invocations",
+        "capability_executions",
+        "plan_agent_runs",
+        "plan_input_requests",
+    ]
 
 
 @pytest.mark.asyncio

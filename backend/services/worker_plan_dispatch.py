@@ -1005,17 +1005,50 @@ async def fence_worker_dispatch_target(
     db: AsyncSession,
     *,
     receipt: PlanAgentWorkerDispatchReceipt,
-) -> None:
-    """Take the target Task writer fence before changing receipt/Run state."""
+) -> WorkerPlanDispatchSnapshot:
+    """Restart from a fresh writer transaction and fence the target Task.
 
-    _validate_receipt_shape(receipt)
+    Callers have to read the receipt once to discover its immutable Task and
+    Worker routing identity.  On SQLite WAL that read cannot safely be
+    upgraded after another connection commits: the otherwise harmless Task
+    UPDATE would raise ``SQLITE_BUSY_SNAPSHOT``.  Freeze scalar identity,
+    discard the routing read transaction, then make the Task fence the first
+    write when one exists.  A portable no-op Run update follows so standalone
+    Worker Plans (which have no target Task) also acquire a real SQLite writer
+    fence before ``SELECT ... FOR UPDATE``.  Every caller reloads the remaining
+    aggregate afterwards in canonical Run -> Plan -> receipt order and
+    revalidates the exact generation.
+    """
+
+    snapshot = snapshot_worker_dispatch_receipt(receipt)
+    if db.new or db.dirty or db.deleted:
+        raise WorkerPlanDispatchConflict(
+            "Worker Plan dispatch routing fence requires a clean transaction"
+        )
+    await db.rollback()
     from backend.services.plan_service import fence_plan_target_task
 
     await fence_plan_target_task(
         db,
-        target_task_id=receipt.target_task_id,
-        expected_worker_id=receipt.worker_id,
+        target_task_id=snapshot.target_task_id,
+        expected_worker_id=snapshot.worker_id,
     )
+    run_fenced = await db.execute(
+        update(PlanAgentRun)
+        .where(
+            PlanAgentRun.id == snapshot.run_id,
+            PlanAgentRun.plan_id == snapshot.plan_id,
+            PlanAgentRun.worker_id == snapshot.worker_id,
+            PlanAgentRun.generation == snapshot.run_generation,
+        )
+        .values(updated_at=PlanAgentRun.updated_at)
+    )
+    if run_fenced.rowcount != 1:
+        await db.rollback()
+        raise WorkerPlanDispatchConflict(
+            "Worker Plan Run changed before its dispatch writer fence"
+        )
+    return snapshot
 
 
 async def mark_worker_dispatch_remote_possible(
@@ -1257,16 +1290,15 @@ async def fence_worker_mirror_cancellation(
         raise WorkerPlanDispatchConflict(
             "Worker Plan cancellation aggregate identity changed"
         )
+    expected_plan_lock_version = plan.lock_version
+    expected_input_request_id = run.open_input_request_id
+    expected_target_task_id = plan.target_task_id
+
+    # The API may have read this aggregate before ``remote_possible`` committed.
+    # End that WAL snapshot and make Run the first writer.  Exact generation
+    # predicates mean a Worker ACK can never absorb a newer claim/generation.
+    await db.rollback()
     now = datetime.utcnow()
-    if run.open_input_request_id is not None:
-        await db.execute(
-            update(PlanInputRequest)
-            .where(
-                PlanInputRequest.id == run.open_input_request_id,
-                PlanInputRequest.status.in_(["prepared", "open"]),
-            )
-            .values(status="cancelled", cancelled_at=now)
-        )
     changed = await db.execute(
         update(PlanAgentRun)
         .where(
@@ -1275,6 +1307,13 @@ async def fence_worker_mirror_cancellation(
             PlanAgentRun.worker_id == worker_id,
             PlanAgentRun.status.in_(["queued", "running", "waiting_user"]),
             PlanAgentRun.generation == generation,
+            PlanAgentRun.instance_id.is_(None),
+            (
+                PlanAgentRun.open_input_request_id.is_(None)
+                if expected_input_request_id is None
+                else PlanAgentRun.open_input_request_id
+                == expected_input_request_id
+            ),
         )
         .values(
             status="cancelling",
@@ -1290,11 +1329,91 @@ async def fence_worker_mirror_cancellation(
         raise WorkerPlanDispatchConflict(
             "Worker Plan cancellation intent lost its generation fence"
         )
-    plan.lock_version += 1
-    plan.updated_at = now
+    plan_changed = await db.execute(
+        update(Plan)
+        .where(
+            Plan.id == plan_id,
+            Plan.worker_id == worker_id,
+            Plan.active_run_id == run_id,
+            Plan.lock_version == expected_plan_lock_version,
+        )
+        .values(
+            lock_version=Plan.lock_version + 1,
+            updated_at=now,
+        )
+    )
+    if plan_changed.rowcount != 1:
+        await db.rollback()
+        raise WorkerPlanDispatchConflict(
+            "Worker Plan changed while fencing cancellation"
+        )
+
+    # Re-lock the complete receipt history only after Run -> Plan. The first
+    # read above authenticated the caller's digest; this second read is the
+    # authoritative post-WAL-fence state.
+    receipts = list(
+        (
+            await db.execute(
+                select(PlanAgentWorkerDispatchReceipt)
+                .where(PlanAgentWorkerDispatchReceipt.run_id == run_id)
+                .order_by(
+                    PlanAgentWorkerDispatchReceipt.run_generation,
+                    PlanAgentWorkerDispatchReceipt.id,
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalars()
+    )
+    for receipt in receipts:
+        _validate_receipt_shape(receipt)
+    digests = {
+        receipt.payload_digest
+        for receipt in receipts
+        if receipt.payload_digest is not None
+    }
+    if (
+        digests != {payload_digest}
+        or any(
+            receipt.plan_id != plan_id
+            or receipt.target_task_id != expected_target_task_id
+            or receipt.worker_id != worker_id
+            or receipt.run_generation > generation
+            for receipt in receipts
+        )
+    ):
+        await db.rollback()
+        raise WorkerPlanDispatchConflict(
+            "Worker Plan dispatch history changed during cancellation"
+        )
+
+    if expected_input_request_id is not None:
+        input_changed = await db.execute(
+            update(PlanInputRequest)
+            .where(
+                PlanInputRequest.id == expected_input_request_id,
+                PlanInputRequest.plan_id == plan_id,
+                PlanInputRequest.run_id == run_id,
+                PlanInputRequest.status.in_(["prepared", "open"]),
+            )
+            .values(status="cancelled", cancelled_at=now)
+        )
+        if input_changed.rowcount != 1:
+            await db.rollback()
+            raise WorkerPlanDispatchConflict(
+                "Worker Plan input changed while fencing cancellation"
+            )
     await db.commit()
-    await db.refresh(run)
-    return run
+    fenced = await db.get(PlanAgentRun, run_id, populate_existing=True)
+    if fenced is None:
+        raise WorkerPlanDispatchConflict(
+            "Worker Plan Run disappeared after cancellation fence"
+        )
+    # Keep the post-commit refresh as an explicit cancellation point. The API
+    # shields this mutation and must still reap the exact old lifecycle if its
+    # request is cancelled after durable intent publication.
+    await db.refresh(fenced)
+    return fenced
 
 
 async def finalize_worker_mirror_cancellation(

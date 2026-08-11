@@ -54,7 +54,31 @@ const repo: MonitoredRepo = {
 
 describe('isDeliveryCompatible', () => {
   it('accepts the complete local exact-head policy', () => {
-    expect(isDeliveryCompatible(project, repo)).toBe(true);
+    expect(isDeliveryCompatible(project, repo, ['claude', 'codex'])).toBe(true);
+  });
+
+  it('accepts a repository whose PR Monitor owns automatic merge', () => {
+    expect(isDeliveryCompatible(
+      project,
+      { ...repo, auto_merge: true },
+      ['claude', 'codex'],
+    )).toBe(true);
+  });
+
+  it('accepts a Claude monitor in a Claude-only deployment', () => {
+    expect(isDeliveryCompatible(
+      project,
+      { ...repo, provider: 'claude' },
+      ['claude'],
+    )).toBe(true);
+  });
+
+  it('rejects a Codex monitor in a Claude-only deployment', () => {
+    expect(isDeliveryCompatible(project, repo, ['claude'])).toBe(false);
+  });
+
+  it('rejects all monitors until provider configuration has loaded', () => {
+    expect(isDeliveryCompatible(project, repo, [])).toBe(false);
   });
 
   it.each([
@@ -62,12 +86,13 @@ describe('isDeliveryCompatible', () => {
     ['project without remote', { ...project, has_remote: false }, repo],
     ['remote monitor', project, { ...repo, worker_id: 9 }],
     ['base mismatch', project, { ...repo, default_branch: 'develop' }],
-    ['automatic merge', project, { ...repo, auto_merge: true }],
+    ['automatic Merge Queue', project, { ...repo, merge_queue_mode: 'auto' }],
     ['missing checks', project, { ...repo, required_checks: [] }],
   ])('rejects %s before admission', (_label, candidateProject, candidateRepo) => {
     expect(isDeliveryCompatible(
       candidateProject as Project,
       candidateRepo as MonitoredRepo,
+      ['claude', 'codex'],
     )).toBe(false);
   });
 });

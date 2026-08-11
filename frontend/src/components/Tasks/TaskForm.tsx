@@ -6,17 +6,21 @@ import type {
   Project,
   TagItem,
   Task,
+  TaskSSHGrantInput,
 } from '../../api/client';
 import { Plus, Paperclip, X, Star, Wrench, Settings, Loader2, AlertCircle, Pin } from '../icons';
 import { ProjectSelect } from '../ProjectSelect';
 import { VoiceButton } from '../Voice/VoiceButton';
 import { SecretPicker } from '../Secrets/SecretPicker';
+import { SSHGrantPicker } from '../SSH/TaskSSHAccess';
 import { useFileDrop } from '../../hooks/useFileDrop';
 import { useFileUpload } from '../../hooks/useFileUpload';
 import { skillSupportedByProvider } from '../../config/skillCapabilities';
 import {
   acknowledgeDeliveryAdmission,
+  deliveryProviderOptions,
   prepareDeliveryAdmission,
+  resolveDeliveryProvider,
 } from './deliveryAdmission';
 import { filterDeliveryRepos } from './deliveryCompatibility';
 
@@ -27,7 +31,6 @@ interface TaskFormProps {
 const NEW_PROJECT_VALUE = '__new__';
 const STORAGE_KEY = 'cc_default_task_config';
 const DELIVERY_ADMISSION_SCOPE = 'task-form';
-
 interface StoredTaskDefaults {
   priority?: number;
   mode?: string;
@@ -77,6 +80,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   // workers state removed — Run on moved to Project level
   const [model, setModel] = useState('');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
+  const [providerConfigLoaded, setProviderConfigLoaded] = useState(false);
   const [effort, setEffort] = useState('');
   const [defaultProvider, setDefaultProvider] = useState('codex');
   const [defaultModel, setDefaultModel] = useState('claude-opus-4-6');
@@ -107,6 +111,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const fileUpload = useFileUpload();
   const clearFileUploads = fileUpload.clear;
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
+  const [selectedSSHGrants, setSelectedSSHGrants] = useState<TaskSSHGrantInput[]>([]);
   const [dropError, setDropError] = useState('');
   const [enabledPlugins, setEnabledPlugins] = useState<Record<string, boolean>>({});
   const [codexTaskSkillsEnabled, setCodexTaskSkillsEnabled] = useState(false);
@@ -125,22 +130,39 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     stored: StoredTaskDefaults | null,
     fallbackProvider: string,
     allowDeliveryLoop = false,
+    availableProviders: readonly string[] = ['claude', 'codex'],
   ) => {
     setPriority(stored?.priority ?? 0);
     // Plan creation now lives on the first-class Plans page. Normalize the
     // legacy saved value so an old browser preference cannot recreate the
     // removed Task-form mode invisibly.
     const storedMode = stored?.mode || 'auto';
+    const requestedProvider = stored?.provider || fallbackProvider;
+    const deliveryProvider = resolveDeliveryProvider(
+      requestedProvider,
+      fallbackProvider,
+      availableProviders,
+    );
     const normalizedMode = (
-      storedMode === 'plan' || (storedMode === 'delivery_loop' && !allowDeliveryLoop)
+      storedMode === 'plan'
+      || (storedMode === 'delivery_loop' && (!allowDeliveryLoop || !deliveryProvider))
         ? 'auto'
         : storedMode
     );
+    const resolvedProvider = normalizedMode === 'delivery_loop'
+      ? deliveryProvider!
+      : requestedProvider;
+    const deliveryProviderChanged = normalizedMode === 'delivery_loop'
+      && resolvedProvider !== requestedProvider;
     setMode(normalizedMode);
-    setProvider(normalizedMode === 'delivery_loop' ? 'codex' : (stored?.provider || fallbackProvider));
-    setModel(normalizedMode === 'delivery_loop' ? '' : (stored?.model || ''));
-    setEffort(stored?.effort || '');
-    setCodexServiceTier(stored?.codexServiceTier === 'priority' ? 'priority' : 'default');
+    setProvider(resolvedProvider);
+    setModel(deliveryProviderChanged ? '' : (stored?.model || ''));
+    setEffort(deliveryProviderChanged ? '' : (stored?.effort || ''));
+    setCodexServiceTier(
+      resolvedProvider === 'codex' && stored?.codexServiceTier === 'priority'
+        ? 'priority'
+        : 'default',
+    );
     setThinkingBudget(stored?.thinkingBudget || '');
     setTimeoutHours(stored?.timeoutHours || '');
     setSystemPromptMode(stored?.systemPromptMode || '');
@@ -156,11 +178,15 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     // Restore persisted user choices independently of the server request.
     // A slow or unavailable backend must not make local defaults disappear.
-    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
+    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
     api.config().then((c) => {
       const configuredProvider = c.default_provider || 'codex';
+      const configuredProviderOptions = c.provider_options.length
+        ? c.provider_options
+        : ['claude', 'codex'];
       setDefaultProvider(configuredProvider);
-      setProviderOptions(c.provider_options.length ? c.provider_options : ['claude', 'codex']);
+      setProviderOptions(configuredProviderOptions);
+      setProviderConfigLoaded(true);
       setDefaultModel(c.default_model);
       setModelOptions(c.model_options.filter((m) => m !== 'default'));
       setDefaultCodexModel(c.default_codex_model);
@@ -179,13 +205,19 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       );
       // Re-read after the async request so a default saved while it was in
       // flight still wins over the server defaults.
-      applyStoredDefaults(readStoredTaskDefaults(), configuredProvider, deliveryEnabled);
+      applyStoredDefaults(
+        readStoredTaskDefaults(),
+        configuredProvider,
+        deliveryEnabled,
+        configuredProviderOptions,
+      );
     }).catch(() => {
+      setProviderConfigLoaded(true);
       setCodexModelServiceTiers({});
       setCodexCapabilitiesLoaded(true);
       setDeliveryLoopEnabled(false);
       setAutoCapabilityAvailable(false);
-      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false);
+      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
     });
     api.getRuntimeSettings()
       .then((runtime) => {
@@ -234,9 +266,25 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const selectedProject = projectId
     ? projects.find((project) => project.id === projectId)
     : undefined;
+  const deliveryProviders = useMemo(
+    () => deliveryProviderOptions(providerOptions),
+    [providerOptions],
+  );
   const compatibleDeliveryRepos = useMemo(
-    () => filterDeliveryRepos(selectedProject, monitoredRepos),
-    [monitoredRepos, selectedProject],
+    () => filterDeliveryRepos(
+      selectedProject,
+      monitoredRepos,
+      providerConfigLoaded ? deliveryProviders : [],
+    ),
+    [deliveryProviders, monitoredRepos, providerConfigLoaded, selectedProject],
+  );
+  const selectedDeliveryProvider = resolveDeliveryProvider(
+    provider,
+    defaultProvider,
+    deliveryProviders,
+  );
+  const selectedDeliveryRepo = compatibleDeliveryRepos.find(
+    (repo) => repo.id === deliveryRepoId,
   );
   const remoteTaskScope = Boolean(workerId)
     || selectedProject?.worker_id != null;
@@ -301,6 +349,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (mode !== 'delivery_loop') return;
     clearFileUploads();
     setSelectedSecretIds([]);
+    setSelectedSSHGrants([]);
     setCloneFromTaskId('');
     setPriority(0);
     setThinkingBudget('');
@@ -463,6 +512,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   }, [provider, codexServiceTier, codexCapabilitiesLoaded, activeCodexModelSupportsFast]);
 
   const handleProjectChange = (val: string) => {
+    const nextProject = projects.find((project) => String(project.id) === val);
+    if (nextProject?.worker_id != null) setSelectedSSHGrants([]);
     if (val === NEW_PROJECT_VALUE) {
       setIsNewProject(true);
       setProjectId('');
@@ -531,6 +582,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       && selectedProject?.has_remote === true
       && selectedProject?.local_path != null
       && deliveryRepoId !== ''
+      && selectedDeliveryProvider != null
     )) &&
     (projectId || (isNewProject && newProjectName)) &&
     !fileUpload.isUploading &&
@@ -571,9 +623,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       }));
 
       if (mode === 'delivery_loop') {
-        if (uploadedPaths.length > 0 || selectedSecretIds.length > 0) {
+        if (
+          uploadedPaths.length > 0
+          || selectedSecretIds.length > 0
+          || selectedSSHGrants.length > 0
+        ) {
           throw new Error(
-            'Delivery Loop V1 does not accept Task attachments or Task secrets. '
+            'Delivery Loop V1 does not accept Task attachments, secrets, or SSH grants. '
             + 'Put durable requirements in the prompt or repository.',
           );
         }
@@ -582,6 +638,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         );
         if (!selectedProject || !deliveryRepo) {
           throw new Error('Select a compatible local PR Monitor repository.');
+        }
+        if (!selectedDeliveryProvider) {
+          throw new Error('Select a supported Delivery provider.');
         }
         const title = normalizedDeliveryRequirements
           .split(/\r?\n/)
@@ -594,10 +653,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           title,
           requirements: normalizedDeliveryRequirements,
           base_branch: selectedProject.default_branch,
-          provider: 'codex',
-          model: model || activeDefaultModel,
+          provider: selectedDeliveryProvider,
+          model: model || (
+            selectedDeliveryProvider === 'codex' ? defaultCodexModel : defaultModel
+          ),
           ...(effort ? { effort_level: effort } : {}),
-          codex_service_tier: codexServiceTier,
+          ...(selectedDeliveryProvider === 'codex'
+            ? { codex_service_tier: codexServiceTier }
+            : {}),
           ...(timeoutHours !== '' ? { timeout_hours: Number(timeoutHours) } : {}),
         });
         await api.createDeliveryRun(request);
@@ -610,9 +673,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           mode,
           ...(mode === 'loop' ? { todo_file_path: todoFilePath, max_iterations: parseInt(maxIterations) || 50, must_complete: mustComplete } : {}),
           ...(mode === 'goal' ? { goal_condition: goalCondition, goal_max_turns: parseInt(goalMaxTurns) || 30 } : {}),
+          ...(mode === 'pr_loop' ? { pr_loop_max_turns: parseInt(goalMaxTurns) || 20, pr_loop_poll_interval: parseInt((document.getElementById('pr-loop-poll-interval') as HTMLInputElement)?.value || '60') || 60 } : {}),
           ...(uploadedPaths.length > 0 ? { file_paths: uploadedPaths } : {}),
           ...(attachments.length > 0 ? { attachments } : {}),
           ...(selectedSecretIds.length > 0 ? { secret_ids: selectedSecretIds } : {}),
+          ...(!remoteTaskScope && selectedSSHGrants.length > 0
+            ? { ssh_grants: selectedSSHGrants }
+            : {}),
           ...(workerId ? { worker_id: parseInt(workerId) } : {}),
           ...(autoCapabilityEligible && autoCapabilityBudgetSum > 0 ? {
             capability_policy: {
@@ -664,7 +731,10 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setDescription('');
       fileUpload.clear();
       setSelectedSecretIds([]);
+      setSelectedSSHGrants([]);
       setCloneFromTaskId('');
+      setGoalCondition('');
+      setGoalMaxTurns('30');
       setAutoPlanBudget(0);
       setAutoReviewBudget(0);
       setAutoCapabilityMaxInvocations(1);
@@ -673,6 +743,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
         readStoredTaskDefaults(),
         defaultProvider,
         deliveryLoopEnabled,
+        providerOptions,
       );
       onCreated();
     } catch (err) {
@@ -728,6 +799,13 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             onChange={handleFileSelect}
           />
           <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} />
+          {isAdmin && (
+            <SSHGrantPicker
+              value={selectedSSHGrants}
+              onChange={setSelectedSSHGrants}
+              disabledReason={remoteTaskScope ? 'Manager-local SSH keys are unavailable to Worker Tasks' : undefined}
+            />
+          )}
           {fileUpload.uploads.map((upload) => (
             <div key={upload.id} className="relative rounded overflow-hidden border border-gray-600">
               {upload.preview ? (
@@ -827,15 +905,22 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                 {deliveryReposLoading ? 'Loading repositories…' : 'Select a compatible repository…'}
               </option>
               {compatibleDeliveryRepos.map((repo) => (
-                <option key={repo.id} value={repo.id}>{repo.repo_full_name}</option>
+                <option key={repo.id} value={repo.id}>
+                  {repo.repo_full_name} · {repo.auto_merge ? 'auto merge' : 'ready to merge only'}
+                </option>
               ))}
             </select>
           </label>
           <p className="text-[11px] leading-relaxed text-indigo-200/70">
             Requires a local project and an enabled PR Monitor using panel review,
-            exact-head required CI checks, manual merge, and no Merge Queue. The
-            loop stops at ready to merge; it never merges automatically.
+            exact-head required CI checks, and no Merge Queue. Merge behavior is
+            inherited from the selected PR Monitor.
           </p>
+          {selectedDeliveryRepo && (
+            <p className="text-[11px] leading-relaxed text-indigo-200/90">
+              PR Monitor Auto Merge is {selectedDeliveryRepo.auto_merge ? 'ON: CCM will finish only after GitHub confirms the merge.' : 'OFF: CCM will stop when the PR is ready to merge.'}
+            </p>
+          )}
           {!deliveryReposLoading && selectedProject && compatibleDeliveryRepos.length === 0 && (
             <p className="text-xs text-amber-300">
               No compatible PR Monitor configuration is bound to this project.
@@ -898,6 +983,30 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           />
         </div>
       )}
+      {mode === 'pr_loop' && (
+        <div className="flex items-center gap-2 flex-wrap">
+          <label className="text-xs text-gray-400 whitespace-nowrap">Max turns:</label>
+          <input
+            type="text"
+            inputMode="numeric"
+            className="w-16 bg-gray-700 text-foreground rounded px-2 py-1.5 text-sm"
+            value={goalMaxTurns}
+            onChange={(e) => setGoalMaxTurns(e.target.value.replace(/[^0-9]/g, ''))}
+            onBlur={() => {
+              const n = parseInt(goalMaxTurns);
+              setGoalMaxTurns(String((!n || n < 1) ? 1 : n));
+            }}
+          />
+          <label className="text-xs text-gray-400 whitespace-nowrap">Poll interval (s):</label>
+          <input
+            type="text"
+            inputMode="numeric"
+            className="w-16 bg-gray-700 text-foreground rounded px-2 py-1.5 text-sm"
+            defaultValue="60"
+            id="pr-loop-poll-interval"
+          />
+        </div>
+      )}
       {/* Bottom action row */}
       <div className="flex items-center gap-2 flex-wrap">
         {/* Attach files */}
@@ -953,15 +1062,25 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     const nextMode = e.target.value;
                     setMode(nextMode);
                     if (nextMode === 'delivery_loop') {
-                      setProvider('codex');
-                      setModel('');
+                      const nextProvider = resolveDeliveryProvider(
+                        provider,
+                        defaultProvider,
+                        deliveryProviders,
+                      );
+                      if (nextProvider && nextProvider !== provider) {
+                        setProvider(nextProvider);
+                        setModel('');
+                        setEffort('');
+                      }
+                      if (nextProvider !== 'codex') setCodexServiceTier('default');
                     }
                   }}
                 >
                   <option value="auto">Auto</option>
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
-                  {deliveryLoopEnabled && (
+                  <option value="pr_loop">PR Loop</option>
+                  {deliveryLoopEnabled && deliveryProviders.length > 0 && (
                     <option value="delivery_loop">Delivery Loop</option>
                   )}
                 </select>
@@ -1057,9 +1176,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
                 <span className="text-gray-400">CLI</span>
                 <select
+                  aria-label="Task provider"
                   className="bg-gray-700 text-foreground rounded px-2 py-1 text-xs"
                   value={provider}
-                  disabled={mode === 'delivery_loop'}
                   onChange={(e) => {
                     const nextProvider = e.target.value;
                     setProvider(nextProvider);
@@ -1068,7 +1187,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                     if (nextProvider !== 'codex') setCodexServiceTier('default');
                   }}
                 >
-                  {(mode === 'delivery_loop' ? ['codex'] : providerOptions).map((p) => (
+                  {(mode === 'delivery_loop' ? deliveryProviders : providerOptions).map((p) => (
                     <option key={p} value={p}>{p === 'claude' ? 'Claude' : p === 'codex' ? 'Codex' : p}</option>
                   ))}
                 </select>

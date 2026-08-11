@@ -61,10 +61,10 @@ const monitoredRepo = {
   project_id: 7,
   worker_id: null,
   enabled: true,
-  auto_merge: false,
+  auto_merge: true,
   auto_repair: true,
   max_repair_attempts: 3,
-  provider: 'codex',
+  provider: 'claude',
   review_model: null,
   review_effort: null,
   review_mode: 'panel' as const,
@@ -192,6 +192,14 @@ describe('ProjectTodoList', () => {
     render(<ProjectTodoList projectId={7} project={localProject} />);
 
     const dialog = await openDeliveryTaskModal();
+    const providerSelect = within(dialog).getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('codex');
+    expect(providerSelect).not.toBeDisabled();
+    expect(within(providerSelect).getByRole('option', { name: 'Claude Code' })).toBeInTheDocument();
+    expect(within(providerSelect).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
+    expect(within(dialog).getByText(/PR Monitor Auto Merge is ON/)).toHaveTextContent(
+      'completion waits for GitHub to confirm the merge',
+    );
     await userEvent.click(within(dialog).getByRole('button', { name: 'Create task' }));
 
     await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledWith({
@@ -205,6 +213,33 @@ describe('ProjectTodoList', () => {
     }));
     expect(api.createTask).not.toHaveBeenCalled();
     expect(api.updateProjectTodo).not.toHaveBeenCalled();
+    expect(window.location.hash).toBe('#/tasks/chat/43');
+  });
+
+  it('starts a Claude Delivery Run when Claude is the only configured provider', async () => {
+    vi.mocked(api.listProjectTodos).mockResolvedValue([todo]);
+    vi.mocked(api.config).mockResolvedValue({
+      provider_options: ['claude'],
+      default_provider: 'claude',
+      delivery_loop_enabled: true,
+    } as never);
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([monitoredRepo]);
+    render(<ProjectTodoList projectId={7} project={localProject} />);
+
+    const dialog = await openDeliveryTaskModal();
+    const providerSelect = within(dialog).getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('claude');
+    expect(within(providerSelect).getAllByRole('option')).toHaveLength(1);
+    expect(within(providerSelect).queryByRole('option', { name: 'Codex' })).not.toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Create task' }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    expect(vi.mocked(api.createDeliveryRun).mock.calls[0][0]).toEqual(expect.objectContaining({
+      project_id: 7,
+      monitored_repo_id: 9,
+      source_todo_id: 5,
+      provider: 'claude',
+    }));
     expect(window.location.hash).toBe('#/tasks/chat/43');
   });
 

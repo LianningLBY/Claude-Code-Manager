@@ -336,12 +336,15 @@ async def test_auto_capability_switch_is_independent_and_fail_closed(client):
 
     response = await client.get("/api/system/config")
     assert response.status_code == 200
-    assert response.json()["auto_capability_enabled"] is False
+    assert response.json()["capability_core_enabled"] is True
+    assert response.json()["auto_capability_enabled"] is True
+    assert response.json()["delivery_loop_enabled"] is True
 
     with patch.object(settings, "auto_capability_enabled", True), \
          patch.object(settings, "capability_core_enabled", False):
         response = await client.get("/api/system/config")
     assert response.json()["auto_capability_enabled"] is False
+    assert response.json()["delivery_loop_enabled"] is False
 
     with patch.object(settings, "auto_capability_enabled", True), \
          patch.object(settings, "capability_core_enabled", True):

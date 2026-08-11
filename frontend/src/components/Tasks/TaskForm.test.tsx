@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskForm } from './TaskForm';
 
@@ -10,6 +10,7 @@ vi.mock('../../api/client', () => ({
     ]),
     listTags: vi.fn().mockResolvedValue([]),
     listSecrets: vi.fn().mockResolvedValue([]),
+    listSSHProfiles: vi.fn().mockResolvedValue([]),
     listTasks: vi.fn().mockResolvedValue([]),
     config: vi.fn().mockResolvedValue({
       default_provider: 'claude',
@@ -693,6 +694,19 @@ describe('TaskForm persisted defaults', () => {
     });
   });
 });
+describe('TaskForm frontend review entry location', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it('does not show the looping frontend review control on Task creation', () => {
+    render(<TaskForm onCreated={vi.fn()} />);
+
+    expect(screen.queryByRole('button', { name: '选择前端审查模式' }))
+      .not.toBeInTheDocument();
+  });
+});
 
 describe('TaskForm Auto capabilities', () => {
   const enabledConfig = {
@@ -905,10 +919,10 @@ describe('TaskForm Delivery Loop mode', () => {
       project_id: 1,
       worker_id: null,
       enabled: true,
-      auto_merge: false,
+      auto_merge: true,
       auto_repair: true,
       max_repair_attempts: 3,
-      provider: 'codex',
+      provider: 'claude',
       review_model: null,
       review_effort: null,
       review_mode: 'panel',
@@ -954,7 +968,11 @@ describe('TaskForm Delivery Loop mode', () => {
     await selectProject();
     await openConfigPanel();
     await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
-    expect(screen.getByDisplayValue('Codex')).toBeDisabled();
+    const providerSelect = screen.getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('codex');
+    expect(providerSelect).not.toBeDisabled();
+    expect(within(providerSelect).getByRole('option', { name: 'Claude' })).toBeInTheDocument();
+    expect(within(providerSelect).getByRole('option', { name: 'Codex' })).toBeInTheDocument();
 
     expect(screen.queryByRole('button', { name: 'Attach files' })).not.toBeInTheDocument();
     expect(screen.queryByText('Priority')).not.toBeInTheDocument();
@@ -965,6 +983,10 @@ describe('TaskForm Delivery Loop mode', () => {
     const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
     await waitFor(() => expect(repoSelect).not.toBeDisabled());
     await userEvent.selectOptions(repoSelect, '9');
+    expect(screen.getByText(/Merge behavior is inherited from the selected PR Monitor/)).toBeInTheDocument();
+    expect(screen.getByText(/PR Monitor Auto Merge is ON/)).toHaveTextContent(
+      'CCM will finish only after GitHub confirms the merge',
+    );
     await userEvent.type(
       screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
       'Fix exact-head loop\nwith complete regression tests',
@@ -984,6 +1006,46 @@ describe('TaskForm Delivery Loop mode', () => {
     }));
     expect(api.createTask).not.toHaveBeenCalled();
     expect(onCreated).toHaveBeenCalledOnce();
+  });
+
+  it('creates a Claude Delivery Run when Claude is the only configured provider', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      default_provider: 'claude',
+      provider_options: ['claude'],
+    } as never);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+
+    const providerSelect = screen.getByLabelText('Task provider');
+    expect(providerSelect).toHaveValue('claude');
+    expect(within(providerSelect).getAllByRole('option')).toHaveLength(1);
+    expect(within(providerSelect).queryByRole('option', { name: 'Codex' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Codex speed')).not.toBeInTheDocument();
+
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    await userEvent.type(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      'Ship with Claude only',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    const payload = vi.mocked(api.createDeliveryRun).mock.calls[0][0];
+    expect(payload).toEqual(expect.objectContaining({
+      project_id: 1,
+      monitored_repo_id: 9,
+      title: 'Ship with Claude only',
+      requirements: 'Ship with Claude only',
+      base_branch: 'main',
+      provider: 'claude',
+      model: 'claude-opus-4-6',
+    }));
+    expect(payload).not.toHaveProperty('codex_service_tier');
   });
 
   it('keeps a failed admission key across remount and acknowledges it only after success', async () => {
@@ -1061,5 +1123,115 @@ describe('TaskForm Delivery Loop mode', () => {
     });
 
     expect(api.uploadImages).not.toHaveBeenCalled();
+  });
+
+  it('drops a previously selected SSH grant before Delivery admission', async () => {
+    vi.mocked(api.listSSHProfiles).mockResolvedValueOnce([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      enabled: true,
+      revision: 1,
+      task_access_enabled: true,
+      task_capabilities: ['read'],
+      allowed_roots: ['/srv/app'],
+      has_key: true,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await userEvent.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await userEvent.click(await screen.findByLabelText('Grant production-box'));
+
+    await openConfigPanel();
+    await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
+    const repoSelect = await screen.findByLabelText('Delivery PR Monitor repository');
+    await waitFor(() => expect(repoSelect).not.toBeDisabled());
+    await userEvent.selectOptions(repoSelect, '9');
+    fireEvent.change(
+      screen.getByPlaceholderText('Delivery requirements (Plan → Code → Review → PR Monitor)'),
+      { target: { value: 'Keep Delivery isolated from SSH grants' } },
+    );
+    await userEvent.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createDeliveryRun).toHaveBeenCalledOnce());
+    expect(screen.queryByText(/does not accept.*SSH grants/i)).not.toBeInTheDocument();
+  });
+});
+
+describe('TaskForm SSH grants', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    vi.mocked(api.listSSHProfiles).mockResolvedValue([{
+      id: 41,
+      name: 'production-box',
+      host: 'ssh.internal',
+      port: 22,
+      username: 'deploy',
+      key_path_hint: '…/id_ed25519',
+      public_key_fingerprint: 'SHA256:client-key',
+      host_key_type: 'ssh-ed25519',
+      host_key_fingerprint: 'SHA256:server-key',
+      revision: 1,
+      enabled: true,
+      task_access_enabled: true,
+      task_capabilities: ['read', 'exec', 'write'],
+      allowed_roots: ['/'],
+      created_by: 1,
+      last_tested_at: null,
+      last_test_ok: null,
+      last_error_code: null,
+      last_error_detail: null,
+      created_at: '2026-08-06T00:00:00',
+      updated_at: '2026-08-06T00:00:00',
+    }]);
+  });
+
+  it('submits the selected profile and least-privilege capabilities atomically', async () => {
+    const user = userEvent.setup();
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await user.type(
+      screen.getByPlaceholderText(/Prompt \/ Description/),
+      'inspect production logs',
+    );
+    await user.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await user.click(await screen.findByLabelText('Grant production-box'));
+    await user.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalledWith(
+      expect.objectContaining({
+        ssh_grants: [{ profile_id: 41, capabilities: ['read'] }],
+      }),
+    ));
+  });
+
+  it('clears Manager-local SSH grants when switching to a Worker project', async () => {
+    vi.mocked(api.listProjects).mockResolvedValueOnce([
+      { id: 1, name: 'test-project', git_url: '', has_remote: false, local_path: '/tmp/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [], worker_id: null },
+      { id: 2, name: 'worker-project', worker_id: 9, git_url: '', has_remote: false, local_path: '/workspace/test', status: 'ready', show_in_selector: true, tags: [], sort_order: 0, badge_color: null, env_files: [] },
+    ] as Awaited<ReturnType<typeof api.listProjects>>);
+    const user = userEvent.setup();
+    render(<TaskForm onCreated={vi.fn()} />);
+    await selectProject();
+    await user.click(screen.getByRole('button', { name: /^SSH access/ }));
+    await user.click(await screen.findByLabelText('Grant production-box'));
+
+    await user.click(screen.getByText('test-project'));
+    await user.click(await screen.findByText('worker-project'));
+    expect(screen.getByRole('button', { name: /^SSH access/ })).toBeDisabled();
+    await user.type(screen.getByPlaceholderText(/Prompt \/ Description/), 'remote task');
+    await user.click(screen.getByRole('button', { name: /create/i }));
+
+    await waitFor(() => expect(api.createTask).toHaveBeenCalled());
+    expect(vi.mocked(api.createTask).mock.calls.at(-1)?.[0]).not.toHaveProperty('ssh_grants');
   });
 });

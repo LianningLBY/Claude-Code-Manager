@@ -48,7 +48,11 @@ async def _scope(db_session, *, worker_id=None, auto_merge=False):
         auto_merge=auto_merge,
         review_mode="panel",
         wait_for_ci=True,
-        required_checks=[{"kind": "check_run", "name": "test", "app_id": 1}],
+        required_checks=[{
+            "kind": "check_run",
+            "name": "test",
+            "app_slug": "github-actions",
+        }],
         merge_queue_mode="manual",
         default_branch="main",
     )
@@ -210,22 +214,119 @@ async def test_runtime_defaults_are_frozen_into_policy_and_task(
 
 
 @pytest.mark.asyncio
-async def test_service_rejects_non_codex_even_below_api_schema(db_session):
+async def test_claude_runtime_defaults_are_frozen_into_policy_and_task(
+    db_session,
+    monkeypatch,
+):
+    project, repo = await _scope(db_session)
+    monkeypatch.setattr(settings, "provider_options", "claude")
+    monkeypatch.setattr(settings, "default_model", "claude-opus-4-6")
+    monkeypatch.setattr(settings, "default_effort", "medium")
+
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-claude-frozen",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Run with Claude",
+            requirements="Use the available Claude Code provider safely.",
+            provider="claude",
+        ),
+    )
+
+    task = await db_session.get(Task, run.developer_task_id)
+    assert task is not None
+    assert run.policy_snapshot["provider"] == "claude"
+    assert run.policy_snapshot["model"] == "claude-opus-4-6"
+    assert run.policy_snapshot["codex_service_tier"] == "default"
+    assert run.policy_snapshot["effort_level"] == "medium"
+    assert (
+        task.provider,
+        task.model,
+        task.codex_service_tier,
+        task.effort_level,
+    ) == ("claude", "claude-opus-4-6", "default", "medium")
+
+
+@pytest.mark.asyncio
+async def test_service_rejects_codex_fast_for_claude_provider(db_session):
     project, repo = await _scope(db_session)
 
-    with pytest.raises(DeliveryUnsupportedScopeError, match="Codex provider only"):
+    with pytest.raises(DeliveryValidationError, match="only available"):
         await create_delivery_run(
             db_session,
             DeliveryCreateSpec(
-                idempotency_key="service-claude-rejected",
+                idempotency_key="service-claude-fast-rejected",
                 project_id=project.id,
                 monitored_repo_id=repo.id,
-                title="Reject Claude",
-                requirements="V1 must fail closed.",
+                title="Reject Fast on Claude",
+                requirements="Provider tiers must remain exact.",
+                provider="claude",
+                codex_service_tier="priority",
+            ),
+        )
+    await db_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_admission_rejects_disabled_developer_provider_before_side_effects(
+    db_session,
+    monkeypatch,
+):
+    project, repo = await _scope(db_session)
+    repo.provider = "claude"
+    await db_session.commit()
+    monkeypatch.setattr(settings, "provider_options", "claude")
+
+    with pytest.raises(
+        DeliveryValidationError,
+        match="Delivery provider 'codex' is not enabled",
+    ):
+        await create_delivery_run(
+            db_session,
+            DeliveryCreateSpec(
+                idempotency_key="service-disabled-developer-provider",
+                project_id=project.id,
+                monitored_repo_id=repo.id,
+                title="Reject disabled developer",
+                requirements="Do not start a disabled provider.",
+                provider="codex",
+            ),
+        )
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(DeliveryRun.id))) == 0
+    assert await db_session.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_admission_rejects_disabled_monitor_provider_before_side_effects(
+    db_session,
+    monkeypatch,
+):
+    project, repo = await _scope(db_session)
+    repo.provider = "codex"
+    await db_session.commit()
+    monkeypatch.setattr(settings, "provider_options", "claude")
+
+    with pytest.raises(
+        DeliveryValidationError,
+        match="PR Monitor provider 'codex' is not enabled",
+    ):
+        await create_delivery_run(
+            db_session,
+            DeliveryCreateSpec(
+                idempotency_key="service-disabled-monitor-provider",
+                project_id=project.id,
+                monitored_repo_id=repo.id,
+                title="Reject disabled reviewer",
+                requirements="Do not defer this failure until panel review.",
                 provider="claude",
             ),
         )
     await db_session.rollback()
+    assert await db_session.scalar(select(func.count(DeliveryRun.id))) == 0
+    assert await db_session.scalar(select(func.count(Task.id))) == 0
 
 
 @pytest.mark.asyncio
@@ -314,20 +415,71 @@ async def test_create_delivery_run_rejects_remote_worker_scope(db_session):
 
 
 @pytest.mark.asyncio
-async def test_create_delivery_run_rejects_automatic_merge_policy(db_session):
+async def test_create_delivery_run_freezes_automatic_merge_terminal(db_session):
     project, repo = await _scope(db_session, auto_merge=True)
 
-    with pytest.raises(DeliveryValidationError, match="manual merge"):
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-auto-merge",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Merge after the Gate",
+            requirements="Merge only after the exact PR Monitor Gate passes.",
+        ),
+    )
+
+    assert run.policy_snapshot["auto_merge"] is True
+    assert run.policy_snapshot["terminal"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_auto_merge_admission_rejects_legacy_status_ci_policy(db_session):
+    project, repo = await _scope(db_session, auto_merge=True)
+    repo.required_checks = [{
+        "kind": "status",
+        "name": "tests",
+        "app_slug": "ci-bot",
+    }]
+    await db_session.commit()
+
+    with pytest.raises(
+        DeliveryValidationError,
+        match="app-bound check_run required CI policies",
+    ):
         await create_delivery_run(
             db_session,
             DeliveryCreateSpec(
-                idempotency_key="service-auto-merge",
+                idempotency_key="service-status-auto-merge",
                 project_id=project.id,
                 monitored_repo_id=repo.id,
-                title="No merge",
-                requirements="Stop at ready_to_merge.",
+                title="Reject late auto-merge failure",
+                requirements="Reject before any agent work is admitted.",
             ),
         )
+
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(DeliveryRun.id))) == 0
+    assert await db_session.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_create_delivery_run_freezes_manual_ready_terminal(db_session):
+    project, repo = await _scope(db_session, auto_merge=False)
+
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-manual-merge",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Wait for merge",
+            requirements="Stop after the exact PR Monitor Gate passes.",
+        ),
+    )
+
+    assert run.policy_snapshot["auto_merge"] is False
+    assert run.policy_snapshot["terminal"] == "ready_to_merge"
 
 
 @pytest.mark.asyncio

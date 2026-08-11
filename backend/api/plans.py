@@ -443,6 +443,13 @@ async def create_related_plan(
     if target is None:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, target, db)
+    from backend.api.tasks import _require_not_isolated_browser_child
+
+    await _require_not_isolated_browser_child(
+        db,
+        target,
+        action="used as a Plan owner",
+    )
     if not target.session_id:
         raise HTTPException(400, "Run the target Task before creating a session Plan")
     if target.shared_from_id is not None:
@@ -458,6 +465,11 @@ async def create_related_plan(
         if target is None:
             raise HTTPException(404, "Task not found")
         await require_task_control(request, target, db)
+        await _require_not_isolated_browser_child(
+            db,
+            target,
+            action="used as a Plan owner",
+        )
         return await _create_related_plan(
             db=db,
             request=request,

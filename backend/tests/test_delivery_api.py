@@ -50,6 +50,7 @@ async def _scope(
     session_factory,
     *,
     suffix: str,
+    auto_merge: bool = False,
 ) -> tuple[Project, MonitoredRepo]:
     async with session_factory() as db:
         project = Project(
@@ -67,7 +68,7 @@ async def _scope(
             project_id=project.id,
             webhook_secret="test-secret",
             enabled=True,
-            auto_merge=False,
+            auto_merge=auto_merge,
             review_mode="panel",
             wait_for_ci=True,
             required_checks=[
@@ -130,7 +131,7 @@ async def test_create_is_fail_closed_by_both_feature_flags(
 
 
 @pytest.mark.asyncio
-async def test_delivery_admission_contract_rejects_non_codex_provider(
+async def test_delivery_admission_contract_accepts_claude_provider(
     client,
     session_factory,
     delivery_enabled,
@@ -144,12 +145,43 @@ async def test_delivery_admission_contract_rejects_non_codex_provider(
             repo,
             provider="claude",
             model="claude-opus-4-6",
+        ),
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, body["id"])
+        task = await db.get(Task, body["developer_task_id"])
+        assert run is not None
+        assert task is not None
+        assert run.policy_snapshot["provider"] == "claude"
+        assert run.policy_snapshot["model"] == "claude-opus-4-6"
+        assert task.provider == "claude"
+        assert task.model == "claude-opus-4-6"
+
+
+@pytest.mark.asyncio
+async def test_delivery_admission_rejects_codex_fast_for_claude_provider(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="claude-fast")
+
+    response = await client.post(
+        "/api/delivery-runs",
+        json=_payload(
+            project,
+            repo,
+            provider="claude",
+            model="claude-opus-4-6",
             codex_service_tier="priority",
         ),
     )
 
-    assert response.status_code == 422, response.text
-    assert "codex" in response.text
+    assert response.status_code == 400, response.text
+    assert "only available" in response.text
     async with session_factory() as db:
         assert await db.scalar(select(func.count(DeliveryRun.id))) == 0
         assert await db.scalar(select(func.count(Task.id))) == 0
@@ -268,6 +300,7 @@ async def test_create_is_atomic_and_detail_exposes_durable_evidence(
     body = created.json()
     assert body["phase"] == "planning"
     assert body["activity"] == "ready"
+    assert body["terminal"] == "ready_to_merge"
     assert body["allowed_actions"] == ["pause", "cancel"]
     assert body["delivery_branch"] == (
         f"ccm/delivery/{body['id']}-fix-the-delivery-race"
@@ -295,12 +328,40 @@ async def test_create_is_atomic_and_detail_exposes_durable_evidence(
     assert task_body["delivery_phase"] == "planning"
     assert task_body["delivery_activity"] == "ready"
     assert task_body["delivery_outcome"] is None
+    assert task_body["delivery_terminal"] == "ready_to_merge"
 
     async with session_factory() as db:
         assert await db.scalar(select(func.count(DeliveryRun.id))) == 1
         assert await db.scalar(select(func.count(DeliveryCycle.id))) == 1
         assert await db.scalar(select(func.count(DeliveryTransition.id))) == 1
         assert await db.scalar(select(func.count(Task.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_create_projects_frozen_auto_merge_terminal(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(
+        session_factory,
+        suffix="auto-terminal",
+        auto_merge=True,
+    )
+
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo),
+    )
+
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["terminal"] == "merged"
+    task_response = await client.get(
+        f"/api/tasks/{body['developer_task_id']}"
+    )
+    assert task_response.status_code == 200, task_response.text
+    assert task_response.json()["delivery_terminal"] == "merged"
 
 
 @pytest.mark.asyncio

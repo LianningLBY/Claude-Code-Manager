@@ -346,11 +346,10 @@ class FullMirrorCCMBackend(CCMBackend):
                     or event_dict.get("orphan")
                     or event_dict.get("autonomous")
                 ):
-                    # Pinned claude-pty marks every structured quota event as
-                    # terminal before yielding it. on_event is awaited before
-                    # Session checks that latch, so clear soft events and hard
-                    # events proven to belong to stale/autonomous turns. Only
-                    # a hard signal from this foreground turn may abort it.
+                    # Keep the compatibility clear for older claude-pty
+                    # sessions that latched every structured quota event, and
+                    # for hard events proven stale/autonomous. Only a hard
+                    # signal from this foreground turn may abort it.
                     process = getattr(record, "process", None)
                     session = getattr(process, "session", None)
                     if (
@@ -855,6 +854,7 @@ class FullMirrorCCMBackend(CCMBackend):
         async def _full_autonomous_mirror(event, **ctx):
             nonlocal autonomous_generation, activity_handoff
             generation = None
+            completion_state = None
             event_data = event.to_dict()
             event_data["autonomous"] = True
             background_tracker = _background_work_tracker(
@@ -943,11 +943,25 @@ class FullMirrorCCMBackend(CCMBackend):
                             state.task_turn_generation
                         ),
                     )
-                    await im._finish_pty_autonomous_activity_locked(
+                    completion_state = await im._finish_pty_autonomous_activity_locked(
                         task_id,
                         expected_session_id,
                         generation,
                         event_data,
+                    )
+                # Owner cleanup is globally outer to the PTY transition lock.
+                # Mark the sentinel while serialized above, then take the
+                # durable Harness fence before clearing the background epoch.
+                if (
+                    completion_state is not None
+                    and getattr(completion_state, "task_id", None) == task_id
+                    and getattr(completion_state, "session_id", None)
+                    == expected_session_id
+                    and getattr(completion_state, "generation", None)
+                    == generation
+                ):
+                    await im._try_complete_pty_background_generation(
+                        completion_state
                     )
             except Exception:
                 logger.exception(

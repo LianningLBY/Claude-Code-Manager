@@ -15,6 +15,9 @@ from backend.services.auto_capability_policy import (
 from backend.services.codex_models import validate_codex_service_tier
 
 
+SOURCE_TASK_INCARNATION_METADATA_KEY = "ccm_source_task_incarnation_id"
+
+
 async def purge_task_access_grants(db: AsyncSession, task_id: int) -> None:
     """Remove every ACL row whose authority is one exact Task id.
 
@@ -25,7 +28,11 @@ async def purge_task_access_grants(db: AsyncSession, task_id: int) -> None:
     """
 
     from sqlalchemy import delete
+    from backend.models.task_ssh_grant import TaskSSHGrant
 
+    await db.execute(
+        delete(TaskSSHGrant).where(TaskSSHGrant.task_id == task_id)
+    )
     await db.execute(delete(TaskShare).where(TaskShare.task_id == task_id))
     await db.execute(
         delete(TeamTaskShare).where(TeamTaskShare.task_id == task_id)
@@ -89,7 +96,12 @@ def prepare_task_create_values(values: Mapping[str, object]) -> dict:
     return prepared
 
 
-async def stage_task_record(db: AsyncSession, **values) -> Task:
+async def stage_task_record(
+    db: AsyncSession,
+    *,
+    source_incarnation_id: str | None = None,
+    **values,
+) -> Task:
     """Add and flush one canonical Task without owning the transaction.
 
     Callers such as Plan materialization can atomically persist related rows
@@ -97,9 +109,20 @@ async def stage_task_record(db: AsyncSession, **values) -> Task:
     """
 
     prepared = prepare_task_create_values(values)
-    # Incarnations are system authority, never caller-controlled.  This also
-    # upgrades explicit-id/internal creation paths to the same ABA fence.
-    prepared["incarnation_id"] = secrets.token_hex(16)
+    # Incarnations are system authority, never public caller-controlled. An
+    # internal explicit-id Worker mirror carries the Manager's exact logical
+    # incarnation so remote mutations can close the same-id ABA window.
+    if source_incarnation_id is not None:
+        if values.get("id") is None:
+            raise ValueError(
+                "source Task incarnation requires an internal explicit id"
+            )
+        prepared["incarnation_id"] = source_incarnation_id
+        metadata = dict(prepared.get("metadata_") or {})
+        metadata[SOURCE_TASK_INCARNATION_METADATA_KEY] = source_incarnation_id
+        prepared["metadata_"] = metadata
+    else:
+        prepared["incarnation_id"] = secrets.token_hex(16)
     validate_task_service_tier_configuration(
         provider=prepared["provider"],
         model=prepared["model"],

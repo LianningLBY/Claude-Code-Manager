@@ -437,6 +437,7 @@ async def _verify_current_snapshot(
                 "base_sha": review.base_sha,
                 "head_sha": review.head_sha,
             },
+            base_ref=review.base_ref,
         )
     except GhError as exc:
         # These messages are emitted only after a fully validated GitHub
@@ -470,6 +471,7 @@ async def _load_current_head_route(
     )
     current_ref = head.get("ref") if isinstance(head, dict) else None
     current_sha = head.get("sha") if isinstance(head, dict) else None
+    current_base_ref = base.get("ref") if isinstance(base, dict) else None
     current_base_sha = base.get("sha") if isinstance(base, dict) else None
     if (
         not isinstance(payload, dict)
@@ -492,11 +494,16 @@ async def _load_current_head_route(
     ):
         raise PRHeadDriftError("PR source repository no longer exists")
     if (
-        not isinstance(current_base_sha, str)
+        not isinstance(current_base_ref, str)
+        or not current_base_ref
+        or not isinstance(current_base_sha, str)
         or _GITHUB_SHA_RE.fullmatch(current_base_sha.lower()) is None
     ):
         raise GhError("GitHub PR base snapshot response is malformed")
-    if current_base_sha.lower() != review.base_sha.lower():
+    if (
+        current_base_ref != review.base_ref
+        or current_base_sha.lower() != review.base_sha.lower()
+    ):
         raise PRHeadDriftError("PR base snapshot changed")
     if (
         not isinstance(current_repo, str)

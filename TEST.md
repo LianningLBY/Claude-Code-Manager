@@ -426,6 +426,7 @@ Codex 版本兼容基线（2026-07-24）：
 - 两版 app-server 均已用真实 `thread/start` 启动 CCM FastMCP server，`required`、`enabled_tools` 和 timeout 配置可正常完成 session 初始化。
 - 实测确认 app-server 对 server 名强制 `^[a-zA-Z0-9_-]+$`；renderer 在进 CLI 前做同样校验。
 - smoke test 前后隔离目录均未产生 `config.toml`；路径/中文/引号/反斜杠的无损序列化由不经过 shell 的单元测试覆盖。
+- Managed public proxy 有独立安全版本门槛：只接受同一 live app-server generation 的 `initialize.userAgent` 所证明的稳定版 `>=0.146.0`；`0.144.6`/`0.145.0`、不可解析版本或 process generation 不匹配都必须在 `thread/start` 前降级为 network-off。
 
 #### `test_codex_app_server.py` / `test_service_instance_manager.py` — Codex 主任务 MCP 按 thread 注入
 
@@ -447,6 +448,8 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_required_mcp_pre_turn_failure_falls_back_to_equivalent_exec` | transport 启动失败/no-thread-id 只在 turn 前回退，且 exec argv 保留当前 task 的 required MCP |
 | `test_required_mcp_unknown_app_server_failure_does_not_launch_exec` | required MCP 下未知 adapter 异常继续 fail closed |
 | `test_launch_codex_does_not_fallback_when_replay_is_unsafe` | timeout、busy、required 非 pre-turn、owner mismatch 和已启动 turn 的持久化失败均禁止重放 |
+| `test_managed_network_runtime_version_gate` / `test_old_runtime_downgrades_managed_task_before_thread_start` | exact initialize version + process generation 门控 managed proxy；旧版/未知版仍以 network-off 执行，不发送 direct-network Task |
+| `test_ordinary_task_uses_exact_managed_public_network_profile` / `test_ordinary_task_managed_network_requires_exact_thread_proof` / profile-id 与 drift/recheck 用例 | 每 turn 随机 profile；精确网络配置、thread response、ambient MCP/config/skills/instruction sources 和最终 turn admission 漂移均 fail closed |
 | `test_codex_sub_agent_requires_app_server_and_never_uses_exec` | app-server 关闭时 Sub-Agent 明确失败，绝不降级到没有 live thread control 的 exec |
 | `test_codex_sub_agent_mcp_failure_does_not_launch_exec` | 即使是 pre-turn 错误，Sub-Agent 仍不得走 exec |
 | `test_codex_app_server_rejects_home_owned_by_exec_generation` | 同一 `CODEX_HOME` 有 exec generation 时 app-server 返回 busy |
@@ -809,7 +812,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 
 | 测试 | 验证内容 |
 |------|---------|
-| `test_build_review_prompt_auto_merge_on` / `..._off` | auto_merge 开关影响 prompt（是否含 `gh pr merge`） |
+| `test_build_review_prompt_*` | Reviewer prompt 始终禁止 Agent 执行 `gh pr merge`；合并权限只在后端 |
+| `test_publish_auto_merge_*` / `test_publish_merged_comment_*` | OFF 只发布 ready-to-merge Review；ON 固定 head merge，并以 nonce/head/actor/time 对账最终 merged comment；merge/comment ACK 丢失均不重复写 |
+| `test_delivery_durable_publication_*` | Delivery publication 只能恢复 Run 冻结的 merge policy，错配 outbox fail closed |
 | `test_create_pr_review_task_happy_path` | 创建 PRReview + Task 并广播 `review_created` |
 | `test_create_pr_review_task_broadcast_failure_logged_not_raised` | 广播失败 → logger.warning，不中断流程 |
 | `test_check_and_update_review_merged` / `..._approved` / `..._changes_requested` | gh 状态映射 merged/approved/commented |
@@ -1231,20 +1236,29 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 # Run/Controller/worktree/publisher/PR Monitor 的本地 Git、故障注入与状态机回归
 uv run pytest -q backend/tests/test_delivery_*.py
 
-# 真实 Codex 0.144.6 app-server 隔离探针（显式 opt-in）
+# 真实 Codex app-server 隔离探针（显式 opt-in，不发送模型请求）
 CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
   backend/tests/test_codex_app_server.py::test_real_codex_delivery_permission_profile_blocks_host_reads
+
+# 需让 PATH 中的 codex 指向可验证的稳定版 >=0.146.0
+CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
+  backend/tests/test_codex_app_server.py::test_real_codex_managed_public_network_extended_boundary
 ```
 
-真实探针只调用 `initialize` / `thread/start` / `command/exec`，不调用
-`turn/start`，因此不发送模型请求。它使用临时 `CODEX_HOME` 和 workspace，验证
-宿主文件不可读、GitHub/SSH 凭据环境变量不进入 shell、workspace 可写，
-且 linked-worktree `.git` pointer 不可覆盖。需要已安装项目锁定的
-`codex-cli 0.144.6`；缺少 CLI 时用例会跳过。
+两项真实探针都不调用 `turn/start`，因此不发送模型请求。Delivery 探针通过
+`initialize` / `thread/start` / `command/exec` 验证 network-off 的宿主文件、
+凭据环境和 linked-worktree 边界。Managed 探针要求 PATH 中是可由同一
+app-server `initialize.userAgent` 证明的稳定版 Codex `>=0.146.0`，并让
+`codex sandbox` 使用与生产相同的 permission profile 和
+`shell_environment_policy.inherit=none` + safe explicit set/TMP；它验证公网
+HTTPS 经 managed proxy 成功，同时 direct public TCP、host loopback/private
+destination、pathname/abstract AF_UNIX、UDP、SOCKS 和 deployment upstream
+proxy 全部失败；sandbox loopback bind/self-connect 仅在隔离 netns 内成立，
+不暴露给宿主。缺少 CLI、版本不足或非 Linux 时对应用例跳过。
 
 真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
-一次性 canary 仓库执行；V1 的成功终点必须是 `ready_to_merge`，不得自动
-merge 或 deploy。
+一次性 canary 仓库执行。`auto_merge=false` 的成功终点必须是 `ready_to_merge`；
+`auto_merge=true` 会真实合并，只能在明确授权的 disposable canary 验证。两种模式都不得 deploy。
 
 ## Auto Capability policy、terminal admission 与 durable resume
 
@@ -1275,7 +1289,7 @@ cd frontend && npx vitest run \
 | `test_default_policy_is_real_sql_null` | 默认关闭持久化为 SQL `NULL`，不落 JSON `null` |
 | `test_project_worker_resolution_rejects_policy_before_task_write` | Project 解析出远端 Worker 后仍在任何 Task 副作用前 fail closed |
 | `test_clone_requires_explicit_policy_opt_in` | clone 不继承源 Task 的自动能力授权 |
-| `test_auto_capability_switch_is_independent_and_fail_closed` | `AUTO_CAPABILITY_ENABLED` 独立默认关闭，且 Capability Core 关闭时有效值仍为 false |
+| `test_auto_capability_switch_is_independent_and_fail_closed` | 三个 admission 开关默认开启；Capability Core 关闭时 Auto/Delivery 有效值仍为 false |
 | `test_agent_capability_admission.py` | 只接受当前 exact source/output/terminal 的严格 terminal action，并在 provider 提供时校验 native turn；原子消费总预算与分类预算，失败请求不退预算 |
 | `test_agent_capability_production_adapters.py` | Agent Plan/Review 请求进入真实 executor，原 Task 保持 `waiting_capability`，结果 identity 反向验证 |
 | `test_capability_result.py` | completed Execution、结果类型/id/hash 与 Plan/Review 权威聚合必须完整反向匹配 |
@@ -1288,9 +1302,9 @@ cd frontend && npx vitest run \
 | `test_public_mutation_rejects_agent_resume_invocation` | 人工 advisory consume/cancel 不能改写 Agent/Controller-owned resume 状态机 |
 | 前端 Chat/TaskForm/TaskList/taskStatus | policy 总预算与分类预算配置、`waiting_capability` 状态/等待提示和旧 turn 事件隔离 |
 
-两项开关仍默认关闭；开启后也只有创建时显式冻结了 `capability_policy` 的本地
-普通 Auto Task 可由模型请求 Plan/Review。Worker、Shared、Delivery、Plan、Loop、
-Goal 与迁移导入继续 fail closed。
+Capability Core 与 Auto Capability 的全局 admission 默认开启；仍只有创建时显式
+冻结了 `capability_policy` 的本地普通 Auto Task 可由模型请求 Plan/Review。
+Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail closed。
 
 ## 开发规范
 
@@ -1336,6 +1350,11 @@ Goal 与迁移导入继续 fail closed。
 | `backend/mcp/ccm_skills_server.py` | `backend/tests/test_mcp_server.py` |
 | `backend/models/monitor_session.py` | `backend/tests/test_monitor_models.py` |
 | `backend/services/mcp_config.py` | `backend/tests/test_mcp_config.py` |
+| `backend/services/browser_review.py` | `backend/tests/test_browser_review.py` |
+| `backend/services/browser_review_jobs.py` | `backend/tests/test_browser_review_jobs.py` |
+| `backend/services/test_harness.py` + `test_harness_contracts.py` + `test_harness_targets.py` + `backend/api/test_harness.py` | `backend/tests/test_test_harness.py` + `test_test_harness_contracts.py` + `test_test_harness_targets.py` + `test_api_test_harness.py` + migration tests |
+| `backend/api/browser_reviews.py` + `backend/mcp/ccm_browser_review_server.py` | `backend/tests/test_api_browser_reviews.py` + `backend/tests/test_mcp_config.py` + 真实浏览器冒烟 |
+| `backend/services/workspace_review.py` + `backend/services/workspace_review_intent.py` + `backend/api/workspace_reviews.py` + `backend/mcp/ccm_workspace_review_server.py` | `backend/tests/test_workspace_review.py` + `backend/tests/test_workspace_review_intent.py` + `backend/tests/test_api_workspace_reviews.py` + `frontend/src/components/Chat/{ChatView,BrowserReviewPanel}.test.tsx` |
 | `backend/api/monitor.py` | `backend/tests/test_api_monitor.py` |
 | `backend/api/settings.py` (runtime) | `backend/tests/test_api_settings_runtime.py`（含 context_compact_threshold 默认/更新/越界拒绝） |
 | `backend/services/dispatcher.py` (monitor) | `backend/tests/test_monitor_dispatcher.py` |
@@ -1345,6 +1364,7 @@ Goal 与迁移导入继续 fail closed。
 | `backend/api/pr_monitor.py` | curl 测试 CRUD + webhook |
 | `backend/services/pr_review_service.py` | 集成测试（webhook → task 创建） |
 | `frontend/src/pages/PRMonitorPage.tsx` | TypeScript 类型检查 + 手动 UI 测试 |
+| `frontend/src/pages/BrowserReviewPage.tsx` | `frontend/src/pages/BrowserReviewPage.test.tsx` + TypeScript build + 手动 UI 测试 |
 | `frontend/src/**` | TypeScript 类型检查 (`tsc --noEmit`) |
 | `frontend/src/components/Chat/TaskArtifactLink.tsx` | `frontend/src/components/Chat/ChatView.test.tsx` + `LoopChatView.test.tsx` |
 

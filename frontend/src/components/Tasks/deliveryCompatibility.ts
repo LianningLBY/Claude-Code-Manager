@@ -8,9 +8,14 @@ import type { MonitoredRepo, Project } from '../../api/client';
 export function isDeliveryCompatible(
   project: Project | null | undefined,
   repo: MonitoredRepo,
+  availableProviders: readonly string[],
 ): boolean {
+  const repoProvider = repo.provider?.trim().toLowerCase();
+  const providerEnabled = (repoProvider === 'claude' || repoProvider === 'codex')
+    && availableProviders.includes(repoProvider);
   return Boolean(
     project
+    && providerEnabled
     && project.worker_id == null
     && project.has_remote
     && project.local_path
@@ -18,7 +23,6 @@ export function isDeliveryCompatible(
     && repo.worker_id == null
     && repo.enabled
     && repo.status === 'active'
-    && repo.auto_merge === false
     && repo.merge_queue_mode === 'manual'
     && repo.review_mode === 'panel'
     && repo.wait_for_ci
@@ -30,6 +34,7 @@ export function isDeliveryCompatible(
 export function filterDeliveryRepos(
   project: Project | null | undefined,
   repos: MonitoredRepo[],
+  availableProviders: readonly string[],
 ): MonitoredRepo[] {
-  return repos.filter((repo) => isDeliveryCompatible(project, repo));
+  return repos.filter((repo) => isDeliveryCompatible(project, repo, availableProviders));
 }

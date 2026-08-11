@@ -78,6 +78,15 @@ _GOAL_RECONCILE_INTERVAL = 5.0
 # Native sub-agents are otherwise allowed to run for hours.  Reaching this
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
+# Codex 0.147 exposes no RPC that proves background plugin discovery settled;
+# calling ``plugin/list`` can itself schedule more background work. Isolated
+# preflight therefore never calls it. Two consecutive forced, canonical skill
+# snapshots capture the current inventory without triggering plugin refresh.
+# This is not a plugin-settled proof: safety still comes from disabling plugin
+# features plus the existing thread/ownership/turn fingerprint and revision
+# fences. Bound both reads and wall time so a moving inventory fails closed.
+_ISOLATED_SKILLS_SNAPSHOT_MAX_READS = 8
+_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT = 10.0
 
 
 def _format_process_exit(returncode: int | None) -> str:
@@ -1129,7 +1138,7 @@ def _tool_free_disabled_skill_config(
             continue
         seen.add(canonical)
         disabled.append({"path": canonical, "enabled": False})
-    return disabled
+    return sorted(disabled, key=lambda item: item["path"])
 
 
 def _canonical_app_server_service_tier(value: Any) -> str | None:
@@ -4405,26 +4414,70 @@ class CodexAppServer:
                 },
             )
 
-        async def reconcile_plugin_inventory() -> None:
-            """Wait for Codex 0.147's startup plugin cache reconciliation."""
+        async def read_stable_skills_snapshot(
+        ) -> tuple[list[dict[str, Any]], str, int] | None:
+            """Capture two matching current Codex 0.147 skill inventories."""
 
             runtime_version = self._runtime_version
             if runtime_version is None or runtime_version < (0, 147, 0):
-                return
-            response = await self._request(
-                "plugin/list",
-                {
-                    "cwds": [os.path.abspath(cwd)],
-                    "forceRefetch": False,
-                },
-            )
-            if not isinstance(response, dict):
-                raise ValueError("Codex plugin inventory is malformed")
-            load_errors = response.get("marketplaceLoadErrors")
-            if load_errors not in (None, []):
+                return None
+            reads = 0
+            try:
+                async with asyncio.timeout(
+                    _ISOLATED_SKILLS_SNAPSHOT_TIMEOUT
+                ):
+                    previous_fingerprint: str | None = None
+                    previous_revision: int | None = None
+                    while reads < _ISOLATED_SKILLS_SNAPSHOT_MAX_READS:
+                        reads += 1
+                        revision_before = self._skills_revision
+                        skills_inventory = await read_skills_inventory()
+                        revision_after = self._skills_revision
+                        disabled_skills = _tool_free_disabled_skill_config(
+                            skills_inventory,
+                            cwd=cwd,
+                        )
+                        fingerprint = _canonical_json_fingerprint(
+                            disabled_skills,
+                            label="Codex disabled skills inventory",
+                        )
+                        # Let notifications already queued behind the RPC
+                        # response run before accepting this read.
+                        await asyncio.sleep(0)
+                        revision_drained = self._skills_revision
+                        if (
+                            revision_before != revision_after
+                            or revision_after != revision_drained
+                        ):
+                            previous_fingerprint = None
+                            previous_revision = None
+                            logger.info(
+                                "Resetting Codex isolated skills snapshot "
+                                "after inventory refresh home=%s read=%s",
+                                self.codex_home,
+                                reads,
+                            )
+                            continue
+                        if (
+                            previous_fingerprint == fingerprint
+                            and previous_revision == revision_before
+                        ):
+                            return (
+                                disabled_skills,
+                                fingerprint,
+                                revision_drained,
+                            )
+                        previous_fingerprint = fingerprint
+                        previous_revision = revision_drained
+            except TimeoutError as exc:
                 raise ValueError(
-                    "Codex plugin inventory contains marketplace load errors"
-                )
+                    "Codex isolated skills inventory did not stabilize "
+                    f"within {_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT:g} seconds"
+                ) from exc
+            raise ValueError(
+                "Codex isolated skills inventory did not stabilize after "
+                f"{reads} forced skill reads"
+            )
 
         def require_no_ambient_instruction_config(
             effective_config: dict[str, Any],
@@ -4512,7 +4565,7 @@ class CodexAppServer:
 
         if restricted_tools or network_isolated or task_ssh_protected_paths:
             try:
-                await reconcile_plugin_inventory()
+                stable_skills = await read_stable_skills_snapshot()
                 effective_config = await read_effective_config()
                 require_no_ambient_instruction_config(effective_config)
                 isolated_ambient_effective_config = copy.deepcopy(
@@ -4557,19 +4610,30 @@ class CodexAppServer:
                     isolated_mcp.update(explicit_mcp_servers)
                 thread_config["mcp_servers"] = isolated_mcp
 
-                skills_inventory = await read_skills_inventory()
-                disabled_skills = _tool_free_disabled_skill_config(
-                    skills_inventory,
-                    cwd=cwd,
-                )
-                isolated_skills_inventory_fingerprint = (
-                    _canonical_json_fingerprint(
-                        disabled_skills,
-                        label="Codex disabled skills inventory",
+                if stable_skills is None:
+                    skills_inventory = await read_skills_inventory()
+                    disabled_skills = _tool_free_disabled_skill_config(
+                        skills_inventory,
+                        cwd=cwd,
                     )
-                )
+                    isolated_skills_inventory_fingerprint = (
+                        _canonical_json_fingerprint(
+                            disabled_skills,
+                            label="Codex disabled skills inventory",
+                        )
+                    )
+                    tool_free_skills_revision = self._skills_revision
+                else:
+                    (
+                        disabled_skills,
+                        isolated_skills_inventory_fingerprint,
+                        tool_free_skills_revision,
+                    ) = stable_skills
+                    if self._skills_revision != tool_free_skills_revision:
+                        raise ValueError(
+                            "Codex skills changed after stable reconciliation"
+                        )
                 thread_config["skills"]["config"] = disabled_skills
-                tool_free_skills_revision = self._skills_revision
             except Exception as exc:
                 if task_ssh_protected_paths:
                     message = (

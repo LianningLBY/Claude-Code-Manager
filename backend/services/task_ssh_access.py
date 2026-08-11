@@ -340,11 +340,13 @@ async def task_ssh_protected_paths(
         if not root.is_absolute():
             root = Path.cwd() / root
         # projects._apply_git_config writes the HTTPS token here and points
-        # the local credential.helper at it. Protect both the configured
-        # checkout and the exact runtime worktree/cwd candidate.
-        values.update(
-            _protected_path_variants(root / ".git" / "credentials")
-        )
+        # the local credential.helper at it. Protect an existing credential
+        # leaf, but do not ask a provider sandbox to mount a missing leaf
+        # beneath its already-denied .git parent: bubblewrap cannot create
+        # that mount target inside a read-only parent.
+        credential_path = root / ".git" / "credentials"
+        if credential_path.exists():
+            values.update(_protected_path_variants(credential_path))
 
     # Exact provider allowRead rules, not path omission, preserve the selected
     # ordinary Git credential beneath a denied parent. Removing only the exact

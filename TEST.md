@@ -29,6 +29,12 @@ cd frontend && npx tsc --noEmit
 
 测试使用内存 SQLite，不依赖真实数据库或外部服务。
 
+#### `test_task_ssh_sharing.py` — Task 凭据沙箱边界
+
+| 测试 | 验证内容 |
+|------|---------|
+| `test_protected_paths_cover_all_git_credential_sources` | 已存在的 repo `.git/credentials` 继续进入 deny 列表；不存在的叶子路径不生成 Bubblewrap 挂载，父 `.git` deny 保持不变 |
+
 #### `test_tmp_space_manager.py` — `/tmp` 压力保护
 
 测试在 pytest 隔离目录中注入容量/inode 读数；全局测试环境关闭真实宿主

@@ -205,6 +205,9 @@ async def test_protected_paths_cover_all_git_credential_sources(
     project_key = tmp_path / "project-key"
     project_root = tmp_path / "project"
     runtime_worktree = tmp_path / "runtime-worktree"
+    project_credentials = project_root / ".git" / "credentials"
+    project_credentials.parent.mkdir(parents=True)
+    project_credentials.write_text("https://example.invalid\n")
     monkeypatch.setattr(
         settings,
         "git_ssh_key_path",
@@ -278,7 +281,7 @@ async def test_protected_paths_cover_all_git_credential_sources(
     assert ordinary_protected == protected
     assert str(instance_key) in ordinary_protected
     assert str(project_key) in ordinary_protected
-    assert str(project_root / ".git" / "credentials") in ordinary_protected
+    assert str(project_credentials) in ordinary_protected
     assert str(configured_askpass) in ordinary_protected
     assert str(project_key) not in selected_protected
     assert str(instance_key) in selected_protected
@@ -286,8 +289,8 @@ async def test_protected_paths_cover_all_git_credential_sources(
     assert str(instance_key) in protected
     assert str(global_key) in protected
     assert str(project_key) in protected
-    assert str(project_root / ".git" / "credentials") in protected
-    assert str(runtime_worktree / ".git" / "credentials") in protected
+    assert str(project_credentials) in protected
+    assert str(runtime_worktree / ".git" / "credentials") not in protected
     assert str(
         Path(tempfile.gettempdir()) / "claude-manager-askpass"
     ) in protected

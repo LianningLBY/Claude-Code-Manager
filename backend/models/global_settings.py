@@ -24,6 +24,8 @@ class GlobalSettings(Base):
     # Context compaction threshold (0-1); None = follow env default
     # (settings.context_compact_threshold)
     context_compact_threshold: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Local Task/Plan launch capacity; None = follow MAX_CONCURRENT_INSTANCES.
+    max_concurrent_instances: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Org registry URL override (set via registry-changed callback, takes precedence over env)
     org_registry_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # Default skills/plugins selection for new tasks

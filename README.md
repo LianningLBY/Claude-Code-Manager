@@ -557,6 +557,7 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | | `POST /api/plan-runs/{run_id}/input-requests/{request_id}/answer` | 回答必要输入并恢复同一 Run |
 | | `POST /api/plan-versions/{id}/create-execution-task` | 从 standalone Version 创建执行 Task |
 | Instances | `GET/POST /api/instances` | 实例列表/创建 |
+| Settings | `GET/PUT /api/settings/capacity` | 查看或热更新 Manager 本地并发容量；`null` 恢复环境默认值 |
 | | `DELETE /api/instances/{id}` | 删除实例 |
 | | `POST /api/instances/{id}/stop` | 停止实例 |
 | | `POST /api/instances/{id}/run` | 手动执行 |
@@ -617,7 +618,7 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | `VERIFICATION_CODE_RESEND_COOLDOWN_SECONDS` | `60` | 同一邮箱两次发送的最短间隔（秒） |
 | `VERIFICATION_CODE_SMTP_CONCURRENCY` | `4` | 单进程同时进行的 SMTP 投递上限 |
 | `WORKSPACE_DIR` | `~/Projects` | 项目 clone 目标目录 |
-| `MAX_CONCURRENT_INSTANCES` | `5` | 最大并发 worker 数 |
+| `MAX_CONCURRENT_INSTANCES` | `8` | Manager 本地 Task/Plan 默认并发上限；管理员可在 Settings 热更新覆盖，无需重启 |
 | `AUTO_START_DISPATCHER` | `true` | 启动时自动开始调度 |
 | `CAPABILITY_CORE_ENABLED` | `true` | 允许新建人工/Controller Capability invocation；已接纳工作不受关闭影响 |
 | `AUTO_CAPABILITY_ENABLED` | `true` | 允许带显式 `capability_policy` 的本地普通 Auto Task 通过 exact terminal action 请求 Plan/Code Review，并由 durable outbox 恢复下一轮；同时要求 Capability Core |

@@ -1044,12 +1044,15 @@ async def _runtime_lifespan(app: FastAPI):
         logger.debug("Docker not available, container isolation disabled")
     # PTY 权限透传：bridge HTTP 线程需要往主循环调度协程
     instance_manager._loop = asyncio.get_running_loop()
-    # Apply persisted runtime-settings override (frontend PTY toggle)
+    # Apply persisted runtime-setting overrides before execution runtimes start.
     from backend.models.global_settings import GlobalSettings
     async with async_session() as db:
         row = await db.get(GlobalSettings, 1)
         if row is not None and row.use_pty_mode is not None:
             instance_manager.set_pty_mode(row.use_pty_mode)
+        dispatcher.configure_capacity_override(
+            row.max_concurrent_instances if row is not None else None
+        )
     await _reset_stale_discussion_agents()
     await _cleanup_stale_sub_agents()
     # Browser Agent Tasks are ordinary executable Tasks underneath, but their

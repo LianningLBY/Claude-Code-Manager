@@ -72,12 +72,11 @@ async def test_terminal_owner_evidence_consumes_capacity_everywhere(
         await db.commit()
 
     dispatcher = _dispatcher(db_factory)
+    dispatcher.configure_capacity_override(2)
     with (
-        patch("backend.api.instances.settings") as api_settings,
+        patch("backend.main.dispatcher._max_concurrent_instances_override", 2),
         patch("backend.services.dispatcher.settings") as dispatcher_settings,
     ):
-        api_settings.max_concurrent_instances = 2
-        dispatcher_settings.max_concurrent_instances = 2
         dispatcher_settings.min_idle_instances = 1
 
         response = await client.post(

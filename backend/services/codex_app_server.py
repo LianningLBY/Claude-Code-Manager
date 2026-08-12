@@ -48,7 +48,7 @@ _APP_SERVER_GROUP_POLL_INTERVAL = 0.05
 # make one protocol frame much larger than asyncio's 64 KiB default.  Keep a
 # bounded limit, but leave enough room for large MCP/command output frames so
 # the reader (and therefore live turn injection) is not torn down mid-turn.
-_APP_SERVER_STREAM_LIMIT = 64 * 1024 * 1024
+_APP_SERVER_STREAM_LIMIT = 256 * 1024 * 1024
 _CODEX_LOG_DB_MAX_BYTES = 1024 * 1024 * 1024
 _CODEX_LOG_DB_NAMES = (
     "logs_2.sqlite",

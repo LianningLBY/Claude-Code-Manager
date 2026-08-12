@@ -28,7 +28,10 @@ from backend.services.delivery_service import (
     create_delivery_run,
 )
 from backend.schemas.plan import default_plan_pipeline_config
-from backend.tests.test_auth_ws_security import _create_user
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
 
 
 def _payload(project: Project, repo: MonitoredRepo, **overrides: object) -> dict:

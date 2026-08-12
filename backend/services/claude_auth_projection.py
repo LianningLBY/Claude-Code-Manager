@@ -343,7 +343,14 @@ def inject_cloudrouter_claude_direct_auth(
         )
     for key in _DIRECT_SECRET_AUTH_ENV_KEYS:
         environment.pop(key, None)
-    environment["ANTHROPIC_API_KEY"] = api_key
+    # Claude Code's interactive/PTY path only accepts ANTHROPIC_API_KEY after
+    # its suffix has been recorded in ``customApiKeyResponses.approved``.
+    # Headless ``-p`` skips that consent gate, which made unit/smoke probes pass
+    # while real CCM chat turns failed locally with "Not logged in" whenever a
+    # prior hidden prompt had recorded the managed key as rejected.  Managed
+    # gateway credentials are bearer tokens, so use the explicit token route;
+    # it is non-interactive and does not depend on mutable CLI consent state.
+    environment["ANTHROPIC_AUTH_TOKEN"] = api_key
     environment["ANTHROPIC_BASE_URL"] = base_url
     return True
 

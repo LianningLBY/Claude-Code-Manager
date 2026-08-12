@@ -4027,9 +4027,9 @@ async def test_cloudrouter_claude_launch_replaces_inherited_auth_env(
         )
 
     child_env = mock_exec.call_args.kwargs["env"]
-    assert "ANTHROPIC_AUTH_TOKEN" not in child_env
+    assert child_env["ANTHROPIC_AUTH_TOKEN"] == "projected-api-key"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in child_env
-    assert child_env["ANTHROPIC_API_KEY"] == "projected-api-key"
+    assert "ANTHROPIC_API_KEY" not in child_env
     assert child_env["ANTHROPIC_BASE_URL"] == (
         "https://console.cloudrouter.online"
     )
@@ -4102,9 +4102,9 @@ async def test_cloudrouter_claude_pty_projects_direct_auth_for_model_only(
     # PTY config is now rebuilt from the same strict Task-process allowlist as
     # direct launches; arbitrary backend overrides do not cross the boundary.
     assert observed["env"]["SAFE_VALUE"] == ""
-    assert "ANTHROPIC_AUTH_TOKEN" not in observed["env"]
+    assert observed["env"]["ANTHROPIC_AUTH_TOKEN"] == "projected-api-key"
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in observed["env"]
-    assert observed["env"]["ANTHROPIC_API_KEY"] == "projected-api-key"
+    assert "ANTHROPIC_API_KEY" not in observed["env"]
     assert observed["env"]["ANTHROPIC_BASE_URL"] == (
         "https://console.cloudrouter.online"
     )

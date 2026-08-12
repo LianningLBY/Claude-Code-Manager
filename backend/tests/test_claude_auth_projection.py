@@ -155,10 +155,10 @@ def test_cloudrouter_projection_keeps_key_out_of_disk_and_argv():
         store,
         "/managed/account/claude",
     ) is True
-    assert env["ANTHROPIC_API_KEY"] == "managed-api-key"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "managed-api-key"
     assert env["ANTHROPIC_BASE_URL"].startswith("https://")
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
-    assert "ANTHROPIC_AUTH_TOKEN" not in env
+    assert "ANTHROPIC_API_KEY" not in env
 
 
 def test_reused_projection_rejects_ambient_memory(monkeypatch, tmp_path):

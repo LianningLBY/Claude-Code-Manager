@@ -1080,3 +1080,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **阶段一：角色运行边界**：每个聊天回合把实际发起账号、角色和 `sandbox/unrestricted` 模式写入 source log 与 durable queue；后台启动前复验账号仍 active 且角色未变化。管理员/超级管理员普通回合不套 Task provider 沙箱，Member 及无可信用户主体的内部回合继续 fail closed；Manager→Worker handoff 同步冻结原始 principal，重试不借 system 身份提权。
 - **阶段二：Task 300/315 故障链**：Codex Member 隔离只准入经 inventory 验证的内置 `codex` code-mode MCP，继续拒绝 ambient MCP；Claude canary 兼容 2.1.168 在缺失 bwrap 时的新零模型错误协议；聊天附件启动前复验为 uploads 根下的非 symlink 普通文件，并只投影 exact 文件读取权限。管理员回合仍保留 task-scoped `ccm_ssh`，Task SSH Profile/grant 的管理员配置边界不变。
 - **验证**：Chat/Worker principal 链路 `385 passed`；隔离与运行服务矩阵首次执行到 `1141 passed, 3 skipped` 后仅遇到测试并发覆盖固定 settings 文件，隔离文件单独复跑 `41 passed`；新增相关定向测试全部通过。Python `compileall`、TypeScript `tsc --noEmit`、`git diff --check` 通过。后端全量被 main 同样可复现的既有 SQLite migration downgrade trigger 错误阻断（`trg_task_ssh_effect_project_share_insert` 在 batch rename 时引用暂时不存在的 `tasks`），未混入无关 migration 修复。尚未重启生产服务；Task 300/315 的旧 turn 必须在重启后由用户明确重发，避免自动重复副作用。
+## 2026-08-12 — 沙盒 Task 的 CloudRouter Claude API 认证投影
+
+- **问题**：生产 task 320 正确选中 `cloudrouter-3` 且 Key 存在，但 Task wrapper 使用 `--setting-sources ""` 后不会读取账号 `settings.json` 的 `apiKeyHelper`；旧 CloudRouter wrapper 又清除了主进程认证变量，Claude 因此返回 `Not logged in · Please run /login`。该普通 assistant error 还因 CLI exit 0 被误标为 Task completed。
+- **解决**：在 direct 与 PTY 两条启动路径都先清除 ambient auth，再用所选受管账号向 Claude 主进程投影 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`；继续保留 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`，使 Bash/hooks/MCP 子进程拿不到 Key。删除互相冲突的旧 wrapper，并把普通登录错误纳入 fatal provider error 判定。
+- **避免复发**：隔离测试必须同时证明“模型主进程拥有所选账号认证”和“工具子进程清洗开关存在”，不能把两层权限混为同一环境；`--setting-sources ""` 路径不得依赖账号 settings 中的 helper。
+- **提交**：`67e7c6e`

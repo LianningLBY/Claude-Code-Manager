@@ -41,6 +41,15 @@ from backend.services.task_ssh_access import (
     _protected_path_variants,
     manager_secret_protected_paths,
 )
+from backend.services.mcp_config import (
+    CCM_BROWSER_REVIEW_TOOLS,
+    CCM_FRONTEND_REVIEW_TOOLS,
+    CCM_MONITOR_AGENT_TOOLS,
+    CCM_SKILLS_TOOLS,
+    CCM_SSH_TOOLS,
+    CCM_SUB_AGENT_TOOLS,
+    CCM_WORKSPACE_REVIEW_TOOLS,
+)
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -815,6 +824,38 @@ def test_claude_task_isolation_denies_credentials_and_direct_ssh_network(
     )
     assert all("AUTH_TOKEN" not in command for command in commands)
     assert all("--auth-token" not in command for command in commands)
+
+
+def test_claude_task_isolation_allows_every_injected_task_mcp_tool(
+    tmp_path,
+    monkeypatch,
+):
+    """Scrub forces default mode, so injected MCP tools need exact rules."""
+
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    path = generate_claude_task_isolation_settings(32, [])
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    allowed = set(payload["permissions"]["allow"])
+
+    expected_servers = {
+        "ccm_skills": CCM_SKILLS_TOOLS,
+        "ccm_ssh": CCM_SSH_TOOLS,
+        "ccm_frontend_review": CCM_FRONTEND_REVIEW_TOOLS,
+        "ccm_workspace_review": CCM_WORKSPACE_REVIEW_TOOLS,
+        "ccm_browser_review": CCM_BROWSER_REVIEW_TOOLS,
+        "ccm_monitor_agent": CCM_MONITOR_AGENT_TOOLS,
+        "ccm_sub_agent": CCM_SUB_AGENT_TOOLS,
+    }
+    expected_mcp = {
+        f"mcp__{server}__{tool}"
+        for server, tools in expected_servers.items()
+        for tool in tools
+    }
+    assert allowed == set(CLAUDE_TASK_BUILTIN_TOOLS) | expected_mcp
 
 
 def test_claude_task_isolation_keeps_general_network_without_ssh_grant(

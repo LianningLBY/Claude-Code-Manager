@@ -5498,7 +5498,7 @@ async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
         call.args[1]["forceReload"]
         for call in server._request.await_args_list
         if call.args[0] == "skills/list"
-    ] == [True, True, True, False, False, False]
+    ] == [True, False, False, False, False, False]
     assert all(
         call.args[0] != "plugin/list"
         for call in server._request.await_args_list
@@ -5539,6 +5539,64 @@ async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
         },
     })
     assert await second_process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_0147_waits_out_delayed_forced_skills_notification():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 147, 0)
+    server.ensure_started = AsyncMock()
+    forced_reads = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal forced_reads
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            if params["forceReload"]:
+                forced_reads += 1
+                asyncio.get_running_loop().call_later(
+                    0.01,
+                    server._handle_notification,
+                    "skills/changed",
+                    {},
+                )
+            return _empty_skills_response("/tmp")
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                "thread-delayed-skills",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-delayed-skills"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with patch(
+        "backend.services.codex_app_server._ISOLATED_SKILLS_QUIET_PERIOD",
+        0.02,
+    ):
+        process, thread_id = await server.start_turn(
+            prompt="remain tool-free after the delayed reload event",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=910,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+        )
+
+    assert forced_reads == 1
+    assert thread_id == "thread-delayed-skills"
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-delayed-skills", "status": "completed"},
+    })
+    assert await process.wait() == 0
 
 
 @pytest.mark.asyncio

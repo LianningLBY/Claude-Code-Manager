@@ -233,6 +233,12 @@ def _agent_doc_name(provider: str | None) -> str:
     return "AGENTS.md" if (provider or "claude").lower() == "codex" else "CLAUDE.md"
 
 
+def _should_ensure_agent_docs(task: Task, *, neutral_review_cwd: bool) -> bool:
+    """Whether CCM may mutate the selected workspace with an instruction link."""
+
+    return not neutral_review_cwd and task.mode != "delivery_loop"
+
+
 # CLAUDE.md/AGENTS.md 同步纪律：靠 agent 编码时自觉执行、不做程序化同步。
 # 经 prompt 前导下发是唯一覆盖所有被开发项目的注入点（老项目的文档里没有这条规则）。
 _DOC_SYNC_NOTE = (
@@ -10840,7 +10846,10 @@ class GlobalDispatcher:
             # 存量项目统一补 AGENTS.md（Codex 指令文件）：有 CLAUDE.md 而无
             # AGENTS.md 时注入 symlink，任何项目下次跑任务时自动补齐。
             # 不 commit（由 agent 的正常 git 流程带入），幂等且绝不阻断任务。
-            if not neutral_review_cwd:
+            if _should_ensure_agent_docs(
+                task,
+                neutral_review_cwd=neutral_review_cwd,
+            ):
                 from backend.services.agent_docs import ensure_agents_md
 
                 ensure_agents_md(task.target_repo or cwd)

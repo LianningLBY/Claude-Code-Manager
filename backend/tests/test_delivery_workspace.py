@@ -313,6 +313,78 @@ async def test_controller_commit_is_exact_and_crash_recoverable(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_controller_commit_removes_only_empty_untracked_isolation_placeholders(
+    tmp_path,
+):
+    repo, _remote = _repository(tmp_path)
+    manager = DeliveryWorkspaceManager(allow_local_remotes=True)
+    initial = await manager.prepare(
+        repo_path=str(repo),
+        run_id=251,
+        branch="ccm/delivery/251-placeholders",
+        base_branch="main",
+    )
+    workspace = Path(initial.worktree_path)
+    for name in (".env", "package.json", "pnpm-lock.yaml", ".gitmodules"):
+        (workspace / name).touch()
+    (workspace / ".npmrc").write_text("registry=https://example.test\n")
+    (workspace / "feature.txt").write_text("intended\n")
+
+    committed = await manager.commit_changes(
+        repo_path=str(repo),
+        worktree_path=str(workspace),
+        branch=initial.branch,
+        base_branch="main",
+        expected_head_sha=initial.head_sha,
+        run_id=251,
+        turn_generation=1,
+        title="Keep intended output",
+    )
+
+    assert committed.head_sha != initial.head_sha
+    assert _git(workspace, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines() == [
+        ".npmrc",
+        "feature.txt",
+    ]
+    assert (workspace / ".npmrc").read_text() == "registry=https://example.test\n"
+
+
+@pytest.mark.asyncio
+async def test_controller_commit_preserves_tracked_empty_placeholder_name(tmp_path):
+    repo, _remote = _repository(tmp_path)
+    (repo / ".env").touch()
+    _git(repo, "add", ".env")
+    _git(repo, "config", "user.name", "Delivery Test")
+    _git(repo, "config", "user.email", "delivery@example.test")
+    _git(repo, "commit", "-m", "track empty env")
+    _git(repo, "push", "origin", "main")
+    manager = DeliveryWorkspaceManager(allow_local_remotes=True)
+    initial = await manager.prepare(
+        repo_path=str(repo),
+        run_id=252,
+        branch="ccm/delivery/252-tracked-placeholder",
+        base_branch="main",
+    )
+    workspace = Path(initial.worktree_path)
+    (workspace / "feature.txt").write_text("intended\n")
+
+    committed = await manager.commit_changes(
+        repo_path=str(repo),
+        worktree_path=str(workspace),
+        branch=initial.branch,
+        base_branch="main",
+        expected_head_sha=initial.head_sha,
+        run_id=252,
+        turn_generation=1,
+        title="Preserve tracked config",
+    )
+
+    assert committed.head_sha != initial.head_sha
+    assert (workspace / ".env").is_file()
+    assert _git(workspace, "ls-files", ".env") == ".env"
+
+
+@pytest.mark.asyncio
 async def test_controller_commit_returns_same_head_for_no_change_turn(tmp_path):
     repo, _remote = _repository(tmp_path)
     manager = DeliveryWorkspaceManager(allow_local_remotes=True)

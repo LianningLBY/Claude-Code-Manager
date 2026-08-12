@@ -231,6 +231,7 @@ _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
 # fences. Bound both reads and wall time so a moving inventory fails closed.
 _ISOLATED_SKILLS_SNAPSHOT_MAX_READS = 8
 _ISOLATED_SKILLS_SNAPSHOT_TIMEOUT = 10.0
+_ISOLATED_SKILLS_QUIET_PERIOD = 0.25
 
 
 def _format_process_exit(returncode: int | None) -> str:
@@ -4933,7 +4934,7 @@ class CodexAppServer:
 
         async def read_stable_skills_snapshot(
         ) -> tuple[list[dict[str, Any]], str, int] | None:
-            """Capture two matching current Codex 0.147 skill inventories."""
+            """Capture a quiet, matching current Codex 0.147 inventory."""
 
             runtime_version = self._runtime_version
             if runtime_version is None or runtime_version < (0, 147, 0):
@@ -4948,8 +4949,11 @@ class CodexAppServer:
                     while reads < _ISOLATED_SKILLS_SNAPSHOT_MAX_READS:
                         reads += 1
                         revision_before = self._skills_revision
+                        # One forced read refreshes the process-global cache.
+                        # Subsequent reads inspect that cache without creating
+                        # another delayed ``skills/changed`` notification.
                         skills_inventory = await read_skills_inventory(
-                            force_reload=True,
+                            force_reload=reads == 1,
                         )
                         revision_after = self._skills_revision
                         disabled_skills = _tool_free_disabled_skill_config(
@@ -4981,6 +4985,18 @@ class CodexAppServer:
                             previous_fingerprint == fingerprint
                             and previous_revision == revision_before
                         ):
+                            # Codex 0.147 may publish the forced reload's
+                            # notification after its RPC response. Keep the
+                            # admission private until a real quiet window has
+                            # elapsed, then reject/retry if the monotonic
+                            # revision moved. This prevents a self-induced
+                            # event from interrupting the model turn while
+                            # preserving fail-closed external drift handling.
+                            await asyncio.sleep(_ISOLATED_SKILLS_QUIET_PERIOD)
+                            if self._skills_revision != revision_drained:
+                                previous_fingerprint = None
+                                previous_revision = None
+                                continue
                             return (
                                 disabled_skills,
                                 fingerprint,

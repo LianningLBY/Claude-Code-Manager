@@ -78,6 +78,30 @@ CLAUDE_READ_ONLY_BUILTIN_TOOLS = (
     "Read",
 )
 
+# Bubblewrap/Codex may create empty mount targets for denied workspace-local
+# configuration paths. These exact names are runtime scaffolding only when
+# they remain untracked, zero-byte regular files; the Delivery Controller uses
+# this closed inventory before staging a reviewed Developer tree.
+DELIVERY_ISOLATION_PLACEHOLDER_NAMES = frozenset({
+    ".env",
+    ".env.development",
+    ".env.development.local",
+    ".env.local",
+    ".env.production",
+    ".env.production.local",
+    ".env.test",
+    ".env.test.local",
+    ".gitmodules",
+    ".npmrc",
+    ".yarnrc",
+    ".yarnrc.yml",
+    "bunfig.toml",
+    "package-lock.json",
+    "package.json",
+    "pnpm-lock.yaml",
+    "yarn.lock",
+})
+
 
 class TaskAgentIsolationError(RuntimeError):
     """The provider could not prove the required Task isolation boundary."""

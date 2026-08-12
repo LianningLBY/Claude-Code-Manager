@@ -5494,6 +5494,11 @@ async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
     assert [
         call.args[0] for call in server._request.await_args_list[:3]
     ] == ["skills/list", "skills/list", "skills/list"]
+    assert [
+        call.args[1]["forceReload"]
+        for call in server._request.await_args_list
+        if call.args[0] == "skills/list"
+    ] == [True, True, True, False, False, False]
     assert all(
         call.args[0] != "plugin/list"
         for call in server._request.await_args_list

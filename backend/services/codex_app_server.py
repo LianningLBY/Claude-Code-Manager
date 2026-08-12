@@ -4922,12 +4922,12 @@ class CodexAppServer:
                 "config": await read_effective_config(),
             })
 
-        async def read_skills_inventory() -> Any:
+        async def read_skills_inventory(*, force_reload: bool) -> Any:
             return await self._request(
                 "skills/list",
                 {
                     "cwds": [os.path.abspath(cwd)],
-                    "forceReload": True,
+                    "forceReload": force_reload,
                 },
             )
 
@@ -4948,7 +4948,9 @@ class CodexAppServer:
                     while reads < _ISOLATED_SKILLS_SNAPSHOT_MAX_READS:
                         reads += 1
                         revision_before = self._skills_revision
-                        skills_inventory = await read_skills_inventory()
+                        skills_inventory = await read_skills_inventory(
+                            force_reload=True,
+                        )
                         revision_after = self._skills_revision
                         disabled_skills = _tool_free_disabled_skill_config(
                             skills_inventory,
@@ -5031,7 +5033,16 @@ class CodexAppServer:
                     effective_config,
                     label="effective Codex configuration",
                 )
-                current_skills = await read_skills_inventory()
+                # The forced reads above established a stable current
+                # inventory. Re-audits must not force another process-global
+                # reload: Codex 0.147 can publish that reload's own delayed
+                # ``skills/changed`` notification after durable launch
+                # ownership is committed. A normal read plus the monotonic
+                # revision fence still detects real external drift without
+                # manufacturing a TOCTOU violation itself.
+                current_skills = await read_skills_inventory(
+                    force_reload=False,
+                )
                 current_disabled_skills = _tool_free_disabled_skill_config(
                     current_skills,
                     cwd=cwd,
@@ -5221,7 +5232,9 @@ class CodexAppServer:
                 thread_config["mcp_servers"] = isolated_mcp
 
                 if stable_skills is None:
-                    skills_inventory = await read_skills_inventory()
+                    skills_inventory = await read_skills_inventory(
+                        force_reload=True,
+                    )
                     disabled_skills = _tool_free_disabled_skill_config(
                         skills_inventory,
                         cwd=cwd,

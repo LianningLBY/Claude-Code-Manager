@@ -136,7 +136,7 @@ def test_claude_plan_command_is_read_only():
     )
 
     assert command[0] == settings.claude_binary
-    assert command[command.index("--permission-mode") + 1] == "plan"
+    assert command[command.index("--permission-mode") + 1] == "default"
     assert "--no-session-persistence" in command
     assert "--safe-mode" in command
     assert command[command.index("--tools") + 1] == "Glob,Grep,Read"

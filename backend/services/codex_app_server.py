@@ -4507,10 +4507,10 @@ class CodexAppServer:
         isolated_dynamic_disabled_features: frozenset[str] = frozenset()
 
         async def retry_isolated_admission_after_skills_drift(
-            thread_id: str,
+            thread_id: str | None,
             error: _CodexIsolatedSkillsDriftError,
         ) -> tuple[CodexTurnProcess, str]:
-            """Delete one empty thread and rebuild its exact skill deny-list."""
+            """Rebuild the exact skill deny-list, deleting an empty thread."""
 
             if resume_session_id:
                 # A resumed id owns durable history and must never be deleted
@@ -4524,28 +4524,29 @@ class CodexAppServer:
                 thread_id,
                 _isolated_admission_retry_count,
             )
-            delete_request = asyncio.create_task(self._request(
-                "thread/delete",
-                {"threadId": thread_id},
-                expected_process=isolated_process,
-            ))
             cancelled = False
-            while not delete_request.done():
+            if thread_id is not None:
+                delete_request = asyncio.create_task(self._request(
+                    "thread/delete",
+                    {"threadId": thread_id},
+                    expected_process=isolated_process,
+                ))
+                while not delete_request.done():
+                    try:
+                        await asyncio.shield(delete_request)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        continue
                 try:
-                    await asyncio.shield(delete_request)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    continue
-            try:
-                delete_request.result()
-            except Exception as cleanup_error:
-                raise CodexRequiredMcpPreTurnError(
-                    "Codex could not release an empty isolated thread after "
-                    "its skills inventory changed"
-                ) from cleanup_error
-            finally:
-                self._known_threads.discard(thread_id)
-                self._contexts_by_thread.pop(thread_id, None)
+                    delete_request.result()
+                except Exception as cleanup_error:
+                    raise CodexRequiredMcpPreTurnError(
+                        "Codex could not release an empty isolated thread after "
+                        "its skills inventory changed"
+                    ) from cleanup_error
+                finally:
+                    self._known_threads.discard(thread_id)
+                    self._contexts_by_thread.pop(thread_id, None)
 
             if cancelled:
                 raise asyncio.CancelledError
@@ -5486,7 +5487,19 @@ class CodexAppServer:
             })
         audit_isolated_thread_config()
         require_stable_task_filesystem_boundary("before thread admission")
-        await require_stable_isolated_ambient_state("before thread admission")
+        try:
+            await require_stable_isolated_ambient_state(
+                "before thread admission"
+            )
+        except _CodexIsolatedSkillsDriftError as exc:
+            # Codex 0.147 can publish one final skills/changed notification
+            # after the stable forced snapshot but before thread/start.  No
+            # native thread or model input exists yet, so rebuild the exact
+            # deny-list once. Persistent drift remains a hard failure.
+            return await retry_isolated_admission_after_skills_drift(
+                None,
+                exc,
+            )
         require_isolated_runtime_generation("before thread admission")
         require_managed_network_generation("before thread admission")
         try:

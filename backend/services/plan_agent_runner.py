@@ -994,7 +994,12 @@ def _build_command(
         "--output-format",
         "json",
         "--permission-mode",
-        "plan",
+        # Claude 2.1.168 forces subprocesses hardened with
+        # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB into effective default mode.  Keep
+        # the CLI selector aligned with that fail-closed behavior; the exact
+        # read-only surface remains constrained below and by the generated
+        # isolation settings.
+        "default",
         "--no-session-persistence",
         "--safe-mode",
         "--disable-slash-commands",

@@ -1999,6 +1999,76 @@ async def test_task_isolation_retries_cold_start_skills_drift_before_model_input
 
 
 @pytest.mark.asyncio
+async def test_tool_free_isolation_retries_skills_drift_before_thread_admission():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 147, 0)
+    server.ensure_started = AsyncMock()
+    skill_calls = 0
+    thread_calls = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal skill_calls, thread_calls
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            skill_calls += 1
+            response = _empty_skills_response("/tmp")
+            if skill_calls >= 3:
+                response["data"][0]["skills"] = [{
+                    "path": "/opt/late-plan-skill/SKILL.md",
+                    "enabled": True,
+                }]
+            return response
+        if method == "thread/start":
+            thread_calls += 1
+            return _tool_free_thread_response(
+                "thread-pre-admission-skills-retry",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-pre-admission-skills-retry"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    process, thread_id = await server.start_turn(
+        prompt="start only after the pre-admission skills race settles",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=99531,
+        sandbox_mode="read-only",
+        disable_autonomous_features=True,
+        tools_disabled=True,
+    )
+
+    assert thread_id == "thread-pre-admission-skills-retry"
+    assert thread_calls == 1
+    assert not any(
+        call.args[0] == "thread/delete"
+        for call in server._request.await_args_list
+    )
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    assert thread_call.args[1]["config"]["skills"]["config"] == [{
+        "path": "/opt/late-plan-skill/SKILL.md",
+        "enabled": False,
+    }]
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": "turn-pre-admission-skills-retry",
+            "status": "completed",
+        },
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
 async def test_task_isolation_bounds_persistent_skills_drift_and_cleans_threads(
     isolated_task_boundary,
 ):

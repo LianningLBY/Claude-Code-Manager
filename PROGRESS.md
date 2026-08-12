@@ -1086,3 +1086,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：在 direct 与 PTY 两条启动路径都先清除 ambient auth，再用所选受管账号向 Claude 主进程投影 `ANTHROPIC_API_KEY`/`ANTHROPIC_BASE_URL`；继续保留 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1`，使 Bash/hooks/MCP 子进程拿不到 Key。删除互相冲突的旧 wrapper，并把普通登录错误纳入 fatal provider error 判定。
 - **避免复发**：隔离测试必须同时证明“模型主进程拥有所选账号认证”和“工具子进程清洗开关存在”，不能把两层权限混为同一环境；`--setting-sources ""` 路径不得依赖账号 settings 中的 helper。
 - **提交**：`67e7c6e`
+## 2026-08-12 — Codex 超大日志库阻塞 app-server 初始化
+
+- **问题**：生产 task 321 正确选中 `apex-1` 和 Fast/priority route，但该 home 的 `logs_2.sqlite` 膨胀到约 3.8 GiB；同版本 Codex 使用干净 home 可立即 initialize，实际 home 超过 30 秒仍无响应，CCM 因无法取得 exact runtime/Fast proof 而 fail closed。
+- **解决**：app-server 在独占启动边界检查 1 GiB 阈值，只将同 owner、单硬链接的 `logs_2.sqlite{,-wal,-shm}` 原子移入私有 quarantine；新 app-server initialize/version proof 成功后才删除旧库。启动失败保留证据，下一次成功启动会收敛合法的 crash 遗留 quarantine，config/auth/sessions/rollout/state 不进入清理范围。
+- **避免复发**：Codex home 的 diagnostics DB 与 session/rollout 必须分层维护；不能靠放宽 Fast proof 或无限增加初始化超时掩盖本地状态膨胀。任何自动回收都必须精确文件 allowlist、先完整 lstat 校验再移动、成功启动后才清除。
+- **提交**：`2c7e007`

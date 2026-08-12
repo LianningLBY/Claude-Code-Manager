@@ -3581,6 +3581,7 @@ async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
             return _network_isolated_thread_response(
                 workspace,
                 permission_profile=params["config"]["default_permissions"],
+                writable_roots=[workspace, str(boundary.scratch.path)],
             )
         if method == "turn/start":
             return {"turn": {"id": "turn-delivery-isolated"}}

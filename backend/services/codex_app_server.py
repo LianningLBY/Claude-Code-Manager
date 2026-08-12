@@ -1443,6 +1443,7 @@ def _audit_network_isolated_thread_response(
     response: Any,
     *,
     cwd: str,
+    private_tmpdir: str,
     permission_profile_id: str,
 ) -> None:
     """Prove the Delivery thread kept its exact local sandbox boundary."""
@@ -1478,10 +1479,13 @@ def _audit_network_isolated_thread_response(
     if not isinstance(writable_roots, list):
         raise ValueError("Delivery writable roots were not reported")
     workspace = _canonical_path(cwd)
+    scratch = _canonical_path(private_tmpdir)
     for value in writable_roots:
         if not isinstance(value, str):
             raise ValueError("Delivery writable root is malformed")
         candidate = _canonical_path(value)
+        if candidate == scratch:
+            continue
         try:
             candidate.relative_to(workspace)
         except ValueError as exc:
@@ -5635,6 +5639,7 @@ class CodexAppServer:
                 _audit_network_isolated_thread_response(
                     response,
                     cwd=cwd,
+                    private_tmpdir=str(task_private_tmpdir.path),
                     permission_profile_id=str(network_permission_profile),
                 )
             except (TypeError, ValueError) as exc:

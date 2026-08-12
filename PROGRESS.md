@@ -1103,3 +1103,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：Task 321 在 thread 准入兼容后仍被 actual-tier proxy 拒绝；精确证据显示 Codex 0.147 虽收到 `thread/start.serviceTier=priority`，实际发往 custom provider 的 Responses JSON 却缺失或重置为 `service_tier=default`。
 - **解决**：仅对代理中已由 CCM 精确登记为 priority 的 root/child lineage，将缺失/default 的出站字段重写为当前请求拼写 `fast`（`priority` 保留为兼容别名）；Standard lineage 不升级，显式冲突/未知值仍在任何上游请求前拒绝。代理继续缓存首个 SSE，只有 GPT-5.6 上游 `response.created.response.service_tier=priority` 才发布并生成 actual-tier proof，因此不是放宽校验。
 - **验证**：代理与 app-server 完整测试 `328 passed, 3 skipped`；覆盖缺失/default 两种兼容输入、Standard 防升级、未知 tier 拒绝和上游 proof。
+
+### 2026-08-12 — Task 315 Claude PTY 隐藏权限框修复（commit 905f9b1）
+
+- **根因**：Claude Code 2.1.168 在 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` 下会把有效 permission mode 强制为 `default`；普通 Task 又默认注入 `ccm_frontend_review` / `ccm_workspace_review`，但 Task 隔离 allowlist 未包含这些工具，CloudRouter PTY 因此停在无法经 channel bridge 展示的原生 permission prompt。
+- **修复与边界**：保留凭据隔离所需的 scrub，在 `task_agent_isolation._mcp_allow_rules()` 补齐 frontend/workspace/browser review 的 CCM-owned 精确工具清单；`--strict-mcp-config` 仍只暴露本轮私有 MCP。新增精确集合回归，要求内置工具与七类可能注入的 CCM MCP 权限既不缺失也不扩张。
+- **验证**：隔离策略完整文件与 PTY scrub 启动边界共 `43 passed`；Python 编译与 `git diff --check` 通过。未调用真实模型、未运行无关全量测试、未修改或重启生产环境；已有卡住的旧 turn 不会被代码提交自动恢复，部署后需显式重发。

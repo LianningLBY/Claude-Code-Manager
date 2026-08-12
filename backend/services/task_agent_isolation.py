@@ -17,10 +17,13 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from backend.services.mcp_config import (
+    CCM_BROWSER_REVIEW_TOOLS,
+    CCM_FRONTEND_REVIEW_TOOLS,
     CCM_MONITOR_AGENT_TOOLS,
     CCM_SKILLS_TOOLS,
     CCM_SSH_TOOLS,
     CCM_SUB_AGENT_TOOLS,
+    CCM_WORKSPACE_REVIEW_TOOLS,
 )
 from backend.services.task_runtime_secrets import (
     runtime_secret_root,
@@ -1222,11 +1225,19 @@ def _permission_path(path: str) -> str:
 
 
 def _mcp_allow_rules() -> list[str]:
+    # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB makes Claude 2.1.168 enforce its
+    # explicit allow rules in effective ``default`` mode. Keep the complete
+    # CCM-owned inventory here: ``--strict-mcp-config`` still exposes only the
+    # private per-turn servers, while an omitted rule would open an invisible
+    # interactive permission prompt in headless/PTTY execution.
     servers = {
         "ccm_skills": CCM_SKILLS_TOOLS,
         "ccm_ssh": CCM_SSH_TOOLS,
         "ccm_monitor_agent": CCM_MONITOR_AGENT_TOOLS,
         "ccm_sub_agent": CCM_SUB_AGENT_TOOLS,
+        "ccm_frontend_review": CCM_FRONTEND_REVIEW_TOOLS,
+        "ccm_workspace_review": CCM_WORKSPACE_REVIEW_TOOLS,
+        "ccm_browser_review": CCM_BROWSER_REVIEW_TOOLS,
     }
     return [
         f"mcp__{server}__{tool}"

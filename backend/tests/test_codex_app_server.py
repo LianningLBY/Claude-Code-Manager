@@ -11386,6 +11386,143 @@ def reset_registry_fake_servers():
     _RegistryFakeServer.instances = []
 
 
+class _BlockingRestrictedTurnServer(_RegistryFakeServer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.start_calls = 0
+        self.processes = []
+
+    async def start_turn(self, **kwargs):
+        self.start_calls += 1
+
+        async def interrupt():
+            return None
+
+        process = CodexTurnProcess(100 + self.start_calls, interrupt)
+        thread_id = kwargs.get("resume_session_id") or f"thread-{kwargs['task_id']}"
+        process.thread_id = thread_id
+        self.processes.append(process)
+        self.active_threads.add(thread_id)
+        self.known_threads.add(thread_id)
+        return process, thread_id
+
+
+@pytest.mark.asyncio
+async def test_registry_serializes_tool_restricted_turns_per_home(tmp_path):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "shared-home")
+    server = _BlockingRestrictedTurnServer("codex", codex_home=home)
+    registry._servers[home] = server
+
+    first_process, _ = await registry.start_turn(
+        codex_home=home,
+        task_id=1,
+        tools_disabled=True,
+    )
+    second = asyncio.create_task(registry.start_turn(
+        codex_home=home,
+        task_id=2,
+        tools_disabled=True,
+    ))
+    await asyncio.sleep(0)
+
+    assert server.start_calls == 1
+    assert not second.done()
+
+    first_process.finish(0)
+    second_process, _ = await asyncio.wait_for(second, timeout=1)
+    assert server.start_calls == 2
+    second_process.finish(0)
+
+
+@pytest.mark.asyncio
+async def test_registry_cancelled_tool_restricted_waiter_does_not_hold_lock(tmp_path):
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "cancel-home")
+    server = _BlockingRestrictedTurnServer("codex", codex_home=home)
+    registry._servers[home] = server
+
+    first_process, _ = await registry.start_turn(
+        codex_home=home,
+        task_id=1,
+        tools_disabled=True,
+    )
+    cancelled = asyncio.create_task(registry.start_turn(
+        codex_home=home,
+        task_id=2,
+        tools_disabled=True,
+    ))
+    await asyncio.sleep(0)
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+
+    first_process.finish(0)
+    third_process, _ = await asyncio.wait_for(
+        registry.start_turn(
+            codex_home=home,
+            task_id=3,
+            tools_disabled=True,
+        ),
+        timeout=1,
+    )
+    assert server.start_calls == 2
+    third_process.finish(0)
+
+
+@pytest.mark.asyncio
+async def test_registry_tool_restricted_turns_keep_different_homes_parallel(tmp_path):
+    registry = CodexAppServerRegistry("codex")
+    home_a = normalize_codex_home(tmp_path / "home-a")
+    home_b = normalize_codex_home(tmp_path / "home-b")
+    server_a = _BlockingRestrictedTurnServer("codex", codex_home=home_a)
+    server_b = _BlockingRestrictedTurnServer("codex", codex_home=home_b)
+    registry._servers[home_a] = server_a
+    registry._servers[home_b] = server_b
+
+    process_a, process_b = await asyncio.gather(
+        registry.start_turn(codex_home=home_a, task_id=1, mcp_only=True),
+        registry.start_turn(codex_home=home_b, task_id=2, mcp_only=True),
+    )
+
+    assert server_a.start_calls == 1
+    assert server_b.start_calls == 1
+    process_a[0].finish(0)
+    process_b[0].finish(0)
+
+
+@pytest.mark.asyncio
+async def test_registry_releases_tool_restricted_lock_after_admission_failure(tmp_path):
+    class FailsOnceServer(_BlockingRestrictedTurnServer):
+        async def start_turn(self, **kwargs):
+            if self.start_calls == 0:
+                self.start_calls += 1
+                raise CodexAppServerError("admission failed")
+            return await super().start_turn(**kwargs)
+
+    registry = CodexAppServerRegistry("codex")
+    home = normalize_codex_home(tmp_path / "failure-home")
+    server = FailsOnceServer("codex", codex_home=home)
+    registry._servers[home] = server
+
+    with pytest.raises(CodexAppServerError, match="admission failed"):
+        await registry.start_turn(
+            codex_home=home,
+            task_id=1,
+            tools_disabled=True,
+        )
+
+    process, _ = await asyncio.wait_for(
+        registry.start_turn(
+            codex_home=home,
+            task_id=2,
+            tools_disabled=True,
+        ),
+        timeout=1,
+    )
+    process.finish(0)
+
+
 @pytest.mark.asyncio
 async def test_thread_routing_quiescence_requires_terminal_goal_and_idle_status():
     server = CodexAppServer("codex")

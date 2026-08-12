@@ -1835,6 +1835,14 @@ class CodexTurnProcess:
             raise RuntimeError("Cannot bind runtime cleanup to a terminal turn")
         self._runtime_cleanup = cleanup
 
+    def add_done_callback(
+        self,
+        callback: Callable[[asyncio.Future[int]], None],
+    ) -> None:
+        """Run ``callback`` when this exact native turn becomes terminal."""
+
+        self._done.add_done_callback(callback)
+
     def _schedule_runtime_cleanup(self) -> None:
         cleanup = self._runtime_cleanup
         if cleanup is None or self._runtime_cleanup_task is not None:
@@ -8257,6 +8265,12 @@ class CodexAppServerRegistry:
         self._starting_threads: dict[str, object] = {}
         self._shutdown_requested = False
         self._lock = asyncio.Lock()
+        # ``skills/list(forceReload=True)`` is process-global in Codex 0.147.
+        # Two concurrent tool-restricted admissions on one account can make
+        # each other's exact deny-list stale after model input. Hold one
+        # generation across admission and terminal completion; other homes
+        # remain independent and ordinary turns are unaffected.
+        self._isolated_turn_locks: dict[str, asyncio.Lock] = {}
         # Claimed stops and truly-unclaimed admission cleanup can both need to
         # reason about every turn on one shared transport.  Serialize those
         # decisions per home so two cleanup attempts cannot independently
@@ -8288,51 +8302,60 @@ class CodexAppServerRegistry:
     ) -> tuple[CodexTurnProcess, str]:
         home = normalize_codex_home(codex_home)
         resume_session_id = kwargs.get("resume_session_id")
+        isolated_turn_lock: asyncio.Lock | None = None
+        isolated_turn_lock_transferred = False
+        if kwargs.get("tools_disabled") or kwargs.get("mcp_only"):
+            async with self._lock:
+                isolated_turn_lock = self._isolated_turn_locks.setdefault(
+                    home,
+                    asyncio.Lock(),
+                )
+            await isolated_turn_lock.acquire()
         reserved_owner = False
         start_token: object | None = None
-
-        async with self._lock:
-            if self._shutdown_requested:
-                raise CodexAppServerBusyError(
-                    "Codex app-server registry is shutting down"
-                )
-            if home in self._draining:
-                raise CodexAppServerBusyError(
-                    f"Codex account app-server is draining: {home}"
-                )
-            if resume_session_id:
-                if resume_session_id in self._starting_threads:
-                    raise CodexAppServerBusyError(
-                        f"Codex thread {resume_session_id} already has a resume request in flight"
-                    )
-                if resume_session_id in self._rebindings:
-                    raise CodexAppServerBusyError(
-                        f"Codex thread {resume_session_id} is being rebound"
-                    )
-                owner = self._thread_owners.get(resume_session_id)
-                if owner is not None and owner != home:
-                    raise CodexThreadHomeMismatchError(
-                        f"Codex thread {resume_session_id} is bound to {owner}, not {home}; "
-                        "migrate and rebind it before resume"
-                    )
-                if owner is None:
-                    # Reserve the route while the RPC is in flight so two
-                    # concurrent resumes cannot load one rollout in two homes.
-                    self._thread_owners[resume_session_id] = home
-                    reserved_owner = True
-                start_token = object()
-                self._starting_threads[resume_session_id] = start_token
-            server = self._servers.get(home)
-            if server is None:
-                server = self._new_server(home)
-                self._servers[home] = server
-            self._starting[home] = self._starting.get(home, 0) + 1
-
+        server: CodexAppServer | None = None
         process: CodexTurnProcess | None = None
         thread_id: str | None = None
         admitted = False
         starting_released = False
         try:
+            async with self._lock:
+                if self._shutdown_requested:
+                    raise CodexAppServerBusyError(
+                        "Codex app-server registry is shutting down"
+                    )
+                if home in self._draining:
+                    raise CodexAppServerBusyError(
+                        f"Codex account app-server is draining: {home}"
+                    )
+                if resume_session_id:
+                    if resume_session_id in self._starting_threads:
+                        raise CodexAppServerBusyError(
+                            f"Codex thread {resume_session_id} already has a resume request in flight"
+                        )
+                    if resume_session_id in self._rebindings:
+                        raise CodexAppServerBusyError(
+                            f"Codex thread {resume_session_id} is being rebound"
+                        )
+                    owner = self._thread_owners.get(resume_session_id)
+                    if owner is not None and owner != home:
+                        raise CodexThreadHomeMismatchError(
+                            f"Codex thread {resume_session_id} is bound to {owner}, not {home}; "
+                            "migrate and rebind it before resume"
+                        )
+                    if owner is None:
+                        # Reserve the route while the RPC is in flight so two
+                        # concurrent resumes cannot load one rollout in two homes.
+                        self._thread_owners[resume_session_id] = home
+                        reserved_owner = True
+                    start_token = object()
+                    self._starting_threads[resume_session_id] = start_token
+                server = self._servers.get(home)
+                if server is None:
+                    server = self._new_server(home)
+                    self._servers[home] = server
+                self._starting[home] = self._starting.get(home, 0) + 1
+
             try:
                 process, thread_id = await server.start_turn(**kwargs)
             except (
@@ -8355,6 +8378,14 @@ class CodexAppServerRegistry:
                 starting_released = True
                 self._thread_owners[thread_id] = home
                 admitted = True
+            if isolated_turn_lock is not None:
+                isolated_turn_lock_transferred = True
+
+                def release_isolated_turn_lock(_done: asyncio.Future[int]) -> None:
+                    if isolated_turn_lock.locked():
+                        isolated_turn_lock.release()
+
+                process.add_done_callback(release_isolated_turn_lock)
             return process, thread_id
         except BaseException as exc:
             if isinstance(
@@ -8382,7 +8413,7 @@ class CodexAppServerRegistry:
                         ) from exc
                 if resume_session_id == exc.thread_id:
                     reserved_owner = False
-            if getattr(server, "shutdown_requested", False):
+            if server is not None and getattr(server, "shutdown_requested", False):
                 async with self._lock:
                     if self._servers.get(home) is server:
                         self._draining.add(home)
@@ -8430,6 +8461,12 @@ class CodexAppServerRegistry:
                 except asyncio.CancelledError:
                     continue
             cleanup.result()
+            if (
+                isolated_turn_lock is not None
+                and not isolated_turn_lock_transferred
+                and isolated_turn_lock.locked()
+            ):
+                isolated_turn_lock.release()
 
     def _decrement_starting_locked(self, home: str) -> None:
         """Release one start reservation while ``self._lock`` is held."""

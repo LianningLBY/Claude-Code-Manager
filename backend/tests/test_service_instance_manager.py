@@ -52,6 +52,7 @@ from backend.services.mcp_config import (
     render_codex_exec_config_args,
 )
 from backend.services.task_agent_isolation import (
+    CLAUDE_SUBPROCESS_ENV_SCRUB,
     TaskAgentIsolationError,
     discover_linked_worktree_git_read_boundary,
 )
@@ -3977,7 +3978,7 @@ async def test_launch_unsets_claude_and_manager_secret_env(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_cloudrouter_claude_launch_removes_inherited_auth_env(
+async def test_cloudrouter_claude_launch_replaces_inherited_auth_env(
     db_factory, tmp_path
 ):
     async with db_factory() as db:
@@ -3989,9 +3990,10 @@ async def test_cloudrouter_claude_launch_removes_inherited_auth_env(
     account_root = tmp_path / "cloudrouter-1"
     config_dir = account_root / "claude"
     config_dir.mkdir(parents=True)
-    account = MagicMock(root=account_root)
+    account = MagicMock(root=account_root, api_provider="cloudrouter")
     store = MagicMock()
     store.account_for_claude_config_dir.return_value = account
+    store._read_api_key.return_value = "projected-api-key"
     @asynccontextmanager
     async def runtime_admission(*_args):
         yield account
@@ -4025,14 +4027,18 @@ async def test_cloudrouter_claude_launch_removes_inherited_auth_env(
         )
 
     child_env = mock_exec.call_args.kwargs["env"]
-    for key in inherited:
-        assert key not in child_env
+    assert "ANTHROPIC_AUTH_TOKEN" not in child_env
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in child_env
+    assert child_env["ANTHROPIC_API_KEY"] == "projected-api-key"
+    assert child_env["ANTHROPIC_BASE_URL"] == (
+        "https://console.cloudrouter.online"
+    )
     assert child_env["CLAUDE_CONFIG_DIR"] == str(config_dir)
     await asyncio.sleep(0.1)
 
 
 @pytest.mark.asyncio
-async def test_cloudrouter_claude_pty_wraps_binary_and_removes_auth_overrides(
+async def test_cloudrouter_claude_pty_projects_direct_auth_for_model_only(
     db_factory, tmp_path
 ):
     async with db_factory() as db:
@@ -4044,9 +4050,10 @@ async def test_cloudrouter_claude_pty_wraps_binary_and_removes_auth_overrides(
     account_root = tmp_path / "cloudrouter-1"
     config_dir = account_root / "claude"
     config_dir.mkdir(parents=True)
-    account = MagicMock(root=account_root)
+    account = MagicMock(root=account_root, api_provider="cloudrouter")
     store = MagicMock()
     store.account_for_claude_config_dir.return_value = account
+    store._read_api_key.return_value = "projected-api-key"
 
     @asynccontextmanager
     async def runtime_admission(*_args):
@@ -4091,22 +4098,17 @@ async def test_cloudrouter_claude_pty_wraps_binary_and_removes_auth_overrides(
         chat_initiated=True,
     )
 
-    wrapper = Path(observed["binary"])
-    assert wrapper.name == "cloudrouter_claude_wrapper.sh"
-    assert wrapper.is_file()
-    assert os.access(wrapper, os.X_OK)
-    assert observed["env"]["CCM_CLOUDROUTER_CLAUDE_BINARY"] == (
-        "/opt/claude-real"
-    )
+    assert observed["binary"] == "/opt/claude-real"
     # PTY config is now rebuilt from the same strict Task-process allowlist as
     # direct launches; arbitrary backend overrides do not cross the boundary.
     assert observed["env"]["SAFE_VALUE"] == ""
-    for key in (
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_API_KEY",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ):
-        assert key not in observed["env"]
+    assert "ANTHROPIC_AUTH_TOKEN" not in observed["env"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in observed["env"]
+    assert observed["env"]["ANTHROPIC_API_KEY"] == "projected-api-key"
+    assert observed["env"]["ANTHROPIC_BASE_URL"] == (
+        "https://console.cloudrouter.online"
+    )
+    assert observed["env"][CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
     assert observed["env"]["AUTH_TOKEN"] == ""
     assert observed["env"]["CCM_INTERNAL_SERVICE_TOKEN"] == ""
     assert im.get_config_dir(inst.id) == str(config_dir)
@@ -17038,6 +17040,18 @@ def test_parse_codex_turn_failed_extracts_nested_message():
         im._fatal_provider_error_for_event(event)
         == "stream disconnected before completion: transport error"
     )
+
+
+def test_claude_login_error_message_is_turn_fatal():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    assert im._fatal_provider_error_for_event({
+        "event_type": "message",
+        "role": "assistant",
+        "content": "Not logged in · Please run /login",
+        "raw_json": "{}",
+        "is_error": True,
+    }) == "Not logged in · Please run /login"
 
 
 def test_parse_codex_file_change_started_is_tool_use():

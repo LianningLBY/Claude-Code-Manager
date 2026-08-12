@@ -65,7 +65,6 @@ _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_API_KEY",
     "CLAUDE_CODE_OAUTH_TOKEN",
 )
-_CLOUDROUTER_CLAUDE_BINARY_ENV = "CCM_CLOUDROUTER_CLAUDE_BINARY"
 _CLOUDROUTER_CODEX_AUTH_ENV_KEYS = (
     "OPENAI_API_KEY",
     "CODEX_API_KEY",
@@ -3779,6 +3778,21 @@ class InstanceManager:
             for key in auth_keys:
                 env.pop(key, None)
 
+            if provider == "claude":
+                from backend.services.claude_auth_projection import (
+                    inject_cloudrouter_claude_direct_auth,
+                )
+
+                if not inject_cloudrouter_claude_direct_auth(
+                    env,
+                    self.cloudrouter_store,
+                    config_dir,
+                ):
+                    raise RuntimeError(
+                        "Selected Claude API account could not be projected "
+                        "into the model process"
+                    )
+
         # Provider account home.  The Codex assignment is especially important
         # for app-server fallback: the rollout and auth.json must stay together.
         if config_dir and provider == "claude":
@@ -5578,22 +5592,19 @@ class InstanceManager:
                     overrides["CCM_INTERNAL_SERVICE_TOKEN"] = ""
                     final_binary = wrapper or cfg.claude_binary
                     if cloudrouter_api:
-                        cloudrouter_wrapper = Path(__file__).with_name(
-                            "cloudrouter_claude_wrapper.sh"
+                        from backend.services.claude_auth_projection import (
+                            inject_cloudrouter_claude_direct_auth,
                         )
-                        if not (
-                            cloudrouter_wrapper.is_file()
-                            and os.access(cloudrouter_wrapper, os.X_OK)
+
+                        if not inject_cloudrouter_claude_direct_auth(
+                            overrides,
+                            self.cloudrouter_store,
+                            config_dir,
                         ):
                             raise RuntimeError(
-                                "CloudRouter Claude wrapper is unavailable"
+                                "Selected Claude API account could not be "
+                                "projected into the PTY model process"
                             )
-                        for key in _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS:
-                            overrides.pop(key, None)
-                        overrides[_CLOUDROUTER_CLAUDE_BINARY_ENV] = str(
-                            final_binary
-                        )
-                        final_binary = str(cloudrouter_wrapper)
                     if claude_isolation_settings_path is not None:
                         from backend.services.task_agent_isolation import (
                             CLAUDE_TASK_BUILTIN_TOOLS,
@@ -12562,6 +12573,11 @@ class InstanceManager:
             return content or "Codex turn failed"
         if event_type in {"result", "session_crashed"}:
             return content or "Claude turn failed"
+        if event_type in {"message", "result"}:
+            from backend.services.claude_pool import is_auth_failure
+
+            if is_auth_failure(content):
+                return content or "Claude authentication failed"
         if event_type == "rate_limit_event":
             return content or "Claude API rate limit"
         if event_type == "system_event" and (

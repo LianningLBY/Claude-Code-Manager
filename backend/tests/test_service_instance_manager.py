@@ -4636,6 +4636,7 @@ async def test_claude_pty_scrubs_ambient_credentials_and_restores_exact_git_env(
         async def launch_for_ccm(self, **kwargs):
             config = self.build_config()
             observed["binary"] = config.claude_binary
+            observed["response_timeout"] = config.response_timeout
             # Mirror claude_pty._env: start from the parent, remove its nested
             # Claude coordinates, then apply CCM's exact overrides.
             runtime_env = {
@@ -4687,6 +4688,9 @@ async def test_claude_pty_scrubs_ambient_credentials_and_restores_exact_git_env(
     env = observed["env"]
     assert Path(observed["binary"]).name == "task_claude_wrapper.sh"
     assert observed["dangerous"] is False
+    assert observed["response_timeout"] == (
+        settings.claude_pty_response_idle_timeout_seconds
+    )
     assert env["SAFE_VALUE"] == ""
     assert env["AUTH_TOKEN"] == ""
     assert env["CCM_INTERNAL_SERVICE_TOKEN"] == ""

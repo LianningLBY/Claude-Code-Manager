@@ -5536,6 +5536,9 @@ class InstanceManager:
                             "PTY backend does not expose secure config construction"
                         )
                     cfg = original_build_config(**kw)
+                    cfg.response_timeout = float(
+                        settings.claude_pty_response_idle_timeout_seconds
+                    )
                     original_overrides = dict(
                         getattr(cfg, "env_overrides", None) or {}
                     )
@@ -8764,6 +8767,20 @@ class InstanceManager:
                             else f"Process exited with code {ec}"
                         )
                     )
+                    await db.flush()
+                if (
+                    not preserve_background_failure
+                    and not successful_terminal
+                    and provider_error.startswith("Response timed out")
+                ):
+                    # A silent Claude PTY timeout means the persisted native
+                    # turn may contain an unmatched tool_use. Resuming that
+                    # session deterministically reproduced the same dead turn
+                    # in production (task 315). Fence it off so the next user
+                    # turn starts a fresh native session instead of replaying
+                    # corrupted executor state.
+                    task.session_id = None
+                    task.context_window_usage = None
                     await db.flush()
                 if not preserve_background_failure:
                     if (

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     merge_push_retries: int = 3
     auto_push_to_origin: bool = True
     task_timeout_seconds: int = 7200  # 2 hours
+    # A live Claude PTY can lose the native tool executor while leaving the
+    # parent CLI and its JSONL tailer alive.  Bound foreground JSONL silence
+    # below the task-wide timeout so the exact turn fails and can be retried
+    # instead of remaining in a false "running" state for two hours.
+    claude_pty_response_idle_timeout_seconds: float = 900.0
     # 会话上下文利用率达到该比例即自动摘要+换新 session。超大 context 的请求
     # 在服务端易挂起（2026-07-08 task 22/27 连环 stall 均发生在 ~90% 区间），
     # 故不要设回 0.9 让 session 在重灾区长时间工作。

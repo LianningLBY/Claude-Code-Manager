@@ -44,6 +44,11 @@ _APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_TERM_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_KILL_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_GROUP_POLL_INTERVAL = 0.05
+# App-server speaks newline-delimited JSON and tool results can legitimately
+# make one protocol frame much larger than asyncio's 64 KiB default.  Keep a
+# bounded limit, but leave enough room for large MCP/command output frames so
+# the reader (and therefore live turn injection) is not torn down mid-turn.
+_APP_SERVER_STREAM_LIMIT = 64 * 1024 * 1024
 _CODEX_LOG_DB_MAX_BYTES = 1024 * 1024 * 1024
 _CODEX_LOG_DB_NAMES = (
     "logs_2.sqlite",
@@ -3974,7 +3979,7 @@ class CodexAppServer:
             "stdout": asyncio.subprocess.PIPE,
             "stderr": asyncio.subprocess.PIPE,
             "env": env,
-            "limit": 10 * 1024 * 1024,
+            "limit": _APP_SERVER_STREAM_LIMIT,
         }
         if os.name == "posix":
             spawn_kwargs["start_new_session"] = True
@@ -8863,6 +8868,18 @@ class CodexAppServerRegistry:
                             f"{starting} admitted app-server request(s) are "
                             f"in flight on its shared transport: {home}"
                         )
+                    if server.has_other_live_turn_processes(process):
+                        # Explicit stop currently requires recycling the whole
+                        # account transport to prove task-scoped MCP helpers
+                        # are gone.  Never interrupt first and discover peers
+                        # afterwards: recycling here would turn an unrelated
+                        # peer with emitted output/external effects into an
+                        # unreplayable failure.
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the claimed turn while another live "
+                            "turn shares its Codex app-server transport: "
+                            f"{home}"
+                        )
                     # Close admission before the interrupt RPC.  A request
                     # admitted earlier remains visible in ``_starting`` and
                     # blocks transport-level escalation below.
@@ -8912,11 +8929,10 @@ class CodexAppServerRegistry:
                     )
 
                 if has_peer_turns:
-                    logger.warning(
-                        "Recycling shared Codex app-server transport after "
-                        "an explicit turn interrupt; peer turns "
-                        "will fail and retry: %s",
-                        home,
+                    raise CodexSharedTransportBusyError(
+                        "Cannot recycle the claimed turn because another live "
+                        "turn appeared on its Codex app-server transport: "
+                        f"{home}"
                     )
 
                 # Admission is drained.  Transport recycle is the only

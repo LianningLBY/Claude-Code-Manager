@@ -25,6 +25,7 @@ from backend.services.codex_app_server import (
     CodexAppServerRegistry,
     CodexRequiredMcpError,
     CodexRequiredMcpPreTurnError,
+    CodexSharedTransportBusyError,
     CodexServiceTierUnavailableError,
     CodexThreadHomeMismatchError,
     CodexThreadIdentityMismatchError,
@@ -32,6 +33,7 @@ from backend.services.codex_app_server import (
     CodexThreadRuntimeRecycleError,
     CodexThreadTerminalStateError,
     CodexTurnProcess,
+    _APP_SERVER_STREAM_LIMIT,
     _audit_isolated_request_config,
     _codex_runtime_read_paths,
     _format_process_exit,
@@ -9227,7 +9229,7 @@ async def test_unconfirmed_descendant_abandon_escalates_transport_shutdown(
 
 
 @pytest.mark.asyncio
-async def test_claimed_stop_recycles_shared_transport_when_interrupt_unconfirmed(
+async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
     tmp_path,
 ):
     """An explicit stop stays effective when exact descendant cleanup wedges."""
@@ -9300,24 +9302,26 @@ async def test_claimed_stop_recycles_shared_transport_when_interrupt_unconfirmed
         "thread-peer": home,
     })
 
-    assert await registry.stop_claimed_turn(
-        home,
-        target,
-        reason="user requested stop",
-    ) is True
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="another live turn shares",
+    ):
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
 
-    server.shutdown.assert_awaited_once_with(
-        interrupted_process=target,
-        reason="user requested stop",
-    )
-    assert target.returncode == 130
-    assert target.termination_kind == "internal_abort"
-    assert peer.returncode == 1
-    assert not server._contexts_by_thread
-    assert not server._contexts_by_turn
-    assert not server._contexts_by_descendant
-    assert home not in registry._servers
-    assert registry._thread_owners == {}
+    server.shutdown.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert server._contexts_by_thread["thread-target"] is target_context
+    assert server._contexts_by_thread["thread-peer"] is peer_context
+    assert registry._servers[home] is server
+    assert registry._thread_owners == {
+        "thread-target": home,
+        "thread-peer": home,
+    }
     assert home not in registry._draining
 
 
@@ -10812,6 +10816,7 @@ async def test_app_server_spawn_uses_independent_session(tmp_path):
             await server._start()
 
     assert spawn.await_args.kwargs["start_new_session"] is True
+    assert spawn.await_args.kwargs["limit"] == _APP_SERVER_STREAM_LIMIT
     assert spawn.await_args.args == (
         server.binary,
         "app-server",

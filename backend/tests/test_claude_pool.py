@@ -124,6 +124,9 @@ class TestTransientOverloadDetection:
     def test_case_insensitive(self):
         assert is_transient_overload("SERVER IS TEMPORARILY LIMITING REQUESTS")
 
+    def test_pty_jsonl_inactivity_timeout_does_not_replay_same_session(self):
+        assert not is_transient_overload("Response timed out after 900.0s")
+
     # --- precedence: account usage-limit / auth-failure must rotate, not wait ---
     def test_usage_limit_takes_precedence(self):
         # A genuine usage-limit banner must NOT be treated as transient.

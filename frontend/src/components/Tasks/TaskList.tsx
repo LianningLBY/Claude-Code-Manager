@@ -259,7 +259,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   className="rounded bg-indigo-600/20 px-1.5 text-[10px] font-medium text-indigo-300 hover:bg-indigo-600/30"
                   title={`Delivery Run #${t.delivery_run_id}`}
                 >
-                  Delivery #{t.delivery_run_id}
+                  DLV-{t.delivery_run_id}
                 </button>
               )}
               {t.mode === 'plan' ? (

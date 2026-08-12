@@ -48,6 +48,7 @@ export function PlanCatalog({ plans, projects, selectedPlanId, onSelectPlan, onN
               {plan.current_version && <span className="rounded-full bg-indigo-500/15 px-2 py-0.5 text-[10px] text-indigo-300">v{plan.current_version.version_number}</span>}
               <span className={`rounded-full border px-2 py-0.5 text-[10px] ${planDisplayStateClassName(plan.display_state)}`}>{planDisplayStateLabel(plan.display_state)}</span>
               {plan.read_only && <span className="rounded-full border border-indigo-500/40 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300">Capability · read-only</span>}
+              {plan.delivery_run_id != null && <button type="button" onClick={(event) => { event.stopPropagation(); window.location.hash = `#/delivery/${plan.delivery_run_id}`; }} className="rounded-full border border-indigo-500/40 bg-indigo-500/10 px-2 py-0.5 text-[10px] text-indigo-300 hover:bg-indigo-500/20">DLV-{plan.delivery_run_id}</button>}
               {appliedOlder && <span className="rounded-full bg-teal-500/15 px-2 py-0.5 text-[10px] text-teal-300">earlier Version applied</span>}
             </div>
             <div className="mt-1 truncate text-sm font-semibold text-gray-100">{plan.title}</div>

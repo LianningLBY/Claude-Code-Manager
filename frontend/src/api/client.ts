@@ -1134,6 +1134,7 @@ export interface PlanResource {
   legacy: boolean;
   ownership: 'standard' | 'capability';
   read_only: boolean;
+  delivery_run_id: number | null;
   latest_run_status: string | null;
   latest_run_error: string | null;
   pipeline_config: PlanPipelineConfig;
@@ -1430,6 +1431,74 @@ export interface DeliveryRun {
   updated_at: string;
   completed_at: string | null;
   allowed_actions: Array<'pause' | 'resume' | 'cancel'>;
+}
+
+export interface DeliveryCycle {
+  id: number;
+  run_id: number;
+  cycle_number: number;
+  status: string;
+  trigger_kind: string;
+  trigger_payload: Record<string, unknown>;
+  base_sha: string | null;
+  start_head_sha: string | null;
+  result_head_sha: string | null;
+  result_head_tree_sha: string | null;
+  result_patch_sha256: string | null;
+  plan_invocation_id: number | null;
+  plan_version_id: number | null;
+  review_invocation_id: number | null;
+  review_result_id: number | null;
+  review_verdict: string | null;
+  review_summary: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+}
+
+export interface DeliveryTurn {
+  id: number;
+  run_id: number;
+  cycle_id: number;
+  generation: number;
+  purpose: string;
+  trigger_kind: string;
+  trigger_payload: Record<string, unknown>;
+  status: string;
+  task_id: number | null;
+  task_retry_count: number | null;
+  task_instance_id: number | null;
+  task_started_at: string | null;
+  task_session_id: string | null;
+  checkpoint: Record<string, unknown> | null;
+  checkpoint_status: string | null;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface DeliveryTransition {
+  id: number;
+  run_id: number;
+  state_version: number;
+  cause: string;
+  actor_kind: string;
+  actor_id: string | null;
+  before_state: Record<string, unknown>;
+  after_state: Record<string, unknown>;
+  metadata: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface DeliveryRunDetail extends DeliveryRun {
+  policy_snapshot: Record<string, unknown>;
+  cycles: DeliveryCycle[];
+  turns: DeliveryTurn[];
+  transitions: DeliveryTransition[];
 }
 
 export interface DeliveryRunCreate {
@@ -2362,6 +2431,8 @@ export const api = {
     return request<{ total: number }>(`/api/plans/count${query.size ? `?${query}` : ''}`);
   },
   getPlan: (planId: number) => request<PlanResource>(`/api/plans/${planId}`),
+  getPlanVersion: (versionId: number) =>
+    request<PlanVersion>(`/api/plan-versions/${versionId}`),
   resolvePlanApplicationDelivery: (
     planId: number,
     receiptKey: string,
@@ -2897,7 +2968,7 @@ export const api = {
       `/api/delivery-runs${projectId ? `?project_id=${projectId}` : ''}`,
     ),
   getDeliveryRun: (runId: number) =>
-    request<DeliveryRun>(`/api/delivery-runs/${runId}`),
+    request<DeliveryRunDetail>(`/api/delivery-runs/${runId}`),
   pauseDeliveryRun: (runId: number, reason: string) =>
     request<DeliveryRun>(`/api/delivery-runs/${runId}/pause`, {
       method: 'POST', body: JSON.stringify({ reason }),

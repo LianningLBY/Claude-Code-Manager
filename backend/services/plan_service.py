@@ -30,6 +30,7 @@ from backend.models.plan_agent import (
     PlanAgentStep,
     PlanAgentWorkerDispatchReceipt,
 )
+from backend.models.delivery import DeliveryCycle
 from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
@@ -3210,6 +3211,19 @@ async def plan_resources(
     if not plans:
         return []
     plan_ids = [plan.id for plan in plans]
+    delivery_rows = list(
+        (
+            await db.execute(
+                select(DeliveryCycle.run_id, PlanVersion.plan_id)
+                .join(PlanVersion, PlanVersion.id == DeliveryCycle.plan_version_id)
+                .where(PlanVersion.plan_id.in_(plan_ids))
+                .order_by(DeliveryCycle.id.desc())
+            )
+        ).all()
+    )
+    delivery_run_by_plan: dict[int, int] = {}
+    for delivery_run_id, plan_id in delivery_rows:
+        delivery_run_by_plan.setdefault(plan_id, delivery_run_id)
     version_ids = {
         plan.current_version_id for plan in plans if plan.current_version_id is not None
     }
@@ -3478,6 +3492,7 @@ async def plan_resources(
                 legacy=plan.id in legacy_plan_ids,
                 ownership="capability" if capability_owned else "standard",
                 read_only=capability_owned,
+                delivery_run_id=delivery_run_by_plan.get(plan.id),
                 latest_run_status=latest.status if latest else None,
                 latest_run_error=(
                     latest.error

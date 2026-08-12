@@ -3,7 +3,7 @@ import type { ReactNode } from 'react';
 import {
   Bot, Menu, X, PanelLeftClose, PanelLeftOpen, LayoutDashboard, ListTodo, FolderGit2, KeyRound,
   FolderOpen, MessagesSquare, GitPullRequest, Server, Sparkles, Users, Globe,
-  ScrollText, Settings,
+  ScrollText, Settings, GitBranch,
 } from '../icons';
 import type { ComponentType } from 'react';
 import { api } from '../../api/client';
@@ -128,6 +128,7 @@ export function AppShell({ currentPage, onNavigate, wide, children }: AppShellPr
     { key: 'dashboard', label: 'Dashboard', icon: LayoutDashboard, show: isAdmin },
     { key: 'tasks', label: 'Tasks', icon: ListTodo, show: true },
     { key: 'plans', label: 'Plans', icon: ScrollText, show: true },
+    { key: 'delivery', label: 'Delivery', icon: GitBranch, show: true },
     { key: 'projects', label: 'Projects', icon: FolderGit2, show: true },
     // These pages expose Manager-host data rather than per-tenant resources.
     // Their backend routers are admin-only, so do not advertise dead links to

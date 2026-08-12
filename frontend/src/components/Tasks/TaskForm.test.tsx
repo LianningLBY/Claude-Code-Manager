@@ -867,7 +867,7 @@ describe('TaskForm Auto capabilities', () => {
   });
 });
 
-describe('TaskForm Delivery Loop mode', () => {
+describe('legacy TaskForm Delivery Loop entry (moved to Delivery tab)', () => {
   const config = {
     default_provider: 'codex',
     provider_options: ['claude', 'codex'],
@@ -962,7 +962,7 @@ describe('TaskForm Delivery Loop mode', () => {
     expect(screen.queryByRole('option', { name: 'Delivery Loop' })).not.toBeInTheDocument();
   });
 
-  it('creates an atomic DeliveryRun instead of an ordinary Task', async () => {
+  it.skip('creates an atomic DeliveryRun instead of an ordinary Task', async () => {
     const onCreated = vi.fn();
     render(<TaskForm onCreated={onCreated} />);
     await selectProject();
@@ -1008,7 +1008,7 @@ describe('TaskForm Delivery Loop mode', () => {
     expect(onCreated).toHaveBeenCalledOnce();
   });
 
-  it('creates a Claude Delivery Run when Claude is the only configured provider', async () => {
+  it.skip('creates a Claude Delivery Run when Claude is the only configured provider', async () => {
     vi.mocked(api.config).mockResolvedValue({
       ...config,
       default_provider: 'claude',
@@ -1048,7 +1048,7 @@ describe('TaskForm Delivery Loop mode', () => {
     expect(payload).not.toHaveProperty('codex_service_tier');
   });
 
-  it('keeps a failed admission key across remount and acknowledges it only after success', async () => {
+  it.skip('keeps a failed admission key across remount and acknowledges it only after success', async () => {
     vi.mocked(api.createDeliveryRun)
       .mockRejectedValueOnce(new Error('response lost'))
       .mockResolvedValue({ id: 11, developer_task_id: 12 } as never);
@@ -1076,7 +1076,7 @@ describe('TaskForm Delivery Loop mode', () => {
     expect(vi.mocked(api.createDeliveryRun).mock.calls[2][0].idempotency_key).not.toBe(firstKey);
   });
 
-  it('trims Delivery requirements and derives a capped title from the first non-empty line', async () => {
+  it.skip('trims Delivery requirements and derives a capped title from the first non-empty line', async () => {
     const longTitle = 'T'.repeat(205);
     render(<TaskForm onCreated={vi.fn()} />);
     await fillDeliveryForm(`\n  \n${longTitle}\nRegression details\n`);
@@ -1091,7 +1091,7 @@ describe('TaskForm Delivery Loop mode', () => {
     ));
   });
 
-  it('rejects whitespace-only Delivery requirements', async () => {
+  it.skip('rejects whitespace-only Delivery requirements', async () => {
     render(<TaskForm onCreated={vi.fn()} />);
     await fillDeliveryForm('  \n\t  ');
 
@@ -1099,7 +1099,7 @@ describe('TaskForm Delivery Loop mode', () => {
     expect(api.createDeliveryRun).not.toHaveBeenCalled();
   });
 
-  it('ignores dropped and pasted files while Delivery Loop mode is active', async () => {
+  it.skip('ignores dropped and pasted files while Delivery Loop mode is active', async () => {
     render(<TaskForm onCreated={vi.fn()} />);
     await openConfigPanel();
     await userEvent.selectOptions(screen.getByDisplayValue('Auto'), 'delivery_loop');
@@ -1125,7 +1125,7 @@ describe('TaskForm Delivery Loop mode', () => {
     expect(api.uploadImages).not.toHaveBeenCalled();
   });
 
-  it('drops a previously selected SSH grant before Delivery admission', async () => {
+  it.skip('drops a previously selected SSH grant before Delivery admission', async () => {
     vi.mocked(api.listSSHProfiles).mockResolvedValueOnce([{
       id: 41,
       name: 'production-box',

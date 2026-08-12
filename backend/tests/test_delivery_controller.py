@@ -29,6 +29,7 @@ from backend.models.pr_monitor import (
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.test_harness import TestHarnessRun as HarnessRun
+from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.delivery_controller import (
     CapabilitySnapshot,
     CoreDeliveryCapabilityGateway,
@@ -247,7 +248,7 @@ class FakeCapabilities:
                     title=request_payload["title"],
                     initial_request=request_payload["prompt"],
                     target_task_id=task_id,
-                    pipeline_config={},
+                    pipeline_config=default_plan_pipeline_config().model_dump(),
                 )
                 db.add(plan)
                 await db.flush()
@@ -726,7 +727,13 @@ async def _scope(
         auto_repair=True,
         review_mode="panel",
         wait_for_ci=True,
-        required_checks=[{"kind": "check_run", "name": "test"}],
+        required_checks=[
+            {
+                "kind": "check_run",
+                "name": "test",
+                "app_slug": "github-actions",
+            }
+        ],
         merge_queue_mode="manual",
         default_branch="main",
     )
@@ -1517,6 +1524,7 @@ async def test_disabled_core_does_not_admit_controller_work_for_terminal_run(
 async def test_happy_path_stops_at_exact_ready_to_merge(
     db_session,
     db_factory,
+    client,
 ):
     run, _repo = await _scope(db_session)
     workspace = FakeWorkspace()
@@ -1544,6 +1552,8 @@ async def test_happy_path_stops_at_exact_ready_to_merge(
     async with db_factory() as db:
         completed = await db.get(DeliveryRun, run.id)
         task = await db.get(Task, completed.developer_task_id)
+        cycle = await db.get(DeliveryCycle, completed.current_cycle_id)
+        plan_version = await db.get(PlanVersion, cycle.plan_version_id)
         assert (completed.phase, completed.activity, completed.outcome) == (
             "done",
             "terminal",
@@ -1559,10 +1569,40 @@ async def test_happy_path_stops_at_exact_ready_to_merge(
         assert monitor.developer_task_id is None
         assert wake.status == "shadow"
         assert wake.developer_task_id is None
+        task_id = task.id
+        plan_id = plan_version.plan_id
     assert dispatcher.wake_count == 1
     assert publisher.pr_calls == 1
     assert publisher.monitor_calls == 1
     assert publisher.verify_calls == 1
+
+    # The Delivery workspace is a projection over the native records. Prove
+    # that every page-facing API resolves the same completed fake workflow,
+    # rather than manufacturing a second Plan, Task, or PR Monitor record.
+    delivery_response = await client.get(f"/api/delivery-runs/{run.id}")
+    assert delivery_response.status_code == 200, delivery_response.text
+    delivery = delivery_response.json()
+    assert delivery["developer_task_id"] == task_id
+    assert delivery["pr_monitor_run_id"] == monitor_id
+    assert delivery["cycles"][0]["plan_version_id"] == plan_version.id
+    assert delivery["turns"][0]["task_id"] == task_id
+
+    plan_response = await client.get(f"/api/plans/{plan_id}")
+    assert plan_response.status_code == 200, plan_response.text
+    assert plan_response.json()["delivery_run_id"] == run.id
+
+    task_response = await client.get(f"/api/tasks/{task_id}")
+    assert task_response.status_code == 200, task_response.text
+    task_projection = task_response.json()
+    assert task_projection["delivery_run_id"] == run.id
+    assert task_projection["delivery_terminal"] == "ready_to_merge"
+
+    monitor_response = await client.get(f"/api/pr-monitor/runs/{monitor_id}")
+    assert monitor_response.status_code == 200, monitor_response.text
+    monitor_projection = monitor_response.json()
+    assert monitor_projection["id"] == delivery["pr_monitor_run_id"]
+    assert monitor_projection["pr_number"] == delivery["pr_number"]
+    assert monitor_projection["current_head_sha"] == delivery["head_sha"]
 
 
 @pytest.mark.asyncio

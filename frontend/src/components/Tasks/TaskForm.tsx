@@ -76,7 +76,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [deliveryReposLoading, setDeliveryReposLoading] = useState(false);
   const [provider, setProvider] = useState('codex');
   // 分布式 Worker：执行位置（'' = 本机）
-  const [workerId, setWorkerId] = useState('');
+  const [workerId] = useState('');
   // workers state removed — Run on moved to Project level
   const [model, setModel] = useState('');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
@@ -129,8 +129,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const applyStoredDefaults = (
     stored: StoredTaskDefaults | null,
     fallbackProvider: string,
-    allowDeliveryLoop = false,
-    availableProviders: readonly string[] = ['claude', 'codex'],
   ) => {
     setPriority(stored?.priority ?? 0);
     // Plan creation now lives on the first-class Plans page. Normalize the
@@ -138,26 +136,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     // removed Task-form mode invisibly.
     const storedMode = stored?.mode || 'auto';
     const requestedProvider = stored?.provider || fallbackProvider;
-    const deliveryProvider = resolveDeliveryProvider(
-      requestedProvider,
-      fallbackProvider,
-      availableProviders,
-    );
-    const normalizedMode = (
-      storedMode === 'plan'
-      || (storedMode === 'delivery_loop' && (!allowDeliveryLoop || !deliveryProvider))
-        ? 'auto'
-        : storedMode
-    );
-    const resolvedProvider = normalizedMode === 'delivery_loop'
-      ? deliveryProvider!
-      : requestedProvider;
-    const deliveryProviderChanged = normalizedMode === 'delivery_loop'
-      && resolvedProvider !== requestedProvider;
+    const normalizedMode = storedMode === 'plan' || storedMode === 'delivery_loop'
+      ? 'auto'
+      : storedMode;
+    const resolvedProvider = requestedProvider;
     setMode(normalizedMode);
     setProvider(resolvedProvider);
-    setModel(deliveryProviderChanged ? '' : (stored?.model || ''));
-    setEffort(deliveryProviderChanged ? '' : (stored?.effort || ''));
+    setModel(stored?.model || '');
+    setEffort(stored?.effort || '');
     setCodexServiceTier(
       resolvedProvider === 'codex' && stored?.codexServiceTier === 'priority'
         ? 'priority'
@@ -178,7 +164,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     // Restore persisted user choices independently of the server request.
     // A slow or unavailable backend must not make local defaults disappear.
-    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
+    applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     api.config().then((c) => {
       const configuredProvider = c.default_provider || 'codex';
       const configuredProviderOptions = c.provider_options.length
@@ -208,8 +194,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       applyStoredDefaults(
         readStoredTaskDefaults(),
         configuredProvider,
-        deliveryEnabled,
-        configuredProviderOptions,
       );
     }).catch(() => {
       setProviderConfigLoaded(true);
@@ -217,7 +201,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexCapabilitiesLoaded(true);
       setDeliveryLoopEnabled(false);
       setAutoCapabilityAvailable(false);
-      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
+      applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     });
     api.getRuntimeSettings()
       .then((runtime) => {
@@ -742,8 +726,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       applyStoredDefaults(
         readStoredTaskDefaults(),
         defaultProvider,
-        deliveryLoopEnabled,
-        providerOptions,
       );
       onCreated();
     } catch (err) {
@@ -1080,9 +1062,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
                   <option value="pr_loop">PR Loop</option>
-                  {deliveryLoopEnabled && deliveryProviders.length > 0 && (
-                    <option value="delivery_loop">Delivery Loop</option>
-                  )}
                 </select>
 
                 {autoCapabilityEligible && (
@@ -1162,15 +1141,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                         then resume the same Task. Budgets are non-refundable.
                       </p>
                     </div>
-                  </>
-                )}
-
-                {false && (
-                  <>
-                    {/* Run on removed — Task inherits from Project */}
-                    <span className="text-gray-400">Run on</span>
-                    <select className="hidden" value={workerId} onChange={(e) => setWorkerId(e.target.value)}>
-                    </select>
                   </>
                 )}
 

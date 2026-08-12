@@ -15,6 +15,7 @@ import WorkersPage from './pages/WorkersPage';
 import TeamPage from './pages/TeamPage';
 import { SkillsPage } from './pages/SkillsPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { DeliveryPage } from './pages/DeliveryPage';
 
 import { getToken } from './api/client';
 import { isCapacitor, getServerUrl, getApiBase } from './config/server';
@@ -46,14 +47,15 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: string |
   }
 }
 
-const VALID_PAGES = new Set(['tasks', 'plans', 'dashboard', 'projects', 'secrets', 'files', 'discussions', 'pr-monitor', 'workers', 'skills', 'team', 'settings', 'server']);
+const VALID_PAGES = new Set(['tasks', 'plans', 'delivery', 'dashboard', 'projects', 'secrets', 'files', 'discussions', 'pr-monitor', 'workers', 'skills', 'team', 'settings', 'server']);
 
-function parseHash(): { page: string; chatTaskId: number | null; planId: number | null } {
+function parseHash(): { page: string; chatTaskId: number | null; planId: number | null; deliveryRunId: number | null } {
   const hash = window.location.hash.replace(/^#\/?/, '');
   const parts = hash.split('/');
   const page = VALID_PAGES.has(parts[0]) ? parts[0] : 'tasks';
   let chatTaskId: number | null = null;
   let planId: number | null = null;
+  let deliveryRunId: number | null = null;
   if (page === 'tasks' && parts[1] === 'chat' && parts[2]) {
     const id = parseInt(parts[2], 10);
     if (id > 0) chatTaskId = id;
@@ -62,13 +64,18 @@ function parseHash(): { page: string; chatTaskId: number | null; planId: number 
     const id = parseInt(parts[1], 10);
     if (id > 0) planId = id;
   }
-  return { page, chatTaskId, planId };
+  if (page === 'delivery' && parts[1]) {
+    const id = parseInt(parts[1], 10);
+    if (id > 0) deliveryRunId = id;
+  }
+  return { page, chatTaskId, planId, deliveryRunId };
 }
 
-function updateHash(page: string, chatTaskId: number | null, planId: number | null) {
+function updateHash(page: string, chatTaskId: number | null, planId: number | null, deliveryRunId: number | null) {
   let hash = `#/${page}`;
   if (page === 'tasks' && chatTaskId) hash += `/chat/${chatTaskId}`;
   if (page === 'plans' && planId) hash += `/${planId}`;
+  if (page === 'delivery' && deliveryRunId) hash += `/${deliveryRunId}`;
   if (window.location.hash !== hash) {
     window.history.replaceState(null, '', hash);
   }
@@ -79,13 +86,14 @@ function App() {
   const [page, setPage] = useState(initial.page);
   const [chatTaskId, setChatTaskId] = useState<number | null>(initial.chatTaskId);
   const [planId, setPlanId] = useState<number | null>(initial.planId);
+  const [deliveryRunId, setDeliveryRunId] = useState<number | null>(initial.deliveryRunId);
   const [authenticated, setAuthenticated] = useState(false);
   const [checking, setChecking] = useState(true);
   const [needsServerConfig, setNeedsServerConfig] = useState(false);
 
   useEffect(() => {
-    updateHash(page, chatTaskId, planId);
-  }, [page, chatTaskId, planId]);
+    updateHash(page, chatTaskId, planId, deliveryRunId);
+  }, [page, chatTaskId, planId, deliveryRunId]);
 
   useEffect(() => {
     const onHashChange = () => {
@@ -93,6 +101,7 @@ function App() {
       setPage(parsed.page);
       setChatTaskId(parsed.chatTaskId);
       setPlanId(parsed.planId);
+      setDeliveryRunId(parsed.deliveryRunId);
     };
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
@@ -109,12 +118,21 @@ function App() {
     setPage(p);
     if (p !== 'tasks') setChatTaskId(null);
     if (p !== 'plans') setPlanId(null);
+    if (p !== 'delivery') setDeliveryRunId(null);
   };
 
   const handleNavigateTask = (taskId: number) => {
+    setDeliveryRunId(null);
     setPlanId(null);
     setChatTaskId(taskId);
     setPage('tasks');
+  };
+
+  const handleNavigatePlan = (nextPlanId: number) => {
+    setDeliveryRunId(null);
+    setChatTaskId(null);
+    setPlanId(nextPlanId);
+    setPage('plans');
   };
 
   useEffect(() => {
@@ -190,6 +208,7 @@ function App() {
         {page === 'dashboard' && <Dashboard />}
         {page === 'tasks' && <TasksPage chatTaskId={chatTaskId} onChatTaskChange={setChatTaskId} />}
         {page === 'plans' && <PlansPage selectedPlanId={planId} onSelectedPlanChange={setPlanId} onNavigateTask={handleNavigateTask} onNavigateSettings={() => handleNavigate('settings')} />}
+        {page === 'delivery' && <DeliveryPage selectedRunId={deliveryRunId} onSelectedRunChange={setDeliveryRunId} onNavigate={handleNavigate} onNavigateTask={handleNavigateTask} onNavigatePlan={handleNavigatePlan} />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'secrets' && <SecretsPage />}
         {page === 'files' && <FilesPage />}

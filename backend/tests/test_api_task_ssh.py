@@ -1189,20 +1189,10 @@ async def test_task_ssh_write_receipt_replays_without_retaining_content(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("generation_limit", "incarnation_limit", "expected_message"),
-    [
-        (1, 100, "execution generation"),
-        (100, 1, "Task incarnation"),
-    ],
-)
-async def test_task_ssh_effect_admission_has_durable_count_limits(
+async def test_task_ssh_effect_admission_has_no_count_quota(
     client,
     tmp_path,
     monkeypatch,
-    generation_limit,
-    incarnation_limit,
-    expected_message,
 ):
     profile_id, _ = await _create_profile(client, tmp_path)
     created = await client.post("/api/tasks", json={
@@ -1222,28 +1212,19 @@ async def test_task_ssh_effect_admission_has_durable_count_limits(
         "backend.api.task_ssh.executor_for_profile",
         lambda _profile: FakeExecutor(),
     )
-    monkeypatch.setattr(
-        "backend.api.task_ssh.MAX_TASK_SSH_EFFECTS_PER_GENERATION",
-        generation_limit,
-    )
-    monkeypatch.setattr(
-        "backend.api.task_ssh.MAX_TASK_SSH_EFFECTS_PER_INCARNATION",
-        incarnation_limit,
-    )
+    # This exceeds both former hard limits (64 per generation and 256 per
+    # incarnation) without changing the Task execution identity.
+    for index in range(257):
+        response = await client.post(
+            f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
+            json={
+                "effect_id": f"{index + 1:032x}",
+                "command": f"command-{index}",
+            },
+        )
+        assert response.status_code == 200, response.text
 
-    first = await client.post(
-        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
-        json={"effect_id": _effect_id(108), "command": "first"},
-    )
-    rejected = await client.post(
-        f"/api/tasks/{task_id}/ssh-access/{profile_id}/execute",
-        json={"effect_id": _effect_id(109), "command": "second"},
-    )
-
-    assert first.status_code == 200
-    assert rejected.status_code == 409
-    assert expected_message in rejected.json()["detail"]["message"]
-    assert calls == 1
+    assert calls == 257
 
 
 @pytest.mark.asyncio

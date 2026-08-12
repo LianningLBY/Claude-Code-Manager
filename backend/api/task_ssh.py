@@ -10,7 +10,7 @@ from datetime import datetime
 from functools import wraps
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, select, text, update
+from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,10 +81,9 @@ MAX_TASK_SSH_WRITE_BYTES = 1024 * 1024
 # The executor captures at most 64 KiB across stdout+stderr. JSON escaping can
 # expand control/replacement characters by up to 6x, so reserve a hard 512 KiB
 # envelope. Every successful response fits this envelope and therefore remains
-# replayable after an ACK loss; the count quotas bound permanent DB growth.
+# replayable after an ACK loss. Receipts remain permanently auditable; SSH
+# authorization and the one-effect-at-a-time fence are the admission controls.
 MAX_TASK_SSH_REPLAY_PAYLOAD_BYTES = 512 * 1024
-MAX_TASK_SSH_EFFECTS_PER_GENERATION = 64
-MAX_TASK_SSH_EFFECTS_PER_INCARNATION = 256
 _UNKNOWN_EFFECT_STATUSES = ("running", "ambiguous")
 
 
@@ -669,36 +668,6 @@ async def _admit_task_ssh_effect(
         profile_id=profile_id,
         required_capability=required_capability,
     )
-    generation_count = await db.scalar(
-        select(func.count(TaskSSHEffectReceipt.id)).where(
-            TaskSSHEffectReceipt.task_id == generation.task_id,
-            TaskSSHEffectReceipt.task_incarnation_id
-            == generation.incarnation_id,
-            TaskSSHEffectReceipt.task_retry_count == generation.retry_count,
-            TaskSSHEffectReceipt.task_turn_generation
-            == generation.turn_generation,
-            TaskSSHEffectReceipt.task_status == generation.status,
-        )
-    )
-    if (generation_count or 0) >= MAX_TASK_SSH_EFFECTS_PER_GENERATION:
-        raise _effect_http_error(
-            409,
-            "Task SSH effect limit reached for this execution generation",
-            effect_id,
-        )
-    incarnation_count = await db.scalar(
-        select(func.count(TaskSSHEffectReceipt.id)).where(
-            TaskSSHEffectReceipt.task_id == generation.task_id,
-            TaskSSHEffectReceipt.task_incarnation_id
-            == generation.incarnation_id,
-        )
-    )
-    if (incarnation_count or 0) >= MAX_TASK_SSH_EFFECTS_PER_INCARNATION:
-        raise _effect_http_error(
-            409,
-            "Task SSH effect limit reached for this Task incarnation",
-            effect_id,
-        )
     receipt = TaskSSHEffectReceipt(
         effect_id=effect_id,
         task_id=task_id,

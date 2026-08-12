@@ -535,14 +535,6 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           )}
         </div>
 
-        <ProjectSelect
-          projects={tagFilteredProjects}
-          value={projectFilter}
-          onChange={(v) => setProjectFilter(v ? Number(v) : undefined)}
-          placeholder="Projects"
-          tagColorMap={tagColorMap}
-        />
-
         <button
           onClick={() => {
             setShowSearch((s) => {
@@ -583,6 +575,14 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         {filteredSearchResults !== null && (
           <span className="text-xs text-gray-500 whitespace-nowrap">{filteredSearchResults.length} match{filteredSearchResults.length === 1 ? '' : 'es'}</span>
         )}
+
+        <ProjectSelect
+          projects={tagFilteredProjects}
+          value={projectFilter}
+          onChange={(v) => setProjectFilter(v ? Number(v) : undefined)}
+          placeholder="Projects"
+          tagColorMap={tagColorMap}
+        />
       </div>
   );
 

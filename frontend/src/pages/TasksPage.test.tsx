@@ -124,7 +124,7 @@ vi.mock('../components/Chat/LoopChatView', () => ({
   LoopChatView: () => null,
 }));
 vi.mock('../components/ProjectSelect', () => ({
-  ProjectSelect: () => null,
+  ProjectSelect: () => <button type="button">Projects</button>,
 }));
 vi.mock('../components/Tasks/TaskBadges', () => ({
   PluginsBadge: ({ task }: { task: { id: number } }) => (
@@ -300,6 +300,22 @@ describe('TasksPage realtime reconciliation', () => {
     await userEvent.click(screen.getByRole('button', { name: /Filter/ }));
     expect(screen.queryByText('Standalone Plans')).not.toBeInTheDocument();
     expect(screen.queryByText('Related Plans')).not.toBeInTheDocument();
+  });
+
+  it('places search directly after Filter and before Projects', async () => {
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    const filterButton = await screen.findByRole('button', { name: /Filter/ });
+    const searchButton = screen.getByTitle('Search task titles (regex)');
+    const projectButton = screen.getByRole('button', { name: 'Projects' });
+
+    expect(filterButton.compareDocumentPosition(searchButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(searchButton.compareDocumentPosition(projectButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it('shows the attention tag in the split-mode task sidebar', async () => {

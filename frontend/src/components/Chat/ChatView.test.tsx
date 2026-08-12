@@ -467,6 +467,11 @@ describe('ChatView', () => {
     expect(badges.className).toContain('flex-nowrap');
     expect(badges.className).toContain('overflow-hidden');
 
+    const projectBadge = screen.getByTestId('chat-project-badge');
+    expect(projectBadge).toHaveAttribute('title', 'A long mobile project name');
+    expect(projectBadge).toHaveClass('w-fit', 'max-w-full', 'shrink', 'truncate');
+    expect(projectBadge).not.toHaveClass('flex-1', 'grow', 'w-full');
+
     const actions = screen.getByTestId('chat-header-actions');
     expect(actions.className).toContain('shrink-0');
     expect(screen.getByText('Plans').className).toContain('hidden');

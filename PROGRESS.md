@@ -1092,3 +1092,8 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：app-server 在独占启动边界检查 1 GiB 阈值，只将同 owner、单硬链接的 `logs_2.sqlite{,-wal,-shm}` 原子移入私有 quarantine；新 app-server initialize/version proof 成功后才删除旧库。启动失败保留证据，下一次成功启动会收敛合法的 crash 遗留 quarantine，config/auth/sessions/rollout/state 不进入清理范围。
 - **避免复发**：Codex home 的 diagnostics DB 与 session/rollout 必须分层维护；不能靠放宽 Fast proof 或无限增加初始化超时掩盖本地状态膨胀。任何自动回收都必须精确文件 allowlist、先完整 lstat 校验再移动、成功启动后才清除。
 - **提交**：`2c7e007`
+## 2026-08-12 — Apex Fast thread/start 省略 serviceTier
+
+- **问题**：日志库恢复后 task 321 的 Apex `thread/start` 成功，但 Codex 0.147 custom-provider 响应省略 `serviceTier`；旧门禁在真正的 actual-tier proxy proof 之前把缺字段误判为降级。
+- **解决**：只有请求为 priority、exact actual-tier proxy 存在且强制 proof 时，允许缺失的 thread 响应 tier 临时通过；turn 仍须由代理观察首个上游 `response.created.response.service_tier=priority` 才发布成功。没有 proxy proof 的相同响应继续在 turn/start 前 fail closed。
+- **提交**：`5fa758c`

@@ -1109,3 +1109,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **根因**：Claude Code 2.1.168 在 `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` 下会把有效 permission mode 强制为 `default`；普通 Task 又默认注入 `ccm_frontend_review` / `ccm_workspace_review`，但 Task 隔离 allowlist 未包含这些工具，CloudRouter PTY 因此停在无法经 channel bridge 展示的原生 permission prompt。
 - **修复与边界**：保留凭据隔离所需的 scrub，在 `task_agent_isolation._mcp_allow_rules()` 补齐 frontend/workspace/browser review 的 CCM-owned 精确工具清单；`--strict-mcp-config` 仍只暴露本轮私有 MCP。新增精确集合回归，要求内置工具与七类可能注入的 CCM MCP 权限既不缺失也不扩张。
 - **验证**：隔离策略完整文件与 PTY scrub 启动边界共 `43 passed`；Python 编译与 `git diff --check` 通过。未调用真实模型、未运行无关全量测试、未修改或重启生产环境；已有卡住的旧 turn 不会被代码提交自动恢复，部署后需显式重发。
+# 2026-08-12 — Claude 受管 API 账号 PTY 认证修复
+
+- 问题：Claude CLI 2.1.168 的交互 PTY 路径只在 `.claude.json.customApiKeyResponses.approved` 包含 Key 后缀时才使用 `ANTHROPIC_API_KEY`；headless `-p` 会跳过该门禁，导致 smoke 通过而生产 PTY 报 `Not logged in`。
+- 修复：受管 CloudRouter Key 改用无交互 `ANTHROPIC_AUTH_TOKEN` Bearer 投影，继续保留子进程凭据 scrub。
+- 防回归：新增 opt-in 真实 claude-pty 测试，刻意把当前 Key 指纹写入 `rejected` 后验证首轮返回固定文本。
+- 实现提交：`e0ea9e04`。

@@ -149,6 +149,34 @@ def test_claude_plan_command_is_read_only():
     assert "--dangerously-skip-permissions" not in command
 
 
+def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
+    from backend.services.plan_agent_runner import (
+        _versioned_planner_prompt,
+        _versioned_reviewer_prompt,
+    )
+
+    common = {
+        "planning_request": "Add a status endpoint.",
+        "target_context": "",
+        "interaction_history": "",
+        "repository_context": '{"changed_since_run_start": false}',
+    }
+    planner = _versioned_planner_prompt(
+        **common,
+        base_plan=None,
+        reviewer_feedback=None,
+    )
+    reviewer = _versioned_reviewer_prompt(
+        **common,
+        plan_content="Inspect the existing route conventions.",
+    )
+
+    assert "header must be at most 20 characters" in planner
+    assert "not user decisions" in planner
+    assert "header must be at most 20 characters" in reviewer
+    assert "not be converted into a user question" in reviewer
+
+
 def test_structured_output_parsers_accept_native_provider_envelopes():
     claude_raw = json.dumps({
         "type": "result",

@@ -5350,20 +5350,16 @@ async def test_tool_free_profile_rejects_server_initiated_tool_request():
 
 
 @pytest.mark.asyncio
-async def test_tool_free_profile_invalidates_active_turn_when_skills_change():
+async def test_tool_free_profile_records_skills_change_without_false_violation():
     server = CodexAppServer("codex")
     process, thread_id = await _start_tool_free_test_turn(server)
-    context = server._contexts_by_thread[thread_id]
     server._schedule_tool_free_violation = MagicMock()
     revision = server._skills_revision
 
     server._handle_notification("skills/changed", {})
 
     assert server._skills_revision == revision + 1
-    server._schedule_tool_free_violation.assert_called_once_with(
-        context,
-        "skills inventory changed",
-    )
+    server._schedule_tool_free_violation.assert_not_called()
     server._handle_notification("turn/completed", {
         "threadId": thread_id,
         "turn": {
@@ -5477,6 +5473,9 @@ async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
         "backend.services.codex_app_server."
         "_ISOLATED_SKILLS_SNAPSHOT_TIMEOUT",
         1.0,
+    ), patch(
+        "backend.services.codex_app_server._ISOLATED_SKILLS_QUIET_PERIOD",
+        0.01,
     ):
         process, thread_id = await server.start_turn(
             prompt="remain tool-free with the current skills snapshot",
@@ -5494,11 +5493,11 @@ async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
     assert [
         call.args[0] for call in server._request.await_args_list[:3]
     ] == ["skills/list", "skills/list", "skills/list"]
-    assert [
-        call.args[1]["forceReload"]
+    assert all(
+        call.args[1]["forceReload"] is False
         for call in server._request.await_args_list
         if call.args[0] == "skills/list"
-    ] == [True, False, False, False, False, False]
+    )
     assert all(
         call.args[0] != "plugin/list"
         for call in server._request.await_args_list
@@ -5542,7 +5541,7 @@ async def test_codex_0147_stabilizes_skills_snapshot_without_plugin_list():
 
 
 @pytest.mark.asyncio
-async def test_codex_0147_waits_out_delayed_forced_skills_notification():
+async def test_codex_0147_does_not_force_a_delayed_skills_notification():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server._runtime_version = (0, 147, 0)
@@ -5556,12 +5555,6 @@ async def test_codex_0147_waits_out_delayed_forced_skills_notification():
         if method == "skills/list":
             if params["forceReload"]:
                 forced_reads += 1
-                asyncio.get_running_loop().call_later(
-                    0.01,
-                    server._handle_notification,
-                    "skills/changed",
-                    {},
-                )
             return _empty_skills_response("/tmp")
         if method == "thread/start":
             return _tool_free_thread_response(
@@ -5590,11 +5583,71 @@ async def test_codex_0147_waits_out_delayed_forced_skills_notification():
             tools_disabled=True,
         )
 
-    assert forced_reads == 1
+    assert forced_reads == 0
     assert thread_id == "thread-delayed-skills"
     server._handle_notification("turn/completed", {
         "threadId": thread_id,
         "turn": {"id": "turn-delayed-skills", "status": "completed"},
+    })
+    assert await process.wait() == 0
+
+
+@pytest.mark.asyncio
+async def test_codex_0147_avoids_late_forced_skills_watcher_event():
+    """Admission must not schedule a self-induced post-start watcher event."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server._runtime_version = (0, 147, 0)
+    server.ensure_started = AsyncMock()
+    forced_reads = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal forced_reads
+        if method == "config/read":
+            return _ambient_mcp_response()
+        if method == "skills/list":
+            if params["forceReload"]:
+                forced_reads += 1
+                asyncio.get_running_loop().call_later(
+                    0.3,
+                    server._handle_notification,
+                    "skills/changed",
+                    {},
+                )
+            return _empty_skills_response("/tmp")
+        if method == "thread/start":
+            return _tool_free_thread_response(
+                "thread-late-skills",
+                permission_profile=params["config"]["default_permissions"],
+            )
+        if method == "turn/start":
+            return {"turn": {"id": "turn-late-skills"}}
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+    with patch(
+        "backend.services.codex_app_server._ISOLATED_SKILLS_QUIET_PERIOD",
+        0.35,
+    ):
+        process, thread_id = await server.start_turn(
+            prompt="remain tool-free after the watcher's debounce",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            effort="high",
+            resume_session_id=None,
+            git_env=None,
+            task_id=911,
+            sandbox_mode="read-only",
+            disable_autonomous_features=True,
+            tools_disabled=True,
+        )
+
+    assert forced_reads == 0
+    assert thread_id == "thread-late-skills"
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {"id": "turn-late-skills", "status": "completed"},
     })
     assert await process.wait() == 0
 

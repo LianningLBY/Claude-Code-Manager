@@ -223,14 +223,16 @@ _GOAL_RECONCILE_INTERVAL = 5.0
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
 # Codex 0.147 exposes no RPC that proves background plugin discovery settled;
-# calling ``plugin/list`` can itself schedule more background work. Isolated
-# preflight therefore never calls it. Two consecutive forced, canonical skill
-# snapshots capture the current inventory without triggering plugin refresh.
-# This is not a plugin-settled proof: safety still comes from disabling plugin
-# features plus the existing thread/ownership/turn fingerprint and revision
-# fences. Bound both reads and wall time so a moving inventory fails closed.
+# forcing either plugin or skill discovery can itself schedule delayed global
+# watcher work. Isolated preflight therefore reads the watcher-maintained skill
+# cache twice without forcing a refresh. This is not a plugin-settled proof:
+# safety still comes from disabling plugin features plus the existing thread,
+# ownership, turn fingerprint and monotonic revision fences. Bound both reads
+# and wall time so a moving inventory fails closed.
 _ISOLATED_SKILLS_SNAPSHOT_MAX_READS = 8
 _ISOLATED_SKILLS_SNAPSHOT_TIMEOUT = 10.0
+# Keep admission private briefly after two matching cache reads so already
+# queued real watcher events can advance the revision before model input.
 _ISOLATED_SKILLS_QUIET_PERIOD = 0.25
 
 
@@ -4949,11 +4951,16 @@ class CodexAppServer:
                     while reads < _ISOLATED_SKILLS_SNAPSHOT_MAX_READS:
                         reads += 1
                         revision_before = self._skills_revision
-                        # One forced read refreshes the process-global cache.
-                        # Subsequent reads inspect that cache without creating
-                        # another delayed ``skills/changed`` notification.
+                        # Codex's watcher owns and updates the process-global
+                        # cache.  A forced read manufactures a delayed
+                        # ``skills/changed`` notification whose debounce can
+                        # exceed several seconds and invalidate the exact
+                        # deny-list after model input.  Read the watcher cache
+                        # twice and fence it with the monotonic revision;
+                        # genuine filesystem drift still advances that
+                        # revision and fails closed.
                         skills_inventory = await read_skills_inventory(
-                            force_reload=reads == 1,
+                            force_reload=False,
                         )
                         revision_after = self._skills_revision
                         disabled_skills = _tool_free_disabled_skill_config(
@@ -7428,11 +7435,19 @@ class CodexAppServer:
 
     def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
         if method == "skills/changed":
-            # Skill discovery is process-global. Any change invalidates the
-            # exact path inventory captured for every active tool-free turn.
+            # Discovery is process-global, but a tool-free review has already
+            # proved an empty environment/dynamic-tool surface, deny-all
+            # filesystem/network permissions, no instruction sources, and
+            # request-level disabling of skill instructions, bundled skills,
+            # and the orchestrator. Codex 0.147 also emits this notification
+            # asynchronously when thread/start applies that deny config, so
+            # treating it as capability use kills a correctly isolated model
+            # turn. Keep the monotonic revision for every subsequent
+            # admission. MCP-only turns retain the active-turn fence because
+            # their explicitly allowed tool surface is not empty.
             self._skills_revision += 1
             for context in list(self._contexts_by_thread.values()):
-                if context.tools_disabled or context.mcp_only:
+                if context.mcp_only:
                     self._schedule_tool_free_violation(
                         context,
                         "skills inventory changed",

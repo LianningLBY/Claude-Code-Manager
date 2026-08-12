@@ -30,7 +30,7 @@ import stat
 import time
 import tomllib
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 from urllib.parse import parse_qsl, urlencode, urlsplit
@@ -513,7 +513,7 @@ def _extract_request_identity(
     headers: dict[str, str],
     body: bytes,
     expected_lineage: Callable[[str, str | None], tuple[str, str]],
-) -> _RequestIdentity:
+) -> tuple[_RequestIdentity, bytes]:
     if headers.get("content-encoding", "identity").lower() not in {
         "",
         "identity",
@@ -626,13 +626,34 @@ def _extract_request_identity(
             f"Unsupported request service_tier {requested_raw!r}",
             identity,
         )
-    if requested != expected:
+    if requested != expected and not (
+        expected == CODEX_TIER_PRIORITY
+        and requested == CODEX_TIER_DEFAULT
+    ):
         raise _CodexTierRequestMismatch(
             f"Codex request tier mismatch for thread {thread_id}: "
             f"expected {expected}, got {requested}",
             identity,
         )
-    return identity
+    if expected == CODEX_TIER_PRIORITY and requested == CODEX_TIER_DEFAULT:
+        # Codex 0.147's app-server accepts serviceTier on thread/start but its
+        # custom-provider Responses transport can omit (or reset) the matching
+        # HTTP field.  The exact CCM lineage mapping is authoritative for
+        # request construction, while _forward_verified_sse still requires the
+        # upstream response to prove that priority was actually admitted.
+        payload["service_tier"] = CODEX_TIER_PRIORITY
+        body = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(body) > _MAX_REQUEST_BYTES:
+            raise CodexTierProofError("Codex request body is too large")
+        identity = replace(
+            identity,
+            requested_tier=CODEX_TIER_PRIORITY,
+        )
+    return identity, body
 
 
 async def _iter_response_raw(
@@ -1239,7 +1260,7 @@ class CodexActualTierProxy:
         ):
             body = await self._read_body(reader, headers)
             try:
-                identity = _extract_request_identity(
+                identity, body = _extract_request_identity(
                     headers,
                     body,
                     self._resolve_lineage,

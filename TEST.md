@@ -1391,6 +1391,12 @@ Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail close
 | `frontend/src/**` | TypeScript 类型检查 (`tsc --noEmit`) |
 | `frontend/src/components/Chat/TaskArtifactLink.tsx` | `frontend/src/components/Chat/ChatView.test.tsx` + `LoopChatView.test.tsx` |
 
+Codex Fast transport compatibility is covered by
+`backend/tests/test_codex_tier_proxy.py`: an exact priority lineage repairs
+Codex 0.147's missing/default outgoing `service_tier`, while Standard and
+unsupported tier mismatches remain fail-closed and Fast still requires the
+upstream `response.created` priority proof.
+
 ## 分布式 Worker 测试
 
 ### 单元/集成测试

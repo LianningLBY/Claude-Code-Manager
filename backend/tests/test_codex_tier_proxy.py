@@ -343,13 +343,13 @@ async def test_upstream_non_success_fails_waiter_without_second_response():
 
 
 @pytest.mark.asyncio
-async def test_request_tier_mismatch_never_reaches_upstream():
-    calls = 0
+@pytest.mark.parametrize("request_tier", [None, "default"])
+async def test_fast_proxy_repairs_missing_transport_tier(request_tier):
+    seen = {}
 
-    async def handler(_request: httpx.Request) -> httpx.Response:
-        nonlocal calls
-        calls += 1
-        return httpx.Response(500)
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, content=_sse(tier="priority"))
 
     proxy = await _running_proxy(handler)
     proxy.set_thread_tier("thread-1", "priority")
@@ -365,12 +365,12 @@ async def test_request_tier_mismatch_never_reaches_upstream():
             response = await client.post(
                 f"{proxy.local_base_url}/responses",
                 headers={"x-client-request-id": "thread-1"},
-                json=_request_body(tier=None),
+                json=_request_body(tier=request_tier),
             )
-        assert response.status_code == 502
-        assert calls == 0
-        with pytest.raises(CodexTierProofError, match="request tier mismatch"):
-            await waiter
+        assert response.status_code == 200
+        assert seen["body"]["service_tier"] == "priority"
+        proof = await waiter
+        assert proof.actual_tier == "priority"
     finally:
         await proxy.close()
 
@@ -397,7 +397,7 @@ async def test_rejected_child_request_does_not_claim_lineage():
                 json=_request_body(
                     thread_id="child-rejected",
                     turn_id="turn-rejected",
-                    tier=None,
+                    tier="flex",
                     parent_thread_id="root-1",
                 ),
             )

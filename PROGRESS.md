@@ -1097,3 +1097,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：日志库恢复后 task 321 的 Apex `thread/start` 成功，但 Codex 0.147 custom-provider 响应省略 `serviceTier`；旧门禁在真正的 actual-tier proxy proof 之前把缺字段误判为降级。
 - **解决**：只有请求为 priority、exact actual-tier proxy 存在且强制 proof 时，允许缺失的 thread 响应 tier 临时通过；turn 仍须由代理观察首个上游 `response.created.response.service_tier=priority` 才发布成功。没有 proxy proof 的相同响应继续在 turn/start 前 fail closed。
 - **提交**：`5fa758c`
+
+## 2026-08-12 — Codex 0.147 custom-provider Fast 请求字段修复
+
+- **问题**：Task 321 在 thread 准入兼容后仍被 actual-tier proxy 拒绝；精确证据显示 Codex 0.147 虽收到 `thread/start.serviceTier=priority`，实际发往 custom provider 的 Responses JSON 却缺失或重置为 `service_tier=default`。
+- **解决**：仅对代理中已由 CCM 精确登记为 priority 的 root/child lineage，将缺失/default 的出站字段重写为 `priority`；Standard lineage 不升级，显式冲突/未知值仍在任何上游请求前拒绝。代理继续缓存首个 SSE，只有上游 `response.created.response.service_tier=priority` 才发布并生成 actual-tier proof，因此不是放宽校验。
+- **验证**：代理与 app-server 完整测试 `328 passed, 3 skipped`；覆盖缺失/default 两种兼容输入、Standard 防升级、未知 tier 拒绝和上游 proof。

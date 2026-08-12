@@ -20,7 +20,7 @@ const ACTIVE_CODEX_LOGIN_STATUSES = new Set([
   'running', 'awaiting_otp', 'verifying_otp', 'finalizing',
 ]);
 
-const API_AUTH_KINDS = new Set(['cloudrouter_api', 'apex_api']);
+const API_AUTH_KINDS = new Set(['cloudrouter_api', 'apex_api', 'apibest_api']);
 
 function isApiAuthKind(authKind: string | null | undefined): boolean {
   return authKind != null && API_AUTH_KINDS.has(authKind);
@@ -31,7 +31,9 @@ function resolveApiProvider(
   provider: ApiAccountProvider | null | undefined,
 ): ApiAccountProvider {
   if (provider) return provider;
-  return authKind === 'apex_api' ? 'apex' : 'cloudrouter';
+  if (authKind === 'apex_api') return 'apex';
+  if (authKind === 'apibest_api') return 'apibest';
+  return 'cloudrouter';
 }
 
 function barColor(utilization: number): string {
@@ -528,7 +530,7 @@ function AccountCard({ account, preferred, lastSelected, apiKeyHint, onClearCool
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
+            {apiProvider === 'apex' ? 'APEXROUTER API' : apiProvider === 'apibest' ? 'APIBEST API' : 'API'}
           </span>
         )}
         {cleanupPending && (
@@ -751,7 +753,7 @@ function CodexAccountCard({ account, preferred, lastSelected, apiKeyHint, onClea
         </span>
         {isApi && (
           <span className="px-1.5 py-0.5 rounded bg-sky-600/30 text-sky-300 text-[10px] font-semibold uppercase">
-            {apiProvider === 'apex' ? 'APEXROUTER API' : 'API'}
+            {apiProvider === 'apex' ? 'APEXROUTER API' : apiProvider === 'apibest' ? 'APIBEST API' : 'API'}
           </span>
         )}
         {cleanupPending && (
@@ -940,7 +942,9 @@ function AddApiAccountModal({ onClose, onAdded }: {
   const [apiKey, setApiKey] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const providerName = apiProvider === 'apex' ? 'ApexRouter' : 'CloudRouter';
+  const providerName = apiProvider === 'apex'
+    ? 'ApexRouter'
+    : apiProvider === 'apibest' ? 'APIBest' : 'CloudRouter';
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -987,6 +991,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
             >
               <option value="cloudrouter">CloudRouter</option>
               <option value="apex">ApexRouter</option>
+              <option value="apibest">APIBest</option>
             </select>
           </div>
           <div>
@@ -996,7 +1001,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder={apiProvider === 'apex' ? '例如：ApexRouter Codex' : '例如：CloudRouter Claude'}
+              placeholder={apiProvider === 'apex' ? '例如：ApexRouter Codex' : apiProvider === 'apibest' ? '例如：APIBest' : '例如：CloudRouter Claude'}
               autoComplete="off"
               required
             />
@@ -1009,7 +1014,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
-              placeholder={apiProvider === 'apex' ? 'lck_...' : 'cr-...'}
+              placeholder={apiProvider === 'apex' ? 'lck_...' : apiProvider === 'apibest' ? 'sk-...' : 'cr-...'}
               autoComplete="new-password"
               required
             />
@@ -1018,12 +1023,14 @@ function AddApiAccountModal({ onClose, onAdded }: {
             <p>每把 Key 建立一个独立 API 账号目录，Key 会以 0600 权限持久保存，不会显示在账号列表或日志中。</p>
             {apiProvider === 'cloudrouter' ? (
               <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
-            ) : (
+            ) : apiProvider === 'apex' ? (
               <>
                 <p>ApexRouter 仅用于 Codex；系统会通过 /v1/models 验证 Key 并读取支持的模型。</p>
                 <p>额度通过 /v1/usage 获取：“已用”为当前 Key 用量，剩余、上限与并发限制由同组 Key 共享。</p>
                 <p>ApexRouter 当前不返回到期时间，因此到期时间和剩余天数会显示为无法确认。</p>
               </>
+            ) : (
+              <p>系统先通过 APIBest /v1/models 验证 Key，再从公开价格目录识别可用的 Claude 与 Codex 模型；该渠道暂不展示额度。</p>
             )}
             <p>API 账号会直接加入现有账号池，任务、换模型、会话与自动轮换方式不变。</p>
           </div>

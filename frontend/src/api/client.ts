@@ -1700,13 +1700,13 @@ export interface CloudRouterModelMap {
   codex: string[];
 }
 
-export type ApiAccountProvider = 'cloudrouter' | 'apex';
+export type ApiAccountProvider = 'cloudrouter' | 'apex' | 'apibest';
 
 export interface CloudRouterAccount {
   id: string;
   name: string;
   api_provider: ApiAccountProvider;
-  auth_kind: 'cloudrouter_api' | 'apex_api';
+  auth_kind: 'cloudrouter_api' | 'apex_api' | 'apibest_api';
   enabled: boolean;
   retired: boolean;
   cleanup_pending?: boolean;

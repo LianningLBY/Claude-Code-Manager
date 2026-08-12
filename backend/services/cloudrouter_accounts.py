@@ -38,6 +38,10 @@ USAGE_URL = f"{CODEX_BASE_URL}/usage"
 APEX_CODEX_BASE_URL = "https://api.apexin.ai/v1"
 APEX_MODELS_URL = f"{APEX_CODEX_BASE_URL}/models"
 APEX_USAGE_URL = f"{APEX_CODEX_BASE_URL}/usage"
+APIBEST_CLAUDE_BASE_URL = "https://apibest.ai"
+APIBEST_CODEX_BASE_URL = f"{APIBEST_CLAUDE_BASE_URL}/v1"
+APIBEST_MODELS_URL = f"{APIBEST_CODEX_BASE_URL}/models"
+APIBEST_PRICING_URL = f"{APIBEST_CLAUDE_BASE_URL}/api/pricing"
 LEGACY_APEX_CODEX_BASE_URL = "https://35-75-22-186.sslip.io/v1"
 LEGACY_APEX_ENDPOINTS = {
     "claude_base_url": None,
@@ -51,6 +55,7 @@ LEGACY_APEX_ENDPOINTS = {
 APEX_CODEX_CLIENT_VERSION = "0.147.0"
 API_PROVIDER_CLOUDROUTER = "cloudrouter"
 API_PROVIDER_APEX = "apex"
+API_PROVIDER_APIBEST = "apibest"
 APEX_CODEX_PROVIDER = "apexrouter"
 # Existing installs may already have the pre-rename provider in their managed
 # config. Accept only its exact CCM-owned shape and atomically rewrite it.
@@ -105,9 +110,19 @@ API_PROVIDER_SPECS = {
         models_url=APEX_MODELS_URL,
         usage_url=APEX_USAGE_URL,
     ),
+    API_PROVIDER_APIBEST: ApiProviderSpec(
+        id=API_PROVIDER_APIBEST,
+        label="APIBest",
+        account_prefix="apibest",
+        codex_provider="apibest",
+        claude_base_url=APIBEST_CLAUDE_BASE_URL,
+        codex_base_url=APIBEST_CODEX_BASE_URL,
+        models_url=APIBEST_MODELS_URL,
+        usage_url=None,
+    ),
 }
 ACCOUNT_ID_RE = re.compile(
-    r"^(?P<provider>cloudrouter|apex)-(?P<number>[1-9][0-9]*)$"
+    r"^(?P<provider>cloudrouter|apex|apibest)-(?P<number>[1-9][0-9]*)$"
 )
 MAX_METADATA_BYTES = 256 * 1024
 MAX_API_RESPONSE_BYTES = 1024 * 1024
@@ -638,6 +653,53 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
             raise CloudRouterUpstreamError("invalid_models_response")
         provider = _provider_for_model(model_id)
         if not provider or model_id in seen:
+            continue
+        seen.add(model_id)
+        result[provider].append(model_id)
+    for values in result.values():
+        values.sort()
+    if not any(result.values()):
+        raise CloudRouterUpstreamError("no_supported_models")
+    return result
+
+
+def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
+    """Build APIBest's CCM catalog from its public pricing response.
+
+    APIBest validates the token at ``/v1/models`` but currently returns an
+    empty ``data`` array for valid credentials. Its pricing endpoint exposes
+    the actual model ids and supported endpoint types, so use that catalog
+    only after the authenticated models probe succeeds.
+    """
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        raise CloudRouterUpstreamError("invalid_models_response")
+    items = payload["data"]
+    if len(items) > MAX_DISCOVERED_MODELS:
+        raise CloudRouterUpstreamError("too_many_models")
+    result: dict[str, list[str]] = {"claude": [], "codex": []}
+    seen: set[str] = set()
+    for item in items:
+        model_id = item.get("model_name") if isinstance(item, dict) else None
+        endpoint_types = (
+            item.get("supported_endpoint_types", [])
+            if isinstance(item, dict)
+            else []
+        )
+        if not isinstance(model_id, str) or not isinstance(endpoint_types, list):
+            continue
+        model_id = model_id.strip()
+        if (
+            not model_id
+            or len(model_id.encode("utf-8")) > MAX_MODEL_ID_BYTES
+            or any(character.isspace() for character in model_id)
+        ):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        provider = _provider_for_model(model_id)
+        if not provider or model_id in seen:
+            continue
+        required_endpoint = "anthropic" if provider == "claude" else "openai"
+        if required_endpoint not in endpoint_types:
             continue
         seen.add(model_id)
         result[provider].append(model_id)
@@ -1709,9 +1771,11 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Invalid Claude settings: {account.id}",
             ) from exc
+        expected_base_url = API_PROVIDER_SPECS[account.api_provider].claude_base_url
         if (
             not isinstance(settings, dict)
-            or settings.get("env") != {"ANTHROPIC_BASE_URL": CLAUDE_BASE_URL}
+            or settings.get("env")
+            != {"ANTHROPIC_BASE_URL": expected_base_url}
             or settings.get("apiKeyHelper")
             != _claude_helper_command(account.root)
         ):
@@ -2230,9 +2294,19 @@ class CloudRouterAccountStore:
             return _normalise_apex_models(
                 await self._request_json(models_url, api_key)
             )
-        return _normalise_models(
-            await self._request_json(spec.models_url, api_key)
-        )
+        payload = await self._request_json(spec.models_url, api_key)
+        if provider == API_PROVIDER_APIBEST:
+            authenticated = (
+                _normalise_models(payload)
+                if isinstance(payload, dict) and payload.get("data")
+                else None
+            )
+            if authenticated is not None:
+                return authenticated
+            return _normalise_apibest_pricing(
+                await self._request_json(APIBEST_PRICING_URL, api_key)
+            )
+        return _normalise_models(payload)
 
     def _read_api_key(self, account: CloudRouterAccount) -> str:
         path = account.root / "api.key"

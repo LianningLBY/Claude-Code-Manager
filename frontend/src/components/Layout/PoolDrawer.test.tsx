@@ -558,6 +558,36 @@ describe('PoolDrawer', () => {
       });
     });
 
+    it('adds an APIBest key as a dual-provider API account', async () => {
+      vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
+        ...apiAccount,
+        id: 'apibest-1',
+        name: 'APIBest',
+        api_provider: 'apibest',
+        auth_kind: 'apibest_api',
+      });
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByTitle('添加 API 账号'));
+      await user.selectOptions(screen.getByLabelText('API 渠道'), 'apibest');
+
+      expect(screen.getByLabelText('APIBest API Key')).toBeInTheDocument();
+      expect(screen.getByText(/公开价格目录识别可用的 Claude 与 Codex 模型/)).toBeInTheDocument();
+      await user.type(screen.getByLabelText('账号名称'), 'APIBest');
+      await user.type(screen.getByLabelText('APIBest API Key'), 'sk-test-only');
+      await user.click(screen.getByRole('button', { name: '验证并添加' }));
+
+      await waitFor(() => {
+        expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
+          name: 'APIBest',
+          api_key: 'sk-test-only',
+          api_provider: 'apibest',
+        });
+      });
+    });
+
     it('deletes a Claude API projection by shared api_account_id and refreshes both pools', async () => {
       vi.mocked(api.getPoolUsage).mockResolvedValue({
         enabled: true,

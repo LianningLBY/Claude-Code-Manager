@@ -983,6 +983,7 @@ python -m pytest \
 | `TestRateLimitDetection` / `TestAuthFailureDetection` / `TestPoolRotatable` | 限速/认证失败文案检测（窄正则，含中英文与各时区变体） |
 | `test_cloudrouter_claude_launch_replaces_inherited_auth_env` / `test_cloudrouter_claude_pty_projects_direct_auth_for_model_only` | CloudRouter Claude direct/PTY 启动均以所选账号 Key 覆盖 ambient auth，保留子进程凭据清洗开关 |
 | `test_real_claude_pty_uses_managed_bearer_token` | opt-in 真实 Claude PTY 调用：预置当前 Key 为 rejected，验证 Bearer 投影仍能完成首轮响应；需 `CCM_RUN_REAL_CLAUDE_API_TESTS=1`、`CCM_REAL_CLAUDE_API_KEY_FILE` 和 `CCM_REAL_CLAUDE_BASE_URL` |
+| `test_add_apibest_builds_private_dual_provider_home` / `test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog` | APIBest 双 provider 私有账号目录，以及「认证 models 空目录 → 公开 pricing 模型发现」链路 |
 | `test_claude_login_error_message_is_turn_fatal` | Claude 以 exit 0 返回普通 `Not logged in` error message 时仍判定回合失败 |
 | `TestTransientOverloadDetection` | **瞬时 429/过载检测**：命中 Anthropic 官方文案 `Server is temporarily limiting requests (not your usage limit)` / overloaded；与「额度用尽/认证失败」互斥（那些走换号）；无误报 |
 | `TestTransientRetryDelay` | 退避计算：首次≈base、指数增长、封顶 cap、最小 1s |

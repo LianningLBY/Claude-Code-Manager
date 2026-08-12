@@ -18,6 +18,10 @@ from starlette.requests import Request
 import backend.services.cloudrouter_accounts as cloudrouter_module
 import backend.api.cloudrouter_accounts as cloudrouter_api
 from backend.services.cloudrouter_accounts import (
+    APIBEST_CLAUDE_BASE_URL,
+    APIBEST_CODEX_BASE_URL,
+    APIBEST_MODELS_URL,
+    APIBEST_PRICING_URL,
     APEX_CODEX_BASE_URL,
     APEX_MODELS_URL,
     APEX_USAGE_URL,
@@ -48,8 +52,16 @@ def test_apex_gateway_uses_apexin_endpoint():
 def test_api_auth_kind_is_limited_to_registered_gateways():
     assert cloudrouter_module.is_api_auth_kind("cloudrouter_api")
     assert cloudrouter_module.is_api_auth_kind("apex_api")
+    assert cloudrouter_module.is_api_auth_kind("apibest_api")
     assert not cloudrouter_module.is_api_auth_kind("legacy_api")
     assert not cloudrouter_module.is_api_auth_kind("oauth")
+
+
+def test_apibest_gateway_uses_fixed_compatible_endpoints():
+    assert APIBEST_CLAUDE_BASE_URL == "https://apibest.ai"
+    assert APIBEST_CODEX_BASE_URL == "https://apibest.ai/v1"
+    assert APIBEST_MODELS_URL == "https://apibest.ai/v1/models"
+    assert APIBEST_PRICING_URL == "https://apibest.ai/api/pricing"
 
 
 async def _add(
@@ -169,6 +181,33 @@ async def test_add_apex_builds_private_codex_only_home_without_leaking_key(
     assert str(root / "key-helper") in codex_config
     assert "lck-test-secret" not in codex_config
     assert os.popen(str(root / "key-helper")).read() == "lck-test-secret"
+
+
+@pytest.mark.asyncio
+async def test_add_apibest_builds_private_dual_provider_home(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(store, "probe_models", AsyncMock(return_value=MODELS))
+
+    account = await store.add_account(
+        "APIBest primary", "sk-test-secret", api_provider="apibest",
+    )
+
+    assert account.id == "apibest-1"
+    assert account.api_provider == "apibest"
+    assert account.auth_kind == "apibest_api"
+    assert account.providers == ["claude", "codex"]
+    settings = json.loads((account.root / "claude" / "settings.json").read_text())
+    assert settings["env"] == {"ANTHROPIC_BASE_URL": APIBEST_CLAUDE_BASE_URL}
+    codex = (account.root / "codex" / "config.toml").read_text()
+    assert 'model_provider = "apibest"' in codex
+    assert f'base_url = "{APIBEST_CODEX_BASE_URL}"' in codex
+    assert "sk-test-secret" not in settings.__repr__() + codex
+    usage = await store.fetch_usage(account.id, force=True)
+    assert usage["known"] is False
+    assert usage["available"] is True
+    assert usage["reason"] == "usage_not_supported"
 
 
 @pytest.mark.asyncio
@@ -1227,6 +1266,44 @@ async def test_apex_model_probe_uses_apex_endpoint_and_never_projects_claude(
         ),
         "lck-test-secret",
     )
+
+
+@pytest.mark.asyncio
+async def test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    request = AsyncMock(side_effect=[
+        {"object": "list", "data": [], "success": True},
+        {
+            "data": [
+                {
+                    "model_name": "claude-sonnet-5",
+                    "supported_endpoint_types": ["anthropic", "openai"],
+                },
+                {
+                    "model_name": "gpt-5.6-luna",
+                    "supported_endpoint_types": ["openai"],
+                },
+                {
+                    "model_name": "claude-openai-only",
+                    "supported_endpoint_types": ["openai"],
+                },
+            ],
+        },
+    ])
+    monkeypatch.setattr(store, "_request_json", request)
+
+    models = await store.probe_models("sk-test", api_provider="apibest")
+
+    assert models == {
+        "claude": ["claude-sonnet-5"],
+        "codex": ["gpt-5.6-luna"],
+    }
+    assert [item.args for item in request.await_args_list] == [
+        (APIBEST_MODELS_URL, "sk-test"),
+        (APIBEST_PRICING_URL, "sk-test"),
+    ]
 
 
 @pytest.mark.asyncio

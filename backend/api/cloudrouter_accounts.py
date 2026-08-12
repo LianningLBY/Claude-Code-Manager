@@ -31,7 +31,7 @@ router = APIRouter(
 class CloudRouterAccountCreate(BaseModel):
     name: str
     api_key: SecretStr
-    api_provider: Literal["cloudrouter", "apex"] = "cloudrouter"
+    api_provider: Literal["cloudrouter", "apex", "apibest"] = "cloudrouter"
 
 
 def _get_store() -> CloudRouterAccountStore:

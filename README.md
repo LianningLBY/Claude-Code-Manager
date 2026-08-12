@@ -47,6 +47,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 ### 可靠性
 - **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Claude API Key 只投影给模型主进程，Bash、hooks 与 MCP 子进程仍会清除凭据。Codex Fast 只选择真实广告 `priority` 的账号；ApexRouter 的模型目录能力也会参与选择。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
 - **API 账号安全删除** — CloudRouter/ApexRouter 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
+- **APIBest 渠道** — 可在 API 账号中直接添加 APIBest Key，同时发现 Claude/Codex 模型。CCM 先经 `/v1/models` 验证 Key，空目录时再读公开 `/api/pricing`；该渠道当前不展示额度
 - **Claude API PTY 认证** — 受管网关 Key 以无交互 Bearer token 投影给 Claude 主进程，不受 CLI `.claude.json` 中 API-key 批准/拒绝状态影响；凭据仍不会进入 Bash、hooks 或 MCP 子进程
 - **Codex 日志库自维护** — app-server 启动前自动隔离超过 1 GiB 的本地诊断日志库，只有新运行时初始化成功后才回收旧库；账号配置、认证和 session/rollout 始终保留
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级

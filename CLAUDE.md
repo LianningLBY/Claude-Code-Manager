@@ -518,3 +518,7 @@ uv run alembic history         # 查看历史
 - 目标 worker 重建必须走 admin-only `POST /api/tasks/migration-import`，首个可见状态就在同一事务内保留 `plan_review/completed/failed/cancelled/conflict` 等不可调度的源状态且不 wake Dispatcher（不能安全保留时回退 `cancelled`）；禁止恢复旧的 `pending create → 第二请求 cancel` 窗口。Manager 必须发送并核对 exact Task incarnation；存量随机 identity 的 Worker mirror 只允许在 Task writer fence 内一次性绑定，绑定后缺失/不同 identity 一律 409，刷新还必须清除裸 task_id ACL/SSH grants。迁移认领/完成/回滚 CAS 同时绑定 incarnation + 原 status + 原 worker_id，`in_progress`/`executing` 一律先停止再迁移
 - `worker_id` 与 provider/Skills/User Skill snapshot 的组合更新必须作为同一次协调迁移处理：目标 Worker 的 inert import 先接收已校验的最终配置，Manager 只在导入成功后把最终配置与 Worker 指针放进同一次 CAS；导入/搬运失败时 Manager 保留原配置。迁移认领与完成 CAS 还必须比较所有待更新字段的原值，不能覆盖并发配置写入
 - Worker 销毁 = 批量迁回 + terminate；纯本地项目 = rsync 播种（_init_local_repo 见 .git 跳过）
+
+## APIBest 渠道
+
+- 固定 Claude base URL 为 `https://apibest.ai`、Codex base URL 为 `https://apibest.ai/v1`。添加账号时先用带 Bearer Key 的 `/v1/models` 验证认证；若有效 Key 返回空 `data`，再从公开 `/api/pricing` 按 `supported_endpoint_types` 发现 Claude/Codex 模型。不得跳过前置认证或猜测模型。`usage_url=None` 表示额度未知但账号可用，不得误判为额度耗尽。

@@ -1495,11 +1495,18 @@ async def test_waiting_ci_reconciler_starts_panel_only_after_pass(
         assert await pr_review_panel.reconcile_waiting_ci_reviews(db_factory) == 1
 
     refreshed = await db_session.get(PRReview, review.id, populate_existing=True)
+    monitor = await db_session.get(
+        PRMonitorRun,
+        review.monitor_run_id,
+        populate_existing=True,
+    )
     runs = list((await db_session.execute(
         select(PRReviewerRun).where(PRReviewerRun.pr_review_id == review.id)
     )).scalars())
     assert refreshed.status == "reviewing"
     assert refreshed.ci_status == "passed"
+    assert monitor.status == "reviewing"
+    assert monitor.state_version == 2
     assert len(runs) == 3
     tasks = [await db_session.get(Task, run.task_id) for run in runs]
     assert all(task.metadata_["pr_auto_merge"] is True for task in tasks)

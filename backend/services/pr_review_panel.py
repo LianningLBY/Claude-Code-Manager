@@ -847,6 +847,13 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     review=locked,
                     context=context,
                 )
+                # The Review and its owning Monitor are one exact-head
+                # lifecycle.  Advancing only the Review leaves the Monitor in
+                # ``waiting_ci``; a fast final reviewer then correctly fails
+                # the publication fence because the active binding does not
+                # say ``reviewing``.  Persist both transitions atomically.
+                locked_run.status = "reviewing"
+                locked_run.state_version += 1
                 await db.commit()
                 started += 1
                 _wake_dispatcher()

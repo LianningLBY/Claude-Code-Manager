@@ -9062,6 +9062,17 @@ class CodexAppServerRegistry:
             await _settle_registry_cleanup(_reopen_interrupted_home())
             return False
 
+        if server.has_other_live_turn_processes(process):
+            # The abandoned admission is uncertain, but killing the account
+            # transport would also kill an unrelated live Task.  Keep this
+            # home draining so no new turn can enter and require explicit
+            # reconciliation of the abandoned generation instead.
+            raise CodexSharedTransportBusyError(
+                "Cannot shut down an unclaimed Codex turn while another live "
+                "turn shares its app-server transport: "
+                f"{home}"
+            )
+
         # If the interrupt was not acknowledged, stopping this account's
         # transport is the only way to rule out real model work continuing
         # without an InstanceManager consumer. A shutdown failure deliberately

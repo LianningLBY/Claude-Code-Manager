@@ -9229,6 +9229,38 @@ async def test_unconfirmed_descendant_abandon_escalates_transport_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_unconfirmed_unclaimed_abort_does_not_kill_live_peer(tmp_path):
+    home = normalize_codex_home(tmp_path / "shared-unclaimed-abort")
+    server = CodexAppServer("codex", codex_home=home)
+    target = CodexTurnProcess(1001, AsyncMock())
+    peer = CodexTurnProcess(1002, AsyncMock())
+    server._contexts_by_thread = {
+        "thread-target": SimpleNamespace(process=target),
+        "thread-peer": SimpleNamespace(process=peer),
+    }
+    server.abandon_turn = AsyncMock(return_value=False)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="another live turn shares",
+    ):
+        await registry.abort_unclaimed_turn(
+            home,
+            target,
+            reason="admission caller cancelled",
+        )
+
+    server.shutdown.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert registry._servers[home] is server
+    assert home in registry._draining
+
+
+@pytest.mark.asyncio
 async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
     tmp_path,
 ):

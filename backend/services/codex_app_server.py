@@ -44,6 +44,13 @@ _APP_SERVER_GRACEFUL_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_TERM_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_KILL_SHUTDOWN_TIMEOUT = 5.0
 _APP_SERVER_GROUP_POLL_INTERVAL = 0.05
+_CODEX_LOG_DB_MAX_BYTES = 1024 * 1024 * 1024
+_CODEX_LOG_DB_NAMES = (
+    "logs_2.sqlite",
+    "logs_2.sqlite-wal",
+    "logs_2.sqlite-shm",
+)
+_CODEX_LOG_QUARANTINE_PREFIX = ".ccm-log-quarantine-"
 _ACTIVE_TURN_MISMATCH_RE = re.compile(
     r"expected active turn id\s+[`'\"]?"
     r"(?P<expected>[^\s`'\"]+)[`'\"]?\s+but found\s+[`'\"]?"
@@ -57,6 +64,136 @@ _NO_ACTIVE_GOAL_RE = re.compile(
     r"\b(?:no active goal|goal is not active|goal not found)\b",
     re.IGNORECASE,
 )
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _validate_owned_regular_file(path: Path) -> os.stat_result:
+    info = path.lstat()
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+    ):
+        raise CodexAppServerError(
+            f"Unsafe Codex app-server log database entry: {path}"
+        )
+    return info
+
+
+def _validated_log_quarantine(path: Path) -> bool:
+    try:
+        info = path.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077
+        ):
+            return False
+        entries = list(path.iterdir())
+        if not entries or any(entry.name not in _CODEX_LOG_DB_NAMES for entry in entries):
+            return False
+        for entry in entries:
+            _validate_owned_regular_file(entry)
+        return True
+    except (FileNotFoundError, OSError, CodexAppServerError):
+        return False
+
+
+def _prepare_codex_log_db_rotation(codex_home: Path) -> tuple[Path, ...]:
+    """Atomically isolate an oversized Codex diagnostics database.
+
+    Native rollout/session state is deliberately outside this exact filename
+    allowlist.  Old quarantines are returned only when their complete shape is
+    still CCM-owned, so a later successful initialize can finish cleanup after
+    a Manager crash between rename and unlink.
+    """
+
+    stale = tuple(
+        entry
+        for entry in codex_home.iterdir()
+        if entry.name.startswith(_CODEX_LOG_QUARANTINE_PREFIX)
+        and _validated_log_quarantine(entry)
+    )
+    database = codex_home / _CODEX_LOG_DB_NAMES[0]
+    try:
+        database_info = _validate_owned_regular_file(database)
+    except FileNotFoundError:
+        return stale
+    if database_info.st_size <= _CODEX_LOG_DB_MAX_BYTES:
+        return stale
+
+    sources: list[Path] = []
+    for name in _CODEX_LOG_DB_NAMES:
+        source = codex_home / name
+        try:
+            _validate_owned_regular_file(source)
+        except FileNotFoundError:
+            continue
+        sources.append(source)
+
+    quarantine = codex_home / (
+        _CODEX_LOG_QUARANTINE_PREFIX + secrets.token_hex(8)
+    )
+    quarantine.mkdir(mode=0o700)
+    moved: list[tuple[Path, Path]] = []
+    try:
+        for source in sources:
+            target = quarantine / source.name
+            os.replace(source, target)
+            moved.append((source, target))
+        _fsync_directory(quarantine)
+        _fsync_directory(codex_home)
+    except BaseException:
+        for source, target in reversed(moved):
+            try:
+                os.replace(target, source)
+            except OSError:
+                logger.exception(
+                    "Could not restore Codex log database after rotation failure"
+                )
+        try:
+            quarantine.rmdir()
+        except OSError:
+            pass
+        raise
+    logger.warning(
+        "Quarantined oversized Codex app-server log database home=%s bytes=%s",
+        codex_home,
+        database_info.st_size,
+    )
+    return (*stale, quarantine)
+
+
+def _finalize_codex_log_db_rotation(
+    codex_home: Path,
+    quarantines: Sequence[Path],
+) -> None:
+    """Delete only validated quarantines after a new app-server initialized."""
+
+    for quarantine in quarantines:
+        if quarantine.parent != codex_home or not _validated_log_quarantine(quarantine):
+            logger.error(
+                "Refusing unsafe Codex log quarantine cleanup path=%s",
+                quarantine,
+            )
+            continue
+        for name in _CODEX_LOG_DB_NAMES:
+            entry = quarantine / name
+            try:
+                _validate_owned_regular_file(entry)
+            except FileNotFoundError:
+                continue
+            entry.unlink()
+        quarantine.rmdir()
+        logger.info("Removed recovered Codex log quarantine home=%s", codex_home)
+    _fsync_directory(codex_home)
 CODEX_SERVICE_TIER_DEFAULT = "default"
 CODEX_SERVICE_TIER_PRIORITY = "priority"
 _CODEX_SERVICE_TIERS = frozenset({
@@ -3821,6 +3958,7 @@ class CodexAppServer:
             os.chmod(codex_home, 0o700)
         except OSError:
             logger.warning("Could not enforce 0700 on CODEX_HOME %s", codex_home)
+        log_quarantines = _prepare_codex_log_db_rotation(codex_home)
         env = {
             key: value
             for key, value in os.environ.items()
@@ -3889,6 +4027,19 @@ class CodexAppServer:
             )
             self._runtime_version_process = process
             await self._notify("initialized", {})
+            try:
+                _finalize_codex_log_db_rotation(
+                    codex_home,
+                    log_quarantines,
+                )
+            except OSError:
+                # Initialization already proved the replacement database is
+                # healthy. Keep the exact quarantine for a later successful
+                # startup instead of failing or touching session state.
+                logger.exception(
+                    "Could not remove recovered Codex log quarantine home=%s",
+                    codex_home,
+                )
         except BaseException:
             # ``_start`` runs under the lifecycle lock, so use the locked
             # helper instead of re-entering public ``shutdown``.

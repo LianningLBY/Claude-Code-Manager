@@ -37,6 +37,8 @@ from backend.services.codex_app_server import (
     _format_process_exit,
     _harden_ambient_shell_environment_policy,
     _network_isolated_permission_config,
+    _finalize_codex_log_db_rotation,
+    _prepare_codex_log_db_rotation,
     _parse_codex_app_server_version,
     _task_ssh_permission_config,
     codex_project_trust_target,
@@ -76,6 +78,93 @@ _CODEX_0_144_6_TURN_START_FIELDS = frozenset({
     "outputSchema",
     "personality",
 })
+
+
+def test_oversized_codex_log_db_is_quarantined_then_removed(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "codex-home"
+    home.mkdir(mode=0o700)
+    (home / "config.toml").write_text("model = 'test'\n", encoding="utf-8")
+    sessions = home / "sessions"
+    sessions.mkdir()
+    rollout = sessions / "rollout.jsonl"
+    rollout.write_text("session evidence\n", encoding="utf-8")
+    for name, payload in {
+        "logs_2.sqlite": b"oversized-log-db",
+        "logs_2.sqlite-wal": b"wal",
+        "logs_2.sqlite-shm": b"shm",
+    }.items():
+        (home / name).write_bytes(payload)
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._CODEX_LOG_DB_MAX_BYTES",
+        4,
+    )
+
+    quarantines = _prepare_codex_log_db_rotation(home)
+
+    assert len(quarantines) == 1
+    quarantine = quarantines[0]
+    assert quarantine.parent == home
+    assert {entry.name for entry in quarantine.iterdir()} == {
+        "logs_2.sqlite",
+        "logs_2.sqlite-wal",
+        "logs_2.sqlite-shm",
+    }
+    assert not (home / "logs_2.sqlite").exists()
+    assert rollout.read_text(encoding="utf-8") == "session evidence\n"
+    assert (home / "config.toml").is_file()
+
+    _finalize_codex_log_db_rotation(home, quarantines)
+
+    assert not quarantine.exists()
+    assert rollout.read_text(encoding="utf-8") == "session evidence\n"
+
+
+def test_codex_log_rotation_rejects_unsafe_sidecar_without_partial_move(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "codex-home"
+    home.mkdir(mode=0o700)
+    database = home / "logs_2.sqlite"
+    database.write_bytes(b"oversized-log-db")
+    target = tmp_path / "outside"
+    target.write_bytes(b"outside")
+    (home / "logs_2.sqlite-wal").symlink_to(target)
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._CODEX_LOG_DB_MAX_BYTES",
+        4,
+    )
+
+    with pytest.raises(CodexAppServerError, match="Unsafe.*log database"):
+        _prepare_codex_log_db_rotation(home)
+
+    assert database.read_bytes() == b"oversized-log-db"
+    assert (home / "logs_2.sqlite-wal").is_symlink()
+    assert not any(
+        entry.name.startswith(".ccm-log-quarantine-")
+        for entry in home.iterdir()
+    )
+
+
+def test_successful_codex_log_cleanup_recovers_stale_quarantine(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / "codex-home"
+    home.mkdir(mode=0o700)
+    quarantine = home / ".ccm-log-quarantine-deadbeef"
+    quarantine.mkdir(mode=0o700)
+    (quarantine / "logs_2.sqlite").write_bytes(b"old")
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._CODEX_LOG_DB_MAX_BYTES",
+        4,
+    )
+
+    quarantines = _prepare_codex_log_db_rotation(home)
+    assert quarantines == (quarantine,)
+
+    _finalize_codex_log_db_rotation(home, quarantines)
+    assert not quarantine.exists()
 
 
 @pytest.fixture

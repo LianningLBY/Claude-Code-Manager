@@ -627,6 +627,9 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_claude_pool.py::TestChatPoolRotationCodexGate` | codex 任务绝不进 claude 号池轮换（不 gate 会用 claude --resume 重启 codex session） |
 | `test_service_instance_manager.py::test_parse_codex_reasoning_becomes_thinking` 等 | codex 解析器：reasoning→thinking、file_change/mcp_tool_call/web_search→tool 事件、todo_list、error item、turn.failed 嵌套 message |
 | `test_codex_models.py::TestCodexContextWindow` | codex 模型窗口表（272K/128K，models_cache.json 实测）与回退 |
+| `test_oversized_codex_log_db_is_quarantined_then_removed` | 超过阈值的 Codex `logs_2.sqlite{,-wal,-shm}` 原子隔离并在成功证明新运行时后清理，不影响 config/session |
+| `test_codex_log_rotation_rejects_unsafe_sidecar_without_partial_move` | 日志 sidecar 为 symlink/非安全文件时移动前 fail closed，不产生半轮换 |
+| `test_successful_codex_log_cleanup_recovers_stale_quarantine` | Manager 在 rename 后崩溃留下的合法 quarantine 会由下一次成功启动收敛 |
 | `test_task_migrator.py::test_migrate_codex_task_uses_codex_session_mover` 等 | 迁移按 provider 分流搬 session；rollout 文件 glob 定位 |
 | `test_api_monitor.py::test_create_monitor_accepts_local_codex_task` / `test_create_sub_agent_accepts_codex_task` | 本地 Codex Monitor 与 Sub-Agent 都走各自的 Codex runtime；Worker/Shared Monitor 仍在启动任何错误 provider 子进程前显式拒绝 |
 | `test_service_pr_review.py::test_create_pr_review_task_codex_provider` | PR 审核 task 透传 repo.provider，codex 未配模型时补默认 |

@@ -1101,5 +1101,5 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 ## 2026-08-12 — Codex 0.147 custom-provider Fast 请求字段修复
 
 - **问题**：Task 321 在 thread 准入兼容后仍被 actual-tier proxy 拒绝；精确证据显示 Codex 0.147 虽收到 `thread/start.serviceTier=priority`，实际发往 custom provider 的 Responses JSON 却缺失或重置为 `service_tier=default`。
-- **解决**：仅对代理中已由 CCM 精确登记为 priority 的 root/child lineage，将缺失/default 的出站字段重写为 `priority`；Standard lineage 不升级，显式冲突/未知值仍在任何上游请求前拒绝。代理继续缓存首个 SSE，只有上游 `response.created.response.service_tier=priority` 才发布并生成 actual-tier proof，因此不是放宽校验。
+- **解决**：仅对代理中已由 CCM 精确登记为 priority 的 root/child lineage，将缺失/default 的出站字段重写为当前请求拼写 `fast`（`priority` 保留为兼容别名）；Standard lineage 不升级，显式冲突/未知值仍在任何上游请求前拒绝。代理继续缓存首个 SSE，只有 GPT-5.6 上游 `response.created.response.service_tier=priority` 才发布并生成 actual-tier proof，因此不是放宽校验。
 - **验证**：代理与 app-server 完整测试 `328 passed, 3 skipped`；覆盖缺失/default 两种兼容输入、Standard 防升级、未知 tier 拒绝和上游 proof。

@@ -641,7 +641,10 @@ def _extract_request_identity(
         # HTTP field.  The exact CCM lineage mapping is authoritative for
         # request construction, while _forward_verified_sse still requires the
         # upstream response to prove that priority was actually admitted.
-        payload["service_tier"] = CODEX_TIER_PRIORITY
+        # Use the current wire spelling. OpenAI documents ``priority`` as a
+        # request alias, but custom providers can implement only ``fast``;
+        # GPT-5.6 responses must still prove the canonical ``priority`` tier.
+        payload["service_tier"] = "fast"
         body = json.dumps(
             payload,
             ensure_ascii=False,

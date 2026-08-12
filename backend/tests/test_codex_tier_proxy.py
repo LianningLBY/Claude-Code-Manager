@@ -368,7 +368,7 @@ async def test_fast_proxy_repairs_missing_transport_tier(request_tier):
                 json=_request_body(tier=request_tier),
             )
         assert response.status_code == 200
-        assert seen["body"]["service_tier"] == "priority"
+        assert seen["body"]["service_tier"] == "fast"
         proof = await waiter
         assert proof.actual_tier == "priority"
     finally:

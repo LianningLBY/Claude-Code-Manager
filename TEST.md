@@ -1393,7 +1393,8 @@ Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail close
 
 Codex Fast transport compatibility is covered by
 `backend/tests/test_codex_tier_proxy.py`: an exact priority lineage repairs
-Codex 0.147's missing/default outgoing `service_tier`, while Standard and
+Codex 0.147's missing/default outgoing `service_tier` to the current `fast`
+request spelling, while Standard and
 unsupported tier mismatches remain fail-closed and Fast still requires the
 upstream `response.created` priority proof.
 

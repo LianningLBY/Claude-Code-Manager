@@ -5645,7 +5645,7 @@ async def test_turn_owner_hook_skills_change_fails_closed_before_model_input():
 
 
 @pytest.mark.asyncio
-async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
+async def test_fast_turn_uses_actual_priority_proof_when_thread_omits_tier():
     server = CodexAppServer(
         "codex",
         actual_tier_proxy_route=CodexTierProxyRoute(
@@ -5686,7 +5686,7 @@ async def test_fast_turn_requires_actual_priority_proof_and_v2_object_disable():
                     "id": "thread-fast-proof",
                     "status": {"type": "idle"},
                 },
-                "serviceTier": "priority",
+                "serviceTier": None,
             }
         if method == "turn/start":
             def notify_started_input():

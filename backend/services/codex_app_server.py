@@ -5751,6 +5751,17 @@ class CodexAppServer:
             if isinstance(response, dict)
             else None
         )
+        if (
+            effective_service_tier is None
+            and rpc_service_tier == CODEX_SERVICE_TIER_PRIORITY
+            and actual_tier_proxy is not None
+            and self._require_actual_tier_proof
+        ):
+            # Codex 0.147 custom-provider thread/start can accept the tier in
+            # the request while omitting it from the response.  This value is
+            # provisional only: the turn remains unpublished until the exact
+            # proxy lineage proves the upstream response's actual tier below.
+            effective_service_tier = rpc_service_tier
         if effective_service_tier != rpc_service_tier:
             if resume_session_id:
                 effective_service_tier = (

@@ -879,162 +879,19 @@ describe('UpdateButton', () => {
     });
   });
 
-  describe('automatic update reminder', () => {
-    it('performs a dry-run and shows a non-blocking top notice after the initial delay', async () => {
+  describe('update checks', () => {
+    it('does not check for or prompt about updates automatically', async () => {
       vi.useFakeTimers();
       render(<UpdateButton />);
 
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+      });
+
+      expect(api.getUpdateStatus).not.toHaveBeenCalled();
+      expect(api.startUpdate).not.toHaveBeenCalled();
       expect(findModalOverlay()).toBeNull();
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.getUpdateStatus).toHaveBeenCalledTimes(1);
-      expect(api.startUpdate).toHaveBeenCalledTimes(1);
-      expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
-      const notice = screen.getByTestId('update-available-notice');
-      expect(notice.className).toContain('pointer-events-none');
-      expect(notice.className).toContain('top-[calc(env(safe-area-inset-top)+0.75rem)]');
-      expect(screen.getByText('发现可用更新')).toBeInTheDocument();
-      expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
-      expect(findModalOverlay()).toBeNull();
-    });
-
-    it('keeps mobile notice actions large enough to tap', async () => {
-      vi.useFakeTimers();
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(screen.getByRole('button', { name: '查看详情' }).className).toContain('min-h-11');
-      const closeButton = screen.getByRole('button', { name: '关闭更新提醒' });
-      expect(closeButton.className).toContain('h-11');
-      expect(closeButton.className).toContain('w-11');
-    }, 15_000);
-
-    it('opens the existing update modal only after the user clicks view details', async () => {
-      vi.useFakeTimers();
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-      expect(findModalOverlay()).toBeNull();
-
-      await act(async () => {
-        screen.getByRole('button', { name: '查看详情' }).click();
-      });
-
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(findModalOverlay()).toBeTruthy();
-      expect(screen.getByRole('button', { name: '确认更新' })).toBeInTheDocument();
-    });
-
-    it('silently ignores automatic check failures', async () => {
-      vi.useFakeTimers();
-      vi.mocked(api.startUpdate).mockRejectedValue(new Error('offline'));
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(findModalOverlay()).toBeNull();
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(screen.queryByText('更新失败')).not.toBeInTheDocument();
-    });
-
-    it('stays silent when the automatic check finds the latest version', async () => {
-      vi.useFakeTimers();
-      vi.mocked(api.startUpdate).mockResolvedValue({
-        has_updates: false,
-        needs_restart: false,
-      } as never);
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
-      expect(findModalOverlay()).toBeNull();
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(screen.queryByTestId('update-available-dot')).not.toBeInTheDocument();
-    });
-
-    it('still reminds about a manual pull when the remote fetch failed', async () => {
-      vi.useFakeTimers();
-      vi.mocked(api.startUpdate).mockResolvedValue({
-        has_updates: false,
-        needs_restart: true,
-        manual_update_detected: true,
-        current_commit: 'def5678',
-        running_commit: 'abc1234',
-        error: 'network unavailable',
-      } as never);
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(screen.getByText('检测到待完成的本地更新')).toBeInTheDocument();
-      expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
-      expect(findModalOverlay()).toBeNull();
-
-      await act(async () => {
-        screen.getByRole('button', { name: '查看详情' }).click();
-      });
-      expect(screen.getByText(/磁盘代码尚未完整部署/)).toBeInTheDocument();
-      expect(screen.getByText(/远端更新检查失败/)).toBeInTheDocument();
-    });
-
-    it('does not repeat the same reminder fingerprint during one page lifetime', async () => {
-      vi.useFakeTimers();
-      render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledWith({ dry_run: true });
-      expect(screen.getByText('发现可用更新')).toBeInTheDocument();
-
-      await act(async () => {
-        screen.getByRole('button', { name: '关闭更新提醒' }).click();
-      });
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(60 * 60_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledTimes(2);
-      expect(findModalOverlay()).toBeNull();
-      expect(screen.queryByTestId('update-available-notice')).not.toBeInTheDocument();
-      expect(screen.getByTestId('update-available-dot')).toBeInTheDocument();
-    });
-
-    it('reminds again when the page is opened again', async () => {
-      vi.useFakeTimers();
-      const firstPage = render(<UpdateButton />);
-
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-      expect(screen.getByTestId('update-available-notice')).toBeInTheDocument();
-
-      firstPage.unmount();
-      render(<UpdateButton />);
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1_000);
-      });
-
-      expect(api.startUpdate).toHaveBeenCalledTimes(2);
-      expect(screen.getByTestId('update-available-notice')).toBeInTheDocument();
-      expect(screen.getByText('发现可用更新')).toBeInTheDocument();
+      expect(screen.queryByText('发现可用更新')).not.toBeInTheDocument();
     });
   });
 

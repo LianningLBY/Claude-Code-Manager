@@ -67,6 +67,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [priority, setPriority] = useState(0);
   const [mode, setMode] = useState('auto');
   const [deliveryLoopEnabled, setDeliveryLoopEnabled] = useState(false);
+  const [agentSandboxUnrestricted, setAgentSandboxUnrestricted] = useState(false);
   const [autoCapabilityAvailable, setAutoCapabilityAvailable] = useState(false);
   const [autoPlanBudget, setAutoPlanBudget] = useState(0);
   const [autoReviewBudget, setAutoReviewBudget] = useState(0);
@@ -76,7 +77,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [deliveryReposLoading, setDeliveryReposLoading] = useState(false);
   const [provider, setProvider] = useState('codex');
   // 分布式 Worker：执行位置（'' = 本机）
-  const [workerId, setWorkerId] = useState('');
+  const [workerId] = useState('');
   // workers state removed — Run on moved to Project level
   const [model, setModel] = useState('');
   const [providerOptions, setProviderOptions] = useState<string[]>(['claude', 'codex']);
@@ -129,8 +130,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const applyStoredDefaults = (
     stored: StoredTaskDefaults | null,
     fallbackProvider: string,
-    allowDeliveryLoop = false,
-    availableProviders: readonly string[] = ['claude', 'codex'],
   ) => {
     setPriority(stored?.priority ?? 0);
     // Plan creation now lives on the first-class Plans page. Normalize the
@@ -138,26 +137,14 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     // removed Task-form mode invisibly.
     const storedMode = stored?.mode || 'auto';
     const requestedProvider = stored?.provider || fallbackProvider;
-    const deliveryProvider = resolveDeliveryProvider(
-      requestedProvider,
-      fallbackProvider,
-      availableProviders,
-    );
-    const normalizedMode = (
-      storedMode === 'plan'
-      || (storedMode === 'delivery_loop' && (!allowDeliveryLoop || !deliveryProvider))
-        ? 'auto'
-        : storedMode
-    );
-    const resolvedProvider = normalizedMode === 'delivery_loop'
-      ? deliveryProvider!
-      : requestedProvider;
-    const deliveryProviderChanged = normalizedMode === 'delivery_loop'
-      && resolvedProvider !== requestedProvider;
+    const normalizedMode = storedMode === 'plan' || storedMode === 'delivery_loop'
+      ? 'auto'
+      : storedMode;
+    const resolvedProvider = requestedProvider;
     setMode(normalizedMode);
     setProvider(resolvedProvider);
-    setModel(deliveryProviderChanged ? '' : (stored?.model || ''));
-    setEffort(deliveryProviderChanged ? '' : (stored?.effort || ''));
+    setModel(stored?.model || '');
+    setEffort(stored?.effort || '');
     setCodexServiceTier(
       resolvedProvider === 'codex' && stored?.codexServiceTier === 'priority'
         ? 'priority'
@@ -178,7 +165,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
     if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     // Restore persisted user choices independently of the server request.
     // A slow or unavailable backend must not make local defaults disappear.
-    applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
+    applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     api.config().then((c) => {
       const configuredProvider = c.default_provider || 'codex';
       const configuredProviderOptions = c.provider_options.length
@@ -199,6 +186,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexCapabilitiesLoaded(true);
       const deliveryEnabled = c.delivery_loop_enabled === true;
       setDeliveryLoopEnabled(deliveryEnabled);
+      setAgentSandboxUnrestricted(
+        c.agent_sandbox_unrestricted_enabled === true,
+      );
       setAutoCapabilityAvailable(
         c.capability_core_enabled === true
         && c.auto_capability_enabled === true,
@@ -208,16 +198,15 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       applyStoredDefaults(
         readStoredTaskDefaults(),
         configuredProvider,
-        deliveryEnabled,
-        configuredProviderOptions,
       );
     }).catch(() => {
       setProviderConfigLoaded(true);
       setCodexModelServiceTiers({});
       setCodexCapabilitiesLoaded(true);
       setDeliveryLoopEnabled(false);
+      setAgentSandboxUnrestricted(false);
       setAutoCapabilityAvailable(false);
-      applyStoredDefaults(readStoredTaskDefaults(), 'codex', false, ['claude', 'codex']);
+      applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     });
     api.getRuntimeSettings()
       .then((runtime) => {
@@ -742,8 +731,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       applyStoredDefaults(
         readStoredTaskDefaults(),
         defaultProvider,
-        deliveryLoopEnabled,
-        providerOptions,
       );
       onCreated();
     } catch (err) {
@@ -756,6 +743,15 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   return (
     <form ref={formRef} onSubmit={handleSubmit} className="bg-gray-800 border border-gray-700/60 rounded-xl p-4 space-y-3 overflow-visible shadow-sm">
       <h3 className="text-sm font-semibold text-gray-300">New Task</h3>
+      {agentSandboxUnrestricted && (
+        <div
+          role="alert"
+          className="rounded border border-red-500/60 bg-red-950/60 px-3 py-2 text-xs leading-relaxed text-red-200"
+        >
+          Agent unrestricted permissions are ON. Codex and Claude Plan/Delivery
+          turns bypass CCM host isolation; Claude Plan still has read-only tools.
+        </div>
+      )}
       {dropError && (
         <div className="bg-yellow-900/50 border border-yellow-700 text-yellow-300 text-xs rounded px-3 py-2 flex items-center justify-between">
           <span>{dropError}</span>
@@ -1080,9 +1076,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                   <option value="loop">Loop</option>
                   <option value="goal">Goal</option>
                   <option value="pr_loop">PR Loop</option>
-                  {deliveryLoopEnabled && deliveryProviders.length > 0 && (
-                    <option value="delivery_loop">Delivery Loop</option>
-                  )}
                 </select>
 
                 {autoCapabilityEligible && (
@@ -1162,15 +1155,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
                         then resume the same Task. Budgets are non-refundable.
                       </p>
                     </div>
-                  </>
-                )}
-
-                {false && (
-                  <>
-                    {/* Run on removed — Task inherits from Project */}
-                    <span className="text-gray-400">Run on</span>
-                    <select className="hidden" value={workerId} onChange={(e) => setWorkerId(e.target.value)}>
-                    </select>
                   </>
                 )}
 

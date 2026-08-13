@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
+import errno
 import os
 import signal
+import sys
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 
 from sqlalchemy import select, update
@@ -23,6 +28,100 @@ from backend.services.process_safety import require_safe_process_group_id
 _RUNTIME_TOKEN_ENV = "CCM_PLAN_RUNTIME_TOKEN"
 _PROC_ENV_LIMIT = 2 * 1024 * 1024
 _PROCESS_REAP_TIMEOUT_SECONDS = 5.0
+
+
+class _DarwinProcBsdInfo(ctypes.Structure):
+    """Stable ``PROC_PIDTBSDINFO`` prefix used for exact Darwin PID identity."""
+
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+@lru_cache(maxsize=1)
+def _darwin_libproc():
+    library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    library.proc_pidinfo.argtypes = [
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint64,
+        ctypes.c_void_p,
+        ctypes.c_int,
+    ]
+    library.proc_pidinfo.restype = ctypes.c_int
+    return library
+
+
+@lru_cache(maxsize=1)
+def _darwin_boot_session_uuid() -> str:
+    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    library.sysctlbyname.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+    ]
+    library.sysctlbyname.restype = ctypes.c_int
+    name = b"kern.bootsessionuuid"
+    length = ctypes.c_size_t()
+    ctypes.set_errno(0)
+    if library.sysctlbyname(
+        name,
+        None,
+        ctypes.byref(length),
+        None,
+        0,
+    ) != 0:
+        error = ctypes.get_errno()
+        raise PlanRuntimeReceiptError(
+            f"Could not read Darwin boot identity: {os.strerror(error)}"
+        )
+    if not 1 <= length.value <= 128:
+        raise PlanRuntimeReceiptError("Darwin boot identity has an invalid size")
+    payload = ctypes.create_string_buffer(length.value)
+    ctypes.set_errno(0)
+    if library.sysctlbyname(
+        name,
+        payload,
+        ctypes.byref(length),
+        None,
+        0,
+    ) != 0:
+        error = ctypes.get_errno()
+        raise PlanRuntimeReceiptError(
+            f"Could not read Darwin boot identity: {os.strerror(error)}"
+        )
+    try:
+        value = payload.raw[: length.value].rstrip(b"\0").decode("ascii").lower()
+    except UnicodeDecodeError as exc:
+        raise PlanRuntimeReceiptError(
+            "Darwin boot identity is not ASCII"
+        ) from exc
+    if not _is_canonical_boot_id(value):
+        raise PlanRuntimeReceiptError("Darwin boot identity has an invalid format")
+    return value
 
 
 class PlanRuntimeReceiptError(RuntimeError):
@@ -346,6 +445,8 @@ def runtime_token_environment(snapshot: RuntimeReceiptSnapshot) -> dict[str, str
 
 
 def _read_boot_id() -> str:
+    if sys.platform == "darwin":
+        return _darwin_boot_session_uuid()
     try:
         value = Path("/proc/sys/kernel/random/boot_id").read_text(
             encoding="utf-8"
@@ -360,6 +461,11 @@ def _read_boot_id() -> str:
 def _read_current_start_ticks() -> int:
     """Return a conservative /proc start-time boundary for future children."""
 
+    if sys.platform == "darwin":
+        # Darwin's PROC_PIDTBSDINFO exposes process start time in epoch
+        # microseconds. Keep the same conservative overlap used by Linux so a
+        # launch race can include an extra candidate but never hide a child.
+        return max(0, time.time_ns() // 1_000 - 2_000_000)
     try:
         clock_ticks = int(os.sysconf("SC_CLK_TCK"))
         uptime_text = Path("/proc/uptime").read_text(encoding="utf-8").split()[0]
@@ -375,11 +481,66 @@ def _read_current_start_ticks() -> int:
     return max(0, ticks)
 
 
+def _read_darwin_process_identity(pid: int) -> ProcessIdentity | None:
+    info = _DarwinProcBsdInfo()
+    expected_size = ctypes.sizeof(info)
+    ctypes.set_errno(0)
+    result = _darwin_libproc().proc_pidinfo(
+        pid,
+        3,  # PROC_PIDTBSDINFO
+        0,
+        ctypes.byref(info),
+        expected_size,
+    )
+    if result == 0:
+        error = ctypes.get_errno()
+        if error in {0, errno.ENOENT, errno.ESRCH}:
+            return None
+        raise PlanRuntimeReceiptError(
+            f"Could not read Plan runtime process identity for PID {pid}: "
+            f"{os.strerror(error)}"
+        )
+    if result != expected_size or info.pbi_pid != pid:
+        raise PlanRuntimeReceiptError(
+            f"Plan runtime PID {pid} identity is incomplete"
+        )
+    try:
+        process_group_id = require_safe_process_group_id(
+            int(info.pbi_pgid),
+            context="durable Plan runtime",
+        )
+    except (TypeError, ValueError) as exc:
+        raise PlanRuntimeReceiptError(
+            f"Plan runtime PID {pid} identity is invalid"
+        ) from exc
+    start_ticks = (
+        int(info.pbi_start_tvsec) * 1_000_000
+        + int(info.pbi_start_tvusec)
+    )
+    if start_ticks <= 0:
+        raise PlanRuntimeReceiptError(
+            f"Plan runtime PID {pid} start identity is invalid"
+        )
+    # Darwin's pbi_status uses SZOMB=5. Other states are live for the receipt
+    # protocol; their exact scheduler distinction is irrelevant here.
+    state = "Z" if int(info.pbi_status) == 5 else "R"
+    return ProcessIdentity(
+        pid=pid,
+        process_group_id=process_group_id,
+        start_ticks=start_ticks,
+        uid=int(info.pbi_uid),
+        boot_id=_read_boot_id(),
+        state=state,
+    )
+
+
 def read_process_identity(pid: int) -> ProcessIdentity | None:
-    """Read one exact Linux PID identity without following filesystem links."""
+    """Read one exact POSIX PID identity without following filesystem links."""
 
     if type(pid) is not int or pid <= 1:
         raise PlanRuntimeReceiptError(f"Unsafe Plan runtime PID {pid!r}")
+    if sys.platform == "darwin":
+        return _read_darwin_process_identity(pid)
     proc_dir = Path("/proc") / str(pid)
     try:
         metadata = proc_dir.stat()
@@ -736,6 +897,14 @@ def _group_alive(process_group_id: int) -> bool:
 def _token_process_identities(
     receipt: RuntimeReceiptSnapshot,
 ) -> list[ProcessIdentity]:
+    if not sys.platform.startswith("linux"):
+        # Normal in-memory Darwin cleanup uses the exact retained process or
+        # Codex thread and marks the receipt cleaned directly. After a hard
+        # crash Darwin does not expose a race-safe equivalent of /proc/environ;
+        # retain the receipt fail-closed instead of guessing token ownership.
+        raise PlanRuntimeReceiptError(
+            "Plan runtime token recovery requires Linux /proc"
+        )
     marker = f"{_RUNTIME_TOKEN_ENV}={receipt.runtime_token}".encode("utf-8")
     if receipt.prepared_uid != os.getuid():
         raise PlanRuntimeReceiptError(
@@ -861,6 +1030,13 @@ async def _reconcile_claude_receipt(
     receipt: RuntimeReceiptSnapshot,
 ) -> bool:
     try:
+        if receipt.status == "prepared":
+            # ``prepare_runtime_attempt`` advances the receipt to admitting
+            # before exposing its token to a provider environment. A receipt
+            # that is still prepared therefore proves launch never began and
+            # can be closed without an operating-system process scan.
+            await mark_runtime_cleaned(db_factory, receipt)
+            return True
         if receipt.boot_id is not None and receipt.boot_id != _read_boot_id():
             await mark_runtime_cleaned(db_factory, receipt)
             return True

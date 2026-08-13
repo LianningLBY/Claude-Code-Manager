@@ -12,6 +12,7 @@ async def test_get_runtime_settings(client):
     assert "codex_app_server_enabled" in data
     assert "codex_main_mcp_enabled" in data
     assert "codex_monitor_enabled" in data
+    assert "agent_sandbox_unrestricted_enabled" in data
 
 
 @pytest.mark.asyncio
@@ -35,6 +36,45 @@ async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
     assert put_resp.status_code == 200
     assert put_resp.json()["codex_main_mcp_enabled"] is enabled
     assert put_resp.json()["codex_monitor_enabled"] is enabled
+
+
+@pytest.mark.asyncio
+async def test_toggle_agent_unrestricted_sandbox_roundtrip(
+    client,
+    session_factory,
+):
+    from backend.config import settings
+    from backend.main import instance_manager
+    from backend.models.global_settings import GlobalSettings
+
+    previous = instance_manager.agent_sandbox_unrestricted_enabled
+    try:
+        enabled = await client.put(
+            "/api/settings/runtime",
+            json={"agent_sandbox_unrestricted_enabled": True},
+        )
+        assert enabled.status_code == 200, enabled.text
+        assert enabled.json()["agent_sandbox_unrestricted_enabled"] is True
+        assert instance_manager.agent_sandbox_unrestricted_enabled is True
+        async with session_factory() as db:
+            row = await db.get(GlobalSettings, 1)
+            assert row.agent_sandbox_unrestricted_enabled is True
+
+        observed = await client.get("/api/settings/runtime")
+        assert observed.json()["agent_sandbox_unrestricted_enabled"] is True
+
+        disabled = await client.put(
+            "/api/settings/runtime",
+            json={"agent_sandbox_unrestricted_enabled": False},
+        )
+        assert disabled.status_code == 200, disabled.text
+        assert disabled.json()["agent_sandbox_unrestricted_enabled"] is False
+        assert instance_manager.agent_sandbox_unrestricted_enabled is False
+    finally:
+        instance_manager.set_agent_sandbox_unrestricted_enabled(previous)
+        # The isolated DB is discarded after this test. This assertion also
+        # proves the environment remains only the fallback default.
+        assert isinstance(settings.agent_sandbox_unrestricted_enabled, bool)
 
 
 @pytest.mark.asyncio

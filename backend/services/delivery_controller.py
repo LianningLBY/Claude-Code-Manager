@@ -101,6 +101,10 @@ _MONITOR_WAITING_STATUSES = frozenset(
 _MONITOR_BLOCKED_STATUSES = frozenset({"repair_pending", "waiting_for_fix"})
 _LEGACY_WAKE_ACTIVE = frozenset({"delivering", "accepted", "awaiting_push"})
 _HEX_64_RE = re.compile(r"[0-9a-f]{64}\Z")
+_LEGACY_BOUND_STALE_HEAD_REASON = (
+    "Delivery pull-request history is ambiguous: "
+    "Pull request does not match the exact Delivery subject"
+)
 
 
 class DeliveryControllerError(RuntimeError):
@@ -2452,11 +2456,29 @@ class DeliveryController:
                 if (
                     action.remote_id is not None
                     or action.remote_url is not None
-                    or run.pr_number is not None
-                    or run.pr_url is not None
                 ):
                     raise DeliverySubjectChanged(
                         "Unresolved PR evidence has unexpected remote identity"
+                    )
+                if kind == "pull_request_history_ambiguous" and (
+                    action.status in {"unknown", "leased"}
+                    and reason == _LEGACY_BOUND_STALE_HEAD_REASON
+                    and not isinstance(run.pr_number, bool)
+                    and isinstance(run.pr_number, int)
+                    and run.pr_number > 0
+                    and isinstance(run.pr_url, str)
+                    and bool(run.pr_url)
+                ):
+                    # Older publishers compared the next repair head against
+                    # the still-open PR before advancing its branch.  A bound
+                    # Run cannot create a replacement PR, so retaining this
+                    # receipt while re-entering publisher reconciliation is
+                    # safe.  Success atomically upgrades it to schema v1;
+                    # another identity mismatch remains fail-closed.
+                    return None
+                if run.pr_number is not None or run.pr_url is not None:
+                    raise DeliverySubjectChanged(
+                        "Unresolved PR evidence has incomplete remote identity"
                     )
             else:
                 remote = result.get("remote")

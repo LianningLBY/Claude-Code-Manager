@@ -18,6 +18,7 @@ from backend.models.delivery import (
 from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
+from backend.models.plan import Plan, PlanVersion
 from backend.models.task import Task
 from backend.models.team_share import TeamProjectShare
 from backend.services import delivery_service
@@ -26,7 +27,11 @@ from backend.services.delivery_service import (
     DeliveryValidationError,
     create_delivery_run,
 )
-from backend.tests.test_auth_ws_security import _create_user, secured_client
+from backend.schemas.plan import default_plan_pipeline_config
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
 
 
 def _payload(project: Project, repo: MonitoredRepo, **overrides: object) -> dict:
@@ -335,6 +340,47 @@ async def test_create_is_atomic_and_detail_exposes_durable_evidence(
         assert await db.scalar(select(func.count(DeliveryCycle.id))) == 1
         assert await db.scalar(select(func.count(DeliveryTransition.id))) == 1
         assert await db.scalar(select(func.count(Task.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_delivery_plan_projection_uses_cycle_version_relationship(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="plan-projection")
+    created = await client.post("/api/delivery-runs", json=_payload(project, repo))
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+
+    async with session_factory() as db:
+        plan = Plan(
+            title="Delivery Plan",
+            initial_request="Plan the Delivery",
+            project_id=project.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(),
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=1,
+            content="# Delivery Plan",
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        cycle = await db.scalar(
+            select(DeliveryCycle).where(DeliveryCycle.run_id == run_id)
+        )
+        cycle.plan_version_id = version.id
+        await db.commit()
+        plan_id = plan.id
+
+    response = await client.get(f"/api/plans/{plan_id}")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["delivery_run_id"] == run_id
 
 
 @pytest.mark.asyncio

@@ -833,6 +833,48 @@ class TestFullMirrorBackend:
         )
         im.wait_for_pty_launch_metadata.assert_awaited_once_with(7)
 
+    async def test_foreground_event_recovers_same_consumer_record_from_registry(self):
+        im = MagicMock()
+        im._process_event = AsyncMock()
+        im.wait_for_pty_launch_metadata = AsyncMock()
+        backend = self._bare_backend(im)
+        consumer = asyncio.current_task()
+        record = MagicMock(task=consumer)
+        backend._consumers[7] = consumer
+        im._consumer_records = {7: record}
+        previous = getattr(
+            consumer, "_ccm_output_consumer_record", None
+        )
+        if previous is not None:
+            delattr(consumer, "_ccm_output_consumer_record")
+        try:
+            event = {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "API Error: 403 API key expired",
+                "is_error": True,
+                "raw_json": json.dumps({
+                    "type": "assistant",
+                    "isApiErrorMessage": True,
+                }),
+            }
+            await backend.on_event(7, event, task_id=27)
+        finally:
+            if previous is not None:
+                setattr(
+                    consumer,
+                    "_ccm_output_consumer_record",
+                    previous,
+                )
+
+        im._process_event.assert_awaited_once_with(
+            7,
+            27,
+            event,
+            None,
+            consumer_record=record,
+        )
+
     @pytest.mark.parametrize(
         (
             "status",

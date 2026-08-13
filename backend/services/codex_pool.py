@@ -841,21 +841,47 @@ class CodexPool:
             if preferred:
                 return self._record_selection(preferred, now)
 
-        # Fresh launches prefer a compatible API account.  True
-        # round-robin is preserved within the API and native groups; if every
-        # API projection is unavailable/unsupported, the native group follows
-        # exactly the former config-order rotation.
+        # Fresh launches prefer a compatible API account only after its cached
+        # health has been proven.  At process startup the API cache can still
+        # be unknown; prefer a usable native account in that window so a stale
+        # or invalid API key cannot consume a turn before its first probe.  An
+        # unknown API account remains the final fallback for API-only setups.
+        # True round-robin is preserved within every group.
         api_candidates = [
             account
             for account in candidates
             if _is_api_auth_kind(account.auth_kind)
+        ]
+        api_decisions = {
+            account.id: self._api_quota_decision(account)
+            for account in api_candidates
+        }
+        verified_api_candidates = [
+            account
+            for account in api_candidates
+            if (
+                bool(api_decisions[account.id].get("known"))
+                and api_decisions[account.id].get("available") is True
+            )
+        ]
+        verified_api_ids = {
+            account.id for account in verified_api_candidates
+        }
+        unknown_api_candidates = [
+            account
+            for account in api_candidates
+            if account.id not in verified_api_ids
         ]
         native_candidates = [
             account
             for account in candidates
             if not _is_api_auth_kind(account.auth_kind)
         ]
-        for group in (api_candidates, native_candidates):
+        for group in (
+            verified_api_candidates,
+            native_candidates,
+            unknown_api_candidates,
+        ):
             chosen = self._round_robin_candidate(group)
             if chosen is not None:
                 return self._record_selection(chosen, now)

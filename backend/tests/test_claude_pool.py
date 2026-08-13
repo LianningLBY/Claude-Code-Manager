@@ -1637,6 +1637,34 @@ class TestCloudRouterClaudeProjection:
         assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
         assert pool.status()["last_selected"] is None
 
+    def test_unknown_api_health_uses_native_until_probe_settles(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+        }
+        pool, native_dir = self._mixed_pool(tmp_path, account, snapshot)
+
+        assert pool.select(model="claude-sonnet-5") == str(native_dir)
+
+    def test_unknown_api_health_remains_api_only_fallback(self, tmp_path):
+        account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+        }
+        pool = ClaudePool(
+            config_path=tmp_path / "missing-native-pool.json",
+            cloudrouter_store=_FakeCloudRouterStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="claude-sonnet-5") == account.claude_config_dir
+
     def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterAccount(tmp_path / "cloudrouter-1")
         pool, native_dir = self._mixed_pool(tmp_path, account)

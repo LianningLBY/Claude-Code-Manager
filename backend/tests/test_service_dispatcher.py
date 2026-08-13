@@ -25,6 +25,7 @@ from backend.services.dispatcher import (
     _ModeTurnSequence,
     _ModeTurnTerminalProof,
     _prepend_task_artifact_policy,
+    _should_ensure_agent_docs,
 )
 from backend.services.deployment_start_guard import (
     DeploymentTaskStartBlocked,
@@ -143,6 +144,24 @@ def _make_dispatcher(db_factory):
     dispatcher._revalidate_mode_turn_terminal = AsyncMock()
     dispatcher._mint_mode_turn_continuation = AsyncMock(return_value=object())
     return dispatcher
+
+
+def test_delivery_workspace_never_receives_automatic_agent_doc_mutation():
+    delivery = Task(mode="delivery_loop", delivery_run_id=1, delivery_role="developer")
+    ordinary = Task(mode="auto")
+
+    assert not _should_ensure_agent_docs(
+        delivery,
+        neutral_review_cwd=False,
+    )
+    assert not _should_ensure_agent_docs(
+        ordinary,
+        neutral_review_cwd=True,
+    )
+    assert _should_ensure_agent_docs(
+        ordinary,
+        neutral_review_cwd=False,
+    )
 
 
 async def _run_claimed_lifecycle(

@@ -311,6 +311,21 @@ class FullMirrorCCMBackend(CCMBackend):
         record = getattr(
             consumer, "_ccm_output_consumer_record", None
         )
+        if (
+            record is None
+            and self._consumers.get(key) is consumer
+        ):
+            candidate = self._im._consumer_records.get(key)
+            if (
+                candidate is not None
+                and getattr(candidate, "task", None) is consumer
+            ):
+                # Some pinned claude-pty builds begin consuming before CCM can
+                # attach the immutable record to the asyncio Task. The exact
+                # instance registry is safe only when it still points back to
+                # this same consumer; recover that identity so a structured
+                # API fatal event cannot be lost and later exit 0 as success.
+                record = candidate
         process = getattr(record, "process", None)
         session = getattr(process, "session", None)
         if session is None and self._consumers.get(key) is consumer:

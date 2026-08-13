@@ -68,6 +68,28 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
     }
   }, [runtime, switching]);
 
+  const toggleAgentSandbox = useCallback(async () => {
+    if (!runtime || switching) return;
+    const next = !runtime.agent_sandbox_unrestricted_enabled;
+    if (next) {
+      const ok = window.confirm(
+        '开启后，之后启动的 Codex 回合及 Claude Plan/Delivery 回合会跳过宿主沙箱；Claude Plan 仍只有只读工具，Delivery Coding 会跳过模型权限确认。仅应在受监督的本地调试中使用。确定开启？',
+      );
+      if (!ok) return;
+    }
+    setSwitching(true);
+    try {
+      const updated = await api.updateRuntimeSettings({
+        agent_sandbox_unrestricted_enabled: next,
+      });
+      setRuntime(updated);
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : 'Agent 权限设置更新失败');
+    } finally {
+      setSwitching(false);
+    }
+  }, [runtime, switching]);
+
   const changeCompactThreshold = useCallback(async (value: number) => {
     if (!runtime || switching) return;
     setSwitching(true);
@@ -160,6 +182,41 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
               >
                 <span className={knobCls(runtime.use_pty_mode)} />
               </button>
+            </div>
+          )}
+          {isAdmin && runtime && (
+            <div
+              data-testid="agent-sandbox-unrestricted-setting"
+              className={`rounded-md border px-2 py-2 ${
+                runtime.agent_sandbox_unrestricted_enabled
+                  ? 'border-red-500/60 bg-red-950/50'
+                  : 'border-gray-700 bg-gray-900/20'
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <span className={`text-xs ${
+                  runtime.agent_sandbox_unrestricted_enabled
+                    ? 'font-medium text-red-300'
+                    : 'text-gray-400'
+                }`}>
+                  Claude / Codex 无限制权限
+                </span>
+                <button
+                  type="button"
+                  aria-label="Claude / Codex 无限制权限"
+                  aria-pressed={runtime.agent_sandbox_unrestricted_enabled}
+                  onClick={toggleAgentSandbox}
+                  disabled={switching}
+                  className={toggleCls(runtime.agent_sandbox_unrestricted_enabled)}
+                >
+                  <span className={knobCls(runtime.agent_sandbox_unrestricted_enabled)} />
+                </button>
+              </div>
+              {runtime.agent_sandbox_unrestricted_enabled && (
+                <p role="alert" className="mt-1.5 text-[10px] leading-relaxed text-red-300">
+                  高危：新 Codex / Claude Plan/Delivery 回合跳过 CCM 宿主隔离；Plan 仍只读，Delivery Coding 不再弹模型权限确认。
+                </p>
+              )}
             </div>
           )}
           {isAdmin && runtime && (

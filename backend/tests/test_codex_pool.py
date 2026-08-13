@@ -1209,6 +1209,38 @@ class TestCloudRouterCodexProjection:
         )
         assert pool.status()["last_selected"] is None
 
+    def test_unknown_api_health_uses_native_until_probe_settles(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+            "windows": [],
+        }
+        pool, native_home = self._mixed_pool(tmp_path, account, snapshot)
+
+        assert pool.select(model="gpt-5.5") == str(native_home.resolve())
+
+    def test_unknown_api_health_remains_api_only_fallback(self, tmp_path):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        snapshot = {
+            "available": True,
+            "known": False,
+            "reason": "not_probed",
+            "state": "unknown",
+            "windows": [],
+        }
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account, snapshot),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="gpt-5.5") == str(
+            Path(account.codex_home).resolve()
+        )
+
     def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
         pool, native_home = self._mixed_pool(tmp_path, account)

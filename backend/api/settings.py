@@ -25,6 +25,9 @@ from backend.services.instance_capacity import (
     occupied_slot_predicate,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
+from backend.services.runtime_settings import (
+    effective_agent_sandbox_unrestricted_enabled,
+)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -33,6 +36,7 @@ router = APIRouter(prefix="/api/settings", tags=["settings"])
 # SQLite and would not protect the runtime value, so serialize the complete
 # update in this process.
 _capacity_settings_lock = asyncio.Lock()
+_runtime_settings_lock = asyncio.Lock()
 
 
 async def _get_or_create(db: AsyncSession) -> GlobalSettings:
@@ -203,12 +207,17 @@ async def update_capacity_settings(
 async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
     from backend.main import instance_manager
     row = await _get_or_create(db)
+    # Lifespan applies this same effective DB/env value before dispatch starts.
+    # Returning the live value makes this endpoint an execution truth source.
     return RuntimeSettingsResponse(
         use_pty_mode=instance_manager.pty_mode_enabled,
         pty_available=_pty_available(),
         codex_app_server_enabled=settings.codex_app_server_enabled,
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
         codex_monitor_enabled=settings.codex_main_mcp_enabled,
+        agent_sandbox_unrestricted_enabled=(
+            instance_manager.agent_sandbox_unrestricted_enabled
+        ),
         auto_sort_on_access=(
             row.auto_sort_on_access
             if row.auto_sort_on_access is not None
@@ -220,53 +229,80 @@ async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
 
 @router.put("/runtime", response_model=RuntimeSettingsResponse)
 async def update_runtime_settings(
-    body: RuntimeSettingsUpdate, db: AsyncSession = Depends(get_db)
+    request: Request,
+    body: RuntimeSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
 ):
+    require_admin(request)
     from backend.main import instance_manager
-
-    row = await _get_or_create(db)
-
-    if body.use_pty_mode is not None:
-        effective = instance_manager.set_pty_mode(body.use_pty_mode)
-        if not effective:
-            drained = await instance_manager.drain_idle_pty_sessions()
-            if drained:
-                import logging
-                logging.getLogger(__name__).info(
-                    "PTY mode off: drained %d idle session(s)", drained
-                )
-        row.use_pty_mode = effective
-
-    if body.auto_sort_on_access is not None:
-        row.auto_sort_on_access = body.auto_sort_on_access
-
-    if body.context_compact_threshold is not None:
-        row.context_compact_threshold = body.context_compact_threshold
-
-    await db.commit()
-
-    auto_sort = row.auto_sort_on_access if row.auto_sort_on_access is not None else True
-    compact_threshold = _effective_compact_threshold(row)
-
     from backend.main import broadcaster
-    await broadcaster.broadcast("system", {
-        "event": "runtime_settings_changed",
-        "use_pty_mode": instance_manager.pty_mode_enabled,
-        "codex_app_server_enabled": settings.codex_app_server_enabled,
-        "codex_main_mcp_enabled": settings.codex_main_mcp_enabled,
-        "codex_monitor_enabled": settings.codex_main_mcp_enabled,
-        "auto_sort_on_access": auto_sort,
-        "context_compact_threshold": compact_threshold,
-    })
-    return RuntimeSettingsResponse(
-        use_pty_mode=instance_manager.pty_mode_enabled,
-        pty_available=_pty_available(),
-        codex_app_server_enabled=settings.codex_app_server_enabled,
-        codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
-        codex_monitor_enabled=settings.codex_main_mcp_enabled,
-        auto_sort_on_access=auto_sort,
-        context_compact_threshold=compact_threshold,
-    )
+
+    async def persist_apply_and_respond() -> RuntimeSettingsResponse:
+        async with _runtime_settings_lock:
+            row = await _get_or_create(db)
+
+            if body.use_pty_mode is not None:
+                effective = instance_manager.set_pty_mode(body.use_pty_mode)
+                if not effective:
+                    drained = await instance_manager.drain_idle_pty_sessions()
+                    if drained:
+                        import logging
+                        logging.getLogger(__name__).info(
+                            "PTY mode off: drained %d idle session(s)",
+                            drained,
+                        )
+                row.use_pty_mode = effective
+
+            if body.agent_sandbox_unrestricted_enabled is not None:
+                row.agent_sandbox_unrestricted_enabled = (
+                    body.agent_sandbox_unrestricted_enabled
+                )
+
+            if body.auto_sort_on_access is not None:
+                row.auto_sort_on_access = body.auto_sort_on_access
+
+            if body.context_compact_threshold is not None:
+                row.context_compact_threshold = body.context_compact_threshold
+
+            await db.commit()
+            # There is no await between the durable commit and this runtime
+            # assignment. Cancellation therefore cannot expose a committed
+            # toggle while new turns continue using the previous policy.
+            if body.agent_sandbox_unrestricted_enabled is not None:
+                instance_manager.set_agent_sandbox_unrestricted_enabled(
+                    effective_agent_sandbox_unrestricted_enabled(row)
+                )
+
+            auto_sort = (
+                row.auto_sort_on_access
+                if row.auto_sort_on_access is not None
+                else True
+            )
+            compact_threshold = _effective_compact_threshold(row)
+            response = RuntimeSettingsResponse(
+                use_pty_mode=instance_manager.pty_mode_enabled,
+                pty_available=_pty_available(),
+                codex_app_server_enabled=settings.codex_app_server_enabled,
+                codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
+                codex_monitor_enabled=settings.codex_main_mcp_enabled,
+                agent_sandbox_unrestricted_enabled=(
+                    instance_manager.agent_sandbox_unrestricted_enabled
+                ),
+                auto_sort_on_access=auto_sort,
+                context_compact_threshold=compact_threshold,
+            )
+            await broadcaster.broadcast("system", {
+                "event": "runtime_settings_changed",
+                **response.model_dump(mode="json"),
+            })
+            return response
+
+    update_task = asyncio.create_task(persist_apply_and_respond())
+    try:
+        return await asyncio.shield(update_task)
+    except asyncio.CancelledError:
+        await asyncio.shield(update_task)
+        raise
 
 
 # --- Default Skills ---

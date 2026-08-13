@@ -15,11 +15,13 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
 import signal
 import stat
+import sys
 import time
 import uuid
 from collections import deque
@@ -223,14 +225,17 @@ _GOAL_RECONCILE_INTERVAL = 5.0
 # fence is an explicit failure, never permission to publish a false success.
 _DESCENDANT_TERMINAL_TIMEOUT = 4 * 60 * 60.0
 # Codex 0.147 exposes no RPC that proves background plugin discovery settled;
-# calling ``plugin/list`` can itself schedule more background work. Isolated
-# preflight therefore never calls it. Two consecutive forced, canonical skill
-# snapshots capture the current inventory without triggering plugin refresh.
-# This is not a plugin-settled proof: safety still comes from disabling plugin
-# features plus the existing thread/ownership/turn fingerprint and revision
-# fences. Bound both reads and wall time so a moving inventory fails closed.
+# forcing either plugin or skill discovery can itself schedule delayed global
+# watcher work. Isolated preflight therefore reads the watcher-maintained skill
+# cache twice without forcing a refresh. This is not a plugin-settled proof:
+# safety still comes from disabling plugin features plus the existing thread,
+# ownership, turn fingerprint and monotonic revision fences. Bound both reads
+# and wall time so a moving inventory fails closed.
 _ISOLATED_SKILLS_SNAPSHOT_MAX_READS = 8
 _ISOLATED_SKILLS_SNAPSHOT_TIMEOUT = 10.0
+# Keep admission private briefly after two matching cache reads so already
+# queued real watcher events can advance the revision before model input.
+_ISOLATED_SKILLS_QUIET_PERIOD = 0.25
 
 
 def _format_process_exit(returncode: int | None) -> str:
@@ -695,6 +700,118 @@ def _nearest_concrete_parent_permission(
     return nearest_permission
 
 
+def _npm_codex_native_package_name() -> str | None:
+    """Return the optional native package selected by the npm Codex wrapper."""
+
+    if sys.platform == "darwin":
+        platform_name = "darwin"
+    elif sys.platform.startswith("linux"):
+        platform_name = "linux"
+    elif sys.platform in {"win32", "cygwin"}:
+        platform_name = "win32"
+    else:
+        return None
+    machine = platform.machine().strip().lower()
+    if machine in {"arm64", "aarch64"}:
+        architecture = "arm64"
+    elif machine in {"x86_64", "amd64"}:
+        architecture = "x64"
+    else:
+        return None
+    return f"@openai/codex-{platform_name}-{architecture}"
+
+
+def _read_small_package_manifest(path: Path) -> dict[str, Any] | None:
+    try:
+        info = path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > 128 * 1024
+        ):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _npm_codex_native_binary(launcher: Path) -> Path | None:
+    """Resolve an npm ``bin/codex.js`` launcher to its bundled native binary.
+
+    A request-local permission profile can allow-list a standalone binary and
+    its adjacent code-mode host, but copying only the JavaScript npm launcher
+    detaches it from ``node_modules``.  Resolve the optional package through
+    version-matched manifests instead of parsing or executing wrapper code.
+    """
+
+    if launcher.name != "codex.js" or launcher.parent.name != "bin":
+        return None
+    package_root = launcher.parent.parent
+    launcher_manifest = _read_small_package_manifest(
+        package_root / "package.json"
+    )
+    native_package = _npm_codex_native_package_name()
+    if (
+        launcher_manifest is None
+        or launcher_manifest.get("name") != "@openai/codex"
+        or not isinstance(launcher_manifest.get("version"), str)
+        or native_package is None
+    ):
+        return None
+    scope, package = native_package.split("/", 1)
+    native_root = package_root / "node_modules" / scope / package
+    native_manifest = _read_small_package_manifest(native_root / "package.json")
+    if native_manifest is None:
+        return None
+    native_version = native_manifest.get("version")
+    optional_dependencies = launcher_manifest.get("optionalDependencies")
+    optional_alias = (
+        optional_dependencies.get(native_package)
+        if isinstance(optional_dependencies, dict)
+        else None
+    )
+    # The 0.147 npm wrapper installs platform packages through npm aliases:
+    # the directory is ``@openai/codex-darwin-arm64`` while its manifest is
+    # still named ``@openai/codex`` with a platform-suffixed version. Preserve
+    # compatibility with older direct-name optional packages as well, but in
+    # both cases require the wrapper manifest to bind the exact native build.
+    aliased_release = bool(
+        native_manifest.get("name") == "@openai/codex"
+        and isinstance(native_version, str)
+        and native_version.startswith(f"{launcher_manifest['version']}-")
+        and optional_alias == f"npm:@openai/codex@{native_version}"
+    )
+    direct_release = bool(
+        native_manifest.get("name") == native_package
+        and native_version == launcher_manifest["version"]
+        and optional_alias in {None, native_version}
+    )
+    if not (aliased_release or direct_release):
+        return None
+    executable_name = "codex.exe" if sys.platform == "win32" else "codex"
+    try:
+        candidates = [
+            candidate
+            for candidate in (native_root / "vendor").glob(
+                f"*/bin/{executable_name}"
+            )
+            if not candidate.is_symlink()
+            and candidate.is_file()
+            and os.access(candidate, os.X_OK)
+        ]
+    except OSError:
+        return None
+    if len(candidates) != 1:
+        return None
+    try:
+        resolved = candidates[0].resolve(strict=True)
+        resolved.relative_to(native_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
 def _codex_runtime_read_paths(
     binary: str,
     *,
@@ -715,6 +832,13 @@ def _codex_runtime_read_paths(
         source_info = resolved.stat()
     except (OSError, RuntimeError):
         return ()
+    native_binary = _npm_codex_native_binary(resolved)
+    if native_binary is not None:
+        try:
+            resolved = native_binary
+            source_info = resolved.stat()
+        except OSError:
+            return ()
     if (
         not stat.S_ISREG(source_info.st_mode)
         or not os.access(resolved, os.X_OK)
@@ -1170,11 +1294,39 @@ def _harden_ambient_shell_environment_policy(
     """
 
     ambient = effective_config.get("shell_environment_policy")
-    if not isinstance(ambient, dict) or "filters" not in ambient:
+    if not isinstance(ambient, dict):
         return
     request = thread_config.get("shell_environment_policy")
     if not isinstance(request, dict):
         raise ValueError("isolated shell environment policy is malformed")
+
+    # ``set`` is deep-merged by Codex.  Merely using ``inherit = none`` does
+    # not remove variables injected by the user's ambient Codex config, so
+    # explicitly shadow every ambient-only key with an empty value.  This
+    # preserves CCM's exact task-local values while proving that credentials
+    # and other ambient values cannot reach the isolated model shell.
+    ambient_set = ambient.get("set")
+    if ambient_set is not None:
+        if not isinstance(ambient_set, dict) or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, str)
+            for name, value in ambient_set.items()
+        ):
+            raise ValueError("ambient shell environment set is malformed")
+        request_set = request.get("set")
+        if not isinstance(request_set, dict) or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, str)
+            for name, value in request_set.items()
+        ):
+            raise ValueError("isolated shell environment set is malformed")
+        for name in ambient_set:
+            request_set.setdefault(name, "")
+
+    if "filters" not in ambient:
+        return
 
     ambient_filters = ambient.get("filters")
     if ambient_filters is None:
@@ -1206,6 +1358,74 @@ def _harden_ambient_shell_environment_policy(
             pattern: action for pattern in patterns
         })
     request["filters"] = canonical_filters
+
+
+def _harden_ambient_hook_state(
+    effective_config: dict[str, Any],
+    thread_config: dict[str, Any],
+) -> None:
+    """Neutralize Codex's non-executable persisted hook trust metadata.
+
+    Codex 0.147 exposes hashes from the desktop hook trust UI beneath
+    ``hooks.state``.  That table is deep-merged even when the hooks feature is
+    disabled.  Emptying each known hash prevents ambient trust from surviving
+    while still rejecting any executable or future hook configuration.
+    """
+
+    ambient = effective_config.get("hooks")
+    if ambient is None or ambient == {}:
+        return
+    hook_event_keys = frozenset({
+        "PermissionRequest",
+        "PostCompact",
+        "PostToolUse",
+        "PreCompact",
+        "PreToolUse",
+        "SessionEnd",
+        "SessionStart",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "UserPromptSubmit",
+    })
+    if not isinstance(ambient, dict) or not set(ambient) <= (
+        hook_event_keys | {"state"}
+    ):
+        raise ValueError("ambient hooks include executable configuration")
+
+    request_hooks = thread_config.setdefault("hooks", {})
+    if not isinstance(request_hooks, dict):
+        raise ValueError("isolated hooks configuration is malformed")
+    for event in set(ambient) & hook_event_keys:
+        if ambient[event] != []:
+            raise ValueError("ambient hooks include active event handlers")
+        request_event = request_hooks.setdefault(event, [])
+        if request_event != []:
+            raise ValueError("isolated hook event override is malformed")
+
+    ambient_state = ambient.get("state")
+    if ambient_state is None or ambient_state == {}:
+        return
+    if not isinstance(ambient_state, dict):
+        raise ValueError("ambient hook trust state is malformed")
+
+    neutral_state: dict[str, dict[str, str]] = {}
+    for source, state in ambient_state.items():
+        if (
+            not isinstance(source, str)
+            or not source
+            or not isinstance(state, dict)
+            or set(state) != {"trusted_hash"}
+            or not isinstance(state.get("trusted_hash"), str)
+        ):
+            raise ValueError("ambient hook trust state is malformed")
+        neutral_state[source] = {"trusted_hash": ""}
+
+    request_state = request_hooks.setdefault("state", {})
+    if not isinstance(request_state, dict):
+        raise ValueError("isolated hook trust state is malformed")
+    for source, state in neutral_state.items():
+        request_state[source] = state
 
 
 def _harden_ambient_feature_config(
@@ -1317,6 +1537,7 @@ def _audit_task_ssh_thread_response(
     managed_network_proxy: bool,
     sandbox_mode: str,
     cwd: str,
+    private_tmpdir: str,
 ) -> None:
     """Prove Codex admitted CCM's exact Task-isolation profile."""
 
@@ -1330,19 +1551,38 @@ def _audit_task_ssh_thread_response(
     ):
         raise ValueError("Task isolation profile was not selected")
     sandbox = response.get("sandbox")
-    expected_type = {
-        "workspace-write": "workspaceWrite",
-        "read-only": "readOnly",
-    }.get(sandbox_mode)
     if disable_network == managed_network_proxy:
         raise ValueError("Task response audit lost its network boundary")
     expected_network = managed_network_proxy
     if (
         not isinstance(sandbox, dict)
-        or sandbox.get("type") != expected_type
+        # Every Task profile grants its generation-private TMP leaf write
+        # access. Codex 0.147 therefore reports ``workspaceWrite`` even when
+        # the repository itself was requested as read-only. The selected
+        # request-unique permission profile proves the repository rule; for
+        # read-only turns, also prove TMP is the only extra writable root.
+        or sandbox.get("type") != "workspaceWrite"
         or sandbox.get("networkAccess") is not expected_network
     ):
         raise ValueError("Task isolation resolved an unexpected sandbox policy")
+    if sandbox_mode == "read-only":
+        writable_roots = sandbox.get("writableRoots")
+        expected_scratch = _canonical_path(private_tmpdir)
+        if not isinstance(writable_roots, list) or any(
+            not isinstance(value, str) for value in writable_roots
+        ):
+            raise ValueError("read-only Task writable roots are malformed")
+        if {
+            _canonical_path(value) for value in writable_roots
+        } != {expected_scratch}:
+            raise ValueError("read-only Task admitted an unexpected writable root")
+        if (
+            sandbox.get("excludeTmpdirEnvVar") is not True
+            or sandbox.get("excludeSlashTmp") is not True
+        ):
+            raise ValueError("read-only Task did not isolate ambient temp roots")
+    elif sandbox_mode != "workspace-write":
+        raise ValueError("Task isolation reported an unsupported sandbox mode")
     sources = response.get("instructionSources")
     if not isinstance(sources, list):
         raise ValueError("Task isolation did not report instruction sources")
@@ -1423,6 +1663,7 @@ def _audit_network_isolated_thread_response(
     response: Any,
     *,
     cwd: str,
+    private_tmpdir: str,
     permission_profile_id: str,
 ) -> None:
     """Prove the Delivery thread kept its exact local sandbox boundary."""
@@ -1458,10 +1699,13 @@ def _audit_network_isolated_thread_response(
     if not isinstance(writable_roots, list):
         raise ValueError("Delivery writable roots were not reported")
     workspace = _canonical_path(cwd)
+    scratch = _canonical_path(private_tmpdir)
     for value in writable_roots:
         if not isinstance(value, str):
             raise ValueError("Delivery writable root is malformed")
         candidate = _canonical_path(value)
+        if candidate == scratch:
+            continue
         try:
             candidate.relative_to(workspace)
         except ValueError as exc:
@@ -1810,6 +2054,14 @@ class CodexTurnProcess:
         if self.returncode is not None:
             raise RuntimeError("Cannot bind runtime cleanup to a terminal turn")
         self._runtime_cleanup = cleanup
+
+    def add_done_callback(
+        self,
+        callback: Callable[[asyncio.Future[int]], None],
+    ) -> None:
+        """Run ``callback`` when this exact native turn becomes terminal."""
+
+        self._done.add_done_callback(callback)
 
     def _schedule_runtime_cleanup(self) -> None:
         cleanup = self._runtime_cleanup
@@ -4092,6 +4344,7 @@ class CodexAppServer:
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         mcp_only: bool = False,
+        sandbox_unrestricted_enabled: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -4103,6 +4356,62 @@ class CodexAppServer:
         managed_runtime_prestarted = False
         managed_network_process: asyncio.subprocess.Process | None = None
         isolated_process: asyncio.subprocess.Process | None = None
+        if sandbox_mode not in {
+            "danger-full-access",
+            "workspace-write",
+            "read-only",
+        }:
+            raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
+        if tools_disabled and mcp_only:
+            raise CodexRequiredMcpPreTurnError(
+                "Codex turn cannot be both tool-free and MCP-only"
+            )
+        restricted_tools = tools_disabled or mcp_only
+        if sandbox_unrestricted_enabled and not restricted_tools:
+            requested_sandbox_mode = sandbox_mode
+            requested_filesystem_isolation = bool(task_ssh_protected_paths)
+            requested_network_isolation = bool(
+                network_isolated
+                or task_ssh_disable_network
+                or task_managed_network_proxy
+            )
+            # This is deliberately normalized before any managed-network
+            # version proof or permission-profile construction.  Leaving even
+            # one of the old boundary inputs populated would either rebuild a
+            # named profile later or make the supposedly unrestricted request
+            # fail its isolated admission checks.
+            sandbox_mode = "danger-full-access"
+            task_ssh_protected_paths = ()
+            task_ssh_allowed_read_paths = ()
+            task_git_read_paths = ()
+            task_git_boundary_fingerprint = ()
+            task_private_tmpdir = None
+            task_ssh_disable_network = False
+            task_managed_network_proxy = False
+            network_isolated = False
+            disable_autonomous_features = False
+            logger.critical(
+                "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted an unrestricted "
+                "Codex turn task=%s requested_mode=%s filesystem_isolated=%s "
+                "network_isolated=%s",
+                task_id,
+                requested_sandbox_mode,
+                requested_filesystem_isolation,
+                requested_network_isolation,
+            )
+        elif sandbox_unrestricted_enabled:
+            # Tool-free and MCP-only are capability protocols rather than
+            # ordinary executable sandboxes. Expanding either would grant a
+            # PR reviewer or untrusted Browser child a new tool surface and
+            # break the evidence contract, so the deployment switch does not
+            # rewrite them.
+            logger.warning(
+                "AGENT_SANDBOX_UNRESTRICTED_ENABLED retained capability-"
+                "restricted Codex turn task=%s tools_disabled=%s mcp_only=%s",
+                task_id,
+                tools_disabled,
+                mcp_only,
+            )
         if task_managed_network_proxy:
             # ``initialize`` is the version proof for this exact transport
             # generation. Complete it before constructing the network profile;
@@ -4143,17 +4452,6 @@ class CodexAppServer:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex managed-network runtime generation changed " + stage
                 )
-        if sandbox_mode not in {
-            "danger-full-access",
-            "workspace-write",
-            "read-only",
-        }:
-            raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
-        if tools_disabled and mcp_only:
-            raise CodexRequiredMcpPreTurnError(
-                "Codex turn cannot be both tool-free and MCP-only"
-            )
-        restricted_tools = tools_disabled or mcp_only
         if tools_disabled:
             if os.name != "posix":
                 raise CodexRequiredMcpPreTurnError(
@@ -4487,10 +4785,10 @@ class CodexAppServer:
         isolated_dynamic_disabled_features: frozenset[str] = frozenset()
 
         async def retry_isolated_admission_after_skills_drift(
-            thread_id: str,
+            thread_id: str | None,
             error: _CodexIsolatedSkillsDriftError,
         ) -> tuple[CodexTurnProcess, str]:
-            """Delete one empty thread and rebuild its exact skill deny-list."""
+            """Rebuild the exact skill deny-list, deleting an empty thread."""
 
             if resume_session_id:
                 # A resumed id owns durable history and must never be deleted
@@ -4504,28 +4802,29 @@ class CodexAppServer:
                 thread_id,
                 _isolated_admission_retry_count,
             )
-            delete_request = asyncio.create_task(self._request(
-                "thread/delete",
-                {"threadId": thread_id},
-                expected_process=isolated_process,
-            ))
             cancelled = False
-            while not delete_request.done():
+            if thread_id is not None:
+                delete_request = asyncio.create_task(self._request(
+                    "thread/delete",
+                    {"threadId": thread_id},
+                    expected_process=isolated_process,
+                ))
+                while not delete_request.done():
+                    try:
+                        await asyncio.shield(delete_request)
+                    except asyncio.CancelledError:
+                        cancelled = True
+                        continue
                 try:
-                    await asyncio.shield(delete_request)
-                except asyncio.CancelledError:
-                    cancelled = True
-                    continue
-            try:
-                delete_request.result()
-            except Exception as cleanup_error:
-                raise CodexRequiredMcpPreTurnError(
-                    "Codex could not release an empty isolated thread after "
-                    "its skills inventory changed"
-                ) from cleanup_error
-            finally:
-                self._known_threads.discard(thread_id)
-                self._contexts_by_thread.pop(thread_id, None)
+                    delete_request.result()
+                except Exception as cleanup_error:
+                    raise CodexRequiredMcpPreTurnError(
+                        "Codex could not release an empty isolated thread after "
+                        "its skills inventory changed"
+                    ) from cleanup_error
+                finally:
+                    self._known_threads.discard(thread_id)
+                    self._contexts_by_thread.pop(thread_id, None)
 
             if cancelled:
                 raise asyncio.CancelledError
@@ -4558,6 +4857,7 @@ class CodexAppServer:
                 output_schema=output_schema,
                 tools_disabled=tools_disabled,
                 mcp_only=mcp_only,
+                sandbox_unrestricted_enabled=sandbox_unrestricted_enabled,
                 on_thread_started=on_thread_started,
                 on_turn_prepared=on_turn_prepared,
                 _isolated_admission_retry_count=(
@@ -4889,18 +5189,18 @@ class CodexAppServer:
                 "config": await read_effective_config(),
             })
 
-        async def read_skills_inventory() -> Any:
+        async def read_skills_inventory(*, force_reload: bool) -> Any:
             return await self._request(
                 "skills/list",
                 {
                     "cwds": [os.path.abspath(cwd)],
-                    "forceReload": True,
+                    "forceReload": force_reload,
                 },
             )
 
         async def read_stable_skills_snapshot(
         ) -> tuple[list[dict[str, Any]], str, int] | None:
-            """Capture two matching current Codex 0.147 skill inventories."""
+            """Capture a quiet, matching current Codex 0.147 inventory."""
 
             runtime_version = self._runtime_version
             if runtime_version is None or runtime_version < (0, 147, 0):
@@ -4915,7 +5215,17 @@ class CodexAppServer:
                     while reads < _ISOLATED_SKILLS_SNAPSHOT_MAX_READS:
                         reads += 1
                         revision_before = self._skills_revision
-                        skills_inventory = await read_skills_inventory()
+                        # Codex's watcher owns and updates the process-global
+                        # cache.  A forced read manufactures a delayed
+                        # ``skills/changed`` notification whose debounce can
+                        # exceed several seconds and invalidate the exact
+                        # deny-list after model input.  Read the watcher cache
+                        # twice and fence it with the monotonic revision;
+                        # genuine filesystem drift still advances that
+                        # revision and fails closed.
+                        skills_inventory = await read_skills_inventory(
+                            force_reload=False,
+                        )
                         revision_after = self._skills_revision
                         disabled_skills = _tool_free_disabled_skill_config(
                             skills_inventory,
@@ -4946,6 +5256,18 @@ class CodexAppServer:
                             previous_fingerprint == fingerprint
                             and previous_revision == revision_before
                         ):
+                            # Codex 0.147 may publish the forced reload's
+                            # notification after its RPC response. Keep the
+                            # admission private until a real quiet window has
+                            # elapsed, then reject/retry if the monotonic
+                            # revision moved. This prevents a self-induced
+                            # event from interrupting the model turn while
+                            # preserving fail-closed external drift handling.
+                            await asyncio.sleep(_ISOLATED_SKILLS_QUIET_PERIOD)
+                            if self._skills_revision != revision_drained:
+                                previous_fingerprint = None
+                                previous_revision = None
+                                continue
                             return (
                                 disabled_skills,
                                 fingerprint,
@@ -4998,7 +5320,16 @@ class CodexAppServer:
                     effective_config,
                     label="effective Codex configuration",
                 )
-                current_skills = await read_skills_inventory()
+                # The forced reads above established a stable current
+                # inventory. Re-audits must not force another process-global
+                # reload: Codex 0.147 can publish that reload's own delayed
+                # ``skills/changed`` notification after durable launch
+                # ownership is committed. A normal read plus the monotonic
+                # revision fence still detects real external drift without
+                # manufacturing a TOCTOU violation itself.
+                current_skills = await read_skills_inventory(
+                    force_reload=False,
+                )
                 current_disabled_skills = _tool_free_disabled_skill_config(
                     current_skills,
                     cwd=cwd,
@@ -5188,7 +5519,9 @@ class CodexAppServer:
                 thread_config["mcp_servers"] = isolated_mcp
 
                 if stable_skills is None:
-                    skills_inventory = await read_skills_inventory()
+                    skills_inventory = await read_skills_inventory(
+                        force_reload=True,
+                    )
                     disabled_skills = _tool_free_disabled_skill_config(
                         skills_inventory,
                         cwd=cwd,
@@ -5371,6 +5704,10 @@ class CodexAppServer:
                     isolated_ambient_effective_config,
                     thread_config,
                 )
+                _harden_ambient_hook_state(
+                    isolated_ambient_effective_config,
+                    thread_config,
+                )
                 _audit_ambient_isolation_merge_inputs(
                     isolated_ambient_effective_config,
                     thread_config,
@@ -5381,7 +5718,7 @@ class CodexAppServer:
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex isolated ambient configuration could not be "
-                    "safely overridden"
+                    f"safely overridden: {exc}"
                 ) from exc
             isolated_disabled_features = (
                 isolated_disabled_features
@@ -5466,7 +5803,19 @@ class CodexAppServer:
             })
         audit_isolated_thread_config()
         require_stable_task_filesystem_boundary("before thread admission")
-        await require_stable_isolated_ambient_state("before thread admission")
+        try:
+            await require_stable_isolated_ambient_state(
+                "before thread admission"
+            )
+        except _CodexIsolatedSkillsDriftError as exc:
+            # Codex 0.147 can publish one final skills/changed notification
+            # after the stable forced snapshot but before thread/start.  No
+            # native thread or model input exists yet, so rebuild the exact
+            # deny-list once. Persistent drift remains a hard failure.
+            return await retry_isolated_admission_after_skills_drift(
+                None,
+                exc,
+            )
         require_isolated_runtime_generation("before thread admission")
         require_managed_network_generation("before thread admission")
         try:
@@ -5602,6 +5951,7 @@ class CodexAppServer:
                 _audit_network_isolated_thread_response(
                     response,
                     cwd=cwd,
+                    private_tmpdir=str(task_private_tmpdir.path),
                     permission_profile_id=str(network_permission_profile),
                 )
             except (TypeError, ValueError) as exc:
@@ -5618,6 +5968,7 @@ class CodexAppServer:
                     managed_network_proxy=task_managed_network_proxy,
                     sandbox_mode=sandbox_mode,
                     cwd=cwd,
+                    private_tmpdir=str(task_private_tmpdir.path),
                 )
                 await asyncio.sleep(0)
                 if (
@@ -7352,11 +7703,19 @@ class CodexAppServer:
 
     def _handle_notification(self, method: str, params: dict[str, Any]) -> None:
         if method == "skills/changed":
-            # Skill discovery is process-global. Any change invalidates the
-            # exact path inventory captured for every active tool-free turn.
+            # Discovery is process-global, but a tool-free review has already
+            # proved an empty environment/dynamic-tool surface, deny-all
+            # filesystem/network permissions, no instruction sources, and
+            # request-level disabling of skill instructions, bundled skills,
+            # and the orchestrator. Codex 0.147 also emits this notification
+            # asynchronously when thread/start applies that deny config, so
+            # treating it as capability use kills a correctly isolated model
+            # turn. Keep the monotonic revision for every subsequent
+            # admission. MCP-only turns retain the active-turn fence because
+            # their explicitly allowed tool surface is not empty.
             self._skills_revision += 1
             for context in list(self._contexts_by_thread.values()):
-                if context.tools_disabled or context.mcp_only:
+                if context.mcp_only:
                     self._schedule_tool_free_violation(
                         context,
                         "skills inventory changed",
@@ -8193,12 +8552,22 @@ class CodexAppServerRegistry:
             Callable[[str], CodexTierProxyRoute | None] | None
         ) = None,
         require_actual_tier_proof: bool = False,
+        sandbox_unrestricted_enabled: bool = False,
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
         self._env_remove_resolver = env_remove_resolver
         self._actual_tier_route_resolver = actual_tier_route_resolver
         self._require_actual_tier_proof = bool(require_actual_tier_proof)
+        self._sandbox_unrestricted_enabled = bool(
+            sandbox_unrestricted_enabled
+        )
+        if self._sandbox_unrestricted_enabled:
+            logger.critical(
+                "AGENT_SANDBOX_UNRESTRICTED_ENABLED is active for this "
+                "app-server registry; executable Codex turns can access the "
+                "host filesystem and network without CCM permission profiles"
+            )
         self._servers: dict[str, CodexAppServer] = {}
         self._thread_owners: dict[str, str] = {}
         self._draining: set[str] = set()
@@ -8218,11 +8587,39 @@ class CodexAppServerRegistry:
         self._starting_threads: dict[str, object] = {}
         self._shutdown_requested = False
         self._lock = asyncio.Lock()
+        # ``skills/list(forceReload=True)`` is process-global in Codex 0.147.
+        # Two concurrent tool-restricted admissions on one account can make
+        # each other's exact deny-list stale after model input. Hold one
+        # generation across admission and terminal completion; other homes
+        # remain independent and ordinary turns are unaffected.
+        self._isolated_turn_locks: dict[str, asyncio.Lock] = {}
         # Claimed stops and truly-unclaimed admission cleanup can both need to
         # reason about every turn on one shared transport.  Serialize those
         # decisions per home so two cleanup attempts cannot independently
         # conclude that shutting down the same server generation is safe.
         self._abort_locks: dict[str, asyncio.Lock] = {}
+
+    @property
+    def sandbox_unrestricted_enabled(self) -> bool:
+        return self._sandbox_unrestricted_enabled
+
+    def set_sandbox_unrestricted_enabled(self, enabled: bool) -> bool:
+        """Change the operator-owned policy used by subsequent turn starts."""
+
+        effective = bool(enabled)
+        previous = self._sandbox_unrestricted_enabled
+        self._sandbox_unrestricted_enabled = effective
+        if effective and not previous:
+            logger.critical(
+                "Codex app-server sandbox override enabled at runtime; "
+                "subsequent executable turns use danger-full-access"
+            )
+        elif previous and not effective:
+            logger.warning(
+                "Codex app-server sandbox override disabled at runtime; "
+                "subsequent turns use their CCM permission profiles"
+            )
+        return effective
 
     def _new_server(self, home: str) -> CodexAppServer:
         server_kwargs: dict[str, Any] = {}
@@ -8248,52 +8645,66 @@ class CodexAppServerRegistry:
         **kwargs: Any,
     ) -> tuple[CodexTurnProcess, str]:
         home = normalize_codex_home(codex_home)
+        # Registry configuration is deployment-owned. Individual Tasks and
+        # callers cannot weaken or re-enable the sandbox independently.
+        kwargs["sandbox_unrestricted_enabled"] = (
+            self._sandbox_unrestricted_enabled
+        )
         resume_session_id = kwargs.get("resume_session_id")
+        isolated_turn_lock: asyncio.Lock | None = None
+        isolated_turn_lock_transferred = False
+        if kwargs.get("tools_disabled") or kwargs.get("mcp_only"):
+            async with self._lock:
+                isolated_turn_lock = self._isolated_turn_locks.setdefault(
+                    home,
+                    asyncio.Lock(),
+                )
+            await isolated_turn_lock.acquire()
         reserved_owner = False
         start_token: object | None = None
-
-        async with self._lock:
-            if self._shutdown_requested:
-                raise CodexAppServerBusyError(
-                    "Codex app-server registry is shutting down"
-                )
-            if home in self._draining:
-                raise CodexAppServerBusyError(
-                    f"Codex account app-server is draining: {home}"
-                )
-            if resume_session_id:
-                if resume_session_id in self._starting_threads:
-                    raise CodexAppServerBusyError(
-                        f"Codex thread {resume_session_id} already has a resume request in flight"
-                    )
-                if resume_session_id in self._rebindings:
-                    raise CodexAppServerBusyError(
-                        f"Codex thread {resume_session_id} is being rebound"
-                    )
-                owner = self._thread_owners.get(resume_session_id)
-                if owner is not None and owner != home:
-                    raise CodexThreadHomeMismatchError(
-                        f"Codex thread {resume_session_id} is bound to {owner}, not {home}; "
-                        "migrate and rebind it before resume"
-                    )
-                if owner is None:
-                    # Reserve the route while the RPC is in flight so two
-                    # concurrent resumes cannot load one rollout in two homes.
-                    self._thread_owners[resume_session_id] = home
-                    reserved_owner = True
-                start_token = object()
-                self._starting_threads[resume_session_id] = start_token
-            server = self._servers.get(home)
-            if server is None:
-                server = self._new_server(home)
-                self._servers[home] = server
-            self._starting[home] = self._starting.get(home, 0) + 1
-
+        server: CodexAppServer | None = None
         process: CodexTurnProcess | None = None
         thread_id: str | None = None
         admitted = False
         starting_released = False
         try:
+            async with self._lock:
+                if self._shutdown_requested:
+                    raise CodexAppServerBusyError(
+                        "Codex app-server registry is shutting down"
+                    )
+                if home in self._draining:
+                    raise CodexAppServerBusyError(
+                        f"Codex account app-server is draining: {home}"
+                    )
+                if resume_session_id:
+                    if resume_session_id in self._starting_threads:
+                        raise CodexAppServerBusyError(
+                            f"Codex thread {resume_session_id} already has a resume request in flight"
+                        )
+                    if resume_session_id in self._rebindings:
+                        raise CodexAppServerBusyError(
+                            f"Codex thread {resume_session_id} is being rebound"
+                        )
+                    owner = self._thread_owners.get(resume_session_id)
+                    if owner is not None and owner != home:
+                        raise CodexThreadHomeMismatchError(
+                            f"Codex thread {resume_session_id} is bound to {owner}, not {home}; "
+                            "migrate and rebind it before resume"
+                        )
+                    if owner is None:
+                        # Reserve the route while the RPC is in flight so two
+                        # concurrent resumes cannot load one rollout in two homes.
+                        self._thread_owners[resume_session_id] = home
+                        reserved_owner = True
+                    start_token = object()
+                    self._starting_threads[resume_session_id] = start_token
+                server = self._servers.get(home)
+                if server is None:
+                    server = self._new_server(home)
+                    self._servers[home] = server
+                self._starting[home] = self._starting.get(home, 0) + 1
+
             try:
                 process, thread_id = await server.start_turn(**kwargs)
             except (
@@ -8316,6 +8727,14 @@ class CodexAppServerRegistry:
                 starting_released = True
                 self._thread_owners[thread_id] = home
                 admitted = True
+            if isolated_turn_lock is not None:
+                isolated_turn_lock_transferred = True
+
+                def release_isolated_turn_lock(_done: asyncio.Future[int]) -> None:
+                    if isolated_turn_lock.locked():
+                        isolated_turn_lock.release()
+
+                process.add_done_callback(release_isolated_turn_lock)
             return process, thread_id
         except BaseException as exc:
             if isinstance(
@@ -8343,7 +8762,7 @@ class CodexAppServerRegistry:
                         ) from exc
                 if resume_session_id == exc.thread_id:
                     reserved_owner = False
-            if getattr(server, "shutdown_requested", False):
+            if server is not None and getattr(server, "shutdown_requested", False):
                 async with self._lock:
                     if self._servers.get(home) is server:
                         self._draining.add(home)
@@ -8391,6 +8810,12 @@ class CodexAppServerRegistry:
                 except asyncio.CancelledError:
                     continue
             cleanup.result()
+            if (
+                isolated_turn_lock is not None
+                and not isolated_turn_lock_transferred
+                and isolated_turn_lock.locked()
+            ):
+                isolated_turn_lock.release()
 
     def _decrement_starting_locked(self, home: str) -> None:
         """Release one start reservation while ``self._lock`` is held."""

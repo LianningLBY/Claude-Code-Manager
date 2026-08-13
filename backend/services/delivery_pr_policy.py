@@ -162,6 +162,7 @@ async def frozen_delivery_pr_policy(
     *,
     monitor_run_id: int | None = None,
     require_effect_ready: bool = False,
+    require_thread_resolution_gate: bool = False,
 ) -> FrozenDeliveryPRPolicy | None:
     """Return the validated policy for a Delivery-owned review.
 
@@ -174,7 +175,10 @@ async def frozen_delivery_pr_policy(
     create/attach transaction.  GitHub effect callers must pass
     ``require_effect_ready=True``; that stricter boundary accepts only the
     exact, active ``monitoring/waiting`` Run after its Monitor/Review binding
-    is durable.
+    is durable.  The fixed-thread zero Gate additionally passes
+    ``require_thread_resolution_gate=True`` so it validates the exact
+    pre-publication ``resolving_fixed_threads`` state without making that
+    state eligible for a GitHub publication effect.
     """
 
     delivery_id = review.delivery_id
@@ -209,6 +213,10 @@ async def frozen_delivery_pr_policy(
             "Delivery review no longer matches its Run/PR/base/head subject"
         )
 
+    if require_thread_resolution_gate and not require_effect_ready:
+        raise DeliveryPRPolicyError(
+            "Thread-resolution Gate requires the effect-ready owner fence"
+        )
     if require_effect_ready:
         if (
             run.outcome is None
@@ -240,11 +248,16 @@ async def frozen_delivery_pr_policy(
             monitor_run_id,
             populate_existing=True,
         )
+        required_monitor_status = (
+            "resolving_fixed_threads"
+            if require_thread_resolution_gate
+            else "reviewing"
+        )
         if (
             monitor is None
             or monitor.repo_id != review.repo_id
             or monitor.pr_number != review.pr_number
-            or monitor.status != "reviewing"
+            or monitor.status != required_monitor_status
             or monitor.current_review_id != review.id
             or monitor.current_base_sha != review.base_sha
             or monitor.current_head_sha != review.head_sha

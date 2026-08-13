@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import stat
 from typing import Iterable
 from urllib.parse import urlsplit
 
@@ -1199,6 +1200,41 @@ class DeliveryWorkspaceManager:
             raise DeliveryWorkspaceConflict(
                 "Delivery Controller commit does not allow external Git filters"
             )
+
+        # Provider isolation can materialize exact zero-byte deny placeholders
+        # for credential/config names inside a writable workspace. They are a
+        # runtime boundary, not Developer output, and presence alone can alter
+        # package-manager or deployment behavior. Remove only the explicit
+        # isolation inventory when it is still untracked, regular, unsymlinked
+        # and empty; never apply a pattern or delete a tracked/user file.
+        from backend.services.task_agent_isolation import (
+            DELIVERY_ISOLATION_PLACEHOLDER_NAMES,
+        )
+
+        untracked = {
+            value.decode("utf-8", errors="strict")
+            for value in (
+                await _git(
+                    workspace,
+                    ["ls-files", "--others", "--exclude-standard", "-z"],
+                )
+            ).split(b"\0")
+            if value
+        }
+        for relative in sorted(
+            DELIVERY_ISOLATION_PLACEHOLDER_NAMES & untracked
+        ):
+            candidate = workspace / relative
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                continue
+            if (
+                stat.S_ISREG(info.st_mode)
+                and not stat.S_ISLNK(info.st_mode)
+                and info.st_size == 0
+            ):
+                candidate.unlink()
 
         await _git(workspace, [*_SAFE_GIT_CONFIG, "add", "--all"])
         staged_tree = (

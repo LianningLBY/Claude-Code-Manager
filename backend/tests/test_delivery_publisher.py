@@ -42,6 +42,7 @@ from backend.services.delivery_controller import (
     PublishedPullRequest,
 )
 from backend.services.delivery_publisher import (
+    DeliveryGitAuthenticationError,
     DeliveryGitError,
     DeliveryNonFastForwardError,
     GhDeliveryGateway,
@@ -813,6 +814,52 @@ async def test_existing_pr_with_wrong_exact_subject_is_refused(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["number", "url", "branch", "repo"])
+async def test_bound_pr_stale_head_does_not_relax_remote_identity(
+    db_session,
+    db_factory,
+    mismatch,
+):
+    run, _project, repo = await _delivery_scope(
+        db_session,
+        suffix=f"bound-stale-{mismatch}",
+    )
+    run.pr_number = 17
+    run.pr_url = f"https://github.com/{repo.repo_full_name}/pull/17"
+    await db_session.commit()
+
+    number = 18 if mismatch == "number" else 17
+    payload = _pull(
+        branch=run.delivery_branch,
+        repo_full_name=repo.repo_full_name,
+        number=number,
+        head_sha=HEAD2,
+        head_branch="somebody/elses-branch" if mismatch == "branch" else None,
+        head_repo="other/repository" if mismatch == "repo" else None,
+    )
+    if mismatch == "url":
+        payload["html_url"] = (
+            f"https://github.com/{repo.repo_full_name}/pull/18"
+        )
+    github = FakeGitHub(pulls=[payload])
+    git = FakeGit(repo.repo_full_name, {"main": BASE, run.delivery_branch: HEAD2})
+    publisher = GitHubDeliveryPublisher(db_factory, git=git, github=github)
+
+    with pytest.raises(
+        DeliveryPublisherPermanentError,
+        match="exact Delivery subject",
+    ):
+        await publisher.ensure_pull_request(
+            run_id=run.id,
+            idempotency_key=_key(run),
+            fence=await _fence(db_factory, run),
+        )
+
+    assert git.push_calls == 0
+    assert github.create_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_non_fast_forward_is_never_retried_with_force(db_session, db_factory):
     run, _project, repo = await _delivery_scope(db_session, suffix="non-ff")
     git = FakeGit(
@@ -839,6 +886,35 @@ async def test_non_fast_forward_is_never_retried_with_force(db_session, db_facto
 
 
 @pytest.mark.asyncio
+async def test_proven_git_auth_failure_is_a_no_effect_terminal_error(
+    db_session,
+    db_factory,
+):
+    run, _project, repo = await _delivery_scope(db_session, suffix="git-auth")
+    git = FakeGit(
+        repo.repo_full_name,
+        {"main": BASE, run.delivery_branch: None},
+        push_error=DeliveryGitAuthenticationError("credentials unavailable"),
+    )
+    github = FakeGitHub()
+    publisher = GitHubDeliveryPublisher(db_factory, git=git, github=github)
+
+    with pytest.raises(
+        DeliveryPublisherNoEffectPreflightError,
+        match="credentials are unavailable",
+    ):
+        await publisher.ensure_pull_request(
+            run_id=run.id,
+            idempotency_key=_key(run),
+            fence=await _fence(db_factory, run),
+        )
+
+    assert git.push_calls == 1
+    assert git.remote_refs[run.delivery_branch] is None
+    assert github.create_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_production_git_gateway_uses_plain_refspec_without_force(
     db_session, db_factory, monkeypatch
 ):
@@ -860,6 +936,16 @@ async def test_production_git_gateway_uses_plain_refspec_without_force(
 
     monkeypatch.setattr("backend.services.delivery_publisher._run_git", rejected)
     monkeypatch.setattr(
+        delivery_publisher_service,
+        "_github_credential_config",
+        lambda _url: (
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            "credential.https://github.com.helper=!/trusted/gh auth git-credential",
+        ),
+    )
+    monkeypatch.setattr(
         GitDeliveryGateway,
         "_validated_remote_urls",
         validated_urls,
@@ -872,6 +958,10 @@ async def test_production_git_gateway_uses_plain_refspec_without_force(
     argv = calls[0]
     assert "--force" not in argv
     assert "--force-with-lease" not in argv
+    assert (
+        "credential.https://github.com.helper=!/trusted/gh auth git-credential"
+        in argv
+    )
     assert f"{HEAD}:refs/heads/{run.delivery_branch}" in argv
 
 
@@ -902,6 +992,16 @@ async def test_production_git_gateway_uses_explicit_verified_remote_urls(
 
     monkeypatch.setattr(delivery_publisher_service, "_run_git", successful)
     monkeypatch.setattr(
+        delivery_publisher_service,
+        "_github_credential_config",
+        lambda _url: (
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            "credential.https://github.com.helper=!/trusted/gh auth git-credential",
+        ),
+    )
+    monkeypatch.setattr(
         GitDeliveryGateway,
         "_validated_remote_urls",
         validated_urls,
@@ -914,6 +1014,96 @@ async def test_production_git_gateway_uses_explicit_verified_remote_urls(
     for argv in calls:
         assert project.git_url in argv
         assert "origin" not in argv
+
+
+def test_github_https_credential_helper_is_fixed_and_tokenless(
+    tmp_path,
+    monkeypatch,
+):
+    gh = tmp_path / "trusted gh"
+    gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    gh.chmod(0o700)
+    monkeypatch.setattr(
+        delivery_publisher_service.shutil,
+        "which",
+        lambda command: str(gh) if command == "gh" else None,
+    )
+
+    config = delivery_publisher_service._github_credential_config(
+        "https://github.com/acme/widgets.git"
+    )
+
+    assert config[:2] == (
+        "-c",
+        "credential.https://github.com.helper=",
+    )
+    assert config[2] == "-c"
+    assert "auth git-credential" in config[3]
+    assert str(gh.resolve()) in config[3]
+    assert "token" not in config[3].lower()
+
+
+def test_github_ssh_transport_does_not_require_https_credential_helper(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        delivery_publisher_service.shutil,
+        "which",
+        lambda _command: pytest.fail("SSH transport must not resolve gh"),
+    )
+
+    assert (
+        delivery_publisher_service._github_credential_config(
+            "git@github.com:acme/widgets.git"
+        )
+        == ()
+    )
+
+
+@pytest.mark.asyncio
+async def test_production_git_gateway_classifies_missing_https_credentials(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _project, repo = await _delivery_scope(db_session, suffix="push-auth")
+    publisher = GitHubDeliveryPublisher(
+        db_factory,
+        git=FakeGit(repo.repo_full_name, {"main": BASE}),
+        github=FakeGitHub(),
+    )
+    subject = await publisher._load_subject(run.id)
+
+    async def rejected(_cwd, *args, **_kwargs):
+        assert "push" in args
+        return 128, b"", b"fatal: unable to get password from user\n"
+
+    async def validated_urls(_self, _current):
+        remote = "https://github.com/acme/widgets.git"
+        return remote, remote
+
+    monkeypatch.setattr(delivery_publisher_service, "_run_git", rejected)
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_github_credential_config",
+        lambda _url: (
+            "-c",
+            "credential.https://github.com.helper=",
+            "-c",
+            "credential.https://github.com.helper=!/trusted/gh auth git-credential",
+        ),
+    )
+    monkeypatch.setattr(
+        GitDeliveryGateway,
+        "_validated_remote_urls",
+        validated_urls,
+    )
+
+    with pytest.raises(
+        DeliveryGitAuthenticationError,
+        match="authentication is unavailable",
+    ):
+        await GitDeliveryGateway().push_exact(subject)
 
 
 def test_publisher_rejects_plain_http_github_remote_identity():
@@ -1951,14 +2141,15 @@ async def test_new_cycle_head_creates_review_and_advances_same_monitor_run(
     git.expected_head = HEAD2
     git.expected_tree = TREE2
     git.expected_patch = PATCH2
-    git.remote_refs[run.delivery_branch] = HEAD2
-    github.pulls[:] = [
-        _pull(
-            branch=run.delivery_branch,
-            repo_full_name=repo.repo_full_name,
-            head_sha=HEAD2,
-        )
-    ]
+    original_push_exact = git.push_exact
+
+    async def push_and_advance_bound_pr(subject):
+        result = await original_push_exact(subject)
+        # GitHub advances the already-open PR when its bound branch moves.
+        github.pulls[0]["head"]["sha"] = subject.head_sha
+        return result
+
+    git.push_exact = push_and_advance_bound_pr
 
     head2_pr = await publisher.ensure_pull_request(
         run_id=run.id,
@@ -1981,6 +2172,9 @@ async def test_new_cycle_head_creates_review_and_advances_same_monitor_run(
     assert advanced_id == monitor_id
     assert repeated_id == monitor_id
     assert create_calls == 2
+    assert git.push_calls == 1
+    assert git.remote_refs[run.delivery_branch] == HEAD2
+    assert head2_pr.head_sha == HEAD2
     async with db_factory() as db:
         reviews = list(
             (

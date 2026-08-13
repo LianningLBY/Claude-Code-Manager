@@ -123,7 +123,7 @@ describe('TaskList', () => {
       />,
     );
 
-    const runButton = screen.getByRole('button', { name: 'Delivery #17' });
+    const runButton = screen.getByRole('button', { name: 'DLV-17' });
     expect(runButton).toBeInTheDocument();
     expect(screen.getByText('operator note')).toBeInTheDocument();
     expect(screen.getByTitle('Chat')).toBeInTheDocument();

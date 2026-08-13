@@ -1046,10 +1046,16 @@ async def _runtime_lifespan(app: FastAPI):
     instance_manager._loop = asyncio.get_running_loop()
     # Apply persisted runtime-setting overrides before execution runtimes start.
     from backend.models.global_settings import GlobalSettings
+    from backend.services.runtime_settings import (
+        effective_agent_sandbox_unrestricted_enabled,
+    )
     async with async_session() as db:
         row = await db.get(GlobalSettings, 1)
         if row is not None and row.use_pty_mode is not None:
             instance_manager.set_pty_mode(row.use_pty_mode)
+        instance_manager.set_agent_sandbox_unrestricted_enabled(
+            effective_agent_sandbox_unrestricted_enabled(row)
+        )
         dispatcher.configure_capacity_override(
             row.max_concurrent_instances if row is not None else None
         )

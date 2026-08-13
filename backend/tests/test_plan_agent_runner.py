@@ -136,7 +136,7 @@ def test_claude_plan_command_is_read_only():
     )
 
     assert command[0] == settings.claude_binary
-    assert command[command.index("--permission-mode") + 1] == "plan"
+    assert command[command.index("--permission-mode") + 1] == "default"
     assert "--no-session-persistence" in command
     assert "--safe-mode" in command
     assert command[command.index("--tools") + 1] == "Glob,Grep,Read"
@@ -145,6 +145,52 @@ def test_claude_plan_command_is_read_only():
         "/private/runtime/plan-security.json"
     )
     assert command[command.index("--setting-sources") + 1] == ""
+    assert "Bash" in command[command.index("--disallowed-tools") + 1]
+    assert "--dangerously-skip-permissions" not in command
+
+
+def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
+    from backend.services.plan_agent_runner import (
+        _versioned_planner_prompt,
+        _versioned_reviewer_prompt,
+    )
+
+    common = {
+        "planning_request": "Add a status endpoint.",
+        "target_context": "",
+        "interaction_history": "",
+        "repository_context": '{"changed_since_run_start": false}',
+    }
+    planner = _versioned_planner_prompt(
+        **common,
+        base_plan=None,
+        reviewer_feedback=None,
+    )
+    reviewer = _versioned_reviewer_prompt(
+        **common,
+        plan_content="Inspect the existing route conventions.",
+    )
+
+    assert "header must be at most 20 characters" in planner
+    assert "not user decisions" in planner
+    assert "header must be at most 20 characters" in reviewer
+    assert "not be converted into a user question" in reviewer
+
+
+def test_claude_plan_host_unrestricted_command_keeps_read_only_tools():
+    command = _build_command(
+        provider="claude",
+        model="claude-opus-4-6",
+        effort="high",
+        schema=PLANNER_SCHEMA,
+        isolation_settings_path=None,
+    )
+
+    assert "--settings" not in command
+    assert command[command.index("--setting-sources") + 1] == ""
+    assert command[command.index("--permission-mode") + 1] == "default"
+    assert command[command.index("--tools") + 1] == "Glob,Grep,Read"
+    assert command[command.index("--allowedTools") + 1] == "Glob,Grep,Read"
     assert "Bash" in command[command.index("--disallowed-tools") + 1]
     assert "--dangerously-skip-permissions" not in command
 
@@ -1056,6 +1102,160 @@ async def test_claude_missing_binary_before_spawn_is_route_unavailable(
             runtime_receipt=None,
         )
 
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_claude_unrestricted_plan_skips_host_isolation_preflight(
+    db_factory,
+    monkeypatch,
+):
+    runtime_temp_dir = _plan_runtime_tmp(711)
+    instance_manager = MagicMock()
+    instance_manager.agent_sandbox_unrestricted_enabled = True
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=instance_manager,
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield None, None
+
+    captured_command = None
+    captured_env = None
+
+    async def missing_binary(*command, **kwargs):
+        nonlocal captured_command, captured_env
+        captured_command = command
+        captured_env = kwargs["env"]
+        raise FileNotFoundError("No such file or directory: 'claude'")
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "generate_claude_read_only_isolation_settings",
+        MagicMock(side_effect=AssertionError("must not generate isolation")),
+    )
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        MagicMock(side_effect=AssertionError("must not validate isolation")),
+    )
+    monkeypatch.setattr(
+        "backend.services.plan_agent_runner._settle_spawn",
+        missing_binary,
+    )
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="became unavailable before process admission",
+    ):
+        await runner._run_process_attempt(
+            task_id=711,
+            provider="claude",
+            model="claude-sonnet-5",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home=None,
+            step_id=711,
+            step_type="reviewer",
+            runtime_receipt=None,
+        )
+
+    assert captured_command is not None
+    assert "--settings" not in captured_command
+    assert captured_command[captured_command.index("--allowedTools") + 1] == (
+        "Glob,Grep,Read"
+    )
+    assert captured_env is not None
+    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in captured_env
+    assert runtime_temp_dir.cleaned is True
+
+
+@pytest.mark.asyncio
+async def test_claude_plan_projects_api_account_auth_into_process(
+    db_factory,
+    monkeypatch,
+):
+    runtime_temp_dir = _plan_runtime_tmp(712)
+    instance_manager = MagicMock()
+    instance_manager.agent_sandbox_unrestricted_enabled = True
+    cloudrouter_store = MagicMock()
+    runner = PlanAgentRunner(
+        db_factory=db_factory,
+        instance_manager=instance_manager,
+        cloudrouter_store=cloudrouter_store,
+    )
+    runner._prepare_provider_effect_boundary = AsyncMock(return_value=(
+        (),
+        (),
+        (),
+        runtime_temp_dir,
+    ))
+
+    @asynccontextmanager
+    async def runtime_admission(**_kwargs):
+        yield "/private/claude-api-home", True
+
+    captured_env = None
+
+    async def missing_binary(*_command, **kwargs):
+        nonlocal captured_env
+        captured_env = kwargs["env"]
+        raise FileNotFoundError("No such file or directory: 'claude'")
+
+    def inject_auth(environment, store, config_dir):
+        assert store is cloudrouter_store
+        assert config_dir == "/private/claude-api-home"
+        environment["ANTHROPIC_API_KEY"] = "projected-secret"
+        environment["ANTHROPIC_BASE_URL"] = "https://api.example.invalid"
+        return True
+
+    runner._runtime_admission = runtime_admission
+    monkeypatch.setattr(
+        "backend.services.claude_auth_projection."
+        "inject_cloudrouter_claude_direct_auth",
+        inject_auth,
+    )
+    monkeypatch.setattr(
+        "backend.services.plan_agent_runner._settle_spawn",
+        missing_binary,
+    )
+
+    with pytest.raises(
+        PlanRouteUnavailable,
+        match="became unavailable before process admission",
+    ):
+        await runner._run_process_attempt(
+            task_id=712,
+            provider="claude",
+            model="claude-sonnet-5",
+            effort="high",
+            cwd="/tmp",
+            prompt="review",
+            schema=REVIEWER_SCHEMA_V2,
+            timeout=30,
+            home="/private/claude-api-home",
+            step_id=712,
+            step_type="reviewer",
+            runtime_receipt=None,
+        )
+
+    assert captured_env is not None
+    assert captured_env["CLAUDE_CONFIG_DIR"] == "/private/claude-api-home"
+    assert captured_env["ANTHROPIC_API_KEY"] == "projected-secret"
+    assert captured_env["ANTHROPIC_BASE_URL"] == "https://api.example.invalid"
+    assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in captured_env
     assert runtime_temp_dir.cleaned is True
 
 

@@ -1373,24 +1373,21 @@ export function TaskForm({ onCreated }: TaskFormProps) {
             )}
           </div>
         )}
-        {mode !== 'delivery_loop' && provider === 'codex' && (
+        {mode !== 'delivery_loop' && provider === 'codex' &&
+          (!codexTaskSkillsEnabled || remoteTaskScope || !codexMonitorEnabled) && (
           <span
             className="text-xs text-gray-500 px-1 py-1.5 whitespace-nowrap"
             title={!codexTaskSkillsEnabled
               ? 'Codex 主任务 MCP 已关闭；仅 Sub-Agent 可用'
               : remoteTaskScope
                 ? 'Codex Monitor 当前仅支持本地、非共享任务'
-                : codexMonitorEnabled
-                  ? 'Codex Monitor 已对本地任务开放'
-                  : '当前后端尚未声明 Codex Monitor capability'}
+                : '当前后端尚未声明 Codex Monitor capability'}
           >
             {!codexTaskSkillsEnabled
               ? '主任务 MCP 已关闭 · 仅 Sub-Agent 可用'
               : remoteTaskScope
                 ? 'Monitor 仅支持本地 Codex'
-                : codexMonitorEnabled
-                  ? '本地 Codex Monitor 已启用'
-                  : 'Codex Monitor capability 未知'}
+                : 'Codex Monitor capability 未知'}
           </span>
         )}
         {/* Plugins dropdown */}

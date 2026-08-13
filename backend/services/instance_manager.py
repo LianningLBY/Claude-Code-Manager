@@ -15164,6 +15164,33 @@ class InstanceManager:
                 )
             return stopped
 
+    async def require_stop_session_preflight(self, instance_id: int) -> None:
+        """Reject a known-unsafe shared Codex stop before queue mutation."""
+
+        process = (
+            self.processes.get(instance_id)
+            or self._process_groups.get(instance_id)
+            or self._container_exec_processes.get(instance_id)
+        )
+        from backend.services.codex_app_server import (
+            CodexSharedTransportBusyError,
+            CodexTurnProcess,
+        )
+
+        if not isinstance(process, CodexTurnProcess):
+            return
+        registry = self._codex_app_server
+        codex_home = self._config_dirs.get(instance_id)
+        if registry is None or not codex_home:
+            raise CodexSharedTransportBusyError(
+                "Codex app-server turn has no registered account owner for "
+                f"instance {instance_id}"
+            )
+        await registry.require_claimed_turn_stop_isolated(
+            codex_home,
+            process,
+        )
+
     async def _stop_locked_inner(
         self,
         instance_id: int,

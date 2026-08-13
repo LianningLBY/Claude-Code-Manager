@@ -9238,6 +9238,55 @@ class CodexAppServerRegistry:
                 self._abort_locks[home] = lock
             return lock
 
+    async def require_claimed_turn_stop_isolated(
+        self,
+        codex_home: str | os.PathLike[str],
+        process: CodexTurnProcess,
+    ) -> None:
+        """Fail before caller-side stop effects when transport recycle is unsafe.
+
+        This is deliberately only a preflight: ``stop_claimed_turn`` repeats
+        every check while holding the abort lock before it performs the native
+        interrupt.  Callers use this earlier check to avoid destructive queue
+        or producer cleanup for a stop that is already known to be impossible.
+        """
+
+        home = normalize_codex_home(codex_home)
+        abort_lock = await self._abort_lock_for_home(home)
+        async with abort_lock:
+            async with self._lock:
+                if self._shutdown_requested:
+                    raise CodexSharedTransportBusyError(
+                        "Codex app-server registry is shutting down"
+                    )
+                if home in self._draining:
+                    raise CodexSharedTransportBusyError(
+                        "Cannot isolate a claimed turn while its shared "
+                        f"Codex app-server transport is draining: {home}"
+                    )
+                server = self._servers.get(home)
+                if (
+                    server is None
+                    or not server.owns_live_turn_process(process)
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Cannot isolate a claimed turn because its exact "
+                        "Codex app-server transport generation is no longer "
+                        f"registered: {home}"
+                    )
+                starting = self._starting.get(home, 0)
+                if starting:
+                    raise CodexSharedTransportBusyError(
+                        "Cannot stop the claimed turn while "
+                        f"{starting} admitted app-server request(s) are in "
+                        f"flight on its shared transport: {home}"
+                    )
+                if server.has_other_live_turn_processes(process):
+                    raise CodexSharedTransportBusyError(
+                        "Cannot stop the claimed turn while another live turn "
+                        f"shares its Codex app-server transport: {home}"
+                    )
+
     async def stop_claimed_turn(
         self,
         codex_home: str | os.PathLike[str],

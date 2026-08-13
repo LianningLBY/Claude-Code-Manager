@@ -6069,6 +6069,58 @@ async def test_stop_session_reports_unresolved_exact_owner(
 
 
 @pytest.mark.asyncio
+async def test_stop_session_shared_codex_preflight_preserves_queue(
+    client,
+    session_factory,
+):
+    """A known shared-transport conflict has no queue-side effects."""
+
+    import backend.main
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+    from backend.services.codex_app_server import CodexSharedTransportBusyError
+
+    create_resp = await client.post("/api/tasks", json={
+        "title": "Shared Codex stop",
+        "description": "d",
+        "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = Instance(
+            name="shared-codex-slot",
+            status="running",
+            pid=45679,
+            current_task_id=task_id,
+        )
+        db.add(instance)
+        await db.flush()
+        task.status = "executing"
+        task.instance_id = instance.id
+        await db.commit()
+
+    with patch.object(
+        backend.main.instance_manager,
+        "require_stop_session_preflight",
+        new_callable=AsyncMock,
+        side_effect=CodexSharedTransportBusyError("live peer"),
+    ), patch.object(
+        backend.main.dispatcher,
+        "abort_task_queue",
+        new_callable=AsyncMock,
+    ) as abort_queue:
+        response = await client.post(f"/api/tasks/{task_id}/stop-session")
+
+    assert response.status_code == 409
+    assert "no queued messages" in response.json()["detail"]
+    abort_queue.assert_not_awaited()
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "executing"
+
+
+@pytest.mark.asyncio
 async def test_cancel_reports_unresolved_exact_owner(
     client,
     session_factory,

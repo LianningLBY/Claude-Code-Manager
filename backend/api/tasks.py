@@ -4893,6 +4893,37 @@ async def _stop_task_session_local_under_cancellation_lease(
     termination_operation = (
         "supersede" if worker_supersede else "stop_session"
     )
+    # A Codex turn may share its persistent account transport with descendant
+    # or unrelated turns.  Explicit stop must recycle that transport to prove
+    # native helpers are gone, so a live peer makes the stop impossible.  Find
+    # that stable conflict before cancelling capabilities, clearing queued chat
+    # messages, or closing auxiliary producers.  The registry repeats this
+    # check at the native stop boundary to retain fail-closed race safety.
+    preflight_task = await db.get(Task, task_id, populate_existing=True)
+    if preflight_task is not None and preflight_task.instance_id is not None:
+        preflight_instance_id = await db.scalar(
+            select(Instance.id).where(
+                Instance.id == preflight_task.instance_id,
+                Instance.current_task_id == task_id,
+            )
+        )
+        from backend.services.codex_app_server import (
+            CodexSharedTransportBusyError,
+        )
+
+        if preflight_instance_id is not None:
+            try:
+                await instance_manager.require_stop_session_preflight(
+                    preflight_instance_id
+                )
+            except CodexSharedTransportBusyError as exc:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task session stop is blocked by another live Codex turn; "
+                    "no queued messages or auxiliary producers were changed",
+                ) from exc
+    await db.rollback()
     await _cancel_waiting_task_capability_before_queue_abort(
         task_id,
         db,

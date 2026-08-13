@@ -9836,6 +9836,44 @@ async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
 
 
 @pytest.mark.asyncio
+async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
+    home = normalize_codex_home(tmp_path / "preflight-peer")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-target", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-target"}},
+        {"thread": {"id": "thread-peer", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-peer"}},
+    ])
+    target, _ = await server.start_turn(
+        prompt="target", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=160,
+    )
+    await target.stdout.readline()
+    peer, _ = await server.start_turn(
+        prompt="peer", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=161,
+    )
+    await peer.stdout.readline()
+    server.abandon_turn = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+
+    with pytest.raises(CodexSharedTransportBusyError, match="another live turn"):
+        await registry.require_claimed_turn_stop_isolated(home, target)
+
+    server.abandon_turn.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert home not in registry._draining
+
+    target.finish(0)
+    peer.finish(0)
+
+
+@pytest.mark.asyncio
 async def test_claimed_stop_recycles_transport_after_confirmed_interrupt(tmp_path):
     """Turn terminality alone does not prove native MCP helpers are gone."""
 

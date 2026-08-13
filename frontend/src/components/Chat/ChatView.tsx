@@ -2717,7 +2717,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 </span>
               )}
               {projectName && (
-                <span className="min-w-0 flex-1 truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300">{projectName}</span>
+                <span
+                  data-testid="chat-project-badge"
+                  className="min-w-0 w-fit max-w-full shrink truncate whitespace-nowrap rounded bg-emerald-600/30 px-1.5 text-xs font-medium text-emerald-300"
+                  title={projectName}
+                >
+                  {projectName}
+                </span>
               )}
             </div>
           </div>

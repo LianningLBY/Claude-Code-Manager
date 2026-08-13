@@ -132,6 +132,51 @@ def _dispatcher(db_factory) -> GlobalDispatcher:
     )
 
 
+def test_default_plan_capability_retries_one_transient_run_failure():
+    assert plan_capability_definition().max_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_failed_plan_run_is_replaced_before_capability_becomes_terminal(
+    db_session,
+):
+    _task, invocation = await _create_invocation(db_session)
+    executor = PlanCapabilityExecutor()
+    first = await executor.ensure_started(
+        db_session,
+        invocation_id=invocation.id,
+    )
+    assert first.run_id is not None
+
+    failed_run = await db_session.get(PlanAgentRun, first.run_id)
+    failed_plan = await db_session.get(Plan, failed_run.plan_id)
+    failed_run.status = "failed"
+    failed_run.current_stage = "failed"
+    failed_run.error = "reviewer routes are temporarily unavailable"
+    failed_run.finished_at = datetime.utcnow()
+    failed_plan.active_run_id = None
+    await db_session.commit()
+
+    retrying = await executor.observe(
+        db_session,
+        invocation_id=invocation.id,
+    )
+    assert retrying.status == "queued"
+    active = await capability_service.active_execution_for(
+        db_session,
+        invocation.id,
+    )
+    assert active is not None
+    assert active.attempt == 2
+
+    second = await executor.ensure_started(
+        db_session,
+        invocation_id=invocation.id,
+    )
+    assert second.run_id is not None
+    assert second.run_id != first.run_id
+
+
 async def _claim_capability_run(
     db_factory,
     dispatcher: GlobalDispatcher,
@@ -144,7 +189,10 @@ async def _claim_capability_run(
         instance = await db.get(Instance, instance_id)
         assert run is not None and run.status == "queued"
         assert instance is not None and instance.status == "idle"
-        claimed = await dispatcher._claim_plan_run(db, instance=instance)
+        claimed = await dispatcher._claim_plan_run(
+            db,
+            instance_id=instance.id,
+        )
     assert claimed is not None and claimed[0] == run_id
     return claimed
 
@@ -602,7 +650,10 @@ async def test_capability_claim_and_cancel_race_has_no_cross_aggregate_deadlock(
             async with db_factory() as db:
                 instance = await db.get(Instance, owner_id)
                 assert instance is not None
-                return await dispatcher._claim_plan_run(db, instance=instance)
+                return await dispatcher._claim_plan_run(
+                    db,
+                    instance_id=instance.id,
+                )
 
         async def cancel():
             async with db_factory() as db:

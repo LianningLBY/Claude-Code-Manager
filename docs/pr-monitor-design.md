@@ -1,8 +1,8 @@
 # CCM PR Monitor：从 CI、AI Review 到自动修复与合并
 
 - 文档状态：闭环主体已编码，并通过本地假 GitHub 回归及个人私有 GitHub PR 的 CI失败反馈、原Agent自动修复、Reviewer反馈、再次自动修复和Thread清零联调；真实 Merge Queue 待组织仓库验证
-- 版本：v1.2
-- 更新日期：2026-08-10
+- 版本：v1.3
+- 更新日期：2026-08-13
 - 适用范围：已有 PR 从 CI/AI Review 到修复、重新验证和合并的完整 Monitor Loop
 - 文档定位：本文件是 PR Monitor 唯一权威设计与实现说明；状态机、Prompt、运维和验收均以此为准
 
@@ -58,16 +58,19 @@ Gate 事实。
 | `review_mode` | Reviewer | exact-head CI / Repair | direct `auto_merge` | Merge Queue |
 |---|---|---|---|---|
 | `single` | 一个独立 tool-free Reviewer | 关闭；不支持自动 Repair | 支持 | 仅 `manual` |
-| `panel` | Principal / Senior / QA 三个独立 Reviewer | 可选；Delivery 必须开启 CI 并配置 required checks | 支持 | CI 开启时可用 `shadow/auto`，但与 direct auto-merge 互斥 |
+| `panel` | Principal / Senior / QA 三个独立 Reviewer | 可选；Delivery 自动采用仓库声明的 required checks | 支持 | CI 开启时可用 `shadow/auto`，但与 direct auto-merge 互斥 |
 
-Delivery Loop 只接受 `panel + exact-head required CI + manual Merge Queue`，并在 admission
-时冻结 PR Monitor 的 direct auto-merge 开关；普通 PR Monitor 的 single/panel 都可独立使用该开关。
+Delivery Loop 只接受 `panel + manual Merge Queue`，并要求 `wait_for_ci` 与非空
+`required_checks` 成对出现。Project 导入/quick-start 自动建立内部 Monitor：仓库声明
+required checks 时启用 exact-head CI；未声明时保持 Panel-only，不让用户填写 Monitor。
+direct auto-merge 是每次 Delivery admission 的默认关闭选择，开启时仍强制 app-bound
+required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
 
 ### 0.2 与参考文章的对应关系
 
 | 参考要求 | CCM 实现 | 当前验证状态 |
 |---|---|---|
-| 先 CI，再 AI Review | exact-head required-check Gate | 真实 CI failure/pass 均已验证，失败 head 为零 Reviewer |
+| 声明 CI 时先 CI，再 AI Review | exact-head required-check Gate；无 required checks 时直接进入必经 Panel | 真实 CI failure/pass 均已验证，失败 head 为零 Reviewer |
 | 等待期间不占 Agent | webhook + Reconciler；等待态不保留模型进程 | 已实现 |
 | Principal/Senior/QA 分工 | 三个独立 tool-free Task | 真实三角色并行与阻断/通过均已验证 |
 | Senior 阅读完整受影响文件 | Manager 按 exact base/head blob 注入 changed-file 全文 | 已实现并有 blob/超限/不可用回归 |

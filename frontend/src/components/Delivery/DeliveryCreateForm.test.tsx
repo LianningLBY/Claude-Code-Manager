@@ -7,7 +7,7 @@ import { DeliveryCreateForm } from './DeliveryCreateForm';
 
 vi.mock('../../api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../api/client')>();
-  return { ...actual, api: { ...actual.api, createDeliveryRun: vi.fn() } };
+  return { ...actual, api: { ...actual.api, quickStartDelivery: vi.fn() } };
 });
 
 const project: Project = { id: 1, name: 'CCM', worker_id: null, git_url: 'git@github.com:acme/ccm.git', has_remote: true, local_path: '/srv/ccm', default_branch: 'main', status: 'ready', error_message: null, show_in_selector: true, sort_order: 0, tags: [], env_files: [], git_author_name: null, git_author_email: null, git_credential_type: null, git_ssh_key_path: null, git_https_username: null, git_https_token: null, badge_color: null, created_at: '2026-08-12T00:00:00Z' };
@@ -18,7 +18,7 @@ describe('DeliveryCreateForm', () => {
   afterEach(() => { cleanup(); vi.clearAllMocks(); sessionStorage.clear(); });
 
   it('automatically uses the one compatible repository and server defaults', async () => {
-    vi.mocked(api.createDeliveryRun).mockResolvedValue({ id: 9 } as never);
+    vi.mocked(api.quickStartDelivery).mockResolvedValue({ id: 9 } as never);
     render(<DeliveryCreateForm projects={[project]} repos={[repo]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
     await userEvent.click(screen.getByRole('button', { name: 'Select Project' }));
     await userEvent.click(screen.getByText('CCM'));
@@ -26,15 +26,28 @@ describe('DeliveryCreateForm', () => {
     await userEvent.type(screen.getByLabelText('Delivery title'), 'Ship workspace');
     await userEvent.type(screen.getByLabelText('Delivery requirements'), 'Implement and test it.');
     await userEvent.click(screen.getByRole('button', { name: 'Start Delivery' }));
-    expect(api.createDeliveryRun).toHaveBeenCalledWith(expect.objectContaining({ project_id: 1, monitored_repo_id: 2, provider: 'codex', model: 'gpt-5.6-sol' }));
+    expect(api.quickStartDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      project_id: 1,
+      title: 'Ship workspace',
+      requirements: 'Implement and test it.',
+      auto_merge: false,
+      frontend_review: 'auto',
+    }));
   });
 
-  it('fails closed when a project has multiple compatible repositories', async () => {
-    render(<DeliveryCreateForm projects={[project]} repos={[repo, { ...repo, id: 3, repo_full_name: 'acme/other' }]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
+  it('starts from one requirement and lazily configures a missing monitor', async () => {
+    vi.mocked(api.quickStartDelivery).mockResolvedValue({ id: 10 } as never);
+    render(<DeliveryCreateForm projects={[project]} repos={[]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
     await userEvent.click(screen.getByRole('button', { name: 'Select Project' }));
     await userEvent.click(screen.getByText('CCM'));
-    expect(screen.getByText(/Multiple compatible PR Monitor repositories/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Start Delivery' })).toBeDisabled();
+    expect(screen.getByText(/PR Monitor is created and bound automatically/)).toBeInTheDocument();
+    await userEvent.type(screen.getByLabelText('Delivery requirements'), 'Fix the login flow and test it.');
+    await userEvent.click(screen.getByRole('button', { name: 'Configure & Start Delivery' }));
+    expect(api.quickStartDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      project_id: 1,
+      requirements: 'Fix the login flow and test it.',
+    }));
+    expect(vi.mocked(api.quickStartDelivery).mock.calls[0][0].title).toBeUndefined();
   });
 
   it('warns when Delivery coding turns can bypass the CCM sandbox', () => {
@@ -43,5 +56,46 @@ describe('DeliveryCreateForm', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(
       'Agent unrestricted permissions are ON',
     );
+  });
+
+  it('freezes the explicit automatic merge choice for this Delivery', async () => {
+    vi.mocked(api.quickStartDelivery).mockResolvedValue({ id: 11 } as never);
+    render(<DeliveryCreateForm projects={[project]} repos={[repo]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Select Project' }));
+    await userEvent.click(screen.getByText('CCM'));
+    await userEvent.type(screen.getByLabelText('Delivery requirements'), 'Implement the release.');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Merge automatically/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Start Delivery' }));
+
+    expect(api.quickStartDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      auto_merge: true,
+    }));
+  });
+
+  it('freezes an explicit required frontend review policy', async () => {
+    vi.mocked(api.quickStartDelivery).mockResolvedValue({ id: 12 } as never);
+    render(<DeliveryCreateForm projects={[project]} repos={[repo]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Select Project' }));
+    await userEvent.click(screen.getByText('CCM'));
+    await userEvent.type(screen.getByLabelText('Delivery requirements'), 'Validate the visible workflow.');
+    await userEvent.selectOptions(screen.getByLabelText('Frontend review gate'), 'required');
+    await userEvent.click(screen.getByRole('button', { name: 'Start Delivery' }));
+
+    expect(api.quickStartDelivery).toHaveBeenCalledWith(expect.objectContaining({
+      frontend_review: 'required',
+    }));
+  });
+
+  it('disables automatic merge for a status-only CI policy', async () => {
+    const statusRepo: MonitoredRepo = {
+      ...repo,
+      required_checks: [{ kind: 'status', name: 'legacy-ci', app_slug: 'ci-user' }],
+    };
+    render(<DeliveryCreateForm projects={[project]} repos={[statusRepo]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Select Project' }));
+    await userEvent.click(screen.getByText('CCM'));
+
+    expect(screen.getByRole('checkbox', { name: /Merge automatically/ })).toBeDisabled();
+    expect(screen.getByText(/automatic merge is unavailable/)).toBeInTheDocument();
   });
 });

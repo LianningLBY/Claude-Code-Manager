@@ -1,11 +1,11 @@
 # CCM Autonomous Delivery Loop — 实现基线与后续 Backlog
 
 - 文档状态：Delivery Loop 与 PR Monitor 控制的 direct auto-merge 已实现；部署、Worker 等后续范围仍是 Backlog
-- 文档版本：v0.6
-- 更新日期：2026-08-10
+- 文档版本：v0.7
+- 更新日期：2026-08-13
 - 文档类型：当前实现基线 + 可领取、可验收的长期 Backlog
-- 当前目标：用持久状态机驱动“Plan → Code → Pre-PR Review → PR → CI/PR Monitor → 修复循环 → ready_to_merge 或 merged”
-- 当前安全范围：admission 冻结的 Claude/Codex 本地执行、一个仓库、一个 Developer Task、一个 PR、exact-head CI + Reviewer Panel；合并终点继承 PR Monitor 的冻结开关
+- 当前目标：用持久状态机驱动“Plan → Code → Pre-PR Review → Frontend Review → PR → CI/PR Monitor → 修复循环 → ready_to_merge 或 merged”
+- 当前安全范围：admission 冻结的 Claude/Codex 本地执行、一个仓库、一个 Developer Task、一个 PR、必经 Reviewer Panel + 仓库声明的 exact-head CI；合并终点由每次 Run 的默认关闭开关冻结
 
 > 第 0 节描述当前 V1 的权威实现。第 18 节起保留最初面向完整自动交付平台的长期 Todo；其中 `[ ]` 表示该 Todo 的完整远期范围尚未全部完成，不能据此否定第 0 节列出的 V1 子集。
 
@@ -16,7 +16,7 @@
 ### 0.1 模式与调用关系
 
 - 普通任务仍是 `mode=auto`；Delivery Loop 是独立的 `mode=delivery_loop`。
-- Delivery Run 只能通过 `POST /api/delivery-runs` 创建。Run、Developer Task 和首个 Cycle 在同一事务提交，普通 Task API 无法伪造 Delivery ownership。
+- Delivery Run 只能通过 `POST /api/delivery-runs` 创建；第一方入口使用 `POST /api/delivery-runs/quick-start`，先按 Project GitHub identity 幂等准备内部 PR Monitor，再复用同一 admission。Run、Developer Task 和首个 Cycle 在同一事务提交，普通 Task API 无法伪造 Delivery ownership。
 - Plan 与 Pre-PR Code Review 都通过通用 `CapabilityInvocation/CapabilityExecution` 接口调用。Delivery Controller 使用 required-gate invocation；普通 Auto Task 可创建 human advisory invocation，也可在创建时显式冻结 `capability_policy`，由模型通过 exact terminal action 请求 Plan/Review。
 - Capability executor 与调用者解耦。Auto 请求严格绑定 exact source/output/terminal，并在 provider 提供时绑定 native turn；原子消费预算后进入 `waiting_capability`，完成结果经 durable resume outbox 推进同一 Task 的 G→G+1。`CAPABILITY_CORE_ENABLED` 与 `AUTO_CAPABILITY_ENABLED` 均默认开启，但普通 Task 仍须显式冻结 `capability_policy`；Worker/Shared 及非普通 Auto scope 继续 fail closed。
 
@@ -25,15 +25,18 @@
 ```text
 Create DeliveryRun
   → Plan Capability（Planner + Reviewer pipeline）
+  → Plan Run 失败：同一 Invocation 最多自动创建一个独立 replacement Execution/Run
   → Developer Agent 在固定 worktree 写代码、测试、自审，留下未提交 diff
   → Controller 校验 exact Run/Turn/worktree 后创建带审计 trailer 的 commit
   → Code Review Capability 对 exact base/head/tree/patch 做独立结构化审查
   → changes_requested：携 finding 新建 Cycle，重新 Plan
-  → approved：Controller 以 Action fence 做 exact non-force push，query-before-create 绑定 PR
-  → PR Monitor 等 exact-head required CI + Reviewer Panel 并发布 GitHub 审查结果
+  → approved：按冻结策略运行 Test Harness Frontend Review；failed finding 新建 Cycle
+  → Frontend Review passed/off/auto-unavailable：Controller 以 Action fence 做 exact non-force push，query-before-create 绑定 PR
+  → PR Monitor 必跑 Reviewer Panel；仓库声明 required CI 时再等 exact-head CI
   → blocked：携 PRReview/RepairWake evidence 新建 Cycle，重新 Plan/Code/Review
   → auto_merge OFF：ready_to_merge，远程复验 exact workspace/branch/PR/Monitor 后成功终止
   → auto_merge ON：冻结 base ref non-force fast-forward 到 exact head，确认 merge evidence 与 merged comment 后成功终止
+  → 发布前 failed：操作员可在原 Run 内创建 operator_retry Cycle，从 Plan 继续
 ```
 
 等待 Capability、CI 或 PR Monitor 时不会占用 Developer Instance。Developer Task 会跨 Cycle 复用 session/cwd，但每次执行都有独立、持久的 `DeliveryTurn` generation。
@@ -407,8 +410,9 @@ activity=paused, pause_reason=permission_missing
 | planning | ready/waiting | 创建或等待 Plan Capability |
 | coding | ready/running | 准入或观察一个 bounded Developer Turn；终态后 Controller commit |
 | pre_review | ready/waiting | 创建或等待 exact commit-range Code Review Capability |
+| frontend_review | ready/waiting | 创建或等待 exact-head Test Harness；off/auto-unavailable 留下可见 skip evidence |
 | publishing | ready/running | claim Action，并以双 lease fence push / create-or-bind PR / bind Monitor |
-| monitoring | waiting | 等待 exact-head CI + Reviewer Panel verdict |
+| monitoring | waiting | 等待必经 Reviewer Panel，以及仓库声明时的 exact-head CI verdict |
 | 任意非 done | paused | 人工暂停或安全阻塞 |
 | done | terminal | 必须有 outcome 和 completed_at |
 
@@ -433,7 +437,14 @@ pre_review/ready
   → create/recover exact commit-range Review Capability → pre_review/waiting
   ├─ changes_requested → 完成当前 Cycle，新 Cycle 回 planning/ready
   ├─ capability failure/subject mismatch → done/failed
-  └─ approved → publishing/ready
+  └─ approved → frontend_review/ready
+
+frontend_review/ready
+  → start/recover exact owner/head Test Harness → frontend_review/waiting
+  ├─ off 或 auto-unavailable → 持久化 skip reason → publishing/ready
+  ├─ required-unavailable、stale、cleanup/evidence 不完整 → done/failed
+  ├─ archived failed findings → 完成当前 Cycle，新 Cycle回 planning/ready
+  └─ archived passed report+screenshot → publishing/ready
 
 publishing/ready
   → claim DeliveryAction → publishing/running
@@ -816,9 +827,9 @@ created_at / answered_at
 
 ### 9.3 当前 UI 接入
 
-- `frontend/src/components/Tasks/DeliveryRunPanel.tsx` 展示 Run/Cycle/Turn、等待原因与终态。
-- `TaskForm.tsx` 和 `ProjectTodoList.tsx` 通过专用 Run API 创建，普通 Task API 不接受 Delivery ownership 字段。
-- 当前没有独立 Delivery 顶级页面；完整 Timeline/Human Gate/Deployment UI 仍属于后续 Backlog。
+- 独立 `DeliveryPage` 以 `DeliveryRunDialog` 展示 Plan、Development、Code Review、Frontend Review、Publish PR、CI & PR Review 六个 tab，并保留公开 Timeline 和旧 Cycle 的前端证据摘要。
+- `DeliveryCreateForm` 通过 quick-start API 从一段需求创建 Run，并冻结 Frontend Review 与 auto-merge 选择；普通 Task API 不接受 Delivery ownership 字段。
+- Plan 的 open input 由 progress API 投影到当前 tab 内联回答；AppShell 展示 attention badge。Run-scoped WebSocket 驱动实时刷新，REST 轮询仅作断线兜底。
 
 ### 9.4 长期 Backlog 的原始文件草案（历史）
 
@@ -916,9 +927,10 @@ GET    /api/delivery-runs/{run_id}
 POST   /api/delivery-runs/{run_id}/pause
 POST   /api/delivery-runs/{run_id}/resume
 POST   /api/delivery-runs/{run_id}/cancel
+POST   /api/delivery-runs/{run_id}/retry
 ```
 
-V1 不暴露 take-over/reconcile/retry-action/merge/deploy 管理 API；Controller 的 crash takeover 与 reconcile 由持久 lease 和启动扫描内部完成。Decision/attention/system-status 属于后续运维 Backlog。
+`retry` 仅允许 failed terminal、尚未发布 PR 且无活跃 effect 的 Run 在剩余预算内创建新的审计 Cycle，必须携带 `expected_state_version`。V1 不暴露 take-over/reconcile/retry-action/merge/deploy 管理 API；Controller 的 crash takeover 与 reconcile 由持久 lease 和启动扫描内部完成。Decision/attention/system-status 属于后续运维 Backlog。
 
 普通 Auto Task 可人工调用 advisory Capability：
 
@@ -1000,14 +1012,12 @@ POST /api/github/webhook
 
 ### 10.4 UI 刷新
 
-V1 的 `DeliveryRunPanel` 每 5 秒重新读取 REST detail；命令 409 后立即刷新以移除 stale action。当前没有把下列专用 Delivery WebSocket channel 作为正确性或 UI 依赖。
-
-后续若增加 WebSocket，建议 channel：
+Delivery 页面订阅 Run-scoped channel，列表订阅管理员全局 channel；连接中断时分别以
+10/15 秒 REST 轮询兜底，命令 409 后仍立即读取权威 progress。channel 为：
 
 ```text
-delivery-run:{run_id}
-user:{user_id}
-delivery-runs           # admin only
+delivery:{run_id}       # Project ACL
+deliveries              # admin only
 ```
 
 事件 envelope：

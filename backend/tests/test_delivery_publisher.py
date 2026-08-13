@@ -220,7 +220,9 @@ async def _delivery_scope(
     *,
     suffix: str,
     auto_merge: bool = False,
+    wait_for_ci: bool = True,
 ):
+    assert wait_for_ci or not auto_merge
     repo_name = f"acme/delivery-{suffix}"
     project = Project(
         name=f"publisher-{suffix}",
@@ -235,7 +237,7 @@ async def _delivery_scope(
     await db_session.flush()
     required_checks = [
         {"kind": "check_run", "name": "tests", "app_slug": "github-actions"}
-    ]
+    ] if wait_for_ci else []
     monitored = MonitoredRepo(
         repo_full_name=repo_name,
         project_id=project.id,
@@ -244,7 +246,7 @@ async def _delivery_scope(
         enabled=True,
         auto_merge=auto_merge,
         review_mode="panel",
-        wait_for_ci=True,
+        wait_for_ci=wait_for_ci,
         required_checks=required_checks,
         merge_queue_mode="manual",
         default_branch="main",
@@ -266,7 +268,7 @@ async def _delivery_scope(
             "repo_id": monitored.id,
             "repo_full_name": monitored.repo_full_name,
             "review_mode": "panel",
-            "wait_for_ci": True,
+            "wait_for_ci": wait_for_ci,
             "required_checks": required_checks,
         },
     }
@@ -566,6 +568,32 @@ async def test_create_response_loss_recovers_exact_open_pr(db_session, db_factor
     # state=all is checked before branch publication, after publication, and
     # once more to reconcile the lost create response.
     assert github.list_calls == 3
+
+
+@pytest.mark.asyncio
+async def test_panel_only_policy_can_publish_exact_pr(db_session, db_factory):
+    run, _project, repo = await _delivery_scope(
+        db_session,
+        suffix="panel-only",
+        wait_for_ci=False,
+    )
+    git = FakeGit(repo.repo_full_name, {"main": BASE, run.delivery_branch: None})
+    github = FakeGitHub()
+    github.created_payload = _pull(
+        branch=run.delivery_branch,
+        repo_full_name=repo.repo_full_name,
+    )
+    publisher = GitHubDeliveryPublisher(db_factory, git=git, github=github)
+
+    published = await publisher.ensure_pull_request(
+        run_id=run.id,
+        idempotency_key=_key(run),
+        fence=await _fence(db_factory, run),
+    )
+
+    assert published.pr_number == 17
+    assert git.remote_refs[run.delivery_branch] == HEAD
+    assert github.create_calls == 1
 
 
 @pytest.mark.asyncio

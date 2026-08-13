@@ -29,6 +29,7 @@ DELIVERY_PHASES = (
     "planning",
     "coding",
     "pre_review",
+    "frontend_review",
     "publishing",
     "monitoring",
     "done",
@@ -40,6 +41,7 @@ DELIVERY_CYCLE_ACTIVE_STATUSES = (
     "planning",
     "coding",
     "pre_review",
+    "frontend_review",
     "publishing",
 )
 DELIVERY_CYCLE_TERMINAL_STATUSES = (
@@ -292,6 +294,10 @@ class DeliveryCycle(Base):
         UniqueConstraint(
             "review_invocation_id", name="uq_delivery_cycles_review_invocation"
         ),
+        UniqueConstraint(
+            "frontend_review_run_id",
+            name="uq_delivery_cycles_frontend_review_run",
+        ),
         CheckConstraint(
             f"status IN ({_sql_values(DELIVERY_CYCLE_STATUSES)})",
             name="ck_delivery_cycles_status",
@@ -364,6 +370,26 @@ class DeliveryCycle(Base):
     )
     review_verdict: Mapped[str | None] = mapped_column(String(32), nullable=True)
     review_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Browser/Test Harness is a read-only quality gate over the exact
+    # Developer workspace. The string identity belongs to TestHarnessRun;
+    # keep it as a durable external handle instead of creating a cross-domain
+    # ORM relationship that could bypass Harness cleanup fences.
+    frontend_review_run_id: Mapped[str | None] = mapped_column(
+        String(32),
+        nullable=True,
+    )
+    frontend_review_verdict: Mapped[str | None] = mapped_column(
+        String(24),
+        nullable=True,
+    )
+    frontend_review_summary: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+    frontend_review_skip_reason: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

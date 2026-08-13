@@ -389,6 +389,9 @@ _TOOL_FREE_PASSIVE_NOTIFICATION_METHODS = frozenset({
     "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
     "item/started",
+    # Emitted while the exact required MCP client is connecting. This is
+    # lifecycle telemetry, not a model-requested capability or tool effect.
+    "mcpServer/startupStatus/updated",
     "model/rerouted",
     "model/safetyBuffering/updated",
     "model/verification",

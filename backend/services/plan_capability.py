@@ -112,7 +112,7 @@ def plan_capability_definition(
     *,
     executor: "PlanCapabilityExecutor | None" = None,
     pipeline_config: dict | None = None,
-    max_attempts: int = 1,
+    max_attempts: int = 2,
 ) -> CapabilityDefinition:
     """Build the registry entry without mutating the process-global registry."""
 

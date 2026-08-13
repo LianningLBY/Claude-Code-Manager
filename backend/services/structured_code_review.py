@@ -329,11 +329,14 @@ def build_structured_review_prompt(
     guidance: object | None = None,
     surface: str = "pre_pr",
     expected_role: str = CODE_REVIEWER_ROLE,
+    retry_after_schema_failure: bool = False,
 ) -> str:
     """Render the provider-neutral prompt for one immutable review subject."""
 
     surface = _validate_surface(surface)
     role = _validate_role(expected_role)
+    if type(retry_after_schema_failure) is not bool:
+        raise ValueError("retry_after_schema_failure must be a boolean")
     exact_subject = _coerce_subject(subject)
     _verify_material_patch_binding(material, exact_subject)
     rendered_material = _render_prompt_section(material, "review material")
@@ -350,6 +353,20 @@ def build_structured_review_prompt(
         "summary": "No blocking issue was found in the supplied subject.",
         "findings": [],
     }
+    required_finding_fields = ", ".join(
+        f"`{field}`" for field in sorted(_FINDING_KEYS)
+    )
+    retry_correction = ""
+    if retry_after_schema_failure:
+        retry_correction = f"""
+
+## Retry correction
+
+A previous response for this same immutable subject failed strict schema
+validation. Return a complete replacement result rather than repeating or
+patching the previous response. Re-check every required field. Each finding
+must contain exactly these fields: {required_finding_fields}.
+"""
     return f"""You are an isolated code review agent.
 
 ## Fixed contract
@@ -384,8 +401,11 @@ regression, testing, performance, and operational failures. Report only issues
 grounded in the supplied subject. A preference or optional cleanup is not a
 finding. Every finding must identify a repository-relative path and either a
 positive line number or a concrete hunk. Deduplicate findings by root cause.
+Every finding must contain all required fields, including `title`; use `null`
+for the unused one of `line` and `hunk`, but never omit either field.
 `critical`, `high`, and `medium` are blocking; `low` is advisory. Verdict must
 be `changes_required` exactly when at least one blocking finding exists.
+{retry_correction}
 
 Return exactly one JSON object inside the following markers, with no Markdown
 fence or other text. All listed fields are required and unknown fields are
@@ -409,7 +429,7 @@ def _object_without_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str,
     result: dict[str, object] = {}
     for key, value in pairs:
         if key in result:
-            raise ValueError(f"structured code review JSON repeats key {key!r}")
+            raise ValueError("structured code review JSON repeats key")
         result[key] = value
     return result
 
@@ -428,8 +448,22 @@ def _require_exact_keys(
     expected: frozenset[str],
     label: str,
 ) -> dict[str, object]:
-    if not isinstance(value, dict) or frozenset(value) != expected:
+    if not isinstance(value, dict):
         raise ValueError(f"structured code review {label} has invalid fields")
+    actual = frozenset(value)
+    if actual != expected:
+        details: list[str] = []
+        missing = sorted(expected - actual)
+        if missing:
+            details.append("missing required fields: " + ", ".join(missing))
+        if actual - expected:
+            # Do not echo model-controlled field names into logs or a retry
+            # prompt. The count is enough to make this failure actionable.
+            details.append(f"contains {len(actual - expected)} unknown field(s)")
+        suffix = f" ({'; '.join(details)})" if details else ""
+        raise ValueError(
+            f"structured code review {label} has invalid fields{suffix}"
+        )
     return value
 
 

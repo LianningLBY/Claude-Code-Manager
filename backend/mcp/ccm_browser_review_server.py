@@ -782,7 +782,8 @@ async def finish_review(
     """Persist the final report and canonical structured findings exactly once.
 
     Finding fields are scenario_id, severity, category, title, route, locator,
-    expected, actual, reproduction, evidence, and optional confidence.
+    expected, actual, reproduction, evidence, and optional confidence. Severity
+    is exactly critical, high, medium, low, or info (never blocker).
     """
 
     global _finished

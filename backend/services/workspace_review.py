@@ -91,9 +91,33 @@ _INHERITED_ENV_KEYS = (
     "SYSTEMROOT",
     "WINDIR",
 )
+_FORCED_PREVIEW_RUNTIME_ENV = {
+    # A trusted Preview renders the application only. It must not start a
+    # second Manager control plane inside the reviewed workspace. Apply these
+    # values after the saved profile so a stale profile cannot re-enable a
+    # dispatcher, provider pool, PTY bridge, publisher, or background worker.
+    "AUTO_START_DISPATCHER": "false",
+    "AUTO_PUSH_TO_ORIGIN": "false",
+    "WORKER_ENABLED": "false",
+    "POOL_ENABLED": "false",
+    "CODEX_POOL_ENABLED": "false",
+    "USE_PTY_MODE": "false",
+    "BACKUP_ENABLED": "false",
+    "TMP_CLEANUP_ENABLED": "false",
+    # backend.main constructs this store during import, even when provider
+    # pools are disabled. Never let a Preview inspect or validate the
+    # operator's real API-account store through a repo .env or the default.
+    "CLOUDROUTER_ACCOUNTS_DIR": "{temp_dir}/api-accounts",
+    "POOL_CONFIG_PATH": "{temp_dir}/claude-pool/accounts.json",
+    "CODEX_POOL_CONFIG_PATH": "{temp_dir}/codex-pool/accounts.json",
+    "SSH_KEY_STORAGE_DIR": "{temp_dir}/ssh-keys",
+    "TASK_RUNTIME_SECRET_DIR": "{temp_dir}/task-runtime-secrets",
+    "TEST_HARNESS_ARTIFACT_ROOT": "{temp_dir}/test-harness-artifacts",
+}
 _MAX_GIT_OUTPUT = 16 * 1024 * 1024
 _MAX_UNTRACKED_FILES = 500
 _MAX_UNTRACKED_FILE_BYTES = 2 * 1024 * 1024
+_MAX_PREVIEW_LOG_TAIL_BYTES = 4 * 1024
 
 
 class WorkspaceReviewError(RuntimeError):
@@ -126,6 +150,47 @@ class PreviewHandle:
     url: str
     health_url: str
     processes: list[asyncio.subprocess.Process] = field(default_factory=list)
+    process_logs: list[tuple[str, Path]] = field(default_factory=list)
+
+
+def _preview_log_tail(handle: PreviewHandle, index: int) -> str:
+    """Return a bounded printable tail from one Manager-owned Preview log."""
+
+    try:
+        process_name, log_path = handle.process_logs[index]
+    except IndexError:
+        return ""
+    if log_path.parent != handle.temp_dir or log_path.name != f"{process_name}.log":
+        return ""
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    fd: int | None = None
+    try:
+        fd = os.open(log_path, flags)
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode):
+            return ""
+        offset = max(0, metadata.st_size - _MAX_PREVIEW_LOG_TAIL_BYTES)
+        os.lseek(fd, offset, os.SEEK_SET)
+        payload = os.read(fd, _MAX_PREVIEW_LOG_TAIL_BYTES)
+    except OSError:
+        return ""
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    decoded = payload.decode("utf-8", errors="replace")
+    return "".join(
+        character
+        if character in {"\n", "\r", "\t"} or character.isprintable()
+        else "�"
+        for character in decoded
+    ).strip()
 
 
 def _relative_dir(workspace: Path, value: object) -> Path:
@@ -426,6 +491,7 @@ def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
                         "WORKER_ENABLED": "false",
                         "POOL_ENABLED": "false",
                         "CODEX_POOL_ENABLED": "false",
+                        "USE_PTY_MODE": "false",
                         "BACKUP_ENABLED": "false",
                         "TMP_CLEANUP_ENABLED": "false",
                     },
@@ -475,6 +541,7 @@ def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
                             "WORKER_ENABLED": "false",
                             "POOL_ENABLED": "false",
                             "CODEX_POOL_ENABLED": "false",
+                            "USE_PTY_MODE": "false",
                             "BACKUP_ENABLED": "false",
                             "TMP_CLEANUP_ENABLED": "false",
                         },
@@ -689,6 +756,12 @@ def _safe_preview_env(extra: dict[str, str], variables: dict[str, str]) -> dict[
         }
     )
     env.update({key: _format_value(value, variables) for key, value in extra.items()})
+    env.update(
+        {
+            key: _format_value(value, variables)
+            for key, value in _FORCED_PREVIEW_RUNTIME_ENV.items()
+        }
+    )
     return env
 
 
@@ -744,7 +817,12 @@ class WorkspacePreviewManager:
         async with test_harness_owner_fence(task_id), self._lock:
             if any(handle.task_id == task_id for handle in self._handles.values()):
                 raise WorkspaceReviewBusyError("This Task already has an active workspace preview")
-            temp_dir = Path(tempfile.mkdtemp(prefix="ccm-workspace-preview-"))
+            # tempfile.gettempdir() is commonly reached through /var ->
+            # /private/var on macOS. Publish only the canonical directory so
+            # security-sensitive Preview stores never see a symlink ancestor.
+            temp_dir = Path(
+                tempfile.mkdtemp(prefix="ccm-workspace-preview-")
+            ).resolve(strict=True)
             temp_dir.chmod(0o700)
             port = _allocate_loopback_port()
             python = snapshot.path / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
@@ -809,6 +887,7 @@ class WorkspacePreviewManager:
                 finally:
                     log_file.close()
                 handle.processes.append(process)
+                handle.process_logs.append((item["name"], log_path))
             await self._wait_until_ready(
                 handle,
                 timeout=float(config["startup_timeout_seconds"]),
@@ -823,10 +902,18 @@ class WorkspacePreviewManager:
         last_error = "preview health check did not respond"
         async with httpx.AsyncClient(timeout=2, follow_redirects=True) as client:
             while asyncio.get_running_loop().time() < deadline:
-                for process in handle.processes:
+                for index, process in enumerate(handle.processes):
                     if process.returncode is not None:
+                        process_name = (
+                            handle.process_logs[index][0]
+                            if index < len(handle.process_logs)
+                            else f"#{index + 1}"
+                        )
+                        log_tail = _preview_log_tail(handle, index)
+                        diagnostic = f"; log tail:\n{log_tail}" if log_tail else ""
                         raise WorkspaceReviewError(
-                            f"preview process exited before readiness with code {process.returncode}"
+                            f"preview process {process_name!r} exited before readiness "
+                            f"with code {process.returncode}{diagnostic}"
                         )
                 try:
                     response = await client.get(handle.health_url)
@@ -1043,6 +1130,8 @@ Git manifest is present.
 Call finish_review with the same verdict plus structured findings. Each finding
 must use these exact fields: scenario_id, severity, category, title, route,
 locator, expected, actual, reproduction, evidence, and optional confidence.
+Severity must be exactly critical, high, medium, low, or info; do not use
+aliases such as blocker.
 The verdict must be exactly passed, failed, or inconclusive. Do not use aliases
 such as pass_with_findings, route_locator, expected_behavior,
 reproduction_steps, or evidence_artifacts.

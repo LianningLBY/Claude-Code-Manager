@@ -35,7 +35,24 @@ def test_happy_path_reaches_exact_ready_to_merge_terminal():
         ("code_started", "coding", "running", ()),
         ("code_completed", "pre_review", "ready", ("request_code_review",)),
         ("review_requested", "pre_review", "waiting", ("observe_code_review",)),
-        ("review_approved", "publishing", "ready", ("ensure_pull_request",)),
+        (
+            "review_approved",
+            "frontend_review",
+            "ready",
+            ("request_frontend_review",),
+        ),
+        (
+            "frontend_review_requested",
+            "frontend_review",
+            "waiting",
+            ("observe_frontend_review",),
+        ),
+        (
+            "frontend_review_passed",
+            "publishing",
+            "ready",
+            ("ensure_pull_request",),
+        ),
         ("publish_started", "publishing", "running", ()),
         ("pr_bound", "monitoring", "waiting", ("observe_pr_monitor",)),
         ("monitor_ready", "done", "terminal", ()),
@@ -56,12 +73,14 @@ def test_happy_path_reaches_exact_ready_to_merge_terminal():
     ("blocking_event", "phase"),
     [
         ("review_changes_requested", "pre_review"),
+        ("frontend_review_changes_requested", "frontend_review"),
         ("monitor_blocked", "monitoring"),
     ],
 )
 def test_blocking_evidence_starts_a_fresh_plan_cycle(blocking_event, phase):
     wait_reason = {
         "pre_review": "code_review_capability",
+        "frontend_review": "frontend_review",
         "monitoring": "pr_monitor",
     }[phase]
     state = DeliveryState(
@@ -98,11 +117,24 @@ def test_developer_no_progress_starts_a_fresh_plan_cycle():
     assert reduction.effects == ("request_plan",)
 
 
+def test_frontend_review_can_be_explicitly_skipped_before_start():
+    state = DeliveryState(phase="frontend_review", activity="ready")
+
+    reduction = _reduce(state, "frontend_review_skipped")
+
+    assert (reduction.state.phase, reduction.state.activity) == (
+        "publishing",
+        "ready",
+    )
+    assert reduction.effects == ("ensure_pull_request",)
+
+
 @pytest.mark.parametrize(
     ("phase", "wait_reason", "effect"),
     [
         ("planning", "plan_capability", "observe_plan"),
         ("pre_review", "code_review_capability", "observe_code_review"),
+        ("frontend_review", "frontend_review", "observe_frontend_review"),
         ("monitoring", "pr_monitor", "observe_pr_monitor"),
     ],
 )
@@ -179,6 +211,33 @@ def test_fail_records_bounded_failure_metadata():
     assert result.outcome == "failed"
     assert result.error_code == "workspace_invalid"
     assert "worktree" in (result.error_message or "")
+
+
+def test_failed_terminal_run_can_restart_from_planning_only_explicitly():
+    failed = _reduce(
+        DeliveryState(
+            phase="planning",
+            activity="waiting",
+            wait_reason="plan_capability",
+            state_version=7,
+        ),
+        "fail",
+        error_code="plan_run_failed",
+        error_message="Both reviewer routes were temporarily unavailable",
+    ).state
+
+    retried = _reduce(failed, "retry")
+
+    assert retried.state == DeliveryState(
+        phase="planning",
+        activity="ready",
+        state_version=9,
+    )
+    assert retried.effects == ("request_plan",)
+
+    successful = replace(failed, outcome="success", error_code=None, error_message=None)
+    with pytest.raises(DeliveryTransitionError, match="Only a failed"):
+        _reduce(successful, "retry")
 
 
 def test_monitor_refresh_advances_version_without_changing_wait_subject():

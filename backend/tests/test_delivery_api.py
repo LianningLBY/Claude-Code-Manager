@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from uuid import uuid4
 
 import pytest
@@ -9,6 +10,7 @@ from sqlalchemy import func, select
 
 from backend.api import delivery_runs as delivery_api
 from backend.config import settings
+from backend.models.capability import CapabilityExecution, CapabilityInvocation
 from backend.models.delivery import (
     DeliveryAction,
     DeliveryCycle,
@@ -18,7 +20,8 @@ from backend.models.delivery import (
 from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
-from backend.models.plan import Plan, PlanVersion
+from backend.models.plan import Plan, PlanInputRequest, PlanVersion
+from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
 from backend.models.team_share import TeamProjectShare
 from backend.services import delivery_service
@@ -27,6 +30,7 @@ from backend.services.delivery_service import (
     DeliveryValidationError,
     create_delivery_run,
 )
+from backend.services.delivery_reducer import DeliveryReducerEvent
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.tests.test_auth_ws_security import (
     _create_user,
@@ -340,6 +344,369 @@ async def test_create_is_atomic_and_detail_exposes_durable_evidence(
         assert await db.scalar(select(func.count(DeliveryCycle.id))) == 1
         assert await db.scalar(select(func.count(DeliveryTransition.id))) == 1
         assert await db.scalar(select(func.count(Task.id))) == 1
+
+
+@pytest.mark.asyncio
+async def test_progress_projection_and_attention_count_are_api_authoritative(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="progress")
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo),
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        # Controller lease renewals update this timestamp but are not public
+        # progress and must not make a stuck Run look busy.
+        run.updated_at = datetime(2099, 1, 1)
+        await db.commit()
+
+    progress = await client.get(f"/api/delivery-runs/{run_id}/progress")
+    count = await client.get("/api/delivery-runs/attention-count")
+
+    assert progress.status_code == 200, progress.text
+    body = progress.json()
+    assert body["headline"] == "Preparing the implementation plan"
+    assert body["attention_required"] is False
+    assert body["frontend_review"]["policy"] == "auto"
+    assert [stage["key"] for stage in body["stages"]] == [
+        "planning",
+        "coding",
+        "pre_review",
+        "frontend_review",
+        "publishing",
+        "monitoring",
+    ]
+    assert body["events"][0]["title"] == "Delivery created"
+    assert not body["last_activity_at"].startswith("2099-")
+    assert count.status_code == 200
+    assert count.json() == {"total": 0}
+
+    paused = await client.post(
+        f"/api/delivery-runs/{run_id}/pause",
+        json={"reason": "Choose a rollout strategy"},
+    )
+    assert paused.status_code == 200, paused.text
+    attention = await client.get("/api/delivery-runs/attention-count")
+    paused_progress = await client.get(
+        f"/api/delivery-runs/{run_id}/progress"
+    )
+    assert attention.json() == {"total": 1}
+    assert paused_progress.json()["attention_required"] is True
+    assert paused_progress.json()["attention_kind"] == "paused"
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        run.phase = "done"
+        run.activity = "terminal"
+        run.outcome = "failed"
+        run.error_code = "test_failure"
+        run.error_message = "Inspect this failure in Run detail"
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+
+    terminal_count = await client.get("/api/delivery-runs/attention-count")
+    terminal_progress = await client.get(
+        f"/api/delivery-runs/{run_id}/progress"
+    )
+    assert terminal_count.json() == {"total": 0}
+    assert terminal_progress.json()["attention_required"] is True
+    assert terminal_progress.json()["attention_kind"] == "terminal_error"
+
+
+@pytest.mark.asyncio
+async def test_failed_prepublication_run_retries_in_place_with_a_new_cycle(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="operator-retry")
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo),
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+        task = await db.get(Task, run.developer_task_id)
+        delivery_service.complete_cycle(cycle, status="failed")
+        await delivery_service.apply_run_event(
+            db,
+            run=run,
+            event=DeliveryReducerEvent(
+                "fail",
+                {
+                    "error_code": "plan_run_failed",
+                    "error_message": "Both reviewer routes were unavailable",
+                },
+            ),
+            actor_kind="controller",
+        )
+        task.status = "failed"
+        task.completed_at = datetime.utcnow()
+        task.error_message = run.error_message
+        await db.commit()
+        failed_version = run.state_version
+        first_cycle_id = cycle.id
+
+    failed = await client.get(f"/api/delivery-runs/{run_id}")
+    assert failed.status_code == 200, failed.text
+    assert failed.json()["allowed_actions"] == ["retry"]
+
+    retried = await client.post(
+        f"/api/delivery-runs/{run_id}/retry",
+        json={
+            "expected_state_version": failed_version,
+            "reason": "Provider routes recovered",
+        },
+    )
+    assert retried.status_code == 200, retried.text
+    body = retried.json()
+    assert (body["phase"], body["activity"], body["outcome"]) == (
+        "planning",
+        "ready",
+        None,
+    )
+    assert body["cycle_count"] == 2
+    assert body["allowed_actions"] == ["pause", "cancel"]
+    assert body["error_code"] is None
+    assert body["completed_at"] is None
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        first_cycle = await db.get(DeliveryCycle, first_cycle_id)
+        next_cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+        task = await db.get(Task, run.developer_task_id)
+        transition = await db.scalar(
+            select(DeliveryTransition)
+            .where(
+                DeliveryTransition.run_id == run_id,
+                DeliveryTransition.cause == "retry",
+            )
+        )
+        assert first_cycle.status == "failed"
+        assert next_cycle.status == "planning"
+        assert next_cycle.trigger_kind == "operator_retry"
+        assert next_cycle.trigger_payload["previous_cycle_id"] == first_cycle_id
+        assert next_cycle.trigger_payload["previous_error_code"] == "plan_run_failed"
+        assert transition.metadata_["reason"] == "Provider routes recovered"
+        assert task.status == "delivery_waiting"
+        assert task.completed_at is None
+        assert task.error_message is None
+
+    stale_retry = await client.post(
+        f"/api/delivery-runs/{run_id}/retry",
+        json={"expected_state_version": failed_version},
+    )
+    assert stale_retry.status_code == 409
+    assert "changed before retry" in stale_retry.text
+
+
+@pytest.mark.asyncio
+async def test_retry_is_hidden_when_cycle_budget_is_exhausted(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="retry-budget")
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo, max_cycles=1),
+    )
+    run_id = created.json()["id"]
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+        task = await db.get(Task, run.developer_task_id)
+        delivery_service.complete_cycle(cycle, status="failed")
+        await delivery_service.apply_run_event(
+            db,
+            run=run,
+            event=DeliveryReducerEvent(
+                "fail",
+                {
+                    "error_code": "plan_run_failed",
+                    "error_message": "Temporary provider failure",
+                },
+            ),
+            actor_kind="controller",
+        )
+        task.status = "failed"
+        task.completed_at = datetime.utcnow()
+        await db.commit()
+        failed_version = run.state_version
+
+    failed = await client.get(f"/api/delivery-runs/{run_id}")
+    assert failed.json()["allowed_actions"] == []
+    response = await client.post(
+        f"/api/delivery-runs/{run_id}/retry",
+        json={"expected_state_version": failed_version},
+    )
+    assert response.status_code == 409
+    assert "remaining cycle budget" in response.text
+
+
+@pytest.mark.asyncio
+async def test_progress_projects_open_plan_input_into_the_delivery_run(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="plan-input")
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo),
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    task_id = created.json()["developer_task_id"]
+
+    async with session_factory() as db:
+        plan = Plan(
+            title="Delivery clarification",
+            initial_request="Choose the rollout scope",
+            target_task_id=task_id,
+            project_id=project.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(),
+        )
+        db.add(plan)
+        await db.flush()
+        invocation = CapabilityInvocation(
+            task_id=task_id,
+            capability_key="plan",
+            source="delivery_controller",
+            purpose="required_gate",
+            status="waiting_user",
+            state_version=1,
+            idempotency_key=f"delivery-plan-input-{run_id}",
+            input_payload={"prompt": plan.initial_request},
+            input_hash="a" * 64,
+            subject_kind="task_generation",
+            subject_ref={"task_id": task_id},
+            subject_hash="b" * 64,
+            executor_kind="plan_agent",
+            executor_config={},
+            executor_config_hash="c" * 64,
+            policy_snapshot={},
+            policy_hash="d" * 64,
+            resume_policy="controller",
+            max_attempts=1,
+            active_task_id=task_id,
+        )
+        db.add(invocation)
+        await db.flush()
+        execution = CapabilityExecution(
+            invocation_id=invocation.id,
+            attempt=1,
+            status="waiting_user",
+            state_version=1,
+            active_invocation_id=invocation.id,
+            idempotency_key=f"delivery-plan-execution-{run_id}",
+            executor_kind="plan_agent",
+            input_hash=invocation.input_hash,
+        )
+        db.add(execution)
+        await db.flush()
+        plan_run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="capability",
+            capability_execution_id=execution.id,
+            request_text=plan.initial_request,
+            pipeline_config=plan.pipeline_config,
+            status="waiting_user",
+            current_stage="planner",
+            generation=1,
+            max_interactions=3,
+        )
+        db.add(plan_run)
+        await db.flush()
+        input_request = PlanInputRequest(
+            plan_id=plan.id,
+            run_id=plan_run.id,
+            source_step_id=1,
+            requested_by="planner",
+            reason="The rollout boundary changes the implementation.",
+            questions=[
+                {
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which rollout scope should be used?",
+                    "response_type": "single_choice",
+                    "options": [
+                        {"label": "One project", "value": "one"},
+                        {"label": "All projects", "value": "all"},
+                    ],
+                    "required": True,
+                }
+            ],
+            status="open",
+            idempotency_key=f"delivery-plan-input-request-{run_id}",
+            opened_at=datetime.utcnow(),
+        )
+        db.add(input_request)
+        await db.flush()
+        plan.active_run_id = plan_run.id
+        plan_run.open_input_request_id = input_request.id
+        execution.handle_kind = "plan_agent_run"
+        execution.handle_id = str(plan_run.id)
+        execution.handle_generation = plan_run.generation
+        cycle = await db.scalar(
+            select(DeliveryCycle).where(DeliveryCycle.run_id == run_id)
+        )
+        cycle.plan_invocation_id = invocation.id
+        await db.commit()
+
+    response = await client.get(f"/api/delivery-runs/{run_id}/progress")
+    attention = await client.get("/api/delivery-runs/attention-count")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["attention_required"] is True
+    assert body["attention_kind"] == "plan_input"
+    assert body["headline"] == "Plan needs your decision"
+    assert body["plan_input"]["plan_id"] == plan.id
+    assert body["plan_input"]["request"]["questions"][0]["id"] == "scope"
+    assert body["plan_input"]["run"]["steps"] == []
+    assert attention.json() == {"total": 1}
+
+    # A historical Plan may remain waiting while a newer cycle is current.
+    # Attention must follow the current cycle's exact invocation, not any
+    # waiting Plan ever attached to the reused Developer Task.
+    async with session_factory() as db:
+        stored = await db.get(DeliveryRun, run_id)
+        old_cycle = await db.get(DeliveryCycle, stored.current_cycle_id)
+        old_cycle.status = "completed"
+        old_cycle.active_run_id = None
+        old_cycle.completed_at = datetime.utcnow()
+        await db.flush()
+        current_cycle = DeliveryCycle(
+            run_id=stored.id,
+            cycle_number=2,
+            active_run_id=stored.id,
+            status="planning",
+            state_version=1,
+            trigger_kind="test_new_cycle",
+            trigger_payload={},
+            trigger_hash="e" * 64,
+        )
+        db.add(current_cycle)
+        await db.flush()
+        stored.current_cycle_id = current_cycle.id
+        stored.cycle_count = 2
+        await db.commit()
+
+    historical_attention = await client.get("/api/delivery-runs/attention-count")
+    assert historical_attention.json() == {"total": 0}
 
 
 @pytest.mark.asyncio

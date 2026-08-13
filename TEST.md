@@ -1262,6 +1262,13 @@ uv run python -m pytest backend/tests/test_api_tasks.py -k broadcasts_status_cha
 # Run/Controller/worktree/publisher/PR Monitor 的本地 Git、故障注入与状态机回归
 uv run pytest -q backend/tests/test_delivery_*.py
 
+# Delivery 页快速启动、六阶段进度、Plan 内联输入与侧栏 attention
+cd frontend && npx vitest run \
+  src/components/Delivery/DeliveryCreateForm.test.tsx \
+  src/components/Delivery/DeliveryRunDialog.test.tsx \
+  src/components/Tasks/DeliveryRunPanel.test.tsx \
+  src/components/Layout/AppShell.test.tsx
+
 # 真实 Codex app-server 隔离探针（显式 opt-in，不发送模型请求）
 CCM_RUN_REAL_CODEX_SANDBOX_TESTS=1 uv run pytest -q \
   backend/tests/test_codex_app_server.py::test_real_codex_delivery_permission_profile_blocks_host_reads
@@ -1285,6 +1292,19 @@ proxy 全部失败；sandbox loopback bind/self-connect 仅在隔离 netns 内�
 真实 GitHub/required-CI 端到端验收会 push branch 并创建 PR，只能在明确的
 一次性 canary 仓库执行。`auto_merge=false` 的成功终点必须是 `ready_to_merge`；
 `auto_merge=true` 会真实合并，只能在明确授权的 disposable canary 验证。两种模式都不得 deploy。
+
+`test_delivery_setup.py` 覆盖默认 Monitor 的幂等创建、已有 Monitor 防接管、分支保护
+required check 精确映射、无 required CI 时仍强制 Panel，以及
+`/api/delivery-runs/quick-start` 从一段需求完成内部配置与 Run admission。自动合并
+为每次 Run 的显式、默认关闭选择；没有 app-bound exact CI 时必须在 admission 拒绝。
+`test_delivery_controller.py` 另外覆盖 Frontend Review 的 auto skip、unbound Harness
+崩溃恢复、exact owner/head、归档报告+截图门禁和 finding 回流新 Cycle；
+`test_delivery_api.py` 与 `test_auth_ws_security.py` 覆盖统一 progress、Plan input/attention
+投影、失败 Run 的 state-version fenced 同 Run 新 Cycle 重试，以及 Run-scoped WebSocket
+的 Project ACL。`test_plan_capability.py` 覆盖失败 Plan Run 在 Invocation 终态前自动创建
+第二个独立 Execution/Plan Run，避免一次短暂路由故障直接终止 Delivery。
+`DeliveryRunDialog.test.tsx` 覆盖当前 Round/预算/开轮原因的醒目展示、历史 Round 切换、
+按轮阶段与时间线过滤，以及新 Round/Plan input 自动回到当前轮。
 
 ## Auto Capability policy、terminal admission 与 durable resume
 

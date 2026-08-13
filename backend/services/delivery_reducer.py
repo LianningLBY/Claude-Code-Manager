@@ -59,6 +59,7 @@ _READY_EFFECTS = {
     "planning": ("request_plan",),
     "coding": ("dispatch_code",),
     "pre_review": ("request_code_review",),
+    "frontend_review": ("request_frontend_review",),
     "publishing": ("ensure_pull_request",),
 }
 
@@ -130,6 +131,8 @@ def effects_for_state(state: DeliveryState) -> tuple[str, ...]:
         return ("observe_plan",)
     if state.phase == "pre_review" and state.activity == "waiting":
         return ("observe_code_review",)
+    if state.phase == "frontend_review" and state.activity == "waiting":
+        return ("observe_frontend_review",)
     if state.phase == "monitoring" and state.activity == "waiting":
         return ("observe_pr_monitor",)
     return ()
@@ -217,6 +220,7 @@ def _require_wait_reason(
 _PHASE_WAIT_REASONS = {
     "planning": "plan_capability",
     "pre_review": "code_review_capability",
+    "frontend_review": "frontend_review",
     "monitoring": "pr_monitor",
 }
 
@@ -241,10 +245,21 @@ def reduce_delivery_state(
         raise DeliveryTransitionError("Delivery event payload must be a mapping")
 
     kind = event.kind.strip()
-    if state.activity == "terminal":
+    if state.activity == "terminal" and kind != "retry":
         raise DeliveryTransitionError("A terminal DeliveryRun is immutable")
 
-    if kind == "pause":
+    if kind == "retry":
+        _require_state(state, event, ("done", "terminal"))
+        if state.outcome != "failed":
+            raise DeliveryTransitionError(
+                "Only a failed DeliveryRun can be retried"
+            )
+        next_state = _active_state(
+            state,
+            phase="planning",
+            activity="ready",
+        )
+    elif kind == "pause":
         if state.activity == "paused":
             raise DeliveryTransitionError("DeliveryRun is already paused")
         reason = _non_empty_text(event, "reason")
@@ -330,12 +345,35 @@ def reduce_delivery_state(
         _require_wait_reason(state, event, "code_review_capability")
         next_state = _active_state(
             state,
-            phase="publishing",
+            phase="frontend_review",
             activity="ready",
         )
     elif kind == "review_changes_requested":
         _require_state(state, event, ("pre_review", "waiting"))
         _require_wait_reason(state, event, "code_review_capability")
+        next_state = _active_state(state, phase="planning", activity="ready")
+    elif kind == "frontend_review_requested":
+        _require_state(state, event, ("frontend_review", "ready"))
+        next_state = _active_state(
+            state,
+            phase="frontend_review",
+            activity="waiting",
+            wait_reason="frontend_review",
+        )
+    elif kind in {"frontend_review_passed", "frontend_review_skipped"}:
+        if kind == "frontend_review_passed":
+            _require_state(state, event, ("frontend_review", "waiting"))
+            _require_wait_reason(state, event, "frontend_review")
+        else:
+            _require_state(state, event, ("frontend_review", "ready"))
+        next_state = _active_state(
+            state,
+            phase="publishing",
+            activity="ready",
+        )
+    elif kind == "frontend_review_changes_requested":
+        _require_state(state, event, ("frontend_review", "waiting"))
+        _require_wait_reason(state, event, "frontend_review")
         next_state = _active_state(state, phase="planning", activity="ready")
     elif kind == "publish_started":
         _require_state(state, event, ("publishing", "ready"))

@@ -1,6 +1,7 @@
-import type { DeliveryRunCreate } from '../../api/client';
+import type { DeliveryQuickStartCreate, DeliveryRunCreate } from '../../api/client';
 
 type DeliveryAdmissionDraft = Omit<DeliveryRunCreate, 'idempotency_key'>;
+type DeliveryQuickStartDraft = Omit<DeliveryQuickStartCreate, 'idempotency_key'>;
 
 export type DeliveryProvider = 'claude' | 'codex';
 
@@ -42,7 +43,7 @@ function newIdempotencyKey(): string {
   return `delivery-${nonce}`.slice(0, 128);
 }
 
-function fingerprint(draft: DeliveryAdmissionDraft): string {
+function fingerprint(draft: object): string {
   const entries = Object.entries(draft)
     .filter(([, value]) => value !== undefined)
     .sort(([left], [right]) => left.localeCompare(right));
@@ -129,6 +130,45 @@ export function acknowledgeDeliveryAdmission(
   } catch {
     // A stale key is safe: a changed request rotates it, and an exact request
     // is deliberately replayed to the already-created Run.
+  }
+  inMemoryAdmissions.delete(scope);
+}
+
+/** Bind the one-message/lazy-Monitor admission to the same durable retry key. */
+export function prepareDeliveryQuickStart(
+  scope: string,
+  draft: DeliveryQuickStartDraft,
+): DeliveryQuickStartCreate {
+  const requestFingerprint = fingerprint(draft);
+  const stored = readStored(scope);
+  const idempotencyKey = stored?.fingerprint === requestFingerprint
+    ? stored.idempotencyKey
+    : newIdempotencyKey();
+  writeStored(scope, {
+    version: 1,
+    fingerprint: requestFingerprint,
+    idempotencyKey,
+  });
+  return { ...draft, idempotency_key: idempotencyKey };
+}
+
+/** Clear an acknowledged quick-start without disturbing a newer request. */
+export function acknowledgeDeliveryQuickStart(
+  scope: string,
+  request: DeliveryQuickStartCreate,
+): void {
+  const { idempotency_key: idempotencyKey, ...draft } = request;
+  const stored = readStored(scope);
+  if (
+    stored?.idempotencyKey !== idempotencyKey
+    || stored.fingerprint !== fingerprint(draft)
+  ) {
+    return;
+  }
+  try {
+    globalThis.sessionStorage?.removeItem(storageKey(scope));
+  } catch {
+    // A stale key is safe for the same reasons as full Delivery admission.
   }
   inMemoryAdmissions.delete(scope);
 }

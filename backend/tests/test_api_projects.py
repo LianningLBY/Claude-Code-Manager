@@ -1,9 +1,22 @@
 """Tests for Project API endpoints."""
+from pathlib import Path
+import subprocess
+
 import pytest
 from unittest.mock import patch, AsyncMock
 
 from backend.models.discussion import Discussion
 from backend.models.project import Project
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
 
 
 @pytest.fixture
@@ -293,3 +306,122 @@ async def test_init_local_repo_preserves_both_existing_docs(db_factory, tmp_path
     async with db_factory() as db:
         p2 = await db.get(Project, pid)
         assert p2.status == "ready"
+
+
+@pytest.mark.asyncio
+async def test_existing_remote_project_adds_missing_origin_before_ready(
+    db_factory,
+    tmp_path,
+    monkeypatch,
+):
+    from backend.api import projects as projects_mod
+    from backend.services import delivery_setup
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", str(remote)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    local = tmp_path / "existing"
+    local.mkdir()
+    _git(local, "init", "-b", "main")
+    _git(local, "config", "user.name", "CCM Test")
+    _git(local, "config", "user.email", "ccm@example.invalid")
+    (local / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(local, "add", "seed.txt")
+    _git(local, "commit", "-m", "seed")
+
+    monkeypatch.setattr(projects_mod, "async_session", db_factory)
+    monitor_setup = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        delivery_setup,
+        "try_auto_configure_delivery_monitor",
+        monitor_setup,
+    )
+    async with db_factory() as db:
+        project = Project(
+            name="existing-remote",
+            local_path=str(local),
+            git_url=str(remote),
+            has_remote=True,
+            default_branch="main",
+            status="pending",
+        )
+        db.add(project)
+        await db.commit()
+        await db.refresh(project)
+        project_id = project.id
+
+    await projects_mod._clone_repo(
+        project_id,
+        str(remote),
+        str(local),
+        "existing-remote",
+        "main",
+        {
+            "git_author_name": "CCM Test",
+            "git_author_email": "ccm@example.invalid",
+        },
+    )
+
+    assert _git(local, "remote", "get-url", "origin") == str(remote)
+    async with db_factory() as db:
+        stored = await db.get(Project, project_id)
+        assert stored is not None
+        assert stored.status == "ready"
+        assert stored.error_message is None
+    monitor_setup.assert_awaited_once_with(project_id)
+
+
+@pytest.mark.asyncio
+async def test_existing_remote_project_rejects_ambiguous_origin(tmp_path):
+    from backend.api import projects as projects_mod
+
+    local = tmp_path / "ambiguous"
+    local.mkdir()
+    _git(local, "init", "-b", "main")
+    first = "https://github.com/acme/first.git"
+    second = "https://github.com/acme/second.git"
+    _git(local, "remote", "add", "origin", first)
+    _git(local, "config", "--add", "remote.origin.url", second)
+
+    with pytest.raises(RuntimeError, match="at most one fetch"):
+        await projects_mod._prepare_existing_project_remote(
+            str(local),
+            first,
+            env=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_existing_remote_project_repairs_push_only_origin(tmp_path):
+    from backend.api import projects as projects_mod
+
+    remote = tmp_path / "push-only-remote.git"
+    subprocess.run(
+        ["git", "init", "--bare", "--initial-branch=main", str(remote)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    local = tmp_path / "push-only"
+    local.mkdir()
+    _git(local, "init", "-b", "main")
+    _git(local, "config", "remote.origin.pushurl", str(remote))
+    _git(local, "config", "user.name", "CCM Test")
+    _git(local, "config", "user.email", "ccm@example.invalid")
+    (local / "seed.txt").write_text("seed\n", encoding="utf-8")
+    _git(local, "add", "seed.txt")
+    _git(local, "commit", "-m", "seed")
+    _git(local, "push", "origin", "main")
+
+    await projects_mod._prepare_existing_project_remote(
+        str(local),
+        str(remote),
+        env=None,
+    )
+
+    assert _git(local, "remote", "get-url", "origin") == str(remote)
+    assert _git(local, "remote", "get-url", "--push", "origin") == str(remote)

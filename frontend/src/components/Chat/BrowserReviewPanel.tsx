@@ -46,6 +46,7 @@ const STAGE_LABELS: Record<string, string> = {
   creating_agent: '正在创建黑盒审查 Agent',
   preview_ready: '隔离预览已就绪',
   browser_agent_queued: '黑盒浏览器 Agent 已排队',
+  agent_starting: 'Browser Agent 正在启动',
   reviewing: '浏览器 Agent 正在审查',
   checking_fingerprint: '正在核对工作区版本',
   publishing_report: '正在回传 Task 报告',
@@ -72,6 +73,8 @@ const STAGE_LABELS: Record<string, string> = {
   preparing_environment: '正在准备测试环境',
   collecting_evidence: '正在归档测试证据',
   evaluating: '正在生成结构化结论',
+  finalizing_agent_cleanup: '正在收口 Agent 运行资源',
+  evidence_incomplete: '测试证据不完整',
 };
 
 const TARGET_LABELS: Record<TestHarnessTargetKind, string> = {
@@ -93,6 +96,7 @@ interface BrowserReviewPanelProps {
   open: boolean;
   displayMode: BrowserReviewDisplayMode;
   onAvailableChange: (available: boolean) => void;
+  onActiveChange?: (active: boolean) => void;
   onClose: () => void;
   onDisplayModeChange: (mode: BrowserReviewDisplayMode) => void;
   onNewReview: () => void;
@@ -163,6 +167,27 @@ function statusClass(status: string): string {
   return 'border-blue-500/30 bg-blue-500/10 text-blue-300';
 }
 
+function harnessProgressPercent(run: TestHarnessRun, job: BrowserReviewJob | null): number {
+  if (TERMINAL.has(run.status)) return 100;
+  if (['cleaning', 'cleaning_up', 'collecting_evidence', 'evaluating', 'publishing_report', 'agent_reported'].includes(run.stage)) return 92;
+  if (job?.stage === 'executing_actions' || run.stage === 'executing_actions') return 74;
+  if (job || ['agent_starting', 'reviewing', 'browser_ready'].includes(run.stage)) return 60;
+  if (['preview_ready', 'creating_agent', 'browser_agent_queued', 'waiting_for_browser'].includes(run.stage)) return 45;
+  if (['starting_preview', 'waiting_for_preview', 'preparing_preview'].includes(run.stage)) return 30;
+  if (['fingerprinted', 'target_resolved', 'detached_worktree_ready'].includes(run.stage)) return 18;
+  return 8;
+}
+
+function eventClock(value: string): string {
+  const date = new Date(value.endsWith('Z') ? value : `${value}Z`);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
 export function BrowserReviewPanel({
   taskId,
   taskActive,
@@ -175,6 +200,7 @@ export function BrowserReviewPanel({
   open,
   displayMode,
   onAvailableChange,
+  onActiveChange,
   onClose,
   onDisplayModeChange,
   onNewReview,
@@ -230,6 +256,7 @@ export function BrowserReviewPanel({
   const expectedWorkspaceReviewBaselineRef = useRef<string | null | undefined>(undefined);
   const expectedGoalReviewBaselineRef = useRef<string | null | undefined>(undefined);
   const goalReviewRequestIdRef = useRef<number | null>(null);
+  const eventListRef = useRef<HTMLDivElement | null>(null);
 
   const applyRuntimeConfig = useCallback((config: TestHarnessRuntimeConfig) => {
     setRuntimeConfig(config);
@@ -325,12 +352,13 @@ export function BrowserReviewPanel({
       }
       setError(null);
       onAvailableChange(visibleRuns.length > 0);
+      onActiveChange?.(visibleRuns.some((run) => !TERMINAL.has(run.status)));
     } catch (nextError) {
       setError(errorText(nextError));
     } finally {
       setLoading(false);
     }
-  }, [onAvailableChange, onExpectedWorkspaceReviewFound, onGoalReviewFound, onNewReview, taskId]);
+  }, [onActiveChange, onAvailableChange, onExpectedWorkspaceReviewFound, onGoalReviewFound, onNewReview, taskId]);
 
   useEffect(() => {
     startedWorkspaceRunRef.current = null;
@@ -350,8 +378,9 @@ export function BrowserReviewPanel({
     setCapabilitiesLoading(false);
     latestReviewIdRef.current = null;
     onAvailableChange(false);
+    onActiveChange?.(false);
     void refresh();
-  }, [onAvailableChange, refresh, taskId]);
+  }, [onActiveChange, onAvailableChange, refresh, taskId]);
 
   useEffect(() => {
     setRuntimeConfig(null);
@@ -378,7 +407,8 @@ export function BrowserReviewPanel({
     setMinimized(false);
     setSettingsOpen(false);
     onAvailableChange(true);
-  }, [onAvailableChange, startedWorkspaceRun, taskId]);
+    onActiveChange?.(!TERMINAL.has(startedWorkspaceRun.status));
+  }, [onActiveChange, onAvailableChange, startedWorkspaceRun, taskId]);
 
   useEffect(() => {
     expectedWorkspaceReviewBaselineRef.current = expectedWorkspaceReviewBaseline;
@@ -452,6 +482,14 @@ export function BrowserReviewPanel({
   );
   const harnessRunId = displayedRun?.id ?? null;
   const latestScreenshot = job?.latest_screenshot ?? null;
+  const latestEvent = displayedRun?.events.at(-1) ?? null;
+  const liveProgress = displayedRun ? harnessProgressPercent(displayedRun, job) : 0;
+
+  useEffect(() => {
+    const list = eventListRef.current;
+    if (!list || !displayedRun) return;
+    list.scrollTop = list.scrollHeight;
+  }, [displayedRun, displayedRun?.events.length]);
 
   useEffect(() => {
     if (!latestScreenshot) {
@@ -604,6 +642,7 @@ export function BrowserReviewPanel({
       setRuns((current) => current.map((item) => (
         item.id === cancelled.id ? cancelled : item
       )));
+      onActiveChange?.(!TERMINAL.has(cancelled.status));
     } catch (nextError) {
       setError(`停止审查失败，Task 可能仍在运行：${errorText(nextError)}`);
     } finally {
@@ -630,6 +669,7 @@ export function BrowserReviewPanel({
       setSelectedId(repeated.id);
       setMinimized(false);
       onAvailableChange(true);
+      onActiveChange?.(true);
       onNewReview();
     } catch (nextError) {
       setError(`重新测试失败：${errorText(nextError)}`);
@@ -703,6 +743,7 @@ export function BrowserReviewPanel({
       setMinimized(false);
       setSettingsOpen(false);
       onAvailableChange(true);
+      onActiveChange?.(true);
       onNewReview();
     } catch (nextError) {
       setError(`启动测试失败：${errorText(nextError)}`);
@@ -1451,6 +1492,75 @@ export function BrowserReviewPanel({
             )}
           </section>
         )}
+        {displayedRun && !TERMINAL.has(displayedRun.status) && (
+          <section
+            data-testid="browser-agent-live-progress"
+            aria-live="polite"
+            className="overflow-hidden rounded-xl border border-cyan-400/45 bg-gradient-to-br from-cyan-500/12 via-indigo-500/8 to-gray-950 shadow-lg shadow-cyan-950/20"
+          >
+            <div className="flex items-start gap-3 px-3 py-3">
+              <div className="relative mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-cyan-400/40 bg-cyan-400/10 text-cyan-300">
+                <Activity size={16} />
+                <span className="absolute -right-0.5 -top-0.5 h-2.5 w-2.5 animate-pulse rounded-full border-2 border-gray-950 bg-emerald-400" />
+              </div>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="text-xs font-semibold text-cyan-200">Browser Agent 正在执行</div>
+                  <span className="shrink-0 rounded-full border border-cyan-400/30 bg-cyan-400/10 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-cyan-300">
+                    Live
+                  </span>
+                </div>
+                <div className="mt-0.5 text-[11px] font-medium text-gray-200">
+                  {STAGE_LABELS[displayedRun.stage] || displayedRun.stage}
+                </div>
+                {latestEvent && (
+                  <div className="mt-2 rounded-lg border border-white/8 bg-black/25 px-2.5 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate text-[11px] font-medium text-gray-100">{latestEvent.title}</span>
+                      <span className="shrink-0 text-[9px] text-gray-500">{eventClock(latestEvent.created_at)}</span>
+                    </div>
+                    {latestEvent.detail && (
+                      <div className="mt-1 line-clamp-3 whitespace-pre-wrap break-words text-[10px] leading-relaxed text-gray-400">
+                        {latestEvent.detail}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="px-3 pb-3">
+              <div className="h-1.5 overflow-hidden rounded-full bg-gray-800">
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-indigo-400 transition-[width] duration-500"
+                  style={{ width: `${liveProgress}%` }}
+                />
+              </div>
+              <div className="mt-2 grid grid-cols-4 gap-1 text-center text-[9px]">
+                {[
+                  ['准备环境', 8],
+                  ['启动预览', 30],
+                  ['Agent 测试', 60],
+                  ['归档证据', 92],
+                ].map(([label, threshold]) => (
+                  <span
+                    key={String(label)}
+                    className={`rounded px-1 py-1 ${liveProgress >= Number(threshold)
+                      ? 'bg-cyan-400/10 text-cyan-300'
+                      : 'bg-gray-900/70 text-gray-600'}`}
+                  >
+                    {label}
+                  </span>
+                ))}
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10px] text-gray-400">
+                <span>事件 {displayedRun.events.length}</span>
+                <span>步骤 {job ? `${job.steps}/${job.max_steps}` : '等待 Agent'}</span>
+                <span>动作 {job?.actions ?? 0}</span>
+                <span className="ml-auto text-cyan-300/80">每秒自动刷新</span>
+              </div>
+            </div>
+          </section>
+        )}
         {goalProgress && displayedRun && (
           <section data-testid="frontend-review-goal-progress" className="rounded-lg border border-indigo-500/30 bg-indigo-500/8 p-3">
             <div className="flex items-center justify-between gap-3">
@@ -1496,19 +1606,32 @@ export function BrowserReviewPanel({
         {displayedRun && (
           <section className="rounded-lg border border-gray-600/60 bg-gray-900/55">
             <div className="flex items-center gap-1.5 border-b border-gray-600/50 px-3 py-2 text-xs font-medium text-gray-200">
-              <Activity size={13} className="text-indigo-400" />
-              模型观察与操作轨迹
+              <Activity size={13} className={!TERMINAL.has(displayedRun.status) ? 'animate-pulse text-cyan-400' : 'text-indigo-400'} />
+              Agent 实时过程
+              <span className="ml-auto text-[9px] font-normal text-gray-500">
+                {displayedRun.events.length} 条 · 自动跟随最新
+              </span>
             </div>
-            <div className="max-h-72 space-y-0 overflow-y-auto px-3 py-1">
+            <div ref={eventListRef} data-testid="browser-agent-event-list" className="max-h-72 space-y-0 overflow-y-auto px-3 py-1">
               {displayedRun.events.length === 0 && (
                 <div className="py-5 text-center text-[11px] text-gray-500">等待测试 Harness 开始…</div>
               )}
               {displayedRun.events.map((event, index) => (
-                <div key={event.id} className="relative border-l border-gray-600/60 py-2 pl-4">
-                  <span className={`absolute -left-1 top-3 h-2 w-2 rounded-full ${event.event_type === 'decision' ? 'bg-indigo-400' : 'bg-cyan-400'}`} />
+                <div
+                  key={event.id}
+                  data-current-event={index === displayedRun.events.length - 1 ? 'true' : undefined}
+                  className={`relative border-l py-2 pl-4 transition-colors ${index === displayedRun.events.length - 1
+                    ? 'border-cyan-400/70 bg-cyan-400/5'
+                    : 'border-gray-600/60'}`}
+                >
+                  <span className={`absolute -left-1 top-3 h-2 w-2 rounded-full ${index === displayedRun.events.length - 1 && !TERMINAL.has(displayedRun.status)
+                    ? 'animate-pulse bg-emerald-400'
+                    : event.event_type === 'decision'
+                      ? 'bg-indigo-400'
+                      : 'bg-cyan-400'}`} />
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-medium text-gray-300">{event.title}</span>
-                    <span className="text-[9px] text-gray-500">{index + 1}</span>
+                    <span className="shrink-0 text-[9px] text-gray-500">{eventClock(event.created_at)} · #{index + 1}</span>
                   </div>
                   {event.detail && <div className="mt-0.5 whitespace-pre-wrap break-words text-[10px] leading-relaxed text-gray-500">{event.detail}</div>}
                 </div>

@@ -6409,6 +6409,7 @@ async def test_browser_review_child_requires_scoped_auth_before_runtime_material
 async def test_codex_browser_review_requires_mcp_only_app_server(
     db_factory, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", False)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     inst, task = await _isolated_browser_launch_scope(
@@ -6444,11 +6445,17 @@ async def test_codex_browser_review_requires_mcp_only_app_server(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("codex_main_mcp_enabled", [False, True])
 async def test_codex_browser_review_uses_proven_mcp_only_profile(
-    db_factory, monkeypatch, tmp_path,
+    db_factory, monkeypatch, tmp_path, codex_main_mcp_enabled,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
-    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    monkeypatch.setattr(
+        settings,
+        "codex_main_mcp_enabled",
+        codex_main_mcp_enabled,
+    )
     inst, task = await _isolated_browser_launch_scope(
         db_factory,
         instance_name="codex-browser-review-app-server",
@@ -6489,7 +6496,69 @@ async def test_codex_browser_review_uses_proven_mcp_only_profile(
     assert kwargs["disable_project_config"] is True
     assert kwargs["disable_autonomous_features"] is True
     assert kwargs["skill_context"] == ""
+    assert kwargs["git_env"] is None
     assert [spec.name for spec in kwargs["mcp_specs"]] == ["ccm_browser_review"]
+
+
+@pytest.mark.asyncio
+async def test_browser_launch_accepts_stale_claim_gate_after_executing_transition(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """Dispatcher claim cleanup must not invalidate the same Browser turn."""
+
+    from backend.services.test_harness_owner_fence import (
+        install_test_harness_owner_terminal_gate,
+        test_harness_owner_identity,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    inst, claimed = await _isolated_browser_launch_scope(
+        db_factory,
+        instance_name="browser-stale-claim-gate",
+        job_id="job-stale-claim-gate",
+        provider="codex",
+    )
+    async with db_factory() as db:
+        durable = await db.get(Task, claimed.id, populate_existing=True)
+        assert durable is not None and durable.status == "in_progress"
+        await install_test_harness_owner_terminal_gate(
+            db,
+            test_harness_owner_identity(durable),
+            reason="Initial Task lifecycle entered executing status",
+        )
+        durable.status = "executing"
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    async def launch_after_final_admission(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        return 43_211
+
+    with patch.object(
+        manager,
+        "_launch_codex_app_server",
+        new_callable=AsyncMock,
+        side_effect=launch_after_final_admission,
+    ) as launch_app_server:
+        pid = await manager.launch(
+            instance_id=inst.id,
+            prompt="review after the dispatcher status transition",
+            task_id=claimed.id,
+            cwd=str(tmp_path),
+            provider="codex",
+            model=claimed.model,
+            effort_level=claimed.effort_level,
+            codex_service_tier=claimed.codex_service_tier,
+            enabled_skills=claimed.enabled_skills,
+            config_dir=str(tmp_path / "codex-browser-stale-claim-gate"),
+        )
+
+    assert pid == 43_211
+    assert launch_app_server.await_args.kwargs["mcp_only"] is True
 
 
 @pytest.mark.asyncio
@@ -6840,6 +6909,7 @@ async def test_browser_launch_rejects_explicit_resume_even_without_task_drift(
 async def test_claude_browser_review_disables_builtins_but_keeps_bound_mcp(
     db_factory, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "use_pty_mode", False)
     inst, task = await _isolated_browser_launch_scope(
         db_factory,
@@ -7034,6 +7104,7 @@ async def test_api_codex_app_server_disables_project_config(
 async def test_rollout_enabled_routes_fresh_and_resume_with_task_scoped_mcp(
     db_factory, monkeypatch, tmp_path, resume_session_id,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     async with db_factory() as db:
@@ -7769,6 +7840,7 @@ async def test_task_isolation_pre_turn_failure_never_falls_back_to_exec(
 async def test_required_mcp_unknown_app_server_failure_does_not_launch_exec(
     db_factory, monkeypatch, tmp_path, caplog,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     async with db_factory() as db:
@@ -7873,6 +7945,7 @@ async def test_codex_sub_agent_requires_app_server_and_never_uses_exec(
 async def test_codex_sub_agent_mcp_failure_does_not_launch_exec(
     db_factory, monkeypatch, tmp_path, main_mcp_enabled,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(
         settings,
@@ -8260,6 +8333,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
 async def test_launch_codex_app_server_uses_passed_task_scoped_specs(
     db_factory, monkeypatch,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
     process = _make_mock_process(pid=7655)
     registry = MagicMock()

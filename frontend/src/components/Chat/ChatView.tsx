@@ -685,6 +685,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
   const [browserReviewAvailable, setBrowserReviewAvailable] = useState(false);
+  const [browserReviewActive, setBrowserReviewActive] = useState(false);
   const [showBrowserReviewPanel, setShowBrowserReviewPanel] = useState(false);
   const [frontendReviewComposerMode, setFrontendReviewComposerMode] = useState(false);
   const [workspaceReviewComposerMode, setWorkspaceReviewComposerMode] = useState(false);
@@ -708,12 +709,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     localStorage.getItem('ccm-browser-review-display-mode') === 'floating' ? 'floating' : 'docked'
   ));
   const previousBrowserReviewAvailable = useRef(false);
+  const previousBrowserReviewActive = useRef(false);
   const handleBrowserReviewAvailable = useCallback((available: boolean) => {
     setBrowserReviewAvailable(available);
     if (available && !previousBrowserReviewAvailable.current) {
       setShowBrowserReviewPanel(true);
     }
     previousBrowserReviewAvailable.current = available;
+  }, []);
+  const handleBrowserReviewActive = useCallback((active: boolean) => {
+    setBrowserReviewActive(active);
+    if (active && !previousBrowserReviewActive.current) {
+      setShowBrowserReviewPanel(true);
+    }
+    previousBrowserReviewActive.current = active;
   }, []);
   const handleBrowserReviewDisplayModeChange = useCallback((mode: BrowserReviewDisplayMode) => {
     setBrowserReviewDisplayMode(mode);
@@ -732,7 +741,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   useEffect(() => {
     previousBrowserReviewAvailable.current = false;
+    previousBrowserReviewActive.current = false;
     setBrowserReviewAvailable(false);
+    setBrowserReviewActive(false);
     setShowBrowserReviewPanel(false);
     setFrontendReviewComposerMode(false);
     setWorkspaceReviewComposerMode(false);
@@ -2744,19 +2755,30 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <button
                 type="button"
                 onClick={() => setShowBrowserReviewPanel((value) => !value)}
-                className={`relative rounded p-1.5 transition-colors ${
-                  showBrowserReviewPanel
-                    ? 'bg-indigo-500/15 text-indigo-300'
-                    : 'text-gray-600 hover:text-indigo-400'
+                className={`relative inline-flex items-center gap-1.5 rounded-lg border px-2 py-1.5 text-xs font-medium transition-all ${
+                  browserReviewActive
+                    ? 'border-cyan-400/40 bg-cyan-400/12 text-cyan-200 shadow-sm shadow-cyan-950/40'
+                    : showBrowserReviewPanel
+                      ? 'border-indigo-500/35 bg-indigo-500/15 text-indigo-300'
+                      : 'border-transparent text-gray-500 hover:border-indigo-500/25 hover:bg-indigo-500/8 hover:text-indigo-300'
                 }`}
-                title={browserReviewDisplayMode === 'floating' ? '打开前端测试浮窗' : '打开前端测试栏'}
+                title={browserReviewActive
+                  ? '前端 Browser Agent 正在执行，点击查看实时过程'
+                  : browserReviewDisplayMode === 'floating' ? '打开前端测试浮窗' : '打开前端测试栏'}
                 aria-label="Toggle Frontend Review panel"
               >
-                <Eye size={18} />
-                <span
-                  className={`absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full ${browserReviewAvailable ? 'bg-emerald-400' : 'bg-gray-500'}`}
-                  aria-hidden="true"
-                />
+                {browserReviewActive
+                  ? <Loader2 size={16} className="animate-spin" />
+                  : <Eye size={16} />}
+                <span className="hidden sm:inline">{browserReviewActive ? '前端测试中' : '前端测试'}</span>
+                {browserReviewActive ? (
+                  <span className="animate-pulse rounded bg-emerald-400/15 px-1 py-0.5 text-[8px] font-bold uppercase tracking-wide text-emerald-300">Live</span>
+                ) : (
+                  <span
+                    className={`h-1.5 w-1.5 rounded-full ${browserReviewAvailable ? 'bg-emerald-400' : 'bg-gray-500'}`}
+                    aria-hidden="true"
+                  />
+                )}
               </button>
             )}
             {!deliveryReadOnly && task.session_id && task.shared_from_id == null && (
@@ -3797,6 +3819,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           open={showBrowserReviewPanel}
           displayMode={browserReviewDisplayMode}
           onAvailableChange={handleBrowserReviewAvailable}
+          onActiveChange={handleBrowserReviewActive}
           onClose={() => setShowBrowserReviewPanel(false)}
           onDisplayModeChange={handleBrowserReviewDisplayModeChange}
           onNewReview={handleNewBrowserReview}

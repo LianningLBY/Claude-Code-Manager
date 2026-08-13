@@ -11,6 +11,7 @@ vi.mock('../../api/client', () => ({
     pauseDeliveryRun: vi.fn(),
     resumeDeliveryRun: vi.fn(),
     cancelDeliveryRun: vi.fn(),
+    retryDeliveryRun: vi.fn(),
   },
 }));
 
@@ -79,7 +80,7 @@ describe('DeliveryRunPanel', () => {
     render(<DeliveryRunPanel runId={7} />);
 
     expect(await screen.findByText('Pre Review · Running')).toBeInTheDocument();
-    expect(screen.getByText('Cycle 2/10 · 2 developer turns')).toBeInTheDocument();
+    expect(screen.getByText('Round 2 of 10 · 2 developer turns')).toBeInTheDocument();
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Pause' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
@@ -144,5 +145,59 @@ describe('DeliveryRunPanel', () => {
 
     expect(await screen.findByText('Merged')).toBeInTheDocument();
     expect(screen.queryByText('Ready to Merge')).not.toBeInTheDocument();
+  });
+
+  it('retries a failed pre-publication run from Plan without recreating it', async () => {
+    const failed = makeRun({
+      phase: 'done',
+      activity: 'terminal',
+      outcome: 'failed',
+      error_code: 'plan_run_failed',
+      error_message: 'Both reviewer routes were unavailable',
+      state_version: 11,
+      completed_at: '2026-08-05T00:10:00Z',
+      allowed_actions: ['retry'],
+    });
+    const retried = makeRun({
+      phase: 'planning',
+      activity: 'ready',
+      outcome: null,
+      error_code: null,
+      error_message: null,
+      state_version: 12,
+      cycle_count: 3,
+      completed_at: null,
+      allowed_actions: ['pause', 'cancel'],
+    });
+    vi.mocked(api.getDeliveryRun).mockResolvedValue(failed);
+    vi.mocked(api.retryDeliveryRun).mockResolvedValue(retried);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+
+    render(<DeliveryRunPanel runId={7} />);
+
+    await userEvent.click(
+      await screen.findByRole('button', { name: 'Retry from Plan' }),
+    );
+    expect(screen.getByRole('button', { name: 'Confirm Retry from Plan' })).toBeEnabled();
+    await userEvent.type(
+      screen.getByLabelText('Retry from Plan reason (optional)'),
+      'Provider routes recovered',
+    );
+    await userEvent.click(
+      screen.getByRole('button', { name: 'Confirm Retry from Plan' }),
+    );
+
+    await waitFor(() => {
+      expect(api.retryDeliveryRun).toHaveBeenCalledWith(
+        7,
+        11,
+        'Provider routes recovered',
+      );
+    });
+    expect(window.confirm).toHaveBeenCalledWith(
+      'Confirm retry from plan for Delivery Run #7?',
+    );
+    expect(await screen.findByText('Planning · Ready')).toBeInTheDocument();
+    expect(screen.getByText('Round 3 of 10 · 2 developer turns')).toBeInTheDocument();
   });
 });

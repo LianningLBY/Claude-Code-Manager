@@ -155,6 +155,29 @@ async def _latest_execution(
     ).scalar_one_or_none()
 
 
+async def _is_schema_validation_retry(
+    db: AsyncSession,
+    execution: CapabilityExecution,
+) -> bool:
+    """Return whether this attempt follows a strict-output validation failure."""
+
+    if execution.attempt <= 1:
+        return False
+    previous = (
+        await db.execute(
+            select(CapabilityExecution).where(
+                CapabilityExecution.invocation_id == execution.invocation_id,
+                CapabilityExecution.attempt == execution.attempt - 1,
+            )
+        )
+    ).scalar_one_or_none()
+    return (
+        previous is not None
+        and previous.status == "failed"
+        and previous.error_code == "code_review_output_invalid"
+    )
+
+
 async def _load_invocation(
     db: AsyncSession,
     invocation_id: int,
@@ -553,6 +576,7 @@ async def _exact_review_outputs(
         ).scalars()
     )
     parsed_by_hash: dict[str, tuple[dict[str, object], list[LogEntry]]] = {}
+    validation_errors: list[str] = []
     for row in rows:
         if not row.content:
             continue
@@ -563,14 +587,16 @@ async def _exact_review_outputs(
                 surface="pre_pr",
                 expected_role=CODE_REVIEWER_ROLE,
             )
-        except ValueError:
+        except ValueError as exc:
+            validation_errors.append(str(exc))
             continue
         key = capability_value_hash(parsed)
         parsed_by_hash.setdefault(key, (parsed, []))[1].append(row)
     if not parsed_by_hash:
-        raise ValueError(
-            "Reviewer Task produced no valid structured result for its subject"
-        )
+        message = "Reviewer Task produced no valid structured result for its subject"
+        if validation_errors:
+            message += f": {validation_errors[-1]}"
+        raise ValueError(message)
     if len(parsed_by_hash) != 1:
         raise ValueError(
             "Reviewer Task produced multiple different structured results"
@@ -904,12 +930,17 @@ class CodeReviewCapabilityExecutor:
                 base_sha,
                 expected_head_sha=head_sha,
             )
+            retry_after_schema_failure = await _is_schema_validation_retry(
+                db,
+                execution,
+            )
             prompt = build_structured_review_prompt(
                 subject=captured.subject,
                 material=captured.prompt_material(),
                 guidance=captured.prompt_guidance(),
                 surface="pre_pr",
                 expected_role=CODE_REVIEWER_ROLE,
+                retry_after_schema_failure=retry_after_schema_failure,
             )
             route = _review_route(invocation, developer_task)
         except (SubjectChangedError, RepositoryStateError) as exc:

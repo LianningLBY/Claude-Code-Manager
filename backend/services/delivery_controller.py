@@ -47,6 +47,12 @@ from backend.models.pr_monitor import (
 )
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.test_harness import (
+    TestHarnessAttempt,
+    TestHarnessEvidence,
+    TestHarnessFinding,
+    TestHarnessRun,
+)
 from backend.models.worktree import Worktree
 from backend.services.capability_service import (
     CapabilityDisabledError,
@@ -74,7 +80,9 @@ from backend.services.delivery_workspace import (
     DeliveryWorkspaceSnapshot,
 )
 from backend.services.test_harness_owner_fence import (
+    TestHarnessOwnerIdentity,
     no_active_test_harness_owner_graph_predicate,
+    test_harness_owner_identity,
 )
 
 
@@ -409,6 +417,9 @@ class _RunContext:
     requirements: str
     auto_merge: bool
     terminal: str
+    frontend_review_mode: str
+    frontend_review_profile: str
+    frontend_review_allow_actions: bool
 
 
 def _utcnow() -> datetime:
@@ -463,6 +474,7 @@ class DeliveryController:
         dispatcher_wake: Callable[[], Any] | None = None,
         workspace_manager: DeliveryWorkspaceManager | None = None,
         publisher: DeliveryPublisher | None = None,
+        test_harness_service: Any | None = None,
         enabled: bool | None = None,
         poll_interval_seconds: float | None = None,
         reconcile_interval_seconds: float | None = None,
@@ -526,6 +538,7 @@ class DeliveryController:
         )
         self.workspace = workspace_manager or DeliveryWorkspaceManager()
         self.publisher = publisher or UnavailableDeliveryPublisher()
+        self.test_harness_service = test_harness_service
         # The rollout flag gates new Run admission at the API boundary.  The
         # controller itself stays on so a restart/config rollback cannot
         # strand work that was already admitted durably.  ``enabled=False`` is
@@ -896,6 +909,20 @@ class DeliveryController:
                     name=f"delivery-release-{lease.run_id}-{lease.generation}",
                 )
                 await _await_task_settled(release)
+                try:
+                    from backend.services.delivery_events import (
+                        broadcast_delivery_event,
+                    )
+
+                    await broadcast_delivery_event(
+                        "delivery_progress_changed",
+                        run_id=run_id,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Delivery Run %s progress broadcast failed",
+                        run_id,
+                    )
             if immediate:
                 self.wake()
             return True
@@ -1132,6 +1159,16 @@ class DeliveryController:
             terminal = (
                 policy.get("terminal") if isinstance(policy, dict) else None
             )
+            frontend_review = policy.get("frontend_review")
+            if not isinstance(frontend_review, dict):
+                frontend_review = {
+                    "mode": "off",
+                    "profile": "standard",
+                    "allow_actions": True,
+                }
+            frontend_review_mode = frontend_review.get("mode")
+            frontend_review_profile = frontend_review.get("profile")
+            frontend_review_allow_actions = frontend_review.get("allow_actions")
             frozen_repo_full_name = (
                 monitor_policy.get("repo_full_name")
                 if isinstance(monitor_policy, dict)
@@ -1146,6 +1183,9 @@ class DeliveryController:
                 or type(auto_merge) is not bool
                 or terminal
                 != ("merged" if auto_merge else "ready_to_merge")
+                or frontend_review_mode not in {"auto", "required", "off"}
+                or frontend_review_profile not in {"standard", "exhaustive"}
+                or type(frontend_review_allow_actions) is not bool
                 or repo.project_id != project.id
                 or not isinstance(frozen_repo_full_name, str)
                 or not frozen_repo_full_name
@@ -1174,6 +1214,9 @@ class DeliveryController:
                 requirements=run.requirements,
                 auto_merge=auto_merge,
                 terminal=terminal,
+                frontend_review_mode=frontend_review_mode,
+                frontend_review_profile=frontend_review_profile,
+                frontend_review_allow_actions=frontend_review_allow_actions,
             )
 
     async def _drive(self, lease: _Lease) -> bool:
@@ -1184,6 +1227,8 @@ class DeliveryController:
             return await self._drive_coding(lease, context)
         if context.phase == "pre_review":
             return await self._drive_review(lease, context)
+        if context.phase == "frontend_review":
+            return await self._drive_frontend_review(lease, context)
         if context.phase == "publishing":
             return await self._drive_publishing(lease, context)
         if context.phase == "monitoring":
@@ -2147,7 +2192,7 @@ class DeliveryController:
             cycle.result_patch_sha256 = patch_sha
             run.patch_sha256 = patch_sha
             if snapshot.verdict == "approved":
-                cycle.status = "publishing"
+                cycle.status = "frontend_review"
                 cycle.state_version += 1
                 cycle.updated_at = _utcnow()
                 await apply_run_event(
@@ -2158,6 +2203,24 @@ class DeliveryController:
                     actor_id=str(invocation_id),
                     metadata={"review_result_id": snapshot.result_id},
                 )
+                # Direct service callers and legacy policies intentionally
+                # keep the original Code Review -> Publish flow. Record the
+                # omitted Browser gate explicitly instead of making it
+                # invisible in the progress timeline.
+                if context.frontend_review_mode == "off":
+                    skip_reason = "Frontend review is disabled by Delivery policy"
+                    cycle.frontend_review_skip_reason = skip_reason
+                    cycle.status = "publishing"
+                    cycle.state_version += 1
+                    cycle.updated_at = _utcnow()
+                    await apply_run_event(
+                        db,
+                        run=run,
+                        event=DeliveryReducerEvent("frontend_review_skipped"),
+                        actor_kind="controller",
+                        actor_id=self.owner_id,
+                        metadata={"skip_reason": skip_reason},
+                    )
             else:
                 if run.cycle_count >= run.max_cycles:
                     failure_message = (
@@ -2226,6 +2289,623 @@ class DeliveryController:
                             "subject": subject,
                         },
                     )
+            await db.commit()
+        return True
+
+    def _frontend_harness_service(self):
+        if self.test_harness_service is not None:
+            return self.test_harness_service
+        from backend.services.test_harness import test_harness_service
+
+        return test_harness_service
+
+    async def _skip_frontend_review(
+        self,
+        lease: _Lease,
+        context: _RunContext,
+        *,
+        reason: str,
+    ) -> bool:
+        """Persist one deterministic auto-policy skip with exact Task fences."""
+
+        async with self.db_factory() as db:
+            run = await lock_run(db, lease.run_id)
+            self._assert_lease(run, lease)
+            cycle = await lock_current_cycle(db, run)
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == run.developer_task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if (
+                run.phase != "frontend_review"
+                or run.activity != "ready"
+                or cycle.id != context.cycle_id
+                or cycle.status != "frontend_review"
+                or cycle.frontend_review_run_id is not None
+                or run.head_sha != context.head_sha
+                or run.head_tree_sha != context.head_tree_sha
+                or task is None
+                or task.status != "delivery_waiting"
+            ):
+                await db.rollback()
+                return True
+            if not await self._developer_task_settled_locked(db, task):
+                await db.rollback()
+                return False
+            if not await self._fence_developer_task_graph_locked(db, task):
+                await db.rollback()
+                return False
+            skip_reason = reason.strip()[:2000]
+            cycle.frontend_review_skip_reason = skip_reason
+            cycle.status = "publishing"
+            cycle.state_version += 1
+            cycle.updated_at = _utcnow()
+            await apply_run_event(
+                db,
+                run=run,
+                event=DeliveryReducerEvent("frontend_review_skipped"),
+                actor_kind="controller",
+                actor_id=self.owner_id,
+                metadata={"skip_reason": skip_reason},
+            )
+            await db.commit()
+        return True
+
+    async def _drive_frontend_review(
+        self,
+        lease: _Lease,
+        context: _RunContext,
+    ) -> bool:
+        """Run Browser/Test Harness as a read-only gate over the exact head."""
+
+        if context.frontend_review_mode == "off":
+            return await self._skip_frontend_review(
+                lease,
+                context,
+                reason="Frontend review is disabled by Delivery policy",
+            )
+        if not context.head_sha or not context.head_tree_sha:
+            raise DeliverySubjectChanged("Frontend review subject is incomplete")
+
+        if context.activity == "ready":
+            harness_idempotency_key = (
+                f"delivery:{context.run_id}:cycle:{context.cycle_id}:"
+                f"frontend:{context.head_sha}"
+            )
+            async with self.db_factory() as db:
+                run = await db.get(DeliveryRun, lease.run_id, populate_existing=True)
+                self._assert_lease(run, lease)
+                cycle = await db.get(
+                    DeliveryCycle,
+                    context.cycle_id,
+                    populate_existing=True,
+                )
+                task = await db.get(
+                    Task,
+                    context.developer_task_id,
+                    populate_existing=True,
+                )
+                project = await db.get(Project, context.project_id)
+                if (
+                    run.phase != "frontend_review"
+                    or run.activity != "ready"
+                    or cycle is None
+                    or cycle.id != run.current_cycle_id
+                    or cycle.status != "frontend_review"
+                    or task is None
+                    or task.status != "delivery_waiting"
+                    or task.delivery_run_id != run.id
+                    or project is None
+                ):
+                    raise DeliverySubjectChanged(
+                        "Frontend review owner changed before admission"
+                    )
+                if not await self._developer_task_settled_locked(db, task):
+                    await db.rollback()
+                    return False
+                owner_identity = test_harness_owner_identity(task)
+                owner_user_id = run.created_by
+                if cycle.frontend_review_run_id is not None:
+                    raise DeliverySubjectChanged(
+                        "Frontend review handle exists before its waiting transition"
+                    )
+                recoverable_harness = await db.scalar(
+                    select(TestHarnessRun).where(
+                        TestHarnessRun.task_id == task.id,
+                        TestHarnessRun.idempotency_scope == f"task:{task.id}",
+                        TestHarnessRun.idempotency_key
+                        == harness_idempotency_key,
+                    )
+                )
+                recovery_harness_id = None
+                if recoverable_harness is not None:
+                    if (
+                        recoverable_harness.target_kind != "current_workspace"
+                        or recoverable_harness.project_id != task.project_id
+                        or recoverable_harness.owner_task_incarnation_id
+                        != owner_identity.incarnation_id
+                        or recoverable_harness.owner_task_retry_count
+                        != owner_identity.retry_count
+                        or recoverable_harness.owner_task_turn_generation
+                        != owner_identity.turn_generation
+                        or recoverable_harness.owner_task_status
+                        != owner_identity.status
+                        or (
+                            recoverable_harness.source_git_head is not None
+                            and recoverable_harness.source_git_head
+                            != context.head_sha
+                        )
+                    ):
+                        raise DeliverySubjectChanged(
+                            "Recovered frontend review does not match the exact owner"
+                        )
+                    recovery_harness_id = recoverable_harness.id
+                elif not await self._fence_developer_task_graph_locked(db, task):
+                    await db.rollback()
+                    return False
+                from backend.services.workspace_review import (
+                    workspace_review_capability,
+                )
+
+                capability = (
+                    None
+                    if recovery_harness_id is not None
+                    else workspace_review_capability(task, project)
+                )
+                await db.rollback()
+
+            harness_run_id = recovery_harness_id
+            if harness_run_id is None:
+                unavailable_reason = None
+                if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+                    unavailable_reason = "AUTH_TOKEN is not configured"
+                elif not capability or not capability.get("available"):
+                    unavailable_reason = str(
+                        (capability or {}).get("reason")
+                        or "trusted Preview is unavailable"
+                    )
+                if unavailable_reason is not None:
+                    message = f"Frontend review unavailable: {unavailable_reason}"
+                    if context.frontend_review_mode == "auto":
+                        return await self._skip_frontend_review(
+                            lease,
+                            context,
+                            reason=message,
+                        )
+                    await self._fail_run(
+                        lease,
+                        code="frontend_review_unavailable",
+                        message=message,
+                    )
+                    return False
+
+                from backend.services.test_harness_contracts import TestHarnessSpec
+
+                goal = (
+                    "Validate the current Delivery implementation as a black-box "
+                    "frontend. Verify the requested user-visible behavior, runtime "
+                    "health, error feedback, and regressions. Report issues only; "
+                    "do not edit source code.\n\nDelivery requirements:\n"
+                    + context.requirements
+                )[:20_000]
+                service = self._frontend_harness_service()
+                try:
+                    harness_run = await service.start_task_run(
+                        task_id=context.developer_task_id,
+                        spec=TestHarnessSpec(
+                            target_kind="current_workspace",
+                            target={},
+                            goal=goal,
+                            profile=context.frontend_review_profile,
+                            allow_actions=context.frontend_review_allow_actions,
+                            idempotency_key=harness_idempotency_key,
+                        ),
+                        owner_user_id=owner_user_id,
+                        owner_identity=owner_identity,
+                    )
+                    harness_run_id = harness_run.id
+                except Exception as exc:
+                    from backend.services.test_harness import TestHarnessBusyError
+
+                    if isinstance(exc, TestHarnessBusyError):
+                        return False
+                    # Starting the Harness can cross Browser/Preview boundaries.
+                    # Its idempotency key makes retry safe, but an unclassified
+                    # error must remain visible instead of silently publishing.
+                    raise DeliverySubjectChanged(
+                        f"Frontend review could not start safely: {exc}"
+                    ) from exc
+
+            async with self.db_factory() as db:
+                run = await lock_run(db, lease.run_id)
+                self._assert_lease(run, lease)
+                cycle = await lock_current_cycle(db, run)
+                task = (
+                    await db.execute(
+                        select(Task)
+                        .where(Task.id == run.developer_task_id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                exact_harness = await db.get(
+                    TestHarnessRun,
+                    harness_run_id,
+                    populate_existing=True,
+                )
+                if (
+                    run.phase != "frontend_review"
+                    or run.activity != "ready"
+                    or cycle.id != context.cycle_id
+                    or cycle.status != "frontend_review"
+                    or cycle.frontend_review_run_id not in {None, harness_run_id}
+                    or run.head_sha != context.head_sha
+                    or task is None
+                    or task.status != owner_identity.status
+                    or task.incarnation_id != owner_identity.incarnation_id
+                    or task.retry_count != owner_identity.retry_count
+                    or task.turn_generation != owner_identity.turn_generation
+                    or exact_harness is None
+                    or exact_harness.task_id != task.id
+                    or exact_harness.target_kind != "current_workspace"
+                    or exact_harness.owner_task_incarnation_id
+                    != owner_identity.incarnation_id
+                    or exact_harness.owner_task_retry_count
+                    != owner_identity.retry_count
+                    or exact_harness.owner_task_turn_generation
+                    != owner_identity.turn_generation
+                    or exact_harness.owner_task_status != owner_identity.status
+                    or (
+                        exact_harness.source_git_head is not None
+                        and exact_harness.source_git_head != context.head_sha
+                    )
+                ):
+                    raise DeliverySubjectChanged(
+                        "Frontend review owner changed while binding its handle"
+                    )
+                cycle.frontend_review_run_id = harness_run_id
+                cycle.state_version += 1
+                cycle.updated_at = _utcnow()
+                await apply_run_event(
+                    db,
+                    run=run,
+                    event=DeliveryReducerEvent("frontend_review_requested"),
+                    actor_kind="test_harness",
+                    actor_id=harness_run_id,
+                    metadata={"test_harness_run_id": harness_run_id},
+                )
+                await db.commit()
+            return True
+
+        if context.activity != "waiting":
+            raise DeliverySubjectChanged(
+                "Frontend review phase has an invalid activity"
+            )
+
+        async with self.db_factory() as db:
+            cycle = await db.get(
+                DeliveryCycle,
+                context.cycle_id,
+                populate_existing=True,
+            )
+            harness_run_id = cycle.frontend_review_run_id if cycle else None
+            harness = (
+                await db.get(TestHarnessRun, harness_run_id)
+                if harness_run_id is not None
+                else None
+            )
+            task = await db.get(Task, context.developer_task_id)
+            attempt = None
+            findings: list[TestHarnessFinding] = []
+            evidence: list[TestHarnessEvidence] = []
+            if harness is not None:
+                attempt = (
+                    await db.execute(
+                        select(TestHarnessAttempt)
+                        .where(TestHarnessAttempt.run_id == harness.id)
+                        .order_by(TestHarnessAttempt.ordinal.desc())
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
+                findings = list(
+                    (
+                        await db.execute(
+                            select(TestHarnessFinding)
+                            .where(TestHarnessFinding.run_id == harness.id)
+                            .order_by(TestHarnessFinding.ordinal)
+                        )
+                    ).scalars()
+                )
+                if attempt is not None:
+                    evidence = list(
+                        (
+                            await db.execute(
+                                select(TestHarnessEvidence).where(
+                                    TestHarnessEvidence.run_id == harness.id,
+                                    TestHarnessEvidence.attempt_id == attempt.id,
+                                )
+                            )
+                        ).scalars()
+                    )
+            if harness is None or task is None:
+                raise DeliverySubjectChanged(
+                    "Frontend review wait lost its Harness owner"
+                )
+            owner_identity = TestHarnessOwnerIdentity(
+                task_id=task.id,
+                incarnation_id=harness.owner_task_incarnation_id or "",
+                retry_count=harness.owner_task_retry_count or 0,
+                turn_generation=harness.owner_task_turn_generation or 0,
+                status=harness.owner_task_status or "",
+            )
+            harness_snapshot = {
+                "id": harness.id,
+                "task_id": harness.task_id,
+                "owner_incarnation": harness.owner_task_incarnation_id,
+                "owner_retry": harness.owner_task_retry_count,
+                "owner_turn": harness.owner_task_turn_generation,
+                "owner_status": harness.owner_task_status,
+                "status": harness.status,
+                "stage": harness.stage,
+                "verdict": harness.verdict,
+                "source_git_head": harness.source_git_head,
+                "stale": harness.stale,
+                "report": harness.report,
+                "error": harness.error,
+                "cleanup_status": harness.cleanup_status,
+                "attempt_id": attempt.id if attempt else None,
+                "archive_state": attempt.archive_state if attempt else None,
+                "finding_ids": [item.id for item in findings],
+                "evidence_ids": [item.id for item in evidence],
+            }
+
+        if harness_snapshot["status"] not in {
+            "completed",
+            "failed",
+            "cancelled",
+            "stale",
+        }:
+            return False
+        if harness_snapshot["cleanup_status"] != "completed":
+            try:
+                await self._frontend_harness_service().cancel(
+                    harness_run_id,
+                    expected_identity=owner_identity,
+                )
+            except Exception as exc:
+                raise DeliverySubjectChanged(
+                    f"Frontend review cleanup could not be proven: {exc}"
+                ) from exc
+            return False
+        if (
+            harness_snapshot["task_id"] != context.developer_task_id
+            or harness_snapshot["owner_incarnation"] != task.incarnation_id
+            or harness_snapshot["owner_retry"] != task.retry_count
+            or harness_snapshot["owner_turn"] != task.turn_generation
+            or harness_snapshot["owner_status"] != task.status
+            or harness_snapshot["source_git_head"] != context.head_sha
+            or harness_snapshot["stale"] is True
+        ):
+            raise DeliverySubjectChanged(
+                "Frontend review result does not match the exact Delivery head"
+            )
+
+        verdict = harness_snapshot["verdict"]
+        if harness_snapshot["status"] != "completed" or verdict not in {
+            "passed",
+            "failed",
+        }:
+            await self._fail_run(
+                lease,
+                code="frontend_review_error",
+                message=(
+                    harness_snapshot["error"]
+                    or harness_snapshot["report"]
+                    or f"Frontend review ended with {harness_snapshot['status']}/{verdict}"
+                ),
+            )
+            return False
+
+        evidence_kinds = {item.kind for item in evidence}
+        if (
+            harness_snapshot["archive_state"] != "complete"
+            or not harness_snapshot["report"]
+            or "screenshot" not in evidence_kinds
+            or "report" not in evidence_kinds
+        ):
+            await self._fail_run(
+                lease,
+                code="frontend_review_evidence_incomplete",
+                message=(
+                    "Frontend review ended without a complete archived "
+                    "report and screenshot evidence set"
+                ),
+            )
+            return False
+
+        async with self.db_factory() as db:
+            run = await lock_run(db, lease.run_id)
+            self._assert_lease(run, lease)
+            cycle = await lock_current_cycle(db, run)
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(Task.id == run.developer_task_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            exact_harness = await db.get(
+                TestHarnessRun,
+                harness_run_id,
+                populate_existing=True,
+            )
+            exact_attempt = (
+                await db.get(
+                    TestHarnessAttempt,
+                    harness_snapshot["attempt_id"],
+                    populate_existing=True,
+                )
+                if harness_snapshot["attempt_id"] is not None
+                else None
+            )
+            exact_evidence: list[TestHarnessEvidence] = []
+            if exact_attempt is not None:
+                exact_evidence = list(
+                    (
+                        await db.execute(
+                            select(TestHarnessEvidence)
+                            .where(
+                                TestHarnessEvidence.run_id == harness_run_id,
+                                TestHarnessEvidence.attempt_id == exact_attempt.id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+            exact_findings = list(
+                (
+                    await db.execute(
+                        select(TestHarnessFinding)
+                        .where(TestHarnessFinding.run_id == harness_run_id)
+                        .order_by(TestHarnessFinding.ordinal)
+                        .with_for_update()
+                    )
+                ).scalars()
+            )
+            if (
+                run.phase != "frontend_review"
+                or run.activity != "waiting"
+                or cycle.id != context.cycle_id
+                or cycle.frontend_review_run_id != harness_run_id
+                or run.head_sha != context.head_sha
+                or task is None
+                or task.status != "delivery_waiting"
+                or exact_harness is None
+                or exact_harness.task_id != task.id
+                or exact_harness.target_kind != "current_workspace"
+                or exact_harness.owner_task_incarnation_id
+                != task.incarnation_id
+                or exact_harness.owner_task_retry_count != task.retry_count
+                or exact_harness.owner_task_turn_generation
+                != task.turn_generation
+                or exact_harness.owner_task_status != task.status
+                or exact_harness.status != harness_snapshot["status"]
+                or exact_harness.verdict != verdict
+                or exact_harness.report != harness_snapshot["report"]
+                or exact_harness.cleanup_status != "completed"
+                or exact_harness.source_git_head != context.head_sha
+                or exact_harness.stale
+                or exact_attempt is None
+                or exact_attempt.run_id != harness_run_id
+                or exact_attempt.archive_state
+                != harness_snapshot["archive_state"]
+                or {item.id for item in exact_evidence}
+                != set(harness_snapshot["evidence_ids"])
+                or not {"report", "screenshot"}.issubset(
+                    {item.kind for item in exact_evidence}
+                )
+                or {item.id for item in exact_findings}
+                != set(harness_snapshot["finding_ids"])
+            ):
+                raise DeliverySubjectChanged(
+                    "Frontend review result changed before acceptance"
+                )
+            if not await self._developer_task_settled_locked(db, task):
+                await db.rollback()
+                return False
+            if not await self._fence_developer_task_graph_locked(db, task):
+                await db.rollback()
+                return False
+
+            cycle.frontend_review_verdict = verdict
+            cycle.frontend_review_summary = (
+                harness_snapshot["report"] or harness_snapshot["error"]
+            )[:20_000]
+            cycle.state_version += 1
+            cycle.updated_at = _utcnow()
+            if verdict == "passed":
+                cycle.status = "publishing"
+                await apply_run_event(
+                    db,
+                    run=run,
+                    event=DeliveryReducerEvent("frontend_review_passed"),
+                    actor_kind="test_harness",
+                    actor_id=harness_run_id,
+                    metadata={
+                        "test_harness_run_id": harness_run_id,
+                        "evidence_count": len(evidence),
+                    },
+                )
+            elif run.cycle_count >= run.max_cycles:
+                failure_message = (
+                    "Frontend review found issues after the Delivery cycle "
+                    "budget was exhausted"
+                )
+                complete_cycle(cycle, status="failed")
+                await apply_run_event(
+                    db,
+                    run=run,
+                    event=DeliveryReducerEvent(
+                        "fail",
+                        {
+                            "error_code": "delivery_max_cycles",
+                            "error_message": failure_message,
+                        },
+                    ),
+                    actor_kind="controller",
+                    actor_id=self.owner_id,
+                    metadata={"test_harness_run_id": harness_run_id},
+                )
+                task.status = "failed"
+                task.completed_at = _utcnow()
+                task.error_message = failure_message
+            else:
+                finding_payload = [
+                    {
+                        "fingerprint": item.fingerprint,
+                        "scenario_id": item.scenario_id,
+                        "severity": item.severity,
+                        "category": item.category,
+                        "title": item.title,
+                        "route": item.route,
+                        "locator": item.locator,
+                        "expected": item.expected,
+                        "actual": item.actual,
+                        "reproduction": item.reproduction,
+                        "evidence": item.evidence_names,
+                    }
+                    for item in exact_findings
+                ]
+                complete_cycle(cycle)
+                await apply_run_event(
+                    db,
+                    run=run,
+                    event=DeliveryReducerEvent(
+                        "frontend_review_changes_requested"
+                    ),
+                    actor_kind="test_harness",
+                    actor_id=harness_run_id,
+                    metadata={
+                        "test_harness_run_id": harness_run_id,
+                        "summary": cycle.frontend_review_summary,
+                    },
+                )
+                await start_next_cycle(
+                    db,
+                    run=run,
+                    trigger_kind="frontend_review_changes_requested",
+                    trigger_payload={
+                        "test_harness_run_id": harness_run_id,
+                        "source_git_head": context.head_sha,
+                        "report": cycle.frontend_review_summary,
+                        "findings": finding_payload,
+                    },
+                )
             await db.commit()
         return True
 

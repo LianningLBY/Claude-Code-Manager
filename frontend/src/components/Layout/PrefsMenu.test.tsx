@@ -192,6 +192,27 @@ describe('PrefsMenu', () => {
       );
     });
 
+    it('treats an older runtime response without the sandbox field as restricted', async () => {
+      const user = userEvent.setup();
+      vi.mocked(api.getRuntimeSettings).mockResolvedValueOnce({
+        use_pty_mode: false,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        auto_sort_on_access: true,
+        context_compact_threshold: 0.8,
+      });
+      render(<PrefsMenu isAdmin={true} />);
+
+      await user.click(screen.getByTitle('偏好设置（时区 / 主题）'));
+
+      const toggle = await screen.findByRole('button', {
+        name: 'Claude / Codex 无限制权限',
+      });
+      expect(toggle).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    });
+
     it('does not enable unrestricted Agent permissions when cancelled', async () => {
       const user = userEvent.setup();
       vi.spyOn(window, 'confirm').mockReturnValue(false);

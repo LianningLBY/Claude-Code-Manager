@@ -528,8 +528,8 @@ export interface RuntimeSettings {
   codex_main_mcp_enabled?: boolean;
   /** Absent on pre-PR7B2 runtimes; unknown must fail closed for Monitor. */
   codex_monitor_enabled?: boolean;
-  /** Operator switch: executable Agent turns bypass CCM sandbox restrictions. */
-  agent_sandbox_unrestricted_enabled: boolean;
+  /** Absent on older Workers; unknown must keep the restricted sandbox. */
+  agent_sandbox_unrestricted_enabled?: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;

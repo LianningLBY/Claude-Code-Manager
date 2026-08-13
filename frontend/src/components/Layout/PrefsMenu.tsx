@@ -70,7 +70,7 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
 
   const toggleAgentSandbox = useCallback(async () => {
     if (!runtime || switching) return;
-    const next = !runtime.agent_sandbox_unrestricted_enabled;
+    const next = runtime.agent_sandbox_unrestricted_enabled !== true;
     if (next) {
       const ok = window.confirm(
         '开启后，之后启动的 Codex 回合及 Claude Plan/Delivery 回合会跳过宿主沙箱；Claude Plan 仍只有只读工具，Delivery Coding 会跳过模型权限确认。仅应在受监督的本地调试中使用。确定开启？',
@@ -89,6 +89,8 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
       setSwitching(false);
     }
   }, [runtime, switching]);
+
+  const agentSandboxUnrestricted = runtime?.agent_sandbox_unrestricted_enabled === true;
 
   const changeCompactThreshold = useCallback(async (value: number) => {
     if (!runtime || switching) return;
@@ -188,14 +190,14 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
             <div
               data-testid="agent-sandbox-unrestricted-setting"
               className={`rounded-md border px-2 py-2 ${
-                runtime.agent_sandbox_unrestricted_enabled
+                agentSandboxUnrestricted
                   ? 'border-red-500/60 bg-red-950/50'
                   : 'border-gray-700 bg-gray-900/20'
               }`}
             >
               <div className="flex items-center justify-between gap-3">
                 <span className={`text-xs ${
-                  runtime.agent_sandbox_unrestricted_enabled
+                  agentSandboxUnrestricted
                     ? 'font-medium text-red-300'
                     : 'text-gray-400'
                 }`}>
@@ -204,15 +206,15 @@ export function PrefsMenu({ isAdmin }: { isAdmin: boolean }) {
                 <button
                   type="button"
                   aria-label="Claude / Codex 无限制权限"
-                  aria-pressed={runtime.agent_sandbox_unrestricted_enabled}
+                  aria-pressed={agentSandboxUnrestricted}
                   onClick={toggleAgentSandbox}
                   disabled={switching}
-                  className={toggleCls(runtime.agent_sandbox_unrestricted_enabled)}
+                  className={toggleCls(agentSandboxUnrestricted)}
                 >
-                  <span className={knobCls(runtime.agent_sandbox_unrestricted_enabled)} />
+                  <span className={knobCls(agentSandboxUnrestricted)} />
                 </button>
               </div>
-              {runtime.agent_sandbox_unrestricted_enabled && (
+              {agentSandboxUnrestricted && (
                 <p role="alert" className="mt-1.5 text-[10px] leading-relaxed text-red-300">
                   高危：新 Codex / Claude Plan/Delivery 回合跳过 CCM 宿主隔离；Plan 仍只读，Delivery Coding 不再弹模型权限确认。
                 </p>

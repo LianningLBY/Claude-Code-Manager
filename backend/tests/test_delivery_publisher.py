@@ -144,8 +144,6 @@ class FakeGit:
         self.remote_refs[subject.delivery_branch] = subject.head_sha
         if self.push_response_lost:
             raise DeliveryGitError("response lost")
-        from backend.services.delivery_publisher import PushResult
-        return PushResult()
 
 
 @dataclass
@@ -1104,6 +1102,58 @@ async def test_production_git_gateway_classifies_missing_https_credentials(
         match="authentication is unavailable",
     ):
         await GitDeliveryGateway().push_exact(subject)
+
+
+@pytest.mark.asyncio
+async def test_production_git_gateway_refuses_unpersisted_fork_fallback(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _project, repo = await _delivery_scope(
+        db_session,
+        suffix="push-permission",
+    )
+    publisher = GitHubDeliveryPublisher(
+        db_factory,
+        git=FakeGit(repo.repo_full_name, {"main": BASE}),
+        github=FakeGitHub(),
+    )
+    subject = await publisher._load_subject(run.id)
+    calls: list[tuple[str, ...]] = []
+
+    async def rejected(_cwd, *args, **_kwargs):
+        calls.append(args)
+        return (
+            1,
+            b"",
+            b"remote: Permission to acme/widgets denied to ccm-bot.\n",
+        )
+
+    async def validated_urls(_self, _current):
+        remote = "https://github.com/acme/widgets.git"
+        return remote, remote
+
+    monkeypatch.setattr(delivery_publisher_service, "_run_git", rejected)
+    monkeypatch.setattr(
+        delivery_publisher_service,
+        "_github_credential_config",
+        lambda _url: (),
+    )
+    monkeypatch.setattr(
+        GitDeliveryGateway,
+        "_validated_remote_urls",
+        validated_urls,
+    )
+
+    with pytest.raises(
+        DeliveryGitAuthenticationError,
+        match="write permission is unavailable",
+    ):
+        await GitDeliveryGateway().push_exact(subject)
+
+    assert len(calls) == 1
+    assert "push" in calls[0]
 
 
 def test_publisher_rejects_plain_http_github_remote_identity():

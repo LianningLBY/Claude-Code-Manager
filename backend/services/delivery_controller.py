@@ -2380,6 +2380,9 @@ class DeliveryController:
             or pull_request.base_sha != context.base_sha
             or pull_request.head_sha != context.head_sha
             or pull_request.head_branch != context.delivery_branch
+            or not isinstance(pull_request.head_repo_full_name, str)
+            or pull_request.head_repo_full_name.lower()
+            != context.repo_full_name.lower()
             or not pull_request.url
             or pull_request.pr_number <= 0
         ):
@@ -2529,10 +2532,9 @@ class DeliveryController:
             or not isinstance(result.get("base_sha"), str)
             or not isinstance(result.get("head_sha"), str)
             or not isinstance(result.get("head_branch"), str)
-            or (
-                result.get("head_repo_full_name") is not None
-                and not isinstance(result.get("head_repo_full_name"), str)
-            )
+            or not isinstance(result.get("head_repo_full_name"), str)
+            or result.get("head_repo_full_name", "").lower()
+            != context.repo_full_name.lower()
         ):
             raise DeliverySubjectChanged(
                 "Publish action has a malformed remote PR receipt"
@@ -2975,6 +2977,11 @@ class DeliveryController:
                 or monitor.pr_number != pull_request.pr_number
                 or monitor.current_base_sha != run.base_sha
                 or monitor.current_head_sha != run.head_sha
+                or monitor.head_repo_full_name is None
+                or pull_request.head_repo_full_name is None
+                or monitor.head_repo_full_name.lower()
+                != pull_request.head_repo_full_name.lower()
+                or monitor.head_branch != pull_request.head_branch
             ):
                 raise DeliverySubjectChanged(
                     "Publish result no longer matches its durable action"
@@ -3193,11 +3200,11 @@ class DeliveryController:
             raise DeliverySubjectChanged(
                 "PR Monitor advanced to an unowned base/head subject"
             )
-        if monitor_snapshot["head_branch"] not in (None, context.delivery_branch):
+        if monitor_snapshot["head_branch"] != context.delivery_branch:
             raise DeliverySubjectChanged("PR head branch changed")
         if (
-            monitor_snapshot["head_repo_full_name"] is not None
-            and monitor_snapshot["head_repo_full_name"].lower()
+            not isinstance(monitor_snapshot["head_repo_full_name"], str)
+            or monitor_snapshot["head_repo_full_name"].lower()
             != repo_full_name.lower()
         ):
             raise DeliverySubjectChanged("PR head repository changed")

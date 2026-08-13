@@ -460,14 +460,12 @@ describe('Codex provider UI gating', () => {
     expect(screen.getByText('Thinking')).toBeInTheDocument();
   });
 
-  it('shows Monitor with ordinary/User Skills for local Codex', async () => {
+  it('keeps the local Monitor status quiet while exposing Monitor in Plugins', async () => {
     const cliSelect = await renderAndOpenConfig();
     expect(screen.queryByText(/本地 Codex Monitor 已启用/)).not.toBeInTheDocument();
 
     await userEvent.selectOptions(cliSelect, 'codex');
-    expect(
-      screen.getByText('本地 Codex Monitor 已启用'),
-    ).toBeInTheDocument();
+    expect(screen.queryByText(/本地 Codex Monitor 已启用/)).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByText(/Plugins/)).toBeInTheDocument());
     expect(screen.getByText('Skills')).toBeInTheDocument();
     await userEvent.click(screen.getByText(/Plugins/));

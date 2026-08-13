@@ -702,12 +702,24 @@ class ClaudePool:
             logger.warning("Pool has no available accounts (exclude=%s)", exclude)
             return None
 
-        # Fresh launches prefer a compatible API account.  Keep
-        # the existing cooldown-expiry order within each account kind so the
-        # native pool remains the unchanged fallback when no API projection is
-        # usable for this model.
+        # Fresh launches prefer a compatible API account only after cached
+        # health has been proven.  At process startup an API account can still
+        # be unknown, so keep it behind a usable native account until the first
+        # probe settles.  Unknown API accounts remain a final fallback for
+        # API-only installations.
+        def automatic_rank(account: PoolAccount) -> int:
+            if not _is_api_auth_kind(account.auth_kind):
+                return 1
+            decision = self._api_quota_decision(account)
+            if (
+                bool(decision.get("known"))
+                and decision.get("available") is True
+            ):
+                return 0
+            return 2
+
         candidates.sort(key=lambda a: (
-            0 if _is_api_auth_kind(a.auth_kind) else 1,
+            automatic_rank(a),
             self._cooldowns.get(a.id, 0),
         ))
         # Manual switch: preferred account jumps the queue; if it fails the

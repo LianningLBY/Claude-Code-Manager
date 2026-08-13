@@ -18,6 +18,8 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import signal
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlsplit
@@ -80,10 +82,18 @@ _SCP_GITHUB_RE = re.compile(
 _MAX_GIT_OUTPUT = 128 * 1024
 _MAX_GITHUB_LIST_BYTES = 2 * 1024 * 1024
 _MAX_PR_BODY_BYTES = 60 * 1024
+_LEGACY_BOUND_STALE_HEAD_REASON = (
+    "Delivery pull-request history is ambiguous: "
+    "Pull request does not match the exact Delivery subject"
+)
 
 
 class DeliveryGitError(RuntimeError):
     """A Git read/write failed without proving a permanent ref conflict."""
+
+
+class DeliveryGitAuthenticationError(DeliveryGitError):
+    """A GitHub credential failure proved that no Git write was attempted."""
 
 
 class DeliveryNonFastForwardError(DeliveryGitError):
@@ -252,6 +262,62 @@ def _github_repo_from_url(value: object) -> str | None:
 
 def _git_environment() -> dict[str, str]:
     return _controller_git_environment()
+
+
+def _github_credential_config(remote_url: str) -> tuple[str, ...]:
+    """Return one fixed GitHub-only credential helper for HTTPS transport.
+
+    Controller Git deliberately ignores ambient/global credential helpers.  An
+    HTTPS push still needs a credential source, so bind Git to the already
+    authenticated GitHub CLI without placing its token in argv, an environment
+    variable, the repository config, or a temporary plaintext file.  SSH
+    remotes continue to use the separately constrained SSH transport.
+    """
+
+    try:
+        parsed = urlsplit(remote_url)
+    except ValueError as exc:
+        raise DeliveryGitAuthenticationError(
+            "Delivery GitHub credential scope is invalid"
+        ) from exc
+    if parsed.scheme.lower() != "https":
+        return ()
+    executable = shutil.which("gh")
+    if executable is None:
+        raise DeliveryGitAuthenticationError(
+            "GitHub CLI is unavailable for Delivery HTTPS authentication"
+        )
+    try:
+        resolved = Path(executable).resolve(strict=True)
+    except OSError as exc:
+        raise DeliveryGitAuthenticationError(
+            "GitHub CLI cannot be resolved for Delivery HTTPS authentication"
+        ) from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise DeliveryGitAuthenticationError(
+            "GitHub CLI is not executable for Delivery HTTPS authentication"
+        )
+    helper = f"!{shlex.quote(str(resolved))} auth git-credential"
+    return (
+        "-c",
+        "credential.https://github.com.helper=",
+        "-c",
+        f"credential.https://github.com.helper={helper}",
+    )
+
+
+def _is_authentication_failure(diagnostic: str) -> bool:
+    return any(
+        marker in diagnostic
+        for marker in (
+            "authentication failed",
+            "could not read username",
+            "terminal prompts disabled",
+            "unable to get password",
+            "no oauth token",
+            "not logged into any github hosts",
+        )
+    )
 
 
 async def _await_cleanup_settled(
@@ -540,8 +606,9 @@ class GitDeliveryGateway:
             raise DeliveryGitError("Invalid remote branch")
         fetch_url, _push_url = await self._validated_remote_urls(subject)
         ref = f"refs/heads/{branch}"
-        returncode, stdout, _stderr = await _run_git(
+        returncode, stdout, stderr = await _run_git(
             subject.workspace_path,
+            *_github_credential_config(fetch_url),
             "ls-remote",
             "--upload-pack=git-upload-pack",
             "--refs",
@@ -549,6 +616,13 @@ class GitDeliveryGateway:
             ref,
         )
         if returncode != 0:
+            diagnostic = (stdout + b"\n" + stderr).decode(
+                "utf-8", errors="replace"
+            ).lower()
+            if _is_authentication_failure(diagnostic):
+                raise DeliveryGitAuthenticationError(
+                    "GitHub authentication is unavailable for Delivery ref reads"
+                )
             raise DeliveryGitError("Unable to read the exact remote ref")
         if not stdout:
             return None
@@ -569,6 +643,7 @@ class GitDeliveryGateway:
         refspec = f"{subject.head_sha}:refs/heads/{subject.delivery_branch}"
         returncode, stdout, stderr = await _run_git(
             subject.workspace_path,
+            *_github_credential_config(push_url),
             "push",
             "--porcelain",
             "--no-verify",
@@ -581,6 +656,10 @@ class GitDeliveryGateway:
         diagnostic = (stdout + b"\n" + stderr).decode(
             "utf-8", errors="replace"
         ).lower()
+        if _is_authentication_failure(diagnostic):
+            raise DeliveryGitAuthenticationError(
+                "GitHub authentication is unavailable for Delivery push"
+            )
         if any(
             marker in diagnostic
             for marker in (
@@ -646,6 +725,7 @@ class GitDeliveryGateway:
         refspec = f"{subject.head_sha}:refs/heads/{subject.delivery_branch}"
         returncode, stdout, stderr = await _run_git(
             subject.workspace_path,
+            *_github_credential_config(fork_url),
             "push",
             "--porcelain",
             "--no-verify",
@@ -1042,6 +1122,8 @@ class GitHubDeliveryPublisher:
         self,
         subject: _PublishingSubject,
         value: object,
+        *,
+        allow_bound_open_stale_head: bool = False,
     ) -> _PullRequestSnapshot:
         if not isinstance(value, dict):
             raise DeliveryPublisherPermanentError(
@@ -1064,6 +1146,20 @@ class GitHubDeliveryPublisher:
         head_repo_name = (
             head_repo.get("full_name") if isinstance(head_repo, dict) else None
         )
+        normalized_head_sha = head_sha.lower() if isinstance(head_sha, str) else None
+        bound_open_stale_head = (
+            allow_bound_open_stale_head
+            and state == "open"
+            and subject.pr_number is not None
+            and subject.pr_url is not None
+            and number == subject.pr_number
+            and isinstance(url, str)
+            and url.rstrip("/") == subject.pr_url.rstrip("/")
+            and isinstance(normalized_head_sha, str)
+            and _SHA_RE.fullmatch(normalized_head_sha) is not None
+            and isinstance(head_repo_name, str)
+            and head_repo_name.lower() == subject.repo_full_name.lower()
+        )
         if (
             isinstance(number, bool)
             or not isinstance(number, int)
@@ -1074,7 +1170,10 @@ class GitHubDeliveryPublisher:
             or base_sha.lower() != subject.base_sha
             or base_ref != subject.base_branch
             or not isinstance(head_sha, str)
-            or head_sha.lower() != subject.head_sha
+            or (
+                normalized_head_sha != subject.head_sha
+                and not bound_open_stale_head
+            )
             or head_ref != subject.delivery_branch
             or not isinstance(base_repo_name, str)
             or base_repo_name.lower() != subject.repo_full_name.lower()
@@ -1133,7 +1232,7 @@ class GitHubDeliveryPublisher:
                 pr_number=number,
                 url=url,
                 base_sha=subject.base_sha,
-                head_sha=subject.head_sha,
+                head_sha=normalized_head_sha,
                 head_branch=subject.delivery_branch,
                 head_repo_full_name=head_repo_name,
             ),
@@ -1155,6 +1254,8 @@ class GitHubDeliveryPublisher:
     async def _find_existing_pull_request(
         self,
         subject: _PublishingSubject,
+        *,
+        allow_bound_open_stale_head: bool = False,
     ) -> _PullRequestSnapshot | None:
         owner = subject.repo_full_name.split("/", 1)[0]
         candidates = await self._github.list_pull_requests(
@@ -1168,7 +1269,11 @@ class GitHubDeliveryPublisher:
             raise DeliveryPublisherPermanentError(
                 "GitHub returned ambiguous PR history for one Delivery branch"
             )
-        return self._validate_pull_request_snapshot(subject, candidates[0])
+        return self._validate_pull_request_snapshot(
+            subject,
+            candidates[0],
+            allow_bound_open_stale_head=allow_bound_open_stale_head,
+        )
 
     @staticmethod
     def _publish_progress_subject(subject: _PublishingSubject) -> dict[str, object]:
@@ -1190,6 +1295,31 @@ class GitHubDeliveryPublisher:
             "kind": "pull_request_create_intent",
             "subject": self._publish_progress_subject(subject),
         }
+
+    def _is_bound_history_reconciliation_receipt(
+        self,
+        subject: _PublishingSubject,
+        value: object,
+    ) -> bool:
+        """Recognize an old ambiguous receipt that is safe to reconcile.
+
+        A Run already bound to a PR can never enter the PR-create path below,
+        so replay may only inspect that identity and idempotently advance its
+        frozen branch.  This specifically recovers receipts produced when an
+        older publisher compared a repair cycle's new head with the open PR's
+        previous head before pushing the branch.
+        """
+
+        return (
+            subject.pr_number is not None
+            and subject.pr_url is not None
+            and isinstance(value, dict)
+            and set(value) == {"schema_version", "kind", "subject", "reason"}
+            and value.get("schema_version") == 2
+            and value.get("kind") == "pull_request_history_ambiguous"
+            and value.get("subject") == self._publish_progress_subject(subject)
+            and value.get("reason") == _LEGACY_BOUND_STALE_HEAD_REASON
+        )
 
     async def _load_create_intent(
         self,
@@ -1214,6 +1344,13 @@ class GitHubDeliveryPublisher:
                 raise DeliverySubjectChanged("Delivery publish action disappeared")
             result = action.result
             if result is None and action.remote_id is None and action.remote_url is None:
+                await db.rollback()
+                return False
+            if (
+                action.remote_id is None
+                and action.remote_url is None
+                and self._is_bound_history_reconciliation_receipt(subject, result)
+            ):
                 await db.rollback()
                 return False
             expected = self._create_intent_receipt(subject)
@@ -1315,16 +1452,35 @@ class GitHubDeliveryPublisher:
             await self._assert_effect_fence(subject, fence, db=db)
             if run is None or action is None:
                 raise DeliverySubjectChanged("Delivery publish action disappeared")
-            if action.result not in (None, self._create_intent_receipt(subject)):
+            bound_reconciliation = (
+                kind == "pull_request_history_ambiguous"
+                and snapshot is None
+                and action.remote_id is None
+                and action.remote_url is None
+                and self._is_bound_history_reconciliation_receipt(
+                    subject,
+                    action.result,
+                )
+            )
+            if (
+                action.result not in (None, self._create_intent_receipt(subject))
+                and not bound_reconciliation
+            ):
                 raise DeliverySubjectChanged(
                     "Delivery publish action already has different remote evidence"
                 )
 
+            stored_reason = (
+                f"Bound PR reconciliation failed after legacy receipt recovery: "
+                f"{reason}"
+                if bound_reconciliation
+                else reason
+            )
             receipt: dict[str, object] = {
                 "schema_version": 2,
                 "kind": kind,
                 "subject": self._publish_progress_subject(subject),
-                "reason": reason[:1000],
+                "reason": stored_reason[:1000],
             }
             if kind == "pull_request_history_conflict" and snapshot is None:
                 raise DeliverySubjectChanged(
@@ -1367,7 +1523,7 @@ class GitHubDeliveryPublisher:
                     "Unresolved PR creation has unexpected remote identity"
                 )
             action.result = receipt
-            action.last_error = reason[:2000]
+            action.last_error = stored_reason[:2000]
             await db.commit()
 
     def _pull_request_body(self, subject: _PublishingSubject) -> str:
@@ -1436,6 +1592,10 @@ class GitHubDeliveryPublisher:
         # which was already closed after CCM lost the creation response.
         try:
             await self._assert_remote_base(subject)
+        except DeliveryGitAuthenticationError as exc:
+            raise DeliveryPublisherNoEffectPreflightError(
+                "GitHub credentials are unavailable before Delivery publication"
+            ) from exc
         except DeliveryPublisherPermanentError as base_error:
             try:
                 historical = await self._find_existing_pull_request(subject)
@@ -1454,7 +1614,15 @@ class GitHubDeliveryPublisher:
             ) from base_error
 
         try:
-            existing = await self._find_existing_pull_request(subject)
+            existing = await self._find_existing_pull_request(
+                subject,
+                # A later repair cycle is already durably bound to this PR.
+                # Its open PR necessarily exposes the previous cycle's head
+                # until the exact non-force push below advances the branch.
+                # Number, URL, repo and branch identity remain strict here;
+                # every post-push read uses exact-head validation again.
+                allow_bound_open_stale_head=True,
+            )
         except DeliveryPublisherPermanentError as exc:
             reason = f"Delivery pull-request history is ambiguous: {exc}"
             await self._record_terminal_pull_request_conflict(
@@ -1491,15 +1659,24 @@ class GitHubDeliveryPublisher:
         # Side effect 1: exact non-force branch publication.  A lost response
         # is recovered by reading the exact remote ref before deciding whether
         # the error is still relevant.
-        remote_head = await self._git.remote_ref_sha(
-            subject, subject.delivery_branch
-        )
+        try:
+            remote_head = await self._git.remote_ref_sha(
+                subject, subject.delivery_branch
+            )
+        except DeliveryGitAuthenticationError as exc:
+            raise DeliveryPublisherNoEffectPreflightError(
+                "GitHub credentials are unavailable before Delivery publication"
+            ) from exc
         push_result = PushResult()  # default: no fork
         if remote_head != subject.head_sha:
             await self._assert_subject(subject, require_remote_head=False)
             await self._assert_effect_fence(subject, fence)
             try:
                 push_result = await self._git.push_exact(subject)
+            except DeliveryGitAuthenticationError as exc:
+                raise DeliveryPublisherNoEffectPreflightError(
+                    "GitHub credentials are unavailable for Delivery publication"
+                ) from exc
             except DeliveryNonFastForwardError as exc:
                 # A rejected non-force ref update proves that this attempt did
                 # not mutate the remote branch.
@@ -1537,6 +1714,30 @@ class GitHubDeliveryPublisher:
             await self._assert_subject(subject, require_remote_head=True)
         await self._assert_effect_fence(subject, fence)
         if preexisting_open is not None:
+            if preexisting_open.head_sha != subject.head_sha:
+                # The remote ref may already have advanced while GitHub's PR
+                # list response was stale.  Never return the relaxed snapshot
+                # as publication evidence: re-read and require the exact head.
+                try:
+                    refreshed = await self._find_existing_pull_request(subject)
+                except DeliveryPublisherPermanentError as exc:
+                    reason = f"Delivery pull-request history is ambiguous: {exc}"
+                    await self._record_terminal_pull_request_conflict(
+                        subject,
+                        fence,
+                        kind="pull_request_history_ambiguous",
+                        reason=reason,
+                    )
+                    raise DeliveryPublisherPermanentError(reason) from exc
+                if refreshed is None:
+                    raise DeliveryPublisherPermanentError(
+                        "Bound pull request did not expose the published head"
+                    )
+                return await self._open_pull_request_or_record_conflict(
+                    subject,
+                    fence,
+                    refreshed,
+                )
             return preexisting_open
         if subject.pr_number is not None or subject.pr_url is not None:
             raise DeliveryPublisherPermanentError(
@@ -2305,6 +2506,7 @@ class GitHubDeliveryPublisher:
 
 
 __all__ = [
+    "DeliveryGitAuthenticationError",
     "DeliveryGitError",
     "DeliveryNonFastForwardError",
     "GhDeliveryGateway",

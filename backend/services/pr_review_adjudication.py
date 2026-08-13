@@ -1857,6 +1857,7 @@ async def _finish_fixed_resolution_gate(
                 current,
                 monitor_run_id=run.id,
                 require_effect_ready=True,
+                require_thread_resolution_gate=True,
             )
         except DeliveryPRPolicyError:
             await db.rollback()

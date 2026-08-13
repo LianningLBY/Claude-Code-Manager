@@ -33,6 +33,7 @@ def test_task_temp_is_short_private_and_generation_unique():
     second = _new_task_temp(turn_generation=2)
     try:
         assert first.path != second.path
+        assert first.path == first.path.resolve(strict=True)
         assert len(os.fsencode(first.path)) <= 60
         assert stat.S_IMODE(first.path.parent.stat().st_mode) == 0o700
         assert stat.S_IMODE(first.path.stat().st_mode) == 0o700

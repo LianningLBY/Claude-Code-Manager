@@ -890,6 +890,11 @@ class InstanceManager:
         # Codex persistent JSON-RPC backend.  Created lazily so Claude-only
         # deployments never start an extra process.
         self._codex_app_server = None
+        # Operator-owned effective value. The DB runtime override is applied
+        # during lifespan startup before Dispatcher admission begins.
+        self._agent_sandbox_unrestricted_enabled = bool(
+            settings.agent_sandbox_unrestricted_enabled
+        )
         # Relogin/delete reserves a canonical CODEX_HOME here as well as in
         # the app-server registry.  The manager-level gate also covers the
         # `codex exec` path when app-server is disabled or falls back.
@@ -972,6 +977,32 @@ class InstanceManager:
     @property
     def pty_mode_enabled(self) -> bool:
         return self._pty_enabled and self._pty_backend is not None
+
+    @property
+    def agent_sandbox_unrestricted_enabled(self) -> bool:
+        return self._agent_sandbox_unrestricted_enabled
+
+    def set_agent_sandbox_unrestricted_enabled(self, enabled: bool) -> bool:
+        """Apply the operator policy to subsequent executable Agent turns."""
+
+        effective = bool(enabled)
+        previous = self._agent_sandbox_unrestricted_enabled
+        self._agent_sandbox_unrestricted_enabled = effective
+        registry = self._codex_app_server
+        if registry is not None:
+            registry.set_sandbox_unrestricted_enabled(effective)
+        if effective and not previous:
+            logger.critical(
+                "Agent sandbox unrestricted mode enabled; subsequent "
+                "Claude Plan/Delivery and executable Codex turns can bypass "
+                "host isolation; Claude Plan retains a read-only tool inventory"
+            )
+        elif previous and not effective:
+            logger.warning(
+                "Agent sandbox unrestricted mode disabled; subsequent turns "
+                "return to CCM permission profiles"
+            )
+        return effective
 
     def is_pty_managed_turn(
         self,
@@ -2436,7 +2467,11 @@ class InstanceManager:
                 raise RuntimeError("Launch admission callback is already running")
             launch_boundary_attempted = True
             selected_actual_transport = actual_transport
-            if provider == "claude" and delivery_task:
+            if (
+                provider == "claude"
+                and delivery_task
+                and not agent_unrestricted_delivery_turn
+            ):
                 from backend.services.task_agent_isolation import (
                     discover_linked_worktree_git_read_boundary,
                 )
@@ -2510,6 +2545,7 @@ class InstanceManager:
         ] = ()
         task_private_tmpdir = None
         delivery_task = False
+        agent_unrestricted_delivery_turn = False
         if execution_mode not in {"sandbox", "unrestricted"}:
             raise LaunchSupersededError("Invalid Task execution mode")
         unrestricted_admin_turn = bool(
@@ -2601,6 +2637,11 @@ class InstanceManager:
                     db,
                     task,
                     cwd=cwd,
+                )
+                agent_unrestricted_delivery_turn = bool(
+                    delivery_task
+                    and self._agent_sandbox_unrestricted_enabled
+                    and provider in {"claude", "codex"}
                 )
                 if delivery_task:
                     if (
@@ -2824,9 +2865,10 @@ class InstanceManager:
                     task_ssh_capabilities = set(
                         task_ssh_runtime.capabilities
                     )
-                    task_ssh_broker_only = (
+                    task_ssh_broker_only = bool(
                         task_ssh_runtime.broker_only
                         and not unrestricted_admin_turn
+                        and not agent_unrestricted_delivery_turn
                     )
                     explicit_git_paths = (
                         ()
@@ -2837,7 +2879,10 @@ class InstanceManager:
                     # provider-account, and scoped runtime credentials. A Task
                     # with grants additionally loses direct network access and
                     # reaches SSH only through the broker MCP.
-                    if not unrestricted_admin_turn:
+                    if not (
+                        unrestricted_admin_turn
+                        or agent_unrestricted_delivery_turn
+                    ):
                         task_ssh_protected_path_values = (
                             await task_ssh_protected_paths(
                                 db,
@@ -2929,6 +2974,12 @@ class InstanceManager:
                     # filesystem/network tools.
                     task_skill_context = ""
                     codex_monitor_enabled = False
+                    if pr_review_task or browser_review_task:
+                        # Dispatcher may have prepared project Git identity or
+                        # credentials before it learned that this is a fixed,
+                        # tool-free review.  Neither review route may inherit
+                        # that process environment.
+                        git_env = None
         if provider == "codex":
             # A Codex turn is not reusable when its process adapter reaches a
             # terminal returncode: the output consumer may still be migrating
@@ -2971,7 +3022,12 @@ class InstanceManager:
                 logger.warning("Could not enforce 0700 on CODEX_HOME %s", config_dir)
             self._config_dirs[instance_id] = config_dir
 
-        if task_id is not None and config_dir and not unrestricted_admin_turn:
+        if (
+            task_id is not None
+            and config_dir
+            and not unrestricted_admin_turn
+            and not agent_unrestricted_delivery_turn
+        ):
             from backend.services.task_ssh_access import (
                 _protected_path_variants,
             )
@@ -2990,7 +3046,14 @@ class InstanceManager:
         mcp_config_path = None
         claude_isolation_settings_path = None
         claude_isolation_tools: tuple[str, ...] | None = None
+        claude_unrestricted_tools: tuple[str, ...] | None = None
         claude_delivery_git_boundary = None
+        if provider == "claude" and agent_unrestricted_delivery_turn:
+            from backend.services.task_agent_isolation import (
+                CLAUDE_DELIVERY_BUILTIN_TOOLS,
+            )
+
+            claude_unrestricted_tools = CLAUDE_DELIVERY_BUILTIN_TOOLS
         if (
             provider == "claude"
             and task_id
@@ -3013,6 +3076,7 @@ class InstanceManager:
             and task_id
             and not pr_review_task
             and not unrestricted_admin_turn
+            and not agent_unrestricted_delivery_turn
         ):
             from backend.services.task_agent_isolation import (
                 CLAUDE_TASK_BUILTIN_TOOLS,
@@ -3645,7 +3709,11 @@ class InstanceManager:
                             task_private_tmpdir.cleanup_if_unbound
                         )
 
-        if provider == "claude" and delivery_task:
+        if (
+            provider == "claude"
+            and delivery_task
+            and not agent_unrestricted_delivery_turn
+        ):
             from backend.services.task_agent_isolation import (
                 discover_linked_worktree_git_read_boundary,
             )
@@ -3667,6 +3735,7 @@ class InstanceManager:
             and self.pty_mode_enabled
             and not pr_review_task
             and not browser_review_task
+            and not agent_unrestricted_delivery_turn
         ):
             return await self._launch_pty(
                 instance_id=instance_id,
@@ -3697,6 +3766,7 @@ class InstanceManager:
                     claude_isolation_settings_path
                 ),
                 claude_isolation_tools=claude_isolation_tools,
+                claude_unrestricted_tools=claude_unrestricted_tools,
                 private_runtime_tempdir=task_private_tmpdir,
                 on_launch_admitted=admit_claude_pty_transport,
             )
@@ -3731,6 +3801,7 @@ class InstanceManager:
             ),
             claude_isolation_settings_path=claude_isolation_settings_path,
             claude_isolation_tools=claude_isolation_tools,
+            claude_unrestricted_tools=claude_unrestricted_tools,
         )
         if provider == "codex":
             logger.info(
@@ -3966,6 +4037,9 @@ class InstanceManager:
                     self._codex_actual_tier_route_for_home
                 ),
                 require_actual_tier_proof=True,
+                sandbox_unrestricted_enabled=(
+                    self._agent_sandbox_unrestricted_enabled
+                ),
             )
         return self._codex_app_server
 
@@ -5429,6 +5503,7 @@ class InstanceManager:
         queue_timestamp: float | None = None,
         claude_isolation_settings_path: Path | None = None,
         claude_isolation_tools: Sequence[str] | None = None,
+        claude_unrestricted_tools: Sequence[str] | None = None,
         private_runtime_tempdir=None,
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
@@ -5440,7 +5515,12 @@ class InstanceManager:
         unchanged.
         """
         isolation_fingerprint = None
-        if claude_isolation_settings_path is not None:
+        if claude_unrestricted_tools is not None:
+            isolation_fingerprint = (
+                "agent-unrestricted-v1",
+                tuple(claude_unrestricted_tools),
+            )
+        elif claude_isolation_settings_path is not None:
             isolation_fingerprint = (
                 self._claude_task_runtime_fingerprint(
                     claude_isolation_settings_path,
@@ -5448,24 +5528,24 @@ class InstanceManager:
                     git_env=git_env,
                 )
             )
-            if resume_session_id:
-                existing_session = (
-                    self._pty_backend._pool._sessions.get(
-                        resume_session_id
-                    )
+        if isolation_fingerprint is not None and resume_session_id:
+            existing_session = (
+                self._pty_backend._pool._sessions.get(
+                    resume_session_id
                 )
-                existing_fingerprint = getattr(
-                    getattr(existing_session, "config", None),
-                    "_ccm_task_isolation_fingerprint",
-                    None,
-                )
-                if (
-                    existing_session is not None
-                    and existing_fingerprint != isolation_fingerprint
-                ):
-                    # A hot process cannot absorb changed CLI settings. Stop
-                    # it while idle and cold-resume the same native session.
-                    await self.release_pty_session(resume_session_id)
+            )
+            existing_fingerprint = getattr(
+                getattr(existing_session, "config", None),
+                "_ccm_task_isolation_fingerprint",
+                None,
+            )
+            if (
+                existing_session is not None
+                and existing_fingerprint != isolation_fingerprint
+            ):
+                # A hot process cannot absorb changed CLI settings. Stop
+                # it while idle and cold-resume the same native session.
+                await self.release_pty_session(resume_session_id)
 
         is_cold_start = (
             resume_session_id
@@ -5523,6 +5603,7 @@ class InstanceManager:
                 wrapper = claude_binary_override
                 if original_build_config is None and (
                     claude_isolation_settings_path is not None
+                    or claude_unrestricted_tools is not None
                     or cloudrouter_api
                     or wrapper is not None
                 ):
@@ -5639,6 +5720,31 @@ class InstanceManager:
                         })
                         cfg.claude_binary = str(task_wrapper)
                         cfg.dangerously_skip_permissions = False
+                        setattr(
+                            cfg,
+                            "_ccm_task_isolation_fingerprint",
+                            isolation_fingerprint,
+                        )
+                    elif claude_unrestricted_tools is not None:
+                        task_wrapper = Path(__file__).with_name(
+                            "task_claude_wrapper.sh"
+                        )
+                        if not (
+                            task_wrapper.is_file()
+                            and os.access(task_wrapper, os.X_OK)
+                        ):
+                            raise RuntimeError(
+                                "Task Claude permission wrapper is unavailable"
+                            )
+                        overrides.update({
+                            "CCM_TASK_CLAUDE_PROFILE": "unrestricted",
+                            "CCM_TASK_CLAUDE_BINARY": str(final_binary),
+                            "CCM_TASK_CLAUDE_TOOLS": ",".join(
+                                claude_unrestricted_tools
+                            ),
+                        })
+                        cfg.claude_binary = str(task_wrapper)
+                        cfg.dangerously_skip_permissions = True
                         setattr(
                             cfg,
                             "_ccm_task_isolation_fingerprint",
@@ -8992,6 +9098,7 @@ class InstanceManager:
         tools_disabled: bool = False,
         claude_isolation_settings_path: Path | None = None,
         claude_isolation_tools: Sequence[str] | None = None,
+        claude_unrestricted_tools: Sequence[str] | None = None,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -9030,6 +9137,19 @@ class InstanceManager:
                     ])
             else:
                 cmd.append("--dangerously-skip-permissions")
+                if claude_unrestricted_tools is not None and not tools_disabled:
+                    selected_claude_tools = tuple(claude_unrestricted_tools)
+                    cmd.extend([
+                        "--setting-sources",
+                        "",
+                        "--strict-mcp-config",
+                        "--disable-slash-commands",
+                        "--no-chrome",
+                        "--tools",
+                        ",".join(selected_claude_tools),
+                        "--allowedTools",
+                        ",".join(selected_claude_tools),
+                    ])
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
             if model:

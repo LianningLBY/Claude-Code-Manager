@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { PrefsMenu } from './PrefsMenu';
+import { api } from '../../api/client';
 
 vi.mock('../../api/client', () => ({
   api: {
@@ -10,6 +11,7 @@ vi.mock('../../api/client', () => ({
       pty_available: true,
       codex_app_server_enabled: true,
       codex_main_mcp_enabled: true,
+      agent_sandbox_unrestricted_enabled: false,
       auto_sort_on_access: true,
       context_compact_threshold: 0.8,
     }),
@@ -160,6 +162,47 @@ describe('PrefsMenu', () => {
       const status = await screen.findByTestId('codex-main-mcp-status');
       expect(status).toHaveTextContent('Codex 主任务 MCP');
       expect(status).toHaveTextContent('已启用');
+    });
+
+    it('requires confirmation and enables unrestricted Agent permissions', async () => {
+      const user = userEvent.setup();
+      const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+      vi.mocked(api.updateRuntimeSettings).mockResolvedValue({
+        use_pty_mode: false,
+        pty_available: true,
+        codex_app_server_enabled: true,
+        codex_main_mcp_enabled: true,
+        agent_sandbox_unrestricted_enabled: true,
+        auto_sort_on_access: true,
+        context_compact_threshold: 0.8,
+      });
+      render(<PrefsMenu isAdmin={true} />);
+
+      await user.click(screen.getByTitle('偏好设置（时区 / 主题）'));
+      await user.click(await screen.findByRole('button', {
+        name: 'Claude / Codex 无限制权限',
+      }));
+
+      expect(confirmSpy).toHaveBeenCalledOnce();
+      expect(api.updateRuntimeSettings).toHaveBeenCalledWith({
+        agent_sandbox_unrestricted_enabled: true,
+      });
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        '新 Codex / Claude Plan/Delivery 回合跳过 CCM 宿主隔离',
+      );
+    });
+
+    it('does not enable unrestricted Agent permissions when cancelled', async () => {
+      const user = userEvent.setup();
+      vi.spyOn(window, 'confirm').mockReturnValue(false);
+      render(<PrefsMenu isAdmin={true} />);
+
+      await user.click(screen.getByTitle('偏好设置（时区 / 主题）'));
+      await user.click(await screen.findByRole('button', {
+        name: 'Claude / Codex 无限制权限',
+      }));
+
+      expect(api.updateRuntimeSettings).not.toHaveBeenCalled();
     });
 
     it('shows logout button', async () => {

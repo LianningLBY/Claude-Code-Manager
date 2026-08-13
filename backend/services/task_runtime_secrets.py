@@ -283,7 +283,16 @@ def private_task_temp_root() -> Path:
             "System temporary directory must be an absolute path"
         )
     # Keep the path comfortably below AF_UNIX and bubblewrap mount limits.
-    return Path(os.path.abspath(base)) / f"ccm-tmp-{os.geteuid()}"
+    # Darwin exposes /tmp as a system symlink to /private/tmp. Return the
+    # canonical base so downstream no-symlink admission compares the exact
+    # path we created instead of rejecting CCM's own scratch directory.
+    try:
+        canonical_base = base.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise TaskRuntimeSecretError(
+            "System temporary directory is unavailable"
+        ) from exc
+    return canonical_base / f"ccm-tmp-{os.geteuid()}"
 
 
 def _open_private_task_temp_root(

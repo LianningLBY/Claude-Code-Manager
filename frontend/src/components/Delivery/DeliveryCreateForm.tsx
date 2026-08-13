@@ -86,6 +86,11 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
         <div><h1 className="text-lg font-semibold text-gray-100">Start a Delivery</h1><p className="mt-1 text-xs leading-5 text-gray-500">Choose a configured Project. Repository access, required checks, review policy and merge behavior come from Projects and PR Monitor.</p></div>
         <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1 text-[11px] text-indigo-300">Plan → Code → Review → PR Gate</span>
       </div>
+      {config?.agent_sandbox_unrestricted_enabled && (
+        <div role="alert" className="mt-4 rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-2 text-xs leading-5 text-red-200">
+          Agent unrestricted permissions are ON. Delivery coding turns can access the host filesystem and network without CCM permission prompts. Plan, Reviewer and Browser capability boundaries remain restricted.
+        </div>
+      )}
       <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(220px,.7fr)_1fr]">
         <ProjectSelect projects={projects.filter((item) => item.show_in_selector)} value={projectId} onChange={(value) => setProjectId(value ? Number(value) : undefined)} placeholder="Select Project" />
         <input aria-label="Delivery title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} required placeholder="What should this Delivery accomplish?" className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />

@@ -13,6 +13,15 @@ class Settings(BaseSettings):
     # Startup/protocol failures automatically fall back to `codex exec`.
     codex_app_server_enabled: bool = True
     codex_app_server_request_timeout: float = 30.0
+    # Boot default for the operator-owned emergency escape hatch. The admin
+    # runtime-settings page persists an optional DB override. When effective,
+    # CCM does not install its request-local filesystem/network permission
+    # profiles for Codex and Claude Plan/Delivery turns. Codex requests
+    # ``danger-full-access``; Claude Plan keeps a read-only tool inventory;
+    # Claude Delivery bypasses prompts with an explicit coding-tool allowlist.
+    # Tool-free PR review and MCP-only Browser Agent capability contracts stay
+    # restricted. Keep false outside explicitly supervised local debugging.
+    agent_sandbox_unrestricted_enabled: bool = False
     # Inject task-scoped required ccm_skills into Codex main tasks on both
     # app-server and the MCP-equivalent exec fallback.  Keep the environment
     # override as an emergency rollback switch.

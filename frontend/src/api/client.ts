@@ -528,6 +528,8 @@ export interface RuntimeSettings {
   codex_main_mcp_enabled?: boolean;
   /** Absent on pre-PR7B2 runtimes; unknown must fail closed for Monitor. */
   codex_monitor_enabled?: boolean;
+  /** Operator switch: executable Agent turns bypass CCM sandbox restrictions. */
+  agent_sandbox_unrestricted_enabled: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;
@@ -736,6 +738,8 @@ export interface SystemConfig {
   /** Server gate defaults on; each ordinary Task still needs explicit policy. */
   auto_capability_enabled?: boolean;
   delivery_loop_enabled?: boolean;
+  /** High-risk deployment switch for executable Claude/Codex Agent turns. */
+  agent_sandbox_unrestricted_enabled?: boolean;
 }
 
 export type AutoCapabilityKey = 'plan' | 'code_review';
@@ -2217,7 +2221,7 @@ export const api = {
 
   // Global Settings
   getRuntimeSettings: () => request<RuntimeSettings>('/api/settings/runtime'),
-  updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
+  updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'agent_sandbox_unrestricted_enabled' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
     request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(data) }),
   getCapacitySettings: () => request<CapacitySettings>('/api/settings/capacity'),
   updateCapacitySettings: (maxConcurrentInstances: number | null) =>

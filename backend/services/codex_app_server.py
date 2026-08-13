@@ -15,11 +15,13 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import secrets
 import shutil
 import signal
 import stat
+import sys
 import time
 import uuid
 from collections import deque
@@ -698,6 +700,118 @@ def _nearest_concrete_parent_permission(
     return nearest_permission
 
 
+def _npm_codex_native_package_name() -> str | None:
+    """Return the optional native package selected by the npm Codex wrapper."""
+
+    if sys.platform == "darwin":
+        platform_name = "darwin"
+    elif sys.platform.startswith("linux"):
+        platform_name = "linux"
+    elif sys.platform in {"win32", "cygwin"}:
+        platform_name = "win32"
+    else:
+        return None
+    machine = platform.machine().strip().lower()
+    if machine in {"arm64", "aarch64"}:
+        architecture = "arm64"
+    elif machine in {"x86_64", "amd64"}:
+        architecture = "x64"
+    else:
+        return None
+    return f"@openai/codex-{platform_name}-{architecture}"
+
+
+def _read_small_package_manifest(path: Path) -> dict[str, Any] | None:
+    try:
+        info = path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_size > 128 * 1024
+        ):
+            return None
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _npm_codex_native_binary(launcher: Path) -> Path | None:
+    """Resolve an npm ``bin/codex.js`` launcher to its bundled native binary.
+
+    A request-local permission profile can allow-list a standalone binary and
+    its adjacent code-mode host, but copying only the JavaScript npm launcher
+    detaches it from ``node_modules``.  Resolve the optional package through
+    version-matched manifests instead of parsing or executing wrapper code.
+    """
+
+    if launcher.name != "codex.js" or launcher.parent.name != "bin":
+        return None
+    package_root = launcher.parent.parent
+    launcher_manifest = _read_small_package_manifest(
+        package_root / "package.json"
+    )
+    native_package = _npm_codex_native_package_name()
+    if (
+        launcher_manifest is None
+        or launcher_manifest.get("name") != "@openai/codex"
+        or not isinstance(launcher_manifest.get("version"), str)
+        or native_package is None
+    ):
+        return None
+    scope, package = native_package.split("/", 1)
+    native_root = package_root / "node_modules" / scope / package
+    native_manifest = _read_small_package_manifest(native_root / "package.json")
+    if native_manifest is None:
+        return None
+    native_version = native_manifest.get("version")
+    optional_dependencies = launcher_manifest.get("optionalDependencies")
+    optional_alias = (
+        optional_dependencies.get(native_package)
+        if isinstance(optional_dependencies, dict)
+        else None
+    )
+    # The 0.147 npm wrapper installs platform packages through npm aliases:
+    # the directory is ``@openai/codex-darwin-arm64`` while its manifest is
+    # still named ``@openai/codex`` with a platform-suffixed version. Preserve
+    # compatibility with older direct-name optional packages as well, but in
+    # both cases require the wrapper manifest to bind the exact native build.
+    aliased_release = bool(
+        native_manifest.get("name") == "@openai/codex"
+        and isinstance(native_version, str)
+        and native_version.startswith(f"{launcher_manifest['version']}-")
+        and optional_alias == f"npm:@openai/codex@{native_version}"
+    )
+    direct_release = bool(
+        native_manifest.get("name") == native_package
+        and native_version == launcher_manifest["version"]
+        and optional_alias in {None, native_version}
+    )
+    if not (aliased_release or direct_release):
+        return None
+    executable_name = "codex.exe" if sys.platform == "win32" else "codex"
+    try:
+        candidates = [
+            candidate
+            for candidate in (native_root / "vendor").glob(
+                f"*/bin/{executable_name}"
+            )
+            if not candidate.is_symlink()
+            and candidate.is_file()
+            and os.access(candidate, os.X_OK)
+        ]
+    except OSError:
+        return None
+    if len(candidates) != 1:
+        return None
+    try:
+        resolved = candidates[0].resolve(strict=True)
+        resolved.relative_to(native_root.resolve(strict=True))
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
 def _codex_runtime_read_paths(
     binary: str,
     *,
@@ -718,6 +832,13 @@ def _codex_runtime_read_paths(
         source_info = resolved.stat()
     except (OSError, RuntimeError):
         return ()
+    native_binary = _npm_codex_native_binary(resolved)
+    if native_binary is not None:
+        try:
+            resolved = native_binary
+            source_info = resolved.stat()
+        except OSError:
+            return ()
     if (
         not stat.S_ISREG(source_info.st_mode)
         or not os.access(resolved, os.X_OK)
@@ -1173,11 +1294,39 @@ def _harden_ambient_shell_environment_policy(
     """
 
     ambient = effective_config.get("shell_environment_policy")
-    if not isinstance(ambient, dict) or "filters" not in ambient:
+    if not isinstance(ambient, dict):
         return
     request = thread_config.get("shell_environment_policy")
     if not isinstance(request, dict):
         raise ValueError("isolated shell environment policy is malformed")
+
+    # ``set`` is deep-merged by Codex.  Merely using ``inherit = none`` does
+    # not remove variables injected by the user's ambient Codex config, so
+    # explicitly shadow every ambient-only key with an empty value.  This
+    # preserves CCM's exact task-local values while proving that credentials
+    # and other ambient values cannot reach the isolated model shell.
+    ambient_set = ambient.get("set")
+    if ambient_set is not None:
+        if not isinstance(ambient_set, dict) or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, str)
+            for name, value in ambient_set.items()
+        ):
+            raise ValueError("ambient shell environment set is malformed")
+        request_set = request.get("set")
+        if not isinstance(request_set, dict) or any(
+            not isinstance(name, str)
+            or not name
+            or not isinstance(value, str)
+            for name, value in request_set.items()
+        ):
+            raise ValueError("isolated shell environment set is malformed")
+        for name in ambient_set:
+            request_set.setdefault(name, "")
+
+    if "filters" not in ambient:
+        return
 
     ambient_filters = ambient.get("filters")
     if ambient_filters is None:
@@ -1209,6 +1358,74 @@ def _harden_ambient_shell_environment_policy(
             pattern: action for pattern in patterns
         })
     request["filters"] = canonical_filters
+
+
+def _harden_ambient_hook_state(
+    effective_config: dict[str, Any],
+    thread_config: dict[str, Any],
+) -> None:
+    """Neutralize Codex's non-executable persisted hook trust metadata.
+
+    Codex 0.147 exposes hashes from the desktop hook trust UI beneath
+    ``hooks.state``.  That table is deep-merged even when the hooks feature is
+    disabled.  Emptying each known hash prevents ambient trust from surviving
+    while still rejecting any executable or future hook configuration.
+    """
+
+    ambient = effective_config.get("hooks")
+    if ambient is None or ambient == {}:
+        return
+    hook_event_keys = frozenset({
+        "PermissionRequest",
+        "PostCompact",
+        "PostToolUse",
+        "PreCompact",
+        "PreToolUse",
+        "SessionEnd",
+        "SessionStart",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "UserPromptSubmit",
+    })
+    if not isinstance(ambient, dict) or not set(ambient) <= (
+        hook_event_keys | {"state"}
+    ):
+        raise ValueError("ambient hooks include executable configuration")
+
+    request_hooks = thread_config.setdefault("hooks", {})
+    if not isinstance(request_hooks, dict):
+        raise ValueError("isolated hooks configuration is malformed")
+    for event in set(ambient) & hook_event_keys:
+        if ambient[event] != []:
+            raise ValueError("ambient hooks include active event handlers")
+        request_event = request_hooks.setdefault(event, [])
+        if request_event != []:
+            raise ValueError("isolated hook event override is malformed")
+
+    ambient_state = ambient.get("state")
+    if ambient_state is None or ambient_state == {}:
+        return
+    if not isinstance(ambient_state, dict):
+        raise ValueError("ambient hook trust state is malformed")
+
+    neutral_state: dict[str, dict[str, str]] = {}
+    for source, state in ambient_state.items():
+        if (
+            not isinstance(source, str)
+            or not source
+            or not isinstance(state, dict)
+            or set(state) != {"trusted_hash"}
+            or not isinstance(state.get("trusted_hash"), str)
+        ):
+            raise ValueError("ambient hook trust state is malformed")
+        neutral_state[source] = {"trusted_hash": ""}
+
+    request_state = request_hooks.setdefault("state", {})
+    if not isinstance(request_state, dict):
+        raise ValueError("isolated hook trust state is malformed")
+    for source, state in neutral_state.items():
+        request_state[source] = state
 
 
 def _harden_ambient_feature_config(
@@ -1350,13 +1567,13 @@ def _audit_task_ssh_thread_response(
         raise ValueError("Task isolation resolved an unexpected sandbox policy")
     if sandbox_mode == "read-only":
         writable_roots = sandbox.get("writableRoots")
+        expected_scratch = _canonical_path(private_tmpdir)
         if not isinstance(writable_roots, list) or any(
-            not isinstance(path, str) for path in writable_roots
+            not isinstance(value, str) for value in writable_roots
         ):
             raise ValueError("read-only Task writable roots are malformed")
-        expected_scratch = _canonical_path(private_tmpdir)
         if {
-            _canonical_path(path) for path in writable_roots
+            _canonical_path(value) for value in writable_roots
         } != {expected_scratch}:
             raise ValueError("read-only Task admitted an unexpected writable root")
         if (
@@ -4127,6 +4344,7 @@ class CodexAppServer:
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         mcp_only: bool = False,
+        sandbox_unrestricted_enabled: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -4138,6 +4356,62 @@ class CodexAppServer:
         managed_runtime_prestarted = False
         managed_network_process: asyncio.subprocess.Process | None = None
         isolated_process: asyncio.subprocess.Process | None = None
+        if sandbox_mode not in {
+            "danger-full-access",
+            "workspace-write",
+            "read-only",
+        }:
+            raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
+        if tools_disabled and mcp_only:
+            raise CodexRequiredMcpPreTurnError(
+                "Codex turn cannot be both tool-free and MCP-only"
+            )
+        restricted_tools = tools_disabled or mcp_only
+        if sandbox_unrestricted_enabled and not restricted_tools:
+            requested_sandbox_mode = sandbox_mode
+            requested_filesystem_isolation = bool(task_ssh_protected_paths)
+            requested_network_isolation = bool(
+                network_isolated
+                or task_ssh_disable_network
+                or task_managed_network_proxy
+            )
+            # This is deliberately normalized before any managed-network
+            # version proof or permission-profile construction.  Leaving even
+            # one of the old boundary inputs populated would either rebuild a
+            # named profile later or make the supposedly unrestricted request
+            # fail its isolated admission checks.
+            sandbox_mode = "danger-full-access"
+            task_ssh_protected_paths = ()
+            task_ssh_allowed_read_paths = ()
+            task_git_read_paths = ()
+            task_git_boundary_fingerprint = ()
+            task_private_tmpdir = None
+            task_ssh_disable_network = False
+            task_managed_network_proxy = False
+            network_isolated = False
+            disable_autonomous_features = False
+            logger.critical(
+                "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted an unrestricted "
+                "Codex turn task=%s requested_mode=%s filesystem_isolated=%s "
+                "network_isolated=%s",
+                task_id,
+                requested_sandbox_mode,
+                requested_filesystem_isolation,
+                requested_network_isolation,
+            )
+        elif sandbox_unrestricted_enabled:
+            # Tool-free and MCP-only are capability protocols rather than
+            # ordinary executable sandboxes. Expanding either would grant a
+            # PR reviewer or untrusted Browser child a new tool surface and
+            # break the evidence contract, so the deployment switch does not
+            # rewrite them.
+            logger.warning(
+                "AGENT_SANDBOX_UNRESTRICTED_ENABLED retained capability-"
+                "restricted Codex turn task=%s tools_disabled=%s mcp_only=%s",
+                task_id,
+                tools_disabled,
+                mcp_only,
+            )
         if task_managed_network_proxy:
             # ``initialize`` is the version proof for this exact transport
             # generation. Complete it before constructing the network profile;
@@ -4178,17 +4452,6 @@ class CodexAppServer:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex managed-network runtime generation changed " + stage
                 )
-        if sandbox_mode not in {
-            "danger-full-access",
-            "workspace-write",
-            "read-only",
-        }:
-            raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
-        if tools_disabled and mcp_only:
-            raise CodexRequiredMcpPreTurnError(
-                "Codex turn cannot be both tool-free and MCP-only"
-            )
-        restricted_tools = tools_disabled or mcp_only
         if tools_disabled:
             if os.name != "posix":
                 raise CodexRequiredMcpPreTurnError(
@@ -4594,6 +4857,7 @@ class CodexAppServer:
                 output_schema=output_schema,
                 tools_disabled=tools_disabled,
                 mcp_only=mcp_only,
+                sandbox_unrestricted_enabled=sandbox_unrestricted_enabled,
                 on_thread_started=on_thread_started,
                 on_turn_prepared=on_turn_prepared,
                 _isolated_admission_retry_count=(
@@ -5440,6 +5704,10 @@ class CodexAppServer:
                     isolated_ambient_effective_config,
                     thread_config,
                 )
+                _harden_ambient_hook_state(
+                    isolated_ambient_effective_config,
+                    thread_config,
+                )
                 _audit_ambient_isolation_merge_inputs(
                     isolated_ambient_effective_config,
                     thread_config,
@@ -5450,7 +5718,7 @@ class CodexAppServer:
             except (TypeError, ValueError) as exc:
                 raise CodexRequiredMcpPreTurnError(
                     "Codex isolated ambient configuration could not be "
-                    "safely overridden"
+                    f"safely overridden: {exc}"
                 ) from exc
             isolated_disabled_features = (
                 isolated_disabled_features
@@ -8284,12 +8552,22 @@ class CodexAppServerRegistry:
             Callable[[str], CodexTierProxyRoute | None] | None
         ) = None,
         require_actual_tier_proof: bool = False,
+        sandbox_unrestricted_enabled: bool = False,
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
         self._env_remove_resolver = env_remove_resolver
         self._actual_tier_route_resolver = actual_tier_route_resolver
         self._require_actual_tier_proof = bool(require_actual_tier_proof)
+        self._sandbox_unrestricted_enabled = bool(
+            sandbox_unrestricted_enabled
+        )
+        if self._sandbox_unrestricted_enabled:
+            logger.critical(
+                "AGENT_SANDBOX_UNRESTRICTED_ENABLED is active for this "
+                "app-server registry; executable Codex turns can access the "
+                "host filesystem and network without CCM permission profiles"
+            )
         self._servers: dict[str, CodexAppServer] = {}
         self._thread_owners: dict[str, str] = {}
         self._draining: set[str] = set()
@@ -8321,6 +8599,28 @@ class CodexAppServerRegistry:
         # conclude that shutting down the same server generation is safe.
         self._abort_locks: dict[str, asyncio.Lock] = {}
 
+    @property
+    def sandbox_unrestricted_enabled(self) -> bool:
+        return self._sandbox_unrestricted_enabled
+
+    def set_sandbox_unrestricted_enabled(self, enabled: bool) -> bool:
+        """Change the operator-owned policy used by subsequent turn starts."""
+
+        effective = bool(enabled)
+        previous = self._sandbox_unrestricted_enabled
+        self._sandbox_unrestricted_enabled = effective
+        if effective and not previous:
+            logger.critical(
+                "Codex app-server sandbox override enabled at runtime; "
+                "subsequent executable turns use danger-full-access"
+            )
+        elif previous and not effective:
+            logger.warning(
+                "Codex app-server sandbox override disabled at runtime; "
+                "subsequent turns use their CCM permission profiles"
+            )
+        return effective
+
     def _new_server(self, home: str) -> CodexAppServer:
         server_kwargs: dict[str, Any] = {}
         if self._env_remove_resolver is not None:
@@ -8345,6 +8645,11 @@ class CodexAppServerRegistry:
         **kwargs: Any,
     ) -> tuple[CodexTurnProcess, str]:
         home = normalize_codex_home(codex_home)
+        # Registry configuration is deployment-owned. Individual Tasks and
+        # callers cannot weaken or re-enable the sandbox independently.
+        kwargs["sandbox_unrestricted_enabled"] = (
+            self._sandbox_unrestricted_enabled
+        )
         resume_session_id = kwargs.get("resume_session_id")
         isolated_turn_lock: asyncio.Lock | None = None
         isolated_turn_lock_transferred = False

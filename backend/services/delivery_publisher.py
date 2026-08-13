@@ -101,13 +101,6 @@ class DeliveryNonFastForwardError(DeliveryGitError):
 
 
 @dataclass(frozen=True, slots=True)
-class PushResult:
-    """Outcome of push_exact — records whether code was pushed to a fork."""
-    pushed_to_fork: bool = False
-    fork_full_name: str | None = None  # e.g. "myuser/target-repo"
-
-
-@dataclass(frozen=True, slots=True)
 class _PublishingSubject:
     run_id: int
     project_id: int
@@ -173,7 +166,7 @@ class DeliveryGitGateway(Protocol):
         branch: str,
     ) -> str | None: ...
 
-    async def push_exact(self, subject: _PublishingSubject) -> PushResult: ...
+    async def push_exact(self, subject: _PublishingSubject) -> None: ...
 
 
 class DeliveryGitHubGateway(Protocol):
@@ -200,7 +193,6 @@ class DeliveryGitHubGateway(Protocol):
         body: str,
         head_branch: str,
         base_branch: str,
-        fork_full_name: str | None = None,
     ) -> dict: ...
 
 
@@ -316,6 +308,21 @@ def _is_authentication_failure(diagnostic: str) -> bool:
             "unable to get password",
             "no oauth token",
             "not logged into any github hosts",
+        )
+    )
+
+
+def _is_write_permission_failure(diagnostic: str) -> bool:
+    """Return only for a remote refusal which proves no ref update occurred."""
+
+    return any(
+        marker in diagnostic
+        for marker in (
+            "write access to repository not granted",
+            "permission to ",
+            "the requested url returned error: 403",
+            "remote: permission denied",
+            "remote: access denied",
         )
     )
 
@@ -638,7 +645,7 @@ class GitDeliveryGateway:
             raise DeliveryGitError("Remote returned a malformed ref")
         return sha
 
-    async def push_exact(self, subject: _PublishingSubject) -> PushResult:
+    async def push_exact(self, subject: _PublishingSubject) -> None:
         _fetch_url, push_url = await self._validated_remote_urls(subject)
         refspec = f"{subject.head_sha}:refs/heads/{subject.delivery_branch}"
         returncode, stdout, stderr = await _run_git(
@@ -652,7 +659,7 @@ class GitDeliveryGateway:
             refspec,
         )
         if returncode == 0:
-            return PushResult()
+            return
         diagnostic = (stdout + b"\n" + stderr).decode(
             "utf-8", errors="replace"
         ).lower()
@@ -672,70 +679,17 @@ class GitDeliveryGateway:
             raise DeliveryNonFastForwardError(
                 "Remote delivery branch rejected the non-force update"
             )
-        # Check for permission denied — try fork fallback
-        if any(
-            marker in diagnostic
-            for marker in (
-                "permission",
-                "denied",
-                "403",
-                "could not read from remote",
-                "unable to access",
+        if _is_write_permission_failure(diagnostic):
+            # Delivery has no durable field for a cross-repository head route.
+            # Treat a proven upstream refusal as a no-effect preflight failure
+            # instead of pushing to an unrecorded fork which cannot be recovered
+            # safely after a crash or across a later repair cycle.
+            raise DeliveryGitAuthenticationError(
+                "GitHub write permission is unavailable for Delivery push"
             )
-        ):
-            return await self._push_via_fork(subject)
         # Do not include stderr: remote URLs and credential helpers may expose
         # sensitive material in diagnostics.
         raise DeliveryGitError("Git push did not report success")
-
-    async def _push_via_fork(self, subject: _PublishingSubject) -> PushResult:
-        """Fork the repo and push to the fork when direct push is denied."""
-        import logging
-        logger = logging.getLogger(__name__)
-
-        # 1. Ensure fork exists (gh repo fork is idempotent)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "gh", "repo", "fork", subject.repo_full_name,
-                "--clone=false", "--default-branch-only",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(proc.communicate(), timeout=60)
-        except (OSError, asyncio.TimeoutError) as exc:
-            raise DeliveryGitError(f"Failed to fork repository: {exc}") from exc
-
-        # 2. Get current user and fork URL
-        user_info = await _gh_api_value("user", max_output_bytes=4096)
-        if not isinstance(user_info, dict) or "login" not in user_info:
-            raise DeliveryGitError("Cannot determine GitHub username for fork")
-        fork_owner = user_info["login"]
-        repo_name = subject.repo_full_name.split("/")[-1]
-        fork_full_name = f"{fork_owner}/{repo_name}"
-        fork_url = f"https://github.com/{fork_full_name}.git"
-
-        logger.info(
-            "Delivery push denied on %s, using fork %s",
-            subject.repo_full_name,
-            fork_full_name,
-        )
-
-        # 3. Push to fork
-        refspec = f"{subject.head_sha}:refs/heads/{subject.delivery_branch}"
-        returncode, stdout, stderr = await _run_git(
-            subject.workspace_path,
-            *_github_credential_config(fork_url),
-            "push",
-            "--porcelain",
-            "--no-verify",
-            fork_url,
-            refspec,
-        )
-        if returncode != 0:
-            raise DeliveryGitError("Git push to fork did not report success")
-
-        return PushResult(pushed_to_fork=True, fork_full_name=fork_full_name)
 
 
 class GhDeliveryGateway:
@@ -788,20 +742,14 @@ class GhDeliveryGateway:
         body: str,
         head_branch: str,
         base_branch: str,
-        fork_full_name: str | None = None,
     ) -> dict:
-        # Cross-repo PR: head must be "fork_owner:branch"
-        head_ref = head_branch
-        if fork_full_name:
-            fork_owner = fork_full_name.split("/")[0]
-            head_ref = f"{fork_owner}:{head_branch}"
         return await _gh_api_json(
             f"repos/{repo_full_name}/pulls",
             method="POST",
             payload={
                 "title": title,
                 "body": body,
-                "head": head_ref,
+                "head": head_branch,
                 "base": base_branch,
                 "maintainer_can_modify": True,
             },
@@ -1178,8 +1126,7 @@ class GitHubDeliveryPublisher:
             or not isinstance(base_repo_name, str)
             or base_repo_name.lower() != subject.repo_full_name.lower()
             or not isinstance(head_repo_name, str)
-            # Allow fork PRs: head repo may differ from base repo
-            # (e.g. fork_owner/repo vs upstream_owner/repo)
+            or head_repo_name.lower() != subject.repo_full_name.lower()
         ):
             raise DeliveryPublisherPermanentError(
                 "Pull request does not match the exact Delivery subject"
@@ -1667,12 +1614,11 @@ class GitHubDeliveryPublisher:
             raise DeliveryPublisherNoEffectPreflightError(
                 "GitHub credentials are unavailable before Delivery publication"
             ) from exc
-        push_result = PushResult()  # default: no fork
         if remote_head != subject.head_sha:
             await self._assert_subject(subject, require_remote_head=False)
             await self._assert_effect_fence(subject, fence)
             try:
-                push_result = await self._git.push_exact(subject)
+                await self._git.push_exact(subject)
             except DeliveryGitAuthenticationError as exc:
                 raise DeliveryPublisherNoEffectPreflightError(
                     "GitHub credentials are unavailable for Delivery publication"
@@ -1759,7 +1705,6 @@ class GitHubDeliveryPublisher:
                 body=self._pull_request_body(subject),
                 head_branch=subject.delivery_branch,
                 base_branch=subject.base_branch,
-                fork_full_name=push_result.fork_full_name,
             )
             created_snapshot = self._validate_pull_request_snapshot(subject, created)
             published = await self._open_pull_request_or_record_conflict(

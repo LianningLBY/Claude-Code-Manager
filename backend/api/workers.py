@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.config import settings
 from backend.database import get_db
 from backend.models.worker import Worker
+from backend.schemas.global_settings import RuntimeSettingsUpdate
 from backend.schemas.worker import WorkerCreate, WorkerLogsResponse, WorkerResponse
 from backend.services.worker_provisioner import worker_control_plane_enabled
 
@@ -1903,12 +1904,31 @@ async def get_worker_runtime_settings(worker_id: int, request: Request, db: Asyn
 
 
 @router.put("/{worker_id}/settings/runtime")
-async def update_worker_runtime_settings(worker_id: int, request: Request, body: dict, db: AsyncSession = Depends(get_db)):
+async def update_worker_runtime_settings(
+    worker_id: int,
+    request: Request,
+    body: RuntimeSettingsUpdate,
+    db: AsyncSession = Depends(get_db),
+):
     worker = await db.get(Worker, worker_id)
     if not worker:
         raise HTTPException(404, "Worker not found")
     from backend.api.deps import require_worker_access as _rwa
     await _rwa(request, worker)
+    payload = body.model_dump(exclude_unset=True)
+    # Worker owners may keep using the historical low-risk runtime controls,
+    # but must not inherit future Manager-wide switches merely because the
+    # shared response/update schema grows.  Anything outside this explicit
+    # owner allowlist requires an administrator before the deployment bearer
+    # token forwards it to the Worker.
+    owner_fields = {
+        "use_pty_mode",
+        "auto_sort_on_access",
+        "context_compact_threshold",
+    }
+    if set(payload) - owner_fields:
+        from backend.api.deps import require_admin
+        require_admin(request)
     if worker.status != "ready" or not worker.private_ip:
         raise HTTPException(409, f"Worker 未就绪（{worker.status}）")
     r = await _worker_http_request(
@@ -1916,7 +1936,7 @@ async def update_worker_runtime_settings(worker_id: int, request: Request, body:
         "PUT",
         "/api/settings/runtime",
         timeout=10,
-        payload=body,
+        payload=payload,
     )
     return _worker_response_json(r)
 

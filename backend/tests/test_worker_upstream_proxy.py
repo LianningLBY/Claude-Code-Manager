@@ -7,18 +7,25 @@ credentials and failures separate from the browser's Manager authentication.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from fastapi import HTTPException
 
 import backend.api.workers as workers_api
 from backend.models.worker import Worker
+from backend.schemas.global_settings import RuntimeSettingsUpdate
 
 
 pytestmark = pytest.mark.usefixtures("worker_control_plane_auth")
 
 
-async def _insert_ready_worker(session_factory) -> Worker:
+async def _insert_ready_worker(
+    session_factory,
+    *,
+    owner_user_id: int | None = None,
+) -> Worker:
     async with session_factory() as db:
         worker = Worker(
             name="proxy-worker",
@@ -29,6 +36,7 @@ async def _insert_ready_worker(session_factory) -> Worker:
             ssh_key_path="/tmp/test-worker-key",
             auth_token="internal-worker-token",
             accounts=[],
+            owner_user_id=owner_user_id,
         )
         db.add(worker)
         await db.commit()
@@ -90,6 +98,92 @@ def _install_worker_transport(monkeypatch, outcomes):
 
     monkeypatch.setattr(workers_api.httpx, "AsyncClient", FakeAsyncClient)
     return requests, pending
+
+
+def _request(*, user_id: int, role: str):
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=user_id,
+            user_role=role,
+            auth_type="jwt",
+        )
+    )
+
+
+@pytest.mark.parametrize("value", [True, False, None])
+async def test_worker_owner_cannot_change_global_unrestricted_sandbox(
+    session_factory,
+    monkeypatch,
+    value,
+):
+    worker = await _insert_ready_worker(session_factory, owner_user_id=42)
+    requests, _ = _install_worker_transport(monkeypatch, [])
+
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as exc_info:
+            await workers_api.update_worker_runtime_settings(
+                worker.id,
+                _request(user_id=42, role="member"),
+                RuntimeSettingsUpdate(
+                    agent_sandbox_unrestricted_enabled=value,
+                ),
+                db,
+            )
+
+    assert exc_info.value.status_code == 403
+    assert requests == []
+
+
+async def test_worker_owner_can_update_non_privileged_runtime_setting(
+    session_factory,
+    monkeypatch,
+):
+    worker = await _insert_ready_worker(session_factory, owner_user_id=42)
+    response_body = {"use_pty_mode": False}
+    requests, pending = _install_worker_transport(
+        monkeypatch,
+        [_FakeResponse(200, response_body)],
+    )
+
+    async with session_factory() as db:
+        response = await workers_api.update_worker_runtime_settings(
+            worker.id,
+            _request(user_id=42, role="member"),
+            RuntimeSettingsUpdate(use_pty_mode=False),
+            db,
+        )
+
+    assert response == response_body
+    assert requests[0][2]["json"] == {"use_pty_mode": False}
+    assert not pending
+
+
+async def test_admin_can_enable_worker_global_unrestricted_sandbox(
+    session_factory,
+    monkeypatch,
+):
+    worker = await _insert_ready_worker(session_factory, owner_user_id=42)
+    response_body = {"agent_sandbox_unrestricted_enabled": True}
+    requests, pending = _install_worker_transport(
+        monkeypatch,
+        [_FakeResponse(200, response_body)],
+    )
+
+    async with session_factory() as db:
+        response = await workers_api.update_worker_runtime_settings(
+            worker.id,
+            _request(user_id=7, role="admin"),
+            RuntimeSettingsUpdate(
+                agent_sandbox_unrestricted_enabled=True,
+            ),
+            db,
+        )
+
+    assert response == response_body
+    assert requests[0][2]["json"] == {
+        "agent_sandbox_unrestricted_enabled": True,
+    }
+    assert not pending
 
 
 @pytest.mark.parametrize("remote_status", [401, 403])

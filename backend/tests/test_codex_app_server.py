@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import signal
@@ -35,8 +36,12 @@ from backend.services.codex_app_server import (
     CodexTurnProcess,
     _APP_SERVER_STREAM_LIMIT,
     _audit_isolated_request_config,
+    _audit_network_isolated_thread_response,
+    _audit_task_ssh_thread_response,
     _codex_runtime_read_paths,
+    _npm_codex_native_package_name,
     _format_process_exit,
+    _harden_ambient_hook_state,
     _harden_ambient_shell_environment_policy,
     _network_isolated_permission_config,
     _finalize_codex_log_db_rotation,
@@ -286,6 +291,10 @@ def test_harden_ambient_shell_environment_policy_uses_canonical_filters():
             "filters": {"AMBIENT_*": "include"},
             "exclude": ["AMBIENT_*"],
             "include_only": [],
+            "set": {
+                "GH_TOKEN": "ambient-secret",
+                "CCM_EXACT": "ambient-value",
+            },
         },
     }
     thread_config = {
@@ -293,7 +302,7 @@ def test_harden_ambient_shell_environment_policy_uses_canonical_filters():
             "inherit": "none",
             "exclude": ["SECRET_*", "TOKEN_*"],
             "include_only": [],
-            "set": {},
+            "set": {"CCM_EXACT": "task-value"},
         },
     }
 
@@ -308,10 +317,18 @@ def test_harden_ambient_shell_environment_policy_uses_canonical_filters():
         "SECRET_*": "exclude",
         "TOKEN_*": "exclude",
     }
+    assert policy["set"] == {
+        "GH_TOKEN": "",
+        "CCM_EXACT": "task-value",
+    }
     assert "exclude" not in policy
     assert "include_only" not in policy
     assert effective_config["shell_environment_policy"] == {
         "filters": {"AMBIENT_*": "include"},
+        "set": {
+            "GH_TOKEN": "ambient-secret",
+            "CCM_EXACT": "ambient-value",
+        },
     }
 
 
@@ -332,6 +349,55 @@ def test_harden_ambient_shell_environment_policy_preserves_legacy_runtime():
         "exclude": ["SECRET_*"],
         "include_only": [],
     }
+
+
+def test_harden_ambient_hook_state_clears_only_persisted_trust_hashes():
+    effective_config = {
+        "hooks": {
+            "PreToolUse": [],
+            "SessionStart": [],
+            "state": {
+                "/Users/operator/.codex/hooks.json:pre_tool_use:0:0": {
+                    "trusted_hash": "ambient-trusted-hash",
+                },
+            },
+        },
+    }
+    source = "/Users/operator/.codex/hooks.json:pre_tool_use:0:0"
+    thread_config = {
+        "hooks": {
+            "state": {
+                source: {"trusted_hash": "request-trusted-hash"},
+            },
+        },
+    }
+
+    _harden_ambient_hook_state(effective_config, thread_config)
+
+    assert thread_config == {
+        "hooks": {
+            "PreToolUse": [],
+            "SessionStart": [],
+            "state": {
+                "/Users/operator/.codex/hooks.json:pre_tool_use:0:0": {
+                    "trusted_hash": "",
+                },
+            },
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "hooks",
+    [
+        {"after_turn": ["/tmp/attacker"]},
+        {"PreToolUse": [{"command": "/tmp/attacker"}]},
+        {"state": {"source": {"trusted_hash": "hash", "enabled": True}}},
+    ],
+)
+def test_harden_ambient_hook_state_rejects_capability_config(hooks):
+    with pytest.raises(ValueError, match="ambient hook"):
+        _harden_ambient_hook_state({"hooks": hooks}, {})
 
 
 @pytest.mark.parametrize(
@@ -445,12 +511,74 @@ def _task_isolated_thread_response(
     return response
 
 
+def test_read_only_task_accepts_only_known_codex_0147_sandbox_summary(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    response = _task_isolated_thread_response(
+        "thread-read-only-0147",
+        permission_profile="ccm-task-exact",
+        sandbox_type="workspaceWrite",
+        writable_roots=[str(scratch)],
+    )
+
+    _audit_task_ssh_thread_response(
+        response,
+        permission_profile_id="ccm-task-exact",
+        disable_network=True,
+        managed_network_proxy=False,
+        sandbox_mode="read-only",
+        cwd=str(workspace),
+        private_tmpdir=str(scratch),
+    )
+    response["sandbox"]["writableRoots"] = [str(tmp_path / "other")]
+    with pytest.raises(ValueError, match="unexpected writable root"):
+        _audit_task_ssh_thread_response(
+            response,
+            permission_profile_id="ccm-task-exact",
+            disable_network=True,
+            managed_network_proxy=False,
+            sandbox_mode="read-only",
+            cwd=str(workspace),
+            private_tmpdir=str(scratch),
+        )
+
+
+def test_delivery_accepts_only_exact_private_tmp_writable_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    scratch = tmp_path / "scratch"
+    workspace.mkdir()
+    scratch.mkdir()
+    response = _network_isolated_thread_response(
+        str(workspace),
+        permission_profile="ccm-delivery-exact",
+        writable_roots=[str(scratch)],
+    )
+
+    _audit_network_isolated_thread_response(
+        response,
+        cwd=str(workspace),
+        permission_profile_id="ccm-delivery-exact",
+        private_tmpdir=str(scratch),
+    )
+    response["sandbox"]["writableRoots"] = [str(tmp_path / "other")]
+    with pytest.raises(ValueError, match="outside the worktree"):
+        _audit_network_isolated_thread_response(
+            response,
+            cwd=str(workspace),
+            permission_profile_id="ccm-delivery-exact",
+            private_tmpdir=str(scratch),
+        )
+
+
 async def _start_tool_free_test_turn(
     server: CodexAppServer,
     *,
     thread_id: str = "thread-tool-free-test",
     turn_id: str = "turn-tool-free-test",
     resume_session_id: str | None = None,
+    sandbox_unrestricted_enabled: bool = False,
 ) -> tuple[CodexTurnProcess, str]:
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
@@ -480,6 +608,7 @@ async def _start_tool_free_test_turn(
         sandbox_mode="read-only",
         disable_autonomous_features=True,
         tools_disabled=True,
+        sandbox_unrestricted_enabled=sandbox_unrestricted_enabled,
     )
 
 
@@ -689,6 +818,66 @@ def test_codex_runtime_read_paths_supports_release_without_code_mode_host(
 
     assert len(runtime_paths) == 1
     assert Path(runtime_paths[0]).samefile(release)
+
+
+def test_codex_runtime_read_paths_resolves_npm_wrapper_native_package(tmp_path):
+    native_package = _npm_codex_native_package_name()
+    if native_package is None:
+        pytest.skip("platform has no known Codex npm native package")
+    package_root = tmp_path / "lib" / "node_modules" / "@openai" / "codex"
+    launcher = package_root / "bin" / "codex.js"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    (package_root / "package.json").write_text(
+        json.dumps({
+            "name": "@openai/codex",
+            "version": "0.147.0",
+            "optionalDependencies": {
+                native_package: (
+                    "npm:@openai/codex@0.147.0-"
+                    + native_package.removeprefix("@openai/codex-")
+                ),
+            },
+        }),
+        encoding="utf-8",
+    )
+    scope, package = native_package.split("/", 1)
+    native_root = package_root / "node_modules" / scope / package
+    native_root.mkdir(parents=True)
+    (native_root / "package.json").write_text(
+        json.dumps({
+            "name": "@openai/codex",
+            "version": (
+                "0.147.0-"
+                + native_package.removeprefix("@openai/codex-")
+            ),
+        }),
+        encoding="utf-8",
+    )
+    executable_name = "codex.exe" if sys.platform == "win32" else "codex"
+    bin_dir = native_root / "vendor" / "test-target" / "bin"
+    bin_dir.mkdir(parents=True)
+    native = bin_dir / executable_name
+    native.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    native.chmod(0o755)
+    code_mode_host = bin_dir / (
+        "codex-code-mode-host.exe"
+        if sys.platform == "win32"
+        else "codex-code-mode-host"
+    )
+    code_mode_host.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    code_mode_host.chmod(0o755)
+
+    runtime_paths = _codex_runtime_read_paths(
+        str(launcher),
+        projection_root=tmp_path / "projection",
+    )
+
+    assert len(runtime_paths) == 2
+    projected_binary, projected_host = map(Path, runtime_paths)
+    assert projected_binary.samefile(native)
+    assert projected_host.samefile(code_mode_host)
 
 
 @pytest.mark.parametrize("helper_kind", ["symlink", "not-executable"])
@@ -1463,10 +1652,9 @@ async def test_hostile_ambient_unknown_feature_and_old_profiles_are_neutralized(
         {"tools": {"future_remote_tool": {"enabled": True}}},
         {"hooks": {"after_turn": ["/tmp/attacker"]}},
         {"orchestrator": {"future_remote_agent": {"enabled": True}}},
-        {"shell_environment_policy": {"set": {"GH_TOKEN": "ambient"}}},
     ],
 )
-async def test_uncovered_ambient_capability_or_shell_secret_fails_closed(
+async def test_uncovered_ambient_capability_fails_closed(
     isolated_task_boundary,
     ambient_override,
 ):
@@ -3560,6 +3748,103 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
         ("thread", "thread-read-only-monitor"),
         ("turn", process, "thread-read-only-monitor"),
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_profile", ["plan", "delivery"])
+async def test_unrestricted_switch_replaces_executable_permission_profiles(
+    isolated_task_boundary,
+    requested_profile,
+    caplog,
+):
+    boundary = isolated_task_boundary(908)
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": f"thread-unrestricted-{requested_profile}",
+                "status": {"type": "idle"},
+            },
+            "sandbox": {
+                "type": "dangerFullAccess",
+                "networkAccess": True,
+            },
+        },
+        {"turn": {"id": f"turn-unrestricted-{requested_profile}"}},
+    ])
+    isolation_kwargs = (
+        {
+            "sandbox_mode": "read-only",
+            "task_ssh_protected_paths": ("/Users/operator/.ssh",),
+            "task_ssh_disable_network": True,
+        }
+        if requested_profile == "plan"
+        else {
+            "sandbox_mode": "workspace-write",
+            "network_isolated": True,
+        }
+    )
+
+    with caplog.at_level(logging.CRITICAL):
+        await server.start_turn(
+            prompt="exercise the configured sandbox override",
+            cwd=boundary.cwd,
+            model="gpt-5.6-terra",
+            effort="medium",
+            resume_session_id=None,
+            git_env=None,
+            task_id=908,
+            disable_project_config=True,
+            disable_user_mcp=True,
+            disable_autonomous_features=True,
+            task_git_read_paths=boundary.git_read_paths,
+            task_git_boundary_fingerprint=boundary.git_fingerprint,
+            task_private_tmpdir=boundary.scratch,
+            sandbox_unrestricted_enabled=True,
+            **isolation_kwargs,
+        )
+
+    assert [call.args[0] for call in server._request.await_args_list] == [
+        "thread/start",
+        "turn/start",
+    ]
+    thread_params = server._request.await_args_list[0].args[1]
+    assert thread_params["sandbox"] == "danger-full-access"
+    assert "default_permissions" not in thread_params["config"]
+    assert "permissions" not in thread_params["config"]
+    assert "agents" not in thread_params["config"]
+    assert "features" not in thread_params["config"]
+    turn_params = server._request.await_args_list[1].args[1]
+    assert "sandboxPolicy" not in turn_params
+    assert "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_unrestricted_switch_does_not_expand_tool_free_review():
+    server = CodexAppServer("codex")
+
+    await _start_tool_free_test_turn(
+        server,
+        sandbox_unrestricted_enabled=True,
+    )
+
+    thread_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "thread/start"
+    )
+    thread_params = thread_call.args[1]
+    assert "sandbox" not in thread_params
+    assert thread_params["config"]["default_permissions"].startswith(
+        "ccm_pr_review_no_access_v1_"
+    )
+    turn_call = next(
+        call for call in server._request.await_args_list
+        if call.args[0] == "turn/start"
+    )
+    assert turn_call.args[1]["environments"] == []
+    assert turn_call.args[1]["runtimeWorkspaceRoots"] == []
 
 
 @pytest.mark.asyncio
@@ -11410,6 +11695,7 @@ class _RegistryFakeServer:
         self.known_threads = set()
         self.shutdown_count = 0
         self.steered = []
+        self.start_turn_calls = []
         self.create_thread_calls = []
         self.recycle_thread_calls = []
         type(self).instances.append(self)
@@ -11425,6 +11711,7 @@ class _RegistryFakeServer:
         return thread_id in self.known_threads
 
     async def start_turn(self, **kwargs):
+        self.start_turn_calls.append(dict(kwargs))
         thread_id = kwargs.get("resume_session_id") or f"thread-{kwargs['task_id']}"
         self.active_threads.add(thread_id)
         self.known_threads.add(thread_id)
@@ -12180,6 +12467,38 @@ async def test_registry_routes_each_canonical_home_to_one_server(
     )
     assert server_a.steered == [(thread_a, "a-only")]
     assert server_b.steered == []
+
+
+@pytest.mark.asyncio
+async def test_registry_owns_unrestricted_sandbox_switch(
+    tmp_path,
+    reset_registry_fake_servers,
+):
+    registry = CodexAppServerRegistry("codex")
+    assert registry.sandbox_unrestricted_enabled is False
+    assert registry.set_sandbox_unrestricted_enabled(True) is True
+    home = tmp_path / "unrestricted-account"
+
+    with patch(
+        "backend.services.codex_app_server.CodexAppServer",
+        _RegistryFakeServer,
+    ):
+        await registry.start_turn(
+            codex_home=home,
+            resume_session_id=None,
+            task_id=71,
+            # A Task-level caller cannot turn the deployment override off.
+            sandbox_unrestricted_enabled=False,
+        )
+
+    server = _RegistryFakeServer.instances[0]
+    assert server.start_turn_calls == [{
+        "resume_session_id": None,
+        "task_id": 71,
+        "sandbox_unrestricted_enabled": True,
+    }]
+    assert registry.set_sandbox_unrestricted_enabled(False) is False
+    assert registry.sandbox_unrestricted_enabled is False
 
 
 @pytest.mark.asyncio

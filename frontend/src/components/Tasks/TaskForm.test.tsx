@@ -938,6 +938,19 @@ describe('legacy TaskForm Delivery Loop entry (moved to Delivery tab)', () => {
     }]);
   });
 
+  it('shows a high-risk warning when the Codex sandbox override is active', async () => {
+    vi.mocked(api.config).mockResolvedValue({
+      ...config,
+      agent_sandbox_unrestricted_enabled: true,
+    } as never);
+
+    render(<TaskForm onCreated={vi.fn()} />);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Agent unrestricted permissions are ON',
+    );
+  });
+
   async function fillDeliveryForm(requirements: string) {
     await selectProject();
     await openConfigPanel();

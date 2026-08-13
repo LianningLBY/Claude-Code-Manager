@@ -67,6 +67,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [priority, setPriority] = useState(0);
   const [mode, setMode] = useState('auto');
   const [deliveryLoopEnabled, setDeliveryLoopEnabled] = useState(false);
+  const [agentSandboxUnrestricted, setAgentSandboxUnrestricted] = useState(false);
   const [autoCapabilityAvailable, setAutoCapabilityAvailable] = useState(false);
   const [autoPlanBudget, setAutoPlanBudget] = useState(0);
   const [autoReviewBudget, setAutoReviewBudget] = useState(0);
@@ -185,6 +186,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexCapabilitiesLoaded(true);
       const deliveryEnabled = c.delivery_loop_enabled === true;
       setDeliveryLoopEnabled(deliveryEnabled);
+      setAgentSandboxUnrestricted(
+        c.agent_sandbox_unrestricted_enabled === true,
+      );
       setAutoCapabilityAvailable(
         c.capability_core_enabled === true
         && c.auto_capability_enabled === true,
@@ -200,6 +204,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       setCodexModelServiceTiers({});
       setCodexCapabilitiesLoaded(true);
       setDeliveryLoopEnabled(false);
+      setAgentSandboxUnrestricted(false);
       setAutoCapabilityAvailable(false);
       applyStoredDefaults(readStoredTaskDefaults(), 'codex');
     });
@@ -738,6 +743,15 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   return (
     <form ref={formRef} onSubmit={handleSubmit} className="bg-gray-800 border border-gray-700/60 rounded-xl p-4 space-y-3 overflow-visible shadow-sm">
       <h3 className="text-sm font-semibold text-gray-300">New Task</h3>
+      {agentSandboxUnrestricted && (
+        <div
+          role="alert"
+          className="rounded border border-red-500/60 bg-red-950/60 px-3 py-2 text-xs leading-relaxed text-red-200"
+        >
+          Agent unrestricted permissions are ON. Codex and Claude Plan/Delivery
+          turns bypass CCM host isolation; Claude Plan still has read-only tools.
+        </div>
+      )}
       {dropError && (
         <div className="bg-yellow-900/50 border border-yellow-700 text-yellow-300 text-xs rounded px-3 py-2 flex items-center justify-between">
           <span>{dropError}</span>

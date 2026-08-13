@@ -648,6 +648,52 @@ class UnresolvedTerminalReceiptPublisher(FakePublisher):
         )
 
 
+class BoundHistoryAmbiguityThenSuccessPublisher(FakePublisher):
+    def __init__(self, db_factory) -> None:
+        super().__init__(db_factory)
+        self.failed_once = False
+
+    async def ensure_pull_request(self, *, run_id, idempotency_key, fence):
+        if self.failed_once:
+            return await super().ensure_pull_request(
+                run_id=run_id,
+                idempotency_key=idempotency_key,
+                fence=fence,
+            )
+        self.failed_once = True
+        self.pr_calls += 1
+        async with self.db_factory() as db:
+            run = await db.get(DeliveryRun, run_id)
+            repo = await db.get(MonitoredRepo, run.monitored_repo_id)
+            action = await db.get(DeliveryAction, fence.action_id)
+            url = f"https://github.com/{repo.repo_full_name}/pull/73"
+            action.result = {
+                "schema_version": 2,
+                "kind": "pull_request_history_ambiguous",
+                "subject": {
+                    "run_id": run.id,
+                    "repo_id": repo.id,
+                    "repo_full_name": repo.repo_full_name,
+                    "base_branch": run.base_branch,
+                    "delivery_branch": run.delivery_branch,
+                    "base_sha": run.base_sha,
+                    "head_sha": run.head_sha,
+                    "head_tree_sha": run.head_tree_sha,
+                    "patch_sha256": run.patch_sha256,
+                },
+                "reason": (
+                    "Delivery pull-request history is ambiguous: Pull request "
+                    "does not match the exact Delivery subject"
+                ),
+            }
+            run.pr_number = 73
+            run.pr_url = url
+            await db.commit()
+        raise DeliveryPublisherPermanentError(
+            "old publisher compared the PR before its branch push"
+        )
+
+
 class MonitorFailsOncePublisher(FakePublisher):
     async def ensure_monitor(self, **kwargs):
         if self.monitor_calls == 0:
@@ -2503,6 +2549,52 @@ async def test_unresolved_terminal_receipt_fails_without_publisher_replay(
         )
         assert receipt_kind in (failed.error_message or "")
     assert publisher.pr_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_bound_history_ambiguity_reconciles_without_replacement_pr(
+    db_session,
+    db_factory,
+):
+    run, _repo = await _scope(db_session)
+    workspace = FakeWorkspace()
+    publisher = BoundHistoryAmbiguityThenSuccessPublisher(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        publisher,
+    )
+    await _to_publishing(controller, db_factory, workspace, run.id)
+
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        action = await db.scalar(
+            select(DeliveryAction).where(DeliveryAction.run_id == run.id)
+        )
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        assert action.status == "unknown"
+        assert action.result["kind"] == "pull_request_history_ambiguous"
+        assert action.remote_id is None
+        assert stored.pr_number == 73
+        action.next_attempt_at = datetime.utcnow() - timedelta(seconds=1)
+        await db.commit()
+
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        action = await db.scalar(
+            select(DeliveryAction).where(DeliveryAction.run_id == run.id)
+        )
+        recovered = await db.get(DeliveryRun, run.id, populate_existing=True)
+        assert action.status == "succeeded"
+        assert action.result["schema_version"] == 1
+        assert action.remote_id == "73"
+        assert (recovered.phase, recovered.activity, recovered.outcome) == (
+            "monitoring",
+            "waiting",
+            None,
+        )
+    assert publisher.pr_calls == 2
 
 
 @pytest.mark.asyncio

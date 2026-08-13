@@ -330,6 +330,21 @@ async def test_config_reflects_settings(client):
 
 
 @pytest.mark.asyncio
+async def test_config_exposes_agent_unrestricted_sandbox_state(client):
+    from backend.main import instance_manager
+
+    previous = instance_manager.agent_sandbox_unrestricted_enabled
+    try:
+        instance_manager.set_agent_sandbox_unrestricted_enabled(True)
+        response = await client.get("/api/system/config")
+    finally:
+        instance_manager.set_agent_sandbox_unrestricted_enabled(previous)
+
+    assert response.status_code == 200
+    assert response.json()["agent_sandbox_unrestricted_enabled"] is True
+
+
+@pytest.mark.asyncio
 async def test_auto_capability_switch_is_independent_and_fail_closed(client):
     from unittest.mock import patch
     from backend.config import settings

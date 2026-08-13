@@ -5144,6 +5144,7 @@ async def test_codex_pr_review_uses_only_isolated_app_server_route(
             provider="codex",
             config_dir=str(tmp_path / "codex-home"),
             enabled_skills={"monitor": True, "sub-agent": True},
+            git_env={"GH_TOKEN": "must-not-reach-review"},
         )
 
     assert pid == 43_210
@@ -5154,6 +5155,7 @@ async def test_codex_pr_review_uses_only_isolated_app_server_route(
     assert kwargs["tools_disabled"] is True
     assert kwargs["mcp_specs"] == ()
     assert kwargs["skill_context"] == ""
+    assert kwargs["git_env"] is None
     exec_mock.assert_not_awaited()
 
 
@@ -5425,6 +5427,65 @@ async def test_claude_delivery_uses_networkless_git_read_only_profile_without_mc
 
 
 @pytest.mark.asyncio
+async def test_claude_delivery_unrestricted_switch_skips_sandbox_and_prompts(
+    db_factory,
+    tmp_path,
+):
+    from backend.services.task_agent_isolation import (
+        CLAUDE_DELIVERY_BUILTIN_TOOLS,
+    )
+
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    process = _make_mock_process(returncode=None)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.set_agent_sandbox_unrestricted_enabled(True)
+    manager._consume_output = AsyncMock()
+
+    with (
+        patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as exec_mock,
+        patch(
+            "backend.services.task_agent_isolation."
+            "generate_claude_delivery_isolation_settings"
+        ) as generate_isolation,
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="implement the approved plan",
+            task_id=task_id,
+            cwd=workspace,
+            model="claude-opus-4-6",
+            provider="claude",
+            config_dir=str(tmp_path / "delivery-claude-home"),
+            git_env={"GH_TOKEN": "must-not-reach-model"},
+            effort_level="high",
+            codex_service_tier="default",
+        )
+
+    generate_isolation.assert_not_called()
+    argv = list(exec_mock.await_args.args)
+    expected_tools = ",".join(CLAUDE_DELIVERY_BUILTIN_TOOLS)
+    assert "--dangerously-skip-permissions" in argv
+    assert argv[argv.index("--tools") + 1] == expected_tools
+    assert argv[argv.index("--allowedTools") + 1] == expected_tools
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--settings" not in argv
+    assert "AskUserQuestion" not in expected_tools
+    launched_env = exec_mock.await_args.kwargs["env"]
+    assert "GH_TOKEN" not in launched_env
+    assert "CCM_ASK_USER_TOKEN" not in launched_env
+    assert manager._pending_private_runtime_tempdirs == {}
+
+
+@pytest.mark.asyncio
 async def test_claude_delivery_pty_receives_same_exact_profile(
     db_factory,
     monkeypatch,
@@ -5491,6 +5552,60 @@ async def test_claude_delivery_pty_receives_same_exact_profile(
         "claude-delivery-security.json"
     )
     await manager._cleanup_unbound_private_runtime_tempdir(instance_id)
+
+
+@pytest.mark.asyncio
+async def test_claude_delivery_pty_unrestricted_switch_uses_direct_promptless_profile(
+    db_factory,
+    tmp_path,
+):
+    from backend.services.task_agent_isolation import (
+        CLAUDE_DELIVERY_BUILTIN_TOOLS,
+    )
+
+    instance_id, task_id, workspace = await _delivery_launch_scope(
+        db_factory,
+        tmp_path,
+        provider="claude",
+        model="claude-opus-4-6",
+    )
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.set_agent_sandbox_unrestricted_enabled(True)
+    manager._pty_enabled = True
+    manager._pty_backend = MagicMock()
+    manager._launch_pty = AsyncMock(return_value=54_321)
+    manager._consume_output = AsyncMock()
+    process = _make_mock_process(returncode=None)
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=process,
+    ) as exec_mock:
+        pid = await manager.launch(
+            instance_id=instance_id,
+            prompt="implement the approved plan",
+            task_id=task_id,
+            cwd=workspace,
+            model="claude-opus-4-6",
+            provider="claude",
+            config_dir=str(tmp_path / "delivery-claude-home"),
+            git_env={"GH_TOKEN": "must-not-reach-model"},
+            effort_level="high",
+            codex_service_tier="default",
+        )
+
+    assert pid == process.pid
+    manager._launch_pty.assert_not_awaited()
+    argv = list(exec_mock.await_args.args)
+    expected_tools = ",".join(CLAUDE_DELIVERY_BUILTIN_TOOLS)
+    assert "--dangerously-skip-permissions" in argv
+    assert argv[argv.index("--tools") + 1] == expected_tools
+    assert argv[argv.index("--allowedTools") + 1] == expected_tools
+    assert "--mcp-config" not in argv
+    assert "AskUserQuestion" not in expected_tools
+    assert exec_mock.await_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+    assert "GH_TOKEN" not in exec_mock.await_args.kwargs["env"]
 
 
 @pytest.mark.asyncio
@@ -7836,6 +7951,7 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     db_factory, monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    monkeypatch.setattr(settings, "agent_sandbox_unrestricted_enabled", True)
     async with db_factory() as db:
         inst = Instance(name="codex-registry-inst")
         db.add(inst)
@@ -7884,6 +8000,10 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
 
     assert pid == 7654
     registry_cls.assert_called_once()
+    assert (
+        registry_cls.call_args.kwargs["sandbox_unrestricted_enabled"]
+        is True
+    )
     assert registry.start_turn.await_args.kwargs["codex_home"] == str(
         codex_home.resolve()
     )

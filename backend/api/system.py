@@ -66,6 +66,7 @@ async def stats(db: AsyncSession = Depends(get_db)):
 
 @router.get("/config")
 async def get_config(db: AsyncSession = Depends(get_db)):
+    from backend.main import instance_manager
     from backend.services.plan_pipeline_settings import (
         effective_plan_pipeline_config,
     )
@@ -112,6 +113,11 @@ async def get_config(db: AsyncSession = Depends(get_db)):
         "delivery_loop_enabled": (
             settings.delivery_loop_enabled
             and settings.capability_core_enabled
+        ),
+        # Operator-owned emergency switch. Expose the live effective value so
+        # Task creation can warn before a new turn is admitted.
+        "agent_sandbox_unrestricted_enabled": (
+            instance_manager.agent_sandbox_unrestricted_enabled
         ),
         # Manager must see this exact capability before forwarding a PR review
         # to a Worker. Older Workers would run it from their CCM checkout and

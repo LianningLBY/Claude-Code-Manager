@@ -1,5 +1,7 @@
 """Delivery controller remains the only repair wake owner for its PR."""
 
+from datetime import datetime, timedelta
+
 import pytest
 from sqlalchemy import select
 
@@ -17,6 +19,9 @@ from backend.services.delivery_service import value_hash
 from backend.services.pr_monitor_loop import (
     record_blocking_evidence,
     record_gate_pass,
+)
+from backend.services.pr_review_adjudication import (
+    reconcile_fixed_finding_resolutions,
 )
 
 
@@ -235,6 +240,63 @@ async def test_delivery_gate_never_enters_auto_merge_queue_after_config_drift(
         ).scalars()
     )
     assert actions == []
+
+
+@pytest.mark.asyncio
+async def test_delivery_zero_thread_gate_restores_exact_publication_stage(
+    db_session,
+    db_factory,
+):
+    repo, monitor, review, _delivery = await _delivery_review(
+        db_session,
+        suffix="fixed-thread-gate",
+    )
+    started_at = datetime.utcnow() - timedelta(seconds=2)
+    publication_task = Task(
+        title="Delivery exact-head panel publisher",
+        description="immutable panel result",
+        status="completed",
+        retry_count=0,
+        started_at=started_at,
+        completed_at=started_at + timedelta(seconds=1),
+        metadata_={
+            "pr_auto_merge": False,
+            "pr_wait_for_ci": True,
+            "pr_required_checks": repo.required_checks,
+            "pr_action_nonce": review.action_nonce,
+        },
+    )
+    db_session.add(publication_task)
+    await db_session.flush()
+    monitor.status = "resolving_fixed_threads"
+    review.status = "publishing"
+    review.action_taken = None
+    review.task_id = publication_task.id
+    review.pending_action = "waiting_threads:lgtm_comment"
+    review.pending_review_body = "Panel reviewers found no blocking issue."
+    review.publishing_actor = "ccm-bot"
+    review.publishing_retry_count = publication_task.retry_count
+    review.publishing_task_started_at = publication_task.started_at
+    review.publishing_started_at = started_at
+    await db_session.commit()
+
+    # No Finding remains, so recovery should cross the zero-thread Gate even
+    # though this Delivery-owned Monitor is intentionally not yet reviewing.
+    assert await reconcile_fixed_finding_resolutions(db_factory) == 0
+
+    restored_monitor = await db_session.get(
+        PRMonitorRun,
+        monitor.id,
+        populate_existing=True,
+    )
+    restored_review = await db_session.get(
+        PRReview,
+        review.id,
+        populate_existing=True,
+    )
+    assert restored_monitor.status == "reviewing"
+    assert restored_review.status == "publishing"
+    assert restored_review.pending_action == "lgtm_comment"
 
 
 @pytest.mark.asyncio

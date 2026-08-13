@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -20,6 +21,22 @@ from backend.services import plan_runtime_receipt as runtime_receipts
 
 def _boot_id(hex_digit: str) -> str:
     return str(uuid.UUID(hex_digit * 32))
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Darwin libproc contract")
+def test_darwin_runtime_identity_uses_boot_session_and_libproc():
+    boot_id = runtime_receipts._read_boot_id()
+    identity = runtime_receipts.read_process_identity(os.getpid())
+
+    assert str(uuid.UUID(boot_id)) == boot_id
+    assert identity is not None
+    assert identity.pid == os.getpid()
+    assert identity.uid == os.getuid()
+    assert identity.process_group_id == os.getpgid(0)
+    assert identity.start_ticks > 0
+    assert identity.boot_id == boot_id
+    assert identity.state != "Z"
+    assert runtime_receipts._read_current_start_ticks() > 0
 
 
 async def _create_step(
@@ -357,6 +374,10 @@ async def test_runtime_generation_rejects_broken_redundant_identity_or_attempt_g
         )
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="Linux /proc environment scan contract",
+)
 def test_proc_scan_skips_older_same_uid_process_before_unreadable_environ(
     monkeypatch,
 ):
@@ -400,6 +421,37 @@ def test_proc_scan_skips_older_same_uid_process_before_unreadable_environ(
 
     assert runtime_receipts._token_process_identities(snapshot) == []
     assert opened == []
+
+
+@pytest.mark.asyncio
+async def test_claude_prepared_receipt_cleans_without_process_scan(
+    db_factory,
+    monkeypatch,
+):
+    step = await _create_step(db_factory)
+    receipt = await _create_receipt(
+        db_factory,
+        step,
+        status="prepared",
+    )
+    token_scan = MagicMock(
+        side_effect=AssertionError("prepared receipt must not scan processes")
+    )
+    monkeypatch.setattr(
+        runtime_receipts,
+        "_token_process_identities",
+        token_scan,
+    )
+
+    assert await runtime_receipts.reconcile_runtime_receipt(
+        db_factory,
+        object(),
+        receipt_id=receipt.id,
+        allow_transport_kill=False,
+    )
+
+    token_scan.assert_not_called()
+    assert await _receipt_status(db_factory, receipt.id) == ("cleaned", None)
 
 
 @pytest.mark.asyncio

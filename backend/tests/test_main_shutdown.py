@@ -267,6 +267,7 @@ async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
     pty_backend.shutdown = AsyncMock()
     instance_manager = MagicMock()
     instance_manager._pty_backend = pty_backend
+    instance_manager.shutdown_pty_backend = AsyncMock()
     instance_manager.shutdown_codex_app_server = AsyncMock()
 
     watcher = MagicMock(shutdown=AsyncMock())
@@ -293,7 +294,8 @@ async def test_dispatcher_shutdown_error_propagates_after_other_cleanup(
     worker_health.cancel.assert_called_once_with()
     upload_cleanup.cancel.assert_called_once_with()
     tmp_cleanup.cancel.assert_called_once_with()
-    pty_backend.shutdown.assert_awaited_once_with()
+    instance_manager.shutdown_pty_backend.assert_awaited_once_with()
+    pty_backend.shutdown.assert_not_awaited()
     instance_manager.shutdown_codex_app_server.assert_awaited_once_with()
     watcher.shutdown.assert_awaited_once_with()
     backup.stop.assert_called_once_with()
@@ -313,6 +315,7 @@ async def test_dispatcher_shutdown_retry_can_recover_after_transport_cleanup(
     pty_backend = MagicMock(shutdown=AsyncMock())
     instance_manager = MagicMock()
     instance_manager._pty_backend = pty_backend
+    instance_manager.shutdown_pty_backend = AsyncMock()
     instance_manager.shutdown_codex_app_server = AsyncMock()
     watcher = MagicMock(shutdown=AsyncMock())
 
@@ -331,7 +334,8 @@ async def test_dispatcher_shutdown_retry_can_recover_after_transport_cleanup(
     )
 
     assert dispatcher.shutdown.await_count == 2
-    pty_backend.shutdown.assert_awaited_once_with()
+    instance_manager.shutdown_pty_backend.assert_awaited_once_with()
+    pty_backend.shutdown.assert_not_awaited()
     instance_manager.shutdown_codex_app_server.assert_awaited_once_with()
     upload_cleanup.cancel.assert_called_once_with()
     tmp_cleanup.cancel.assert_called_once_with()
@@ -345,6 +349,7 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
     dispatcher = MagicMock(shutdown=AsyncMock())
     instance_manager = MagicMock()
     instance_manager._pty_backend = None
+    instance_manager.shutdown_pty_backend = AsyncMock()
     instance_manager.shutdown_codex_app_server = AsyncMock()
     watcher = MagicMock(shutdown=AsyncMock())
     monkeypatch.setattr(main, "dispatcher", dispatcher)
@@ -385,6 +390,7 @@ async def test_shutdown_awaits_cancelled_background_tasks(monkeypatch):
     assert all(task.done() for task in tasks)
     assert all(done.is_set() for done in finalized)
     worker_relay.shutdown.assert_awaited_once_with()
+    instance_manager.shutdown_pty_backend.assert_awaited_once_with()
     watcher.shutdown.assert_awaited_once_with()
 
 

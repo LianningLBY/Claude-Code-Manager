@@ -53,6 +53,8 @@ from backend.services.mcp_config import (
 )
 from backend.services.task_agent_isolation import (
     CLAUDE_SUBPROCESS_ENV_SCRUB,
+    CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+    CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
     TaskAgentIsolationError,
     discover_linked_worktree_git_read_boundary,
 )
@@ -63,6 +65,7 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.user import User
 from backend.models.test_harness import (
     TestHarnessChildBinding as HarnessChildBindingModel,
     TestHarnessRun as HarnessRunModel,
@@ -4422,17 +4425,53 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     await asyncio.sleep(0.1)
 
 
+def _assert_unrestricted_claude_permission_profile(
+    settings_path: Path,
+    *,
+    builtin_tools: str,
+    allowed_rules: str,
+) -> set[str]:
+    """Assert the scrub-compatible unrestricted profile contract."""
+
+    assert settings_path.is_file()
+    assert settings_path.name.startswith("claude-")
+    assert settings_path.suffix == ".json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    selected_builtins = set(filter(None, builtin_tools.split(",")))
+    selected_rules = set(filter(None, allowed_rules.split(",")))
+
+    assert selected_builtins == set(CLAUDE_UNRESTRICTED_BUILTIN_TOOLS)
+    assert not any(rule.startswith("mcp__") for rule in selected_builtins)
+    assert selected_rules == set(payload["permissions"]["allow"])
+    assert set(CLAUDE_UNRESTRICTED_PERMISSION_TOOLS) < selected_rules
+    assert payload["permissions"]["deny"] == []
+    assert "sandbox" not in payload
+    return selected_rules
+
+
 @pytest.mark.asyncio
-async def test_admin_claude_turn_bypasses_task_sandbox_but_keeps_ssh_mcp(
+async def test_admin_claude_unrestricted_direct_uses_explicit_allow_profile_and_keeps_mcp(
     db_factory,
     monkeypatch,
     tmp_path,
 ):
     monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
     async with db_factory() as db:
         inst = Instance(name="admin-unrestricted-claude")
+        principal = User(
+            email="admin-unrestricted@example.com",
+            name="Admin Unrestricted",
+            password_hash="test-only",
+            role="admin",
+            is_active=True,
+        )
         profile = _managed_ssh_profile("admin-unrestricted-ssh")
-        db.add_all([inst, profile])
+        db.add_all([inst, principal, profile])
         await db.flush()
         task = Task(
             title="admin unrestricted",
@@ -4449,7 +4488,7 @@ async def test_admin_claude_turn_bypasses_task_sandbox_but_keeps_ssh_mcp(
             capabilities=["read"],
         ))
         await db.commit()
-        task_id, instance_id = task.id, inst.id
+        task_id, instance_id, principal_id = task.id, inst.id, principal.id
 
     process = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
@@ -4471,13 +4510,27 @@ async def test_admin_claude_turn_bypasses_task_sandbox_but_keeps_ssh_mcp(
             cwd=str(tmp_path),
             provider="claude",
             config_dir=str(tmp_path / "admin-home"),
+            initiating_user_id=principal_id,
             initiating_user_role="admin",
             execution_mode="unrestricted",
         )
 
     validate.assert_not_called()
     argv = list(exec_mock.await_args.args)
-    assert "--settings" not in argv
+    assert "--dangerously-skip-permissions" in argv
+    assert "--disable-slash-commands" in argv
+    settings_path = Path(argv[argv.index("--settings") + 1])
+    allowed_rules = _assert_unrestricted_claude_permission_profile(
+        settings_path,
+        builtin_tools=argv[argv.index("--tools") + 1],
+        allowed_rules=argv[argv.index("--allowedTools") + 1],
+    )
+    assert {
+        "mcp__ccm_skills__ccm_command_help",
+        "mcp__ccm_ssh__list_connections",
+        "mcp__ccm_ssh__read_file",
+    } <= allowed_rules
+    assert exec_mock.await_args.kwargs["env"][CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
     config_path = Path(argv[argv.index("--mcp-config") + 1])
     try:
         config = json.loads(config_path.read_text())
@@ -4485,6 +4538,187 @@ async def test_admin_claude_turn_bypasses_task_sandbox_but_keeps_ssh_mcp(
     finally:
         config_path.unlink(missing_ok=True)
     await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_super_admin_claude_unrestricted_pty_cold_resume_uses_explicit_allow_profile(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    attachment = upload_dir / "outside-workspace.pdf"
+    attachment.write_bytes(b"test-only attachment")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    async with db_factory() as db:
+        inst = Instance(name="super-admin-unrestricted-claude-pty")
+        principal = User(
+            email="super-admin-unrestricted@example.com",
+            name="Super Admin Unrestricted",
+            password_hash="test-only",
+            role="super_admin",
+            is_active=True,
+        )
+        db.add_all([inst, principal])
+        await db.flush()
+        task = Task(
+            title="super admin unrestricted PTY cold resume",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id, instance_id, principal_id = task.id, inst.id, principal.id
+
+    observed = {}
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class FakePTYBackend:
+        _pool = types.SimpleNamespace(_sessions={})
+
+        @staticmethod
+        def build_config(**_kwargs):
+            return types.SimpleNamespace(
+                env_overrides={},
+                claude_binary="/opt/claude-real",
+                dangerously_skip_permissions=True,
+            )
+
+        async def launch_for_ccm(self, **kwargs):
+            config = self.build_config()
+            observed["kwargs"] = kwargs
+            observed["binary"] = config.claude_binary
+            observed["dangerous"] = config.dangerously_skip_permissions
+            observed["env"] = dict(config.env_overrides)
+            im.processes[kwargs["instance_id"]] = _make_mock_process(
+                pid=52_003,
+                returncode=None,
+            )
+            return kwargs["resume_session_id"]
+
+    im._pty_backend = FakePTYBackend()
+    im._pty_enabled = True
+    native_session_id = "84d8d832-f879-4f59-a0c6-affa0af157d3"
+
+    pid = await im.launch(
+        instance_id=instance_id,
+        prompt="read the attached file",
+        task_id=task_id,
+        cwd=str(workspace),
+        provider="claude",
+        config_dir=str(tmp_path / "admin-home"),
+        resume_session_id=native_session_id,
+        chat_initiated=True,
+        initiating_user_id=principal_id,
+        initiating_user_role="super_admin",
+        execution_mode="unrestricted",
+        attachment_paths=(str(attachment),),
+    )
+
+    assert pid == 52_003
+    assert Path(observed["binary"]).name == "task_claude_wrapper.sh"
+    assert observed["dangerous"] is True
+    env = observed["env"]
+    assert env[CLAUDE_SUBPROCESS_ENV_SCRUB] == "1"
+    assert env["CCM_TASK_CLAUDE_PROFILE"] == "unrestricted"
+    allowed_rules = _assert_unrestricted_claude_permission_profile(
+        Path(env["CCM_TASK_CLAUDE_SETTINGS"]),
+        builtin_tools=env["CCM_TASK_CLAUDE_TOOLS"],
+        allowed_rules=env["CCM_TASK_CLAUDE_ALLOWED_RULES"],
+    )
+    assert {
+        "mcp__ccm_skills__ccm_command_help",
+        "mcp__ccm_frontend_review__start_review",
+        "mcp__ccm_workspace_review__test_current_changes",
+    } <= allowed_rules
+    launch_kwargs = observed["kwargs"]
+    assert launch_kwargs["resume_session_id"] == native_session_id
+    config_path = Path(launch_kwargs["mcp_config_path"])
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        assert {
+            "ccm_skills",
+            "ccm_frontend_review",
+            "ccm_workspace_review",
+        } <= set(config["mcpServers"])
+    finally:
+        config_path.unlink(missing_ok=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current_role", "is_active", "error"),
+    [
+        ("member", True, "role changed"),
+        ("admin", False, "no longer active"),
+    ],
+)
+async def test_unrestricted_retry_revalidates_principal_before_provider_launch(
+    db_factory,
+    tmp_path,
+    current_role,
+    is_active,
+    error,
+):
+    """A cached admin retry cannot survive demotion or deactivation."""
+
+    async with db_factory() as db:
+        principal = User(
+            email=f"stale-admin-{current_role}-{is_active}@example.com",
+            name="Stale Admin",
+            password_hash="test-only",
+            role=current_role,
+            is_active=is_active,
+        )
+        inst = Instance(name=f"stale-admin-{current_role}-{is_active}")
+        db.add_all([principal, inst])
+        await db.flush()
+        task = Task(
+            title="stale unrestricted retry",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        principal_id, instance_id, task_id = (
+            principal.id,
+            inst.id,
+            task.id,
+        )
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+    ) as exec_mock:
+        with pytest.raises(LaunchSupersededError, match=error):
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="retry with cached admin role",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider="claude",
+                initiating_user_id=principal_id,
+                initiating_user_role="admin",
+                execution_mode="unrestricted",
+            )
+
+    exec_mock.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -8520,6 +8754,10 @@ async def test_claude_chat_pool_rotation_migration_failure_requeues_without_swit
         model_override="claude-opus-4-8",
         source_log_id=source_id,
         queue_admission_fence=retry_fence,
+        initiating_user_id=None,
+        initiating_user_role="member",
+        execution_mode="sandbox",
+        attachment_paths=(),
     )
     assert pool.status()["last_selected"] == "claude-a"
 
@@ -9459,6 +9697,10 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         queue_timestamp=42.5,
         source_log_id=source_id,
         queue_admission_fence=retry_fence,
+        initiating_user_id=None,
+        initiating_user_role="member",
+        execution_mode="sandbox",
+        attachment_paths=(),
     )
     async with db_factory() as db:
         refreshed_task = await db.get(Task, task.id)
@@ -9530,6 +9772,10 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         model_override="gpt-5.5",
         source_log_id=source_id,
         queue_admission_fence=retry_fence,
+        initiating_user_id=None,
+        initiating_user_role="member",
+        execution_mode="sandbox",
+        attachment_paths=(),
     )
 
 
@@ -9659,6 +9905,10 @@ async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
         model_override="gpt-5.5",
         source_log_id=source_id,
         queue_admission_fence=retry_fence,
+        initiating_user_id=None,
+        initiating_user_role="member",
+        execution_mode="sandbox",
+        attachment_paths=(),
     )
 
 
@@ -13122,6 +13372,10 @@ async def test_chat_requeue_allows_exact_preflight_source(db_factory):
         model_override=None,
         source_log_id=source_id,
         queue_admission_fence=retry_fence,
+        initiating_user_id=None,
+        initiating_user_role="member",
+        execution_mode="sandbox",
+        attachment_paths=(),
     )
 
 
@@ -15577,6 +15831,94 @@ async def test_launch_chat_initiated_stores_enable_workflows_in_params(db_factor
 
 
 @pytest.mark.asyncio
+async def test_chat_retry_params_preserve_unrestricted_principal_and_attachments(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    """Automatic relaunch must not downgrade the admitted admin turn."""
+
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    attachment = upload_dir / "managed.pdf"
+    attachment.write_bytes(b"managed attachment")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
+
+    async with db_factory() as db:
+        inst = Instance(name="unrestricted-retry-params")
+        principal = User(
+            email="unrestricted-retry@example.com",
+            name="Unrestricted Retry",
+            password_hash="test-only",
+            role="super_admin",
+            is_active=True,
+        )
+        db.add_all([inst, principal])
+        await db.flush()
+        task = Task(
+            title="preserve unrestricted retry principal",
+            status="executing",
+            provider="claude",
+            instance_id=inst.id,
+        )
+        db.add(task)
+        await db.commit()
+        instance_id, task_id, principal_id = inst.id, task.id, principal.id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    process = _make_mock_process()
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=process,
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="read the attachment",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="claude",
+            chat_initiated=True,
+            initiating_user_id=principal_id,
+            initiating_user_role="super_admin",
+            execution_mode="unrestricted",
+            attachment_paths=(str(attachment),),
+        )
+
+    params = manager._launch_params[instance_id]
+    assert params["initiating_user_id"] == principal_id
+    assert params["initiating_user_role"] == "super_admin"
+    assert params["execution_mode"] == "unrestricted"
+    assert params["attachment_paths"] == (str(attachment),)
+
+    dispatcher = MagicMock()
+    dispatcher.snapshot_queue_admission = AsyncMock(return_value=object())
+    dispatcher.enqueue_message = AsyncMock(return_value=True)
+    manager._chat_automatic_relaunch_is_blocked = AsyncMock(return_value=False)
+    with patch("backend.main.dispatcher", dispatcher):
+        assert await manager._requeue_chat_prompt(
+            task_id,
+            params,
+            RuntimeError("replacement route busy"),
+            phase="test",
+            provider="Claude",
+        ) is True
+    retry = dispatcher.enqueue_message.await_args.kwargs
+    assert retry["initiating_user_id"] == principal_id
+    assert retry["initiating_user_role"] == "super_admin"
+    assert retry["execution_mode"] == "unrestricted"
+    assert retry["attachment_paths"] == (str(attachment),)
+
+
+@pytest.mark.asyncio
 async def test_launch_chat_initiated_stores_enable_workflows_false_in_params(db_factory):
     """chat_initiated launch stores enable_workflows=False in _launch_params."""
     async with db_factory() as db:
@@ -16466,6 +16808,10 @@ async def test_release_pty_session():
 
     class FakePool:
         removed = []
+        sessions = {}
+
+        async def get(self, sid):
+            return self.sessions.get(sid)
 
         async def remove(self, sid):
             FakePool.removed.append(sid)
@@ -16474,10 +16820,409 @@ async def test_release_pty_session():
         _pool = FakePool()
 
     im._pty_backend = FakeBackend()
-    await im.release_pty_session("sid-x")
+    assert await im.release_pty_session("sid-x") is True
     assert FakePool.removed == ["sid-x"]
-    await im.release_pty_session("")  # empty -> no-op
+    assert await im.release_pty_session("") is False  # empty -> no-op
     assert FakePool.removed == ["sid-x"]
+
+
+@pytest.mark.asyncio
+async def test_release_pty_session_fails_closed_when_exact_session_survives():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+
+    session = Session()
+
+    class FakePool:
+        async def get(self, _sid):
+            return session
+
+        async def remove(self, _sid):
+            raise RuntimeError("stop failed")
+
+    im._pty_backend = types.SimpleNamespace(
+        _pool=FakePool(),
+        _sessions={1: session},
+    )
+
+    assert await im.release_pty_session("sid-x") is False
+
+
+@pytest.mark.asyncio
+async def test_release_pty_session_recovers_after_pool_pops_before_stop_error():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+        stop_calls = 0
+
+        async def stop(self):
+            self.stop_calls += 1
+            if self.stop_calls == 1:
+                raise RuntimeError("first stop failed")
+            self.is_alive = False
+
+    session = Session()
+
+    class FakePool:
+        def __init__(self):
+            self._sessions = {"sid-x": session}
+
+        async def get(self, sid):
+            return self._sessions.get(sid)
+
+        async def remove(self, sid):
+            removed = self._sessions.pop(sid, None)
+            if removed is not None:
+                await removed.stop()
+
+    im._pty_backend = types.SimpleNamespace(
+        _pool=FakePool(),
+        _sessions={1: session},
+    )
+
+    assert await im.release_pty_session("sid-x") is True
+    assert session.stop_calls == 2
+    assert session.is_alive is False
+
+
+@pytest.mark.asyncio
+async def test_release_pty_session_settles_stop_before_delivering_cancellation():
+    im = InstanceManager(MagicMock(), MagicMock())
+    stop_started = asyncio.Event()
+    allow_stop = asyncio.Event()
+
+    class Session:
+        is_alive = True
+
+        async def stop(self):
+            stop_started.set()
+            await allow_stop.wait()
+            self.is_alive = False
+
+    session = Session()
+
+    class FakePool:
+        def __init__(self):
+            self._sessions = {"sid-x": session}
+
+        async def get(self, sid):
+            return self._sessions.get(sid)
+
+        async def remove(self, sid):
+            removed = self._sessions.pop(sid, None)
+            if removed is not None:
+                await removed.stop()
+
+    im._pty_backend = types.SimpleNamespace(
+        _pool=FakePool(),
+        _sessions={},
+    )
+
+    release = asyncio.create_task(im.release_pty_session("sid-x"))
+    await stop_started.wait()
+    release.cancel()
+    await asyncio.sleep(0)
+    assert release.done() is False
+
+    allow_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await release
+    assert session.is_alive is False
+
+
+@pytest.mark.asyncio
+async def test_launch_pty_runtime_fingerprint_change_fails_when_hot_session_survives(
+    tmp_path,
+):
+    im = InstanceManager(_FakeDBFactory(), MagicMock())
+
+    class Session:
+        is_alive = True
+        config = types.SimpleNamespace(
+            _ccm_task_isolation_fingerprint="stale-fingerprint"
+        )
+
+    session = Session()
+
+    class FakePool:
+        _sessions = {"sid-hot": session}
+
+        async def get(self, _sid):
+            return session
+
+        async def remove(self, _sid):
+            raise RuntimeError("exact hot session survived")
+
+    class FakeBackend:
+        _pool = FakePool()
+        _sessions = {1: session}
+
+        async def launch_for_ccm(self, **_kwargs):
+            raise AssertionError("stale PTY Session must not be reused")
+
+    im._pty_backend = FakeBackend()
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(
+        RuntimeError,
+        match="could not stop its exact hot PTY Session",
+    ):
+        await im._launch_pty(
+            instance_id=1,
+            prompt="run",
+            task_id=121,
+            cwd=str(tmp_path),
+            model=None,
+            resume_session_id="sid-hot",
+            loop_iteration=None,
+            git_env=None,
+            thinking_budget=None,
+            effort_level=None,
+            chat_initiated=False,
+            config_dir=None,
+            enable_workflows=False,
+            enabled_skills=None,
+            mcp_config_path=None,
+            claude_unrestricted_settings_path=settings_path,
+            claude_unrestricted_tools=CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+            claude_unrestricted_allowed_rules=("Read",),
+        )
+
+
+def test_task_runtime_scope_retained_by_live_pty_and_removed_after_dead_eviction(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+
+    session = Session()
+    im._pty_backend = types.SimpleNamespace(
+        _pool=types.SimpleNamespace(_sessions={"sid": session})
+    )
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._reserve_task_runtime_scope(121)
+    im._adopt_task_runtime_scope_pty(121, session)
+
+    assert im.cleanup_task_runtime_scope_after_turn(121) is False
+    cleanup.assert_not_called()
+
+    session.is_alive = False
+    im._pty_backend._pool._sessions.clear()
+    assert im.cleanup_task_runtime_scope_after_turn(121) is True
+    cleanup.assert_called_once_with(121)
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_scope_pty_stop_releases_owner(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+
+        async def stop(self):
+            self.is_alive = False
+            return 0
+
+    session = Session()
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._pty_backend = types.SimpleNamespace(
+        _pool=types.SimpleNamespace(_sessions={}),
+        _sessions={},
+    )
+    im._reserve_task_runtime_scope(124)
+    im._adopt_task_runtime_scope_pty(124, session)
+    await session.stop()
+
+    assert session not in im._task_runtime_scope_pty_owners
+    cleanup.assert_called_once_with(124)
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_scope_pty_stop_retains_owner_while_pool_resident(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+
+        async def stop(self):
+            self.is_alive = False
+
+    session = Session()
+    im._pty_backend = types.SimpleNamespace(
+        _pool=types.SimpleNamespace(_sessions={"sid": session}),
+        _sessions={},
+    )
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._reserve_task_runtime_scope(125)
+    im._adopt_task_runtime_scope_pty(125, session)
+    await session.stop()
+
+    assert im._task_runtime_scope_pty_owners[session] == 125
+    cleanup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_scope_pty_stop_retains_owner_during_migration(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+
+        async def stop(self):
+            self.is_alive = False
+
+    session = Session()
+    im._pty_backend = types.SimpleNamespace(
+        _pool=types.SimpleNamespace(_sessions={"sid": session}),
+        _sessions={9: session},
+    )
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._reserve_task_runtime_scope(125)
+    im._adopt_task_runtime_scope_pty(125, session)
+    await session.stop()
+
+    assert im._task_runtime_scope_pty_owners[session] == 125
+    cleanup.assert_not_called()
+
+    im._pty_backend._pool._sessions.clear()
+    im._pty_backend._sessions.clear()
+    await session.stop()
+    assert session not in im._task_runtime_scope_pty_owners
+    cleanup.assert_called_once_with(125)
+
+
+@pytest.mark.asyncio
+async def test_task_runtime_scope_pty_stop_failure_retains_owner(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    class Session:
+        is_alive = True
+
+        async def stop(self):
+            raise RuntimeError("stop failed")
+
+    session = Session()
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._reserve_task_runtime_scope(126)
+    im._adopt_task_runtime_scope_pty(126, session)
+    with pytest.raises(RuntimeError, match="stop failed"):
+        await session.stop()
+
+    assert im._task_runtime_scope_pty_owners[session] == 126
+    cleanup.assert_not_called()
+
+
+def test_task_runtime_scope_direct_owner_requires_exact_terminal_process(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+    process = _make_mock_process(pid=52_121, returncode=None)
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._reserve_task_runtime_scope(122)
+    im._adopt_task_runtime_scope_direct(122, 9, process)
+
+    assert im.cleanup_task_runtime_scope_after_turn(122) is False
+    cleanup.assert_not_called()
+
+    process.returncode = 0
+    im._release_task_runtime_scope_direct_owner(9, process)
+    cleanup.assert_called_once_with(122)
+
+
+@pytest.mark.asyncio
+async def test_replaced_consumer_releases_exact_terminal_direct_scope(
+    monkeypatch,
+):
+    im = InstanceManager(MagicMock(), MagicMock())
+    old_process = _make_mock_process(pid=52_122, returncode=0)
+    new_process = _make_mock_process(pid=52_123, returncode=None)
+    cleanup = MagicMock()
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        cleanup,
+    )
+
+    im._reserve_task_runtime_scope(123)
+    im._adopt_task_runtime_scope_direct(123, 9, old_process)
+    old_consumer = asyncio.create_task(asyncio.sleep(0))
+    im._track_output_consumer(
+        9,
+        old_process,
+        old_consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=123,
+    )
+
+    im._reserve_task_runtime_scope(123)
+    im._adopt_task_runtime_scope_direct(123, 9, new_process)
+    new_consumer = asyncio.create_task(asyncio.sleep(60))
+    replacement = im._track_output_consumer(
+        9,
+        new_process,
+        new_consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=123,
+    )
+    im.processes[9] = new_process
+
+    await old_consumer
+    await asyncio.sleep(0)
+
+    assert im._consumer_records[9] is replacement
+    assert im.processes[9] is new_process
+    assert (9, old_process) not in im._task_runtime_scope_direct_owners
+    assert im._task_runtime_scope_direct_owners[(9, new_process)] == 123
+    cleanup.assert_not_called()
+    im._release_task_runtime_scope_direct_owner(9, new_process)
+    cleanup.assert_called_once_with(123)
+    new_consumer.cancel()
+    await asyncio.gather(new_consumer, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------

@@ -827,12 +827,11 @@ async def _shutdown_runtime_services(
             failures.append(exc)
         logger.exception("Dispatcher shutdown failed")
 
-    if instance_manager._pty_backend is not None:
-        try:
-            await instance_manager._pty_backend.shutdown()
-        except BaseException as exc:
-            failures.append(exc)
-            logger.exception("PTY backend shutdown failed")
+    try:
+        await instance_manager.shutdown_pty_backend()
+    except BaseException as exc:
+        failures.append(exc)
+        logger.exception("PTY backend shutdown failed")
 
     try:
         await instance_manager.shutdown_codex_app_server()

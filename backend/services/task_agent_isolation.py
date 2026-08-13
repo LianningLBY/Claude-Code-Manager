@@ -43,6 +43,72 @@ CLAUDE_TASK_BUILTIN_TOOLS = (
     "Write",
 )
 
+# An unrestricted administrator turn historically used Claude's complete
+# built-in inventory.  It still needs an explicit permission allowlist because
+# subprocess environment scrubbing can make an interactive PTY report effective
+# ``default`` mode, but that compatibility profile must not silently remove
+# native web, agent, workflow, or skill tools.  ``default`` is Claude's own
+# stable token for the complete built-in inventory. Permission allow rules are
+# separate and concrete below.
+CLAUDE_UNRESTRICTED_BUILTIN_TOOLS = ("default",)
+
+# ``default`` is expanded only by Claude's base-tool parser.  The permission
+# parser treats it as a literal (unknown) tool name, so unrestricted turns need
+# concrete allow rules even though their inventory remains future-compatible.
+# These are the canonical built-ins registered by the pinned production CLI
+# (2.1.168), including conditionally enabled tools.  Keep canonical registry
+# names here rather than legacy aliases (for example ``Task`` or
+# ``MultiEdit``): ``--tools default`` controls availability, while this list
+# only prevents an available built-in from falling into a hidden permission
+# prompt after Claude's effective-mode fallback.
+CLAUDE_UNRESTRICTED_PERMISSION_TOOLS = (
+    "Agent",
+    "AskUserQuestion",
+    "Bash",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "DesignSync",
+    "Edit",
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitPlanMode",
+    "ExitWorktree",
+    "Glob",
+    "Grep",
+    "ListMcpResourcesTool",
+    "LSP",
+    "Monitor",
+    "NotebookEdit",
+    "PowerShell",
+    "PushNotification",
+    "Read",
+    "ReadMcpResourceTool",
+    "RemoteTrigger",
+    "REPL",
+    "ScheduleWakeup",
+    "SendMessage",
+    "SendUserFile",
+    "SendUserMessage",
+    "ShareOnboardingGuide",
+    "Skill",
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskOutput",
+    "TaskStop",
+    "TaskUpdate",
+    "TeamCreate",
+    "TeamDelete",
+    "TodoWrite",
+    "ToolSearch",
+    "WaitForMcpServers",
+    "WebFetch",
+    "WebSearch",
+    "Workflow",
+    "Write",
+)
+
 CLAUDE_DELIVERY_BUILTIN_TOOLS = (
     "Bash",
     "Edit",
@@ -1270,6 +1336,36 @@ def _mcp_allow_rules() -> list[str]:
     ]
 
 
+def claude_permission_allow_rules(
+    builtin_tools: Iterable[str] = CLAUDE_TASK_BUILTIN_TOOLS,
+    *,
+    include_mcp_tools: bool = True,
+) -> tuple[str, ...]:
+    """Return exact permission rules separately from Claude's tool inventory.
+
+    ``--tools`` accepts built-in tool names, while ``permissions.allow`` and
+    ``--allowedTools`` also accept MCP matchers.  Keeping this union public
+    lets direct and PTY launchers share one permission policy without putting
+    ``mcp__...`` rules into the built-in tool inventory.
+    """
+
+    selected_tools = tuple(builtin_tools)
+    if (
+        any(
+            not isinstance(tool, str) or not tool or "," in tool
+            for tool in selected_tools
+        )
+        or len(selected_tools) != len(set(selected_tools))
+    ):
+        raise TaskAgentIsolationError(
+            "Claude Task permissions require a unique exact tool allowlist"
+        )
+    return (
+        *selected_tools,
+        *(tuple(_mcp_allow_rules()) if include_mcp_tools else ()),
+    )
+
+
 def _generate_claude_isolation_settings(
     *,
     namespace: str,
@@ -1341,13 +1437,10 @@ def _generate_claude_isolation_settings(
             "Claude Task Git credential read overrides must be exact paths"
         )
     selected_tools = tuple(builtin_tools)
-    if any(
-        not isinstance(tool, str) or not tool or "," in tool
-        for tool in selected_tools
-    ):
-        raise TaskAgentIsolationError(
-            "Claude Task isolation requires an exact tool allowlist"
-        )
+    permission_allow_rules = claude_permission_allow_rules(
+        selected_tools,
+        include_mcp_tools=include_mcp_tools,
+    )
     capabilities = set(ssh_capabilities) & {"exec", "read", "write"}
     hooks = []
     if include_task_hooks and settings.ask_user_enabled:
@@ -1401,10 +1494,7 @@ def _generate_claude_isolation_settings(
         "permissions": {
             "defaultMode": "acceptEdits",
             "disableBypassPermissionsMode": "disable",
-            "allow": [
-                *selected_tools,
-                *(_mcp_allow_rules() if include_mcp_tools else []),
-            ],
+            "allow": list(permission_allow_rules),
             "deny": permission_denies,
         },
         "sandbox": {
@@ -1468,6 +1558,70 @@ def generate_claude_task_isolation_settings(
         disable_direct_network=disable_direct_network,
         include_task_hooks=True,
         builtin_tools=CLAUDE_TASK_BUILTIN_TOOLS,
+    )
+
+
+def generate_claude_unrestricted_task_settings(
+    task_id: int,
+    *,
+    turn_generation: int,
+    builtin_tools: Iterable[str] = CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
+) -> Path:
+    """Write one private permission profile for an unrestricted admin turn.
+
+    Claude 2.1.168 can report effective ``default`` mode when subprocess
+    credential scrubbing is enabled even though the launcher requested bypass
+    mode.  Exact built-in and CCM MCP allow rules prevent that compatibility
+    behavior from opening an invisible interactive permission dialog.  This
+    profile deliberately contains no filesystem or network sandbox; role and
+    execution-mode admission remain the launcher's responsibility.
+    """
+
+    if (
+        isinstance(turn_generation, bool)
+        or not isinstance(turn_generation, int)
+        or turn_generation < 0
+    ):
+        raise ValueError("Claude unrestricted Task turn generation is invalid")
+
+    from backend.config import settings
+    from backend.services.ask_user_settings import ask_user_hook_entry
+    from backend.services.trusted_runtime import materialize_trusted_python_asset
+
+    selected_tools = tuple(builtin_tools)
+    allow_rules = claude_permission_allow_rules(selected_tools)
+    payload: dict[str, object] = {
+        "showThinkingSummaries": True,
+        "disableAutoMode": "disable",
+        "disableAgentView": True,
+        "disableRemoteControl": True,
+        "disableSkillShellExecution": True,
+        "permissions": {
+            "defaultMode": "bypassPermissions",
+            "allow": list(allow_rules),
+            "deny": [],
+        },
+    }
+    if settings.ask_user_enabled:
+        ask_user_script = materialize_trusted_python_asset(
+            "ask_user_hook",
+            namespace="task",
+            identifier=task_id,
+        )
+        payload["hooks"] = {
+            "PreToolUse": [
+                ask_user_hook_entry(script_path=ask_user_script)
+            ]
+        }
+    # Keep one stable, atomically-replaced profile per Task.  A hot PTY
+    # session retains the Task scope for its complete native-process lifetime;
+    # using the turn generation in the filename would otherwise accumulate
+    # one stale owner-only file per chat turn until that session is released.
+    return write_private_json(
+        "task",
+        task_id,
+        "claude-unrestricted-security.json",
+        payload,
     )
 
 
@@ -1605,6 +1759,101 @@ def _require_exact_keys(value: object, expected: set[str], label: str) -> dict:
             f"Claude Task isolation {label} has an unexpected shape"
         )
     return value
+
+
+def validate_claude_unrestricted_task_settings(
+    settings_path: Path,
+    *,
+    builtin_tools: Iterable[str] = CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
+) -> None:
+    """Validate one CCM-owned unrestricted permission profile without CLI I/O."""
+
+    try:
+        info = settings_path.lstat()
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.geteuid()
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+        ):
+            raise ValueError("settings path is not a private regular file")
+        payload = json.loads(
+            settings_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_strict_json_object,
+        )
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise TaskAgentIsolationError(
+            "Claude unrestricted Task settings are not a private strict JSON file"
+        ) from exc
+
+    from backend.config import settings
+
+    require_ask_user_hook = bool(settings.ask_user_enabled)
+    expected_top_level = {
+        "showThinkingSummaries",
+        "disableAutoMode",
+        "disableAgentView",
+        "disableRemoteControl",
+        "disableSkillShellExecution",
+        "permissions",
+    }
+    if require_ask_user_hook:
+        expected_top_level.add("hooks")
+    if not isinstance(payload, dict) or set(payload) != expected_top_level:
+        raise TaskAgentIsolationError(
+            "Claude unrestricted Task settings have an unexpected shape"
+        )
+    exact_values = {
+        "showThinkingSummaries": True,
+        "disableAutoMode": "disable",
+        "disableAgentView": True,
+        "disableRemoteControl": True,
+        "disableSkillShellExecution": True,
+    }
+    if any(payload.get(key) != value for key, value in exact_values.items()):
+        raise TaskAgentIsolationError(
+            "Claude unrestricted Task settings weaken autonomous controls"
+        )
+
+    selected_tools = tuple(builtin_tools)
+    expected_allow = list(claude_permission_allow_rules(selected_tools))
+    permissions = _require_exact_keys(
+        payload.get("permissions"),
+        {"defaultMode", "allow", "deny"},
+        "unrestricted permissions",
+    )
+    if (
+        permissions["defaultMode"] != "bypassPermissions"
+        or permissions["allow"] != expected_allow
+        or permissions["deny"] != []
+    ):
+        raise TaskAgentIsolationError(
+            "Claude unrestricted Task permission policy is not exact"
+        )
+
+    if not require_ask_user_hook:
+        return
+    from backend.services.ask_user_settings import ask_user_hook_entry
+    from backend.services.trusted_runtime import (
+        trusted_python_asset_filename,
+        verify_materialized_trusted_python_asset,
+    )
+
+    hooks = _require_exact_keys(payload.get("hooks"), {"PreToolUse"}, "hooks")
+    ask_user_script = (
+        settings_path.parent / trusted_python_asset_filename("ask_user_hook")
+    )
+    verify_materialized_trusted_python_asset(
+        "ask_user_hook",
+        ask_user_script,
+    )
+    if hooks["PreToolUse"] != [
+        ask_user_hook_entry(script_path=ask_user_script)
+    ]:
+        raise TaskAgentIsolationError(
+            "Claude unrestricted Task AskUser hook is not the CCM-owned entry"
+        )
 
 
 def _validate_claude_security_contract(

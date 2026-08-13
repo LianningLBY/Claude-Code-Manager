@@ -838,6 +838,17 @@ class InstanceManager:
         self._active_private_runtime_tempdirs: dict[
             tuple[int, object], object
         ] = {}
+        # Task-scoped Claude settings, frozen hook entrypoints, and MCP config
+        # live in one private scope.  Direct turns own it until their exact
+        # process generation is terminal; PTY turns transfer ownership to the
+        # exact native Session, which can stay hot and run autonomous turns
+        # after the visible foreground consumer exits.  Scope cleanup is
+        # therefore owner-based rather than tied to a Dispatcher turn finally.
+        self._task_runtime_scope_pending: set[int] = set()
+        self._task_runtime_scope_direct_owners: dict[
+            tuple[int, object], int
+        ] = {}
+        self._task_runtime_scope_pty_owners: dict[object, int] = {}
         # Goal/Loop intentionally contain multiple sequential provider turns
         # inside one Task generation.  An already-bound source may cross the
         # provider boundary again only with a one-shot token minted from the
@@ -1210,23 +1221,76 @@ class InstanceManager:
             logger.exception("Codex inject failed for thread %s", thread_id)
             return False
 
-    async def release_pty_session(self, session_id: str) -> None:
+    async def release_pty_session(self, session_id: str) -> bool:
         """Return a PTY session to nothing — stop it and remove from the pool.
         Used when a workload (e.g. a loop task) is finished with its session.
         No-op when PTY mode is not in use."""
         if self._pty_backend is None or not session_id:
-            return
+            return False
+        pool = self._pty_backend._pool
+        session = await pool.get(session_id)
         try:
-            await self._pty_backend._pool.remove(session_id)
+            # SessionPool.remove() unpublishes the exact Session before it
+            # awaits stop.  Keep that cleanup alive across caller
+            # cancellation so an unpublished native process cannot survive.
+            await _settle_instance_cleanup(pool.remove(session_id))
         except Exception:
             logger.exception("Failed to release PTY session %s", session_id)
+            # If the pinned pool already popped the Session before stop
+            # failed, retain our captured identity and make one direct,
+            # cancellation-safe recovery attempt.  Cold resume remains
+            # forbidden unless exact native death is observable afterwards.
+            if session is None or await pool.get(session_id) is session:
+                return False
+            try:
+                await _settle_instance_cleanup(session.stop())
+            except Exception:
+                logger.exception(
+                    "Failed to recover removed PTY session %s", session_id
+                )
+                return False
+        if session is None:
+            return True
+        pool_session = await pool.get(session_id)
+        released = bool(
+            pool_session is not session
+            and getattr(session, "is_alive", True) is False
+        )
+        if released:
+            self._release_task_runtime_scope_pty_owner(session)
+        return released
 
     async def drain_idle_pty_sessions(self) -> int:
         """Stop idle PTY sessions (called after PTY mode is switched off).
         In-flight turns are untouched and finish on the PTY path."""
         if self._pty_backend is None:
             return 0
-        return await self._pty_backend.drain_idle_sessions()
+        before = dict(getattr(self._pty_backend._pool, "_sessions", {}))
+        drained = await self._pty_backend.drain_idle_sessions()
+        after = getattr(self._pty_backend._pool, "_sessions", {})
+        for session_id, session in before.items():
+            if (
+                after.get(session_id) is not session
+                and getattr(session, "is_alive", True) is False
+            ):
+                self._release_task_runtime_scope_pty_owner(session)
+        self._reap_dead_task_runtime_scope_pty_owners()
+        return drained
+
+    async def shutdown_pty_backend(self) -> None:
+        """Stop PTY transports, then release only proven-dead scope owners."""
+
+        backend = self._pty_backend
+        if backend is None:
+            return
+        sessions = set(
+            getattr(getattr(backend, "_pool", None), "_sessions", {}).values()
+        )
+        await backend.shutdown()
+        for session in sessions:
+            if getattr(session, "is_alive", True) is False:
+                self._release_task_runtime_scope_pty_owner(session)
+        self._reap_dead_task_runtime_scope_pty_owners()
 
     def set_pty_mode(self, enabled: bool) -> bool:
         """Enable/disable PTY mode at runtime. Returns the effective state.
@@ -1667,6 +1731,14 @@ class InstanceManager:
                                 )
                             )
                         )
+                        if (
+                            task_id is not None
+                            and not unresolved_generation
+                            and task_id in self._task_runtime_scope_pending
+                        ):
+                            self._discard_task_runtime_scope_reservation(
+                                task_id
+                            )
                         if (
                             not unresolved_generation
                             and self._launch_reservations.get(instance_id)
@@ -2452,6 +2524,51 @@ class InstanceManager:
 
         selected_actual_transport: str | None = None
 
+        async def require_current_initiating_principal() -> None:
+            """Revalidate a frozen user principal at the provider boundary.
+
+            The Dispatcher performs the same check when it first consumes a
+            queued message.  Automatic transient retries and account rotation
+            can wait and relaunch without returning through that queue, so the
+            final common launch boundary must not trust their cached role.
+            System/Worker turns intentionally have no local user id and retain
+            their separately authenticated envelope semantics.
+            """
+
+            if initiating_user_id is None:
+                return
+            if (
+                isinstance(initiating_user_id, bool)
+                or not isinstance(initiating_user_id, int)
+                or initiating_user_id <= 0
+            ):
+                raise LaunchSupersededError(
+                    "Task turn initiator identity is invalid"
+                )
+
+            from backend.models.user import User
+
+            async with self.db_factory() as principal_db:
+                principal = await principal_db.get(User, initiating_user_id)
+                if principal is None or not principal.is_active:
+                    raise LaunchSupersededError(
+                        "Task turn initiator is no longer active"
+                    )
+                principal_role = principal.role
+
+            expected_execution_mode = (
+                "unrestricted"
+                if principal_role in {"admin", "super_admin"}
+                else "sandbox"
+            )
+            if (
+                principal_role != initiating_user_role
+                or expected_execution_mode != execution_mode
+            ):
+                raise LaunchSupersededError(
+                    "Task turn initiator role changed after admission"
+                )
+
         async def admit_external_launch(actual_transport: str) -> None:
             """Persist the actual route and cross the provider boundary once."""
 
@@ -2491,6 +2608,10 @@ class InstanceManager:
                         "Claude Delivery Git isolation boundary changed at "
                         "provider launch"
                     )
+            # Retry/backoff and account migration may have taken long enough
+            # for an administrator to be disabled or demoted.  Revalidate as
+            # late as possible before any provider process/turn is admitted.
+            await require_current_initiating_principal()
             # Sharing may be enabled after the initial Task snapshot. Recheck
             # at the last common boundary for Claude PTY/direct and Codex
             # app-server/direct routes; an unavailable check is also a veto.
@@ -3046,14 +3167,26 @@ class InstanceManager:
         mcp_config_path = None
         claude_isolation_settings_path = None
         claude_isolation_tools: tuple[str, ...] | None = None
+        claude_isolation_allowed_rules: tuple[str, ...] | None = None
+        claude_unrestricted_settings_path = None
         claude_unrestricted_tools: tuple[str, ...] | None = None
+        claude_unrestricted_allowed_rules: tuple[str, ...] | None = None
         claude_delivery_git_boundary = None
+        claude_task_runtime_scope_reserved = False
         if provider == "claude" and agent_unrestricted_delivery_turn:
             from backend.services.task_agent_isolation import (
                 CLAUDE_DELIVERY_BUILTIN_TOOLS,
             )
 
             claude_unrestricted_tools = CLAUDE_DELIVERY_BUILTIN_TOOLS
+        if (
+            provider == "claude"
+            and task_id
+            and not pr_review_task
+            and not agent_unrestricted_delivery_turn
+        ):
+            self._reserve_task_runtime_scope(task_id)
+            claude_task_runtime_scope_reserved = True
         if (
             provider == "claude"
             and task_id
@@ -3070,6 +3203,43 @@ class InstanceManager:
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
                 task_status=task_status,
+            )
+        if (
+            provider == "claude"
+            and task_id
+            and not pr_review_task
+            and not delivery_task
+            and unrestricted_admin_turn
+        ):
+            from backend.services.task_agent_isolation import (
+                CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+                CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
+                claude_permission_allow_rules,
+                generate_claude_unrestricted_task_settings,
+                validate_claude_unrestricted_task_settings,
+            )
+
+            if task_turn_generation is None:
+                raise LaunchSupersededError(
+                    "Claude unrestricted Task lost its exact turn generation"
+                )
+            claude_unrestricted_tools = CLAUDE_UNRESTRICTED_BUILTIN_TOOLS
+            claude_unrestricted_allowed_rules = (
+                claude_permission_allow_rules(
+                    CLAUDE_UNRESTRICTED_PERMISSION_TOOLS
+                )
+            )
+            claude_unrestricted_settings_path = (
+                generate_claude_unrestricted_task_settings(
+                    task_id,
+                    turn_generation=task_turn_generation,
+                    builtin_tools=CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
+                )
+            )
+            await asyncio.to_thread(
+                validate_claude_unrestricted_task_settings,
+                claude_unrestricted_settings_path,
+                builtin_tools=CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
             )
         if (
             provider == "claude"
@@ -3119,6 +3289,16 @@ class InstanceManager:
                 })
 
                 claude_isolation_tools = CLAUDE_DELIVERY_BUILTIN_TOOLS
+                from backend.services.task_agent_isolation import (
+                    claude_permission_allow_rules,
+                )
+
+                claude_isolation_allowed_rules = (
+                    claude_permission_allow_rules(
+                        CLAUDE_DELIVERY_BUILTIN_TOOLS,
+                        include_mcp_tools=False,
+                    )
+                )
                 (
                     claude_isolation_settings_path,
                     claude_delivery_git_boundary,
@@ -3138,6 +3318,15 @@ class InstanceManager:
                 )
             else:
                 claude_isolation_tools = CLAUDE_TASK_BUILTIN_TOOLS
+                from backend.services.task_agent_isolation import (
+                    claude_permission_allow_rules,
+                )
+
+                claude_isolation_allowed_rules = (
+                    claude_permission_allow_rules(
+                        CLAUDE_TASK_BUILTIN_TOOLS,
+                    )
+                )
                 claude_isolation_settings_path = (
                     generate_claude_task_isolation_settings(
                         task_id,
@@ -3483,6 +3672,10 @@ class InstanceManager:
                         source_log_id=source_log_id,
                         current_message=current_message,
                         queue_timestamp=queue_timestamp,
+                        initiating_user_id=initiating_user_id,
+                        initiating_user_role=initiating_user_role,
+                        execution_mode=execution_mode,
+                        attachment_paths=attachment_paths,
                         disable_project_config=(
                             cloudrouter_account is not None
                             or pr_review_task
@@ -3762,11 +3955,27 @@ class InstanceManager:
                 source_log_id=source_log_id,
                 current_message=current_message,
                 queue_timestamp=queue_timestamp,
+                initiating_user_id=initiating_user_id,
+                initiating_user_role=initiating_user_role,
+                execution_mode=execution_mode,
+                attachment_paths=attachment_paths,
                 claude_isolation_settings_path=(
                     claude_isolation_settings_path
                 ),
                 claude_isolation_tools=claude_isolation_tools,
+                claude_isolation_allowed_rules=(
+                    claude_isolation_allowed_rules
+                ),
+                claude_unrestricted_settings_path=(
+                    claude_unrestricted_settings_path
+                ),
                 claude_unrestricted_tools=claude_unrestricted_tools,
+                claude_unrestricted_allowed_rules=(
+                    claude_unrestricted_allowed_rules
+                ),
+                claude_task_runtime_scope_reserved=(
+                    claude_task_runtime_scope_reserved
+                ),
                 private_runtime_tempdir=task_private_tmpdir,
                 on_launch_admitted=admit_claude_pty_transport,
             )
@@ -3801,7 +4010,14 @@ class InstanceManager:
             ),
             claude_isolation_settings_path=claude_isolation_settings_path,
             claude_isolation_tools=claude_isolation_tools,
+            claude_isolation_allowed_rules=claude_isolation_allowed_rules,
+            claude_unrestricted_settings_path=(
+                claude_unrestricted_settings_path
+            ),
             claude_unrestricted_tools=claude_unrestricted_tools,
+            claude_unrestricted_allowed_rules=(
+                claude_unrestricted_allowed_rules
+            ),
         )
         if provider == "codex":
             logger.info(
@@ -3946,6 +4162,11 @@ class InstanceManager:
                     task_id,
                     cmd,
                     spawn_kwargs,
+                    task_runtime_scope_task_id=(
+                        task_id
+                        if claude_task_runtime_scope_reserved
+                        else None
+                    ),
                 )
             except BaseException:
                 if task_private_tmpdir is not None:
@@ -4009,6 +4230,10 @@ class InstanceManager:
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
                 "codex_service_tier": codex_service_tier,
+                "initiating_user_id": initiating_user_id,
+                "initiating_user_role": initiating_user_role,
+                "execution_mode": execution_mode,
+                "attachment_paths": tuple(attachment_paths),
             }
 
         return await self._persist_and_track_launch(
@@ -4499,6 +4724,10 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        attachment_paths: Sequence[str] = (),
         disable_project_config: bool = False,
         disable_user_mcp: bool = False,
         codex_service_tier: str = "default",
@@ -4588,6 +4817,10 @@ class InstanceManager:
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
                 "codex_service_tier": codex_service_tier,
+                "initiating_user_id": initiating_user_id,
+                "initiating_user_role": initiating_user_role,
+                "execution_mode": execution_mode,
+                "attachment_paths": tuple(attachment_paths),
             }
 
         try:
@@ -4783,6 +5016,10 @@ class InstanceManager:
                         instance_id,
                         process,
                     )
+                    self._release_task_runtime_scope_direct_owner(
+                        instance_id,
+                        process,
+                    )
                 try:
                     async with self.db_factory() as db:
                         if reap_confirmed:
@@ -4883,11 +5120,11 @@ class InstanceManager:
                     exc_info=(type(error), error, error.__traceback__),
                 )
 
+            recovery_key = (instance_id, process)
+            pending_recovery = self._consumer_recovery_pending.get(
+                recovery_key
+            )
             if self._consumer_records.get(instance_id) is record:
-                recovery_key = (instance_id, process)
-                pending_recovery = self._consumer_recovery_pending.get(
-                    recovery_key
-                )
                 if pending_recovery is not None:
                     # The OS process is gone, but the durable Task/Instance
                     # owner was not settled.  Keep every exact in-memory handle
@@ -4917,6 +5154,22 @@ class InstanceManager:
                     self._launch_params.pop(instance_id, None)
                     if self._process_groups.get(instance_id) is process:
                         self._process_groups.pop(instance_id, None)
+                self._release_task_runtime_scope_direct_owner(
+                    instance_id,
+                    process,
+                )
+            elif (
+                pending_recovery is None
+                and self._generation_reap_confirmed(instance_id, process)
+            ):
+                # A chat retry can publish a replacement record on the same
+                # reusable slot before this old consumer's done callback runs.
+                # The instance-keyed maps belong to the replacement, but the
+                # exact terminal process must still surrender its Task scope.
+                self._release_task_runtime_scope_direct_owner(
+                    instance_id,
+                    process,
+                )
 
         consumer.add_done_callback(_consumer_done)
         return record
@@ -5370,6 +5623,153 @@ class InstanceManager:
             add_component("git-env-value", value.encode("utf-8"))
         return digest.hexdigest()
 
+    def _reserve_task_runtime_scope(self, task_id: int) -> None:
+        """Fence a Task scope while launch files are being materialized."""
+
+        self._task_runtime_scope_pending.add(task_id)
+
+    def _discard_task_runtime_scope_reservation(self, task_id: int) -> bool:
+        """Release a pre-spawn fence after proving no generation escaped."""
+
+        self._task_runtime_scope_pending.discard(task_id)
+        return self._cleanup_task_runtime_scope_if_unused(task_id)
+
+    def _adopt_task_runtime_scope_direct(
+        self,
+        task_id: int,
+        instance_id: int,
+        process: object,
+    ) -> None:
+        key = (instance_id, process)
+        existing = self._task_runtime_scope_direct_owners.get(key)
+        if existing is not None and existing != task_id:
+            raise RuntimeError("Direct process already owns another Task scope")
+        self._task_runtime_scope_direct_owners[key] = task_id
+        self._task_runtime_scope_pending.discard(task_id)
+
+    def _adopt_task_runtime_scope_pty(
+        self,
+        task_id: int,
+        session: object,
+    ) -> None:
+        existing = self._task_runtime_scope_pty_owners.get(session)
+        if existing is not None and existing != task_id:
+            raise RuntimeError("PTY Session already owns another Task scope")
+        self._task_runtime_scope_pty_owners[session] = task_id
+        self._task_runtime_scope_pending.discard(task_id)
+        self._install_task_runtime_scope_pty_stop_callback(session)
+        self._reap_dead_task_runtime_scope_pty_owners()
+
+    def _install_task_runtime_scope_pty_stop_callback(
+        self,
+        session: object,
+    ) -> None:
+        """Release a Session owner after its exact normal stop succeeds.
+
+        The pinned pool's periodic reaper has no host callback, but every
+        remove/evict/reap/shutdown path awaits ``Session.stop``.  Wrapping the
+        resident object covers those paths while deliberately retaining scope
+        across a native-process death that Session may auto-resume.
+        """
+
+        stop = getattr(session, "stop", None)
+        if not callable(stop):
+            return
+        marker = "_ccm_task_runtime_scope_stop_callback"
+        if getattr(session, marker, False):
+            return
+
+        async def stop_and_release(*args, **kwargs):
+            result = await _settle_instance_cleanup(stop(*args, **kwargs))
+            backend = self._pty_backend
+            registrations = (
+                getattr(getattr(backend, "_pool", None), "_sessions", None),
+                getattr(backend, "_sessions", None),
+            )
+            remains_registered = any(
+                candidate is session
+                for sessions in registrations
+                if isinstance(sessions, dict)
+                for candidate in sessions.values()
+            )
+            if (
+                not remains_registered
+                and getattr(session, "is_alive", True) is False
+            ):
+                self._release_task_runtime_scope_pty_owner(session)
+            return result
+
+        setattr(session, "stop", stop_and_release)
+        setattr(session, marker, True)
+
+    def _reap_dead_task_runtime_scope_pty_owners(self) -> None:
+        """Release Sessions already removed by claude-pty's own pool reaper.
+
+        Overflow eviction and the periodic idle reaper live inside the pinned
+        ``claude_pty`` dependency and do not call back into InstanceManager.
+        Absence from that pool plus exact native death is the conservative
+        proof that their Task assets are no longer in use.
+        """
+
+        registered_sessions: set[object] = set()
+        backend = self._pty_backend
+        if backend is not None:
+            for sessions in (
+                getattr(getattr(backend, "_pool", None), "_sessions", None),
+                getattr(backend, "_sessions", None),
+            ):
+                if isinstance(sessions, dict):
+                    registered_sessions.update(sessions.values())
+        for session in tuple(self._task_runtime_scope_pty_owners):
+            if (
+                session not in registered_sessions
+                and getattr(session, "is_alive", True) is False
+            ):
+                self._release_task_runtime_scope_pty_owner(session)
+
+    def _task_runtime_scope_has_owner(self, task_id: int) -> bool:
+        return bool(
+            task_id in self._task_runtime_scope_pending
+            or task_id in self._task_runtime_scope_direct_owners.values()
+            or task_id in self._task_runtime_scope_pty_owners.values()
+        )
+
+    def _cleanup_task_runtime_scope_if_unused(self, task_id: int) -> bool:
+        """Remove a scope only when no exact provider generation owns it."""
+
+        if self._task_runtime_scope_has_owner(task_id):
+            return False
+        from backend.services.mcp_config import cleanup_mcp_config
+
+        cleanup_mcp_config(task_id)
+        return True
+
+    def _release_task_runtime_scope_direct_owner(
+        self,
+        instance_id: int,
+        process: object,
+    ) -> None:
+        task_id = self._task_runtime_scope_direct_owners.pop(
+            (instance_id, process), None
+        )
+        if task_id is not None:
+            self._cleanup_task_runtime_scope_if_unused(task_id)
+
+    def _release_task_runtime_scope_pty_owner(self, session: object) -> None:
+        task_id = self._task_runtime_scope_pty_owners.pop(session, None)
+        if task_id is not None:
+            self._cleanup_task_runtime_scope_if_unused(task_id)
+
+    def cleanup_task_runtime_scope_after_turn(self, task_id: int) -> bool:
+        """Dispatcher terminal hook; hot PTY owners deliberately retain it."""
+
+        had_owner = self._task_runtime_scope_has_owner(task_id)
+        self._reap_dead_task_runtime_scope_pty_owners()
+        if had_owner and not self._task_runtime_scope_has_owner(task_id):
+            # Reaping the final dead PTY owner already performed the cleanup.
+            return True
+        return self._cleanup_task_runtime_scope_if_unused(task_id)
+
     def _reserve_private_runtime_tempdir(
         self,
         instance_id: int,
@@ -5501,9 +5901,17 @@ class InstanceManager:
         source_log_id: int | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        attachment_paths: Sequence[str] = (),
         claude_isolation_settings_path: Path | None = None,
         claude_isolation_tools: Sequence[str] | None = None,
+        claude_isolation_allowed_rules: Sequence[str] | None = None,
+        claude_unrestricted_settings_path: Path | None = None,
         claude_unrestricted_tools: Sequence[str] | None = None,
+        claude_unrestricted_allowed_rules: Sequence[str] | None = None,
+        claude_task_runtime_scope_reserved: bool = False,
         private_runtime_tempdir=None,
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
     ) -> int:
@@ -5515,18 +5923,25 @@ class InstanceManager:
         unchanged.
         """
         isolation_fingerprint = None
-        if claude_unrestricted_tools is not None:
-            isolation_fingerprint = (
-                "agent-unrestricted-v1",
-                tuple(claude_unrestricted_tools),
-            )
-        elif claude_isolation_settings_path is not None:
+        runtime_settings_path = (
+            claude_unrestricted_settings_path
+            or claude_isolation_settings_path
+        )
+        if runtime_settings_path is not None:
             isolation_fingerprint = (
                 self._claude_task_runtime_fingerprint(
-                    claude_isolation_settings_path,
+                    runtime_settings_path,
                     mcp_config_path=mcp_config_path,
                     git_env=git_env,
                 )
+            )
+        elif claude_unrestricted_tools is not None:
+            # Legacy unrestricted Delivery turns intentionally have no Task
+            # settings/MCP profile. Their fixed built-in inventory remains the
+            # complete hot-process boundary.
+            isolation_fingerprint = (
+                "agent-unrestricted-v1",
+                tuple(claude_unrestricted_tools),
             )
         if isolation_fingerprint is not None and resume_session_id:
             existing_session = (
@@ -5545,7 +5960,12 @@ class InstanceManager:
             ):
                 # A hot process cannot absorb changed CLI settings. Stop
                 # it while idle and cold-resume the same native session.
-                await self.release_pty_session(resume_session_id)
+                released = await self.release_pty_session(resume_session_id)
+                if not released:
+                    raise RuntimeError(
+                        "Changed Claude Task runtime could not stop its exact "
+                        "hot PTY Session"
+                    )
 
         is_cold_start = (
             resume_session_id
@@ -5588,6 +6008,10 @@ class InstanceManager:
                 "source_log_id": source_log_id,
                 "current_message": current_message or prompt,
                 "queue_timestamp": queue_timestamp,
+                "initiating_user_id": initiating_user_id,
+                "initiating_user_role": initiating_user_role,
+                "execution_mode": execution_mode,
+                "attachment_paths": tuple(attachment_paths),
             }
             self._launch_params[instance_id] = pty_launch_params
         try:
@@ -5603,6 +6027,7 @@ class InstanceManager:
                 wrapper = claude_binary_override
                 if original_build_config is None and (
                     claude_isolation_settings_path is not None
+                    or claude_unrestricted_settings_path is not None
                     or claude_unrestricted_tools is not None
                     or cloudrouter_api
                     or wrapper is not None
@@ -5692,11 +6117,18 @@ class InstanceManager:
                     if claude_isolation_settings_path is not None:
                         from backend.services.task_agent_isolation import (
                             CLAUDE_TASK_BUILTIN_TOOLS,
+                            claude_permission_allow_rules,
                         )
 
                         selected_claude_tools = tuple(
                             claude_isolation_tools
                             or CLAUDE_TASK_BUILTIN_TOOLS
+                        )
+                        selected_allowed_rules = tuple(
+                            claude_isolation_allowed_rules
+                            or claude_permission_allow_rules(
+                                selected_claude_tools,
+                            )
                         )
 
                         task_wrapper = Path(__file__).with_name(
@@ -5717,6 +6149,9 @@ class InstanceManager:
                             "CCM_TASK_CLAUDE_TOOLS": ",".join(
                                 selected_claude_tools
                             ),
+                            "CCM_TASK_CLAUDE_ALLOWED_RULES": ",".join(
+                                selected_allowed_rules
+                            ),
                         })
                         cfg.claude_binary = str(task_wrapper)
                         cfg.dangerously_skip_permissions = False
@@ -5726,6 +6161,23 @@ class InstanceManager:
                             isolation_fingerprint,
                         )
                     elif claude_unrestricted_tools is not None:
+                        from backend.services.task_agent_isolation import (
+                            claude_permission_allow_rules,
+                        )
+
+                        selected_claude_tools = tuple(
+                            claude_unrestricted_tools
+                        )
+                        selected_allowed_rules = tuple(
+                            claude_unrestricted_allowed_rules
+                            or claude_permission_allow_rules(
+                                selected_claude_tools,
+                                include_mcp_tools=(
+                                    claude_unrestricted_settings_path
+                                    is not None
+                                ),
+                            )
+                        )
                         task_wrapper = Path(__file__).with_name(
                             "task_claude_wrapper.sh"
                         )
@@ -5740,9 +6192,16 @@ class InstanceManager:
                             "CCM_TASK_CLAUDE_PROFILE": "unrestricted",
                             "CCM_TASK_CLAUDE_BINARY": str(final_binary),
                             "CCM_TASK_CLAUDE_TOOLS": ",".join(
-                                claude_unrestricted_tools
+                                selected_claude_tools
+                            ),
+                            "CCM_TASK_CLAUDE_ALLOWED_RULES": ",".join(
+                                selected_allowed_rules
                             ),
                         })
+                        if claude_unrestricted_settings_path is not None:
+                            overrides["CCM_TASK_CLAUDE_SETTINGS"] = str(
+                                claude_unrestricted_settings_path
+                            )
                         cfg.claude_binary = str(task_wrapper)
                         cfg.dangerously_skip_permissions = True
                         setattr(
@@ -5824,6 +6283,12 @@ class InstanceManager:
                     "PTY process exited during startup "
                     f"(exit_code={exit_code})"
                 )
+            if (
+                task_id is not None
+                and claude_task_runtime_scope_reserved
+                and native_session is not None
+            ):
+                self._adopt_task_runtime_scope_pty(task_id, native_session)
             turn_started_at = datetime.utcnow()
             if container_exec_spec is not None and process is not None:
                 self._container_mgr.register_exec(
@@ -6014,7 +6479,11 @@ class InstanceManager:
                             )
 
                     reap_confirmed = backend_stopped and (
-                        process is None or process.returncode is not None
+                        process is None
+                        or self._generation_reap_confirmed(
+                            instance_id,
+                            process,
+                        )
                     )
                     if reap_confirmed and process is not None:
                         try:
@@ -6040,6 +6509,23 @@ class InstanceManager:
                         process=process,
                     )
                 if reap_confirmed:
+                    native_session = (
+                        getattr(process, "session", None)
+                        if process is not None
+                        else None
+                    )
+                    if (
+                        native_session is not None
+                        and getattr(native_session, "is_alive", True) is False
+                    ):
+                        self._release_task_runtime_scope_pty_owner(
+                            native_session
+                        )
+                    if (
+                        task_id is not None
+                        and claude_task_runtime_scope_reserved
+                    ):
+                        self._discard_task_runtime_scope_reservation(task_id)
                     if (
                         pty_launch_params is not None
                         and self._launch_params.get(instance_id)
@@ -6995,7 +7481,10 @@ class InstanceManager:
             )
             return False
         # Absence/unknown is not proof that an exact native Session stopped.
-        return getattr(session, "is_alive", True) is False
+        stopped = getattr(session, "is_alive", True) is False
+        if stopped:
+            self._release_task_runtime_scope_pty_owner(session)
+        return stopped
 
     async def _stop_exact_detached_pty_session(
         self,
@@ -9098,7 +9587,10 @@ class InstanceManager:
         tools_disabled: bool = False,
         claude_isolation_settings_path: Path | None = None,
         claude_isolation_tools: Sequence[str] | None = None,
+        claude_isolation_allowed_rules: Sequence[str] | None = None,
+        claude_unrestricted_settings_path: Path | None = None,
         claude_unrestricted_tools: Sequence[str] | None = None,
+        claude_unrestricted_allowed_rules: Sequence[str] | None = None,
     ) -> list[str]:
         """Build the subprocess command for a supported coding-agent CLI."""
         if provider == "claude":
@@ -9111,10 +9603,15 @@ class InstanceManager:
             if claude_isolation_settings_path is not None:
                 from backend.services.task_agent_isolation import (
                     CLAUDE_TASK_BUILTIN_TOOLS,
+                    claude_permission_allow_rules,
                 )
 
                 selected_claude_tools = tuple(
                     claude_isolation_tools or CLAUDE_TASK_BUILTIN_TOOLS
+                )
+                selected_allowed_rules = tuple(
+                    claude_isolation_allowed_rules
+                    or claude_permission_allow_rules(selected_claude_tools)
                 )
 
                 cmd.extend([
@@ -9133,12 +9630,30 @@ class InstanceManager:
                         "--tools",
                         ",".join(selected_claude_tools),
                         "--allowedTools",
-                        ",".join(selected_claude_tools),
+                        ",".join(selected_allowed_rules),
                     ])
             else:
                 cmd.append("--dangerously-skip-permissions")
                 if claude_unrestricted_tools is not None and not tools_disabled:
+                    from backend.services.task_agent_isolation import (
+                        claude_permission_allow_rules,
+                    )
+
                     selected_claude_tools = tuple(claude_unrestricted_tools)
+                    selected_allowed_rules = tuple(
+                        claude_unrestricted_allowed_rules
+                        or claude_permission_allow_rules(
+                            selected_claude_tools,
+                            include_mcp_tools=(
+                                claude_unrestricted_settings_path is not None
+                            ),
+                        )
+                    )
+                    if claude_unrestricted_settings_path is not None:
+                        cmd.extend([
+                            "--settings",
+                            str(claude_unrestricted_settings_path),
+                        ])
                     cmd.extend([
                         "--setting-sources",
                         "",
@@ -9148,7 +9663,7 @@ class InstanceManager:
                         "--tools",
                         ",".join(selected_claude_tools),
                         "--allowedTools",
-                        ",".join(selected_claude_tools),
+                        ",".join(selected_allowed_rules),
                     ])
             if resume_session_id:
                 cmd.extend(["--resume", resume_session_id])
@@ -10215,6 +10730,20 @@ class InstanceManager:
                         retry_kwargs["queue_timestamp"] = params[
                             "queue_timestamp"
                         ]
+                    retry_kwargs.update({
+                        "initiating_user_id": params.get(
+                            "initiating_user_id"
+                        ),
+                        "initiating_user_role": params.get(
+                            "initiating_user_role", "member"
+                        ),
+                        "execution_mode": params.get(
+                            "execution_mode", "sandbox"
+                        ),
+                        "attachment_paths": tuple(
+                            params.get("attachment_paths") or ()
+                        ),
+                    })
                     admitted = await enqueuer(**retry_kwargs)
                     if admitted is False:
                         logger.info(
@@ -10378,6 +10907,20 @@ class InstanceManager:
                                     retry_kwargs["queue_timestamp"] = (
                                         params["queue_timestamp"]
                                     )
+                                retry_kwargs.update({
+                                    "initiating_user_id": params.get(
+                                        "initiating_user_id"
+                                    ),
+                                    "initiating_user_role": params.get(
+                                        "initiating_user_role", "member"
+                                    ),
+                                    "execution_mode": params.get(
+                                        "execution_mode", "sandbox"
+                                    ),
+                                    "attachment_paths": tuple(
+                                        params.get("attachment_paths") or ()
+                                    ),
+                                })
                                 await dispatcher.enqueue_message(**retry_kwargs)
                 except Exception:
                     logger.exception(
@@ -11361,6 +11904,14 @@ class InstanceManager:
                 codex_service_tier=params.get(
                     "codex_service_tier", "default"
                 ),
+                initiating_user_id=params.get("initiating_user_id"),
+                initiating_user_role=params.get(
+                    "initiating_user_role", "member"
+                ),
+                execution_mode=params.get("execution_mode", "sandbox"),
+                attachment_paths=tuple(
+                    params.get("attachment_paths") or ()
+                ),
             )
             return True
 
@@ -11467,6 +12018,16 @@ class InstanceManager:
                 requeue_kwargs["queue_timestamp"] = params[
                     "queue_timestamp"
                 ]
+            requeue_kwargs.update({
+                "initiating_user_id": params.get("initiating_user_id"),
+                "initiating_user_role": params.get(
+                    "initiating_user_role", "member"
+                ),
+                "execution_mode": params.get("execution_mode", "sandbox"),
+                "attachment_paths": tuple(
+                    params.get("attachment_paths") or ()
+                ),
+            })
             admitted = await dispatcher.enqueue_message(**requeue_kwargs)
             if admitted is False:
                 logger.info(
@@ -11580,6 +12141,14 @@ class InstanceManager:
                     queue_timestamp=params.get("queue_timestamp"),
                     codex_service_tier=params.get(
                         "codex_service_tier", "default"
+                    ),
+                    initiating_user_id=params.get("initiating_user_id"),
+                    initiating_user_role=params.get(
+                        "initiating_user_role", "member"
+                    ),
+                    execution_mode=params.get("execution_mode", "sandbox"),
+                    attachment_paths=tuple(
+                        params.get("attachment_paths") or ()
                     ),
                 )
                 return True
@@ -11718,6 +12287,14 @@ class InstanceManager:
                 queue_timestamp=params.get("queue_timestamp"),
                 codex_service_tier=params.get(
                     "codex_service_tier", "default"
+                ),
+                initiating_user_id=params.get("initiating_user_id"),
+                initiating_user_role=params.get(
+                    "initiating_user_role", "member"
+                ),
+                execution_mode=params.get("execution_mode", "sandbox"),
+                attachment_paths=tuple(
+                    params.get("attachment_paths") or ()
                 ),
             )
             return True
@@ -13883,6 +14460,7 @@ class InstanceManager:
         spawn_kwargs: dict,
         *,
         codex_home: str | None = None,
+        task_runtime_scope_task_id: int | None = None,
     ) -> asyncio.subprocess.Process:
         """Spawn and register a direct process without a cancellation gap.
 
@@ -13916,6 +14494,12 @@ class InstanceManager:
             # spawn cancellation so failed cleanup cannot release the home
             # while the child generation may still be alive.
             self._codex_exec_homes[instance_id] = codex_home
+        if task_runtime_scope_task_id is not None:
+            self._adopt_task_runtime_scope_direct(
+                task_runtime_scope_task_id,
+                instance_id,
+                process,
+            )
 
         if cancellation is None:
             return process
@@ -13943,6 +14527,10 @@ class InstanceManager:
                     self._codex_exec_homes.pop(instance_id, None)
             if self._process_groups.get(instance_id) is process:
                 self._process_groups.pop(instance_id, None)
+            self._release_task_runtime_scope_direct_owner(
+                instance_id,
+                process,
+            )
 
         cleanup = asyncio.create_task(cleanup_cancelled_spawn())
         cleanup_error: BaseException | None = None
@@ -16242,6 +16830,18 @@ class InstanceManager:
         record = self._consumer_records.get(instance_id)
         if record is not None and record.task is task:
             self._consumer_records.pop(instance_id, None)
+        if process is not None:
+            native_session = getattr(process, "session", None)
+            if (
+                native_session is not None
+                and getattr(native_session, "is_alive", True) is False
+            ):
+                self._release_task_runtime_scope_pty_owner(native_session)
+            if self._generation_reap_confirmed(instance_id, process):
+                self._release_task_runtime_scope_direct_owner(
+                    instance_id,
+                    process,
+                )
         self._clear_consumer_recovery_pending(instance_id, process)
         self._transient_attempts.pop(instance_id, None)
         self._pty_rate_limit_seen.discard(instance_id)

@@ -11566,9 +11566,9 @@ class GlobalDispatcher:
                 if failed:
                     await self._handle_pr_review_failure(task, str(e))
         finally:
-            from backend.services.mcp_config import cleanup_mcp_config
-
-            cleanup_mcp_config(task.id)
+            self.instance_manager.cleanup_task_runtime_scope_after_turn(
+                task.id
+            )
             _cleanup_skill_prompt_files(task.id)
             if has_temporary_initial_skills:
                 try:

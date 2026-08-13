@@ -84,6 +84,9 @@ def _make_dispatcher(db_factory):
     )
     instance_manager.wait_for_output_consumer = AsyncMock()
     instance_manager._publish_agent_terminal_admission = AsyncMock()
+    instance_manager.cleanup_task_runtime_scope_after_turn = MagicMock(
+        return_value=True
+    )
     # Model the real InstanceManager interface used by failure classification.
     instance_manager.pty_mode_enabled = False
     instance_manager.is_pty_managed_turn = MagicMock(return_value=False)
@@ -1244,6 +1247,9 @@ async def test_lifecycle_success(db_factory):
     assert launch["source_log_id"] == source.id
 
     assert d.broadcaster.broadcast.await_count >= 2
+    d.instance_manager.cleanup_task_runtime_scope_after_turn.assert_called_once_with(
+        task_obj.id
+    )
 
 
 @pytest.mark.asyncio
@@ -2568,6 +2574,9 @@ async def test_lifecycle_exception(db_factory):
         t = await db.get(Task, task_obj.id)
         assert t.status == "failed"
         assert t.error_message is not None
+    d.instance_manager.cleanup_task_runtime_scope_after_turn.assert_called_once_with(
+        task_obj.id
+    )
 
 
 @pytest.mark.asyncio

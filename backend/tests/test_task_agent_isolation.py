@@ -16,11 +16,15 @@ from backend.services.task_agent_isolation import (
     CLAUDE_SUBPROCESS_ENV_SCRUB,
     CLAUDE_SUB_AGENT_BUILTIN_TOOLS,
     CLAUDE_TASK_BUILTIN_TOOLS,
+    CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
+    CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
     TaskAgentIsolationError,
+    claude_permission_allow_rules,
     discover_linked_worktree_git_read_boundary,
     generate_claude_aux_isolation_settings,
     generate_claude_delivery_isolation_settings,
     generate_claude_task_isolation_settings,
+    generate_claude_unrestricted_task_settings,
     generate_claude_zero_tool_isolation_settings,
     prepare_task_working_directory,
     require_claude_apply_seccomp,
@@ -28,6 +32,7 @@ from backend.services.task_agent_isolation import (
     scrub_task_model_environment,
     validate_claude_delivery_isolation_settings,
     validate_claude_task_isolation_settings,
+    validate_claude_unrestricted_task_settings,
 )
 from backend.services import trusted_runtime
 from backend.services.trusted_runtime import (
@@ -858,6 +863,75 @@ def test_claude_task_isolation_allows_every_injected_task_mcp_tool(
     assert allowed == set(CLAUDE_TASK_BUILTIN_TOOLS) | expected_mcp
 
 
+def test_claude_unrestricted_task_settings_are_private_exact_and_keep_ask_user(
+    tmp_path,
+    monkeypatch,
+):
+    runtime_root = tmp_path / "runtime"
+    monkeypatch.setattr(settings, "task_runtime_secret_dir", str(runtime_root))
+    monkeypatch.setattr(settings, "ask_user_enabled", True)
+
+    path = generate_claude_unrestricted_task_settings(
+        121,
+        turn_generation=7,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert path.name == "claude-unrestricted-security.json"
+    info = path.lstat()
+    assert stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
+    assert info.st_nlink == 1
+    assert stat.S_IMODE(info.st_mode) == 0o600
+    assert "sandbox" not in payload
+    assert payload["permissions"] == {
+        "defaultMode": "bypassPermissions",
+        "allow": list(
+            claude_permission_allow_rules(
+                CLAUDE_UNRESTRICTED_PERMISSION_TOOLS
+            )
+        ),
+        "deny": [],
+    }
+    assert payload["permissions"]["allow"][:len(
+        CLAUDE_UNRESTRICTED_PERMISSION_TOOLS
+    )] == list(CLAUDE_UNRESTRICTED_PERMISSION_TOOLS)
+    assert all(
+        not rule.startswith("mcp__")
+        for rule in CLAUDE_UNRESTRICTED_PERMISSION_TOOLS
+    )
+    ask_user_command = payload["hooks"]["PreToolUse"][0]["hooks"][0][
+        "command"
+    ]
+    ask_user_script = Path(shlex.split(ask_user_command)[1])
+    verify_materialized_trusted_python_asset("ask_user_hook", ask_user_script)
+    assert ask_user_script.parent == path.parent
+
+    validate_claude_unrestricted_task_settings(path)
+
+
+def test_claude_unrestricted_task_settings_validator_rejects_sandbox_field(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(tmp_path / "runtime"),
+    )
+    monkeypatch.setattr(settings, "ask_user_enabled", False)
+    path = generate_claude_unrestricted_task_settings(
+        122,
+        turn_generation=0,
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["sandbox"] = {"enabled": False}
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+
+    with pytest.raises(TaskAgentIsolationError, match="unexpected shape"):
+        validate_claude_unrestricted_task_settings(path)
+
+
 def test_claude_task_isolation_keeps_general_network_without_ssh_grant(
     tmp_path,
     monkeypatch,
@@ -1245,6 +1319,7 @@ def test_task_claude_wrapper_is_private_and_uses_exact_cli_boundary():
     assert "--strict-mcp-config" in text
     assert "--permission-mode acceptEdits" in text
     assert "--dangerously-skip-permissions" not in text
+    assert text.count("--disable-slash-commands") == 3
     assert set(CLAUDE_TASK_BUILTIN_TOOLS) == {
         "AskUserQuestion",
         "Bash",

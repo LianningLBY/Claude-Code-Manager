@@ -262,6 +262,29 @@ class TestStreamParserSystemEvents:
 # ========== InstanceManager._consume_output tests ==========
 
 
+def test_parse_codex_background_lifecycle_event():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "background.lifecycle",
+        "state": "running",
+        "reason": "waiting_for_descendants",
+        "active_count": 2,
+        "active_thread_ids": ["child-a", "child-b"],
+        "started_at": "2026-08-13T12:00:00",
+        "last_activity_at": "2026-08-13T12:01:00",
+    }))
+
+    assert event is not None
+    assert event["event_type"] == "background_lifecycle"
+    assert event["background_state"] == "running"
+    assert event["background_reason"] == "waiting_for_descendants"
+    assert event["background_active_count"] == 2
+    assert event["background_active_thread_ids"] == ["child-a", "child-b"]
+    assert event["background_started_at"] == "2026-08-13T12:00:00"
+    assert event["background_last_activity_at"] == "2026-08-13T12:01:00"
+
+
 def _make_mock_process_with_output(lines: list[str], exit_code: int = 0):
     """Create a mock process that yields NDJSON lines from stdout."""
     proc = MagicMock()

@@ -17,6 +17,7 @@ import type {
   TestHarnessRun,
   UploadResult,
   WorkspaceReviewCapabilities,
+  BackgroundLifecycle,
 } from '../../api/client';
 import { DEFAULT_BROWSER_CHANNEL } from '../../config/browserReview';
 import { useWebSocket } from '../../hooks/useWebSocket';
@@ -79,6 +80,31 @@ const WORKSPACE_REVIEW_START_TOOLS = new Set([
   'ccm_workspace_review.test_current_changes',
   'ccm_workspace_review.test_git_target',
 ]);
+
+const BACKGROUND_STALLED_AFTER_MS = 30 * 60 * 1000;
+const BACKGROUND_LONG_STALLED_AFTER_MS = 2 * 60 * 60 * 1000;
+
+function latestBackgroundLifecycle(
+  messages: ChatMessage[],
+  identity: TaskTurnIdentity,
+): BackgroundLifecycle | null {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!messageMatchesTaskTurn(message, identity)) continue;
+    const lifecycle = message.background_lifecycle;
+    if (lifecycle) return lifecycle;
+  }
+  return null;
+}
+
+function formatBackgroundSilence(milliseconds: number): string {
+  const minutes = Math.max(0, Math.floor(milliseconds / 60_000));
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder ? `${hours} 小时 ${remainder} 分钟前` : `${hours} 小时前`;
+}
 
 function workspaceReviewGoalFromToolInput(rawInput: unknown): string | null {
   if (typeof rawInput !== 'string' || !rawInput.trim()) return null;
@@ -884,6 +910,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // A native agent/monitor tail can remain active while the owning foreground
   // turn is still `executing`; keep the marker independently visible.
   const isProcessing = sending || backgroundActive || ['in_progress', 'executing', 'waiting_capability'].includes(effectiveStatus);
+  const backgroundLifecycle = useMemo(
+    () => latestBackgroundLifecycle(messages, activeTaskTurnRef.current),
+    [messages, task.retry_count, task.turn_generation],
+  );
+  const [, refreshBackgroundAge] = useState(0);
+  useEffect(() => {
+    if (!backgroundLifecycle) return;
+    const timer = window.setInterval(
+      () => refreshBackgroundAge((generation) => generation + 1),
+      60_000,
+    );
+    return () => window.clearInterval(timer);
+  }, [backgroundLifecycle]);
   const workspaceReviewCanBeConfigured = (
     workspaceReviewCapability?.available === true
     || workspaceReviewCapability?.suggested_config != null
@@ -1388,6 +1427,41 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (msg.channel !== `task:${task.id}` || !msg.data) return;
 
     const eventType = msg.data.event_type as string || (msg.data.event as string);
+    if (eventType === 'background_lifecycle') {
+      const identity = eventTaskTurnIdentity(msg.data, task.id);
+      if (!identity || observeTaskTurn(identity) < 0) return;
+      const lifecycle: BackgroundLifecycle = {
+        state: msg.data.background_state === 'completed' ? 'completed' : 'running',
+        reason: String(msg.data.background_reason || 'waiting_for_descendants'),
+        active_count: Math.max(0, Number(msg.data.background_active_count) || 0),
+        active_thread_ids: Array.isArray(msg.data.background_active_thread_ids)
+          ? msg.data.background_active_thread_ids.map(String)
+          : [],
+        started_at: String(msg.data.background_started_at || new Date().toISOString()),
+        last_activity_at: typeof msg.data.background_last_activity_at === 'string'
+          ? msg.data.background_last_activity_at
+          : null,
+      };
+      const persistedId = Number(msg.data.id);
+      const entry: ChatMessage = {
+        id: Number.isFinite(persistedId) && persistedId > 0
+          ? persistedId
+          : Date.now() + Math.random(),
+        role: 'system', event_type: 'background_lifecycle', content: null,
+        tool_name: null, tool_input: null, tool_output: null, is_error: false,
+        loop_iteration: null,
+        task_retry_count: identity.retryCount,
+        task_turn_generation: identity.turnGeneration,
+        timestamp: typeof msg.data.timestamp === 'string'
+          ? msg.data.timestamp
+          : new Date().toISOString(),
+        image_urls: null, attachments: null,
+        background_lifecycle: lifecycle,
+        persisted: Number.isFinite(persistedId) && persistedId > 0,
+      };
+      setMessages((previous) => mergeChatHistory([entry], previous));
+      return;
+    }
     if (eventType === 'goal_evaluation') {
       setFrontendReviewGoalProgress({
         turn: Number(msg.data.turn) || 0,
@@ -3342,7 +3416,47 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
           )
         )}
-        {isProcessing && (
+        {isProcessing && backgroundLifecycle && (() => {
+          if (backgroundLifecycle.state === 'completed') {
+            return (
+              <div className="mx-3 flex items-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
+                <Check size={14} />
+                <span>后台任务已完成，正在收尾…</span>
+              </div>
+            );
+          }
+          const lastActivity = Date.parse(
+            backgroundLifecycle.last_activity_at || backgroundLifecycle.started_at,
+          );
+          const silenceMs = Number.isFinite(lastActivity)
+            ? Math.max(0, Date.now() - lastActivity)
+            : 0;
+          const longStalled = silenceMs >= BACKGROUND_LONG_STALLED_AFTER_MS;
+          const possiblyStalled = silenceMs >= BACKGROUND_STALLED_AFTER_MS;
+          const reason = backgroundLifecycle.reason === 'waiting_for_native_goal'
+            ? '原生 Goal'
+            : `${backgroundLifecycle.active_count} 个子 Agent`;
+          return (
+            <div className={`mx-3 rounded-lg border px-3 py-2 text-sm ${
+              longStalled
+                ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                : possiblyStalled
+                  ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                  : 'border-sky-500/25 bg-sky-500/10 text-sky-300'
+            }`}>
+              <div className="flex items-center gap-2 font-medium">
+                {possiblyStalled
+                  ? <AlertCircle size={14} />
+                  : <Loader2 size={14} className="animate-spin" />}
+                <span>{possiblyStalled ? '后台任务可能停滞' : '主回复已完成，后台仍在运行'}</span>
+              </div>
+              <div className="mt-1 text-xs opacity-75">
+                正在等待{reason} · 最近活动 {formatBackgroundSilence(silenceMs)}
+              </div>
+            </div>
+          );
+        })()}
+        {isProcessing && !backgroundLifecycle && (
           <div className="flex gap-2 items-start text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
             {showFrontendReviewGoal ? (
@@ -4427,6 +4541,8 @@ const MessageBubble = memo(function MessageBubble({
   onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
 }) {
   const isUser = message.role === 'user';
+
+  if (message.event_type === 'background_lifecycle') return null;
 
   if (message.event_type === 'permission_request') {
     return <PermissionCard message={message} taskId={taskId} />;

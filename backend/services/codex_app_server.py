@@ -217,6 +217,7 @@ _DESCENDANT_RECONCILE_INTERVAL = 5.0
 _DESCENDANT_RECONCILE_REQUEST_TIMEOUT = 5.0
 _DESCENDANT_INTERRUPT_CONFIRM_TIMEOUT = 10.0
 _DESCENDANT_INTERRUPT_POLL_INTERVAL = 0.1
+_BACKGROUND_LIFECYCLE_ACTIVITY_INTERVAL = 60.0
 # A transient local app-server RPC failure is not evidence that a Goal ended.
 # Retry while retaining the exact CCM process generation; turn/Goal
 # notifications remain the fast path and invalidate the stale guard.
@@ -2188,6 +2189,10 @@ class _TurnContext:
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
     deferred_terminal_notification: dict[str, Any] | None = None
+    background_lifecycle_started_at: datetime | None = None
+    background_lifecycle_last_activity_at: datetime | None = None
+    background_lifecycle_last_published_monotonic: float | None = None
+    background_lifecycle_reason: str | None = None
     following_native_goal: bool = False
     pending_goal_terminal_notification: dict[str, Any] | None = None
     goal_terminal_generation: int = 0
@@ -3033,7 +3038,10 @@ class CodexAppServer:
     ) -> None:
         if not self._context_is_current(context):
             return
+        changed = thread_id not in context.active_descendant_thread_ids
         context.active_descendant_thread_ids.add(thread_id)
+        if changed:
+            self._publish_background_lifecycle_activity(context)
         self._signal_descendant_state_change(context)
 
     def _mark_descendant_terminal(
@@ -3041,8 +3049,69 @@ class CodexAppServer:
         context: _TurnContext,
         thread_id: str,
     ) -> None:
+        changed = thread_id in context.active_descendant_thread_ids
         context.active_descendant_thread_ids.discard(thread_id)
+        if changed:
+            self._publish_background_lifecycle_activity(context)
         self._signal_descendant_state_change(context)
+
+    def _publish_background_lifecycle(
+        self,
+        context: _TurnContext,
+        *,
+        state: str,
+        reason: str | None = None,
+        activity: bool = False,
+        force: bool = False,
+    ) -> None:
+        """Expose a retained native lifecycle without changing ownership."""
+
+        if not self._context_is_current(context):
+            return
+        now = datetime.utcnow()
+        if context.background_lifecycle_started_at is None:
+            context.background_lifecycle_started_at = now
+        if activity or state == "completed":
+            context.background_lifecycle_last_activity_at = now
+        if reason is not None:
+            context.background_lifecycle_reason = reason
+        monotonic_now = time.monotonic()
+        last_published = context.background_lifecycle_last_published_monotonic
+        if (
+            not force
+            and last_published is not None
+            and monotonic_now - last_published
+            < _BACKGROUND_LIFECYCLE_ACTIVITY_INTERVAL
+        ):
+            return
+        context.background_lifecycle_last_published_monotonic = monotonic_now
+        context.process.feed({
+            "type": "background.lifecycle",
+            "state": state,
+            "reason": context.background_lifecycle_reason,
+            "active_count": len(context.active_descendant_thread_ids),
+            "active_thread_ids": sorted(
+                context.active_descendant_thread_ids
+            ),
+            "started_at": context.background_lifecycle_started_at.isoformat(),
+            "last_activity_at": (
+                context.background_lifecycle_last_activity_at.isoformat()
+                if context.background_lifecycle_last_activity_at
+                else None
+            ),
+        })
+
+    def _publish_background_lifecycle_activity(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        if context.background_lifecycle_started_at is None:
+            return
+        self._publish_background_lifecycle(
+            context,
+            state="running",
+            activity=True,
+        )
 
     def _contexts_tracking_descendant(
         self,
@@ -3630,6 +3699,13 @@ class CodexAppServer:
                 context.turn_id,
             )
             return
+        self._publish_background_lifecycle(
+            context,
+            state="running",
+            reason="waiting_for_descendants",
+            activity=True,
+            force=True,
+        )
         turn = params.get("turn") or {}
         runtime = self._thread_runtime.get(context.thread_id)
         goal_may_continue = bool(
@@ -3806,6 +3882,13 @@ class CodexAppServer:
         context.goal_terminal_generation += 1
         generation = context.goal_terminal_generation
         context.pending_goal_terminal_notification = dict(params)
+        self._publish_background_lifecycle(
+            context,
+            state="running",
+            reason="waiting_for_native_goal",
+            activity=True,
+            force=True,
+        )
         self._reset_goal_turn_identity(context)
         guard = asyncio.create_task(
             self._guard_native_goal_terminal(
@@ -3854,6 +3937,12 @@ class CodexAppServer:
 
         if not self._context_is_current(context):
             return
+        if context.background_lifecycle_started_at is not None:
+            self._publish_background_lifecycle(
+                context,
+                state="completed",
+                force=True,
+            )
         turn = params.get("turn") or {}
         terminal_turn_id = turn.get("id") or context.turn_id
         status = turn.get("status") or "completed"
@@ -7827,6 +7916,12 @@ class CodexAppServer:
             return
         thread_id = params.get("threadId")
         thread_id_str = str(thread_id) if thread_id else None
+        if thread_id_str is not None:
+            lifecycle_context = self._lineage_context_for_thread(thread_id_str)
+            if lifecycle_context is not None:
+                self._publish_background_lifecycle_activity(
+                    lifecycle_context,
+                )
         if method == "thread/goal/updated" and thread_id_str is not None:
             goal = params.get("goal")
             goal_status = (

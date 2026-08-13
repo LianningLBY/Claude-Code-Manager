@@ -946,6 +946,7 @@ export interface ChatMessage {
   /** Native item metadata used for narrowly-scoped compatibility filtering. */
   native_item_type?: string | null;
   native_item_status?: string | null;
+  background_lifecycle?: BackgroundLifecycle | null;
   /** True when this row came from persisted chat history, not live optimism. */
   persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）
@@ -954,6 +955,15 @@ export interface ChatMessage {
   // ask_user 卡片（event_type === 'ask_user_question' 时存在）
   ask_questions?: AskUserQuestion[] | null;
   ask_status?: 'pending' | 'answered' | 'timed_out' | 'expired' | null;
+}
+
+export interface BackgroundLifecycle {
+  state: 'running' | 'completed';
+  reason: 'waiting_for_descendants' | 'waiting_for_native_goal' | string;
+  active_count: number;
+  active_thread_ids: string[];
+  started_at: string;
+  last_activity_at: string | null;
 }
 
 export interface CodexForkAnchor {

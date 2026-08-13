@@ -13152,6 +13152,21 @@ class InstanceManager:
                 "content": "turn.completed",
                 "context_usage": self._codex_context_usage(usage) if usage else None,
             })
+        elif codex_type == "background.lifecycle":
+            event.update({
+                "event_type": "background_lifecycle",
+                "content": None,
+                "background_state": data.get("state"),
+                "background_reason": data.get("reason"),
+                "background_active_count": data.get("active_count"),
+                "background_active_thread_ids": data.get(
+                    "active_thread_ids"
+                ),
+                "background_started_at": data.get("started_at"),
+                "background_last_activity_at": data.get(
+                    "last_activity_at"
+                ),
+            })
         elif "error" in codex_type.lower() or data.get("error"):
             # turn.failed 形如 {"type":"turn.failed","error":{"message":...}}（实测）
             message = data.get("message")

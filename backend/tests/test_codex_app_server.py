@@ -34,6 +34,7 @@ from backend.services.codex_app_server import (
     CodexThreadRuntimeRecycleError,
     CodexThreadTerminalStateError,
     CodexTurnProcess,
+    _TurnContext,
     _APP_SERVER_STREAM_LIMIT,
     _audit_isolated_request_config,
     _audit_network_isolated_thread_response,
@@ -9871,6 +9872,43 @@ async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
 
     target.finish(0)
     peer.finish(0)
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_terminates_all_live_turns_for_same_task(tmp_path):
+    home = normalize_codex_home(tmp_path / "same-task-turns")
+    server = CodexAppServer("codex", codex_home=home)
+    target = CodexTurnProcess(4321, AsyncMock())
+    descendant = CodexTurnProcess(4321, AsyncMock())
+    server._contexts_by_thread = {
+        "thread-target": _TurnContext(
+            "thread-target", target, 0.0, task_id=160,
+        ),
+        "thread-descendant": _TurnContext(
+            "thread-descendant", descendant, 0.0, task_id=160,
+        ),
+    }
+    server.abandon_turn = AsyncMock(return_value=False)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+
+    await registry.require_claimed_turn_stop_isolated(home, target)
+    assert await registry.stop_claimed_turn(
+        home, target, reason="user requested stop",
+    ) is True
+
+    assert server.abandon_turn.await_count == 2
+    server.abandon_turn.assert_any_await(target, "user requested stop")
+    server.abandon_turn.assert_any_await(descendant, "user requested stop")
+    server.shutdown.assert_awaited_once_with(
+        interrupted_processes=frozenset({target, descendant}),
+        reason="user requested stop",
+    )
+    assert target.returncode == 130
+    assert descendant.returncode == 130
+    assert target.termination_kind == "internal_abort"
+    assert descendant.termination_kind == "internal_abort"
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,12 @@ from backend.models.pr_monitor import (
 )
 from backend.models.project import Project
 from backend.models.task import Task
-from backend.models.test_harness import TestHarnessRun as HarnessRun
+from backend.models.test_harness import (
+    TestHarnessAttempt as HarnessAttempt,
+    TestHarnessEvidence as HarnessEvidence,
+    TestHarnessFinding as HarnessFinding,
+    TestHarnessRun as HarnessRun,
+)
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.delivery_controller import (
     CapabilitySnapshot,
@@ -324,6 +329,140 @@ class FakeDispatcher:
 
     def wake(self) -> None:
         self.wake_count += 1
+
+
+class FakeFrontendHarness:
+    """Durable Harness double used to exercise the Delivery Browser gate."""
+
+    def __init__(self, db_factory) -> None:
+        self.db_factory = db_factory
+        self.start_calls = 0
+        self.cancel_calls = 0
+        self.run_id = "f" * 32
+        self.last_spec = None
+
+    async def start_task_run(
+        self,
+        *,
+        task_id,
+        spec,
+        owner_user_id=None,
+        owner_identity,
+    ):
+        del owner_user_id
+        self.start_calls += 1
+        self.last_spec = spec
+        assert spec.target_kind == "current_workspace"
+        assert spec.idempotency_key
+        async with self.db_factory() as db:
+            existing = await db.get(HarnessRun, self.run_id)
+            if existing is not None:
+                return existing
+            task = await db.get(Task, task_id)
+            delivery = await db.get(DeliveryRun, task.delivery_run_id)
+            assert owner_identity.task_id == task.id
+            assert owner_identity.incarnation_id == task.incarnation_id
+            assert owner_identity.retry_count == task.retry_count
+            assert owner_identity.turn_generation == task.turn_generation
+            assert owner_identity.status == task.status == "delivery_waiting"
+            harness = HarnessRun(
+                id=self.run_id,
+                task_id=task.id,
+                owner_task_incarnation_id=task.incarnation_id,
+                owner_task_retry_count=task.retry_count,
+                owner_task_turn_generation=task.turn_generation,
+                owner_task_status=task.status,
+                project_id=task.project_id,
+                target_kind="current_workspace",
+                target_spec={"kind": "current_workspace"},
+                test_plan={"objective": "Validate Delivery"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="a" * 64,
+                idempotency_scope=f"task:{task.id}",
+                idempotency_key=spec.idempotency_key,
+                root_run_id=self.run_id,
+                status="running",
+                stage="reviewing",
+                source_git_head=delivery.head_sha,
+                cleanup_status="pending",
+            )
+            db.add(harness)
+            await db.commit()
+            await db.refresh(harness)
+            return harness
+
+    async def finish(
+        self,
+        *,
+        verdict: str,
+        report: str,
+        finding: bool = False,
+        complete_evidence: bool = True,
+    ) -> None:
+        async with self.db_factory() as db:
+            harness = await db.get(HarnessRun, self.run_id)
+            harness.status = "completed"
+            harness.stage = "completed"
+            harness.verdict = verdict
+            harness.report = report
+            harness.cleanup_status = "completed"
+            harness.completed_at = datetime.utcnow()
+            attempt = HarnessAttempt(
+                id="e" * 32,
+                run_id=harness.id,
+                ordinal=1,
+                status="completed",
+                stage="completed",
+                provider="codex",
+                model="gpt-test",
+                reasoning_effort="medium",
+                codex_service_tier="default",
+                archive_state="complete" if complete_evidence else "incomplete",
+                result_data={"verdict": verdict},
+            )
+            db.add(attempt)
+            if complete_evidence:
+                for evidence_id, kind, name, content_type in (
+                    ("1" * 32, "screenshot", "final.png", "image/png"),
+                    ("2" * 32, "report", "report.md", "text/markdown"),
+                ):
+                    db.add(
+                        HarnessEvidence(
+                            id=evidence_id,
+                            run_id=harness.id,
+                            attempt_id=attempt.id,
+                            kind=kind,
+                            name=name,
+                            content_type=content_type,
+                            storage_path=f"archive/{name}",
+                            sha256=evidence_id * 2,
+                            byte_size=8,
+                            metadata_={},
+                        )
+                    )
+            if finding:
+                db.add(
+                    HarnessFinding(
+                        id="3" * 32,
+                        run_id=harness.id,
+                        ordinal=1,
+                        fingerprint="4" * 64,
+                        scenario_id="delivery-flow",
+                        severity="high",
+                        category="functionality",
+                        title="Save action does not complete",
+                        expected="The change is saved",
+                        actual="The page reports an error",
+                        reproduction=["Open the form", "Press Save"],
+                        evidence_names=["final.png"],
+                    )
+                )
+            await db.commit()
+
+    async def cancel(self, run_id, *, expected_identity) -> None:
+        assert run_id == self.run_id
+        assert expected_identity.task_id > 0
+        self.cancel_calls += 1
 
 
 def _real_dispatcher(db_factory) -> GlobalDispatcher:
@@ -753,6 +892,7 @@ async def _scope(
     max_cycles: int = 4,
     max_no_progress: int = 2,
     auto_merge: bool = False,
+    frontend_review: str = "off",
 ):
     project = Project(
         name="delivery-controller-project",
@@ -795,6 +935,7 @@ async def _scope(
             requirements="Implement the change and prove it with tests.",
             max_cycles=max_cycles,
             max_no_progress=max_no_progress,
+            frontend_review=frontend_review,
         ),
     )
     return run, repo
@@ -809,6 +950,7 @@ def _controller(
     owner="controller-a",
     dispatcher=None,
     enabled=True,
+    test_harness_service=None,
 ):
     return DeliveryController(
         db_factory=db_factory,
@@ -816,6 +958,7 @@ def _controller(
         capability_gateway=capabilities,
         publisher=publisher,
         dispatcher=dispatcher,
+        test_harness_service=test_harness_service,
         owner_id=owner,
         enabled=enabled,
         poll_interval_seconds=0.01,
@@ -961,6 +1104,25 @@ async def _to_publishing(controller, db_factory, workspace, run_id, head=HEAD_ON
     assert await controller.reconcile_run(run_id)  # consume Review -> publishing
 
 
+async def _to_frontend_ready(
+    controller,
+    db_factory,
+    workspace,
+    run_id,
+    *,
+    head=HEAD_ONE,
+    tree=TREE_ONE,
+):
+    await _to_coding_pending(controller, run_id)
+    await _complete_code(db_factory, workspace, run_id, head, tree)
+    assert await controller.reconcile_run(run_id)  # exact terminal -> pre-review
+    assert await controller.reconcile_run(run_id)  # create Review invocation
+    assert await controller.reconcile_run(run_id)  # approved -> frontend ready
+    async with db_factory() as db:
+        run = await db.get(DeliveryRun, run_id, populate_existing=True)
+        assert (run.phase, run.activity) == ("frontend_review", "ready")
+
+
 async def _to_monitoring(controller, db_factory, workspace, run_id):
     await _to_publishing(controller, db_factory, workspace, run_id)
     assert await controller.reconcile_run(run_id)
@@ -968,6 +1130,246 @@ async def _to_monitoring(controller, db_factory, workspace, run_id):
         run = await db.get(DeliveryRun, run_id, populate_existing=True)
         assert (run.phase, run.activity) == ("monitoring", "waiting")
         return run.pr_monitor_run_id
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_auto_policy_records_unavailable_skip(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _repo = await _scope(db_session, frontend_review="auto")
+    workspace = FakeWorkspace()
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+    )
+    monkeypatch.setattr(settings, "auth_token", "")
+
+    await _to_frontend_ready(controller, db_factory, workspace, run.id)
+    assert await controller.reconcile_run(run.id)
+
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        cycle = await db.get(DeliveryCycle, stored.current_cycle_id)
+        assert (stored.phase, stored.activity) == ("publishing", "ready")
+        assert cycle.frontend_review_run_id is None
+        assert cycle.frontend_review_verdict is None
+        assert cycle.frontend_review_skip_reason == (
+            "Frontend review unavailable: AUTH_TOKEN is not configured"
+        )
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_recovers_unbound_idempotent_harness(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    from backend.services.test_harness_contracts import TestHarnessSpec
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_identity,
+    )
+
+    run, _repo = await _scope(db_session, frontend_review="auto")
+    workspace = FakeWorkspace()
+    harness = FakeFrontendHarness(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+        test_harness_service=harness,
+    )
+    await _to_frontend_ready(controller, db_factory, workspace, run.id)
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id)
+        task = await db.get(Task, stored.developer_task_id)
+        cycle_id = stored.current_cycle_id
+        head_sha = stored.head_sha
+        owner_identity = test_harness_owner_identity(task)
+    await harness.start_task_run(
+        task_id=task.id,
+        spec=TestHarnessSpec(
+            target_kind="current_workspace",
+            target={},
+            goal="Recover the Browser gate",
+            idempotency_key=(
+                f"delivery:{run.id}:cycle:{cycle_id}:frontend:{head_sha}"
+            ),
+        ),
+        owner_identity=owner_identity,
+    )
+    # Model a restart after Harness admission but before the Delivery cycle
+    # bound the handle. Recovery must use frozen durable identity even if the
+    # mutable runtime configuration is no longer available.
+    monkeypatch.setattr(settings, "auth_token", "")
+
+    assert await controller.reconcile_run(run.id)
+    assert harness.start_calls == 1
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        cycle = await db.get(DeliveryCycle, stored.current_cycle_id)
+        assert (stored.phase, stored.activity) == ("frontend_review", "waiting")
+        assert cycle.frontend_review_run_id == harness.run_id
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_pass_requires_archived_report_and_screenshot(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _repo = await _scope(db_session, frontend_review="auto")
+    workspace = FakeWorkspace()
+    harness = FakeFrontendHarness(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+        test_harness_service=harness,
+    )
+    monkeypatch.setattr(settings, "auth_token", "test-token")
+    monkeypatch.setattr(
+        "backend.services.workspace_review.workspace_review_capability",
+        lambda task, project: {
+            "available": True,
+            "configured": True,
+            "reason": None,
+            "repo_path": task.last_cwd,
+        },
+    )
+
+    await _to_frontend_ready(controller, db_factory, workspace, run.id)
+    assert await controller.reconcile_run(run.id)  # bind Harness
+    assert harness.start_calls == 1
+    assert harness.last_spec.target_kind == "current_workspace"
+    assert harness.last_spec.profile == "standard"
+    assert harness.last_spec.allow_actions is True
+    assert "Implement the change and prove it with tests." in (
+        harness.last_spec.goal
+    )
+    await harness.finish(verdict="passed", report="All scenarios passed.")
+    assert await controller.reconcile_run(run.id)  # accept exact evidence
+
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        cycle = await db.get(DeliveryCycle, stored.current_cycle_id)
+        assert (stored.phase, stored.activity) == ("publishing", "ready")
+        assert cycle.frontend_review_run_id == harness.run_id
+        assert cycle.frontend_review_verdict == "passed"
+        assert cycle.frontend_review_summary == "All scenarios passed."
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_rejects_pass_without_complete_evidence(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _repo = await _scope(db_session, frontend_review="auto")
+    workspace = FakeWorkspace()
+    harness = FakeFrontendHarness(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+        test_harness_service=harness,
+    )
+    monkeypatch.setattr(settings, "auth_token", "test-token")
+    monkeypatch.setattr(
+        "backend.services.workspace_review.workspace_review_capability",
+        lambda task, project: {
+            "available": True,
+            "configured": True,
+            "reason": None,
+            "repo_path": task.last_cwd,
+        },
+    )
+
+    await _to_frontend_ready(controller, db_factory, workspace, run.id)
+    assert await controller.reconcile_run(run.id)
+    await harness.finish(
+        verdict="passed",
+        report="Looks good, but evidence was not archived.",
+        complete_evidence=False,
+    )
+    assert await controller.reconcile_run(run.id)
+
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        assert (stored.phase, stored.activity, stored.outcome) == (
+            "done",
+            "terminal",
+            "failed",
+        )
+        assert stored.error_code == "frontend_review_evidence_incomplete"
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_findings_start_a_new_planning_cycle(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _repo = await _scope(
+        db_session,
+        frontend_review="auto",
+        max_cycles=3,
+    )
+    workspace = FakeWorkspace()
+    harness = FakeFrontendHarness(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+        test_harness_service=harness,
+    )
+    monkeypatch.setattr(settings, "auth_token", "test-token")
+    monkeypatch.setattr(
+        "backend.services.workspace_review.workspace_review_capability",
+        lambda task, project: {
+            "available": True,
+            "configured": True,
+            "reason": None,
+            "repo_path": task.last_cwd,
+        },
+    )
+
+    await _to_frontend_ready(controller, db_factory, workspace, run.id)
+    assert await controller.reconcile_run(run.id)
+    await harness.finish(
+        verdict="failed",
+        report="The Save flow is broken.",
+        finding=True,
+    )
+    assert await controller.reconcile_run(run.id)
+
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        current = await db.get(DeliveryCycle, stored.current_cycle_id)
+        previous = await db.scalar(
+            select(DeliveryCycle).where(
+                DeliveryCycle.run_id == stored.id,
+                DeliveryCycle.cycle_number == 1,
+            )
+        )
+        assert (stored.phase, stored.activity, stored.cycle_count) == (
+            "planning",
+            "ready",
+            2,
+        )
+        assert previous.frontend_review_verdict == "failed"
+        assert current.trigger_kind == "frontend_review_changes_requested"
+        assert current.trigger_payload["source_git_head"] == HEAD_ONE
+        assert current.trigger_payload["findings"][0]["title"] == (
+            "Save action does not complete"
+        )
 
 
 async def _set_monitor_terminal(

@@ -90,6 +90,7 @@ PR_LOOP_REVISION = "a3f7c2d8e1b4"
 CAPACITY_OVERRIDE_REVISION = "a4d8e2f6b1c3"
 CAPACITY_PR_LOOP_MERGE_REVISION = "c5e7a9d1f3b6"
 AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION = "e6a2c4f8b190"
+DELIVERY_FRONTEND_REVIEW_REVISION = "a7d4e9c2f610"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -100,7 +101,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION
+CURRENT_HEAD_REVISION = DELIVERY_FRONTEND_REVIEW_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -7193,7 +7194,7 @@ class TestSchemaConsistency:
     def test_delivery_schema_constraints_and_indexes_match_orm(self, tmp_path):
         db_path = str(tmp_path / "delivery-schema.db")
         cfg = _alembic_cfg(db_path)
-        _run_alembic(cfg, command.upgrade, DELIVERY_LOOP_REVISION)
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
         engine = create_engine(f"sqlite:///{db_path}")
         inspector = inspect(engine)
 
@@ -7436,6 +7437,12 @@ class TestPublishedMigrationHistory:
         assert script.get_current_head() == CURRENT_HEAD_REVISION
         assert (
             script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            == AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION
+        )
+        assert (
+            script.get_revision(
+                AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION
+            ).down_revision
             == CAPACITY_PR_LOOP_MERGE_REVISION
         )
         assert set(

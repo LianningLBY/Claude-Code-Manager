@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 import hashlib
 import json
+from pathlib import Path
 import re
 import secrets
 from typing import Any
@@ -166,6 +167,12 @@ class DeliveryCreateSpec:
     timeout_hours: float | None = None
     max_cycles: int = 10
     max_no_progress: int = 3
+    # ``None`` preserves the legacy explicit-Monitor API behavior. The
+    # one-message entry point always sends a concrete per-Run choice.
+    auto_merge: bool | None = None
+    # Direct service callers predate the Browser gate and retain the legacy
+    # flow unless they opt in. Public API schemas explicitly default to auto.
+    frontend_review: str = "off"
 
 
 def _admission_scope(created_by: int | None) -> str:
@@ -199,8 +206,8 @@ def _admission_request(
     The resolved runtime tuple is stored separately in ``policy_snapshot``.
     """
 
-    return {
-        "schema_version": 1,
+    request = {
+        "schema_version": 2,
         "project_id": spec.project_id,
         "monitored_repo_id": spec.monitored_repo_id,
         "title": title,
@@ -219,6 +226,10 @@ def _admission_request(
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
     }
+    if spec.auto_merge is not None:
+        request["auto_merge"] = spec.auto_merge
+    request["frontend_review"] = spec.frontend_review
+    return request
 
 
 async def _idempotent_admission(
@@ -228,6 +239,7 @@ async def _idempotent_admission(
     project_id: int,
     idempotency_key: str,
     request_hash: str,
+    legacy_request_hash: str,
 ) -> DeliveryRun | None:
     existing = (
         await db.execute(
@@ -242,7 +254,16 @@ async def _idempotent_admission(
     ).scalar_one_or_none()
     if existing is None:
         return None
-    if existing.request_hash != request_hash:
+    policy = (
+        existing.policy_snapshot
+        if isinstance(existing.policy_snapshot, dict)
+        else {}
+    )
+    legacy_replay = (
+        policy.get("schema_version") == 1
+        and existing.request_hash == legacy_request_hash
+    )
+    if existing.request_hash != request_hash and not legacy_replay:
         raise DeliveryConflictError(
             "Idempotency key is already bound to a different Delivery request"
         )
@@ -448,16 +469,20 @@ async def create_delivery_run(
         limit=20,
     )
     admission_scope = _admission_scope(spec.created_by)
-    request_hash = value_hash(
-        _admission_request(
-            spec,
-            title=title,
-            requirements=requirements,
-            provider=requested_provider,
-            model=requested_model,
-            effort_level=requested_effort,
-        )
+    admission_request = _admission_request(
+        spec,
+        title=title,
+        requirements=requirements,
+        provider=requested_provider,
+        model=requested_model,
+        effort_level=requested_effort,
     )
+    request_hash = value_hash(admission_request)
+    legacy_request = dict(admission_request)
+    legacy_request["schema_version"] = 1
+    legacy_request.pop("auto_merge", None)
+    legacy_request.pop("frontend_review", None)
+    legacy_request_hash = value_hash(legacy_request)
 
     # A real write is the portable project-scoped admission mutex. SELECT FOR
     # UPDATE is a no-op on SQLite, while this same-column write serializes on
@@ -484,6 +509,7 @@ async def create_delivery_run(
         project_id=project.id,
         idempotency_key=idempotency_key,
         request_hash=request_hash,
+        legacy_request_hash=legacy_request_hash,
     )
     if existing is not None:
         await db.commit()
@@ -581,22 +607,64 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Delivery Loop requires Merge Queue disabled"
         )
-    if (
-        (repo.review_mode or "single") != "panel"
-        or not repo.wait_for_ci
-        or not repo.required_checks
-    ):
+    if (repo.review_mode or "single") != "panel":
         raise DeliveryValidationError(
-            "Delivery Loop requires PR Monitor panel review with exact-head "
-            "required CI checks"
+            "Delivery Loop requires PR Monitor panel review"
         )
-    if repo.auto_merge and not required_checks_support_direct_auto_merge(
-        repo.required_checks
+    if bool(repo.wait_for_ci) != bool(repo.required_checks):
+        raise DeliveryValidationError(
+            "PR Monitor exact-head CI policy is incomplete"
+        )
+    if spec.auto_merge is not None and type(spec.auto_merge) is not bool:
+        raise DeliveryValidationError("auto_merge must be a boolean")
+    auto_merge = (
+        bool(repo.auto_merge)
+        if spec.auto_merge is None
+        else spec.auto_merge
+    )
+    if auto_merge and (
+        not repo.wait_for_ci
+        or not repo.required_checks
+        or not required_checks_support_direct_auto_merge(repo.required_checks)
     ):
         raise DeliveryValidationError(
             "Delivery auto-merge requires app-bound check_run required CI "
-            "policies"
+            "policies discovered from branch protection"
         )
+    frontend_review = _non_empty_text(
+        spec.frontend_review,
+        field="frontend_review",
+        limit=16,
+    ).lower()
+    if frontend_review not in {"auto", "required", "off"}:
+        raise DeliveryValidationError(
+            "frontend_review must be 'auto', 'required', or 'off'"
+        )
+    if frontend_review == "required":
+        if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+            raise DeliveryUnavailableError(
+                "Required frontend review needs a configured AUTH_TOKEN"
+            )
+        if project.preview_config is None:
+            raise DeliveryValidationError(
+                "Required frontend review needs a confirmed Project Preview configuration"
+            )
+        try:
+            from backend.services.workspace_review import (
+                WorkspaceReviewError,
+                validate_preview_config,
+            )
+
+            preview_workspace = Path(project.local_path).resolve(strict=True)
+            if not (preview_workspace / ".git").exists():
+                raise WorkspaceReviewError(
+                    "Project path is not a Git checkout"
+                )
+            validate_preview_config(project.preview_config, preview_workspace)
+        except (OSError, TypeError, ValueError, WorkspaceReviewError) as exc:
+            raise DeliveryValidationError(
+                f"Required frontend review Preview configuration is invalid: {exc}"
+            ) from exc
     source_todo: ProjectTodo | None = None
     if spec.source_todo_id is not None:
         todo = (
@@ -632,9 +700,8 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "Delivery base branch must match the PR Monitor default branch"
         )
-    auto_merge = bool(repo.auto_merge)
     policy = {
-        "schema_version": 1,
+        "schema_version": 2,
         "terminal": "merged" if auto_merge else "ready_to_merge",
         "auto_merge": auto_merge,
         "max_cycles": spec.max_cycles,
@@ -644,6 +711,11 @@ async def create_delivery_run(
         "codex_service_tier": spec.codex_service_tier,
         "effort_level": resolved_effort,
         "timeout_hours": spec.timeout_hours,
+        "frontend_review": {
+            "mode": frontend_review,
+            "profile": "standard",
+            "allow_actions": True,
+        },
         "pr_monitor": {
             "repo_id": repo.id,
             "repo_full_name": repo.repo_full_name,

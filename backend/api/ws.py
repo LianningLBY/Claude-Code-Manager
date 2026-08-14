@@ -23,10 +23,12 @@ _GLOBAL_CHANNELS = {
     "system_update",
     "pr-monitor",
     "capabilities",
+    "deliveries",
 }
 _INSTANCE_CHANNEL_RE = re.compile(r"instance:([1-9]\d*)\Z")
 _TASK_CHANNEL_RE = re.compile(r"task:([1-9]\d*)\Z")
 _PLAN_CHANNEL_RE = re.compile(r"plan:([1-9]\d*)\Z")
+_DELIVERY_CHANNEL_RE = re.compile(r"delivery:([1-9]\d*)\Z")
 _WORKER_CHANNEL_RE = re.compile(r"worker:([1-9]\d*)\Z")
 _DISCUSSION_CHANNEL_RE = re.compile(
     r"discussion:([1-9]\d*)(?::agent:[1-9]\d*)?\Z"
@@ -204,6 +206,33 @@ async def _ws_plan_channel_allowed(identity: dict, plan_id: int, db=None) -> boo
         return await check(session)
 
 
+async def _ws_delivery_channel_allowed(
+    identity: dict,
+    run_id: int,
+    db=None,
+) -> bool:
+    """Authorize scoped Delivery updates through the owning Project ACL."""
+
+    from backend.api.deps import has_project_access
+    from backend.database import async_session
+    from backend.models.delivery import DeliveryRun
+
+    async def check(session) -> bool:
+        run = await session.get(DeliveryRun, run_id)
+        if run is None:
+            return False
+        return await has_project_access(
+            _acl_request(identity),
+            run.project_id,
+            session,
+        )
+
+    if db is not None:
+        return await check(db)
+    async with async_session() as session:
+        return await check(session)
+
+
 async def _ws_discussion_channel_allowed(
     identity: dict,
     discussion_id: int,
@@ -239,6 +268,7 @@ async def _ws_channel_allowed(channel: object, identity: dict, db=None) -> bool:
     instance_match = _INSTANCE_CHANNEL_RE.fullmatch(channel)
     task_match = _TASK_CHANNEL_RE.fullmatch(channel)
     plan_match = _PLAN_CHANNEL_RE.fullmatch(channel)
+    delivery_match = _DELIVERY_CHANNEL_RE.fullmatch(channel)
     worker_match = _WORKER_CHANNEL_RE.fullmatch(channel)
     discussion_match = _DISCUSSION_CHANNEL_RE.fullmatch(channel)
     known_channel = bool(
@@ -246,6 +276,7 @@ async def _ws_channel_allowed(channel: object, identity: dict, db=None) -> bool:
         or instance_match
         or task_match
         or plan_match
+        or delivery_match
         or worker_match
         or discussion_match
     )
@@ -265,6 +296,12 @@ async def _ws_channel_allowed(channel: object, identity: dict, db=None) -> bool:
         return await _ws_plan_channel_allowed(
             identity,
             int(plan_match.group(1)),
+            db,
+        )
+    if delivery_match:
+        return await _ws_delivery_channel_allowed(
+            identity,
+            int(delivery_match.group(1)),
             db,
         )
     if worker_match:

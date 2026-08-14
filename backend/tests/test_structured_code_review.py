@@ -113,6 +113,21 @@ def test_build_pre_pr_prompt_is_provider_neutral_and_subject_pinned(subject):
     assert "Codex" not in prompt
 
 
+def test_build_retry_prompt_calls_out_complete_finding_shape(subject):
+    prompt = build_structured_review_prompt(
+        subject=subject,
+        surface="pre_pr",
+        expected_role="code_reviewer",
+        material={"patch": PATCH, "changed_paths": ["app.py"]},
+        retry_after_schema_failure=True,
+    )
+
+    assert "## Retry correction" in prompt
+    assert "previous response" in prompt
+    assert "`title`" in prompt
+    assert "complete replacement result" in prompt
+
+
 def test_build_rejects_unknown_surface_or_role(subject):
     with pytest.raises(ValueError, match="unsupported.*surface"):
         build_structured_review_prompt(
@@ -312,6 +327,21 @@ def test_parse_rejects_unknown_fields_and_duplicate_json_keys(subject):
     )
     with pytest.raises(ValueError, match="repeats key"):
         parse_structured_review_output(duplicate_key_json, expected_subject=subject)
+
+
+def test_parse_reports_missing_required_finding_fields(subject):
+    finding = _finding()
+    finding.pop("title")
+
+    with pytest.raises(ValueError, match="missing required fields: title"):
+        parse_structured_review_output(
+            _output(_payload(
+                subject,
+                verdict="changes_required",
+                findings=[finding],
+            )),
+            expected_subject=subject,
+        )
 
 
 def test_parse_rejects_finding_without_attachable_location(subject):

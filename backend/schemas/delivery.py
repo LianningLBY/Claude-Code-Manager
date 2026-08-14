@@ -5,6 +5,11 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from backend.schemas.plan_resource import (
+    PlanInputRequestResponse,
+    PlanRunResource,
+)
+
 
 class DeliveryRunCreate(BaseModel):
     idempotency_key: str = Field(min_length=1, max_length=128)
@@ -23,6 +28,10 @@ class DeliveryRunCreate(BaseModel):
     timeout_hours: float | None = Field(default=None, ge=0, le=168)
     max_cycles: int = Field(default=10, ge=1, le=100)
     max_no_progress: int = Field(default=3, ge=1, le=20)
+    # Omitted callers retain the selected Monitor's legacy repository policy.
+    # First-party quick-start always freezes an explicit per-Run choice.
+    auto_merge: bool | None = None
+    frontend_review: Literal["auto", "required", "off"] = "auto"
 
     model_config = ConfigDict(extra="forbid")
 
@@ -36,6 +45,32 @@ class DeliveryRunCreate(BaseModel):
     )
     @classmethod
     def strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("field must not be blank")
+        return normalized
+
+
+class DeliveryQuickStartCreate(BaseModel):
+    """One-message Delivery admission with lazy PR Monitor bootstrap."""
+
+    idempotency_key: str = Field(min_length=1, max_length=128)
+    project_id: int = Field(gt=0)
+    requirements: str = Field(min_length=1, max_length=200_000)
+    title: str | None = Field(default=None, max_length=200)
+    timeout_hours: float | None = Field(default=None, ge=0, le=168)
+    max_cycles: int = Field(default=10, ge=1, le=100)
+    max_no_progress: int = Field(default=3, ge=1, le=20)
+    auto_merge: bool = False
+    frontend_review: Literal["auto", "required", "off"] = "auto"
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("idempotency_key", "requirements", "title")
+    @classmethod
+    def strip_quick_start_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         normalized = value.strip()
@@ -111,6 +146,10 @@ class DeliveryCycleResponse(BaseModel):
     review_result_id: int | None
     review_verdict: str | None
     review_summary: str | None
+    frontend_review_run_id: str | None
+    frontend_review_verdict: str | None
+    frontend_review_summary: str | None
+    frontend_review_skip_reason: str | None
     error_code: str | None
     error_message: str | None
     created_at: datetime
@@ -186,3 +225,118 @@ class DeliveryResumeCommand(BaseModel):
     reason: str | None = Field(default=None, max_length=2000)
 
     model_config = ConfigDict(extra="forbid")
+
+
+class DeliveryRetryCommand(BaseModel):
+    """Explicit operator retry of one failed pre-publication Run."""
+
+    expected_state_version: int = Field(ge=1)
+    reason: str | None = Field(default=None, max_length=2000)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("reason")
+    @classmethod
+    def normalize_optional_reason(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
+class DeliveryAgentActivity(BaseModel):
+    role: Literal["planner", "plan_reviewer", "developer", "code_reviewer", "browser_reviewer"]
+    provider: str | None = None
+    model: str | None = None
+    effort: str | None = None
+    service_tier: str | None = None
+    status: str
+    activity_kind: str
+    headline: str
+    detail: str | None = None
+    task_id: int | None = None
+    source_kind: str
+    source_id: str | None = None
+    started_at: datetime | None = None
+    first_output_at: datetime | None = None
+    last_activity_at: datetime | None = None
+    output_chars: int = 0
+
+
+class DeliveryStageProgress(BaseModel):
+    key: Literal[
+        "planning",
+        "coding",
+        "pre_review",
+        "frontend_review",
+        "publishing",
+        "monitoring",
+    ]
+    label: str
+    state: Literal[
+        "pending",
+        "ready",
+        "running",
+        "waiting",
+        "paused",
+        "completed",
+        "failed",
+        "cancelled",
+        "skipped",
+    ]
+    summary: str
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class DeliveryTimelineEvent(BaseModel):
+    id: str
+    stage: str
+    kind: str
+    source: str
+    title: str
+    detail: str | None = None
+    status: str | None = None
+    created_at: datetime
+
+
+class DeliveryPlanInputProjection(BaseModel):
+    plan_id: int
+    run: PlanRunResource
+    request: PlanInputRequestResponse
+
+
+class DeliveryFrontendReviewProgress(BaseModel):
+    policy: Literal["auto", "required", "off"]
+    run_id: str | None = None
+    status: str | None = None
+    stage: str | None = None
+    verdict: str | None = None
+    report: str | None = None
+    error: str | None = None
+    cleanup_status: str | None = None
+    evidence_archive_state: str | None = None
+    finding_count: int = 0
+    evidence_count: int = 0
+    skip_reason: str | None = None
+
+
+class DeliveryProgressResponse(BaseModel):
+    run_id: int
+    state_version: int
+    phase: str
+    activity: str
+    headline: str
+    detail: str | None = None
+    attention_required: bool = False
+    attention_kind: str | None = None
+    last_activity_at: datetime | None = None
+    stages: list[DeliveryStageProgress]
+    active_agent: DeliveryAgentActivity | None = None
+    events: list[DeliveryTimelineEvent]
+    plan_input: DeliveryPlanInputProjection | None = None
+    frontend_review: DeliveryFrontendReviewProgress
+
+
+class DeliveryAttentionCount(BaseModel):
+    total: int

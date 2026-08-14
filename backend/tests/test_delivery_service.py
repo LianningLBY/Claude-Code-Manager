@@ -16,6 +16,7 @@ from backend.models.task import Task
 from backend.services.delivery_reducer import DeliveryReducerEvent
 from backend.services.delivery_service import (
     DeliveryCreateSpec,
+    DeliveryUnavailableError,
     DeliveryUnsupportedScopeError,
     DeliveryValidationError,
     apply_run_event,
@@ -24,6 +25,7 @@ from backend.services.delivery_service import (
     lock_current_cycle,
     lock_run,
     start_next_cycle,
+    value_hash,
 )
 
 
@@ -361,6 +363,49 @@ async def test_idempotency_scope_is_per_principal_and_project(db_session):
 
 
 @pytest.mark.asyncio
+async def test_idempotent_replay_accepts_pre_frontend_policy_hash(db_session):
+    project, repo = await _scope(db_session)
+    spec = DeliveryCreateSpec(
+        idempotency_key="legacy-delivery-replay",
+        project_id=project.id,
+        monitored_repo_id=repo.id,
+        title="Legacy admission",
+        requirements="Return the already-frozen Run after an upgrade.",
+        created_by=15,
+    )
+    first = await create_delivery_run(db_session, spec)
+
+    legacy_request = {
+        "schema_version": 1,
+        "project_id": project.id,
+        "monitored_repo_id": repo.id,
+        "title": spec.title,
+        "requirements": spec.requirements,
+        "source_todo_id": None,
+        "base_branch": None,
+        "provider": "codex",
+        "model": None,
+        "codex_service_tier": "default",
+        "effort_level": None,
+        "timeout_hours": None,
+        "max_cycles": 10,
+        "max_no_progress": 3,
+    }
+    legacy_policy = dict(first.policy_snapshot)
+    legacy_policy["schema_version"] = 1
+    legacy_policy.pop("frontend_review", None)
+    first.request_hash = value_hash(legacy_request)
+    first.policy_snapshot = legacy_policy
+    first.policy_hash = value_hash(legacy_policy)
+    await db_session.commit()
+
+    replay = await create_delivery_run(db_session, spec)
+
+    assert replay.id == first.id
+    assert await db_session.scalar(select(func.count(DeliveryRun.id))) == 1
+
+
+@pytest.mark.asyncio
 async def test_concurrent_same_admission_returns_one_run(tmp_path):
     engine = create_async_engine(
         f"sqlite+aiosqlite:///{tmp_path / 'delivery-idempotency.db'}",
@@ -431,6 +476,130 @@ async def test_create_delivery_run_freezes_automatic_merge_terminal(db_session):
 
     assert run.policy_snapshot["auto_merge"] is True
     assert run.policy_snapshot["terminal"] == "merged"
+
+
+@pytest.mark.asyncio
+async def test_explicit_run_merge_choice_overrides_repo_default(db_session):
+    project, repo = await _scope(db_session, auto_merge=True)
+
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-explicit-manual-merge",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Keep the PR open",
+            requirements="Finish all gates but leave merge to a human.",
+            auto_merge=False,
+        ),
+    )
+
+    assert run.policy_snapshot["auto_merge"] is False
+    assert run.policy_snapshot["terminal"] == "ready_to_merge"
+
+
+@pytest.mark.asyncio
+async def test_panel_only_monitor_is_valid_for_manual_delivery(db_session):
+    project, repo = await _scope(db_session, auto_merge=False)
+    repo.wait_for_ci = False
+    repo.required_checks = []
+    await db_session.commit()
+
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-panel-only",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Panel without invented CI",
+            requirements="Create a PR and require the independent Panel.",
+            auto_merge=False,
+        ),
+    )
+
+    assert run.policy_snapshot["pr_monitor"]["wait_for_ci"] is False
+    assert run.policy_snapshot["pr_monitor"]["required_checks"] == []
+    assert run.policy_snapshot["terminal"] == "ready_to_merge"
+
+
+@pytest.mark.asyncio
+async def test_required_frontend_review_fails_closed_without_auth_token(
+    db_session,
+    monkeypatch,
+):
+    project, repo = await _scope(db_session)
+    monkeypatch.setattr(settings, "auth_token", "")
+
+    with pytest.raises(
+        DeliveryUnavailableError,
+        match="configured AUTH_TOKEN",
+    ):
+        await create_delivery_run(
+            db_session,
+            DeliveryCreateSpec(
+                idempotency_key="service-required-frontend-no-auth",
+                project_id=project.id,
+                monitored_repo_id=repo.id,
+                title="Require Browser review",
+                requirements="Do not publish without Browser evidence.",
+                frontend_review="required",
+            ),
+        )
+    await db_session.rollback()
+    assert await db_session.scalar(select(func.count(DeliveryRun.id))) == 0
+    assert await db_session.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_required_frontend_review_freezes_valid_preview_policy(
+    db_session,
+    monkeypatch,
+    tmp_path,
+):
+    project, repo = await _scope(db_session)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    (workspace / ".git").mkdir()
+    project.local_path = str(workspace)
+    project.preview_config = {
+        "version": 1,
+        "name": "Static preview",
+        "setup": [],
+        "processes": [
+            {
+                "name": "web",
+                "command": [
+                    "{python}",
+                    "-m",
+                    "http.server",
+                    "{preview_port}",
+                ],
+                "cwd": ".",
+            }
+        ],
+        "url": "http://127.0.0.1:{preview_port}/",
+        "health_url": "http://127.0.0.1:{preview_port}/",
+    }
+    await db_session.commit()
+    monkeypatch.setattr(settings, "auth_token", "test-token")
+
+    run = await create_delivery_run(
+        db_session,
+        DeliveryCreateSpec(
+            idempotency_key="service-required-frontend-valid",
+            project_id=project.id,
+            monitored_repo_id=repo.id,
+            title="Require Browser review",
+            requirements="Publish only with complete Browser evidence.",
+            frontend_review="required",
+        ),
+    )
+
+    assert run.policy_snapshot["frontend_review"] == {
+        "mode": "required",
+        "profile": "standard",
+        "allow_actions": True,
+    }
 
 
 @pytest.mark.asyncio

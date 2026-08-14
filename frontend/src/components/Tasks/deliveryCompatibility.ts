@@ -25,8 +25,7 @@ export function isDeliveryCompatible(
     && repo.status === 'active'
     && repo.merge_queue_mode === 'manual'
     && repo.review_mode === 'panel'
-    && repo.wait_for_ci
-    && repo.required_checks.length > 0
+    && repo.wait_for_ci === (repo.required_checks.length > 0)
     && repo.default_branch === project.default_branch,
   );
 }

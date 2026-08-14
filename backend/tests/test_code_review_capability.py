@@ -139,6 +139,7 @@ def _structured_output(
     subject: dict,
     *,
     changes_requested: bool = False,
+    omit_finding_title: bool = False,
 ) -> str:
     findings = []
     verdict = "pass"
@@ -160,6 +161,8 @@ def _structured_output(
                 "test": "Assert the public value expected by callers.",
             }
         ]
+        if omit_finding_title:
+            findings[0].pop("title")
     payload = {
         "schema_version": 1,
         "subject": subject,
@@ -388,6 +391,55 @@ async def test_invalid_or_untrusted_output_fails_attempt_and_retries(
     failed_run = await db_session.get(CodeReviewRun, run.id)
     assert failed_run is not None and failed_run.status == "failed"
     assert await db_session.scalar(select(func.count(CodeReviewResult.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_schema_failure_retry_receives_actionable_correction(
+    db_session,
+    review_repo,
+):
+    _developer, invocation = await _create_invocation(db_session, review_repo)
+    executor = CodeReviewCapabilityExecutor()
+    await executor.ensure_started(db_session, invocation_id=invocation.id)
+    first_execution, first_run, first_reviewer = await _handled(
+        db_session,
+        invocation.id,
+    )
+    await _complete_reviewer_task(
+        db_session,
+        first_reviewer,
+        _structured_output(
+            first_run.subject_ref,
+            changes_requested=True,
+            omit_finding_title=True,
+        ),
+    )
+
+    retrying = await executor.observe(db_session, invocation_id=invocation.id)
+
+    assert retrying.status == "queued"
+    assert "missing required fields: title" in (retrying.error_message or "")
+    await executor.ensure_started(db_session, invocation_id=invocation.id)
+    second_execution, second_run, second_reviewer = await _handled(
+        db_session,
+        invocation.id,
+    )
+    assert second_execution.attempt == 2
+    assert second_execution.id != first_execution.id
+    assert second_reviewer.id != first_reviewer.id
+    assert "## Retry correction" in (second_reviewer.description or "")
+    assert "`title`" in (second_reviewer.description or "")
+    assert second_run.prompt_hash != first_run.prompt_hash
+
+    await _complete_reviewer_task(
+        db_session,
+        second_reviewer,
+        _structured_output(second_run.subject_ref, changes_requested=True),
+    )
+    ready = await executor.observe(db_session, invocation_id=invocation.id)
+
+    assert ready.status == "ready"
+    assert ready.verdict == "changes_requested"
 
 
 @pytest.mark.asyncio

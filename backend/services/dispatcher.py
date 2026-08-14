@@ -12109,29 +12109,58 @@ class GlobalDispatcher:
                     if owner is None:
                         await db.rollback()
                         return
-                    instance_predicates = [
-                        Instance.id == instance_id,
-                        Instance.status == "running",
-                        (
-                            Instance.current_task_id.is_(None)
-                            if owner.current_task_id is None
-                            else Instance.current_task_id == owner.current_task_id
-                        ),
-                        (
-                            Instance.pid.is_(None)
-                            if owner.pid is None
-                            else Instance.pid == owner.pid
-                        ),
-                        (
-                            Instance.started_at.is_(None)
-                            if owner.started_at is None
-                            else Instance.started_at == owner.started_at
-                        ),
-                    ]
+                    # The output consumer normally proves process reap and
+                    # releases the reverse Instance owner before Dispatcher
+                    # commits the Task terminal status.  A Browser binding
+                    # still needs its durable receipt after that ordering.  An
+                    # exact idle/error, pid-less, unowned snapshot is safe to
+                    # fence with a no-op CAS while the lifecycle lock and
+                    # in-memory dead-runtime checks above remain held.
+                    instance_already_released = bool(
+                        browser_binding_id is not None
+                        and owner.status in {"idle", "error"}
+                        and owner.current_task_id is None
+                        and owner.pid is None
+                    )
+                    instance_predicates = [Instance.id == instance_id]
+                    if instance_already_released:
+                        instance_predicates.extend([
+                            Instance.status == owner.status,
+                            Instance.current_task_id.is_(None),
+                            Instance.pid.is_(None),
+                        ])
+                    else:
+                        instance_predicates.extend([
+                            Instance.status == "running",
+                            (
+                                Instance.current_task_id.is_(None)
+                                if owner.current_task_id is None
+                                else Instance.current_task_id
+                                == owner.current_task_id
+                            ),
+                            (
+                                Instance.pid.is_(None)
+                                if owner.pid is None
+                                else Instance.pid == owner.pid
+                            ),
+                        ])
+                    instance_predicates.append(
+                        Instance.started_at.is_(None)
+                        if owner.started_at is None
+                        else Instance.started_at == owner.started_at
+                    )
                     instance_reset = await db.execute(
                         update(Instance)
                         .where(*instance_predicates)
-                        .values(status="idle", current_task_id=None, pid=None)
+                        .values(
+                            status=(
+                                owner.status
+                                if instance_already_released
+                                else "idle"
+                            ),
+                            current_task_id=None,
+                            pid=None,
+                        )
                     )
                     if not instance_reset.rowcount:
                         # The Task transition above belongs to the same
@@ -12184,7 +12213,7 @@ class GlobalDispatcher:
                             await db.rollback()
                             return
                     await db.commit()
-                if instance_reset.rowcount:
+                if instance_reset.rowcount and not instance_already_released:
                     logger.warning(
                         "Safety reset inactive owner: instance %s / task %s",
                         instance_id,

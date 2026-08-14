@@ -27,6 +27,7 @@ from backend.services.test_harness_children import (
     CHILD_STOP_FAILED,
     TestHarnessChildError as ChildError,
     TestHarnessChildService as ChildService,
+    browser_child_binding_error,
     browser_child_ssh_grant_error,
     finalize_reaped_browser_child_binding,
 )
@@ -548,6 +549,83 @@ async def test_browser_child_allows_only_runtime_account_metadata(db_factory):
         await db.commit()
         claimed = await TaskQueue(db).dequeue(instance_id=92)
         assert claimed is not None and claimed.id == child.id
+
+
+@pytest.mark.asyncio
+async def test_browser_child_accepts_previous_status_terminal_gate_after_executing_transition(
+    db_factory,
+):
+    owner_id, run_id = await _owner_and_run(db_factory, suffix="status-gate")
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-status-gate",
+        harness_run_id=run_id,
+        child_values=_child_values("job-status-gate"),
+    )
+    await service.activate(binding.id)
+
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue(instance_id=93)
+        assert claimed is not None and claimed.id == child.id
+        durable = await db.get(Task, child.id, populate_existing=True)
+        in_progress_identity = owner_identity_for_test(durable)
+        await install_test_harness_owner_terminal_gate(
+            db,
+            in_progress_identity,
+            reason="Task mode lifecycle entered executing status",
+        )
+        durable.status = "executing"
+        await db.commit()
+
+    async with db_factory() as db:
+        durable = await db.get(Task, child.id)
+        durable_binding = await db.get(ChildBindingModel, binding.id)
+        assert browser_child_binding_error(durable_binding, durable) is None
+
+
+@pytest.mark.asyncio
+async def test_browser_child_rejects_current_or_drifted_terminal_gate(db_factory):
+    owner_id, run_id = await _owner_and_run(db_factory, suffix="active-gate")
+    service = ChildService(db_factory=db_factory)
+    child, binding = await service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id="job-active-gate",
+        harness_run_id=run_id,
+        child_values=_child_values("job-active-gate"),
+    )
+    await service.activate(binding.id)
+
+    async with db_factory() as db:
+        claimed = await TaskQueue(db).dequeue(instance_id=94)
+        assert claimed is not None and claimed.id == child.id
+        durable = await db.get(Task, child.id, populate_existing=True)
+        await install_test_harness_owner_terminal_gate(
+            db,
+            owner_identity_for_test(durable),
+            reason="terminalizing exact Browser child generation",
+        )
+        await db.commit()
+
+    async with db_factory() as db:
+        durable = await db.get(Task, child.id)
+        durable_binding = await db.get(ChildBindingModel, binding.id)
+        assert browser_child_binding_error(durable_binding, durable) == (
+            "Browser child generation is already terminalizing"
+        )
+        metadata = dict(durable.metadata_ or {})
+        gate = dict(metadata["test_harness_terminal_generation"])
+        gate["cleanup_harness_run_ids"] = ["a" * 32]
+        metadata["test_harness_terminal_generation"] = gate
+        durable.metadata_ = metadata
+        await db.commit()
+
+    async with db_factory() as db:
+        durable = await db.get(Task, child.id)
+        durable_binding = await db.get(ChildBindingModel, binding.id)
+        assert browser_child_binding_error(durable_binding, durable) == (
+            "Browser child terminal gate metadata drifted"
+        )
 
 
 @pytest.mark.asyncio

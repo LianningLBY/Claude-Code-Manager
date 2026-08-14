@@ -382,7 +382,7 @@ describe('BrowserReviewPanel', () => {
     );
 
     expect(await screen.findByText('前端运行审查')).toBeInTheDocument();
-    expect(screen.getByText('模型观察与操作轨迹')).toBeInTheDocument();
+    expect(screen.getByText('Agent 实时过程')).toBeInTheDocument();
     expect(screen.getByText(/首屏存在横向溢出/)).toBeInTheDocument();
     expect(screen.getByText('page errors: 1')).toBeInTheDocument();
     expect(screen.getByText('审查结论')).toBeInTheDocument();
@@ -781,6 +781,7 @@ describe('BrowserReviewPanel', () => {
       value: vi.fn(),
     });
     const onDisplayModeChange = vi.fn();
+    const onActiveChange = vi.fn();
 
     render(
       <BrowserReviewPanel
@@ -789,6 +790,7 @@ describe('BrowserReviewPanel', () => {
         open
         displayMode="floating"
         onAvailableChange={vi.fn()}
+        onActiveChange={onActiveChange}
         onClose={vi.fn()}
         onDisplayModeChange={onDisplayModeChange}
         onNewReview={vi.fn()}
@@ -798,12 +800,16 @@ describe('BrowserReviewPanel', () => {
     const panel = await screen.findByLabelText('Frontend Review progress');
     expect(panel).toHaveAttribute('data-display-mode', 'floating');
     expect(screen.getAllByText('正在验证页面状态').length).toBeGreaterThan(0);
+    expect(screen.getByTestId('browser-agent-live-progress')).toHaveTextContent('Browser Agent 正在执行');
+    expect(screen.getByTestId('browser-agent-live-progress')).toHaveTextContent('步骤 3/20');
+    expect(screen.getByTestId('browser-agent-event-list').querySelector('[data-current-event="true"]')).not.toBeNull();
+    await waitFor(() => expect(onActiveChange).toHaveBeenCalledWith(true));
     expect(await screen.findByAltText('Latest frontend review screenshot')).toHaveAttribute(
       'src',
       'blob:frontend-review-screenshot',
     );
     const screenshotHeading = screen.getByText('最新浏览器画面');
-    const traceHeading = screen.getByText('模型观察与操作轨迹');
+    const traceHeading = screen.getByText('Agent 实时过程');
     expect(screenshotHeading.compareDocumentPosition(traceHeading)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
@@ -829,11 +835,11 @@ describe('BrowserReviewPanel', () => {
     });
 
     fireEvent.click(screen.getByRole('button', { name: 'Minimize Frontend Review window' }));
-    expect(screen.queryByText('模型观察与操作轨迹')).not.toBeInTheDocument();
+    expect(screen.queryByText('Agent 实时过程')).not.toBeInTheDocument();
     expect(screen.getByText('前端运行审查')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Restore Frontend Review window' }));
-    expect(screen.getByText('模型观察与操作轨迹')).toBeInTheDocument();
+    expect(screen.getByText('Agent 实时过程')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Dock Frontend Review panel' }));
     expect(onDisplayModeChange).toHaveBeenCalledWith('docked');

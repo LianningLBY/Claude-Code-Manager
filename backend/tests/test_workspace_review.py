@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 import pytest
 from sqlalchemy import select
 
+from backend.config import settings
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.workspace_review import WorkspaceReviewRun
@@ -16,6 +17,7 @@ from backend.services import workspace_review as workspace_review_module
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.workspace_review import (
     _browser_agent_prompt,
+    _safe_preview_env,
     PreviewConfigurationError,
     PreviewHandle,
     WorkspacePreviewManager,
@@ -93,6 +95,7 @@ def test_browser_agent_prompt_publishes_canonical_result_schema_and_zero_budget(
     assert "browser_open, browser_inspect, and browser_observe only" in prompt
     assert "scenario_id, severity, category, title, route" in prompt
     assert "verdict must be exactly passed, failed, or inconclusive" in prompt
+    assert "Severity must be exactly critical, high, medium, low, or info" in prompt
     assert "reproduction_steps" in prompt
     assert "reproduction and evidence must be JSON arrays" in prompt
     assert "never use high/medium/low" in prompt
@@ -189,6 +192,46 @@ def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_buil
         "--port",
         "{preview_port}",
     ]
+    assert suggestion["processes"][0]["env"]["USE_PTY_MODE"] == "false"
+    assert suggestion["sandbox"]["processes"][0]["env"]["USE_PTY_MODE"] == "false"
+
+
+def test_preview_environment_forces_manager_control_plane_services_off(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    env = _safe_preview_env(
+        {
+            "USE_PTY_MODE": "true",
+            "AUTO_START_DISPATCHER": "true",
+            "POOL_ENABLED": "true",
+            "CUSTOM_PREVIEW_PORT": "{preview_port}",
+        },
+        {
+            "workspace": "/tmp/workspace",
+            "preview_port": "43123",
+            "temp_dir": "/tmp/preview",
+            "temp_db": "/tmp/preview/db.sqlite",
+            "python": "/usr/bin/python3",
+        },
+    )
+
+    assert env["CUSTOM_PREVIEW_PORT"] == "43123"
+    assert env["OPENAI_API_KEY"] == ""
+    assert env["USE_PTY_MODE"] == "false"
+    assert env["AUTO_START_DISPATCHER"] == "false"
+    assert env["AUTO_PUSH_TO_ORIGIN"] == "false"
+    assert env["WORKER_ENABLED"] == "false"
+    assert env["POOL_ENABLED"] == "false"
+    assert env["CODEX_POOL_ENABLED"] == "false"
+    assert env["BACKUP_ENABLED"] == "false"
+    assert env["TMP_CLEANUP_ENABLED"] == "false"
+    assert env["CLOUDROUTER_ACCOUNTS_DIR"] == "/tmp/preview/api-accounts"
+    assert env["POOL_CONFIG_PATH"] == "/tmp/preview/claude-pool/accounts.json"
+    assert env["CODEX_POOL_CONFIG_PATH"] == "/tmp/preview/codex-pool/accounts.json"
+    assert env["SSH_KEY_STORAGE_DIR"] == "/tmp/preview/ssh-keys"
+    assert env["TASK_RUNTIME_SECRET_DIR"] == "/tmp/preview/task-runtime-secrets"
+    assert env["TEST_HARNESS_ARTIFACT_ROOT"] == (
+        "/tmp/preview/test-harness-artifacts"
+    )
 
 
 def test_sandbox_preview_profile_requires_explicit_port_and_public_hosts(tmp_path):
@@ -220,6 +263,7 @@ async def test_new_workspace_review_waits_for_terminal_cleanup_proof(
     tmp_path,
     db_factory,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     from backend.services.test_harness_owner_fence import (
         test_harness_owner_identity,
     )
@@ -360,10 +404,48 @@ async def test_preview_manager_starts_loopback_process_and_cleans_it_up(tmp_path
     assert handle.url.startswith("http://127.0.0.1:")
     assert process.returncode is None
     assert temp_dir.is_dir()
+    assert temp_dir == temp_dir.resolve(strict=True)
 
     await manager.stop("preview-test")
     assert process.returncode is not None
     assert not temp_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_preview_start_failure_reports_bounded_process_log_and_cleans_up(
+    tmp_path,
+):
+    workspace = _make_repo(tmp_path)
+    config = _http_preview_config()
+    config["processes"][0]["command"] = [
+        "{python}",
+        "-c",
+        (
+            "import sys; "
+            "sys.stdout.write('START-OF-LOG\\n' + 'x' * 9000 + "
+            "'\\nFINAL PREVIEW DIAGNOSTIC\\n'); "
+            "sys.stdout.flush(); sys.exit(23)"
+        ),
+        "{preview_port}",
+    ]
+    config = validate_preview_config(config, workspace)
+    snapshot = await capture_workspace_snapshot(workspace, config)
+    manager = WorkspacePreviewManager()
+
+    with pytest.raises(WorkspaceReviewError) as raised:
+        await manager.start(
+            run_id="preview-failure",
+            task_id=18,
+            snapshot=snapshot,
+            config=config,
+        )
+
+    message = str(raised.value)
+    assert "preview process 'web' exited before readiness with code 23" in message
+    assert "FINAL PREVIEW DIAGNOSTIC" in message
+    assert "START-OF-LOG" not in message
+    assert len(message.encode()) < 5 * 1024
+    assert "preview-failure" not in manager._handles
 
 
 @pytest.mark.asyncio
@@ -414,6 +496,7 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
     tmp_path,
     db_factory,
 ):
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     workspace = _make_repo(tmp_path)
     config = validate_preview_config(_http_preview_config(), workspace)
     async with db_factory() as db:

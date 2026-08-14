@@ -3364,6 +3364,7 @@ class InstanceManager:
             provider == "claude"
             and task_id is not None
             and not pr_review_task
+            and not browser_review_task
             and not delivery_task
             and settings.ask_user_enabled
         ):
@@ -3386,10 +3387,17 @@ class InstanceManager:
                 git_env = dict(git_env or {})
                 git_env[ASK_USER_TOKEN_ENV] = ask_user_token
 
-        if task_id is not None and not pr_review_task and not delivery_task:
+        if (
+            task_id is not None
+            and not pr_review_task
+            and not browser_review_task
+            and not delivery_task
+        ):
             # These variables are inherited by Claude PTY, Claude direct, and
             # Codex shell environments. Empty agent coordinates prevent any
             # Task (granted or not) from reaching a service-level SSH agent.
+            # A Browser child is MCP-only and receives no shell environment at
+            # all, including otherwise-safe empty SSH variables.
             git_env = dict(git_env or {})
             git_env.update({
                 "SSH_AUTH_SOCK": "",
@@ -3756,6 +3764,17 @@ class InstanceManager:
                 except CodexRequiredMcpPreTurnError as exc:
                     if launch_boundary_attempted:
                         raise
+                    logger.warning(
+                        "Codex app-server pre-turn admission failed "
+                        "task_id=%s instance_id=%s browser_review=%s "
+                        "pr_review=%s delivery=%s reason=%s",
+                        task_id,
+                        instance_id,
+                        browser_review_task,
+                        pr_review_task,
+                        delivery_task,
+                        exc,
+                    )
                     if delivery_task:
                         raise CodexRequiredMcpError(
                             "Codex Delivery workspace/network isolation could "

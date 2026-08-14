@@ -5517,6 +5517,12 @@ async def test_mcp_only_profile_keeps_bound_mcp_and_denies_ambient_capabilities(
     context = server._contexts_by_thread[thread_id]
     assert context.mcp_only is True
     server._schedule_tool_free_violation = MagicMock()
+    server._handle_notification("mcpServer/startupStatus/updated", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "server": "ccm_browser_review",
+        "status": "ready",
+    })
     server._handle_notification("item/started", {
         "threadId": thread_id,
         "turnId": "turn-mcp-only",

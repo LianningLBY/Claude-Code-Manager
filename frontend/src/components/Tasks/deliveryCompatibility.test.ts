@@ -57,6 +57,14 @@ describe('isDeliveryCompatible', () => {
     expect(isDeliveryCompatible(project, repo, ['claude', 'codex'])).toBe(true);
   });
 
+  it('accepts the mandatory Panel when the repository declares no required CI', () => {
+    expect(isDeliveryCompatible(
+      project,
+      { ...repo, wait_for_ci: false, required_checks: [] },
+      ['claude', 'codex'],
+    )).toBe(true);
+  });
+
   it('accepts a repository whose PR Monitor owns automatic merge', () => {
     expect(isDeliveryCompatible(
       project,

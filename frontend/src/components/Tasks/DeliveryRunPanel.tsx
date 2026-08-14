@@ -11,7 +11,7 @@ import {
   XCircle,
 } from '../icons';
 
-type DeliveryAction = 'pause' | 'resume' | 'cancel';
+type DeliveryAction = 'pause' | 'resume' | 'cancel' | 'retry';
 
 interface DeliveryRunPanelProps {
   runId: number;
@@ -39,7 +39,12 @@ const actionLabels: Record<DeliveryAction, string> = {
   pause: 'Pause',
   resume: 'Resume',
   cancel: 'Cancel',
+  retry: 'Retry from Plan',
 };
+
+function actionRequiresReason(action: DeliveryAction): boolean {
+  return action === 'pause' || action === 'cancel';
+}
 
 function isObservationOnly(run: DeliveryRun): boolean {
   return (
@@ -110,7 +115,7 @@ export function DeliveryRunPanel({
   const submitAction = async () => {
     if (!run || !pendingAction || acting) return;
     const normalizedReason = reason.trim();
-    if (pendingAction !== 'resume' && !normalizedReason) {
+    if (actionRequiresReason(pendingAction) && !normalizedReason) {
       setError(`${actionLabels[pendingAction]} requires a reason.`);
       return;
     }
@@ -125,7 +130,13 @@ export function DeliveryRunPanel({
         ? await api.pauseDeliveryRun(run.id, normalizedReason)
         : pendingAction === 'resume'
           ? await api.resumeDeliveryRun(run.id, normalizedReason || undefined)
-          : await api.cancelDeliveryRun(run.id, normalizedReason);
+          : pendingAction === 'retry'
+            ? await api.retryDeliveryRun(
+              run.id,
+              run.state_version,
+              normalizedReason || undefined,
+            )
+            : await api.cancelDeliveryRun(run.id, normalizedReason);
       setRun(next);
       setPendingAction(null);
       setReason('');
@@ -164,7 +175,7 @@ export function DeliveryRunPanel({
           </div>
           {run && (
             <p className="mt-1 text-xs text-gray-400">
-              Cycle {run.cycle_count}/{run.max_cycles} · {run.turn_count} developer turn{run.turn_count === 1 ? '' : 's'}
+              Round {run.cycle_count} of {run.max_cycles} · {run.turn_count} developer turn{run.turn_count === 1 ? '' : 's'}
             </p>
           )}
         </div>
@@ -250,6 +261,15 @@ export function DeliveryRunPanel({
                 <XCircle size={13} /> Cancel
               </button>
             )}
+            {allowedActions.includes('retry') && (
+              <button
+                type="button"
+                onClick={() => chooseAction('retry')}
+                className="inline-flex items-center gap-1 rounded bg-indigo-600/20 px-2 py-1 text-xs font-medium text-indigo-300 hover:bg-indigo-600/30"
+              >
+                <RefreshCw size={13} /> Retry from Plan
+              </button>
+            )}
             {allowedActions.length === 0
               && (isObservationOnly(run) || run.activity !== 'terminal') && (
               <span className="text-[11px] text-gray-500">
@@ -263,7 +283,7 @@ export function DeliveryRunPanel({
           {pendingAction && (
             <div className="mt-3 rounded border border-gray-700 bg-gray-900/60 p-2">
               <label className="block text-xs text-gray-300">
-                {actionLabels[pendingAction]} reason{pendingAction === 'resume' ? ' (optional)' : ''}
+                {actionLabels[pendingAction]} reason{actionRequiresReason(pendingAction) ? '' : ' (optional)'}
                 <textarea
                   aria-label={`${actionLabels[pendingAction]} reason`}
                   value={reason}
@@ -285,7 +305,7 @@ export function DeliveryRunPanel({
                 <button
                   type="button"
                   onClick={() => void submitAction()}
-                  disabled={acting || (pendingAction !== 'resume' && !reason.trim())}
+                  disabled={acting || (actionRequiresReason(pendingAction) && !reason.trim())}
                   className={`rounded px-2 py-1 text-xs font-medium text-white disabled:opacity-40 ${
                     pendingAction === 'cancel'
                       ? 'bg-red-600 hover:bg-red-500'

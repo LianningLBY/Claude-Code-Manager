@@ -506,6 +506,39 @@ PR Monitor 的审核流程会在后端 shell out 调用 `gh pr view` / `gh pr re
 2. **账号权限**：该 GitHub 账号需要对被监控仓库有 push / review 权限（auto-merge 还需要 merge 权限）
 3. **PUBLIC_BASE_URL**：在 `.env` 中设置 `PUBLIC_BASE_URL`（如 `https://ccm.example.com`），PR Monitor 页面才能显示正确的 Webhook Payload URL
 
+不要求该 GitHub 账号是仓库创建者。只读分析需要仓库/PR 读取权限；发布审查、
+Delivery 推送分支和创建 PR 需要相应的 PR 与仓库写权限；只有启用自动合并时，
+才额外要求 CCM 登录账号可被证明为 `write`、`maintain` 或 `admin` collaborator，
+并满足目标分支保护门禁。
+
+### Delivery Loop 快速启动
+
+1. 在 **Projects** 导入本机 GitHub 项目并等待状态变为 `ready`
+2. 打开 **Delivery**，选择项目，在需求框直接描述任务和验收条件；标题可留空
+3. 选择前端审查策略和是否自动合并，点击 **Start Delivery**；系统进入
+   Plan → Development → Code Review → Frontend Review → Publish PR → CI & PR Review
+
+导入完成后 CCM 会尽力自动创建并绑定该项目的内部 PR Monitor；第一次 Start 也会
+进行同一套幂等准备。Panel Review 始终启用；required CI 优先使用 GitHub 分支保护
+声明的精确 check，没有声明 required check 时只运行 Panel，不会根据可选、部署或
+push-only workflow 猜一个 CI Gate，也不要求用户填写 PR Monitor 表单。默认在全部
+门禁通过后保持 PR 打开；每次启动可显式开启“自动合并”，但只有已发现 app-bound
+exact CI、GitHub 写权限和严格分支保护同时满足时才允许执行。
+
+前端审查默认是 `Auto`：项目已确认可信 Preview 且配置了 `AUTH_TOKEN` 时，会在创建
+PR 前由独立 Browser Agent 运行 Test Harness；能力不可用时会在进度中显示跳过原因。
+`Required` 会把同一条件变成强制门禁，`Off` 则明确关闭。运行详情按六个阶段展示公开
+进度、Agent 路由、报告和截图证据；当前 Round、总预算、开轮原因和耗时会置顶高亮，
+历史 Round 可横向切换，阶段内容与时间线只展示所选轮次，避免把新一轮误判为旧 Plan
+卡住。如果 Plan 需要选择或补充信息，页面会自动聚焦当前 Round、切回 Plan tab 并内嵌
+回答表单，侧栏同时显示待处理数量。
+
+Planner/Reviewer 路由因 stream stall、临时不可用等原因让一次 Plan Run 失败时，系统会
+先在同一个 Capability Invocation 内自动创建一次新的 Plan Run 重试。两次尝试都失败且
+尚未发布 PR 时，详情页会显示 **Retry from Plan**：它在原 Delivery Run 内保留失败记录并
+新建一个 Cycle 重新规划，不需要重新 Start Delivery；发布后的失败仍交给 PR Monitor 流程
+收敛，不允许回退重放。
+
 Panel 中的 Finding 操作是独立的审计流程：**Ignore** 和 **Human advice** 只保存决策或供下一次候选生成参考，不会把阻断项改成通过；**Generate AI fix** 会在与 Reviewer 相同的 tool-free 沙箱中读取后端冻结的 exact-head 单文件输入，只输出有界 unified diff，不会直接访问仓库或 GitHub。候选完成后必须从 CCM 后端下载 diff；后端签发并保存与当前用户、Action 和 SHA-256 绑定的下载回执，只有回传同一回执并再次确认 exact base/head/repo/ref 后才会创建 commit。push 以 captured head 为 expected-old 做原子 compare-and-swap，分支被删除、漂移或远端结果无法证明时会拒绝或进入可对账恢复，不覆盖他人提交。
 
 同一 Finding 同时只有一个 active AI fix。自动 fix Task 的编辑、聊天、注入、重试、取消、停止和删除入口均被冻结；本机和 Worker 都由 Manager 按 exact generation 收口结果，Worker 成功前先补齐完整日志，失败或 Manager/Worker 崩溃后则从持久 Action/lease 恢复，不能靠内存状态重复生成或重复 push。详细状态机与安全边界见 [PR Monitor 权威设计](docs/pr-monitor-design.md)。

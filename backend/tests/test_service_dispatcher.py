@@ -13109,6 +13109,48 @@ async def test_browser_transport_admission_wins_safe_replay_classification(
 
 
 @pytest.mark.asyncio
+async def test_browser_terminal_receipt_after_output_consumer_released_instance(
+    db_factory,
+):
+    """Normal consumer-first cleanup must not strand a Browser binding."""
+
+    from backend.models.test_harness import TestHarnessChildBinding
+
+    scope = await _seed_browser_child_lifecycle(
+        db_factory,
+        suffix="consumer-released-before-task-terminal",
+    )
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        child = await db.get(Task, scope.child_id)
+        generation = dispatcher._task_lifecycle_generation(child)
+        instance = await db.get(Instance, scope.instance_id)
+        instance.status = "idle"
+        instance.pid = None
+        instance.current_task_id = None
+        await db.commit()
+
+    completed, background_active = await dispatcher._complete_owned_task_result(
+        generation,
+    )
+    assert completed is True
+    assert background_active is False
+
+    await dispatcher._reset_instance_if_stale(scope.instance_id, generation)
+
+    async with db_factory() as db:
+        child = await db.get(Task, scope.child_id)
+        instance = await db.get(Instance, scope.instance_id)
+        binding = await db.get(TestHarnessChildBinding, scope.binding_id)
+        assert child.status == "completed"
+        assert instance.status == "idle"
+        assert instance.current_task_id is None
+        assert instance.pid is None
+        assert binding.state == "completed"
+        assert binding.completed_at is not None
+
+
+@pytest.mark.asyncio
 async def test_sqlite_transport_writer_wins_replay_finalizer_race(tmp_path):
     """Committed provider admission makes the waiting finalizer fail closed."""
 

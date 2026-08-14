@@ -15,6 +15,7 @@ from backend.models.pr_monitor import (
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.services import pr_review_panel
+from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
 from backend.services.delivery_service import value_hash
 from backend.services.pr_monitor_loop import (
     record_blocking_evidence,
@@ -36,6 +37,7 @@ async def _delivery_review(
     merge_queue_mode: str = "manual",
     auto_repair: bool = True,
     auto_merge: bool = False,
+    wait_for_ci: bool = True,
 ) -> tuple[MonitoredRepo, PRMonitorRun, PRReview, DeliveryRun]:
     project = Project(name=f"delivery-monitor-{suffix}")
     db_session.add(project)
@@ -49,14 +51,14 @@ async def _delivery_review(
         auto_repair=auto_repair,
         max_repair_attempts=3,
         merge_queue_mode=merge_queue_mode,
-        wait_for_ci=True,
+        wait_for_ci=wait_for_ci,
         required_checks=[
             {
                 "kind": "check_run",
                 "name": "tests",
                 "app_slug": "github-actions",
             }
-        ],
+        ] if wait_for_ci else [],
     )
     db_session.add(repo)
     await db_session.flush()
@@ -77,7 +79,7 @@ async def _delivery_review(
             "repo_id": repo.id,
             "repo_full_name": repo.repo_full_name,
             "review_mode": "panel",
-            "wait_for_ci": True,
+            "wait_for_ci": wait_for_ci,
             "required_checks": repo.required_checks,
         },
     }
@@ -126,6 +128,27 @@ async def _delivery_review(
     monitor.current_review_id = review.id
     await db_session.commit()
     return repo, monitor, review, delivery
+
+
+@pytest.mark.asyncio
+async def test_delivery_panel_only_monitor_uses_frozen_no_ci_policy(db_session):
+    _repo, monitor, review, _delivery = await _delivery_review(
+        db_session,
+        suffix="panel-only-policy",
+        wait_for_ci=False,
+    )
+
+    policy = await frozen_delivery_pr_policy(
+        db_session,
+        review,
+        monitor_run_id=monitor.id,
+    )
+
+    assert policy is not None
+    assert policy.auto_merge is False
+    assert policy.terminal == "ready_to_merge"
+    assert policy.wait_for_ci is False
+    assert policy.required_checks == []
 
 
 @pytest.mark.asyncio

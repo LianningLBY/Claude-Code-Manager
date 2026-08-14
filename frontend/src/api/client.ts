@@ -1386,6 +1386,7 @@ export type DeliveryPhase =
   | 'planning'
   | 'coding'
   | 'pre_review'
+  | 'frontend_review'
   | 'publishing'
   | 'monitoring'
   | 'done';
@@ -1434,7 +1435,7 @@ export interface DeliveryRun {
   created_at: string;
   updated_at: string;
   completed_at: string | null;
-  allowed_actions: Array<'pause' | 'resume' | 'cancel'>;
+  allowed_actions: Array<'pause' | 'resume' | 'cancel' | 'retry'>;
 }
 
 export interface DeliveryCycle {
@@ -1455,6 +1456,10 @@ export interface DeliveryCycle {
   review_result_id: number | null;
   review_verdict: string | null;
   review_summary: string | null;
+  frontend_review_run_id: string | null;
+  frontend_review_verdict: string | null;
+  frontend_review_summary: string | null;
+  frontend_review_skip_reason: string | null;
   error_code: string | null;
   error_message: string | null;
   created_at: string;
@@ -1505,6 +1510,85 @@ export interface DeliveryRunDetail extends DeliveryRun {
   transitions: DeliveryTransition[];
 }
 
+export type DeliveryStageKey = Exclude<DeliveryPhase, 'done'>;
+
+export interface DeliveryAgentActivity {
+  role: 'planner' | 'plan_reviewer' | 'developer' | 'code_reviewer' | 'browser_reviewer';
+  provider: string | null;
+  model: string | null;
+  effort: string | null;
+  service_tier: string | null;
+  status: string;
+  activity_kind: string;
+  headline: string;
+  detail: string | null;
+  task_id: number | null;
+  source_kind: string;
+  source_id: string | null;
+  started_at: string | null;
+  first_output_at: string | null;
+  last_activity_at: string | null;
+  output_chars: number;
+}
+
+export interface DeliveryStageProgress {
+  key: DeliveryStageKey;
+  label: string;
+  state: 'pending' | 'ready' | 'running' | 'waiting' | 'paused' | 'completed' | 'failed' | 'cancelled' | 'skipped';
+  summary: string;
+  started_at: string | null;
+  completed_at: string | null;
+}
+
+export interface DeliveryTimelineEvent {
+  id: string;
+  stage: string;
+  kind: string;
+  source: string;
+  title: string;
+  detail: string | null;
+  status: string | null;
+  created_at: string;
+}
+
+export interface DeliveryPlanInputProjection {
+  plan_id: number;
+  run: PlanRun;
+  request: PlanInputRequest;
+}
+
+export interface DeliveryFrontendReviewProgress {
+  policy: 'auto' | 'required' | 'off';
+  run_id: string | null;
+  status: string | null;
+  stage: string | null;
+  verdict: string | null;
+  report: string | null;
+  error: string | null;
+  cleanup_status: string | null;
+  evidence_archive_state: string | null;
+  finding_count: number;
+  evidence_count: number;
+  skip_reason: string | null;
+}
+
+export interface DeliveryProgress {
+  run_id: number;
+  state_version: number;
+  phase: DeliveryPhase;
+  activity: DeliveryActivity;
+  headline: string;
+  detail: string | null;
+  attention_required: boolean;
+  attention_kind: string | null;
+  last_activity_at: string | null;
+  stages: DeliveryStageProgress[];
+  active_agent: DeliveryAgentActivity | null;
+  events: DeliveryTimelineEvent[];
+  plan_input: DeliveryPlanInputProjection | null;
+  frontend_review: DeliveryFrontendReviewProgress;
+}
+
 export interface DeliveryRunCreate {
   idempotency_key: string;
   project_id: number;
@@ -1520,6 +1604,20 @@ export interface DeliveryRunCreate {
   timeout_hours?: number | null;
   max_cycles?: number;
   max_no_progress?: number;
+  auto_merge?: boolean | null;
+  frontend_review?: 'auto' | 'required' | 'off';
+}
+
+export interface DeliveryQuickStartCreate {
+  idempotency_key: string;
+  project_id: number;
+  requirements: string;
+  title?: string;
+  timeout_hours?: number | null;
+  max_cycles?: number;
+  max_no_progress?: number;
+  auto_merge?: boolean;
+  frontend_review?: 'auto' | 'required' | 'off';
 }
 
 export interface RequiredCheckPolicy {
@@ -2967,12 +3065,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+  quickStartDelivery: (data: DeliveryQuickStartCreate) =>
+    request<DeliveryRun>('/api/delivery-runs/quick-start', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   listDeliveryRuns: (projectId?: number) =>
     request<DeliveryRun[]>(
       `/api/delivery-runs${projectId ? `?project_id=${projectId}` : ''}`,
     ),
   getDeliveryRun: (runId: number) =>
     request<DeliveryRunDetail>(`/api/delivery-runs/${runId}`),
+  getDeliveryProgress: (runId: number) =>
+    request<DeliveryProgress>(`/api/delivery-runs/${runId}/progress`),
+  countDeliveryAttention: () =>
+    request<{ total: number }>('/api/delivery-runs/attention-count'),
   pauseDeliveryRun: (runId: number, reason: string) =>
     request<DeliveryRun>(`/api/delivery-runs/${runId}/pause`, {
       method: 'POST', body: JSON.stringify({ reason }),
@@ -2984,6 +3091,14 @@ export const api = {
   cancelDeliveryRun: (runId: number, reason: string) =>
     request<DeliveryRun>(`/api/delivery-runs/${runId}/cancel`, {
       method: 'POST', body: JSON.stringify({ reason }),
+    }),
+  retryDeliveryRun: (runId: number, expectedStateVersion: number, reason?: string) =>
+    request<DeliveryRun>(`/api/delivery-runs/${runId}/retry`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_state_version: expectedStateVersion,
+        reason: reason?.trim() || null,
+      }),
     }),
 
   // PR Monitor

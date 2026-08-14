@@ -948,8 +948,8 @@ class GitHubDeliveryPublisher:
                 or not repo.enabled
                 or (repo.merge_queue_mode or "manual") != "manual"
                 or (repo.review_mode or "single") != "panel"
-                or not repo.wait_for_ci
-                or not repo.required_checks
+                or bool(repo.wait_for_ci) != bool(repo.required_checks)
+                or (auto_merge and not repo.wait_for_ci)
             ):
                 raise DeliveryPublisherPermanentError(
                     "Delivery repository is no longer eligible for publishing"
@@ -1126,6 +1126,8 @@ class GitHubDeliveryPublisher:
             or not isinstance(base_repo_name, str)
             or base_repo_name.lower() != subject.repo_full_name.lower()
             or not isinstance(head_repo_name, str)
+            # Delivery pushes its fenced branch to the Project origin. A PR
+            # from a same-named branch in a fork is a different subject.
             or head_repo_name.lower() != subject.repo_full_name.lower()
         ):
             raise DeliveryPublisherPermanentError(

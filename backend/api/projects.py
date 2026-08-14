@@ -580,6 +580,130 @@ async def _commit_files(local_path: str, files: list[str], message: str):
     return await proc.communicate(), proc.returncode
 
 
+async def _project_git(
+    local_path: str,
+    *args: str,
+    env: dict[str, str] | None = None,
+    allowed_returncodes: frozenset[int] = frozenset({0}),
+) -> bytes:
+    """Run one bounded project-import Git command without a shell."""
+
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        *args,
+        cwd=local_path,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        env=env,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode not in allowed_returncodes:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        command = args[0] if args else "command"
+        raise RuntimeError(
+            f"git {command} failed" + (f": {detail}" if detail else "")
+        )
+    return stdout
+
+
+async def _local_git_config_values(local_path: str, key: str) -> list[str]:
+    raw = await _project_git(
+        local_path,
+        "config",
+        "--no-includes",
+        "--local",
+        "--null",
+        "--get-all",
+        key,
+        allowed_returncodes=frozenset({0, 1}),
+    )
+    try:
+        return [
+            value.decode("utf-8", errors="strict")
+            for value in raw.split(b"\0")
+            if value
+        ]
+    except UnicodeDecodeError as exc:
+        raise RuntimeError("existing Git origin configuration is not UTF-8") from exc
+
+
+def _same_project_remote(configured: str, existing: str) -> bool:
+    """Compare equivalent GitHub spellings while keeping other URLs exact."""
+
+    from backend.services.delivery_service import _github_repo_from_url
+
+    configured_repo = _github_repo_from_url(configured)
+    existing_repo = _github_repo_from_url(existing)
+    if configured_repo is not None or existing_repo is not None:
+        return (
+            configured_repo is not None
+            and existing_repo is not None
+            and configured_repo.casefold() == existing_repo.casefold()
+        )
+    if os.path.isabs(configured) and os.path.isabs(existing):
+        return os.path.realpath(configured) == os.path.realpath(existing)
+    return configured == existing
+
+
+async def _prepare_existing_project_remote(
+    local_path: str,
+    git_url: str,
+    *,
+    env: dict[str, str] | None,
+) -> None:
+    """Bind an existing exact worktree to one unambiguous configured origin."""
+
+    if (
+        not isinstance(git_url, str)
+        or not git_url.strip()
+        or git_url.startswith("-")
+        or any(character in git_url for character in "\r\n\0")
+    ):
+        raise RuntimeError("configured Git URL is malformed")
+    top_level = (
+        await _project_git(local_path, "rev-parse", "--show-toplevel")
+    ).decode("utf-8", errors="strict").strip()
+    if os.path.realpath(top_level) != os.path.realpath(local_path):
+        raise RuntimeError("existing project directory is not the Git worktree root")
+
+    fetch_urls = await _local_git_config_values(
+        local_path,
+        "remote.origin.url",
+    )
+    push_urls = await _local_git_config_values(
+        local_path,
+        "remote.origin.pushurl",
+    )
+    if len(fetch_urls) > 1 or len(push_urls) > 1:
+        raise RuntimeError(
+            "existing origin must define at most one fetch and one push URL"
+        )
+    if push_urls and not _same_project_remote(git_url, push_urls[0]):
+        raise RuntimeError(
+            "existing origin push URL does not match the configured Project Git URL"
+        )
+    if not fetch_urls:
+        remote_names = (
+            await _project_git(local_path, "remote")
+        ).decode("utf-8", errors="strict").splitlines()
+        await _project_git(
+            local_path,
+            "remote",
+            "set-url" if "origin" in remote_names else "add",
+            "origin",
+            git_url,
+        )
+        fetch_urls = [git_url]
+    if not _same_project_remote(git_url, fetch_urls[0]):
+        raise RuntimeError(
+            "existing origin does not match the configured Project Git URL"
+        )
+    # Fetch only the configured origin. ``git fetch --all`` succeeds when no
+    # remotes exist and previously allowed such projects to be marked ready.
+    await _project_git(local_path, "fetch", "origin", env=env)
+
+
 async def _clone_repo(project_id: int, git_url: str, local_path: str, project_name: str, default_branch: str, git_config: dict | None = None):
     """Clone a git repo in the background."""
     async with async_session() as db:
@@ -596,17 +720,15 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
         env = {**os.environ, **git_env} if git_env else None
 
         if os.path.isdir(local_path):
-            # Already exists, just fetch
-            proc = await asyncio.create_subprocess_exec(
-                "git", "fetch", "--all",
-                cwd=local_path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            # Existing directories are common when a local project is later
+            # connected to GitHub. Make the configured origin explicit before
+            # declaring the import ready; a no-remote fetch is otherwise a
+            # misleading successful no-op.
+            await _prepare_existing_project_remote(
+                local_path,
+                git_url,
                 env=env,
             )
-            _, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                raise RuntimeError(f"git fetch failed: {stderr.decode()}")
         else:
             proc = await asyncio.create_subprocess_exec(
                 "git", "clone", git_url, local_path,
@@ -649,6 +771,16 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
                 )
             )
             await db.commit()
+
+        # Importing a GitHub project should be enough to use the Delivery tab.
+        # This remains best-effort because CI may not have run yet; the
+        # quick-start endpoint performs the same idempotent setup again and
+        # reports a precise error if a declared identity cannot be resolved.
+        from backend.services.delivery_setup import (
+            try_auto_configure_delivery_monitor,
+        )
+
+        await try_auto_configure_delivery_monitor(project_id)
 
     except Exception as e:
         async with async_session() as db:

@@ -31,9 +31,11 @@ from backend.models.test_harness import (
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.task_creation import stage_task_record
 from backend.services.test_harness_owner_fence import (
+    TEST_HARNESS_TERMINAL_GATE_KEY,
     TestHarnessOwnerIdentity,
     lock_test_harness_owner,
     test_harness_owner_fence,
+    test_harness_owner_terminal_gate_matches,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,8 +66,31 @@ BROWSER_CHILD_IDENTITY_METADATA_KEYS = frozenset(
 BROWSER_CHILD_RUNTIME_METADATA_KEYS = frozenset(
     {"claude_account_id", "codex_account_id"}
 )
+BROWSER_CHILD_LIFECYCLE_METADATA_KEYS = frozenset(
+    {TEST_HARNESS_TERMINAL_GATE_KEY}
+)
 BROWSER_CHILD_ALLOWED_METADATA_KEYS = (
-    BROWSER_CHILD_IDENTITY_METADATA_KEYS | BROWSER_CHILD_RUNTIME_METADATA_KEYS
+    BROWSER_CHILD_IDENTITY_METADATA_KEYS
+    | BROWSER_CHILD_RUNTIME_METADATA_KEYS
+    | BROWSER_CHILD_LIFECYCLE_METADATA_KEYS
+)
+
+_BROWSER_CHILD_TERMINAL_GATE_KEYS = frozenset(
+    {
+        "incarnation_id",
+        "retry_count",
+        "turn_generation",
+        "status",
+        "reason",
+        "cleanup_harness_run_ids",
+        "cleanup_workspace_run_ids",
+        "cleanup_browser_binding_ids",
+    }
+)
+_BROWSER_CHILD_TERMINAL_GATE_GRAPH_KEYS = (
+    "cleanup_harness_run_ids",
+    "cleanup_workspace_run_ids",
+    "cleanup_browser_binding_ids",
 )
 
 CHILD_TERMINAL_STATES = frozenset({CHILD_STOPPED, CHILD_COMPLETED})
@@ -245,6 +270,39 @@ def browser_child_binding_error(
     unknown_metadata = set(metadata) - BROWSER_CHILD_ALLOWED_METADATA_KEYS
     if unknown_metadata:
         return "Browser child contains metadata outside its immutable allowlist"
+    terminal_gate = metadata.get(TEST_HARNESS_TERMINAL_GATE_KEY)
+    if terminal_gate is not None:
+        # The Dispatcher deliberately installs a durable gate while moving an
+        # exact Task generation from ``in_progress`` to ``executing``.  Once
+        # that status transition commits, the gate describes the immediately
+        # preceding status and no longer closes admission for the current
+        # generation.  It must remain in metadata for crash recovery, so an
+        # isolated Browser child cannot reject the field merely because it is
+        # present.  Conversely, a gate that still matches the current status
+        # is active terminalization authority and must continue to fail
+        # closed before the provider boundary.
+        if (
+            not isinstance(terminal_gate, dict)
+            or set(terminal_gate) - _BROWSER_CHILD_TERMINAL_GATE_KEYS
+            or terminal_gate.get("incarnation_id") != task.incarnation_id
+            or terminal_gate.get("retry_count") != task.retry_count
+            or terminal_gate.get("turn_generation") != task.turn_generation
+            or terminal_gate.get("status") not in TASK_ACTIVE_STATUSES
+            or any(
+                terminal_gate.get(key, []) != []
+                for key in _BROWSER_CHILD_TERMINAL_GATE_GRAPH_KEYS
+            )
+        ):
+            return "Browser child terminal gate metadata drifted"
+        current_identity = TestHarnessOwnerIdentity(
+            task_id=task.id,
+            incarnation_id=task.incarnation_id,
+            retry_count=task.retry_count,
+            turn_generation=task.turn_generation,
+            status=task.status,
+        )
+        if test_harness_owner_terminal_gate_matches(task, current_identity):
+            return "Browser child generation is already terminalizing"
     if binding.state not in CHILD_TERMINAL_STATES and (
         task.session_id is not None or task.last_cwd is not None
     ):
@@ -1300,10 +1358,12 @@ async def finalize_reaped_browser_child_binding(
 ) -> bool:
     """Write the Browser binding receipt after exact runtime reap proof.
 
-    The caller must hold the exact Instance lifecycle lock, must already have
-    observed ``InstanceManager.is_running(instance_id) is False``, and must
-    clear the reverse Instance owner in this same transaction.  Persisting the
-    binding terminal state here makes that proof recoverable after restart.
+    The caller must hold the exact Instance lifecycle lock and must already
+    have observed ``InstanceManager.is_running(instance_id) is False``.  It
+    either clears the exact reverse Instance owner in this transaction, or
+    fences the pid-less unowned terminal snapshot previously committed by the
+    exact output consumer. Persisting the binding terminal state here makes
+    that proof recoverable after restart.
     """
 
     binding = (

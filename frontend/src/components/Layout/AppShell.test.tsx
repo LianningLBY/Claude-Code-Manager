@@ -8,6 +8,7 @@ vi.mock('../../api/client', () => ({
   api: {
     listWorkers: vi.fn().mockResolvedValue([]),
     countPlans: vi.fn().mockResolvedValue({ total: 0 }),
+    countDeliveryAttention: vi.fn().mockResolvedValue({ total: 0 }),
     getRuntimeSettings: vi.fn().mockResolvedValue({
       use_pty_mode: false,
       pty_available: false,
@@ -116,6 +117,7 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.queryByRole('button', { name: 'Files' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Secrets' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument();
   });
 
   it('keeps the process-wide update control available to administrators', () => {
@@ -125,6 +127,8 @@ describe('AppShell layout and z-index architecture', () => {
     expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Files' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Secrets' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Settings' })).toBeInTheDocument();
+    expect(screen.queryByTitle('偏好设置（时区 / 主题）')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Browser Review' })).not.toBeInTheDocument();
   });
 

@@ -1,7 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   acknowledgeDeliveryAdmission,
+  acknowledgeDeliveryQuickStart,
   prepareDeliveryAdmission,
+  prepareDeliveryQuickStart,
 } from './deliveryAdmission';
 
 const draft = {
@@ -76,5 +78,26 @@ describe('Delivery admission persistence', () => {
     const retry = prepareDeliveryAdmission('storage-blocked', draft);
 
     expect(retry.idempotency_key).toBe(first.idempotency_key);
+  });
+
+  it('freezes the quick-start automatic merge choice into idempotency', () => {
+    const manual = prepareDeliveryQuickStart('quick-start', {
+      project_id: 1,
+      requirements: 'Ship it.',
+      auto_merge: false,
+    });
+    const automatic = prepareDeliveryQuickStart('quick-start', {
+      project_id: 1,
+      requirements: 'Ship it.',
+      auto_merge: true,
+    });
+
+    expect(automatic.idempotency_key).not.toBe(manual.idempotency_key);
+    acknowledgeDeliveryQuickStart('quick-start', automatic);
+    expect(prepareDeliveryQuickStart('quick-start', {
+      project_id: 1,
+      requirements: 'Ship it.',
+      auto_merge: true,
+    }).idempotency_key).not.toBe(automatic.idempotency_key);
   });
 });

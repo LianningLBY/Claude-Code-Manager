@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from backend.api.auth import create_jwt, decode_jwt
 from backend.config import settings
 from backend.models.discussion import Discussion
+from backend.models.pr_monitor import MonitoredRepo
 from backend.models.log_entry import LogEntry
 from backend.models.plan import Plan
 from backend.models.project import Project
@@ -21,6 +22,7 @@ from backend.models.user import User
 from backend.models.user_group import UserGroupMember  # noqa: F401
 from backend.models.worker import Worker
 from backend.schemas.plan import default_plan_pipeline_config
+from backend.services.delivery_service import DeliveryCreateSpec, create_delivery_run
 
 
 @pytest_asyncio.fixture
@@ -983,4 +985,90 @@ async def test_ws_channels_apply_resource_acl_and_default_deny(db_factory):
         assert await _ws_channel_allowed("plans", admin_identity, db)
         assert await _ws_channel_allowed(
             "capabilities", admin_identity, db
+        )
+
+
+@pytest.mark.asyncio
+async def test_ws_delivery_channel_uses_project_acl(db_factory):
+    from backend.api.ws import _ws_channel_allowed
+
+    async with db_factory() as db:
+        owner = User(
+            email="delivery-ws-owner@example.com",
+            name="delivery owner",
+            password_hash="not-used",
+            role="member",
+        )
+        other = User(
+            email="delivery-ws-other@example.com",
+            name="delivery other",
+            password_hash="not-used",
+            role="member",
+        )
+        project = Project(
+            name="delivery-ws-project",
+            local_path="/tmp/delivery-ws-project",
+            git_url="git@github.com:acme/delivery-ws-project.git",
+            has_remote=True,
+            default_branch="main",
+            status="ready",
+        )
+        db.add_all([owner, other, project])
+        await db.flush()
+        db.add(
+            TeamProjectShare(
+                project_id=project.id,
+                target_type="user",
+                target_id=owner.id,
+                shared_by=owner.id,
+            )
+        )
+        repo = MonitoredRepo(
+            repo_full_name="acme/delivery-ws-project",
+            project_id=project.id,
+            webhook_secret="secret",
+            enabled=True,
+            auto_merge=False,
+            auto_repair=True,
+            review_mode="panel",
+            wait_for_ci=False,
+            required_checks=[],
+            merge_queue_mode="manual",
+            default_branch="main",
+        )
+        db.add(repo)
+        await db.flush()
+        run = await create_delivery_run(
+            db,
+            DeliveryCreateSpec(
+                idempotency_key="delivery-ws-run",
+                project_id=project.id,
+                monitored_repo_id=repo.id,
+                title="Delivery WS ACL",
+                requirements="Verify scoped updates.",
+                created_by=owner.id,
+            ),
+        )
+        owner_identity = {
+            "user_id": owner.id,
+            "role": "member",
+            "auth_type": "jwt",
+        }
+        other_identity = {
+            "user_id": other.id,
+            "role": "member",
+            "auth_type": "jwt",
+        }
+
+        assert await _ws_channel_allowed(
+            f"delivery:{run.id}", owner_identity, db
+        )
+        assert not await _ws_channel_allowed(
+            f"delivery:{run.id}", other_identity, db
+        )
+        assert not await _ws_channel_allowed("deliveries", owner_identity, db)
+        assert await _ws_channel_allowed(
+            "deliveries",
+            {**owner_identity, "role": "admin"},
+            db,
         )

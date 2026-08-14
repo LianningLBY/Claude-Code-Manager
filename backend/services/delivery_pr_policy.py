@@ -289,10 +289,11 @@ async def frozen_delivery_pr_policy(
         or not isinstance(monitor_policy, dict)
         or monitor_policy.get("repo_id") != review.repo_id
         or monitor_policy.get("review_mode") != "panel"
-        or wait_for_ci is not True
+        or type(wait_for_ci) is not bool
         or not isinstance(required_checks, list)
-        or not required_checks
         or any(not isinstance(item, dict) for item in required_checks)
+        or bool(wait_for_ci) != bool(required_checks)
+        or (auto_merge and not wait_for_ci)
     ):
         raise DeliveryPRPolicyError(
             "Delivery policy has an invalid merge terminal"

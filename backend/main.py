@@ -159,11 +159,15 @@ capability_resume_coordinator = CapabilityResumeCoordinator(
 )
 dispatcher.capability_invocation_wake = capability_coordinator.wake
 _dispatcher_runtime_lifecycle_lock = asyncio.Lock()
+from backend.services.test_harness import test_harness_service
+
+
 delivery_controller = DeliveryController(
     db_factory=async_session,
     capability_coordinator=capability_coordinator,
     dispatcher=dispatcher,
     publisher=GitHubDeliveryPublisher(async_session),
+    test_harness_service=test_harness_service,
     # Feature flags gate new Run admission. The controller must remain alive
     # to recover exact work admitted by an earlier process/configuration.
     enabled=True,

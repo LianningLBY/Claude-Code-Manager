@@ -495,6 +495,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const lastWsBackgroundAt = useRef(0);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [interrupting, setInterrupting] = useState(false);
+  const [terminalReconciliationPending, setTerminalReconciliationPending] = useState(false);
   const [stillRunning, setStillRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
@@ -536,6 +537,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (incoming.taskId !== current.taskId) {
       clearLiveStreamCache(current.taskId, current);
       activeTaskTurnRef.current = incoming;
+      setTerminalReconciliationPending(false);
       setMessages(restoreLiveStreamCache(task));
       return;
     }
@@ -545,6 +547,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     clearLiveStreamCache(task.id, current);
     activeTaskTurnRef.current = incoming;
+    setTerminalReconciliationPending(false);
     setMessages((previous) => {
       const next = removeOtherTurnProvisionals(previous, incoming);
       syncLiveStreamCache(incoming, next);
@@ -1320,6 +1323,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (comparison > 0) {
       clearLiveStreamCache(current.taskId, current);
       activeTaskTurnRef.current = incoming;
+      setTerminalReconciliationPending(false);
     }
     return comparison;
   }, []);
@@ -1690,6 +1694,36 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           refreshHistoryRef.current();
           return;
         }
+        // A process exit can arrive without its preceding terminal status
+        // event (for example during a WebSocket gap). Re-read the authoritative
+        // Task before clearing the exact generation, rather than leaving a
+        // stale executing prop rendering the generic thinking indicator.
+        setTerminalReconciliationPending(true);
+        void api.getTask(task.id).then((updated) => {
+          if (!sameTaskTurn(exitIdentity, activeTaskTurnRef.current)) return;
+          const updatedIdentity = taskTurnIdentity(updated);
+          if (!sameTaskTurn(exitIdentity, updatedIdentity)) {
+            observeTaskTurn(updatedIdentity);
+            return;
+          }
+          const terminal = ['completed', 'failed', 'cancelled', 'conflict']
+            .includes(updated.status);
+          if (terminal) {
+            setLocalStatus(updated.status);
+            setLocalBackgroundActive(updated.background_active === true);
+            setSending(false);
+            setStillRunning(false);
+            setAutoDequeueFlag(f => f + 1);
+            onTaskUpdated?.(updated);
+          }
+        }).catch(() => {
+          // Keep the existing status until the next poll; the UI uses a
+          // distinct reconciliation message while this request is unresolved.
+        }).finally(() => {
+          if (sameTaskTurn(exitIdentity, activeTaskTurnRef.current)) {
+            setTerminalReconciliationPending(false);
+          }
+        });
         setSending(false);
         setStillRunning(false);
         // Keep an already observed terminal status sticky. A late process_exit
@@ -1951,7 +1985,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(activeTaskTurnRef.current, next);
       return next;
     });
-  }, [markAskUserResolved, observeTaskTurn, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
+  }, [markAskUserResolved, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
@@ -3468,6 +3502,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               </div>
             ) : isWaitingCapability ? (
               <span>Waiting for requested capability...</span>
+            ) : terminalReconciliationPending ? (
+              <span>正在确认任务状态...</span>
             ) : (
               <span>{providerLabel} is thinking...</span>
             )}

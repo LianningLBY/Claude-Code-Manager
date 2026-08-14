@@ -12,6 +12,7 @@ vi.mock('../../api/client', () => ({
   ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
+    getTask: vi.fn(),
     sendTaskChat: vi.fn().mockResolvedValue({}),
     startFrontendReviewGoal: vi.fn().mockResolvedValue({
       status: 'pending',
@@ -328,6 +329,13 @@ describe('ChatView', () => {
     localStorage.clear();
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getTask as ReturnType<typeof vi.fn>).mockReset();
+    (api.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 'executing',
+      background_active: false,
+      retry_count: 0,
+      turn_generation: 0,
+    } as Task);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
@@ -1583,6 +1591,100 @@ describe('ChatView', () => {
       });
       expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
       expect(screen.queryByText(/is thinking/)).not.toBeInTheDocument();
+    });
+
+    it('reconciles a terminal task when process_exit arrives without status_change', async () => {
+      const task = makeTask({
+        id: 413,
+        status: 'executing',
+        retry_count: 2,
+        turn_generation: 11,
+      });
+      vi.mocked(api.getTask).mockImplementation(async (taskId) => (
+        taskId === 413
+          ? { ...task, status: 'completed', background_active: false }
+          : { ...task, id: taskId, status: 'executing' }
+      ));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:413',
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_retry_count: 2,
+            task_turn_generation: 11,
+          },
+        });
+      });
+
+      await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(413), {
+        timeout: 1500,
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+      expect(onTaskUpdated).toHaveBeenCalledWith(expect.objectContaining({
+        id: 413,
+        status: 'completed',
+      }));
+    });
+
+    it('does not apply process_exit reconciliation from an older generation', async () => {
+      const task = makeTask({
+        id: 414,
+        status: 'executing',
+        retry_count: 2,
+        turn_generation: 11,
+      });
+      vi.mocked(api.getTask).mockImplementation(async (taskId) => (
+        taskId === 414
+          ? {
+              ...task,
+              status: 'completed',
+              turn_generation: 12,
+              background_active: false,
+            }
+          : { ...task, id: taskId, status: 'executing' }
+      ));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:414',
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_retry_count: 2,
+            task_turn_generation: 11,
+          },
+        });
+      });
+
+      await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(414), {
+        timeout: 1500,
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('正在确认任务状态...')).not.toBeInTheDocument();
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(onTaskUpdated).not.toHaveBeenCalled();
     });
 
     it('Task 运行时显示但禁用循环审查按钮', () => {

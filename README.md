@@ -45,9 +45,9 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 - **语音输入** — 通过 OpenAI Whisper API 语音转文字创建任务
 
 ### 可靠性
-- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Claude API Key 只投影给模型主进程，Bash、hooks 与 MCP 子进程仍会清除凭据。Codex Fast 只选择真实广告 `priority` 的账号；ApexRouter 的模型目录能力也会参与选择。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
-- **API 账号安全删除** — CloudRouter/ApexRouter 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
-- **APIBest 渠道** — 可在 API 账号中直接添加 APIBest Key，同时发现 Claude/Codex 模型。CCM 先经 `/v1/models` 验证 Key，空目录时再读公开 `/api/pricing`；该渠道当前不展示额度
+- **Claude / Codex 统一账号路由** — 原生账号与 CloudRouter、ApexRouter、APIBest API Key 共用账号池、模型/Service Tier 兼容性检查和 session 迁移。Claude API Key 只投影给模型主进程，Bash、hooks 与 MCP 子进程仍会清除凭据。API 网关只有在自己的模型目录显式广告 Fast 时才参与选择；CCM 验证实际发出的 Responses 请求携带 `service_tier=priority`，但不会把响应中的信息性 `auto/default` 误判成失败。手动「优先账号」最高；自动模式下已有对话保持绑定账号，新会话优先兼容且可用的 API、再回退原生额度选择。两池都显示真正提交后的「最近使用」，API 候选失败不会误改徽标
+- **API 账号安全删除** — CloudRouter/ApexRouter/APIBest 账号先停用新任务，再等待活跃任务和会话释放后删除 Key 与运行配置；忙碌时保留“待清理”状态供重试，不会强杀任务，并保留 Claude projects 与 Codex sessions
+- **APIBest 渠道** — 可在 API 账号中直接添加 APIBest Key，同时发现 Claude/Codex 模型。CCM 先经 `/v1/models` 验证 Key，空目录时再读公开 `/api/pricing`，兼容可选 `service_tiers`；Codex 使用 Responses API，该渠道当前不展示额度
 - **Claude API PTY 认证** — 受管网关 Key 以无交互 Bearer token 投影给 Claude 主进程，不受 CLI `.claude.json` 中 API-key 批准/拒绝状态影响；凭据仍不会进入 Bash、hooks 或 MCP 子进程
 - **Codex 日志库自维护** — app-server 启动前自动隔离超过 1 GiB 的本地诊断日志库，只有新运行时初始化成功后才回收旧库；账号配置、认证和 session/rollout 始终保留
 - **无缝账号轮换** — Claude 递归硬链接 session JSONL 及 sidecar，Codex 独立复制 rollout 并原子完成 app-server rebind + Task binding；撞限、认证失败或主动额度阈值换号时保留原对话上下文，不支持的模型不会静默降级
@@ -917,7 +917,7 @@ cloudflared tunnel run <tunnel-name>
 - **进程超时保护**：任务执行超过 `TASK_TIMEOUT_SECONDS`（默认 30 分钟）后自动 kill，防止进程挂死
 - **多轮对话**：session_id 绑定在 Task 上，follow-up 时使用 `--resume <session_id>` 续接会话
 - **Codex 共享传输停止**：`stop-session` 会终止目标 Task 的全部存活 turn（包括续接期间尚未收敛的旧 turn 及其原生后代），再回收账号 transport 以确认 Task 私有 helper 已退出。不同 Task 的 live turn 或已准入请求会让 API 返回 409，并保留原任务运行证据和排队消息；不会误杀其他任务
-- **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过当前账号 `model/list` 能力检查、app-server 显式 priority 准入，以及 CCM loopback Responses 代理对上游 `response.created.response.service_tier=priority` 的实际响应验证。成功 SSE 在验证前不会释放；缺字段、不一致、非 2xx、未知 lineage 或代理不可用都会明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件会记录 `actual_service_tier_verified=true` 和上游 response id。Fast Goal evaluator 使用与任务相同的模型并走同一实际 tier 证明链路；当前 Distill 无法提供同等证明，因此 Fast Task 会在 Distill 执行前明确返回 409
+- **Codex Fast**：`Task.codex_service_tier` 持久保存 `default|priority`。Standard 会显式清除会话残留的 Fast tier；Fast 必须同时通过账号模型目录的显式能力、app-server priority 准入，以及 CCM loopback Responses 代理对 exact thread/turn 发出的 `service_tier=priority` 请求验证。成功 `response.created` 表示上游接受该请求；其响应 `service_tier` 仅作为遥测，即使为 `auto/default` 或缺失也继续执行。请求 tier 不一致、非 2xx、未知 lineage 或代理不可用仍明确失败，且 Fast 禁止回退 `codex exec`。日志与聊天事件记录 `service_tier_request_verified=true`、上游报告值和 response id，不宣称实际 Fast 已获证明。Fast Goal evaluator 使用与任务相同的模型并走同一请求验证链路；当前 Distill 无法提供同等保证，因此 Fast Task 会在 Distill 执行前明确返回 409
 - **子 Agent 系统**：统一存 `sub_agent_sessions` 表，`agent_type` 区分类别（monitor / native-agent / native-monitor）。CCM 自有子 agent 拥有独立 MCP server，通过 HTTP API 与系统通信
 - **瞬时过载重试**：Anthropic 基础设施侧 429/overloaded 与账号额度用尽严格区分，前者退避重试同一账号，后者走号池轮换
 - **进程管理**：`asyncio.create_subprocess_exec` 启动，必须 unset `CLAUDECODE` 环境变量避免嵌套检测

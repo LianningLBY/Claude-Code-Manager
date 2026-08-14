@@ -133,6 +133,8 @@ MAX_SERVICE_TIERS_PER_MODEL = 16
 MAX_SERVICE_TIER_ID_BYTES = 64
 MAX_CODEX_MODELS_CACHE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_MODELS_CACHE_MODELS = 2048
+SERVICE_TIER_SOURCE_NONE = "none"
+SERVICE_TIER_SOURCE_UPSTREAM = "upstream"
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 DEFAULT_QUOTA_CACHE_TTL = 60.0
 CLAUDE_SKIP_DANGEROUS_PROMPT = "skipDangerousModePermissionPrompt"
@@ -633,12 +635,38 @@ def _provider_for_model(model: str) -> str | None:
     return None
 
 
-def _normalise_models(payload: Any) -> dict[str, list[str]]:
+def _normalise_model_item_service_tiers(item: dict[str, Any]) -> list[str]:
+    """Validate optional Codex service-tier capability metadata."""
+
+    raw_tiers = item.get("service_tiers", [])
+    if (
+        not isinstance(raw_tiers, list)
+        or len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL
+    ):
+        raise CloudRouterUpstreamError("invalid_models_response")
+    tier_ids: set[str] = set()
+    for tier in raw_tiers:
+        tier_id = tier.get("id") if isinstance(tier, dict) else None
+        if not isinstance(tier_id, str):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        tier_id = tier_id.strip()
+        if (
+            not tier_id
+            or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
+            or any(character.isspace() for character in tier_id)
+        ):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        tier_ids.add(tier_id)
+    return sorted(tier_ids)
+
+
+def _normalise_models(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise CloudRouterUpstreamError("invalid_models_response")
     if len(payload["data"]) > MAX_DISCOVERED_MODELS:
         raise CloudRouterUpstreamError("too_many_models")
-    result: dict[str, list[str]] = {"claude": [], "codex": []}
+    result: dict[str, Any] = {"claude": [], "codex": []}
+    service_tiers: dict[str, list[str]] = {}
     seen: set[str] = set()
     for item in payload["data"]:
         model_id = item.get("id") if isinstance(item, dict) else None
@@ -656,14 +684,20 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
             continue
         seen.add(model_id)
         result[provider].append(model_id)
+        if provider == "codex":
+            tier_ids = _normalise_model_item_service_tiers(item)
+            if tier_ids:
+                service_tiers[model_id] = tier_ids
     for values in result.values():
         values.sort()
     if not any(result.values()):
         raise CloudRouterUpstreamError("no_supported_models")
+    if service_tiers:
+        result["service_tiers"] = service_tiers
     return result
 
 
-def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
+def _normalise_apibest_pricing(payload: Any) -> dict[str, Any]:
     """Build APIBest's CCM catalog from its public pricing response.
 
     APIBest validates the token at ``/v1/models`` but currently returns an
@@ -677,7 +711,8 @@ def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
     items = payload["data"]
     if len(items) > MAX_DISCOVERED_MODELS:
         raise CloudRouterUpstreamError("too_many_models")
-    result: dict[str, list[str]] = {"claude": [], "codex": []}
+    result: dict[str, Any] = {"claude": [], "codex": []}
+    service_tiers: dict[str, list[str]] = {}
     seen: set[str] = set()
     for item in items:
         model_id = item.get("model_name") if isinstance(item, dict) else None
@@ -688,6 +723,8 @@ def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
         )
         if not isinstance(model_id, str) or not isinstance(endpoint_types, list):
             continue
+        if any(not isinstance(endpoint_type, str) for endpoint_type in endpoint_types):
+            raise CloudRouterUpstreamError("invalid_models_response")
         model_id = model_id.strip()
         if (
             not model_id
@@ -698,15 +735,25 @@ def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
         provider = _provider_for_model(model_id)
         if not provider or model_id in seen:
             continue
-        required_endpoint = "anthropic" if provider == "claude" else "openai"
-        if required_endpoint not in endpoint_types:
+        compatible_endpoints = (
+            {"anthropic"}
+            if provider == "claude"
+            else {"openai", "openai-response"}
+        )
+        if not compatible_endpoints.intersection(endpoint_types):
             continue
         seen.add(model_id)
         result[provider].append(model_id)
+        if provider == "codex":
+            tier_ids = _normalise_model_item_service_tiers(item)
+            if tier_ids:
+                service_tiers[model_id] = tier_ids
     for values in result.values():
         values.sort()
     if not any(result.values()):
         raise CloudRouterUpstreamError("no_supported_models")
+    if service_tiers:
+        result["service_tiers"] = service_tiers
     return result
 
 
@@ -744,28 +791,11 @@ def _normalise_apex_models(payload: Any) -> dict[str, Any]:
             raise CloudRouterUpstreamError("invalid_models_response")
         if _provider_for_model(model_id) != "codex" or model_id in seen:
             continue
-        raw_tiers = item.get("service_tiers", [])
-        if not isinstance(raw_tiers, list):
-            raise CloudRouterUpstreamError("invalid_models_response")
-        if len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL:
-            raise CloudRouterUpstreamError("invalid_models_response")
-        tier_ids: set[str] = set()
-        for tier in raw_tiers:
-            tier_id = tier.get("id") if isinstance(tier, dict) else None
-            if not isinstance(tier_id, str):
-                raise CloudRouterUpstreamError("invalid_models_response")
-            tier_id = tier_id.strip()
-            if (
-                not tier_id
-                or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
-                or any(character.isspace() for character in tier_id)
-            ):
-                raise CloudRouterUpstreamError("invalid_models_response")
-            tier_ids.add(tier_id)
+        tier_ids = _normalise_model_item_service_tiers(item)
         seen.add(model_id)
         models.append(model_id)
         if tier_ids:
-            service_tiers[model_id] = sorted(tier_ids)
+            service_tiers[model_id] = tier_ids
     models.sort()
     if not models:
         raise CloudRouterUpstreamError("no_supported_models")
@@ -1674,10 +1704,6 @@ class CloudRouterAccountStore:
             # project a coincidentally named Claude model into an unconfigured
             # CLAUDE_CONFIG_DIR.
             normalised_models["claude"] = []
-        elif data.get("service_tiers") not in (None, {}):
-            raise CloudRouterUnsafePathError(
-                f"Unexpected service tier metadata: {account_id}"
-            )
         service_tiers = _normalise_service_tiers(
             data.get("service_tiers"),
             normalised_models["codex"],
@@ -1695,6 +1721,23 @@ class CloudRouterAccountStore:
                 path / "codex",
                 normalised_models["codex"],
             )
+        elif api_provider != API_PROVIDER_APEX:
+            service_tier_source = data.get("service_tiers_source")
+            if service_tier_source is None:
+                # Generic API metadata predating source provenance could only
+                # contain an empty map in released CCM builds. Ignore any
+                # non-empty value left by an intermediate development build;
+                # it never proved account-specific Fast support.
+                service_tiers = {}
+            elif service_tier_source == SERVICE_TIER_SOURCE_NONE:
+                if service_tiers:
+                    raise CloudRouterUnsafePathError(
+                        f"Inconsistent service tier metadata: {account_id}"
+                    )
+            elif service_tier_source != SERVICE_TIER_SOURCE_UPSTREAM:
+                raise CloudRouterUnsafePathError(
+                    f"Invalid service tier source metadata: {account_id}"
+                )
         account = CloudRouterAccount(
             id=account_id,
             name=name,
@@ -2339,6 +2382,11 @@ class CloudRouterAccountStore:
     ) -> dict[str, Any]:
         current = _now()
         provider = normalize_api_provider(api_provider)
+        service_tiers_source = (
+            SERVICE_TIER_SOURCE_UPSTREAM
+            if "service_tiers" in models
+            else SERVICE_TIER_SOURCE_NONE
+        )
         provider_models, service_tiers = _split_model_probe(models)
         return {
             "version": 2,
@@ -2350,6 +2398,7 @@ class CloudRouterAccountStore:
             "cleanup_pending": False,
             "models": provider_models,
             "service_tiers": service_tiers,
+            "service_tiers_source": service_tiers_source,
             "key_hint": key_hint,
             "endpoints": dict(API_PROVIDER_SPECS[provider].endpoints),
             "created_at": created_at or current,
@@ -2478,9 +2527,19 @@ class CloudRouterAccountStore:
                     metadata_path, maximum=MAX_METADATA_BYTES,
                 ).decode("utf-8"),
             )
+            service_tiers_source = (
+                SERVICE_TIER_SOURCE_UPSTREAM
+                if "service_tiers" in models
+                else SERVICE_TIER_SOURCE_NONE
+            )
             provider_models, service_tiers = _split_model_probe(models)
             data["models"] = provider_models
             data["service_tiers"] = service_tiers
+            # Development builds briefly persisted response-based denials.
+            # Response metadata is informational and must not override the
+            # account's current catalog capability.
+            data.pop("service_tier_denials", None)
+            data["service_tiers_source"] = service_tiers_source
             data["updated_at"] = _now()
             _atomic_private_json(
                 metadata_path,

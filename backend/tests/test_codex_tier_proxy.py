@@ -105,13 +105,13 @@ async def test_fast_proxy_requires_request_and_actual_priority():
             )
         assert response.status_code == 200
         assert b"response.created" in response.content
-        proof = await proxy.wait_for_actual_tier(
+        proof = await proxy.wait_for_request_acceptance(
             "thread-1",
             "turn-1",
             "priority",
             timeout=0.2,
         )
-        assert proof.actual_tier == "priority"
+        assert proof.upstream_reported_tier == "priority"
         assert proof.response_id == "resp-1"
         assert seen["body"]["service_tier"] == "priority"
         assert seen["request"].headers["authorization"] == "Bearer do-not-log"
@@ -204,7 +204,7 @@ async def test_standard_proxy_does_not_depend_on_responses_sse_prelude():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reported_tier", ["default", "auto", None])
-async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter(
+async def test_fast_accepts_informational_response_tier(
     reported_tier: str | None,
 ):
     async def handler(_request: httpx.Request) -> httpx.Response:
@@ -222,22 +222,16 @@ async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter(
                 headers={"x-client-request-id": "thread-1"},
                 json=_request_body(),
             )
-        assert response.status_code == 502
-        assert b"response.created" not in response.content
-        with pytest.raises(
-            CodexTierProofError,
-            match="actual service tier",
-        ) as exc_info:
-            await proxy.wait_for_actual_tier(
-                "thread-1",
-                "turn-1",
-                "priority",
-                timeout=0.2,
-            )
-        message = str(exc_info.value)
-        assert "requested=priority" in message
-        assert f"upstream_actual={reported_tier!r}" in message
-        assert "Fast was not honored" in message
+        assert response.status_code == 200
+        assert b"response.created" in response.content
+        proof = await proxy.wait_for_request_acceptance(
+            "thread-1",
+            "turn-1",
+            "priority",
+            timeout=0.2,
+        )
+        assert proof.requested_tier == "priority"
+        assert proof.upstream_reported_tier == reported_tier
     finally:
         await proxy.close()
 
@@ -265,7 +259,7 @@ async def test_fast_proxy_rejects_non_sse_success_without_releasing_body():
             CodexTierProofError,
             match="ended before response.created",
         ):
-            await proxy.wait_for_actual_tier(
+            await proxy.wait_for_request_acceptance(
                 "thread-1",
                 "turn-1",
                 "priority",
@@ -299,7 +293,7 @@ async def test_fast_proxy_rejects_compressed_sse_before_releasing_body():
             CodexTierProofError,
             match="Compressed Responses stream cannot be audited",
         ):
-            await proxy.wait_for_actual_tier(
+            await proxy.wait_for_request_acceptance(
                 "thread-1",
                 "turn-1",
                 "priority",
@@ -320,7 +314,7 @@ async def test_upstream_non_success_fails_waiter_without_second_response():
 
     proxy = await _running_proxy(handler)
     proxy.set_thread_tier("thread-1", "priority")
-    waiter = asyncio.create_task(proxy.wait_for_actual_tier(
+    waiter = asyncio.create_task(proxy.wait_for_request_acceptance(
         "thread-1",
         "turn-1",
         "priority",
@@ -354,7 +348,7 @@ async def test_fast_proxy_repairs_missing_transport_tier(request_tier):
     proxy = await _running_proxy(handler)
     proxy.set_thread_tier("thread-1", "priority")
     try:
-        waiter = asyncio.create_task(proxy.wait_for_actual_tier(
+        waiter = asyncio.create_task(proxy.wait_for_request_acceptance(
             "thread-1",
             "turn-1",
             "priority",
@@ -368,9 +362,9 @@ async def test_fast_proxy_repairs_missing_transport_tier(request_tier):
                 json=_request_body(tier=request_tier),
             )
         assert response.status_code == 200
-        assert seen["body"]["service_tier"] == "fast"
+        assert seen["body"]["service_tier"] == "priority"
         proof = await waiter
-        assert proof.actual_tier == "priority"
+        assert proof.upstream_reported_tier == "priority"
     finally:
         await proxy.close()
 
@@ -448,13 +442,13 @@ async def test_one_waiter_timeout_does_not_cancel_another_waiter():
     proxy = await _running_proxy(handler)
     proxy.set_thread_tier("thread-1", "priority")
     try:
-        short_wait = asyncio.create_task(proxy.wait_for_actual_tier(
+        short_wait = asyncio.create_task(proxy.wait_for_request_acceptance(
             "thread-1",
             "turn-1",
             "priority",
             timeout=0.1,
         ))
-        long_wait = asyncio.create_task(proxy.wait_for_actual_tier(
+        long_wait = asyncio.create_task(proxy.wait_for_request_acceptance(
             "thread-1",
             "turn-1",
             "priority",
@@ -469,13 +463,13 @@ async def test_one_waiter_timeout_does_not_cancel_another_waiter():
                 json=_request_body(),
             )
         assert response.status_code == 200
-        assert (await long_wait).actual_tier == "priority"
+        assert (await long_wait).upstream_reported_tier == "priority"
     finally:
         await proxy.close()
 
 
 @pytest.mark.asyncio
-async def test_later_mismatch_supersedes_same_turn_proof():
+async def test_later_informational_tier_updates_same_turn_observation():
     calls = 0
 
     async def handler(_request: httpx.Request) -> httpx.Response:
@@ -499,7 +493,7 @@ async def test_later_mismatch_supersedes_same_turn_proof():
             )
             assert first.status_code == 200
             assert (
-                await proxy.wait_for_actual_tier(
+                await proxy.wait_for_request_acceptance(
                     "thread-1",
                     "turn-1",
                     "priority",
@@ -511,14 +505,15 @@ async def test_later_mismatch_supersedes_same_turn_proof():
                 headers={"x-client-request-id": "thread-1"},
                 json=_request_body(),
             )
-        assert second.status_code == 502
-        with pytest.raises(CodexTierProofError, match="actual service tier"):
-            await proxy.wait_for_actual_tier(
-                "thread-1",
-                "turn-1",
-                "priority",
-                timeout=0.2,
-            )
+        assert second.status_code == 200
+        proof = await proxy.wait_for_request_acceptance(
+            "thread-1",
+            "turn-1",
+            "priority",
+            timeout=0.2,
+        )
+        assert proof.response_id == "resp-2"
+        assert proof.upstream_reported_tier == "default"
     finally:
         await proxy.close()
 
@@ -550,7 +545,7 @@ async def test_child_thread_inherits_exact_parent_tier():
                 ),
             )
         assert response.status_code == 200
-        proof = await proxy.wait_for_actual_tier(
+        proof = await proxy.wait_for_request_acceptance(
             "child-1",
             "child-turn",
             "priority",
@@ -730,7 +725,7 @@ async def test_stream_failure_after_commit_never_writes_second_http_response():
         assert b"response.created" in response
         assert b"502" not in response
         with pytest.raises(CodexTierProofError, match="proxy failed"):
-            await proxy.wait_for_actual_tier(
+            await proxy.wait_for_request_acceptance(
                 "thread-1",
                 "turn-1",
                 "priority",

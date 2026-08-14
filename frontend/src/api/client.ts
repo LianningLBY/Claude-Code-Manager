@@ -1883,6 +1883,8 @@ export interface CloudRouterAccount {
   cleanup_pending?: boolean;
   key_hint: string;
   models: CloudRouterModelMap;
+  /** API-advertised service tiers by Codex model. */
+  service_tiers?: Record<string, string[]>;
   providers: string[];
   account_dir: string;
   claude_config_dir: string;
@@ -1905,6 +1907,7 @@ export interface CloudRouterAccountProjection {
   retired?: boolean;
   cleanup_pending?: boolean;
   supported_models?: string[];
+  service_tiers?: Record<string, string[]>;
   api_quota?: CloudRouterApiQuota | null;
 }
 

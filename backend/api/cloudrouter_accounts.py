@@ -1,7 +1,7 @@
 """Administrative API for managed API-gateway Claude/Codex accounts.
 
 The historical route is retained so existing CloudRouter clients continue to
-work; the request's ``api_provider`` selects CloudRouter or ApexRouter.
+work; ``api_provider`` selects CloudRouter, ApexRouter, or APIBest.
 """
 
 from __future__ import annotations

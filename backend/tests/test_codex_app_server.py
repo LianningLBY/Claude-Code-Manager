@@ -62,7 +62,7 @@ from backend.services.task_runtime_secrets import (
     create_private_task_temp_dir,
 )
 from backend.services.codex_tier_proxy import (
-    CodexActualTierProof,
+    CodexTierRequestProof,
     CodexTierProofError,
     CodexTierProxyRoute,
 )
@@ -3581,9 +3581,10 @@ async def test_fast_turn_requires_live_catalog_and_persists_admission_proof():
     assert started == {"type": "thread.started", "thread_id": "thread-fast"}
     assert proof == {
         "type": "system_event",
-        "content": "Codex Fast priority 请求准入已确认 · 模型 gpt-5.6-sol",
+        "content": "Codex Fast priority 请求已发送 · 模型 gpt-5.6-sol",
         "requested_service_tier": "priority",
         "admitted_service_tier": "priority",
+        "service_tier_request_verified": False,
         "model": "gpt-5.6-sol",
         "thread_id": "thread-fast",
         "turn_id": "turn-fast",
@@ -6142,19 +6143,19 @@ async def test_fast_turn_uses_actual_priority_proof_when_thread_omits_tier():
     )
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    proof = CodexActualTierProof(
+    proof = CodexTierRequestProof(
         thread_id="thread-fast-proof",
         turn_id="turn-fast-proof",
         parent_thread_id=None,
         requested_tier="priority",
-        actual_tier="priority",
+        upstream_reported_tier="auto",
         response_id="resp-fast-proof",
         observed_at=1.0,
     )
     proxy = SimpleNamespace(
         is_alive=True,
         set_thread_tier=MagicMock(),
-        wait_for_actual_tier=AsyncMock(return_value=proof),
+        wait_for_request_acceptance=AsyncMock(return_value=proof),
         register_thread_parent=MagicMock(),
     )
     server._actual_tier_proxy = proxy
@@ -6244,7 +6245,7 @@ async def test_fast_turn_uses_actual_priority_proof_when_thread_omits_tier():
         "thread-fast-proof",
         "priority",
     )
-    proxy.wait_for_actual_tier.assert_awaited_once_with(
+    proxy.wait_for_request_acceptance.assert_awaited_once_with(
         "thread-fast-proof",
         "turn-fast-proof",
         "priority",
@@ -6254,8 +6255,9 @@ async def test_fast_turn_uses_actual_priority_proof_when_thread_omits_tier():
         "thread.started"
     )
     event = json.loads((await process.stdout.readline()).decode())
-    assert event["actual_service_tier_verified"] is True
+    assert event["service_tier_request_verified"] is True
     assert event["admitted_service_tier"] == "priority"
+    assert event["upstream_reported_service_tier"] == "auto"
     assert event["upstream_response_id"] == "resp-fast-proof"
 
 
@@ -6270,19 +6272,19 @@ async def test_standard_turn_fences_request_without_requiring_actual_field():
     )
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
-    proof = CodexActualTierProof(
+    proof = CodexTierRequestProof(
         thread_id="thread-standard-proof",
         turn_id="turn-standard-proof",
         parent_thread_id=None,
         requested_tier="default",
-        actual_tier="default",
+        upstream_reported_tier="default",
         response_id="resp-standard-proof",
         observed_at=1.0,
     )
     proxy = SimpleNamespace(
         is_alive=True,
         set_thread_tier=MagicMock(),
-        wait_for_actual_tier=AsyncMock(return_value=proof),
+        wait_for_request_acceptance=AsyncMock(return_value=proof),
         register_thread_parent=MagicMock(),
     )
     server._actual_tier_proxy = proxy
@@ -6312,11 +6314,11 @@ async def test_standard_turn_fences_request_without_requiring_actual_field():
         "thread-standard-proof",
         "default",
     )
-    proxy.wait_for_actual_tier.assert_not_awaited()
+    proxy.wait_for_request_acceptance.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
+async def test_fast_request_proof_failure_interrupts_exact_native_turn():
     server = CodexAppServer(
         "codex",
         actual_tier_proxy_route=CodexTierProxyRoute(
@@ -6329,9 +6331,9 @@ async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
     proxy = SimpleNamespace(
         is_alive=True,
         set_thread_tier=MagicMock(),
-        wait_for_actual_tier=AsyncMock(side_effect=CodexTierProofError(
-            "actual priority mismatch",
-        )),
+        wait_for_request_acceptance=AsyncMock(
+            side_effect=CodexTierProofError("upstream response was malformed"),
+        ),
         register_thread_parent=MagicMock(),
     )
     server._actual_tier_proxy = proxy
@@ -6360,7 +6362,7 @@ async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
     server._request = AsyncMock(side_effect=request)
     with pytest.raises(
         CodexServiceTierUnavailableError,
-        match="actual priority mismatch",
+        match="upstream response was malformed",
     ):
         await server.start_turn(
             prompt="must be interrupted",

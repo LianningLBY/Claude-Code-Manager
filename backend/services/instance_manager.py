@@ -4327,7 +4327,7 @@ class InstanceManager:
             # custom provider and still clears sticky Fast state through RPC.
             # Never log auth content or the configured upstream URL.
             logger.warning(
-                "Codex actual-tier route is unavailable home=%s reason=%s",
+                "Codex tier request route is unavailable home=%s reason=%s",
                 codex_home,
                 "unsupported-or-unverifiable-account",
             )

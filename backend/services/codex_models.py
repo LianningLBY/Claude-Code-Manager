@@ -27,8 +27,7 @@ CODEX_SERVICE_TIERS = (
 
 # Codex CLI model catalog (`service_tiers[].id == "priority"`). This is the
 # request/UI safety gate for native accounts. API gateway accounts additionally
-# require their own catalog capability, and a live mismatch persistently removes
-# that account/model route until the account capability changes.
+# require their own catalog capability before CCM sends a priority request.
 CODEX_MODEL_SERVICE_TIERS: dict[str, list[str]] = {
     "gpt-5.6-sol": ["default", "priority"],
     "gpt-5.6-terra": ["default", "priority"],

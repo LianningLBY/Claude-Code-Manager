@@ -1883,10 +1883,8 @@ export interface CloudRouterAccount {
   cleanup_pending?: boolean;
   key_hint: string;
   models: CloudRouterModelMap;
-  /** Effective API-advertised tiers after runtime-proven denials. */
+  /** API-advertised service tiers by Codex model. */
   service_tiers?: Record<string, string[]>;
-  /** Tiers explicitly disproven by an actual upstream response. */
-  service_tier_denials?: Record<string, string[]>;
   providers: string[];
   account_dir: string;
   claude_config_dir: string;

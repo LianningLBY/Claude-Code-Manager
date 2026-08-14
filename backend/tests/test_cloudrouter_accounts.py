@@ -1398,14 +1398,10 @@ async def test_generic_api_accounts_require_upstream_fast_capability_and_reload(
     # An intermediate development build persisted model-name inference without
     # provenance. It must not make existing accounts look Fast-capable.
     metadata["service_tiers"] = {"gpt-5.4": ["priority"]}
+    metadata["service_tier_denials"] = {"gpt-5.4": ["priority"]}
     metadata.pop("service_tiers_source")
     (account.root / "account.json").write_text(json.dumps(metadata))
     assert store.reload()[0].service_tiers == {}
-    await store.record_codex_service_tier_mismatch(
-        account.codex_home,
-        "gpt-5.4",
-    )
-    assert store.reload()[0].service_tier_denials == {}
 
     with pytest.raises(
         CloudRouterAccountError,
@@ -1430,6 +1426,7 @@ async def test_generic_api_accounts_require_upstream_fast_capability_and_reload(
         (refreshed.root / "account.json").read_text()
     )
     assert refreshed_metadata["service_tiers_source"] == "upstream"
+    assert "service_tier_denials" not in refreshed_metadata
     assert store.reload()[0].service_tiers == {"gpt-5.5": ["priority"]}
 
 
@@ -1449,56 +1446,6 @@ async def test_generic_account_rejects_tiers_claimed_by_none_source(
         match="Inconsistent service tier metadata",
     ):
         store.reload()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "api_provider",
-    ["cloudrouter", "apibest", "apex"],
-)
-async def test_actual_fast_mismatch_is_persisted_and_survives_catalog_refresh(
-    tmp_path, monkeypatch, api_provider,
-):
-    store = CloudRouterAccountStore(tmp_path / f"{api_provider}-accounts")
-    probe = AsyncMock(return_value={
-        "claude": [],
-        "codex": ["gpt-5.6-sol"],
-        "service_tiers": {"gpt-5.6-sol": ["priority"]},
-    })
-    monkeypatch.setattr(store, "probe_models", probe)
-    account = await store.add_account(
-        f"{api_provider} Fast",
-        "sk-test-secret",
-        api_provider=api_provider,
-    )
-
-    assert account.supports_service_tier(
-        "codex", "gpt-5.6-sol", "priority",
-    )
-    denied = await store.record_codex_service_tier_mismatch(
-        account.codex_home,
-        "gpt-5.6-sol",
-    )
-
-    assert denied is not None
-    assert denied.service_tiers == {}
-    assert denied.service_tier_denials == {
-        "gpt-5.6-sol": ["priority"],
-    }
-    metadata = json.loads((denied.root / "account.json").read_text())
-    assert metadata["service_tiers"] == {
-        "gpt-5.6-sol": ["priority"],
-    }
-    assert metadata["service_tier_denials"] == {
-        "gpt-5.6-sol": ["priority"],
-    }
-    assert store.reload()[0].service_tiers == {}
-
-    refreshed = await store.refresh_account(account.id)
-    assert refreshed.service_tiers == {}
-    assert refreshed.service_tier_denials == {
-        "gpt-5.6-sol": ["priority"],
-    }
 
 
 @pytest.mark.asyncio
@@ -2271,7 +2218,6 @@ async def test_first_api_account_lazily_creates_both_runtime_pools(
         model="gpt-5.5"
     ) == str(Path(account.codex_home).resolve())
     assert dispatcher.codex_pool is fake_main.codex_pool
-    assert manager.codex_pool is fake_main.codex_pool
 
 
 @pytest.mark.asyncio
@@ -2321,7 +2267,6 @@ async def test_pending_apex_tombstone_initializes_both_pool_tabs_after_restart(
     assert codex is not None
     assert claude.list_accounts()[0]["api_account_id"] == account.id
     assert codex.list_accounts()[0]["api_account_id"] == account.id
-    assert fake_main.instance_manager.codex_pool is codex
 
 
 @pytest.mark.asyncio

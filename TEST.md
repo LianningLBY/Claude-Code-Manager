@@ -482,7 +482,7 @@ Codex 版本兼容基线（2026-07-24）：
 | `test_launch_codex_app_server_routes_turn_to_canonical_home` | capability 关闭时 app-server 行为保持原样且不注入空配置 |
 | `test_codex_main_mcp_capability_does_not_change_claude_launch` | capability 开启不改变 Claude provider 的启动路径 |
 
-Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；Standard 清除 sticky tier；已加载 thread 的 Standard↔Fast 切换等待 `thread/settings/updated`，root lineage 有活跃请求时拒绝切换；`model/list` 不支持、admission 不一致或无法确认时不得发送 `turn/start`；Fast 在 app-server 关闭/失败时禁止 `codex exec` fallback；选号、限额轮换、Worker 迁移和 API 网关 capability 均保留 tier。所有 API 网关只信账号目录的显式 tier，未知模型和 malformed tier 都必须 fail closed；真实回包明确不匹配时须持久 denial 并重载号池，目录刷新不能恢复 denial，超时/网络错误不得误写。loopback Responses 代理必须覆盖 secret path/loopback/endpoint/WS 门禁、请求 thread/turn/parent lineage、request priority 校验、上游非 2xx，以及在释放任何成功 SSE 前要求首个 `response.created.response.service_tier=priority`；缺字段、Standard、非法值或后续同 turn 失败都不能留下可用 Fast proof。Codex 0.147 custom-provider `thread/start` 省略 `serviceTier` 时只允许 exact proxy proof 路径继续，未启用实际 tier proof 的同形响应仍须在 `turn/start` 前拒绝。Standard 请求不得携带 priority，但兼容上游不返回 informational tier。Fast Goal evaluator 必须继承任务模型并走 priority app-server 与实际 tier 证明，且在主回合前拒绝不同/不兼容 evaluator；Standard Goal evaluator 显式固定 Standard。Fast Task 的 Distill 必须在启动其 Standard auxiliary 前返回 409。
+Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；Standard 清除 sticky tier；已加载 thread 的 Standard↔Fast 切换等待 `thread/settings/updated`，root lineage 有活跃请求时拒绝切换；`model/list` 不支持、admission 不一致或无法确认时不得发送 `turn/start`；Fast 在 app-server 关闭/失败时禁止 `codex exec` fallback；选号、限额轮换、Worker 迁移和 API 网关 capability 均保留 tier。所有 API 网关只信账号目录的显式 tier，未知模型和 malformed tier 都必须 fail closed。loopback Responses 代理必须覆盖 secret path/loopback/endpoint/WS 门禁、请求 thread/turn/parent lineage、出站 `priority` 校验和上游非 2xx；成功 `response.created` 的信息性响应 tier 为 `priority/auto/default` 或缺失均继续执行并记录遥测，不得形成账号 denial。Codex 0.147 custom-provider `thread/start` 省略 `serviceTier` 时只允许 exact proxy request-proof 路径继续；Standard 请求不得携带 priority。Fast Goal evaluator 必须继承任务模型并走相同的 priority 请求验证链路，且在主回合前拒绝不同/不兼容 evaluator；Standard Goal evaluator 显式固定 Standard。Fast Task 的 Distill 必须在启动其 Standard auxiliary 前返回 409。
 
 路由配置一致性回归还必须覆盖：本机 active/运行中子 Agent 更新明确 409；Worker stage 只落 durable candidate，Manager exact CAS 后才 ack；stage/ack 响应丢失、orphan reconcile、Instance/pre-owner launch、queued recovery/final barrier、重启恢复及 Codex 子 Agent commit/cancel 均不得让旧 Standard turn 越过 Fast 配置。Manager 已 commit 后即使 ACK/readback 暂不可用，API 也返回 Manager 权威 Task，Worker marker 在后续 readback 收敛前持续阻断执行。
 
@@ -509,7 +509,7 @@ Codex Fast 回归还必须覆盖：新建/恢复 thread 都显式携带 tier；S
 8. 关闭 app-server 后启用 Codex Sub-Agent task，应明确报告其需要 app-server，且不得启动 exec。
 9. 设置 `CODEX_MAIN_MCP_ENABLED=false` 重启并确认普通 Codex exec 无 `ccm_skills`；测试完移除该覆盖并恢复原来的 `CODEX_APP_SERVER_ENABLED` 设置。
 
-Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模型、相同 effort 和 prompt 分别运行 Standard/Fast，确认 Fast 日志和聊天事件记录 requested/admitted=`priority`、`actual_service_tier_verified=true` 及上游 response id；再用 mini/Spark、未知模型、关闭 app-server，以及代理模拟返回 `service_tier=default`/缺字段四种场景验证都明确失败且没有成功 Fast 输出。各 API 网关还要验证真实回包确实为 `priority`；若明确返回 `auto/default`，确认该账号/模型随后不再参与 Fast 选号。之后把同一已加载 Task 从 Fast 切 Standard、再切回 Fast，确认下一轮请求配置分别为 default/priority，且 Standard 没有继承旧 Fast。网关速度与计费需单独实测，不能套用 OpenAI 官方倍率。
+Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模型、相同 effort 和 prompt 分别运行 Standard/Fast，抓取出站请求确认 CLI 配置 `fast` 最终转换为 Responses API 的 `service_tier=priority`，并确认日志和聊天事件记录 requested/admitted=`priority`、`service_tier_request_verified=true`、信息性上游 tier 及 response id。再用 mini/Spark、未知模型、关闭 app-server、请求 tier 错误和上游非 2xx 验证都明确失败；代理模拟返回 `service_tier=auto/default` 或缺字段则必须继续成功且不得改变账号 capability。之后把同一已加载 Task 从 Fast 切 Standard、再切回 Fast，确认下一轮请求配置分别为 default/priority，且 Standard 没有继承旧 Fast。网关速度与计费需单独实测，不能套用 OpenAI 官方倍率。
 
 真实验收记录（2026-07-24）：
 
@@ -983,7 +983,7 @@ python -m pytest \
 | `TestRateLimitDetection` / `TestAuthFailureDetection` / `TestPoolRotatable` | 限速/认证失败文案检测（窄正则，含中英文与各时区变体） |
 | `test_cloudrouter_claude_launch_replaces_inherited_auth_env` / `test_cloudrouter_claude_pty_projects_direct_auth_for_model_only` | CloudRouter Claude direct/PTY 启动均以所选账号 Key 覆盖 ambient auth，保留子进程凭据清洗开关 |
 | `test_real_claude_pty_uses_managed_bearer_token` | opt-in 真实 Claude PTY 调用：预置当前 Key 为 rejected，验证 Bearer 投影仍能完成首轮响应；需 `CCM_RUN_REAL_CLAUDE_API_TESTS=1`、`CCM_REAL_CLAUDE_API_KEY_FILE` 和 `CCM_REAL_CLAUDE_BASE_URL` |
-| `test_add_apibest_builds_private_dual_provider_home` / `test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog` / `test_generic_api_accounts_require_upstream_fast_capability_and_reload` / `test_actual_fast_mismatch_is_persisted_and_survives_catalog_refresh` | APIBest 双 provider 私有账号目录、「认证 models 空目录 → 公开 pricing 模型发现」，以及 API 网关显式 Fast 能力和真实不匹配 denial 的持久化链路 |
+| `test_add_apibest_builds_private_dual_provider_home` / `test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog` / `test_generic_api_accounts_require_upstream_fast_capability_and_reload` | APIBest 双 provider 私有账号目录、「认证 models 空目录 → 公开 pricing 模型发现」，以及 API 网关显式 Fast 能力来源校验 |
 | `test_claude_login_error_message_is_turn_fatal` | Claude 以 exit 0 返回普通 `Not logged in` error message 时仍判定回合失败 |
 | `TestTransientOverloadDetection` | **瞬时 429/过载检测**：命中 Anthropic 官方文案 `Server is temporarily limiting requests (not your usage limit)` / overloaded；与「额度用尽/认证失败」互斥（那些走换号）；无误报 |
 | `TestTransientRetryDelay` | 退避计算：首次≈base、指数增长、封顶 cap、最小 1s |
@@ -1416,10 +1416,10 @@ Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail close
 
 Codex Fast transport compatibility is covered by
 `backend/tests/test_codex_tier_proxy.py`: an exact priority lineage repairs
-Codex 0.147's missing/default outgoing `service_tier` to the current `fast`
-request spelling, while Standard and
-unsupported tier mismatches remain fail-closed and Fast still requires the
-upstream `response.created` priority proof.
+Codex 0.147's missing/default outgoing `service_tier` to the Responses API
+wire value `priority`, while Standard and unsupported request-tier mismatches
+remain fail-closed. A successful `response.created` accepts the request even
+when its informational response tier is `auto/default` or absent.
 
 ## 分布式 Worker 测试
 

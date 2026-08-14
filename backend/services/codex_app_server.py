@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from backend.services.codex_tier_proxy import (
-    CodexActualTierMismatchError,
     CodexActualTierProxy,
     CodexTierProofError,
     CodexTierProxyRoute,
@@ -559,17 +558,6 @@ class CodexThreadIdentityMismatchError(CodexThreadHomeMismatchError):
 
 class CodexServiceTierUnavailableError(CodexAppServerError):
     """The requested Codex service tier was not admitted before turn/start."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        fast_not_honored: bool = False,
-        upstream_actual_service_tier: str | None = None,
-    ) -> None:
-        super().__init__(message)
-        self.fast_not_honored = bool(fast_not_honored)
-        self.upstream_actual_service_tier = upstream_actual_service_tier
 
 
 class _UnconfirmedTurnCancellation(asyncio.CancelledError):
@@ -6178,7 +6166,8 @@ class CodexAppServer:
             # Codex 0.147 custom-provider thread/start can accept the tier in
             # the request while omitting it from the response.  This value is
             # provisional only: the turn remains unpublished until the exact
-            # proxy lineage proves the upstream response's actual tier below.
+            # proxy lineage proves that its Responses request carried priority
+            # and the upstream accepted it with a successful response.created.
             effective_service_tier = rpc_service_tier
         if effective_service_tier != rpc_service_tier:
             if resume_session_id:
@@ -6625,13 +6614,13 @@ class CodexAppServer:
                     "could not be confirmed",
                 )
             raise asyncio.CancelledError
-        actual_tier_proof = None
+        request_proof = None
         if (
             actual_tier_proxy is not None
             and service_tier == CODEX_SERVICE_TIER_PRIORITY
         ):
             proof_wait = asyncio.create_task(
-                actual_tier_proxy.wait_for_actual_tier(
+                actual_tier_proxy.wait_for_request_acceptance(
                     str(thread_id),
                     str(turn_id),
                     service_tier,
@@ -6649,10 +6638,10 @@ class CodexAppServer:
                 except BaseException:
                     break
             try:
-                actual_tier_proof = proof_wait.result()
+                request_proof = proof_wait.result()
             except CodexTierProofError as exc:
                 reason = (
-                    "Codex upstream did not prove the requested actual "
+                    "Codex upstream did not accept the requested "
                     f"service tier {service_tier!r}: {exc}"
                 )
                 interrupt_confirmed = await self.abandon_turn(
@@ -6664,18 +6653,11 @@ class CodexAppServer:
                         turn_process,
                         f"{reason}, and its interrupt could not be confirmed",
                     ) from exc
-                mismatch = isinstance(exc, CodexActualTierMismatchError)
-                raise CodexServiceTierUnavailableError(
-                    reason,
-                    fast_not_honored=mismatch,
-                    upstream_actual_service_tier=(
-                        exc.actual_tier if mismatch else None
-                    ),
-                ) from exc
+                raise CodexServiceTierUnavailableError(reason) from exc
             if turn_cancelled:
                 cleanup = asyncio.create_task(self.abandon_turn(
                     turn_process,
-                    "Codex actual service-tier proof wait was cancelled",
+                    "Codex service-tier request proof wait was cancelled",
                 ))
                 while not cleanup.done():
                     try:
@@ -6686,7 +6668,7 @@ class CodexAppServer:
                 if not interrupt_confirmed:
                     raise _UnconfirmedTurnCancellation(
                         turn_process,
-                        "Codex actual service-tier proof wait was cancelled "
+                        "Codex service-tier request proof wait was cancelled "
                         "and its interrupt could not be confirmed",
                     )
                 raise asyncio.CancelledError
@@ -6750,11 +6732,11 @@ class CodexAppServer:
         ):
             # Codex can adopt a turn/start submission into an older native
             # Goal turn.  That older generation began before this request's
-            # priority admission, so its actual tier is unknowable here.  Stop
-            # it and fail instead of attaching a Fast proof to old work.
+            # priority admission, so it cannot belong to this fenced request.
+            # Stop it instead of attaching a Fast request proof to old work.
             reason = (
                 "Codex Fast turn was adopted by an older active native turn; "
-                "priority execution cannot be proven"
+                "the priority request cannot be proven"
             )
             interrupt_confirmed = await self.abandon_turn(
                 turn_process,
@@ -6780,45 +6762,42 @@ class CodexAppServer:
             admission_event = {
                 "type": "system_event",
                 "content": (
-                    (
-                        "Codex Fast 实际 priority 已由上游确认"
-                        if actual_tier_proof is not None
-                        else "Codex Fast priority 请求准入已确认"
-                    )
-                    + f" · 模型 {model or 'default'}"
+                    "Codex Fast priority 请求已发送"
+                    f" · 模型 {model or 'default'}"
                 ),
                 "requested_service_tier": CODEX_SERVICE_TIER_PRIORITY,
-                "admitted_service_tier": (
-                    actual_tier_proof.actual_tier
-                    if actual_tier_proof is not None
-                    else effective_service_tier
-                ),
+                "admitted_service_tier": CODEX_SERVICE_TIER_PRIORITY,
+                "service_tier_request_verified": request_proof is not None,
                 "model": model or "default",
                 "thread_id": thread_id,
                 "turn_id": str(turn_id),
             }
-            if actual_tier_proof is not None:
+            if request_proof is not None:
                 admission_event.update({
-                    "actual_service_tier_verified": True,
-                    "upstream_response_id": actual_tier_proof.response_id,
+                    "upstream_reported_service_tier": (
+                        request_proof.upstream_reported_tier
+                    ),
+                    "upstream_response_id": request_proof.response_id,
                 })
             turn_process.feed(admission_event)
             logger.info(
                 "Codex service-tier request admitted task=%s thread=%s turn=%s "
-                "requested=priority admitted=%s actual_verified=%s "
-                "response=%s model=%s",
+                "requested=priority admitted=priority request_verified=%s "
+                "upstream_reported=%s response=%s model=%s",
                 task_id,
                 thread_id,
                 turn_id,
                 (
-                    actual_tier_proof.actual_tier
-                    if actual_tier_proof is not None
-                    else effective_service_tier
+                    request_proof is not None
                 ),
-                actual_tier_proof is not None,
                 (
-                    actual_tier_proof.response_id
-                    if actual_tier_proof is not None
+                    request_proof.upstream_reported_tier
+                    if request_proof is not None
+                    else "unreported"
+                ),
+                (
+                    request_proof.response_id
+                    if request_proof is not None
                     else "-"
                 ),
                 model or "default",
@@ -6828,16 +6807,16 @@ class CodexAppServer:
         else:
             logger.info(
                 "Codex service-tier request admitted task=%s thread=%s turn=%s "
-                "requested=default admitted=%s actual_verified=%s "
+                "requested=default admitted=%s request_verified=%s "
                 "response=%s model=%s",
                 task_id,
                 thread_id,
                 turn_id,
                 effective_service_tier,
-                actual_tier_proof is not None,
+                request_proof is not None,
                 (
-                    actual_tier_proof.response_id
-                    if actual_tier_proof is not None
+                    request_proof.response_id
+                    if request_proof is not None
                     else "-"
                 ),
                 model or "default",

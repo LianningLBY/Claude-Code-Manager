@@ -87,10 +87,6 @@ def _runtime_pools():
             include_native=settings.codex_pool_enabled,
         )
         runtime.dispatcher.codex_pool = runtime.codex_pool
-        runtime.instance_manager.codex_pool = runtime.codex_pool
-
-    if runtime.codex_pool is not None:
-        runtime.instance_manager.codex_pool = runtime.codex_pool
 
     return runtime.dispatcher.pool, runtime.codex_pool
 

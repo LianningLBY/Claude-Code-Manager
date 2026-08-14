@@ -345,7 +345,6 @@ if settings.codex_pool_enabled or _has_cloudrouter_codex_accounts:
             include_native=settings.codex_pool_enabled,
         )
         dispatcher.codex_pool = codex_pool
-        instance_manager.codex_pool = codex_pool
         logger.info("Codex pool enabled with %d accounts", len(codex_pool._accounts))
     except Exception:
         logger.exception("Codex pool init failed — codex pool disabled")

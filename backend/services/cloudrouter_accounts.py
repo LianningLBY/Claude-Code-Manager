@@ -852,31 +852,6 @@ def _normalise_service_tiers(
     return result
 
 
-def _effective_service_tiers(
-    declared: dict[str, list[str]],
-    denied: dict[str, list[str]],
-    *,
-    unsafe_metadata: bool,
-) -> dict[str, list[str]]:
-    """Subtract runtime-proven tier mismatches from catalog capabilities."""
-
-    for model, tiers in denied.items():
-        declared_tiers = set(declared.get(model, []))
-        if any(tier not in declared_tiers for tier in tiers):
-            if unsafe_metadata:
-                raise CloudRouterUnsafePathError(
-                    "Inconsistent API account service tier denial metadata"
-                )
-            raise CloudRouterUpstreamError("invalid_models_response")
-    result: dict[str, list[str]] = {}
-    for model, tiers in declared.items():
-        denied_tiers = set(denied.get(model, []))
-        effective = [tier for tier in tiers if tier not in denied_tiers]
-        if effective:
-            result[model] = effective
-    return result
-
-
 def _split_model_probe(
     value: dict[str, Any],
 ) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
@@ -1426,7 +1401,6 @@ class CloudRouterAccount:
     cleanup_pending: bool
     models: dict[str, list[str]]
     service_tiers: dict[str, list[str]]
-    service_tier_denials: dict[str, list[str]]
     service_tiers_explicit: bool
     key_hint: str
     root: Path
@@ -1507,7 +1481,6 @@ class CloudRouterAccount:
             "cleanup_pending": self.cleanup_pending,
             "models": self.models,
             "service_tiers": self.service_tiers,
-            "service_tier_denials": self.service_tier_denials,
             "providers": self.providers,
             "key_hint": self.key_hint,
             "account_dir": str(self.root),
@@ -1763,16 +1736,6 @@ class CloudRouterAccountStore:
                 raise CloudRouterUnsafePathError(
                     f"Invalid service tier source metadata: {account_id}"
                 )
-        service_tier_denials = _normalise_service_tiers(
-            data.get("service_tier_denials"),
-            normalised_models["codex"],
-            unsafe_metadata=True,
-        )
-        service_tiers = _effective_service_tiers(
-            service_tiers,
-            service_tier_denials,
-            unsafe_metadata=True,
-        )
         account = CloudRouterAccount(
             id=account_id,
             name=name,
@@ -1782,7 +1745,6 @@ class CloudRouterAccountStore:
             cleanup_pending=bool(data.get("cleanup_pending", False)),
             models=normalised_models,
             service_tiers=service_tiers,
-            service_tier_denials=service_tier_denials,
             service_tiers_explicit=service_tiers_explicit,
             key_hint=str(data.get("key_hint") or ""),
             root=path,
@@ -2434,7 +2396,6 @@ class CloudRouterAccountStore:
             "cleanup_pending": False,
             "models": provider_models,
             "service_tiers": service_tiers,
-            "service_tier_denials": {},
             "service_tiers_source": service_tiers_source,
             "key_hint": key_hint,
             "endpoints": dict(API_PROVIDER_SPECS[provider].endpoints),
@@ -2570,26 +2531,12 @@ class CloudRouterAccountStore:
                 else SERVICE_TIER_SOURCE_NONE
             )
             provider_models, service_tiers = _split_model_probe(models)
-            service_tier_denials = {
-                model: sorted(
-                    tier
-                    for tier in denied_tiers
-                    if tier in service_tiers.get(model, [])
-                )
-                for model, denied_tiers in account.service_tier_denials.items()
-                if model in provider_models["codex"]
-            }
-            service_tier_denials = {
-                model: tiers
-                for model, tiers in service_tier_denials.items()
-                if tiers
-            }
             data["models"] = provider_models
             data["service_tiers"] = service_tiers
-            # A catalog refresh is not an execution proof. Preserve an exact
-            # runtime mismatch until the upstream stops advertising that tier
-            # or an operator replaces the account.
-            data["service_tier_denials"] = service_tier_denials
+            # Development builds briefly persisted response-based denials.
+            # Response metadata is informational and must not override the
+            # account's current catalog capability.
+            data.pop("service_tier_denials", None)
             data["service_tiers_source"] = service_tiers_source
             data["updated_at"] = _now()
             _atomic_private_json(
@@ -2599,87 +2546,6 @@ class CloudRouterAccountStore:
             )
             self.reload()
             return self._require_account(account_id)
-
-    async def record_codex_service_tier_mismatch(
-        self,
-        runtime_home: str | os.PathLike[str],
-        model: str | None,
-        *,
-        service_tier: str = "priority",
-    ) -> CloudRouterAccount | None:
-        """Persist an exact runtime proof that one advertised tier failed.
-
-        Catalog metadata is only candidate evidence. The actual Responses
-        ``response.created.service_tier`` is authoritative, so a proven
-        downgrade removes this account/model route from future Fast selection.
-        """
-
-        requested_model = _normalise_model(model)
-        requested_tier = str(service_tier or "").strip().lower()
-        if (
-            not requested_model
-            or requested_model == "default"
-            or requested_tier != "priority"
-        ):
-            return None
-        async with self._mutation_lock:
-            account = self._reload_runtime_account("codex", runtime_home)
-            if not account.supports_model("codex", requested_model):
-                return account
-            metadata_path = account.root / "account.json"
-            data = json.loads(
-                _open_regular_nofollow(
-                    metadata_path,
-                    maximum=MAX_METADATA_BYTES,
-                ).decode("utf-8"),
-            )
-            if (
-                account.api_provider != API_PROVIDER_APEX
-                and data.get("service_tiers_source")
-                != SERVICE_TIER_SOURCE_UPSTREAM
-            ):
-                # Legacy/inferred generic metadata was already excluded at
-                # load time and is not a declared route worth denying.
-                return account
-            declared = _normalise_service_tiers(
-                data.get("service_tiers"),
-                account.models["codex"],
-                unsafe_metadata=True,
-            )
-            if (
-                "service_tiers" not in data
-                and account.api_provider == API_PROVIDER_APEX
-            ):
-                # Materialize the exact legacy Apex models-cache candidate so
-                # the denial remains meaningful after this metadata migration.
-                declared = dict(account.service_tiers)
-                data["service_tiers"] = declared
-            if requested_tier not in declared.get(requested_model, []):
-                return account
-            denials = _normalise_service_tiers(
-                data.get("service_tier_denials"),
-                account.models["codex"],
-                unsafe_metadata=True,
-            )
-            denied_tiers = set(denials.get(requested_model, []))
-            if requested_tier in denied_tiers:
-                return account
-            denied_tiers.add(requested_tier)
-            denials[requested_model] = sorted(denied_tiers)
-            _effective_service_tiers(
-                declared,
-                denials,
-                unsafe_metadata=True,
-            )
-            data["service_tier_denials"] = denials
-            data["updated_at"] = _now()
-            _atomic_private_json(
-                metadata_path,
-                data,
-                maximum=MAX_METADATA_BYTES,
-            )
-            self.reload()
-            return self._reload_runtime_account("codex", runtime_home)
 
     async def fetch_usage(
         self, account_id: str, force: bool = False,

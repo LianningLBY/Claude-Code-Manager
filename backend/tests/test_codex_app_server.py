@@ -9164,6 +9164,8 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
         "started_at": lifecycle["started_at"],
         "last_activity_at": lifecycle["last_activity_at"],
     }
+    assert lifecycle["started_at"].endswith("+00:00")
+    assert lifecycle["last_activity_at"].endswith("+00:00")
 
     # The context remains attached after native parent completion, so a
     # notification already in the transport queue is delivered before EOF.

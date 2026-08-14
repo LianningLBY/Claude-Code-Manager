@@ -27,7 +27,7 @@ import uuid
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
@@ -3068,7 +3068,7 @@ class CodexAppServer:
 
         if not self._context_is_current(context):
             return
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if context.background_lifecycle_started_at is None:
             context.background_lifecycle_started_at = now
         if activity or state == "completed":

@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from backend.services.codex_tier_proxy import (
+    CodexActualTierMismatchError,
     CodexActualTierProxy,
     CodexTierProofError,
     CodexTierProxyError,
@@ -225,7 +226,7 @@ async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter(
         assert response.status_code == 502
         assert b"response.created" not in response.content
         with pytest.raises(
-            CodexTierProofError,
+            CodexActualTierMismatchError,
             match="actual service tier",
         ) as exc_info:
             await proxy.wait_for_actual_tier(
@@ -238,6 +239,8 @@ async def test_actual_tier_mismatch_releases_no_sse_bytes_and_fails_waiter(
         assert "requested=priority" in message
         assert f"upstream_actual={reported_tier!r}" in message
         assert "Fast was not honored" in message
+        assert exc_info.value.requested_tier == "priority"
+        assert exc_info.value.actual_tier == reported_tier
     finally:
         await proxy.close()
 

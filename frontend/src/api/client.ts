@@ -1883,6 +1883,10 @@ export interface CloudRouterAccount {
   cleanup_pending?: boolean;
   key_hint: string;
   models: CloudRouterModelMap;
+  /** Effective API-advertised tiers after runtime-proven denials. */
+  service_tiers?: Record<string, string[]>;
+  /** Tiers explicitly disproven by an actual upstream response. */
+  service_tier_denials?: Record<string, string[]>;
   providers: string[];
   account_dir: string;
   claude_config_dir: string;
@@ -1905,6 +1909,7 @@ export interface CloudRouterAccountProjection {
   retired?: boolean;
   cleanup_pending?: boolean;
   supported_models?: string[];
+  service_tiers?: Record<string, string[]>;
   api_quota?: CloudRouterApiQuota | null;
 }
 

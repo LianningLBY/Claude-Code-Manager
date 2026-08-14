@@ -62,6 +62,7 @@ from backend.services.task_runtime_secrets import (
     create_private_task_temp_dir,
 )
 from backend.services.codex_tier_proxy import (
+    CodexActualTierMismatchError,
     CodexActualTierProof,
     CodexTierProofError,
     CodexTierProxyRoute,
@@ -6329,9 +6330,9 @@ async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
     proxy = SimpleNamespace(
         is_alive=True,
         set_thread_tier=MagicMock(),
-        wait_for_actual_tier=AsyncMock(side_effect=CodexTierProofError(
-            "actual priority mismatch",
-        )),
+        wait_for_actual_tier=AsyncMock(
+            side_effect=CodexActualTierMismatchError("priority", "auto"),
+        ),
         register_thread_parent=MagicMock(),
     )
     server._actual_tier_proxy = proxy
@@ -6360,8 +6361,8 @@ async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
     server._request = AsyncMock(side_effect=request)
     with pytest.raises(
         CodexServiceTierUnavailableError,
-        match="actual priority mismatch",
-    ):
+        match="Fast was not honored",
+    ) as exc_info:
         await server.start_turn(
             prompt="must be interrupted",
             cwd="/tmp",
@@ -6373,6 +6374,8 @@ async def test_actual_tier_proof_failure_interrupts_exact_native_turn():
             codex_service_tier="priority",
         )
 
+    assert exc_info.value.fast_not_honored is True
+    assert exc_info.value.upstream_actual_service_tier == "auto"
     server.abandon_turn.assert_awaited_once()
     abandoned_process = server.abandon_turn.await_args.args[0]
     assert abandoned_process.thread_id == "thread-proof-failure"

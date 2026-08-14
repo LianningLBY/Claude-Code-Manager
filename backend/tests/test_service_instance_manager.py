@@ -8141,6 +8141,64 @@ async def test_fast_launch_does_not_use_exec_after_app_server_failure(
 
 
 @pytest.mark.asyncio
+async def test_explicit_api_fast_mismatch_disables_route_and_reloads_pool(
+    db_factory, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    async with db_factory() as db:
+        inst = Instance(name="codex-fast-api-mismatch")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+
+    account = types.SimpleNamespace(id="apex-2", api_provider="apex")
+    store = MagicMock()
+    store.account_for_codex_home.return_value = account
+
+    @asynccontextmanager
+    async def runtime_admission(*_args, **_kwargs):
+        yield account
+
+    store.runtime_admission = runtime_admission
+    store.record_codex_service_tier_mismatch = AsyncMock(
+        return_value=account,
+    )
+    pool = MagicMock()
+    im = InstanceManager(db_factory, MagicMock())
+    im.cloudrouter_store = store
+    im.codex_pool = pool
+    im._launch_codex_app_server = AsyncMock(
+        side_effect=CodexServiceTierUnavailableError(
+            "requested priority but upstream returned auto",
+            fast_not_honored=True,
+            upstream_actual_service_tier="auto",
+        ),
+    )
+    codex_home = str(tmp_path / "apex-2" / "codex")
+
+    with pytest.raises(
+        CodexServiceTierUnavailableError,
+        match="upstream returned auto",
+    ):
+        await im.launch(
+            instance_id=inst.id,
+            prompt="must be verified",
+            cwd="/tmp",
+            model="gpt-5.6-sol",
+            provider="codex",
+            config_dir=codex_home,
+            codex_service_tier="priority",
+        )
+
+    store.record_codex_service_tier_mismatch.assert_awaited_once_with(
+        codex_home,
+        "gpt-5.6-sol",
+        service_tier="priority",
+    )
+    pool.reload.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_codex_started_turn_wraps_generic_persistence_failure(
     db_factory,
 ):

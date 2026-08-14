@@ -1190,7 +1190,13 @@ async def test_probe_models_uses_bounded_non_redirecting_request(
 
         async def aiter_bytes(self):
             yield json.dumps({
-                "data": [{"id": "claude-opus-4-8"}, {"id": "gpt-5.5"}],
+                "data": [
+                    {"id": "claude-opus-4-8"},
+                    {
+                        "id": "gpt-5.5",
+                        "service_tiers": [{"id": "priority"}],
+                    },
+                ],
             }).encode()
 
     class Stream:
@@ -1221,7 +1227,11 @@ async def test_probe_models_uses_bounded_non_redirecting_request(
 
     models = await store.probe_models("cr-private")
 
-    assert models == {"claude": ["claude-opus-4-8"], "codex": ["gpt-5.5"]}
+    assert models == {
+        "claude": ["claude-opus-4-8"],
+        "codex": ["gpt-5.5"],
+        "service_tiers": {"gpt-5.5": ["priority"]},
+    }
     assert captured["follow_redirects"] is False
     assert captured["method"] == "GET"
     assert captured["headers"]["Authorization"] == "Bearer cr-private"
@@ -1283,6 +1293,11 @@ async def test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog(
                 },
                 {
                     "model_name": "gpt-5.6-luna",
+                    "supported_endpoint_types": ["openai-response"],
+                    "service_tiers": [{"id": "priority"}],
+                },
+                {
+                    "model_name": "gpt-5.5",
                     "supported_endpoint_types": ["openai"],
                 },
                 {
@@ -1298,7 +1313,8 @@ async def test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog(
 
     assert models == {
         "claude": ["claude-sonnet-5"],
-        "codex": ["gpt-5.6-luna"],
+        "codex": ["gpt-5.5", "gpt-5.6-luna"],
+        "service_tiers": {"gpt-5.6-luna": ["priority"]},
     }
     assert [item.args for item in request.await_args_list] == [
         (APIBEST_MODELS_URL, "sk-test"),
@@ -1344,6 +1360,145 @@ async def test_apex_service_tiers_are_persisted_and_reloaded(
     }
     public = store.reload()[0].public_dict()
     assert public["service_tiers"] == {"gpt-5.4": ["priority"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_provider", ["cloudrouter", "apibest"])
+async def test_generic_api_accounts_require_upstream_fast_capability_and_reload(
+    tmp_path, monkeypatch, api_provider,
+):
+    store = CloudRouterAccountStore(tmp_path / f"{api_provider}-accounts")
+    probe = AsyncMock(return_value={
+        "claude": [],
+        "codex": ["gpt-5.4", "gpt-5.4-mini"],
+    })
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        probe,
+    )
+
+    account = await store.add_account(
+        f"{api_provider} Fast",
+        "sk-test-secret",
+        api_provider=api_provider,
+    )
+
+    assert account.service_tiers == {}
+    assert not account.supports_service_tier(
+        "codex", "gpt-5.4", "priority",
+    )
+    assert not account.supports_service_tier(
+        "codex", "gpt-5.4-mini", "priority",
+    )
+    metadata = json.loads((account.root / "account.json").read_text())
+    assert metadata["service_tiers"] == {}
+    assert metadata["service_tiers_source"] == "none"
+
+    # An intermediate development build persisted model-name inference without
+    # provenance. It must not make existing accounts look Fast-capable.
+    metadata["service_tiers"] = {"gpt-5.4": ["priority"]}
+    metadata.pop("service_tiers_source")
+    (account.root / "account.json").write_text(json.dumps(metadata))
+    assert store.reload()[0].service_tiers == {}
+    await store.record_codex_service_tier_mismatch(
+        account.codex_home,
+        "gpt-5.4",
+    )
+    assert store.reload()[0].service_tier_denials == {}
+
+    with pytest.raises(
+        CloudRouterAccountError,
+        match="does not advertise service tier",
+    ):
+        async with store.runtime_admission(
+            "codex",
+            account.codex_home,
+            "gpt-5.4",
+            service_tier="priority",
+        ):
+            pass
+
+    probe.return_value = {
+        "claude": [],
+        "codex": ["gpt-5.5", "gpt-5.4-mini"],
+        "service_tiers": {"gpt-5.5": ["priority"]},
+    }
+    refreshed = await store.refresh_account(account.id)
+    assert refreshed.service_tiers == {"gpt-5.5": ["priority"]}
+    refreshed_metadata = json.loads(
+        (refreshed.root / "account.json").read_text()
+    )
+    assert refreshed_metadata["service_tiers_source"] == "upstream"
+    assert store.reload()[0].service_tiers == {"gpt-5.5": ["priority"]}
+
+
+@pytest.mark.asyncio
+async def test_generic_account_rejects_tiers_claimed_by_none_source(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["service_tiers"] = {"gpt-5.5": ["priority"]}
+    assert metadata["service_tiers_source"] == "none"
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Inconsistent service tier metadata",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "api_provider",
+    ["cloudrouter", "apibest", "apex"],
+)
+async def test_actual_fast_mismatch_is_persisted_and_survives_catalog_refresh(
+    tmp_path, monkeypatch, api_provider,
+):
+    store = CloudRouterAccountStore(tmp_path / f"{api_provider}-accounts")
+    probe = AsyncMock(return_value={
+        "claude": [],
+        "codex": ["gpt-5.6-sol"],
+        "service_tiers": {"gpt-5.6-sol": ["priority"]},
+    })
+    monkeypatch.setattr(store, "probe_models", probe)
+    account = await store.add_account(
+        f"{api_provider} Fast",
+        "sk-test-secret",
+        api_provider=api_provider,
+    )
+
+    assert account.supports_service_tier(
+        "codex", "gpt-5.6-sol", "priority",
+    )
+    denied = await store.record_codex_service_tier_mismatch(
+        account.codex_home,
+        "gpt-5.6-sol",
+    )
+
+    assert denied is not None
+    assert denied.service_tiers == {}
+    assert denied.service_tier_denials == {
+        "gpt-5.6-sol": ["priority"],
+    }
+    metadata = json.loads((denied.root / "account.json").read_text())
+    assert metadata["service_tiers"] == {
+        "gpt-5.6-sol": ["priority"],
+    }
+    assert metadata["service_tier_denials"] == {
+        "gpt-5.6-sol": ["priority"],
+    }
+    assert store.reload()[0].service_tiers == {}
+
+    refreshed = await store.refresh_account(account.id)
+    assert refreshed.service_tiers == {}
+    assert refreshed.service_tier_denials == {
+        "gpt-5.6-sol": ["priority"],
+    }
 
 
 @pytest.mark.asyncio
@@ -1405,7 +1560,7 @@ async def test_legacy_apex_uses_exact_nofollow_models_cache_as_fast_candidate(
 
 
 @pytest.mark.asyncio
-async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
+async def test_explicit_apex_and_generic_accounts_never_use_models_cache_fallback(
     tmp_path, monkeypatch,
 ):
     apex_store = CloudRouterAccountStore(tmp_path / "apex-accounts")
@@ -1437,7 +1592,7 @@ async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
     generic_store, generic = await _add(
         tmp_path,
         monkeypatch,
-        models={"claude": [], "codex": ["gpt-5.4"]},
+        models={"claude": [], "codex": ["gpt-provider-specific"]},
     )
     generic_metadata_path = generic.root / "account.json"
     generic_metadata = json.loads(generic_metadata_path.read_text())
@@ -1445,14 +1600,14 @@ async def test_explicit_or_non_apex_capability_never_uses_models_cache_fallback(
     generic_metadata_path.write_text(json.dumps(generic_metadata))
     (generic.root / "codex" / "models_cache.json").write_text(json.dumps({
         "models": [{
-            "slug": "gpt-5.4",
+            "slug": "gpt-provider-specific",
             "service_tiers": [{"id": "priority"}],
         }],
     }))
     legacy_generic = generic_store.reload()[0]
     assert legacy_generic.service_tiers_explicit is False
     assert not legacy_generic.supports_service_tier(
-        "codex", "gpt-5.4", "priority"
+        "codex", "gpt-provider-specific", "priority"
     )
 
 
@@ -1518,6 +1673,33 @@ async def test_apex_probe_rejects_malformed_service_tiers(
         await store.probe_models(
             "lck-test-secret",
             api_provider="apex",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("api_provider", ["cloudrouter", "apibest"])
+async def test_generic_probe_rejects_malformed_service_tiers(
+    tmp_path, monkeypatch, api_provider,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(return_value={
+            "data": [{
+                "id": "gpt-5.4",
+                "service_tiers": [{"id": "priority tier"}],
+            }],
+        }),
+    )
+
+    with pytest.raises(
+        CloudRouterUpstreamError,
+        match="invalid_models_response",
+    ):
+        await store.probe_models(
+            "sk-test-secret",
+            api_provider=api_provider,
         )
 
 
@@ -2089,6 +2271,7 @@ async def test_first_api_account_lazily_creates_both_runtime_pools(
         model="gpt-5.5"
     ) == str(Path(account.codex_home).resolve())
     assert dispatcher.codex_pool is fake_main.codex_pool
+    assert manager.codex_pool is fake_main.codex_pool
 
 
 @pytest.mark.asyncio
@@ -2138,6 +2321,7 @@ async def test_pending_apex_tombstone_initializes_both_pool_tabs_after_restart(
     assert codex is not None
     assert claude.list_accounts()[0]["api_account_id"] == account.id
     assert codex.list_accounts()[0]["api_account_id"] == account.id
+    assert fake_main.instance_manager.codex_pool is codex
 
 
 @pytest.mark.asyncio

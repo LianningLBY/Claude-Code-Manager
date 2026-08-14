@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Sequence
 
 from backend.services.codex_tier_proxy import (
+    CodexActualTierMismatchError,
     CodexActualTierProxy,
     CodexTierProofError,
     CodexTierProxyRoute,
@@ -558,6 +559,17 @@ class CodexThreadIdentityMismatchError(CodexThreadHomeMismatchError):
 
 class CodexServiceTierUnavailableError(CodexAppServerError):
     """The requested Codex service tier was not admitted before turn/start."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        fast_not_honored: bool = False,
+        upstream_actual_service_tier: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.fast_not_honored = bool(fast_not_honored)
+        self.upstream_actual_service_tier = upstream_actual_service_tier
 
 
 class _UnconfirmedTurnCancellation(asyncio.CancelledError):
@@ -6652,7 +6664,14 @@ class CodexAppServer:
                         turn_process,
                         f"{reason}, and its interrupt could not be confirmed",
                     ) from exc
-                raise CodexServiceTierUnavailableError(reason) from exc
+                mismatch = isinstance(exc, CodexActualTierMismatchError)
+                raise CodexServiceTierUnavailableError(
+                    reason,
+                    fast_not_honored=mismatch,
+                    upstream_actual_service_tier=(
+                        exc.actual_tier if mismatch else None
+                    ),
+                ) from exc
             if turn_cancelled:
                 cleanup = asyncio.create_task(self.abandon_turn(
                     turn_process,

@@ -792,6 +792,10 @@ class InstanceManager:
         # Injected by backend.main. Runtime lookup is path-only and never reads
         # or stores the API key in launch params, git env, or process argv.
         self.cloudrouter_store = None
+        # Injected alongside ``cloudrouter_store``. A runtime-proven Fast
+        # mismatch reloads pool projections after the account capability is
+        # persistently denied.
+        self.codex_pool = None
         self.parser = StreamParser()
         self.processes: dict[int, asyncio.subprocess.Process] = {}
         self._tasks: dict[int, asyncio.Task] = {}  # instance_id -> consumer task
@@ -1688,7 +1692,7 @@ class InstanceManager:
                                 execution_mode=execution_mode,
                                 attachment_paths=attachment_paths,
                             )
-                    except BaseException:
+                    except BaseException as exc:
                         # A token which did not reach the durable provider
                         # boundary must not float into a later, unrelated mode
                         # step.  Preflight retry requires a newly proven
@@ -1745,6 +1749,13 @@ class InstanceManager:
                             is reservation
                         ):
                             self._launch_reservations.pop(instance_id, None)
+                        await self._record_api_fast_mismatch(
+                            provider=provider,
+                            config_dir=config_dir,
+                            model=model,
+                            service_tier=codex_service_tier,
+                            error=exc,
+                        )
                         raise
                     else:
                         if (
@@ -4351,6 +4362,56 @@ class InstanceManager:
                 "Could not resolve CloudRouter runtime home for %s", config_dir
             )
             return None
+
+    async def _record_api_fast_mismatch(
+        self,
+        *,
+        provider: str,
+        config_dir: str | None,
+        model: str | None,
+        service_tier: str,
+        error: BaseException,
+    ) -> None:
+        """Remove only an API Fast route disproven by an actual response."""
+
+        if (
+            provider != "codex"
+            or str(service_tier or "default").strip().lower() != "priority"
+            or not config_dir
+            or not bool(getattr(error, "fast_not_honored", False))
+            or self.cloudrouter_store is None
+        ):
+            return
+        recorder = getattr(
+            self.cloudrouter_store,
+            "record_codex_service_tier_mismatch",
+            None,
+        )
+        if not callable(recorder):
+            return
+        try:
+            account = await recorder(
+                config_dir,
+                model,
+                service_tier="priority",
+            )
+            if self.codex_pool is not None:
+                self.codex_pool.reload()
+            logger.warning(
+                "Disabled disproven Codex Fast route account=%s model=%s "
+                "upstream_actual=%r",
+                getattr(account, "id", None),
+                model,
+                getattr(error, "upstream_actual_service_tier", None),
+            )
+        except Exception:
+            # Preserve the exact provider failure. A persistence problem is
+            # independently visible in logs and must not rewrite task state.
+            logger.exception(
+                "Could not persist disproven Codex Fast route home=%s model=%s",
+                config_dir,
+                model,
+            )
 
     def _provider_process_label(
         self,

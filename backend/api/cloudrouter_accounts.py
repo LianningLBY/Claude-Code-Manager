@@ -1,7 +1,7 @@
 """Administrative API for managed API-gateway Claude/Codex accounts.
 
 The historical route is retained so existing CloudRouter clients continue to
-work; the request's ``api_provider`` selects CloudRouter or ApexRouter.
+work; ``api_provider`` selects CloudRouter, ApexRouter, or APIBest.
 """
 
 from __future__ import annotations
@@ -87,6 +87,10 @@ def _runtime_pools():
             include_native=settings.codex_pool_enabled,
         )
         runtime.dispatcher.codex_pool = runtime.codex_pool
+        runtime.instance_manager.codex_pool = runtime.codex_pool
+
+    if runtime.codex_pool is not None:
+        runtime.instance_manager.codex_pool = runtime.codex_pool
 
     return runtime.dispatcher.pool, runtime.codex_pool
 

@@ -133,6 +133,8 @@ MAX_SERVICE_TIERS_PER_MODEL = 16
 MAX_SERVICE_TIER_ID_BYTES = 64
 MAX_CODEX_MODELS_CACHE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_MODELS_CACHE_MODELS = 2048
+SERVICE_TIER_SOURCE_NONE = "none"
+SERVICE_TIER_SOURCE_UPSTREAM = "upstream"
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
 DEFAULT_QUOTA_CACHE_TTL = 60.0
 CLAUDE_SKIP_DANGEROUS_PROMPT = "skipDangerousModePermissionPrompt"
@@ -633,12 +635,38 @@ def _provider_for_model(model: str) -> str | None:
     return None
 
 
-def _normalise_models(payload: Any) -> dict[str, list[str]]:
+def _normalise_model_item_service_tiers(item: dict[str, Any]) -> list[str]:
+    """Validate optional Codex service-tier capability metadata."""
+
+    raw_tiers = item.get("service_tiers", [])
+    if (
+        not isinstance(raw_tiers, list)
+        or len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL
+    ):
+        raise CloudRouterUpstreamError("invalid_models_response")
+    tier_ids: set[str] = set()
+    for tier in raw_tiers:
+        tier_id = tier.get("id") if isinstance(tier, dict) else None
+        if not isinstance(tier_id, str):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        tier_id = tier_id.strip()
+        if (
+            not tier_id
+            or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
+            or any(character.isspace() for character in tier_id)
+        ):
+            raise CloudRouterUpstreamError("invalid_models_response")
+        tier_ids.add(tier_id)
+    return sorted(tier_ids)
+
+
+def _normalise_models(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise CloudRouterUpstreamError("invalid_models_response")
     if len(payload["data"]) > MAX_DISCOVERED_MODELS:
         raise CloudRouterUpstreamError("too_many_models")
-    result: dict[str, list[str]] = {"claude": [], "codex": []}
+    result: dict[str, Any] = {"claude": [], "codex": []}
+    service_tiers: dict[str, list[str]] = {}
     seen: set[str] = set()
     for item in payload["data"]:
         model_id = item.get("id") if isinstance(item, dict) else None
@@ -656,14 +684,20 @@ def _normalise_models(payload: Any) -> dict[str, list[str]]:
             continue
         seen.add(model_id)
         result[provider].append(model_id)
+        if provider == "codex":
+            tier_ids = _normalise_model_item_service_tiers(item)
+            if tier_ids:
+                service_tiers[model_id] = tier_ids
     for values in result.values():
         values.sort()
     if not any(result.values()):
         raise CloudRouterUpstreamError("no_supported_models")
+    if service_tiers:
+        result["service_tiers"] = service_tiers
     return result
 
 
-def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
+def _normalise_apibest_pricing(payload: Any) -> dict[str, Any]:
     """Build APIBest's CCM catalog from its public pricing response.
 
     APIBest validates the token at ``/v1/models`` but currently returns an
@@ -677,7 +711,8 @@ def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
     items = payload["data"]
     if len(items) > MAX_DISCOVERED_MODELS:
         raise CloudRouterUpstreamError("too_many_models")
-    result: dict[str, list[str]] = {"claude": [], "codex": []}
+    result: dict[str, Any] = {"claude": [], "codex": []}
+    service_tiers: dict[str, list[str]] = {}
     seen: set[str] = set()
     for item in items:
         model_id = item.get("model_name") if isinstance(item, dict) else None
@@ -698,15 +733,25 @@ def _normalise_apibest_pricing(payload: Any) -> dict[str, list[str]]:
         provider = _provider_for_model(model_id)
         if not provider or model_id in seen:
             continue
-        required_endpoint = "anthropic" if provider == "claude" else "openai"
-        if required_endpoint not in endpoint_types:
+        compatible_endpoints = (
+            {"anthropic"}
+            if provider == "claude"
+            else {"openai", "openai-response"}
+        )
+        if not compatible_endpoints.intersection(endpoint_types):
             continue
         seen.add(model_id)
         result[provider].append(model_id)
+        if provider == "codex":
+            tier_ids = _normalise_model_item_service_tiers(item)
+            if tier_ids:
+                service_tiers[model_id] = tier_ids
     for values in result.values():
         values.sort()
     if not any(result.values()):
         raise CloudRouterUpstreamError("no_supported_models")
+    if service_tiers:
+        result["service_tiers"] = service_tiers
     return result
 
 
@@ -744,28 +789,11 @@ def _normalise_apex_models(payload: Any) -> dict[str, Any]:
             raise CloudRouterUpstreamError("invalid_models_response")
         if _provider_for_model(model_id) != "codex" or model_id in seen:
             continue
-        raw_tiers = item.get("service_tiers", [])
-        if not isinstance(raw_tiers, list):
-            raise CloudRouterUpstreamError("invalid_models_response")
-        if len(raw_tiers) > MAX_SERVICE_TIERS_PER_MODEL:
-            raise CloudRouterUpstreamError("invalid_models_response")
-        tier_ids: set[str] = set()
-        for tier in raw_tiers:
-            tier_id = tier.get("id") if isinstance(tier, dict) else None
-            if not isinstance(tier_id, str):
-                raise CloudRouterUpstreamError("invalid_models_response")
-            tier_id = tier_id.strip()
-            if (
-                not tier_id
-                or len(tier_id.encode("utf-8")) > MAX_SERVICE_TIER_ID_BYTES
-                or any(character.isspace() for character in tier_id)
-            ):
-                raise CloudRouterUpstreamError("invalid_models_response")
-            tier_ids.add(tier_id)
+        tier_ids = _normalise_model_item_service_tiers(item)
         seen.add(model_id)
         models.append(model_id)
         if tier_ids:
-            service_tiers[model_id] = sorted(tier_ids)
+            service_tiers[model_id] = tier_ids
     models.sort()
     if not models:
         raise CloudRouterUpstreamError("no_supported_models")
@@ -821,6 +849,31 @@ def _normalise_service_tiers(
             tier_ids.add(tier_id)
         if tier_ids:
             result[model] = sorted(tier_ids)
+    return result
+
+
+def _effective_service_tiers(
+    declared: dict[str, list[str]],
+    denied: dict[str, list[str]],
+    *,
+    unsafe_metadata: bool,
+) -> dict[str, list[str]]:
+    """Subtract runtime-proven tier mismatches from catalog capabilities."""
+
+    for model, tiers in denied.items():
+        declared_tiers = set(declared.get(model, []))
+        if any(tier not in declared_tiers for tier in tiers):
+            if unsafe_metadata:
+                raise CloudRouterUnsafePathError(
+                    "Inconsistent API account service tier denial metadata"
+                )
+            raise CloudRouterUpstreamError("invalid_models_response")
+    result: dict[str, list[str]] = {}
+    for model, tiers in declared.items():
+        denied_tiers = set(denied.get(model, []))
+        effective = [tier for tier in tiers if tier not in denied_tiers]
+        if effective:
+            result[model] = effective
     return result
 
 
@@ -1373,6 +1426,7 @@ class CloudRouterAccount:
     cleanup_pending: bool
     models: dict[str, list[str]]
     service_tiers: dict[str, list[str]]
+    service_tier_denials: dict[str, list[str]]
     service_tiers_explicit: bool
     key_hint: str
     root: Path
@@ -1453,6 +1507,7 @@ class CloudRouterAccount:
             "cleanup_pending": self.cleanup_pending,
             "models": self.models,
             "service_tiers": self.service_tiers,
+            "service_tier_denials": self.service_tier_denials,
             "providers": self.providers,
             "key_hint": self.key_hint,
             "account_dir": str(self.root),
@@ -1674,10 +1729,6 @@ class CloudRouterAccountStore:
             # project a coincidentally named Claude model into an unconfigured
             # CLAUDE_CONFIG_DIR.
             normalised_models["claude"] = []
-        elif data.get("service_tiers") not in (None, {}):
-            raise CloudRouterUnsafePathError(
-                f"Unexpected service tier metadata: {account_id}"
-            )
         service_tiers = _normalise_service_tiers(
             data.get("service_tiers"),
             normalised_models["codex"],
@@ -1695,6 +1746,33 @@ class CloudRouterAccountStore:
                 path / "codex",
                 normalised_models["codex"],
             )
+        elif api_provider != API_PROVIDER_APEX:
+            service_tier_source = data.get("service_tiers_source")
+            if service_tier_source is None:
+                # Generic API metadata predating source provenance could only
+                # contain an empty map in released CCM builds. Ignore any
+                # non-empty value left by an intermediate development build;
+                # it never proved account-specific Fast support.
+                service_tiers = {}
+            elif service_tier_source == SERVICE_TIER_SOURCE_NONE:
+                if service_tiers:
+                    raise CloudRouterUnsafePathError(
+                        f"Inconsistent service tier metadata: {account_id}"
+                    )
+            elif service_tier_source != SERVICE_TIER_SOURCE_UPSTREAM:
+                raise CloudRouterUnsafePathError(
+                    f"Invalid service tier source metadata: {account_id}"
+                )
+        service_tier_denials = _normalise_service_tiers(
+            data.get("service_tier_denials"),
+            normalised_models["codex"],
+            unsafe_metadata=True,
+        )
+        service_tiers = _effective_service_tiers(
+            service_tiers,
+            service_tier_denials,
+            unsafe_metadata=True,
+        )
         account = CloudRouterAccount(
             id=account_id,
             name=name,
@@ -1704,6 +1782,7 @@ class CloudRouterAccountStore:
             cleanup_pending=bool(data.get("cleanup_pending", False)),
             models=normalised_models,
             service_tiers=service_tiers,
+            service_tier_denials=service_tier_denials,
             service_tiers_explicit=service_tiers_explicit,
             key_hint=str(data.get("key_hint") or ""),
             root=path,
@@ -2339,6 +2418,11 @@ class CloudRouterAccountStore:
     ) -> dict[str, Any]:
         current = _now()
         provider = normalize_api_provider(api_provider)
+        service_tiers_source = (
+            SERVICE_TIER_SOURCE_UPSTREAM
+            if "service_tiers" in models
+            else SERVICE_TIER_SOURCE_NONE
+        )
         provider_models, service_tiers = _split_model_probe(models)
         return {
             "version": 2,
@@ -2350,6 +2434,8 @@ class CloudRouterAccountStore:
             "cleanup_pending": False,
             "models": provider_models,
             "service_tiers": service_tiers,
+            "service_tier_denials": {},
+            "service_tiers_source": service_tiers_source,
             "key_hint": key_hint,
             "endpoints": dict(API_PROVIDER_SPECS[provider].endpoints),
             "created_at": created_at or current,
@@ -2478,9 +2564,33 @@ class CloudRouterAccountStore:
                     metadata_path, maximum=MAX_METADATA_BYTES,
                 ).decode("utf-8"),
             )
+            service_tiers_source = (
+                SERVICE_TIER_SOURCE_UPSTREAM
+                if "service_tiers" in models
+                else SERVICE_TIER_SOURCE_NONE
+            )
             provider_models, service_tiers = _split_model_probe(models)
+            service_tier_denials = {
+                model: sorted(
+                    tier
+                    for tier in denied_tiers
+                    if tier in service_tiers.get(model, [])
+                )
+                for model, denied_tiers in account.service_tier_denials.items()
+                if model in provider_models["codex"]
+            }
+            service_tier_denials = {
+                model: tiers
+                for model, tiers in service_tier_denials.items()
+                if tiers
+            }
             data["models"] = provider_models
             data["service_tiers"] = service_tiers
+            # A catalog refresh is not an execution proof. Preserve an exact
+            # runtime mismatch until the upstream stops advertising that tier
+            # or an operator replaces the account.
+            data["service_tier_denials"] = service_tier_denials
+            data["service_tiers_source"] = service_tiers_source
             data["updated_at"] = _now()
             _atomic_private_json(
                 metadata_path,
@@ -2489,6 +2599,87 @@ class CloudRouterAccountStore:
             )
             self.reload()
             return self._require_account(account_id)
+
+    async def record_codex_service_tier_mismatch(
+        self,
+        runtime_home: str | os.PathLike[str],
+        model: str | None,
+        *,
+        service_tier: str = "priority",
+    ) -> CloudRouterAccount | None:
+        """Persist an exact runtime proof that one advertised tier failed.
+
+        Catalog metadata is only candidate evidence. The actual Responses
+        ``response.created.service_tier`` is authoritative, so a proven
+        downgrade removes this account/model route from future Fast selection.
+        """
+
+        requested_model = _normalise_model(model)
+        requested_tier = str(service_tier or "").strip().lower()
+        if (
+            not requested_model
+            or requested_model == "default"
+            or requested_tier != "priority"
+        ):
+            return None
+        async with self._mutation_lock:
+            account = self._reload_runtime_account("codex", runtime_home)
+            if not account.supports_model("codex", requested_model):
+                return account
+            metadata_path = account.root / "account.json"
+            data = json.loads(
+                _open_regular_nofollow(
+                    metadata_path,
+                    maximum=MAX_METADATA_BYTES,
+                ).decode("utf-8"),
+            )
+            if (
+                account.api_provider != API_PROVIDER_APEX
+                and data.get("service_tiers_source")
+                != SERVICE_TIER_SOURCE_UPSTREAM
+            ):
+                # Legacy/inferred generic metadata was already excluded at
+                # load time and is not a declared route worth denying.
+                return account
+            declared = _normalise_service_tiers(
+                data.get("service_tiers"),
+                account.models["codex"],
+                unsafe_metadata=True,
+            )
+            if (
+                "service_tiers" not in data
+                and account.api_provider == API_PROVIDER_APEX
+            ):
+                # Materialize the exact legacy Apex models-cache candidate so
+                # the denial remains meaningful after this metadata migration.
+                declared = dict(account.service_tiers)
+                data["service_tiers"] = declared
+            if requested_tier not in declared.get(requested_model, []):
+                return account
+            denials = _normalise_service_tiers(
+                data.get("service_tier_denials"),
+                account.models["codex"],
+                unsafe_metadata=True,
+            )
+            denied_tiers = set(denials.get(requested_model, []))
+            if requested_tier in denied_tiers:
+                return account
+            denied_tiers.add(requested_tier)
+            denials[requested_model] = sorted(denied_tiers)
+            _effective_service_tiers(
+                declared,
+                denials,
+                unsafe_metadata=True,
+            )
+            data["service_tier_denials"] = denials
+            data["updated_at"] = _now()
+            _atomic_private_json(
+                metadata_path,
+                data,
+                maximum=MAX_METADATA_BYTES,
+            )
+            self.reload()
+            return self._reload_runtime_account("codex", runtime_home)
 
     async def fetch_usage(
         self, account_id: str, force: bool = False,

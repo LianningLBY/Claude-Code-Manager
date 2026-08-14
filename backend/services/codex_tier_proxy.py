@@ -83,6 +83,20 @@ class CodexTierProofError(CodexTierProxyError):
     """A request or upstream response did not prove the expected tier."""
 
 
+class CodexActualTierMismatchError(CodexTierProofError):
+    """The upstream explicitly reported a tier other than the requested one."""
+
+    def __init__(self, requested_tier: str, actual_tier: Any) -> None:
+        self.requested_tier = requested_tier
+        self.actual_tier = actual_tier if isinstance(actual_tier, str) else None
+        super().__init__(
+            "Upstream actual service tier mismatch: "
+            f"requested={requested_tier}, "
+            f"upstream_actual={actual_tier!r}; "
+            "Fast was not honored"
+        )
+
+
 class _CodexTierRequestMismatch(CodexTierProofError):
     """A parsed request identified its turn but carried the wrong tier."""
 
@@ -954,8 +968,9 @@ class CodexActualTierProxy:
                 expected == CODEX_TIER_PRIORITY
                 and existing.actual_tier != expected
             ):
-                raise CodexTierProofError(
-                    "Stored actual service-tier proof does not match expectation"
+                raise CodexActualTierMismatchError(
+                    expected,
+                    existing.actual_tier,
                 )
             return existing
         waiter = self._waiters.get(key)
@@ -1000,8 +1015,9 @@ class CodexActualTierProxy:
                 waiter.expected_tier == CODEX_TIER_PRIORITY
                 and waiter.expected_tier != proof.actual_tier
             ):
-                waiter.future.set_exception(CodexTierProofError(
-                    "Actual service-tier proof does not match waiter",
+                waiter.future.set_exception(CodexActualTierMismatchError(
+                    waiter.expected_tier,
+                    proof.actual_tier,
                 ))
             else:
                 waiter.future.set_result(proof)
@@ -1516,11 +1532,9 @@ class CodexActualTierProxy:
                     identity.expected_tier == CODEX_TIER_PRIORITY
                     and reported_tier != CODEX_TIER_PRIORITY
                 ):
-                    raise CodexTierProofError(
-                        "Upstream actual service tier mismatch: "
-                        "requested=priority, "
-                        f"upstream_actual={reported_tier!r}; "
-                        "Fast was not honored"
+                    raise CodexActualTierMismatchError(
+                        identity.expected_tier,
+                        reported_tier,
                     )
                 actual = (
                     reported_tier

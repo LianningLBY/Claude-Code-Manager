@@ -1122,3 +1122,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：复用同一个管理员运行时开关并把启动默认值改为开启。开启时 Plan、Coding、Reviewer、PR Review 与 Browser 全部获得完整 provider 工具、宿主文件系统及网络权限；Codex 统一使用 `danger-full-access`，Claude 使用完整 allowlist 与 `--dangerously-skip-permissions`。Browser 必需 MCP 继续挂载，但不再限制为唯一工具面。Settings 可随时关闭，关闭后后续 turn 恢复原 read-only、tool-free、MCP-only 和网络隔离边界。
 - **避免复发**：权限提示、Settings 文案、配置默认值、Claude structured pipeline、InstanceManager 和 Codex app-server 必须共享同一开关语义；新增/调整测试同时覆盖开启态扩权与关闭态恢复隔离，禁止只改前端文案或只放开 Coding。
 - **验证**：Plan/Reviewer 43 项、Codex capability 29 项、InstanceManager Reviewer/Browser/PR Review 55 项通过；前端 Delivery/Task/Settings 59 项通过，Vite production build 成功，`git diff --check` 通过。运行时开关已持久设为开启，CCM 本机与外网健康检查均为 200。
+
+## 2026-08-15 — Delivery 可信多 Preview Profile（commit feb285e4）
+
+- **问题**：Project 只能保存一个 Preview 启动契约；monorepo 同时修改 `web/`、`admin/` 等多个可见前端时，Delivery 无法按实际 diff 选择正确入口，也无法证明所有受影响界面都经过 Browser Review。让 Agent 临时生成启动命令又会把不可信 PR 内容带入宿主进程边界。
+- **解决**：新增兼容 v1 的 v2 Preview Profiles。管理员登记 shell-free 的 ID、`match_paths`、enabled/default 和启动契约；Controller 读取最终 `base..head` changed paths，冻结完整配置与匹配顺序，并为每个 Profile 串行运行独立、幂等、exact owner/head/profile 的 Test Harness。全部通过才发布 PR，任一 finding 回流下一 Cycle。Projects 页面可查看/编辑可信 Profiles，Delivery 页面展示逐项进度与结果。
+- **避免复发**：Delivery Agent 只能提交已登记的 Profile ID，不能通过 PR、Task target 或运行时 mutation 注入 argv；活跃 Delivery 期间 Preview 配置作为 Project identity 被写屏障保护。新增契约、路径匹配、配置冻结、多 Profile 串行、migration 往返和 UI 构建回归。
+- **验证**：Delivery/Project API/migration 回归 `119 passed`；Workspace/Harness/changed-path 相关矩阵此前同轮 `92 passed` 后仅由已修复的“首项通过即提前发布”断言截停，修复后 Controller 全文件纳入上述 119 项通过。前端 Delivery/Browser 相关 `23 passed`，TypeScript 0 errors，Vite production build（4763 modules）通过；Python compile、Ruff check 与 `git diff --check` 通过。仓库既有整库 SQLite downgrade trigger 问题仍可独立复现，未混入本功能修复。

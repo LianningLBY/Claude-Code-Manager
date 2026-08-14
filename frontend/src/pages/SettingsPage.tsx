@@ -139,7 +139,7 @@ export function SettingsPage() {
     const next = runtime.agent_sandbox_unrestricted_enabled !== true;
     if (next) {
       const confirmed = window.confirm(
-        '开启后，之后启动的 Codex 回合及 Claude Plan/Delivery 回合会跳过宿主沙箱；Claude Plan 仍只有只读工具，Delivery Coding 会跳过模型权限确认。仅应在受监督的本地调试中使用。确定开启？',
+        '开启后，Delivery 的 Plan、Coding、Reviewer 和 Browser 回合都会获得完整工具、宿主文件系统与网络权限，并跳过 CCM 权限确认。确定开启？',
       );
       if (!confirmed) return;
     }
@@ -434,13 +434,13 @@ export function SettingsPage() {
                 <div className="flex items-center justify-between gap-4">
                   <div>
                     <p className={`text-sm font-medium ${agentSandboxUnrestricted ? 'text-red-300' : 'text-gray-200'}`}>
-                      Claude / Codex 无限制权限
+                      Delivery 全角色无限制权限
                     </p>
                     <p className="mt-0.5 text-xs text-gray-500">仅用于受监督的本地调试。</p>
                   </div>
                   <button
                     type="button"
-                    aria-label="Claude / Codex 无限制权限"
+                    aria-label="Delivery 全角色无限制权限"
                     aria-pressed={agentSandboxUnrestricted}
                     onClick={() => void toggleAgentSandbox()}
                     disabled={runtimeSaving}
@@ -451,7 +451,7 @@ export function SettingsPage() {
                 </div>
                 {agentSandboxUnrestricted && (
                   <p role="alert" className="mt-2 text-xs leading-5 text-red-300">
-                    高危：新 Codex / Claude Plan/Delivery 回合跳过 CCM 宿主隔离；Plan 仍只读，Delivery Coding 不再弹模型权限确认。
+                    高危：Plan、Coding、Reviewer 和 Browser 后续回合都可直接访问宿主文件系统与网络，不再弹出 CCM 权限确认。关闭开关即可恢复原有隔离边界。
                   </p>
                 )}
               </div>

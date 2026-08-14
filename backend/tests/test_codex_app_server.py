@@ -589,6 +589,17 @@ async def _start_tool_free_test_turn(
         if method == "skills/list":
             return _empty_skills_response("/tmp")
         if method == "thread/start":
+            if sandbox_unrestricted_enabled:
+                return {
+                    "thread": {
+                        "id": thread_id,
+                        "status": {"type": "idle"},
+                    },
+                    "sandbox": {
+                        "type": "dangerFullAccess",
+                        "networkAccess": True,
+                    },
+                }
             return _tool_free_thread_response(
                 thread_id,
                 permission_profile=params["config"]["default_permissions"],
@@ -3814,7 +3825,7 @@ async def test_unrestricted_switch_replaces_executable_permission_profiles(
     ]
     thread_params = server._request.await_args_list[0].args[1]
     assert thread_params["sandbox"] == "danger-full-access"
-    assert "default_permissions" not in thread_params["config"]
+    assert "default_permissions" not in thread_params.get("config", {})
     assert "permissions" not in thread_params["config"]
     assert "agents" not in thread_params["config"]
     assert "features" not in thread_params["config"]
@@ -3824,7 +3835,7 @@ async def test_unrestricted_switch_replaces_executable_permission_profiles(
 
 
 @pytest.mark.asyncio
-async def test_unrestricted_switch_does_not_expand_tool_free_review():
+async def test_unrestricted_switch_expands_tool_free_review():
     server = CodexAppServer("codex")
 
     await _start_tool_free_test_turn(
@@ -3837,16 +3848,13 @@ async def test_unrestricted_switch_does_not_expand_tool_free_review():
         if call.args[0] == "thread/start"
     )
     thread_params = thread_call.args[1]
-    assert "sandbox" not in thread_params
-    assert thread_params["config"]["default_permissions"].startswith(
-        "ccm_pr_review_no_access_v1_"
-    )
+    assert thread_params["sandbox"] == "danger-full-access"
+    assert "default_permissions" not in thread_params.get("config", {})
     turn_call = next(
         call for call in server._request.await_args_list
         if call.args[0] == "turn/start"
     )
-    assert turn_call.args[1]["environments"] == []
-    assert turn_call.args[1]["runtimeWorkspaceRoots"] == []
+    assert "sandboxPolicy" not in turn_call.args[1]
 
 
 @pytest.mark.asyncio
@@ -5541,6 +5549,34 @@ async def test_mcp_only_profile_keeps_bound_mcp_and_denies_ambient_capabilities(
         "server": "ccm_browser_review",
     })
     server._schedule_tool_free_violation.assert_not_called()
+
+    server._handle_notification("item/started", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {
+            "id": "mcp-codex-aggregate",
+            "type": "mcpToolCall",
+            "server": "codex",
+            "tool": "ccm_browser_review.browser_open",
+        },
+    })
+    server._schedule_tool_free_violation.assert_not_called()
+
+    server._handle_notification("item/completed", {
+        "threadId": thread_id,
+        "turnId": "turn-mcp-only",
+        "item": {
+            "id": "mcp-codex-rogue",
+            "type": "mcpToolCall",
+            "server": "codex",
+            "tool": "ambient.read_file",
+        },
+    })
+    server._schedule_tool_free_violation.assert_called_once_with(
+        context,
+        "MCP server ['codex']",
+    )
+    server._schedule_tool_free_violation.reset_mock()
 
     server._handle_notification("item/started", {
         "threadId": thread_id,

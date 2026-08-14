@@ -54,7 +54,7 @@ describe('DeliveryCreateForm', () => {
     render(<DeliveryCreateForm projects={[project]} repos={[repo]} config={{ ...config, agent_sandbox_unrestricted_enabled: true }} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
 
     expect(screen.getByRole('alert')).toHaveTextContent(
-      'Agent unrestricted permissions are ON',
+      'All Delivery permissions are ON',
     );
   });
 

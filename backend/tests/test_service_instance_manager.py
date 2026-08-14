@@ -5290,6 +5290,7 @@ async def test_claude_pr_review_disables_all_tools_and_bypasses_pty(
 
     process = _make_mock_process(returncode=None)
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.set_agent_sandbox_unrestricted_enabled(False)
     im._pty_enabled = True
     im._pty_backend = MagicMock()
     im._launch_pty = AsyncMock(
@@ -6921,6 +6922,7 @@ async def test_claude_browser_review_disables_builtins_but_keeps_bound_mcp(
 
     process = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im.set_agent_sandbox_unrestricted_enabled(False)
     im.task_message_enqueuer = AsyncMock()
     with patch(
         "backend.services.instance_manager.asyncio.create_subprocess_exec",

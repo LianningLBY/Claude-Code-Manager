@@ -1174,9 +1174,16 @@ async def test_claude_unrestricted_plan_skips_host_isolation_preflight(
 
     assert captured_command is not None
     assert "--settings" not in captured_command
-    assert captured_command[captured_command.index("--allowedTools") + 1] == (
-        "Glob,Grep,Read"
+    allowed_tools = captured_command[
+        captured_command.index("--allowedTools") + 1
+    ].split(",")
+    assert {"Bash", "Edit", "Write", "Read", "WebFetch", "WebSearch"} <= set(
+        allowed_tools
     )
+    assert "--dangerously-skip-permissions" in captured_command
+    assert captured_command[
+        captured_command.index("--permission-mode") + 1
+    ] == "bypassPermissions"
     assert captured_env is not None
     assert "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB" not in captured_env
     assert runtime_temp_dir.cleaned is True

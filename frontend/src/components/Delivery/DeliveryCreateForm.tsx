@@ -92,7 +92,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
       </div>
       {config?.agent_sandbox_unrestricted_enabled && (
         <div role="alert" className="mt-4 rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-2 text-xs leading-5 text-red-200">
-          Agent unrestricted permissions are ON. Delivery coding turns can access the host filesystem and network without CCM permission prompts. Plan, Reviewer and Browser capability boundaries remain restricted.
+          All Delivery permissions are ON. Plan, Coding, Reviewer and Browser turns can access the host filesystem and network without CCM permission prompts. Turn this off in Settings to restore the restricted capability boundaries.
         </div>
       )}
       <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(220px,.7fr)_1fr]">

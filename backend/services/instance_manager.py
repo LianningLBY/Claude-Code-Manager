@@ -1004,9 +1004,9 @@ class InstanceManager:
             registry.set_sandbox_unrestricted_enabled(effective)
         if effective and not previous:
             logger.critical(
-                "Agent sandbox unrestricted mode enabled; subsequent "
-                "Claude Plan/Delivery and executable Codex turns can bypass "
-                "host isolation; Claude Plan retains a read-only tool inventory"
+                "Agent sandbox unrestricted mode enabled; subsequent Delivery "
+                "Plan, Coding, Reviewer, Browser, and executable Codex turns "
+                "can bypass host isolation and capability-only tool limits"
             )
         elif previous and not effective:
             logger.warning(
@@ -2667,6 +2667,7 @@ class InstanceManager:
         task_private_tmpdir = None
         delivery_task = False
         agent_unrestricted_delivery_turn = False
+        unrestricted_capability_turn = False
         if execution_mode not in {"sandbox", "unrestricted"}:
             raise LaunchSupersededError("Invalid Task execution mode")
         unrestricted_admin_turn = bool(
@@ -2959,6 +2960,11 @@ class InstanceManager:
                         child_task_turn_generation=task.turn_generation,
                         claimed_instance_id=instance_id,
                     )
+                unrestricted_capability_turn = bool(
+                    self._agent_sandbox_unrestricted_enabled
+                    and (pr_review_task or browser_review_task)
+                    and provider in {"claude", "codex"}
+                )
                 if not pr_review_task:
                     from backend.services.task_agent_isolation import (
                         explicit_git_credential_paths,
@@ -3207,9 +3213,14 @@ class InstanceManager:
         if (
             provider == "claude"
             and task_id
-            and not pr_review_task
-            and not delivery_task
-            and unrestricted_admin_turn
+            and (
+                (
+                    not pr_review_task
+                    and not delivery_task
+                    and unrestricted_admin_turn
+                )
+                or unrestricted_capability_turn
+            )
         ):
             from backend.services.task_agent_isolation import (
                 CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
@@ -3247,6 +3258,7 @@ class InstanceManager:
             and not pr_review_task
             and not unrestricted_admin_turn
             and not agent_unrestricted_delivery_turn
+            and not unrestricted_capability_turn
         ):
             from backend.services.task_agent_isolation import (
                 CLAUDE_TASK_BUILTIN_TOOLS,
@@ -4025,7 +4037,11 @@ class InstanceManager:
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
             tools_disabled=(
-                pr_review_task or (provider == "claude" and browser_review_task)
+                not unrestricted_capability_turn
+                and (
+                    pr_review_task
+                    or (provider == "claude" and browser_review_task)
+                )
             ),
             claude_isolation_settings_path=claude_isolation_settings_path,
             claude_isolation_tools=claude_isolation_tools,

@@ -150,7 +150,7 @@ describe('SettingsPage', () => {
     render(<SettingsPage />);
 
     await userEvent.click(await screen.findByRole('button', {
-      name: 'Claude / Codex 无限制权限',
+      name: 'Delivery 全角色无限制权限',
     }));
 
     expect(confirmSpy).toHaveBeenCalledOnce();
@@ -158,7 +158,7 @@ describe('SettingsPage', () => {
       agent_sandbox_unrestricted_enabled: true,
     });
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      '新 Codex / Claude Plan/Delivery 回合跳过 CCM 宿主隔离',
+      'Plan、Coding、Reviewer 和 Browser 后续回合都可直接访问宿主文件系统与网络',
     );
   });
 
@@ -167,7 +167,7 @@ describe('SettingsPage', () => {
     render(<SettingsPage />);
 
     await userEvent.click(await screen.findByRole('button', {
-      name: 'Claude / Codex 无限制权限',
+      name: 'Delivery 全角色无限制权限',
     }));
 
     expect(api.updateRuntimeSettings).not.toHaveBeenCalled();

@@ -748,8 +748,8 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           role="alert"
           className="rounded border border-red-500/60 bg-red-950/60 px-3 py-2 text-xs leading-relaxed text-red-200"
         >
-          Agent unrestricted permissions are ON. Codex and Claude Plan/Delivery
-          turns bypass CCM host isolation; Claude Plan still has read-only tools.
+          All Delivery permissions are ON. Plan, Coding, Reviewer and Browser
+          turns bypass CCM host isolation and capability-only tool limits.
         </div>
       )}
       {dropError && (

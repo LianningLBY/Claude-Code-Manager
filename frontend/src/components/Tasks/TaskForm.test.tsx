@@ -945,7 +945,7 @@ describe('legacy TaskForm Delivery Loop entry (moved to Delivery tab)', () => {
     render(<TaskForm onCreated={vi.fn()} />);
 
     expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Agent unrestricted permissions are ON',
+      'All Delivery permissions are ON',
     );
   });
 

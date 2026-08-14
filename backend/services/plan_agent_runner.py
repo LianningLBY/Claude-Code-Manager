@@ -981,12 +981,53 @@ def _build_command(
     effort: str | None,
     schema: dict,
     isolation_settings_path: str | None,
+    unrestricted: bool = False,
 ) -> list[str]:
     if provider != "claude":
         raise ValueError(
             "Codex Plan turns use the persistent app-server transport"
         )
     schema_json = json.dumps(schema, separators=(",", ":"))
+    if unrestricted:
+        from backend.services.task_agent_isolation import (
+            CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
+            claude_permission_allow_rules,
+        )
+
+        allowed_rules = claude_permission_allow_rules(
+            CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
+            include_mcp_tools=False,
+        )
+        command = [
+            settings.claude_binary,
+            "-p",
+            "-",
+            "--output-format",
+            "json",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "bypassPermissions",
+            "--no-session-persistence",
+            "--disable-slash-commands",
+            "--strict-mcp-config",
+            "--mcp-config",
+            '{"mcpServers":{}}',
+            "--setting-sources",
+            "",
+            "--no-chrome",
+            "--tools",
+            "default",
+            "--allowedTools",
+            ",".join(allowed_rules),
+            "--json-schema",
+            schema_json,
+            "--model",
+            model,
+        ]
+        if effort:
+            command.extend(["--effort", effort])
+        return command
+
     command = [
         settings.claude_binary,
         "-p",
@@ -2464,17 +2505,16 @@ class PlanAgentRunner:
             )
             isolation_path = None
             if unrestricted_plan:
-                # This profile exposes no Bash, hooks, MCP, sub-agents, or
-                # other child-process-capable tool. The CLI's subprocess scrub
-                # is therefore unnecessary here and, on current Claude builds,
-                # forcibly downgrades Plan permission mode before the first
-                # model request even when --allowedTools is explicit.
+                # The deployment-owned switch intentionally gives both the
+                # Planner and structured Reviewer the complete provider tool
+                # inventory. The subprocess scrub would force the effective
+                # permission mode back to default, so omit it for this path.
                 env.pop(CLAUDE_SUBPROCESS_ENV_SCRUB, None)
                 logger.critical(
                     "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted Claude Plan "
-                    "turn task_id=%s step_id=%s; host filesystem isolation is "
-                    "disabled and subprocess scrub is omitted while the "
-                    "provider tool inventory remains read-only",
+                    "pipeline turn task_id=%s step_id=%s; host filesystem, "
+                    "network, and the complete provider tool inventory are "
+                    "enabled",
                     task_id,
                     step_id,
                 )
@@ -2504,6 +2544,7 @@ class PlanAgentRunner:
                 isolation_settings_path=(
                     str(isolation_path) if isolation_path is not None else None
                 ),
+                unrestricted=unrestricted_plan,
             )
             process = None
             token = None

@@ -4501,6 +4501,13 @@ class CodexAppServer:
             "read-only",
         }:
             raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
+        if sandbox_unrestricted_enabled:
+            # The operator-owned global switch deliberately expands fixed
+            # Reviewer and Browser capability turns as well as ordinary coding
+            # turns. Required MCP servers remain attached, but they are no
+            # longer the exclusive tool surface while the switch is on.
+            tools_disabled = False
+            mcp_only = False
         if tools_disabled and mcp_only:
             raise CodexRequiredMcpPreTurnError(
                 "Codex turn cannot be both tool-free and MCP-only"
@@ -4537,19 +4544,6 @@ class CodexAppServer:
                 requested_sandbox_mode,
                 requested_filesystem_isolation,
                 requested_network_isolation,
-            )
-        elif sandbox_unrestricted_enabled:
-            # Tool-free and MCP-only are capability protocols rather than
-            # ordinary executable sandboxes. Expanding either would grant a
-            # PR reviewer or untrusted Browser child a new tool surface and
-            # break the evidence contract, so the deployment switch does not
-            # rewrite them.
-            logger.warning(
-                "AGENT_SANDBOX_UNRESTRICTED_ENABLED retained capability-"
-                "restricted Codex turn task=%s tools_disabled=%s mcp_only=%s",
-                task_id,
-                tools_disabled,
-                mcp_only,
             )
         if task_managed_network_proxy:
             # ``initialize`` is the version proof for this exact transport
@@ -8184,6 +8178,27 @@ class CodexAppServer:
                 candidate = params.get("item")
                 mcp_item = candidate if isinstance(candidate, dict) else params
             if isinstance(mcp_item, dict):
+                # Codex 0.144+ may report MCP calls through its internal
+                # aggregate server and encode the real bound identity in the
+                # tool name (for example ``ccm_skills.ccm_command_help``).
+                # Accept that representation only when it resolves exactly to
+                # a tool that this turn already admitted.
+                reported_tool = mcp_item.get("tool")
+                aggregate_identity: tuple[str, str] | None = None
+                if (
+                    mcp_item.get("server") == "codex"
+                    and isinstance(reported_tool, str)
+                    and "." in reported_tool
+                ):
+                    aggregate_server, aggregate_tool = reported_tool.split(
+                        ".", 1
+                    )
+                    candidate_identity = (aggregate_server, aggregate_tool)
+                    if candidate_identity in context.allowed_mcp_tools:
+                        aggregate_identity = candidate_identity
+                        mcp_item = dict(mcp_item)
+                        mcp_item["server"] = aggregate_server
+                        mcp_item["tool"] = aggregate_tool
                 reported_servers = {
                     value
                     for key in ("server", "serverName", "server_name")
@@ -8191,9 +8206,12 @@ class CodexAppServer:
                     and value
                 }
                 if (
-                    len(reported_servers) != 1
-                    or not reported_servers.issubset(
-                        context.allowed_mcp_servers
+                    aggregate_identity is None
+                    and (
+                        len(reported_servers) != 1
+                        or not reported_servers.issubset(
+                            context.allowed_mcp_servers
+                        )
                     )
                 ):
                     self._schedule_tool_free_violation(
@@ -8226,6 +8244,12 @@ class CodexAppServer:
                 if context.mcp_only and item_type == "mcpToolCall":
                     assert isinstance(item, dict)
                     identity = (item.get("server"), item.get("tool"))
+                    if (
+                        identity[0] == "codex"
+                        and isinstance(identity[1], str)
+                        and "." in identity[1]
+                    ):
+                        identity = tuple(identity[1].split(".", 1))
                     if identity not in context.allowed_mcp_tools:
                         self._schedule_tool_free_violation(
                             context,

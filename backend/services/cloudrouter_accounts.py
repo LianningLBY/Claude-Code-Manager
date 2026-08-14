@@ -723,6 +723,8 @@ def _normalise_apibest_pricing(payload: Any) -> dict[str, Any]:
         )
         if not isinstance(model_id, str) or not isinstance(endpoint_types, list):
             continue
+        if any(not isinstance(endpoint_type, str) for endpoint_type in endpoint_types):
+            raise CloudRouterUpstreamError("invalid_models_response")
         model_id = model_id.strip()
         if (
             not model_id

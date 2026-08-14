@@ -1323,6 +1323,32 @@ async def test_apibest_empty_authenticated_models_falls_back_to_pricing_catalog(
 
 
 @pytest.mark.asyncio
+async def test_apibest_pricing_rejects_non_string_endpoint_types(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "_request_json",
+        AsyncMock(side_effect=[
+            {"object": "list", "data": [], "success": True},
+            {
+                "data": [{
+                    "model_name": "gpt-5.6-luna",
+                    "supported_endpoint_types": [{}],
+                }],
+            },
+        ]),
+    )
+
+    with pytest.raises(
+        CloudRouterUpstreamError,
+        match="invalid_models_response",
+    ):
+        await store.probe_models("sk-test", api_provider="apibest")
+
+
+@pytest.mark.asyncio
 async def test_apex_service_tiers_are_persisted_and_reloaded(
     tmp_path, monkeypatch,
 ):

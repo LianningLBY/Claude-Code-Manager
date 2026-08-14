@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import signal
 import stat
@@ -290,7 +290,9 @@ async def _git(
         await _await_shielded_cleanup(asyncio.create_task(terminate()))
     except TimeoutError as exc:
         await _await_shielded_cleanup(asyncio.create_task(cleanup_readers()))
-        raise DeliveryWorkspaceError(f"Git command timed out: {' '.join(argv)}") from exc
+        raise DeliveryWorkspaceError(
+            f"Git command timed out: {' '.join(argv)}"
+        ) from exc
     except BaseException as exc:
         await _await_shielded_cleanup(
             asyncio.create_task(cleanup_readers()),
@@ -303,6 +305,51 @@ async def _git(
             f"Git command failed ({' '.join(argv)}): {message[:2000]}"
         )
     return stdout
+
+
+async def list_delivery_changed_paths(
+    *,
+    worktree_path: str,
+    base_sha: str,
+    head_sha: str,
+) -> list[str]:
+    """Return the exact committed path manifest used for Preview routing."""
+
+    if _SHA_RE.fullmatch(base_sha) is None or _SHA_RE.fullmatch(head_sha) is None:
+        raise DeliveryWorkspaceError("Invalid Delivery diff identity")
+    workspace = Path(os.path.abspath(worktree_path))
+    if not workspace.is_dir() or not (workspace / ".git").exists():
+        raise DeliveryWorkspaceError("Delivery worktree is unavailable")
+    raw = await _git(
+        workspace,
+        [
+            "diff",
+            "--name-only",
+            "--no-renames",
+            "-z",
+            f"{base_sha}..{head_sha}",
+            "--",
+        ],
+    )
+    paths: list[str] = []
+    for value in raw.split(b"\0"):
+        if not value:
+            continue
+        try:
+            path = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise DeliveryWorkspaceError(
+                "Delivery changed path is not valid UTF-8"
+            ) from exc
+        normalized = str(PurePosixPath(path))
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or ".." in PurePosixPath(normalized).parts
+        ):
+            raise DeliveryWorkspaceError("Delivery changed path is invalid")
+        paths.append(normalized)
+    return sorted(set(paths))
 
 
 def _read_gitdir_pointer(path: Path, *, label: str) -> Path:
@@ -446,7 +493,9 @@ def _validate_remote_endpoint(
             or not local.is_dir()
             or os.path.realpath(local) != str(local)
         ):
-            raise DeliveryWorkspaceConflict("Origin local remote is not a safe directory")
+            raise DeliveryWorkspaceConflict(
+                "Origin local remote is not a safe directory"
+            )
         return value, None
 
     scp_match = _SCP_GITHUB_RE.fullmatch(value)
@@ -529,9 +578,7 @@ async def _validate_controller_git_repository(
         entries.append((key, value))
 
     fetch_values = [value for key, value in entries if key == "remote.origin.url"]
-    push_values = [
-        value for key, value in entries if key == "remote.origin.pushurl"
-    ]
+    push_values = [value for key, value in entries if key == "remote.origin.pushurl"]
     if len(fetch_values) != 1 or len(push_values) > 1:
         raise DeliveryWorkspaceConflict(
             "Origin must define exactly one fetch and at most one push URL"
@@ -644,10 +691,7 @@ def _restore_missing_worktree_pointer(
         raise DeliveryWorkspaceConflict(
             "Delivery worktree control data cannot be read"
         ) from exc
-    if (
-        common_target != repository.common_git_dir
-        or head_value != f"ref: {branch_ref}"
-    ):
+    if common_target != repository.common_git_dir or head_value != f"ref: {branch_ref}":
         raise DeliveryWorkspaceConflict(
             "Delivery worktree control data does not match its branch"
         )
@@ -710,9 +754,9 @@ def _validate_linked_worktree_control(repo: Path, workspace: Path) -> Path:
         common_target = (
             git_dir / commondir.read_text(encoding="utf-8").strip()
         ).resolve(strict=True)
-        backlink_target = Path(
-            backlink.read_text(encoding="utf-8").strip()
-        ).resolve(strict=True)
+        backlink_target = Path(backlink.read_text(encoding="utf-8").strip()).resolve(
+            strict=True
+        )
     except (OSError, UnicodeError) as exc:
         raise DeliveryWorkspaceConflict(
             "Delivery Git control files cannot be resolved"
@@ -802,6 +846,19 @@ class DeliveryWorkspaceManager:
         self.fetch_timeout = fetch_timeout
         self.allow_local_remotes = bool(allow_local_remotes)
 
+    async def list_changed_paths(
+        self,
+        *,
+        worktree_path: str,
+        base_sha: str,
+        head_sha: str,
+    ) -> list[str]:
+        return await list_delivery_changed_paths(
+            worktree_path=worktree_path,
+            base_sha=base_sha,
+            head_sha=head_sha,
+        )
+
     async def prepare(
         self,
         *,
@@ -834,7 +891,9 @@ class DeliveryWorkspaceManager:
         try:
             expected_abs.relative_to(repo)
         except ValueError as exc:
-            raise DeliveryWorkspaceError("Delivery workspace escaped the repository") from exc
+            raise DeliveryWorkspaceError(
+                "Delivery workspace escaped the repository"
+            ) from exc
 
         entries = _parse_worktree_list(
             await _git(repo, ["worktree", "list", "--porcelain", "-z"])
@@ -971,9 +1030,7 @@ class DeliveryWorkspaceManager:
         if existing_branch:
             add_args.extend([str(expected_abs), branch])
         else:
-            add_args.extend(
-                ["--no-track", "-b", branch, str(expected_abs), remote_ref]
-            )
+            add_args.extend(["--no-track", "-b", branch, str(expected_abs), remote_ref])
         await _git(
             repo,
             add_args,
@@ -1011,7 +1068,9 @@ class DeliveryWorkspaceManager:
         )
         workspace = Path(os.path.abspath(worktree_path))
         if workspace.is_symlink() or not workspace.is_dir():
-            raise DeliveryWorkspaceConflict("Delivery workspace is not a safe directory")
+            raise DeliveryWorkspaceConflict(
+                "Delivery workspace is not a safe directory"
+            )
         managed_parent = _ensure_managed_parent(repo)
         try:
             workspace.relative_to(managed_parent)
@@ -1056,8 +1115,10 @@ class DeliveryWorkspaceManager:
             )
         try:
             merge_base = (
-                await _git(workspace, ["merge-base", base_sha, head_sha])
-            ).decode().strip()
+                (await _git(workspace, ["merge-base", base_sha, head_sha]))
+                .decode()
+                .strip()
+            )
         except DeliveryWorkspaceError as exc:
             raise DeliveryWorkspaceConflict(
                 "Delivery branch no longer descends from the frozen base"
@@ -1118,7 +1179,9 @@ class DeliveryWorkspaceManager:
         )
         workspace = Path(os.path.abspath(worktree_path))
         if workspace.is_symlink() or not workspace.is_dir():
-            raise DeliveryWorkspaceConflict("Delivery workspace is not a safe directory")
+            raise DeliveryWorkspaceConflict(
+                "Delivery workspace is not a safe directory"
+            )
         managed_parent = _ensure_managed_parent(repo)
         try:
             workspace.relative_to(managed_parent)
@@ -1221,9 +1284,7 @@ class DeliveryWorkspaceManager:
             ).split(b"\0")
             if value
         }
-        for relative in sorted(
-            DELIVERY_ISOLATION_PLACEHOLDER_NAMES & untracked
-        ):
+        for relative in sorted(DELIVERY_ISOLATION_PLACEHOLDER_NAMES & untracked):
             candidate = workspace / relative
             try:
                 info = candidate.lstat()

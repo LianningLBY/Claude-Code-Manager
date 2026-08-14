@@ -1298,7 +1298,12 @@ required check 精确映射、无 required CI 时仍强制 Panel，以及
 `/api/delivery-runs/quick-start` 从一段需求完成内部配置与 Run admission。自动合并
 为每次 Run 的显式、默认关闭选择；没有 app-bound exact CI 时必须在 admission 拒绝。
 `test_delivery_controller.py` 另外覆盖 Frontend Review 的 auto skip、unbound Harness
-崩溃恢复、exact owner/head、归档报告+截图门禁和 finding 回流新 Cycle；
+崩溃恢复、exact owner/head/profile、最终 diff 同时命中多个 Preview Profile 后的串行执行、
+冻结配置复用、逐项归档报告+截图门禁和 finding 回流新 Cycle；
+`test_workspace_review.py` 覆盖 v1→v2 兼容映射、路径匹配/default 选择和无 default 的能力检测；
+`test_test_harness_contracts.py` / `test_test_harness_execution_context.py` 覆盖显式 Profile ID
+契约与 Run-scoped Preview 冻结；`test_delivery_workspace.py` 覆盖精确 changed-path manifest；
+`test_alembic_migrations.py` 覆盖多 Profile Cycle 字段的 upgrade/downgrade 与唯一 migration head。
 `test_delivery_api.py` 与 `test_auth_ws_security.py` 覆盖统一 progress、Plan input/attention
 投影、失败 Run 的 state-version fenced 同 Run 新 Cycle 重试，以及 Run-scoped WebSocket
 的 Project ACL。`test_plan_capability.py` 覆盖失败 Plan Run 在 Invocation 终态前自动创建

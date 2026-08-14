@@ -105,6 +105,7 @@ class FakeWorkspace:
         self.pending_head_sha: str | None = None
         self.pending_tree_sha: str | None = None
         self.last_commit_subject: tuple[str, int, int] | None = None
+        self.changed_paths = ["frontend/src/App.tsx"]
 
     def advance(self, head: str, tree: str) -> None:
         self.pending_head_sha = head
@@ -120,6 +121,12 @@ class FakeWorkspace:
             head_sha=self.head_sha,
             head_tree_sha=self.tree_sha,
         )
+
+    async def list_changed_paths(self, *, worktree_path, base_sha, head_sha):
+        assert worktree_path == self.worktree_path
+        assert base_sha == self.base_sha
+        assert head_sha == self.head_sha
+        return list(self.changed_paths)
 
     async def prepare(
         self,
@@ -340,6 +347,7 @@ class FakeFrontendHarness:
         self.cancel_calls = 0
         self.run_id = "f" * 32
         self.last_spec = None
+        self.preview_config_overrides = []
 
     async def start_task_run(
         self,
@@ -348,10 +356,13 @@ class FakeFrontendHarness:
         spec,
         owner_user_id=None,
         owner_identity,
+        preview_config_override=None,
     ):
         del owner_user_id
         self.start_calls += 1
         self.last_spec = spec
+        self.preview_config_overrides.append(preview_config_override)
+        self.run_id = ("f" if self.start_calls == 1 else "d") * 32
         assert spec.target_kind == "current_workspace"
         assert spec.idempotency_key
         async with self.db_factory() as db:
@@ -374,7 +385,10 @@ class FakeFrontendHarness:
                 owner_task_status=task.status,
                 project_id=task.project_id,
                 target_kind="current_workspace",
-                target_spec={"kind": "current_workspace"},
+                target_spec={
+                    "kind": "current_workspace",
+                    **spec.target,
+                },
                 test_plan={"objective": "Validate Delivery"},
                 runtime_config={"provider": "codex"},
                 request_fingerprint="a" * 64,
@@ -407,8 +421,9 @@ class FakeFrontendHarness:
             harness.report = report
             harness.cleanup_status = "completed"
             harness.completed_at = datetime.utcnow()
+            evidence_prefix = "e" if self.start_calls == 1 else "c"
             attempt = HarnessAttempt(
-                id="e" * 32,
+                id=evidence_prefix * 32,
                 run_id=harness.id,
                 ordinal=1,
                 status="completed",
@@ -423,8 +438,18 @@ class FakeFrontendHarness:
             db.add(attempt)
             if complete_evidence:
                 for evidence_id, kind, name, content_type in (
-                    ("1" * 32, "screenshot", "final.png", "image/png"),
-                    ("2" * 32, "report", "report.md", "text/markdown"),
+                    (
+                        ("1" if self.start_calls == 1 else "5") * 32,
+                        "screenshot",
+                        "final.png",
+                        "image/png",
+                    ),
+                    (
+                        ("2" if self.start_calls == 1 else "6") * 32,
+                        "report",
+                        "report.md",
+                        "text/markdown",
+                    ),
                 ):
                     db.add(
                         HarnessEvidence(
@@ -468,8 +493,8 @@ class FakeFrontendHarness:
 def _real_dispatcher(db_factory) -> GlobalDispatcher:
     instance_manager = MagicMock()
     lifecycle_locks: dict[int, asyncio.Lock] = {}
-    instance_manager._instance_lifecycle_lock.side_effect = (
-        lambda instance_id: lifecycle_locks.setdefault(instance_id, asyncio.Lock())
+    instance_manager._instance_lifecycle_lock.side_effect = lambda instance_id: (
+        lifecycle_locks.setdefault(instance_id, asyncio.Lock())
     )
     instance_manager.is_running.return_value = False
     instance_manager.processes = {}
@@ -717,9 +742,7 @@ class TerminalHistoryPublisher(FakePublisher):
                 "schema_version": 2,
                 "kind": "pull_request_history_conflict",
                 "subject": subject,
-                "reason": (
-                    "Exact Delivery pull request #73 is already " f"{self.state}"
-                ),
+                "reason": (f"Exact Delivery pull request #73 is already {self.state}"),
                 "remote": {
                     "state": self.state,
                     "repo_id": repo.id,
@@ -735,7 +758,7 @@ class TerminalHistoryPublisher(FakePublisher):
             run.pr_url = url
             await db.commit()
         raise DeliveryPublisherPermanentError(
-            "Exact Delivery pull request #73 is already " f"{self.state}"
+            f"Exact Delivery pull request #73 is already {self.state}"
         )
 
 
@@ -782,9 +805,7 @@ class UnresolvedTerminalReceiptPublisher(FakePublisher):
                 "reason": f"terminal evidence: {self.kind}",
             }
             await db.commit()
-        raise DeliveryPublisherPermanentError(
-            f"terminal evidence: {self.kind}"
-        )
+        raise DeliveryPublisherPermanentError(f"terminal evidence: {self.kind}")
 
 
 class BoundHistoryAmbiguityThenSuccessPublisher(FakePublisher):
@@ -1096,7 +1117,9 @@ async def _finish_code_with_dispatcher(
     return task_id, instance_id
 
 
-async def _to_publishing(controller, db_factory, workspace, run_id, head=HEAD_ONE, tree=TREE_ONE):
+async def _to_publishing(
+    controller, db_factory, workspace, run_id, head=HEAD_ONE, tree=TREE_ONE
+):
     await _to_coding_pending(controller, run_id)
     await _complete_code(db_factory, workspace, run_id, head, tree)
     assert await controller.reconcile_run(run_id)  # exact terminal -> pre-review
@@ -1196,9 +1219,7 @@ async def test_frontend_review_recovers_unbound_idempotent_harness(
             target_kind="current_workspace",
             target={},
             goal="Recover the Browser gate",
-            idempotency_key=(
-                f"delivery:{run.id}:cycle:{cycle_id}:frontend:{head_sha}"
-            ),
+            idempotency_key=(f"delivery:{run.id}:cycle:{cycle_id}:frontend:{head_sha}"),
         ),
         owner_identity=owner_identity,
     )
@@ -1249,9 +1270,7 @@ async def test_frontend_review_pass_requires_archived_report_and_screenshot(
     assert harness.last_spec.target_kind == "current_workspace"
     assert harness.last_spec.profile == "standard"
     assert harness.last_spec.allow_actions is True
-    assert "Implement the change and prove it with tests." in (
-        harness.last_spec.goal
-    )
+    assert "Implement the change and prove it with tests." in (harness.last_spec.goal)
     await harness.finish(verdict="passed", report="All scenarios passed.")
     assert await controller.reconcile_run(run.id)  # accept exact evidence
 
@@ -1262,6 +1281,94 @@ async def test_frontend_review_pass_requires_archived_report_and_screenshot(
         assert cycle.frontend_review_run_id == harness.run_id
         assert cycle.frontend_review_verdict == "passed"
         assert cycle.frontend_review_summary == "All scenarios passed."
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_runs_every_matching_preview_profile_in_order(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    run, _repo = await _scope(db_session, frontend_review="auto")
+    project = await db_session.get(Project, run.project_id)
+    project.preview_config = {"version": 2, "profiles": []}
+    await db_session.commit()
+    workspace = FakeWorkspace()
+    workspace.changed_paths = ["web/src/App.tsx", "admin/src/Users.tsx"]
+    harness = FakeFrontendHarness(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+        test_harness_service=harness,
+    )
+    profiles = [
+        {"id": "web", "enabled": True, "match_paths": ["web/**"]},
+        {"id": "admin", "enabled": True, "match_paths": ["admin/**"]},
+    ]
+    collection = {
+        "version": 2,
+        "default_profile": None,
+        "profiles": profiles,
+        "legacy": False,
+    }
+    monkeypatch.setattr(settings, "auth_token", "test-token")
+    monkeypatch.setattr(
+        "backend.services.workspace_review.workspace_review_capability",
+        lambda task, project: {
+            "available": True,
+            "configured": True,
+            "reason": None,
+            "repo_path": task.last_cwd,
+        },
+    )
+    monkeypatch.setattr(
+        "backend.services.workspace_review.validate_preview_profiles",
+        lambda config, workspace_path: collection,
+    )
+    monkeypatch.setattr(
+        "backend.services.workspace_review.resolve_preview_config",
+        lambda config, workspace_path, changed_paths: profiles,
+    )
+
+    await _to_frontend_ready(controller, db_factory, workspace, run.id)
+    assert await controller.reconcile_run(run.id)  # start web
+    assert harness.last_spec.target == {"preview_profile_id": "web"}
+    await harness.finish(verdict="passed", report="Web passed.")
+    assert await controller.reconcile_run(run.id)  # advance to admin
+
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        cycle = await db.get(DeliveryCycle, stored.current_cycle_id)
+        assert (stored.phase, stored.activity) == ("frontend_review", "ready")
+        assert cycle.frontend_review_profile_ids == ["web", "admin"]
+        assert cycle.frontend_review_profile_index == 1
+        assert cycle.frontend_review_run_id is None
+        assert [item["profile_id"] for item in cycle.frontend_review_results] == ["web"]
+
+    assert await controller.reconcile_run(run.id)  # start admin
+    assert harness.last_spec.target == {"preview_profile_id": "admin"}
+    frozen_collection = {
+        "version": 2,
+        "default_profile": None,
+        "profiles": profiles,
+    }
+    assert harness.preview_config_overrides == [
+        frozen_collection,
+        frozen_collection,
+    ]
+    await harness.finish(verdict="passed", report="Admin passed.")
+    assert await controller.reconcile_run(run.id)  # all profiles passed
+
+    async with db_factory() as db:
+        stored = await db.get(DeliveryRun, run.id, populate_existing=True)
+        cycle = await db.get(DeliveryCycle, stored.current_cycle_id)
+        assert (stored.phase, stored.activity) == ("publishing", "ready")
+        assert [item["profile_id"] for item in cycle.frontend_review_results] == [
+            "web",
+            "admin",
+        ]
 
 
 @pytest.mark.asyncio
@@ -2082,9 +2189,7 @@ async def test_auto_merge_happy_path_requires_exact_merged_review(
             base_ref="main",
             base_sha=stored_run.base_sha,
             head_sha=stored_run.head_sha,
-            delivery_id=(
-                f"delivery:{stored_run.id}:{stored_run.head_sha}"
-            ),
+            delivery_id=(f"delivery:{stored_run.id}:{stored_run.head_sha}"),
             pr_title=stored_run.title,
             pr_author="delivery-bot",
             pr_url=stored_run.pr_url,
@@ -2702,9 +2807,7 @@ async def test_two_controllers_cannot_publish_same_action_concurrently(
         actions = list(
             (
                 await db.execute(
-                    select(DeliveryAction).where(
-                        DeliveryAction.run_id == run.id
-                    )
+                    select(DeliveryAction).where(DeliveryAction.run_id == run.id)
                 )
             ).scalars()
         )

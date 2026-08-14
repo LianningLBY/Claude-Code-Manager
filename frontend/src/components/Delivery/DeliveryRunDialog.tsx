@@ -226,7 +226,7 @@ const STAGE_COMPLETION_EVENTS: Record<DeliveryStageKey, string[]> = {
   planning: ['plan_ready'],
   coding: ['code_completed', 'developer_no_progress'],
   pre_review: ['review_approved', 'review_changes_requested'],
-  frontend_review: ['frontend_review_passed', 'frontend_review_skipped', 'frontend_review_changes_requested'],
+  frontend_review: ['frontend_review_profile_passed', 'frontend_review_passed', 'frontend_review_skipped', 'frontend_review_changes_requested'],
   publishing: ['pr_bound'],
   monitoring: ['monitor_blocked', 'monitor_ready'],
 };
@@ -568,6 +568,12 @@ export function DeliveryRunDialog({
       const latestHarnessEvent = harnessEvents.at(-1) || null;
       const recentHarnessEvents = harnessEvents.slice(-6);
       const browserJob = selectedHarness?.browser_review || null;
+      const profileIds = selectedCycle.frontend_review_profile_ids || [];
+      const profileResults = new Map(
+        (selectedCycle.frontend_review_results || [])
+          .filter((item): item is Record<string, unknown> => item != null && typeof item === 'object')
+          .map((item) => [String(item.profile_id || ''), item]),
+      );
       const selectedHarnessActive = Boolean(
         selectedHarness
         && selectedHarness.stage !== 'completed'
@@ -581,6 +587,42 @@ export function DeliveryRunDialog({
             <Metric label="Findings" value={selectedIsCurrent ? String(selectedSummary.finding_count) : 'See summary'} />
             <Metric label="Evidence" value={selectedIsCurrent ? String(selectedSummary.evidence_count) : 'Archived'} />
           </div>
+          {profileIds.length > 0 && (
+            <div className="rounded-xl border border-gray-800 bg-gray-950/50 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-gray-300">Preview profiles</span>
+                <span className="text-[10px] text-gray-500">
+                  {Math.min(selectedCycle.frontend_review_profile_index + 1, profileIds.length)} / {profileIds.length}
+                </span>
+              </div>
+              <div className="mt-2 space-y-1.5">
+                {profileIds.map((profileId, index) => {
+                  const result = profileResults.get(profileId);
+                  const verdict = typeof result?.verdict === 'string' ? result.verdict : null;
+                  const isCurrent = selectedIsCurrent
+                    && index === selectedCycle.frontend_review_profile_index
+                    && !verdict;
+                  return (
+                    <div key={profileId} className="flex items-center gap-2 rounded-lg border border-gray-800/80 bg-gray-900/60 px-2.5 py-2 text-xs">
+                      {verdict === 'passed' ? (
+                        <CheckCircle2 size={14} className="shrink-0 text-emerald-400" />
+                      ) : verdict ? (
+                        <XCircle size={14} className="shrink-0 text-red-400" />
+                      ) : isCurrent ? (
+                        <Loader2 size={14} className="shrink-0 animate-spin text-cyan-400" />
+                      ) : (
+                        <Circle size={14} className="shrink-0 text-gray-600" />
+                      )}
+                      <span className="font-mono text-gray-300">{profileId}</span>
+                      <span className={`ml-auto text-[10px] ${verdict === 'passed' ? 'text-emerald-400' : verdict ? 'text-red-400' : isCurrent ? 'text-cyan-300' : 'text-gray-600'}`}>
+                        {verdict ? titleCase(verdict) : isCurrent ? 'Running' : index < selectedCycle.frontend_review_profile_index ? 'Completed' : 'Pending'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {selectedSummary.skip_reason && <Notice tone="amber" text={selectedSummary.skip_reason} />}
           {selectedSummary.error && <Notice tone="red" text={selectedSummary.error} />}
           {!selectedIsCurrent && selectedSummary.report && <p className="whitespace-pre-wrap rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 text-xs leading-5 text-gray-400">{selectedSummary.report}</p>}

@@ -182,15 +182,29 @@ def normalize_target(kind: HarnessTargetKind, target: object) -> dict[str, Any]:
         "remote",
         "ref",
         "fetch",
+        "preview_profile_id",
     }
     if unknown:
         raise TestHarnessContractError(
             f"target contains unsupported field: {sorted(unknown)[0]}"
         )
     if kind == "current_workspace":
-        if target:
-            raise TestHarnessContractError("current_workspace target takes no fields")
-        return {}
+        profile_id = target.get("preview_profile_id")
+        if profile_id is None:
+            return {}
+        if (
+            not isinstance(profile_id, str)
+            or not profile_id.strip()
+            or len(profile_id) > 60
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
+                for character in profile_id.strip()
+            )
+        ):
+            raise TestHarnessContractError(
+                "current_workspace preview_profile_id is invalid"
+            )
+        return {"preview_profile_id": profile_id.strip()}
     if kind == "fixed_url":
         url = target.get("url")
         if not isinstance(url, str) or not url.strip() or len(url) > 2048:

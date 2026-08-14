@@ -97,6 +97,20 @@ export interface WorkspacePreviewConfig {
   } | null;
 }
 
+export interface ProjectPreviewProfile extends WorkspacePreviewConfig {
+  id: string;
+  match_paths: string[];
+  enabled: boolean;
+}
+
+export interface ProjectPreviewProfilesConfig {
+  version: 2;
+  default_profile: string | null;
+  profiles: ProjectPreviewProfile[];
+}
+
+export type ProjectPreviewConfig = WorkspacePreviewConfig | ProjectPreviewProfilesConfig;
+
 export interface WorkspaceReviewCapabilities {
   available: boolean;
   reason: string | null;
@@ -568,7 +582,7 @@ export interface Project {
   sort_order: number;
   tags: string[];
   env_files: string[];
-  preview_config?: WorkspacePreviewConfig | null;
+  preview_config?: ProjectPreviewConfig | null;
   git_author_name: string | null;
   git_author_email: string | null;
   git_credential_type: string | null;  // "ssh" | "https" | null
@@ -1467,6 +1481,9 @@ export interface DeliveryCycle {
   review_verdict: string | null;
   review_summary: string | null;
   frontend_review_run_id: string | null;
+  frontend_review_profile_ids: string[];
+  frontend_review_profile_index: number;
+  frontend_review_results: Array<Record<string, unknown>>;
   frontend_review_verdict: string | null;
   frontend_review_summary: string | null;
   frontend_review_skip_reason: string | null;
@@ -2261,7 +2278,7 @@ export const api = {
     git_https_token?: string;
   }) =>
     request<Project>('/api/projects', { method: 'POST', body: JSON.stringify(data) }),
-  updateProject: (id: number, data: Partial<Pick<Project, 'name' | 'show_in_selector' | 'sort_order' | 'tags' | 'env_files' | 'badge_color' | 'git_author_name' | 'git_author_email' | 'git_credential_type' | 'git_ssh_key_path' | 'git_https_username' | 'git_https_token'>>) =>
+  updateProject: (id: number, data: Partial<Pick<Project, 'name' | 'show_in_selector' | 'sort_order' | 'tags' | 'env_files' | 'badge_color' | 'git_author_name' | 'git_author_email' | 'git_credential_type' | 'git_ssh_key_path' | 'git_https_username' | 'git_https_token' | 'preview_config'>>) =>
     request<Project>(`/api/projects/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
   reorderProjects: (orders: { id: number; sort_order: number }[]) =>
     request<Project[]>('/api/projects/reorder', { method: 'PUT', body: JSON.stringify(orders) }),

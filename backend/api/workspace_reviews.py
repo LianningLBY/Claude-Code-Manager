@@ -24,7 +24,7 @@ from backend.services.workspace_review import (
     WorkspaceReviewBusyError,
     WorkspaceReviewError,
     refresh_workspace_review_staleness,
-    validate_preview_config,
+    validate_preview_profiles,
     workspace_review_capability,
     workspace_review_manager,
     workspace_review_run_dict,
@@ -157,10 +157,14 @@ async def approve_workspace_preview_config(
     try:
         from pathlib import Path
 
-        normalized = validate_preview_config(body.config, Path(workspace_path))
+        normalized = validate_preview_profiles(body.config, Path(workspace_path))
     except (PreviewConfigurationError, OSError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    project.preview_config = normalized
+    project.preview_config = {
+        "version": 2,
+        "default_profile": normalized["default_profile"],
+        "profiles": normalized["profiles"],
+    }
     await db.commit()
     return workspace_review_capability(task, project)
 

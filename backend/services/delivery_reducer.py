@@ -72,9 +72,7 @@ def validate_delivery_state(state: DeliveryState) -> None:
     if state.phase not in DELIVERY_PHASES:
         raise DeliveryReducerError(f"Unknown Delivery phase {state.phase!r}")
     if state.activity not in DELIVERY_ACTIVITIES:
-        raise DeliveryReducerError(
-            f"Unknown Delivery activity {state.activity!r}"
-        )
+        raise DeliveryReducerError(f"Unknown Delivery activity {state.activity!r}")
     if state.outcome is not None and state.outcome not in DELIVERY_OUTCOMES:
         raise DeliveryReducerError(f"Unknown Delivery outcome {state.outcome!r}")
     if (
@@ -105,7 +103,9 @@ def validate_delivery_state(state: DeliveryState) -> None:
         return
 
     if state.outcome is not None:
-        raise DeliveryReducerError("A non-terminal Delivery state cannot have an outcome")
+        raise DeliveryReducerError(
+            "A non-terminal Delivery state cannot have an outcome"
+        )
     if state.activity == "waiting" and not state.wait_reason:
         raise DeliveryReducerError("Waiting Delivery state requires wait_reason")
     if state.activity != "waiting" and state.wait_reason is not None:
@@ -251,9 +251,7 @@ def reduce_delivery_state(
     if kind == "retry":
         _require_state(state, event, ("done", "terminal"))
         if state.outcome != "failed":
-            raise DeliveryTransitionError(
-                "Only a failed DeliveryRun can be retried"
-            )
+            raise DeliveryTransitionError("Only a failed DeliveryRun can be retried")
         next_state = _active_state(
             state,
             phase="planning",
@@ -369,6 +367,14 @@ def reduce_delivery_state(
         next_state = _active_state(
             state,
             phase="publishing",
+            activity="ready",
+        )
+    elif kind == "frontend_review_profile_passed":
+        _require_state(state, event, ("frontend_review", "waiting"))
+        _require_wait_reason(state, event, "frontend_review")
+        next_state = _active_state(
+            state,
+            phase="frontend_review",
             activity="ready",
         )
     elif kind == "frontend_review_changes_requested":

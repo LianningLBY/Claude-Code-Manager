@@ -304,8 +304,12 @@ Browser Agent 的 provider、模型、推理强度和 Codex Fast/Standard 可在
 Goal 复查、固定 URL 以及 PR/ref 审查；每个 Run 启动后会冻结实际路由，因此父 Task 与
 黑盒审查 Agent 可以使用不同模型，也不会在运行中因设置变化而漂移。
 
-当前工作区测试会先使用 Project 中管理员确认过的 Preview 配置启动 loopback 隔离
-预览；PR/ref 测试会解析精确 Git SHA，把源码 fetch、依赖安装、构建和 Preview 全部
+当前工作区测试会先使用 Project 中管理员确认过的 Preview Profile 启动 loopback 隔离
+预览。一个 Project 可以登记多个受信任 Profile（例如 `web/**`、`admin/**`）；Delivery
+按最终提交相对 base 的 changed paths 自动选择全部匹配项并依次审查，无匹配时才使用
+管理员指定的 default profile。Profile 的 argv、cwd、环境和 URL 在 Run admission 时冻结，
+Agent 只能选择已登记 ID，不能从 PR 内容替换启动命令。旧版单 Preview 配置会自动映射为
+一个兼容 Profile。PR/ref 测试会解析精确 Git SHA，把源码 fetch、依赖安装、构建和 Preview 全部
 放进临时 Docker Sandbox，绝不在 Manager 宿主机执行不可信提交或切换当前开发工作树。
 独立 Browser Agent 只收到 URL、冻结后的测试计划和浏览器工具，
 不继承父 Task 的会话或仓库上下文，因此更接近黑盒验收。浏览器会收集截图、console、
@@ -525,8 +529,10 @@ push-only workflow 猜一个 CI Gate，也不要求用户填写 PR Monitor 表�
 门禁通过后保持 PR 打开；每次启动可显式开启“自动合并”，但只有已发现 app-bound
 exact CI、GitHub 写权限和严格分支保护同时满足时才允许执行。
 
-前端审查默认是 `Auto`：项目已确认可信 Preview 且配置了 `AUTH_TOKEN` 时，会在创建
-PR 前由独立 Browser Agent 运行 Test Harness；能力不可用时会在进度中显示跳过原因。
+前端审查默认是 `Auto`：项目已确认至少一个可信 Preview Profile 且配置了 `AUTH_TOKEN`
+时，会在创建 PR 前由独立 Browser Agent 运行 Test Harness。最终 diff 同时命中多个
+Profile 时会串行运行全部审查，详情页显示当前项与逐项结果；能力不可用或没有匹配项且
+未配置 default 时会在进度中显示跳过原因。
 `Required` 会把同一条件变成强制门禁，`Off` 则明确关闭。运行详情按六个阶段展示公开
 进度、Agent 路由、报告和截图证据；当前 Round、总预算、开轮原因和耗时会置顶高亮，
 历史 Round 可横向切换，阶段内容与时间线只展示所选轮次，避免把新一轮误判为旧 Plan

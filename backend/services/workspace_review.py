@@ -8,6 +8,7 @@ one separate Browser Review Task whose evidence is displayed on the parent.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import hashlib
 import json
 import logging
@@ -23,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 import httpx
@@ -186,19 +187,21 @@ def _preview_log_tail(handle: PreviewHandle, index: int) -> str:
 
     decoded = payload.decode("utf-8", errors="replace")
     return "".join(
-        character
-        if character in {"\n", "\r", "\t"} or character.isprintable()
-        else "�"
+        character if character in {"\n", "\r", "\t"} or character.isprintable() else "�"
         for character in decoded
     ).strip()
 
 
 def _relative_dir(workspace: Path, value: object) -> Path:
     if not isinstance(value, str) or not value.strip():
-        raise PreviewConfigurationError("preview command cwd must be a relative directory")
+        raise PreviewConfigurationError(
+            "preview command cwd must be a relative directory"
+        )
     posix = PurePosixPath(value.strip())
     if posix.is_absolute() or ".." in posix.parts:
-        raise PreviewConfigurationError("preview command cwd must stay inside the Task workspace")
+        raise PreviewConfigurationError(
+            "preview command cwd must stay inside the Task workspace"
+        )
     candidate = workspace.joinpath(*posix.parts)
     try:
         resolved = candidate.resolve(strict=True)
@@ -208,17 +211,23 @@ def _relative_dir(workspace: Path, value: object) -> Path:
             f"preview command cwd does not resolve inside the workspace: {value}"
         ) from exc
     if not resolved.is_dir():
-        raise PreviewConfigurationError(f"preview command cwd is not a directory: {value}")
+        raise PreviewConfigurationError(
+            f"preview command cwd is not a directory: {value}"
+        )
     return resolved
 
 
 def _validate_command(value: object, *, label: str) -> list[str]:
     if not isinstance(value, list) or not value or len(value) > 64:
-        raise PreviewConfigurationError(f"{label} command must be a non-empty argv list")
+        raise PreviewConfigurationError(
+            f"{label} command must be a non-empty argv list"
+        )
     result: list[str] = []
     for item in value:
         if not isinstance(item, str) or not item or len(item) > 2000 or "\x00" in item:
-            raise PreviewConfigurationError(f"{label} command contains an invalid argument")
+            raise PreviewConfigurationError(
+                f"{label} command contains an invalid argument"
+            )
         result.append(item)
     # Commands are executed without a shell. Explicitly reject shell entry
     # points because Project preview profiles are trusted argv contracts, not
@@ -239,7 +248,9 @@ def _validate_env(value: object, *, label: str) -> dict[str, str]:
         if not isinstance(key, str) or _SAFE_ENV_KEY_RE.fullmatch(key) is None:
             raise PreviewConfigurationError(f"{label} env contains an invalid key")
         if key in _SENSITIVE_ENV_KEYS:
-            raise PreviewConfigurationError(f"{label} may not inject credential variable {key}")
+            raise PreviewConfigurationError(
+                f"{label} may not inject credential variable {key}"
+            )
         if not isinstance(item, str) or len(item) > 4000 or "\x00" in item:
             raise PreviewConfigurationError(f"{label} env contains an invalid value")
         result[key] = item
@@ -352,9 +363,7 @@ def _validate_sandbox_preview_config(
         )
     try:
         allowed_hosts = (
-            sorted(normalize_allowed_hosts(",".join(raw_hosts)))
-            if raw_hosts
-            else []
+            sorted(normalize_allowed_hosts(",".join(raw_hosts))) if raw_hosts else []
         )
     except EgressPolicyError as exc:
         raise PreviewConfigurationError(str(exc)) from exc
@@ -365,7 +374,7 @@ def _validate_sandbox_preview_config(
     }
 
 
-def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
+def _validate_preview_profile(config: object, workspace: Path) -> dict[str, Any]:
     """Validate and normalize one manager-owned, shell-free preview profile."""
 
     if not isinstance(config, dict):
@@ -379,24 +388,36 @@ def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
     normalized_setup: list[dict[str, Any]] = []
     setup = config.get("setup", [])
     if not isinstance(setup, list) or len(setup) > 4:
-        raise PreviewConfigurationError("preview setup must contain at most four commands")
+        raise PreviewConfigurationError(
+            "preview setup must contain at most four commands"
+        )
     for index, item in enumerate(setup):
         if not isinstance(item, dict):
             raise PreviewConfigurationError("preview setup entries must be objects")
         label = f"setup[{index}]"
-        cwd = str(PurePosixPath(_relative_dir(workspace, item.get("cwd", ".")).relative_to(workspace).as_posix()))
+        cwd = str(
+            PurePosixPath(
+                _relative_dir(workspace, item.get("cwd", "."))
+                .relative_to(workspace)
+                .as_posix()
+            )
+        )
         normalized_setup.append(
             {
                 "command": _validate_command(item.get("command"), label=label),
                 "cwd": cwd,
                 "env": _validate_env(item.get("env"), label=label),
-                "timeout_seconds": min(900, max(1, int(item.get("timeout_seconds", 300)))),
+                "timeout_seconds": min(
+                    900, max(1, int(item.get("timeout_seconds", 300)))
+                ),
             }
         )
 
     processes = config.get("processes")
     if not isinstance(processes, list) or not 1 <= len(processes) <= 4:
-        raise PreviewConfigurationError("preview configuration requires one to four processes")
+        raise PreviewConfigurationError(
+            "preview configuration requires one to four processes"
+        )
     normalized_processes: list[dict[str, Any]] = []
     names: set[str] = set()
     for index, item in enumerate(processes):
@@ -412,7 +433,13 @@ def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
         ):
             raise PreviewConfigurationError("preview process names must be unique")
         names.add(process_name)
-        cwd = str(PurePosixPath(_relative_dir(workspace, item.get("cwd", ".")).relative_to(workspace).as_posix()))
+        cwd = str(
+            PurePosixPath(
+                _relative_dir(workspace, item.get("cwd", "."))
+                .relative_to(workspace)
+                .as_posix()
+            )
+        )
         normalized_processes.append(
             {
                 "name": process_name,
@@ -425,10 +452,18 @@ def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
     url = config.get("url")
     health_url = config.get("health_url", url)
     for label, value in (("url", url), ("health_url", health_url)):
-        if not isinstance(value, str) or not value.startswith("http://") or len(value) > 2048:
-            raise PreviewConfigurationError(f"preview {label} must be a loopback HTTP template")
+        if (
+            not isinstance(value, str)
+            or not value.startswith("http://")
+            or len(value) > 2048
+        ):
+            raise PreviewConfigurationError(
+                f"preview {label} must be a loopback HTTP template"
+            )
         if "{preview_port}" not in value:
-            raise PreviewConfigurationError(f"preview {label} must contain {{preview_port}}")
+            raise PreviewConfigurationError(
+                f"preview {label} must contain {{preview_port}}"
+            )
 
     return {
         "version": 1,
@@ -445,6 +480,201 @@ def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
             workspace,
         ),
     }
+
+
+def _preview_profile_id(value: object, *, index: int) -> str:
+    if not isinstance(value, str):
+        raise PreviewConfigurationError(f"preview profiles[{index}].id is required")
+    profile_id = value.strip()
+    if (
+        not profile_id
+        or len(profile_id) > 60
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyz0123456789-_"
+            for character in profile_id
+        )
+    ):
+        raise PreviewConfigurationError(
+            "preview profile ids may contain lowercase letters, digits, '-' and '_'"
+        )
+    return profile_id
+
+
+def _preview_match_paths(value: object, *, index: int) -> list[str]:
+    if not isinstance(value, list) or not value or len(value) > 32:
+        raise PreviewConfigurationError(
+            f"preview profiles[{index}].match_paths must contain one to 32 patterns"
+        )
+    patterns: list[str] = []
+    for pattern in value:
+        if (
+            not isinstance(pattern, str)
+            or not pattern.strip()
+            or len(pattern) > 500
+            or pattern.startswith("/")
+            or "\\" in pattern
+            or ".." in PurePosixPath(pattern).parts
+        ):
+            raise PreviewConfigurationError(
+                f"preview profiles[{index}].match_paths contains an invalid pattern"
+            )
+        patterns.append(pattern.strip())
+    return patterns
+
+
+def validate_preview_profiles(config: object, workspace: Path) -> dict[str, Any]:
+    """Validate a legacy profile or a manager-owned multi-profile collection."""
+
+    if not isinstance(config, dict):
+        raise PreviewConfigurationError("Project has no trusted preview configuration")
+    if config.get("version") == 1:
+        profile = _validate_preview_profile(config, workspace)
+        return {
+            "version": 2,
+            "default_profile": "default",
+            "profiles": [
+                {
+                    **profile,
+                    "id": "default",
+                    "match_paths": ["**"],
+                    "enabled": True,
+                }
+            ],
+            "legacy": True,
+        }
+    if config.get("version") != 2:
+        raise PreviewConfigurationError("preview configuration version must be 1 or 2")
+    raw_profiles = config.get("profiles")
+    if not isinstance(raw_profiles, list) or not 1 <= len(raw_profiles) <= 12:
+        raise PreviewConfigurationError(
+            "preview configuration requires one to 12 profiles"
+        )
+    profiles: list[dict[str, Any]] = []
+    ids: set[str] = set()
+    for index, raw_profile in enumerate(raw_profiles):
+        if not isinstance(raw_profile, dict):
+            raise PreviewConfigurationError(
+                f"preview profiles[{index}] must be an object"
+            )
+        profile_id = _preview_profile_id(raw_profile.get("id"), index=index)
+        if profile_id in ids:
+            raise PreviewConfigurationError("preview profile ids must be unique")
+        ids.add(profile_id)
+        enabled = raw_profile.get("enabled", True)
+        if type(enabled) is not bool:
+            raise PreviewConfigurationError(
+                f"preview profiles[{index}].enabled must be a boolean"
+            )
+        profile_config = dict(raw_profile)
+        profile_config["version"] = 1
+        for metadata_key in ("id", "match_paths", "enabled"):
+            profile_config.pop(metadata_key, None)
+        profiles.append(
+            {
+                **_validate_preview_profile(profile_config, workspace),
+                "id": profile_id,
+                "match_paths": _preview_match_paths(
+                    raw_profile.get("match_paths"),
+                    index=index,
+                ),
+                "enabled": enabled,
+            }
+        )
+    default_profile = config.get("default_profile")
+    if default_profile is not None:
+        if not isinstance(default_profile, str) or default_profile not in ids:
+            raise PreviewConfigurationError(
+                "preview default_profile must reference an existing profile"
+            )
+        selected_default = next(
+            profile for profile in profiles if profile["id"] == default_profile
+        )
+        if not selected_default["enabled"]:
+            raise PreviewConfigurationError(
+                "preview default_profile must reference an enabled profile"
+            )
+    return {
+        "version": 2,
+        "default_profile": default_profile,
+        "profiles": profiles,
+        "legacy": False,
+    }
+
+
+def resolve_preview_config(
+    config: object,
+    workspace: Path,
+    *,
+    changed_paths: Sequence[str] | None = None,
+    profile_ids: Sequence[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Resolve exact trusted profiles for one immutable workspace subject."""
+
+    collection = validate_preview_profiles(config, workspace)
+    profiles = [profile for profile in collection["profiles"] if profile["enabled"]]
+    if collection["legacy"]:
+        return [
+            {
+                **profiles[0],
+                "selection_reason": "legacy preview configuration",
+            }
+        ]
+    if profile_ids is not None:
+        requested = list(dict.fromkeys(profile_ids))
+        by_id = {profile["id"]: profile for profile in profiles}
+        missing = [profile_id for profile_id in requested if profile_id not in by_id]
+        if missing:
+            raise PreviewConfigurationError(
+                f"unknown or disabled preview profile: {missing[0]}"
+            )
+        return [
+            {**by_id[profile_id], "selection_reason": "explicit selection"}
+            for profile_id in requested
+        ]
+    normalized_paths = [
+        str(PurePosixPath(path))
+        for path in (changed_paths or [])
+        if isinstance(path, str) and path and not path.startswith("/")
+    ]
+    selected: list[dict[str, Any]] = []
+    for profile in profiles:
+        matched_pattern = next(
+            (
+                pattern
+                for pattern in profile["match_paths"]
+                if any(fnmatch.fnmatchcase(path, pattern) for path in normalized_paths)
+            ),
+            None,
+        )
+        if matched_pattern is not None:
+            selected.append(
+                {**profile, "selection_reason": f"matched {matched_pattern}"}
+            )
+    if selected:
+        return selected
+    default_profile = collection["default_profile"]
+    if default_profile is None:
+        return []
+    return [
+        {
+            **next(profile for profile in profiles if profile["id"] == default_profile),
+            "selection_reason": "default profile",
+        }
+    ]
+
+
+def validate_preview_config(config: object, workspace: Path) -> dict[str, Any]:
+    """Validate Preview config and return its default/legacy executable profile."""
+
+    resolved = resolve_preview_config(config, workspace, changed_paths=[])
+    if len(resolved) != 1:
+        raise PreviewConfigurationError(
+            "preview configuration has no default profile; select a profile explicitly"
+        )
+    profile = dict(resolved[0])
+    for metadata_key in ("id", "match_paths", "enabled", "selection_reason"):
+        profile.pop(metadata_key, None)
+    return profile
 
 
 def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
@@ -466,7 +696,7 @@ def detect_preview_config(workspace: Path) -> dict[str, Any] | None:
                     "command": ["npm", "run", "build"],
                     "cwd": "frontend",
                     "timeout_seconds": 600,
-                }
+                },
             ],
             "processes": [
                 {
@@ -644,7 +874,9 @@ async def _run_argv(
         ) from exc
     communicate = asyncio.create_task(process.communicate())
     try:
-        stdout, stderr = await asyncio.wait_for(asyncio.shield(communicate), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(
+            asyncio.shield(communicate), timeout=timeout
+        )
     except BaseException:
         await _terminate_process(process)
         if not communicate.done():
@@ -656,7 +888,8 @@ async def _run_argv(
     if process.returncode != 0:
         message = stderr.decode("utf-8", errors="replace")[-3000:].strip()
         raise WorkspaceReviewError(
-            f"command failed ({Path(argv[0]).name})" + (f": {message}" if message else "")
+            f"command failed ({Path(argv[0]).name})"
+            + (f": {message}" if message else "")
         )
     return stdout, stderr
 
@@ -713,18 +946,26 @@ async def capture_workspace_snapshot(
             resolved = candidate.resolve(strict=True)
             resolved.relative_to(workspace)
         except (OSError, ValueError) as exc:
-            raise WorkspaceReviewError(f"cannot safely fingerprint untracked path: {relative}") from exc
+            raise WorkspaceReviewError(
+                f"cannot safely fingerprint untracked path: {relative}"
+            ) from exc
         if not stat.S_ISREG(info.st_mode) or candidate.is_symlink():
-            raise WorkspaceReviewError(f"untracked path is not a regular file: {relative}")
+            raise WorkspaceReviewError(
+                f"untracked path is not a regular file: {relative}"
+            )
         if info.st_size > _MAX_UNTRACKED_FILE_BYTES:
-            raise WorkspaceReviewError(f"untracked file is too large to fingerprint: {relative}")
+            raise WorkspaceReviewError(
+                f"untracked file is too large to fingerprint: {relative}"
+            )
         digest.update(b"\0untracked\0")
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
         digest.update(candidate.read_bytes())
     digest.update(b"\0preview-config\0")
     digest.update(
-        json.dumps(preview_config, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        json.dumps(preview_config, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
     )
     return WorkspaceSnapshot(
         path=workspace,
@@ -744,7 +985,9 @@ def _format_value(value: str, variables: dict[str, str]) -> str:
     return result
 
 
-def _safe_preview_env(extra: dict[str, str], variables: dict[str, str]) -> dict[str, str]:
+def _safe_preview_env(
+    extra: dict[str, str], variables: dict[str, str]
+) -> dict[str, str]:
     env = {key: os.environ[key] for key in _INHERITED_ENV_KEYS if key in os.environ}
     for key in _SENSITIVE_ENV_KEYS:
         env[key] = ""
@@ -777,7 +1020,9 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         return
     try:
         if os.name == "posix":
-            pgid = require_safe_process_group_id(process.pid, context="workspace preview")
+            pgid = require_safe_process_group_id(
+                process.pid, context="workspace preview"
+            )
             os.killpg(pgid, signal.SIGTERM)
         else:
             process.terminate()
@@ -790,7 +1035,9 @@ async def _terminate_process(process: asyncio.subprocess.Process) -> None:
         pass
     try:
         if os.name == "posix":
-            pgid = require_safe_process_group_id(process.pid, context="workspace preview")
+            pgid = require_safe_process_group_id(
+                process.pid, context="workspace preview"
+            )
             os.killpg(pgid, signal.SIGKILL)
         else:
             process.kill()
@@ -816,16 +1063,22 @@ class WorkspacePreviewManager:
     ) -> PreviewHandle:
         async with test_harness_owner_fence(task_id), self._lock:
             if any(handle.task_id == task_id for handle in self._handles.values()):
-                raise WorkspaceReviewBusyError("This Task already has an active workspace preview")
+                raise WorkspaceReviewBusyError(
+                    "This Task already has an active workspace preview"
+                )
             # tempfile.gettempdir() is commonly reached through /var ->
             # /private/var on macOS. Publish only the canonical directory so
             # security-sensitive Preview stores never see a symlink ancestor.
-            temp_dir = Path(
-                tempfile.mkdtemp(prefix="ccm-workspace-preview-")
-            ).resolve(strict=True)
+            temp_dir = Path(tempfile.mkdtemp(prefix="ccm-workspace-preview-")).resolve(
+                strict=True
+            )
             temp_dir.chmod(0o700)
             port = _allocate_loopback_port()
-            python = snapshot.path / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            python = (
+                snapshot.path
+                / ".venv"
+                / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            )
             python_value = str(python) if python.exists() else sys.executable
             variables = {
                 "workspace": str(snapshot.path),
@@ -961,8 +1214,15 @@ class WorkspacePreviewManager:
 
 def _task_workspace(task: Task, project: Project | None) -> Path:
     if task.worker_id is not None:
-        raise WorkspaceReviewError("Current workspace review only supports Manager-local Tasks")
-    raw = (task.last_cwd or task.target_repo or (project.local_path if project else "") or "").strip()
+        raise WorkspaceReviewError(
+            "Current workspace review only supports Manager-local Tasks"
+        )
+    raw = (
+        task.last_cwd
+        or task.target_repo
+        or (project.local_path if project else "")
+        or ""
+    ).strip()
     if not raw or not os.path.isabs(raw):
         raise WorkspaceReviewError("Task has no absolute local workspace")
     candidate = Path(os.path.abspath(raw))
@@ -971,9 +1231,13 @@ def _task_workspace(task: Task, project: Project | None) -> Path:
         for part in candidate.parts[1:]:
             cursor /= part
             if cursor.is_symlink():
-                raise WorkspaceReviewError("Task local workspace contains a symbolic link")
+                raise WorkspaceReviewError(
+                    "Task local workspace contains a symbolic link"
+                )
     except OSError as exc:
-        raise WorkspaceReviewError("Task local workspace cannot be safely inspected") from exc
+        raise WorkspaceReviewError(
+            "Task local workspace cannot be safely inspected"
+        ) from exc
     try:
         workspace = candidate.resolve(strict=True)
     except OSError as exc:
@@ -1004,9 +1268,7 @@ def _safe_workspace_override(value: Path) -> Path:
             "Harness workspace override cannot be safely inspected"
         ) from exc
     if not workspace.is_dir() or not (workspace / ".git").exists():
-        raise WorkspaceReviewError(
-            "Harness workspace override is not a Git checkout"
-        )
+        raise WorkspaceReviewError("Harness workspace override is not a Git checkout")
     return workspace
 
 
@@ -1019,12 +1281,28 @@ def workspace_review_capability(task: Task, project: Project | None) -> dict[str
         # Worktrees use a regular .git file; ordinary repositories use a dir.
         if not (workspace / ".git").exists():
             raise WorkspaceReviewError("Task workspace is not a Git checkout")
-        configured = (
-            validate_preview_config(project.preview_config, workspace)
-            if project is not None and project.preview_config is not None
-            else None
+        configured = None
+        if project is not None and project.preview_config is not None:
+            collection = validate_preview_profiles(project.preview_config, workspace)
+            enabled_profiles = [
+                profile for profile in collection["profiles"] if profile["enabled"]
+            ]
+            if not enabled_profiles:
+                raise PreviewConfigurationError(
+                    "Project has no enabled trusted Preview profile"
+                )
+            default_profile = collection["default_profile"]
+            configured = next(
+                (
+                    profile
+                    for profile in enabled_profiles
+                    if profile["id"] == default_profile
+                ),
+                enabled_profiles[0],
+            )
+        suggestion = (
+            None if configured is not None else detect_preview_config(workspace)
         )
-        suggestion = None if configured is not None else detect_preview_config(workspace)
         return {
             "available": configured is not None,
             "reason": (
@@ -1176,7 +1454,9 @@ class WorkspaceReviewManager:
         owner_identity: TestHarnessOwnerIdentity | None = None,
     ) -> WorkspaceReviewRun:
         if mode not in _ALLOWED_MODES:
-            raise WorkspaceReviewError("workspace review mode must be review_only or fix_loop")
+            raise WorkspaceReviewError(
+                "workspace review mode must be review_only or fix_loop"
+            )
         if profile not in _ALLOWED_PROFILES:
             raise WorkspaceReviewError("workspace review profile is invalid")
         if browser_channel not in {"chrome", "chromium"}:
@@ -1226,7 +1506,10 @@ class WorkspaceReviewManager:
                 locality_error = test_harness_owner_locality_error(task)
                 if locality_error is not None:
                     raise WorkspaceReviewError(locality_error)
-                if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+                if (
+                    not isinstance(settings.auth_token, str)
+                    or not settings.auth_token.strip()
+                ):
                     raise WorkspaceReviewError(
                         "Workspace Review requires a configured AUTH_TOKEN"
                     )
@@ -1307,11 +1590,7 @@ class WorkspaceReviewManager:
                     configured_preview = (
                         preview_config_override
                         if preview_config_override is not None
-                        else (
-                            project.preview_config
-                            if project is not None
-                            else None
-                        )
+                        else (project.preview_config if project is not None else None)
                     )
                 else:
                     # A Harness-linked Workspace Review consumes only the
@@ -1320,9 +1599,7 @@ class WorkspaceReviewManager:
                     workspace = _safe_workspace_override(
                         Path(harness_execution_context["workspace_path"])
                     )
-                    configured_preview = harness_execution_context[
-                        "preview_config"
-                    ]
+                    configured_preview = harness_execution_context["preview_config"]
                 if configured_preview is None:
                     raise PreviewConfigurationError(
                         "Project Preview 尚未确认；请先在 Task 的测试入口确认启动配置"
@@ -1403,7 +1680,9 @@ class WorkspaceReviewManager:
                 name=f"workspace-review-{run.id}",
             )
             self._pipelines[run.id] = pipeline
-            pipeline.add_done_callback(lambda _done, run_id=run.id: self._pipelines.pop(run_id, None))
+            pipeline.add_done_callback(
+                lambda _done, run_id=run.id: self._pipelines.pop(run_id, None)
+            )
             return run
 
     async def _update(self, run_id: str, **values: Any) -> None:
@@ -1412,9 +1691,7 @@ class WorkspaceReviewManager:
             if run is None:
                 return
             proposed_status = values.get("status")
-            cleanup_only = set(values).issubset(
-                {"cleanup_status", "cleanup_error"}
-            )
+            cleanup_only = set(values).issubset({"cleanup_status", "cleanup_error"})
             if run.status in _TERMINAL:
                 if not cleanup_only and proposed_status != run.status:
                     return
@@ -1555,13 +1832,14 @@ class WorkspaceReviewManager:
                 run = await db.get(WorkspaceReviewRun, run_id)
                 parent = await db.get(Task, run.task_id) if run is not None else None
                 if run is None or parent is None:
-                    raise WorkspaceReviewError("Workspace review owner Task disappeared")
+                    raise WorkspaceReviewError(
+                        "Workspace review owner Task disappeared"
+                    )
                 config = dict(run.preview_config)
                 provider = str(runtime_config["provider"])
                 model = str(runtime_config["model"])
                 effort = str(runtime_config["reasoning_effort"])
                 tier = str(runtime_config["codex_service_tier"])
-                created_by = parent.created_by
 
             await self._update(run_id, stage="starting_preview")
             handle = await self.preview_manager.start(
@@ -1618,7 +1896,9 @@ class WorkspaceReviewManager:
                 if dispatcher is not None:
                     dispatcher.wake()
             except Exception:
-                logger.exception("Could not wake dispatcher for workspace browser agent")
+                logger.exception(
+                    "Could not wake dispatcher for workspace browser agent"
+                )
 
             while True:
                 current_job = await browser_review_job_manager.get(job.id)
@@ -1701,7 +1981,9 @@ class WorkspaceReviewManager:
             )
             if job_id:
                 try:
-                    from backend.services.browser_review_jobs import browser_review_job_manager
+                    from backend.services.browser_review_jobs import (
+                        browser_review_job_manager,
+                    )
 
                     await browser_review_job_manager.fail_start(job_id, exc)
                 except Exception:
@@ -1713,8 +1995,7 @@ class WorkspaceReviewManager:
                 )
                 if handle is not None and cleanup_confirmed is False:
                     raise WorkspaceReviewError(
-                        "Workspace preview handle disappeared before cleanup "
-                        "was proven"
+                        "Workspace preview handle disappeared before cleanup was proven"
                     )
             except Exception as exc:
                 await self._update(
@@ -1723,7 +2004,9 @@ class WorkspaceReviewManager:
                     cleanup_error=str(exc)[:4000],
                 )
             else:
-                await self._update(run_id, cleanup_status="completed", cleanup_error=None)
+                await self._update(
+                    run_id, cleanup_status="completed", cleanup_error=None
+                )
             try:
                 async with async_session() as db:
                     final_run = await db.get(WorkspaceReviewRun, run_id)
@@ -1813,7 +2096,9 @@ class WorkspaceReviewManager:
                     "role": "assistant",
                     "content": content,
                     "is_error": False,
-                    "timestamp": entry.timestamp.isoformat() if entry.timestamp else None,
+                    "timestamp": entry.timestamp.isoformat()
+                    if entry.timestamp
+                    else None,
                     "source": "workspace-review",
                 },
             )
@@ -1834,11 +2119,9 @@ class WorkspaceReviewManager:
         if expected_identity is not None and (
             expected_identity.task_id != owner_task_id
             or snapshot is None
-            or snapshot.owner_task_incarnation_id
-            != expected_identity.incarnation_id
+            or snapshot.owner_task_incarnation_id != expected_identity.incarnation_id
             or snapshot.owner_task_retry_count != expected_identity.retry_count
-            or snapshot.owner_task_turn_generation
-            != expected_identity.turn_generation
+            or snapshot.owner_task_turn_generation != expected_identity.turn_generation
             or snapshot.owner_task_status != expected_identity.status
         ):
             raise WorkspaceReviewError(
@@ -1867,8 +2150,7 @@ class WorkspaceReviewManager:
                         select(WorkspaceReviewRun)
                         .where(
                             WorkspaceReviewRun.id == run_id,
-                            WorkspaceReviewRun.task_id
-                            == expected_identity.task_id,
+                            WorkspaceReviewRun.task_id == expected_identity.task_id,
                             WorkspaceReviewRun.owner_task_incarnation_id
                             == expected_identity.incarnation_id,
                             WorkspaceReviewRun.owner_task_retry_count
@@ -1934,9 +2216,7 @@ class WorkspaceReviewManager:
                     if current.status not in _TERMINAL:
                         current.status = "cancelled"
                         current.stage = "cancelled"
-                        current.completed_at = (
-                            current.completed_at or datetime.utcnow()
-                        )
+                        current.completed_at = current.completed_at or datetime.utcnow()
                     current.cleanup_status = (
                         "completed" if cleanup_error is None else "failed"
                     )
@@ -1984,7 +2264,9 @@ class WorkspaceReviewManager:
             for run in runs:
                 run.status = "failed"
                 run.stage = "interrupted"
-                run.error = "Manager restarted before this review reached a terminal state"
+                run.error = (
+                    "Manager restarted before this review reached a terminal state"
+                )
                 run.cleanup_status = "unconfirmed"
                 run.cleanup_error = (
                     "The previous process could not prove Preview cleanup after restart"
@@ -2043,7 +2325,10 @@ async def refresh_workspace_review_staleness(
             # PR/ref Harness targets are immutable detached commits. Comparing
             # them to the parent Task's mutable checkout would falsely mark a
             # valid historical result stale after its temp worktree is removed.
-            if run.harness_run_id and harness_kinds.get(run.harness_run_id) != "current_workspace":
+            if (
+                run.harness_run_id
+                and harness_kinds.get(run.harness_run_id) != "current_workspace"
+            ):
                 continue
             stale = run.workspace_fingerprint != snapshot.fingerprint
             if run.stale != stale:

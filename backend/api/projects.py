@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 _DELIVERY_PROJECT_IDENTITY_FIELDS = frozenset(
-    {"git_url", "has_remote", "default_branch"}
+    {"git_url", "has_remote", "default_branch", "preview_config"}
 )
 
 
@@ -251,6 +251,28 @@ async def update_project(
         raise HTTPException(404, "Project not found")
     project = await db.get(Project, project_id, populate_existing=True)
     updates = body.model_dump(exclude_unset=True)
+    if "preview_config" in updates and updates["preview_config"] is not None:
+        if not project.local_path:
+            raise HTTPException(422, "Project has no local workspace")
+        try:
+            from pathlib import Path
+
+            from backend.services.workspace_review import (
+                PreviewConfigurationError,
+                validate_preview_profiles,
+            )
+
+            normalized = validate_preview_profiles(
+                updates["preview_config"],
+                Path(project.local_path).resolve(strict=True),
+            )
+        except (OSError, PreviewConfigurationError, ValueError) as exc:
+            raise HTTPException(422, str(exc)) from exc
+        updates["preview_config"] = {
+            "version": 2,
+            "default_profile": normalized["default_profile"],
+            "profiles": normalized["profiles"],
+        }
     # Auto-sync has_remote when git_url is set
     if "git_url" in updates and updates["git_url"] and "has_remote" not in updates:
         updates["has_remote"] = True

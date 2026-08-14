@@ -147,6 +147,9 @@ class DeliveryCycleResponse(BaseModel):
     review_verdict: str | None
     review_summary: str | None
     frontend_review_run_id: str | None
+    frontend_review_profile_ids: list[str] = Field(default_factory=list)
+    frontend_review_profile_index: int = 0
+    frontend_review_results: list[dict] = Field(default_factory=list)
     frontend_review_verdict: str | None
     frontend_review_summary: str | None
     frontend_review_skip_reason: str | None
@@ -245,7 +248,9 @@ class DeliveryRetryCommand(BaseModel):
 
 
 class DeliveryAgentActivity(BaseModel):
-    role: Literal["planner", "plan_reviewer", "developer", "code_reviewer", "browser_reviewer"]
+    role: Literal[
+        "planner", "plan_reviewer", "developer", "code_reviewer", "browser_reviewer"
+    ]
     provider: str | None = None
     model: str | None = None
     effort: str | None = None

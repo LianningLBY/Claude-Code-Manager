@@ -23,7 +23,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
 from backend.models.delivery import (
-    DELIVERY_CYCLE_ACTIVE_STATUSES,
     DeliveryCycle,
     DeliveryRun,
     DeliveryTransition,
@@ -31,7 +30,6 @@ from backend.models.delivery import (
 from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
-from backend.models.task import Task
 from backend.schemas.pr_monitor import required_checks_support_direct_auto_merge
 from backend.services.delivery_reducer import (
     DeliveryReducerEvent,
@@ -652,7 +650,7 @@ async def create_delivery_run(
         try:
             from backend.services.workspace_review import (
                 WorkspaceReviewError,
-                validate_preview_config,
+                validate_preview_profiles,
             )
 
             preview_workspace = Path(project.local_path).resolve(strict=True)
@@ -660,7 +658,7 @@ async def create_delivery_run(
                 raise WorkspaceReviewError(
                     "Project path is not a Git checkout"
                 )
-            validate_preview_config(project.preview_config, preview_workspace)
+            validate_preview_profiles(project.preview_config, preview_workspace)
         except (OSError, TypeError, ValueError, WorkspaceReviewError) as exc:
             raise DeliveryValidationError(
                 f"Required frontend review Preview configuration is invalid: {exc}"

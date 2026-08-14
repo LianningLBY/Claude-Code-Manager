@@ -26,6 +26,7 @@ from backend.services.workspace_review import (
     WorkspaceReviewManager,
     capture_workspace_snapshot,
     detect_preview_config,
+    resolve_preview_config,
     validate_preview_config,
     workspace_review_capability,
 )
@@ -79,6 +80,82 @@ def _http_preview_config() -> dict:
     }
 
 
+def _multi_preview_config() -> dict:
+    web = _http_preview_config()
+    web.update({"id": "web", "match_paths": ["web/**"]})
+    admin = _http_preview_config()
+    admin.update(
+        {
+            "id": "admin",
+            "name": "Admin preview",
+            "match_paths": ["admin/**"],
+        }
+    )
+    return {
+        "version": 2,
+        "default_profile": "web",
+        "profiles": [web, admin],
+    }
+
+
+def test_multi_preview_config_selects_profiles_from_changed_paths(tmp_path):
+    workspace = _make_repo(tmp_path)
+    (workspace / "web").mkdir()
+    (workspace / "admin").mkdir()
+
+    selected = resolve_preview_config(
+        _multi_preview_config(),
+        workspace,
+        changed_paths=["admin/src/App.tsx"],
+    )
+
+    assert [profile["id"] for profile in selected] == ["admin"]
+    assert selected[0]["selection_reason"] == "matched admin/**"
+
+
+def test_multi_preview_config_uses_default_only_when_nothing_matches(tmp_path):
+    workspace = _make_repo(tmp_path)
+    (workspace / "web").mkdir()
+    (workspace / "admin").mkdir()
+
+    selected = resolve_preview_config(
+        _multi_preview_config(),
+        workspace,
+        changed_paths=["backend/api.py"],
+    )
+
+    assert [profile["id"] for profile in selected] == ["web"]
+    assert selected[0]["selection_reason"] == "default profile"
+
+
+def test_multi_preview_config_can_select_multiple_affected_frontends(tmp_path):
+    workspace = _make_repo(tmp_path)
+    (workspace / "web").mkdir()
+    (workspace / "admin").mkdir()
+
+    selected = resolve_preview_config(
+        _multi_preview_config(),
+        workspace,
+        changed_paths=["web/src/App.tsx", "admin/src/App.tsx"],
+    )
+
+    assert [profile["id"] for profile in selected] == ["web", "admin"]
+
+
+def test_legacy_preview_config_remains_compatible(tmp_path):
+    workspace = _make_repo(tmp_path)
+
+    selected = resolve_preview_config(
+        _http_preview_config(),
+        workspace,
+        changed_paths=["anything.txt"],
+    )
+
+    assert len(selected) == 1
+    assert selected[0]["id"] == "default"
+    assert selected[0]["selection_reason"] == "legacy preview configuration"
+
+
 def test_browser_agent_prompt_publishes_canonical_result_schema_and_zero_budget():
     prompt = _browser_agent_prompt(
         "job-1",
@@ -129,7 +206,9 @@ def test_browser_agent_prompt_treats_git_manifest_as_data_and_requires_coverage(
     assert "never claim" in prompt
 
 
-def test_preview_config_is_shell_free_and_auto_detection_requires_confirmation(tmp_path):
+def test_preview_config_is_shell_free_and_auto_detection_requires_confirmation(
+    tmp_path,
+):
     workspace = _make_repo(tmp_path)
     (workspace / "package.json").write_text(
         '{"scripts":{"dev":"vite"}}',
@@ -157,7 +236,39 @@ def test_preview_config_is_shell_free_and_auto_detection_requires_confirmation(t
         validate_preview_config(unsafe, workspace)
 
 
-def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_build(tmp_path):
+def test_workspace_review_capability_accepts_profiles_without_default(tmp_path):
+    workspace = _make_repo(tmp_path)
+    profile = _http_preview_config()
+    project = SimpleNamespace(
+        preview_config={
+            "version": 2,
+            "default_profile": None,
+            "profiles": [
+                {
+                    **profile,
+                    "id": "web",
+                    "match_paths": ["web/**"],
+                    "enabled": True,
+                }
+            ],
+        }
+    )
+    task = SimpleNamespace(
+        worker_id=None,
+        last_cwd=str(workspace),
+        target_repo=str(workspace),
+    )
+
+    capability = workspace_review_capability(task, project)
+
+    assert capability["available"] is True
+    assert capability["configured"] is True
+    assert capability["config"]["id"] == "web"
+
+
+def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_build(
+    tmp_path,
+):
     workspace = _make_repo(tmp_path)
     (workspace / "frontend").mkdir()
     (workspace / "frontend" / "package.json").write_text("{}", encoding="utf-8")
@@ -229,9 +340,7 @@ def test_preview_environment_forces_manager_control_plane_services_off(monkeypat
     assert env["CODEX_POOL_CONFIG_PATH"] == "/tmp/preview/codex-pool/accounts.json"
     assert env["SSH_KEY_STORAGE_DIR"] == "/tmp/preview/ssh-keys"
     assert env["TASK_RUNTIME_SECRET_DIR"] == "/tmp/preview/task-runtime-secrets"
-    assert env["TEST_HARNESS_ARTIFACT_ROOT"] == (
-        "/tmp/preview/test-harness-artifacts"
-    )
+    assert env["TEST_HARNESS_ARTIFACT_ROOT"] == ("/tmp/preview/test-harness-artifacts")
 
 
 def test_sandbox_preview_profile_requires_explicit_port_and_public_hosts(tmp_path):
@@ -658,7 +767,9 @@ async def test_workspace_pipeline_creates_context_minimized_browser_task(
     assert browser_job.options.reasoning_effort == "max"
     assert created_child["metadata_"]["isolated_browser_agent"] is True
     assert "Private parent conversation" not in created_child["description"]
-    assert "intentionally received no parent conversation" in created_child["description"]
+    assert (
+        "intentionally received no parent conversation" in created_child["description"]
+    )
     manager._publish_parent_report.assert_awaited_once()
 
 

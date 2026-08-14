@@ -303,6 +303,7 @@ class TestHarnessService:
         spec: TestHarnessSpec,
         owner_user_id: int | None = None,
         owner_identity: TestHarnessOwnerIdentity | None = None,
+        preview_config_override: dict[str, Any] | None = None,
     ) -> TestHarnessRun:
         async with test_harness_owner_fence(task_id):
             return await self._start_task_run_under_owner_fence(
@@ -310,6 +311,7 @@ class TestHarnessService:
                 spec=spec,
                 owner_user_id=owner_user_id,
                 owner_identity=owner_identity,
+                preview_config_override=preview_config_override,
             )
 
     async def _start_task_run_under_owner_fence(
@@ -319,6 +321,7 @@ class TestHarnessService:
         spec: TestHarnessSpec,
         owner_user_id: int | None = None,
         owner_identity: TestHarnessOwnerIdentity | None = None,
+        preview_config_override: dict[str, Any] | None = None,
     ) -> TestHarnessRun:
         normalized = spec.normalized()
         async with self.db_factory() as db:
@@ -377,6 +380,7 @@ class TestHarnessService:
             plan=plan,
             runtime=runtime,
             owner_identity=owner_identity,
+            preview_config_override=preview_config_override,
         )
         if not created:
             return run
@@ -431,6 +435,7 @@ class TestHarnessService:
         plan: dict[str, Any],
         runtime: dict[str, Any],
         owner_identity: TestHarnessOwnerIdentity | None = None,
+        preview_config_override: dict[str, Any] | None = None,
     ) -> tuple[TestHarnessRun, bool]:
         scope = f"task:{task_id}" if task_id is not None else f"admin:{owner_user_id or 0}"
         async with self._lock:
@@ -481,6 +486,8 @@ class TestHarnessService:
                             task=owner,
                             project=project,
                             target_kind=spec.target_kind,
+                            target=spec.target,
+                            preview_config_override=preview_config_override,
                         )
                     except TestHarnessExecutionContextError as exc:
                         raise TestHarnessError(str(exc)) from exc

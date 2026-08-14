@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import inspect
 import logging
+from pathlib import Path
 import re
 import secrets
 from typing import Any, Protocol
@@ -384,9 +385,7 @@ class UnavailableDeliveryPublisher:
             monitor_run_id,
             expected_monitor_state_version,
         )
-        raise DeliveryPublisherUnavailable(
-            "Delivery merged verifier is not configured"
-        )
+        raise DeliveryPublisherUnavailable("Delivery merged verifier is not configured")
 
 
 @dataclass(frozen=True, slots=True)
@@ -892,7 +891,10 @@ class DeliveryController:
                     code="delivery_capability_unavailable",
                     message=str(exc),
                 )
-            except (DeliveryPublisherUnavailable, DeliveryPublisherPermanentError) as exc:
+            except (
+                DeliveryPublisherUnavailable,
+                DeliveryPublisherPermanentError,
+            ) as exc:
                 await self._fail_run(
                     lease,
                     code="delivery_publisher_unavailable",
@@ -1153,12 +1155,8 @@ class DeliveryController:
                 else None
             )
             policy = run.policy_snapshot
-            auto_merge = (
-                policy.get("auto_merge") if isinstance(policy, dict) else None
-            )
-            terminal = (
-                policy.get("terminal") if isinstance(policy, dict) else None
-            )
+            auto_merge = policy.get("auto_merge") if isinstance(policy, dict) else None
+            terminal = policy.get("terminal") if isinstance(policy, dict) else None
             frontend_review = policy.get("frontend_review")
             if not isinstance(frontend_review, dict):
                 frontend_review = {
@@ -1181,8 +1179,7 @@ class DeliveryController:
                 or not isinstance(policy, dict)
                 or value_hash(policy) != run.policy_hash
                 or type(auto_merge) is not bool
-                or terminal
-                != ("merged" if auto_merge else "ready_to_merge")
+                or terminal != ("merged" if auto_merge else "ready_to_merge")
                 or frontend_review_mode not in {"auto", "required", "off"}
                 or frontend_review_profile not in {"standard", "exhaustive"}
                 or type(frontend_review_allow_actions) is not bool
@@ -1516,8 +1513,7 @@ class DeliveryController:
                 and task is not None
                 and task.provider == policy.get("provider")
                 and task.model == policy.get("model")
-                and task.codex_service_tier
-                == policy.get("codex_service_tier")
+                and task.codex_service_tier == policy.get("codex_service_tier")
                 and task.effort_level == policy.get("effort_level")
             )
             if (
@@ -1726,8 +1722,7 @@ class DeliveryController:
             or value_hash(policy) != run.policy_hash
             or task_snapshot["provider"] != policy.get("provider")
             or task_snapshot["model"] != policy.get("model")
-            or task_snapshot["codex_service_tier"]
-            != policy.get("codex_service_tier")
+            or task_snapshot["codex_service_tier"] != policy.get("codex_service_tier")
             or task_snapshot["effort_level"] != policy.get("effort_level")
         ):
             raise DeliverySubjectChanged(
@@ -1739,7 +1734,9 @@ class DeliveryController:
         status = str(task_snapshot["status"])
         if status == "pending":
             if turn_snapshot["status"] not in {"queued", "dispatching"}:
-                raise DeliverySubjectChanged("Running Developer turn returned to pending")
+                raise DeliverySubjectChanged(
+                    "Running Developer turn returned to pending"
+                )
             return False
         if status in _TASK_ACTIVE_STATUSES:
             started_at = task_snapshot["started_at"]
@@ -1800,13 +1797,19 @@ class DeliveryController:
         started_at = task_snapshot["started_at"]
         completed_at = task_snapshot["completed_at"]
         if started_at is None or completed_at is None:
-            raise DeliverySubjectChanged("Developer terminal lacks generation timestamps")
+            raise DeliverySubjectChanged(
+                "Developer terminal lacks generation timestamps"
+            )
         if turn_snapshot["started_at"] is not None:
             if turn_snapshot["started_at"] != started_at:
-                raise DeliverySubjectChanged("Developer terminal belongs to another turn")
+                raise DeliverySubjectChanged(
+                    "Developer terminal belongs to another turn"
+                )
         else:
             if _iso(started_at) == checkpoint.get("previous_started_at"):
-                raise DeliverySubjectChanged("Developer terminal did not start a new turn")
+                raise DeliverySubjectChanged(
+                    "Developer terminal did not start a new turn"
+                )
         if _iso(completed_at) == checkpoint.get("previous_completed_at"):
             raise DeliverySubjectChanged("Developer terminal predates turn admission")
         if status != "completed":
@@ -1966,9 +1969,13 @@ class DeliveryController:
             if snapshot.worktree_path != run.workspace_path:
                 raise DeliverySubjectChanged("Developer completed in another workspace")
             if run.base_sha != snapshot.base_sha:
-                raise DeliverySubjectChanged("Delivery base changed during Developer turn")
+                raise DeliverySubjectChanged(
+                    "Delivery base changed during Developer turn"
+                )
             if run.head_sha != turn.progress_signature_before:
-                raise DeliverySubjectChanged("Delivery head changed before turn completion")
+                raise DeliverySubjectChanged(
+                    "Delivery head changed before turn completion"
+                )
 
             progressed = snapshot.head_sha != turn.progress_signature_before
             run.no_progress_count = 0 if progressed else run.no_progress_count + 1
@@ -2144,7 +2151,8 @@ class DeliveryController:
                 lease,
                 code=snapshot.error_code or "code_review_capability_failed",
                 message=(
-                    snapshot.error_message or f"Code Review capability {snapshot.status}"
+                    snapshot.error_message
+                    or f"Code Review capability {snapshot.status}"
                 ),
             )
             return False
@@ -2235,10 +2243,7 @@ class DeliveryController:
                             .execution_options(populate_existing=True)
                         )
                     ).scalar_one_or_none()
-                    if (
-                        task is None
-                        or task.status not in _TASK_REUSABLE_STATUSES
-                    ):
+                    if task is None or task.status not in _TASK_REUSABLE_STATUSES:
                         raise DeliverySubjectChanged(
                             "Developer Task changed before Review budget failure"
                         )
@@ -2370,11 +2375,254 @@ class DeliveryController:
             )
         if not context.head_sha or not context.head_tree_sha:
             raise DeliverySubjectChanged("Frontend review subject is incomplete")
+        if not context.base_sha or not context.workspace_path:
+            raise DeliverySubjectChanged("Frontend review workspace is incomplete")
+        if context.activity == "ready":
+            legacy_key = (
+                f"delivery:{context.run_id}:cycle:{context.cycle_id}:"
+                f"frontend:{context.head_sha}"
+            )
+            async with self.db_factory() as db:
+                cycle = await db.get(DeliveryCycle, context.cycle_id)
+                task = await db.get(Task, context.developer_task_id)
+                legacy_harness = await db.scalar(
+                    select(TestHarnessRun).where(
+                        TestHarnessRun.task_id == context.developer_task_id,
+                        TestHarnessRun.idempotency_scope
+                        == f"task:{context.developer_task_id}",
+                        TestHarnessRun.idempotency_key == legacy_key,
+                    )
+                )
+            if (
+                legacy_harness is not None
+                and cycle is not None
+                and task is not None
+                and cycle.frontend_review_run_id is None
+                and cycle.frontend_review_config_snapshot is None
+            ):
+                owner_identity = test_harness_owner_identity(task)
+                if (
+                    legacy_harness.target_kind != "current_workspace"
+                    or legacy_harness.owner_task_incarnation_id
+                    != owner_identity.incarnation_id
+                    or legacy_harness.owner_task_retry_count
+                    != owner_identity.retry_count
+                    or legacy_harness.owner_task_turn_generation
+                    != owner_identity.turn_generation
+                    or legacy_harness.owner_task_status != owner_identity.status
+                ):
+                    raise DeliverySubjectChanged(
+                        "Legacy frontend review recovery identity changed"
+                    )
+                from backend.services.test_harness_execution_context import (
+                    execution_context_from_runtime,
+                )
+
+                try:
+                    execution_context = execution_context_from_runtime(
+                        legacy_harness.runtime_config,
+                        target_kind="current_workspace",
+                    )
+                    preview = execution_context["preview_config"]
+                    frozen_config = {
+                        "version": 2,
+                        "default_profile": "default",
+                        "profiles": [
+                            {
+                                **preview,
+                                "id": "default",
+                                "match_paths": ["**"],
+                                "enabled": True,
+                            }
+                        ],
+                    }
+                except Exception:
+                    # Pre-execution-context Harness rows can still be bound by
+                    # their exact owner/head/idempotency evidence. They never
+                    # start another profile, so no mutable Preview config is
+                    # consulted during this recovery path.
+                    frozen_config = None
+                async with self.db_factory() as db:
+                    run = await lock_run(db, lease.run_id)
+                    self._assert_lease(run, lease)
+                    cycle = await lock_current_cycle(db, run)
+                    if (
+                        run.phase != "frontend_review"
+                        or run.activity != "ready"
+                        or cycle.id != context.cycle_id
+                        or cycle.frontend_review_run_id is not None
+                    ):
+                        raise DeliverySubjectChanged(
+                            "Legacy frontend review changed before recovery"
+                        )
+                    cycle.frontend_review_config_snapshot = frozen_config
+                    cycle.frontend_review_profile_ids = ["default"]
+                    cycle.frontend_review_profile_index = 0
+                    cycle.frontend_review_results = []
+                    cycle.frontend_review_run_id = legacy_harness.id
+                    cycle.state_version += 1
+                    cycle.updated_at = _utcnow()
+                    await apply_run_event(
+                        db,
+                        run=run,
+                        event=DeliveryReducerEvent("frontend_review_requested"),
+                        actor_kind="test_harness",
+                        actor_id=legacy_harness.id,
+                        metadata={
+                            "test_harness_run_id": legacy_harness.id,
+                            "preview_profile_id": "default",
+                            "legacy_recovery": True,
+                        },
+                    )
+                    await db.commit()
+                return True
+        if context.activity == "ready" and (
+            not isinstance(settings.auth_token, str) or not settings.auth_token.strip()
+        ):
+            message = "Frontend review unavailable: AUTH_TOKEN is not configured"
+            if context.frontend_review_mode == "auto":
+                return await self._skip_frontend_review(
+                    lease,
+                    context,
+                    reason=message,
+                )
+            await self._fail_run(
+                lease,
+                code="frontend_review_unavailable",
+                message=message,
+            )
+            return False
+
+        if context.activity == "ready":
+            async with self.db_factory() as db:
+                cycle = await db.get(
+                    DeliveryCycle,
+                    context.cycle_id,
+                    populate_existing=True,
+                )
+                project = await db.get(Project, context.project_id)
+                task = await db.get(Task, context.developer_task_id)
+                if cycle is None or project is None:
+                    raise DeliverySubjectChanged(
+                        "Frontend review Project or cycle disappeared"
+                    )
+                frozen_config = cycle.frontend_review_config_snapshot
+                selected_profile_ids = list(cycle.frontend_review_profile_ids or [])
+                selected_index = cycle.frontend_review_profile_index
+
+            if frozen_config is None:
+                changed_paths = await self.workspace.list_changed_paths(
+                    worktree_path=context.workspace_path,
+                    base_sha=context.base_sha,
+                    head_sha=context.head_sha,
+                )
+                from backend.services.workspace_review import (
+                    resolve_preview_config,
+                    validate_preview_profiles,
+                    workspace_review_capability,
+                )
+
+                try:
+                    capability = workspace_review_capability(task, project)
+                    if not capability.get("available"):
+                        raise ValueError(
+                            capability.get("reason") or "trusted Preview is unavailable"
+                        )
+                    if project.preview_config is None:
+                        # Compatibility for injected/legacy capability adapters;
+                        # the production capability cannot report available in
+                        # this state.
+                        collection = None
+                        selected_profiles = [{"id": "default"}]
+                    else:
+                        collection = validate_preview_profiles(
+                            project.preview_config,
+                            Path(context.workspace_path),
+                        )
+                        selected_profiles = resolve_preview_config(
+                            collection,
+                            Path(context.workspace_path),
+                            changed_paths=changed_paths,
+                        )
+                except Exception as exc:
+                    message = f"Frontend review unavailable: {exc}"
+                    if context.frontend_review_mode == "auto":
+                        return await self._skip_frontend_review(
+                            lease,
+                            context,
+                            reason=message,
+                        )
+                    await self._fail_run(
+                        lease,
+                        code="frontend_review_unavailable",
+                        message=message,
+                    )
+                    return False
+                selected_profile_ids = [profile["id"] for profile in selected_profiles]
+                if not selected_profile_ids:
+                    message = (
+                        "Frontend review found no trusted Preview profile matching "
+                        "the final changed paths"
+                    )
+                    if context.frontend_review_mode == "auto":
+                        return await self._skip_frontend_review(
+                            lease,
+                            context,
+                            reason=message,
+                        )
+                    await self._fail_run(
+                        lease,
+                        code="frontend_review_unavailable",
+                        message=message,
+                    )
+                    return False
+                frozen_config = (
+                    {
+                        "version": 2,
+                        "default_profile": collection["default_profile"],
+                        "profiles": collection["profiles"],
+                    }
+                    if collection is not None
+                    else None
+                )
+                async with self.db_factory() as db:
+                    run = await lock_run(db, lease.run_id)
+                    self._assert_lease(run, lease)
+                    cycle = await lock_current_cycle(db, run)
+                    if (
+                        run.phase != "frontend_review"
+                        or run.activity != "ready"
+                        or cycle.id != context.cycle_id
+                        or run.head_sha != context.head_sha
+                    ):
+                        raise DeliverySubjectChanged(
+                            "Frontend review subject changed before profile selection"
+                        )
+                    if cycle.frontend_review_config_snapshot is None:
+                        cycle.frontend_review_config_snapshot = frozen_config
+                        cycle.frontend_review_profile_ids = selected_profile_ids
+                        cycle.frontend_review_profile_index = 0
+                        cycle.frontend_review_results = []
+                        cycle.state_version += 1
+                        cycle.updated_at = _utcnow()
+                        await db.commit()
+                    else:
+                        await db.rollback()
+                        frozen_config = cycle.frontend_review_config_snapshot
+                        selected_profile_ids = list(
+                            cycle.frontend_review_profile_ids or []
+                        )
+                        selected_index = cycle.frontend_review_profile_index
+            if selected_index < 0 or selected_index >= len(selected_profile_ids):
+                raise DeliverySubjectChanged(
+                    "Frontend review profile cursor is invalid"
+                )
+            current_preview_profile_id = selected_profile_ids[selected_index]
 
         if context.activity == "ready":
             harness_idempotency_key = (
                 f"delivery:{context.run_id}:cycle:{context.cycle_id}:"
-                f"frontend:{context.head_sha}"
+                f"frontend:{context.head_sha}:{current_preview_profile_id}"
             )
             async with self.db_factory() as db:
                 run = await db.get(DeliveryRun, lease.run_id, populate_existing=True)
@@ -2417,14 +2665,21 @@ class DeliveryController:
                     select(TestHarnessRun).where(
                         TestHarnessRun.task_id == task.id,
                         TestHarnessRun.idempotency_scope == f"task:{task.id}",
-                        TestHarnessRun.idempotency_key
-                        == harness_idempotency_key,
+                        TestHarnessRun.idempotency_key == harness_idempotency_key,
                     )
                 )
                 recovery_harness_id = None
                 if recoverable_harness is not None:
                     if (
                         recoverable_harness.target_kind != "current_workspace"
+                        or (
+                            recoverable_harness.target_spec.get("preview_profile_id")
+                            not in (
+                                {None, "default"}
+                                if current_preview_profile_id == "default"
+                                else {current_preview_profile_id}
+                            )
+                        )
                         or recoverable_harness.project_id != task.project_id
                         or recoverable_harness.owner_task_incarnation_id
                         != owner_identity.incarnation_id
@@ -2436,8 +2691,7 @@ class DeliveryController:
                         != owner_identity.status
                         or (
                             recoverable_harness.source_git_head is not None
-                            and recoverable_harness.source_git_head
-                            != context.head_sha
+                            and recoverable_harness.source_git_head != context.head_sha
                         )
                     ):
                         raise DeliverySubjectChanged(
@@ -2447,21 +2701,20 @@ class DeliveryController:
                 elif not await self._fence_developer_task_graph_locked(db, task):
                     await db.rollback()
                     return False
-                from backend.services.workspace_review import (
-                    workspace_review_capability,
-                )
-
                 capability = (
                     None
                     if recovery_harness_id is not None
-                    else workspace_review_capability(task, project)
+                    else {"available": True, "reason": None}
                 )
                 await db.rollback()
 
             harness_run_id = recovery_harness_id
             if harness_run_id is None:
                 unavailable_reason = None
-                if not isinstance(settings.auth_token, str) or not settings.auth_token.strip():
+                if (
+                    not isinstance(settings.auth_token, str)
+                    or not settings.auth_token.strip()
+                ):
                     unavailable_reason = "AUTH_TOKEN is not configured"
                 elif not capability or not capability.get("available"):
                     unavailable_reason = str(
@@ -2486,7 +2739,8 @@ class DeliveryController:
                 from backend.services.test_harness_contracts import TestHarnessSpec
 
                 goal = (
-                    "Validate the current Delivery implementation as a black-box "
+                    f"Validate Preview profile '{current_preview_profile_id}' for "
+                    "the current Delivery implementation as a black-box "
                     "frontend. Verify the requested user-visible behavior, runtime "
                     "health, error feedback, and regressions. Report issues only; "
                     "do not edit source code.\n\nDelivery requirements:\n"
@@ -2494,18 +2748,25 @@ class DeliveryController:
                 )[:20_000]
                 service = self._frontend_harness_service()
                 try:
-                    harness_run = await service.start_task_run(
-                        task_id=context.developer_task_id,
-                        spec=TestHarnessSpec(
+                    start_kwargs = {
+                        "task_id": context.developer_task_id,
+                        "spec": TestHarnessSpec(
                             target_kind="current_workspace",
-                            target={},
+                            target={
+                                "preview_profile_id": current_preview_profile_id,
+                            },
                             goal=goal,
                             profile=context.frontend_review_profile,
                             allow_actions=context.frontend_review_allow_actions,
                             idempotency_key=harness_idempotency_key,
                         ),
-                        owner_user_id=owner_user_id,
-                        owner_identity=owner_identity,
+                        "owner_user_id": owner_user_id,
+                        "owner_identity": owner_identity,
+                    }
+                    if frozen_config is not None:
+                        start_kwargs["preview_config_override"] = frozen_config
+                    harness_run = await service.start_task_run(
+                        **start_kwargs,
                     )
                     harness_run_id = harness_run.id
                 except Exception as exc:
@@ -2552,6 +2813,14 @@ class DeliveryController:
                     or exact_harness is None
                     or exact_harness.task_id != task.id
                     or exact_harness.target_kind != "current_workspace"
+                    or (
+                        exact_harness.target_spec.get("preview_profile_id")
+                        not in (
+                            {None, "default"}
+                            if current_preview_profile_id == "default"
+                            else {current_preview_profile_id}
+                        )
+                    )
                     or exact_harness.owner_task_incarnation_id
                     != owner_identity.incarnation_id
                     or exact_harness.owner_task_retry_count
@@ -2593,6 +2862,13 @@ class DeliveryController:
                 populate_existing=True,
             )
             harness_run_id = cycle.frontend_review_run_id if cycle else None
+            profile_ids = list(cycle.frontend_review_profile_ids or []) if cycle else []
+            profile_index = cycle.frontend_review_profile_index if cycle else 0
+            if profile_index < 0 or profile_index >= len(profile_ids):
+                raise DeliverySubjectChanged(
+                    "Frontend review waiting profile cursor is invalid"
+                )
+            current_preview_profile_id = profile_ids[profile_index]
             harness = (
                 await db.get(TestHarnessRun, harness_run_id)
                 if harness_run_id is not None
@@ -2661,6 +2937,7 @@ class DeliveryController:
                 "archive_state": attempt.archive_state if attempt else None,
                 "finding_ids": [item.id for item in findings],
                 "evidence_ids": [item.id for item in evidence],
+                "preview_profile_id": current_preview_profile_id,
             }
 
         if harness_snapshot["status"] not in {
@@ -2788,11 +3065,17 @@ class DeliveryController:
                 or exact_harness is None
                 or exact_harness.task_id != task.id
                 or exact_harness.target_kind != "current_workspace"
-                or exact_harness.owner_task_incarnation_id
-                != task.incarnation_id
+                or (
+                    exact_harness.target_spec.get("preview_profile_id")
+                    not in (
+                        {None, "default"}
+                        if harness_snapshot["preview_profile_id"] == "default"
+                        else {harness_snapshot["preview_profile_id"]}
+                    )
+                )
+                or exact_harness.owner_task_incarnation_id != task.incarnation_id
                 or exact_harness.owner_task_retry_count != task.retry_count
-                or exact_harness.owner_task_turn_generation
-                != task.turn_generation
+                or exact_harness.owner_task_turn_generation != task.turn_generation
                 or exact_harness.owner_task_status != task.status
                 or exact_harness.status != harness_snapshot["status"]
                 or exact_harness.verdict != verdict
@@ -2802,8 +3085,7 @@ class DeliveryController:
                 or exact_harness.stale
                 or exact_attempt is None
                 or exact_attempt.run_id != harness_run_id
-                or exact_attempt.archive_state
-                != harness_snapshot["archive_state"]
+                or exact_attempt.archive_state != harness_snapshot["archive_state"]
                 or {item.id for item in exact_evidence}
                 != set(harness_snapshot["evidence_ids"])
                 or not {"report", "screenshot"}.issubset(
@@ -2826,21 +3108,66 @@ class DeliveryController:
             cycle.frontend_review_summary = (
                 harness_snapshot["report"] or harness_snapshot["error"]
             )[:20_000]
+            results = list(cycle.frontend_review_results or [])
+            results.append(
+                {
+                    "profile_id": harness_snapshot["preview_profile_id"],
+                    "run_id": harness_run_id,
+                    "verdict": verdict,
+                    "report": cycle.frontend_review_summary,
+                    "evidence_count": len(exact_evidence),
+                    "finding_count": len(exact_findings),
+                }
+            )
+            cycle.frontend_review_results = results
             cycle.state_version += 1
             cycle.updated_at = _utcnow()
             if verdict == "passed":
-                cycle.status = "publishing"
-                await apply_run_event(
-                    db,
-                    run=run,
-                    event=DeliveryReducerEvent("frontend_review_passed"),
-                    actor_kind="test_harness",
-                    actor_id=harness_run_id,
-                    metadata={
-                        "test_harness_run_id": harness_run_id,
-                        "evidence_count": len(evidence),
-                    },
-                )
+                next_profile_index = cycle.frontend_review_profile_index + 1
+                if next_profile_index < len(cycle.frontend_review_profile_ids):
+                    cycle.frontend_review_profile_index = next_profile_index
+                    cycle.frontend_review_run_id = None
+                    await apply_run_event(
+                        db,
+                        run=run,
+                        event=DeliveryReducerEvent(
+                            "frontend_review_profile_passed"
+                        ),
+                        actor_kind="test_harness",
+                        actor_id=harness_run_id,
+                        metadata={
+                            "test_harness_run_id": harness_run_id,
+                            "preview_profile_id": harness_snapshot[
+                                "preview_profile_id"
+                            ],
+                            "next_preview_profile_id": (
+                                cycle.frontend_review_profile_ids[
+                                    next_profile_index
+                                ]
+                            ),
+                            "evidence_count": len(evidence),
+                        },
+                    )
+                else:
+                    cycle.status = "publishing"
+                    await apply_run_event(
+                        db,
+                        run=run,
+                        event=DeliveryReducerEvent("frontend_review_passed"),
+                        actor_kind="test_harness",
+                        actor_id=harness_run_id,
+                        metadata={
+                            "test_harness_run_id": harness_run_id,
+                            "preview_profile_ids": list(
+                                cycle.frontend_review_profile_ids
+                            ),
+                            "evidence_count": sum(
+                                int(item.get("evidence_count", 0))
+                                for item in results
+                                if isinstance(item, dict)
+                            ),
+                        },
+                    )
             elif run.cycle_count >= run.max_cycles:
                 failure_message = (
                     "Frontend review found issues after the Delivery cycle "
@@ -2885,9 +3212,7 @@ class DeliveryController:
                 await apply_run_event(
                     db,
                     run=run,
-                    event=DeliveryReducerEvent(
-                        "frontend_review_changes_requested"
-                    ),
+                    event=DeliveryReducerEvent("frontend_review_changes_requested"),
                     actor_kind="test_harness",
                     actor_id=harness_run_id,
                     metadata={
@@ -3066,9 +3391,7 @@ class DeliveryController:
             or not pull_request.url
             or pull_request.pr_number <= 0
         ):
-            raise DeliverySubjectChanged(
-                "Publisher returned a different PR subject"
-            )
+            raise DeliverySubjectChanged("Publisher returned a different PR subject")
 
     def _pull_request_from_receipt(
         self,
@@ -3136,10 +3459,7 @@ class DeliveryController:
                 "pull_request_history_ambiguous",
                 "pull_request_create_unresolved",
             }:
-                if (
-                    action.remote_id is not None
-                    or action.remote_url is not None
-                ):
+                if action.remote_id is not None or action.remote_url is not None:
                     raise DeliverySubjectChanged(
                         "Unresolved PR evidence has unexpected remote identity"
                     )
@@ -3265,9 +3585,7 @@ class DeliveryController:
                 action_id=action_id,
                 token=token,
             )
-            expected_key = (
-                f"delivery:{run.id}:publish:{run.base_sha}:{run.head_sha}"
-            )
+            expected_key = f"delivery:{run.id}:publish:{run.base_sha}:{run.head_sha}"
             if (
                 run.phase != "publishing"
                 or run.activity != "running"
@@ -3416,9 +3734,7 @@ class DeliveryController:
                     .execution_options(populate_existing=True)
                 )
             ).scalar_one_or_none()
-            idempotency_key = (
-                f"delivery:{run.id}:publish:{run.base_sha}:{run.head_sha}"
-            )
+            idempotency_key = f"delivery:{run.id}:publish:{run.base_sha}:{run.head_sha}"
             if action is None:
                 payload = {
                     "schema_version": 1,
@@ -3495,10 +3811,7 @@ class DeliveryController:
                 raise DeliverySubjectChanged(
                     "Succeeded publish action was not atomically bound to its PR"
                 )
-            if (
-                action.next_attempt_at is not None
-                and action.next_attempt_at > now
-            ):
+            if action.next_attempt_at is not None and action.next_attempt_at > now:
                 await db.rollback()
                 return None
             if (
@@ -3511,9 +3824,7 @@ class DeliveryController:
             token = secrets.token_hex(32)
             action.status = "leased"
             action.lease_owner = token
-            action.lease_expires_at = now + timedelta(
-                seconds=self.action_lease_seconds
-            )
+            action.lease_expires_at = now + timedelta(seconds=self.action_lease_seconds)
             action.attempts += 1
             action.last_error = None
             if run.activity == "ready":
@@ -3611,9 +3922,7 @@ class DeliveryController:
     ) -> None:
         self._validate_published_pull_request(context, pull_request)
         if isinstance(monitor_id, bool) or monitor_id <= 0:
-            raise DeliverySubjectChanged(
-                "Publisher returned a different PR subject"
-            )
+            raise DeliverySubjectChanged("Publisher returned a different PR subject")
         async with self.db_factory() as db:
             run = await lock_run(db, lease.run_id)
             self._assert_lease(run, lease)
@@ -3795,7 +4104,9 @@ class DeliveryController:
                 else None
             )
             repo = (
-                await db.get(MonitoredRepo, run.monitored_repo_id, populate_existing=True)
+                await db.get(
+                    MonitoredRepo, run.monitored_repo_id, populate_existing=True
+                )
                 if run is not None and run.monitored_repo_id is not None
                 else None
             )
@@ -3803,7 +4114,9 @@ class DeliveryController:
                 raise DeliverySubjectChanged("Monitoring subject disappeared")
             self._assert_lease(run, lease)
             review = (
-                await db.get(PRReview, monitor.current_review_id, populate_existing=True)
+                await db.get(
+                    PRReview, monitor.current_review_id, populate_existing=True
+                )
                 if monitor.current_review_id is not None
                 else None
             )
@@ -3884,8 +4197,7 @@ class DeliveryController:
             raise DeliverySubjectChanged("PR head branch changed")
         if (
             not isinstance(monitor_snapshot["head_repo_full_name"], str)
-            or monitor_snapshot["head_repo_full_name"].lower()
-            != repo_full_name.lower()
+            or monitor_snapshot["head_repo_full_name"].lower() != repo_full_name.lower()
         ):
             raise DeliverySubjectChanged("PR head repository changed")
 
@@ -3916,8 +4228,7 @@ class DeliveryController:
                 )
             if (
                 review_snapshot is None
-                or review_snapshot["monitor_run_id"]
-                != monitor_snapshot["id"]
+                or review_snapshot["monitor_run_id"] != monitor_snapshot["id"]
                 or review_snapshot["repo_id"] != context.monitored_repo_id
                 or review_snapshot["pr_number"] != run_binding["pr_number"]
                 or review_snapshot["base_ref"] != context.base_branch
@@ -3933,11 +4244,8 @@ class DeliveryController:
                     context.auto_merge
                     and (
                         review_snapshot["status"] != "merged"
-                        or review_snapshot["action_taken"]
-                        != "approved_merged"
-                        or not isinstance(
-                            review_snapshot["publishing_actor"], str
-                        )
+                        or review_snapshot["action_taken"] != "approved_merged"
+                        or not isinstance(review_snapshot["publishing_actor"], str)
                         or not review_snapshot["publishing_actor"]
                         or not isinstance(
                             review_snapshot["publishing_started_at"], datetime
@@ -3980,9 +4288,7 @@ class DeliveryController:
                 run_id=context.run_id,
                 pull_request=expected_pull_request,
                 monitor_run_id=int(monitor_snapshot["id"]),
-                expected_monitor_state_version=int(
-                    monitor_snapshot["state_version"]
-                ),
+                expected_monitor_state_version=int(monitor_snapshot["state_version"]),
             )
             if verified_pull_request != expected_pull_request:
                 raise DeliverySubjectChanged(
@@ -4011,15 +4317,12 @@ class DeliveryController:
                     (
                         await db.execute(
                             select(PRReview)
-                            .where(
-                                PRReview.id == monitor.current_review_id
-                            )
+                            .where(PRReview.id == monitor.current_review_id)
                             .with_for_update()
                             .execution_options(populate_existing=True)
                         )
                     ).scalar_one_or_none()
-                    if monitor is not None
-                    and monitor.current_review_id is not None
+                    if monitor is not None and monitor.current_review_id is not None
                     else None
                 )
                 if (
@@ -4027,10 +4330,8 @@ class DeliveryController:
                     or run.activity != "waiting"
                     or not isinstance(run.policy_snapshot, dict)
                     or value_hash(run.policy_snapshot) != run.policy_hash
-                    or run.policy_snapshot.get("auto_merge")
-                    is not context.auto_merge
-                    or run.policy_snapshot.get("terminal")
-                    != context.terminal
+                    or run.policy_snapshot.get("auto_merge") is not context.auto_merge
+                    or run.policy_snapshot.get("terminal") != context.terminal
                     or run.project_id != context.project_id
                     or run.developer_task_id != context.developer_task_id
                     or run.monitored_repo_id != context.monitored_repo_id
@@ -4062,35 +4363,24 @@ class DeliveryController:
                         or review_snapshot is None
                         or terminal_review.id != review_snapshot["id"]
                         or terminal_review.monitor_run_id != monitor.id
-                        or terminal_review.repo_id
-                        != verified_pull_request.repo_id
-                        or terminal_review.pr_number
-                        != verified_pull_request.pr_number
+                        or terminal_review.repo_id != verified_pull_request.repo_id
+                        or terminal_review.pr_number != verified_pull_request.pr_number
                         or terminal_review.base_ref != context.base_branch
-                        or terminal_review.base_ref
-                        != review_snapshot["base_ref"]
-                        or terminal_review.base_sha
-                        != verified_pull_request.base_sha
-                        or terminal_review.base_sha
-                        != review_snapshot["base_sha"]
-                        or terminal_review.head_sha
-                        != verified_pull_request.head_sha
-                        or terminal_review.head_sha
-                        != review_snapshot["head_sha"]
+                        or terminal_review.base_ref != review_snapshot["base_ref"]
+                        or terminal_review.base_sha != verified_pull_request.base_sha
+                        or terminal_review.base_sha != review_snapshot["base_sha"]
+                        or terminal_review.head_sha != verified_pull_request.head_sha
+                        or terminal_review.head_sha != review_snapshot["head_sha"]
                         or terminal_review.delivery_id
                         != f"delivery:{run.id}:{run.head_sha}"
-                        or terminal_review.delivery_id
-                        != review_snapshot["delivery_id"]
+                        or terminal_review.delivery_id != review_snapshot["delivery_id"]
                         or terminal_review.pr_url.rstrip("/")
                         != verified_pull_request.url.rstrip("/")
-                        or terminal_review.pr_url
-                        != review_snapshot["pr_url"]
-                        or terminal_review.status
-                        != review_snapshot["status"]
+                        or terminal_review.pr_url != review_snapshot["pr_url"]
+                        or terminal_review.status != review_snapshot["status"]
                         or terminal_review.action_taken
                         != review_snapshot["action_taken"]
-                        or terminal_review.task_id
-                        != review_snapshot["task_id"]
+                        or terminal_review.task_id != review_snapshot["task_id"]
                         or terminal_review.action_nonce
                         != review_snapshot["action_nonce"]
                         or terminal_review.publishing_actor
@@ -4167,10 +4457,7 @@ class DeliveryController:
                             .execution_options(populate_existing=True)
                         )
                     ).scalar_one_or_none()
-                    if (
-                        task is None
-                        or task.status not in _TASK_REUSABLE_STATUSES
-                    ):
+                    if task is None or task.status not in _TASK_REUSABLE_STATUSES:
                         raise DeliverySubjectChanged(
                             "Developer Task changed before Monitor budget failure"
                         )
@@ -4320,19 +4607,16 @@ class DeliveryController:
             if not await self._fence_developer_task_graph_locked(db, task):
                 await db.rollback()
                 return
-            message = (
-                review.review_summary or "PR reviewer failed without a summary"
-            )[:2000]
+            message = (review.review_summary or "PR reviewer failed without a summary")[
+                :2000
+            ]
             if run.current_cycle_id is not None:
                 cycle = await db.get(
                     DeliveryCycle,
                     run.current_cycle_id,
                     populate_existing=True,
                 )
-                if (
-                    cycle is not None
-                    and cycle.status in DELIVERY_CYCLE_ACTIVE_STATUSES
-                ):
+                if cycle is not None and cycle.status in DELIVERY_CYCLE_ACTIVE_STATUSES:
                     complete_cycle(cycle, status="failed")
             await apply_run_event(
                 db,

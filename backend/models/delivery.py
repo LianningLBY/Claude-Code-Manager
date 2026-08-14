@@ -123,8 +123,7 @@ class DeliveryRun(Base):
             name="ck_delivery_runs_activity",
         ),
         CheckConstraint(
-            "outcome IS NULL OR "
-            f"outcome IN ({_sql_values(DELIVERY_OUTCOMES)})",
+            f"outcome IS NULL OR outcome IN ({_sql_values(DELIVERY_OUTCOMES)})",
             name="ck_delivery_runs_outcome",
         ),
         CheckConstraint(
@@ -230,9 +229,7 @@ class DeliveryRun(Base):
     )
     outcome: Mapped[str | None] = mapped_column(String(24), nullable=True)
     wait_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    paused_from_activity: Mapped[str | None] = mapped_column(
-        String(24), nullable=True
-    )
+    paused_from_activity: Mapped[str | None] = mapped_column(String(24), nullable=True)
     pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -285,9 +282,7 @@ class DeliveryCycle(Base):
         UniqueConstraint(
             "run_id", "cycle_number", name="uq_delivery_cycles_run_number"
         ),
-        UniqueConstraint(
-            "active_run_id", name="uq_delivery_cycles_active_run"
-        ),
+        UniqueConstraint("active_run_id", name="uq_delivery_cycles_active_run"),
         UniqueConstraint(
             "plan_invocation_id", name="uq_delivery_cycles_plan_invocation"
         ),
@@ -377,6 +372,28 @@ class DeliveryCycle(Base):
     frontend_review_run_id: Mapped[str | None] = mapped_column(
         String(32),
         nullable=True,
+    )
+    frontend_review_config_snapshot: Mapped[dict | None] = mapped_column(
+        JSON,
+        nullable=True,
+    )
+    frontend_review_profile_ids: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
+    )
+    frontend_review_profile_index: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    frontend_review_results: Mapped[list] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+        server_default="[]",
     )
     frontend_review_verdict: Mapped[str | None] = mapped_column(
         String(24),
@@ -604,9 +621,7 @@ class DeliveryTransition(Base):
         UniqueConstraint(
             "run_id", "state_version", name="uq_delivery_transitions_version"
         ),
-        CheckConstraint(
-            "state_version >= 1", name="ck_delivery_transitions_version"
-        ),
+        CheckConstraint("state_version >= 1", name="ck_delivery_transitions_version"),
         Index("ix_delivery_transitions_run_created", "run_id", "created_at"),
     )
 

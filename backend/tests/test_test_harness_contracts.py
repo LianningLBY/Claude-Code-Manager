@@ -39,6 +39,26 @@ def test_read_only_harness_rejects_an_action_budget():
         ).normalized()
 
 
+def test_current_workspace_accepts_a_preview_profile_id():
+    spec = HarnessSpec(
+        target_kind="current_workspace",
+        target={"preview_profile_id": "admin-ui"},
+        goal="Inspect the admin UI",
+    ).normalized()
+
+    assert spec.target == {"preview_profile_id": "admin-ui"}
+
+
+@pytest.mark.parametrize("profile_id", ["../admin", "Admin UI", "", 17])
+def test_current_workspace_rejects_an_invalid_preview_profile_id(profile_id):
+    with pytest.raises(HarnessContractError, match="preview_profile_id"):
+        HarnessSpec(
+            target_kind="current_workspace",
+            target={"preview_profile_id": profile_id},
+            goal="Inspect the admin UI",
+        ).normalized()
+
+
 def test_browser_finding_schema_exposes_only_canonical_fields():
     finding = BrowserReviewFindingInput.model_validate(
         {

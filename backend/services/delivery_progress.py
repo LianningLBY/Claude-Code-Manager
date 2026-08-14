@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Iterable
+from typing import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -74,6 +74,7 @@ _TRANSITION_TITLES = {
     "review_changes_requested": "Code review requested changes",
     "frontend_review_requested": "Frontend review started",
     "frontend_review_passed": "Frontend review passed",
+    "frontend_review_profile_passed": "Preview profile passed",
     "frontend_review_skipped": "Frontend review skipped",
     "frontend_review_changes_requested": "Frontend review found issues",
     "publish_started": "Publishing pull request",

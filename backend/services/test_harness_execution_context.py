@@ -43,6 +43,8 @@ def freeze_harness_execution_context(
     task: Task,
     project: Project | None,
     target_kind: str,
+    target: dict[str, Any] | None = None,
+    preview_config_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Freeze every mutable route/config value used after Run admission."""
 
@@ -63,27 +65,49 @@ def freeze_harness_execution_context(
         "project_id": project_id,
     }
     if target_kind == "current_workspace":
-        if project is None or project.preview_config is None:
+        if project is None or (
+            project.preview_config is None and preview_config_override is None
+        ):
             raise TestHarnessExecutionContextError(
                 "Project has no confirmed Preview configuration"
             )
         try:
             from backend.services.workspace_review import (
                 _task_workspace,
-                validate_preview_config,
+                resolve_preview_config,
             )
 
             workspace = _task_workspace(task, project)
-            preview_config = validate_preview_config(
-                project.preview_config,
-                workspace,
+            profile_id = (
+                target.get("preview_profile_id")
+                if isinstance(target, dict)
+                else None
             )
+            resolved_profiles = resolve_preview_config(
+                (
+                    preview_config_override
+                    if preview_config_override is not None
+                    else project.preview_config
+                ),
+                workspace,
+                profile_ids=[profile_id] if profile_id else None,
+            )
+            if len(resolved_profiles) != 1:
+                raise TestHarnessExecutionContextError(
+                    "Current-workspace Harness requires exactly one Preview profile"
+                )
+            selected = dict(resolved_profiles[0])
+            selected_profile_id = selected.pop("id")
+            for metadata_key in ("match_paths", "enabled", "selection_reason"):
+                selected.pop(metadata_key, None)
+            preview_config = selected
         except Exception as exc:
             raise TestHarnessExecutionContextError(str(exc)) from exc
         context.update(
             {
                 "workspace_path": str(workspace),
                 "preview_config": _json_copy(preview_config),
+                "preview_profile_id": selected_profile_id,
             }
         )
     elif target_kind in {"pull_request", "git_ref"}:

@@ -3440,7 +3440,7 @@ async def get_chat_history(
         task.last_accessed_at = _dt.utcnow()
         await db.commit()
 
-    allowed = ["user_message", "message", "result", "tool_use", "tool_result", "system_init", "system_event", "thinking", "process_exit"]
+    allowed = ["user_message", "message", "result", "tool_use", "tool_result", "system_init", "system_event", "thinking", "process_exit", "background_lifecycle"]
     # Noisy telemetry must be excluded in SQL, before LIMIT applies. Filtering
     # after the query made pages come back short (< limit), which the client
     # reads as "history exhausted" — older messages became unreachable.
@@ -3570,6 +3570,7 @@ async def get_chat_history(
         turn_id = row.native_turn_id
         native_item_type = None
         native_item_status = None
+        background_lifecycle = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
@@ -3612,6 +3613,15 @@ async def get_chat_history(
                         raw_content = raw["raw_content"]
                     if isinstance(raw.get("applied_plans"), list):
                         applied_plans = raw["applied_plans"]
+                    if raw.get("type") == "background.lifecycle":
+                        background_lifecycle = {
+                            "state": raw.get("state"),
+                            "reason": raw.get("reason"),
+                            "active_count": raw.get("active_count"),
+                            "active_thread_ids": raw.get("active_thread_ids"),
+                            "started_at": raw.get("started_at"),
+                            "last_activity_at": raw.get("last_activity_at"),
+                        }
             except (json.JSONDecodeError, TypeError):
                 pass
         if applied_plans is None:
@@ -3654,6 +3664,7 @@ async def get_chat_history(
             "turn_id": turn_id,
             "native_item_type": native_item_type,
             "native_item_status": native_item_status,
+            "background_lifecycle": background_lifecycle,
         })
 
     # Trim back to requested limit (we over-fetched to compensate for

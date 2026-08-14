@@ -12,6 +12,7 @@ vi.mock('../../api/client', () => ({
   ),
   api: {
     getTaskChatHistory: vi.fn().mockResolvedValue([]),
+    getTask: vi.fn(),
     sendTaskChat: vi.fn().mockResolvedValue({}),
     startFrontendReviewGoal: vi.fn().mockResolvedValue({
       status: 'pending',
@@ -328,6 +329,13 @@ describe('ChatView', () => {
     localStorage.clear();
     vi.clearAllMocks();
     (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValue([]);
+    (api.getTask as ReturnType<typeof vi.fn>).mockReset();
+    (api.getTask as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 'executing',
+      background_active: false,
+      retry_count: 0,
+      turn_generation: 0,
+    } as Task);
     (api.getAskUserPending as ReturnType<typeof vi.fn>).mockResolvedValue({ pending: [] });
     (api.listForkAnchors as ReturnType<typeof vi.fn>).mockResolvedValue([]);
     (api.listPlans as ReturnType<typeof vi.fn>).mockResolvedValue([]);
@@ -1583,6 +1591,100 @@ describe('ChatView', () => {
       });
       expect(screen.queryByText(/Goal Agent 第/)).not.toBeInTheDocument();
       expect(screen.queryByText(/is thinking/)).not.toBeInTheDocument();
+    });
+
+    it('reconciles a terminal task when process_exit arrives without status_change', async () => {
+      const task = makeTask({
+        id: 413,
+        status: 'executing',
+        retry_count: 2,
+        turn_generation: 11,
+      });
+      vi.mocked(api.getTask).mockImplementation(async (taskId) => (
+        taskId === 413
+          ? { ...task, status: 'completed', background_active: false }
+          : { ...task, id: taskId, status: 'executing' }
+      ));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:413',
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_retry_count: 2,
+            task_turn_generation: 11,
+          },
+        });
+      });
+
+      await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(413), {
+        timeout: 1500,
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+      expect(onTaskUpdated).toHaveBeenCalledWith(expect.objectContaining({
+        id: 413,
+        status: 'completed',
+      }));
+    });
+
+    it('does not apply process_exit reconciliation from an older generation', async () => {
+      const task = makeTask({
+        id: 414,
+        status: 'executing',
+        retry_count: 2,
+        turn_generation: 11,
+      });
+      vi.mocked(api.getTask).mockImplementation(async (taskId) => (
+        taskId === 414
+          ? {
+              ...task,
+              status: 'completed',
+              turn_generation: 12,
+              background_active: false,
+            }
+          : { ...task, id: taskId, status: 'executing' }
+      ));
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:414',
+          data: {
+            event_type: 'process_exit',
+            exit_code: 0,
+            task_retry_count: 2,
+            task_turn_generation: 11,
+          },
+        });
+      });
+
+      await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(414), {
+        timeout: 1500,
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('正在确认任务状态...')).not.toBeInTheDocument();
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      expect(onTaskUpdated).not.toHaveBeenCalled();
     });
 
     it('Task 运行时显示但禁用循环审查按钮', () => {
@@ -3521,6 +3623,120 @@ describe('Codex app-server 增量消息', () => {
       await new Promise((resolve) => setTimeout(resolve, 650));
     });
     expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
+  });
+
+  it('replaces the thinking spinner with a retained Codex background lifecycle', async () => {
+    const task = makeTask({
+      id: 203,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 1,
+      turn_generation: 7,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+    act(() => {
+      capturedOnMessage!({
+        channel: 'task:203',
+        data: {
+          id: 9001,
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 2,
+          background_active_thread_ids: ['child-a', 'child-b'],
+          background_started_at: new Date().toISOString(),
+          background_last_activity_at: new Date().toISOString(),
+          task_retry_count: 1,
+          task_turn_generation: 7,
+        },
+      });
+    });
+
+    expect(screen.getByText('主回复已完成，后台仍在运行')).toBeInTheDocument();
+    expect(screen.getByText(/正在等待2 个子 Agent/)).toBeInTheDocument();
+    expect(screen.queryByText('Codex is thinking...')).not.toBeInTheDocument();
+  });
+
+  it('labels a retained background lifecycle stalled after 30 silent minutes', async () => {
+    const task = makeTask({
+      id: 204,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 0,
+      turn_generation: 3,
+    });
+    const oldActivity = new Date(Date.now() - 31 * 60_000).toISOString();
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 9002,
+      role: 'system',
+      event_type: 'background_lifecycle',
+      content: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      loop_iteration: null,
+      timestamp: oldActivity,
+      image_urls: null,
+      attachments: null,
+      task_retry_count: 0,
+      task_turn_generation: 3,
+      background_lifecycle: {
+        state: 'running',
+        reason: 'waiting_for_native_goal',
+        active_count: 0,
+        active_thread_ids: [],
+        started_at: oldActivity,
+        last_activity_at: oldActivity,
+      },
+    }]);
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('后台任务可能停滞')).toBeInTheDocument();
+    expect(screen.getByText(/正在等待原生 Goal/)).toBeInTheDocument();
+  });
+
+  it('ignores a retained background lifecycle from an older task turn', async () => {
+    const task = makeTask({
+      id: 205,
+      provider: 'codex',
+      status: 'executing',
+      retry_count: 2,
+      turn_generation: 9,
+    });
+    const now = new Date().toISOString();
+    (api.getTaskChatHistory as ReturnType<typeof vi.fn>).mockResolvedValueOnce([{
+      id: 9003,
+      role: 'system',
+      event_type: 'background_lifecycle',
+      content: null,
+      tool_name: null,
+      tool_input: null,
+      tool_output: null,
+      is_error: false,
+      loop_iteration: null,
+      timestamp: now,
+      image_urls: null,
+      attachments: null,
+      task_retry_count: 1,
+      task_turn_generation: 8,
+      background_lifecycle: {
+        state: 'running',
+        reason: 'waiting_for_descendants',
+        active_count: 1,
+        active_thread_ids: ['old-child'],
+        started_at: now,
+        last_activity_at: now,
+      },
+    }]);
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(await screen.findByText('Codex is thinking...')).toBeInTheDocument();
+    expect(screen.queryByText('主回复已完成，后台仍在运行')).not.toBeInTheDocument();
   });
 
   it('drops old exact status, background, and context events after observing a newer turn', async () => {

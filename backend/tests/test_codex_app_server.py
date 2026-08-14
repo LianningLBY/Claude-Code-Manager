@@ -8269,6 +8269,12 @@ async def test_active_native_goal_keeps_process_across_continuation_turns():
     rows = []
     while line := await process.stdout.readline():
         rows.append(json.loads(line))
+    lifecycle_rows = [
+        row for row in rows if row.get("type") == "background.lifecycle"
+    ]
+    assert lifecycle_rows[0]["state"] == "running"
+    assert lifecycle_rows[-1]["state"] == "completed"
+    assert lifecycle_rows[0]["reason"] == "waiting_for_native_goal"
     assert any(
         row.get("delta") == "continuation output is visible"
         for row in rows
@@ -9078,6 +9084,8 @@ async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
     assert [line["type"] for line in lines] == [
         "item.started",
         "item.completed",
+        "background.lifecycle",
+        "background.lifecycle",
         "turn.completed",
     ]
     assert lines[0]["item"] == {
@@ -9093,7 +9101,10 @@ async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
     }
     assert lines[1]["item"]["type"] == "collab_agent_tool_call"
     assert lines[1]["item"]["status"] == "completed"
-    assert lines[2]["type"] == "turn.completed"
+    assert lines[2]["state"] == "running"
+    assert lines[2]["active_thread_ids"] == ["child-1"]
+    assert lines[3]["state"] == "completed"
+    assert lines[4]["type"] == "turn.completed"
     assert "child-1" not in server._contexts_by_descendant
 
 
@@ -9145,6 +9156,19 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
     assert process.returncode is None
     assert server.has_active_thread("thread-parent") is True
 
+    lifecycle = json.loads(await process.stdout.readline())
+    assert lifecycle == {
+        "type": "background.lifecycle",
+        "state": "running",
+        "reason": "waiting_for_descendants",
+        "active_count": 1,
+        "active_thread_ids": ["thread-child"],
+        "started_at": lifecycle["started_at"],
+        "last_activity_at": lifecycle["last_activity_at"],
+    }
+    assert lifecycle["started_at"].endswith("+00:00")
+    assert lifecycle["last_activity_at"].endswith("+00:00")
+
     # The context remains attached after native parent completion, so a
     # notification already in the transport queue is delivered before EOF.
     server._handle_notification("item/agentMessage/delta", {
@@ -9164,9 +9188,11 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
         lines.append(json.loads(line))
     assert [line["type"] for line in lines] == [
         "item.agent_message.delta",
+        "background.lifecycle",
         "turn.completed",
     ]
     assert lines[0]["delta"] == "late but valid"
+    assert lines[1]["state"] == "completed"
     assert server._contexts_by_descendant == {}
 
 
@@ -9620,9 +9646,15 @@ async def test_descendant_terminal_deadline_holds_adapter_until_proven(
     lines = []
     while line := await process.stdout.readline():
         lines.append(json.loads(line))
-    assert [line["type"] for line in lines] == ["turn.failed"]
+    assert [line["type"] for line in lines] == [
+        "background.lifecycle",
+        "background.lifecycle",
+        "turn.failed",
+    ]
+    assert lines[0]["state"] == "running"
+    assert lines[1]["state"] == "completed"
     assert "could not prove all native sub-agents terminal" in (
-        lines[0]["error"]["message"]
+        lines[2]["error"]["message"]
     )
 
 

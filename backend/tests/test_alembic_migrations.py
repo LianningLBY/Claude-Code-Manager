@@ -110,6 +110,7 @@ WORKER_DESTROY_LIFECYCLE_NONCE_REVISION = "b4e1c7d9f203"
 WORKER_RENAME_TAG_OUTBOX_REVISION = "c4a8e2f6b190"
 PR_MONITOR_TASK_TOMBSTONE_REVISION = "e2a4c6f8b1d3"
 DELIVERY_PR_MONITOR_MERGE_REVISION = "f4c7a9d2e610"
+INSTANCE_PROCESS_IDENTITY_REVISION = "a56a13b7f287"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -120,7 +121,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = DELIVERY_PR_MONITOR_MERGE_REVISION
+CURRENT_HEAD_REVISION = INSTANCE_PROCESS_IDENTITY_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -3508,6 +3509,23 @@ class TestLegacyMigration:
         assert "attention_tag" in task_cols
         assert "delivery_run_id" in task_cols
         assert "delivery_role" in task_cols
+
+        instance_cols = _get_table_columns(engine, "instances")
+        assert instance_cols["process_identity"] == "VARCHAR(128)"
+        instance_checks = {
+            item["name"]
+            for item in inspect(engine).get_check_constraints("instances")
+        }
+        assert "ck_instances_process_identity_requires_pid" in instance_checks
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO instances (name, pid, process_identity) "
+                        "VALUES ('invalid-identity', NULL, 'v1:123:456:"
+                        "11111111-1111-4111-8111-111111111111')"
+                    )
+                )
         assert "turn_generation" in task_cols
         assert "capability_policy" in task_cols
 
@@ -8160,6 +8178,42 @@ class TestFreshMigration:
 
         engine.dispose()
 
+    def test_instance_process_identity_revision_roundtrips(self, tmp_path):
+        """The new Instance identity column owns a reversible linear step."""
+
+        db_path = str(tmp_path / "instance-process-identity-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, DELIVERY_FRONTEND_REVIEW_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "process_identity" not in _get_table_columns(engine, "instances")
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert (
+            _get_table_columns(engine, "instances")["process_identity"]
+            == "VARCHAR(128)"
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, DELIVERY_FRONTEND_REVIEW_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "process_identity" not in _get_table_columns(engine, "instances")
+        with engine.connect() as conn:
+            assert (
+                conn.execute(
+                    text("SELECT version_num FROM alembic_version")
+                ).scalar_one()
+                == DELIVERY_FRONTEND_REVIEW_REVISION
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "process_identity" in _get_table_columns(engine, "instances")
+        engine.dispose()
+
     def test_fresh_db_downgrade_and_upgrade(self, tmp_path):
         """Migrations are reversible: upgrade → downgrade → upgrade."""
         db_path = str(tmp_path / "roundtrip.db")
@@ -10525,6 +10579,18 @@ class TestPublishedMigrationHistory:
                 REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION
             ).down_revision
             == DELIVERY_FRONTEND_REVIEW_REVISION
+        )
+        assert (
+            script.get_revision(
+                INSTANCE_PROCESS_IDENTITY_REVISION
+            ).down_revision
+            == DELIVERY_PR_MONITOR_MERGE_REVISION
+        )
+        assert (
+            script.get_revision(
+                DELIVERY_PR_MONITOR_MERGE_REVISION
+            ).down_revision
+            == PR_MONITOR_TASK_TOMBSTONE_REVISION
         )
         assert (
             script.get_revision(DELIVERY_FRONTEND_REVIEW_REVISION).down_revision

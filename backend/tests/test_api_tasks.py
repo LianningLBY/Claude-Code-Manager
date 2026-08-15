@@ -3785,7 +3785,7 @@ async def test_retry_rejects_orphan_pid_that_may_be_alive(
         await db.commit()
         task_id, instance_id = task.id, instance.id
 
-    with patch("backend.api.tasks.os.kill", return_value=None):
+    with patch("backend.services.process_identity.os.kill", return_value=None):
         response = await client.post(f"/api/tasks/{task_id}/retry")
 
     assert response.status_code == 409
@@ -3797,6 +3797,114 @@ async def test_retry_rejects_orphan_pid_that_may_be_alive(
         assert task.instance_id == instance_id
         assert instance.pid == 43210
         assert instance.current_task_id == task_id
+
+
+@pytest.mark.asyncio
+async def test_retry_allows_task_whose_pid_is_from_a_previous_boot(
+    client, session_factory,
+):
+    """The reported dead end: retry must not be blocked by a reused PID.
+
+    Reproduces screenshot #1004. The recorded boot id differs from the current
+    one, which proves the owning generation died with the previous boot even
+    though an unrelated process now answers to that PID number.
+    """
+    import os as _os
+
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+    from backend.services.process_identity import (
+        ProcessIdentity,
+        encode_process_identity,
+    )
+
+    live_pid = _os.getpid()
+    async with session_factory() as db:
+        task = Task(
+            title="orphan-previous-boot",
+            description="d",
+            status="failed",
+            error_message=(
+                f"Unmanaged process PID {live_pid} may still be running after "
+                "manager restart; automatic retry was blocked to prevent "
+                "duplicate execution"
+            ),
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="orphan-previous-boot-slot",
+            status="error",
+            pid=live_pid,
+            process_identity=encode_process_identity(
+                ProcessIdentity(
+                    pid=live_pid,
+                    start_ticks=999,
+                    boot_id="22222222-2222-4222-8222-222222222222",
+                )
+            ),
+            current_task_id=task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+    response = await client.post(f"/api/tasks/{task_id}/retry")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        assert task.status == "pending"
+        assert task.instance_id is None
+        # The freed slot must stop consuming instance capacity.
+        assert instance.pid is None
+        assert instance.process_identity is None
+        assert instance.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_retry_rejects_orphan_with_exactly_matching_live_identity(
+    client, session_factory,
+):
+    """The safety property: a provably live generation still blocks retry."""
+    import os as _os
+
+    from backend.models.instance import Instance
+    from backend.models.task import Task
+    from backend.services import process_identity as pi
+    from backend.services.process_identity import encode_process_identity
+
+    live_pid = _os.getpid()
+    async with session_factory() as db:
+        task = Task(title="orphan-live-identity", description="d", status="failed")
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="orphan-live-identity-slot",
+            status="error",
+            pid=live_pid,
+            process_identity=encode_process_identity(
+                pi.read_process_identity(live_pid)
+            ),
+            current_task_id=task.id,
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+    response = await client.post(f"/api/tasks/{task_id}/retry")
+
+    assert response.status_code == 409
+    assert "still alive" in response.json()["detail"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert (await db.get(Instance, instance_id)).pid == live_pid
 
 
 @pytest.mark.asyncio
@@ -3828,7 +3936,7 @@ async def test_retry_reconciles_dead_orphan_before_releasing_task(
         task_id, instance_id = task.id, instance.id
 
     with patch(
-        "backend.api.tasks.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         response = await client.post(f"/api/tasks/{task_id}/retry")
@@ -3942,7 +4050,7 @@ async def test_retry_checks_reverse_owner_when_task_side_owner_is_null(
         task_id = task.id
         instance_id = instance.id
 
-    with patch("backend.api.tasks.os.kill", return_value=None):
+    with patch("backend.services.process_identity.os.kill", return_value=None):
         response = await client.post(f"/api/tasks/{task_id}/retry")
 
     assert response.status_code == 409

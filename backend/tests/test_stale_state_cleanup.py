@@ -1787,7 +1787,7 @@ async def test_cleanup_fails_multi_owner_corruption_without_replay(db_factory):
         owner_ids = [owner.id for owner in owners]
 
     with patch(
-        "backend.services.dispatcher.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         await d._cleanup_stale_state()
@@ -1856,7 +1856,7 @@ async def test_cleanup_requeues_unique_consistent_dead_owner(db_factory):
         task_id, owner_id = task.id, owner.id
 
     with patch(
-        "backend.services.dispatcher.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         await d._cleanup_stale_state()
@@ -1899,7 +1899,7 @@ async def test_cleanup_fails_single_mismatched_reverse_owner(
         task_id = task.id
 
     with patch(
-        "backend.services.dispatcher.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         await d._cleanup_stale_state()
@@ -1943,7 +1943,7 @@ async def test_cleanup_preserves_live_owner_while_removing_dead_duplicate(
 
     d.instance_manager.processes[live_id] = MagicMock(returncode=None)
     with patch(
-        "backend.services.dispatcher.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         await d._cleanup_stale_state()
@@ -2094,7 +2094,7 @@ async def test_cleanup_acquires_task_write_before_instance_write(db_factory):
 
     with (
         patch(
-            "backend.services.dispatcher.os.kill",
+            "backend.services.process_identity.os.kill",
             side_effect=ProcessLookupError,
         ),
         patch.object(AsyncSession, "execute", new=record_writes),
@@ -3261,3 +3261,319 @@ async def test_cleanup_multiple_stale_entities(db_factory):
         assert (await db.get(Task, ids["task1"])).status == "pending"
         assert (await db.get(Task, ids["task2"])).status == "pending"
         assert (await db.get(Task, ids["task3"])).status == "pending"
+
+
+# ---------------------------------------------------------------------------
+# PID reuse / host restart recovery
+#
+# A bare os.kill(pid, 0) probe cannot distinguish "this exact generation is
+# still running" from "an unrelated process inherited this PID number". When it
+# guessed wrong the Task was fail-closed as failed forever and its Instance row
+# kept occupying a max_concurrent_instances slot, with no UI path out.
+# ---------------------------------------------------------------------------
+
+_OTHER_BOOT_ID = "11111111-1111-4111-8111-111111111111"
+
+
+def _encoded_identity(pid, start_ticks, boot_id):
+    from backend.services.process_identity import (
+        ProcessIdentity,
+        encode_process_identity,
+    )
+
+    return encode_process_identity(
+        ProcessIdentity(pid=pid, start_ticks=start_ticks, boot_id=boot_id)
+    )
+
+
+async def _add_unstarted_turn_source(
+    db,
+    task,
+    *,
+    generation=1,
+    actual_transport=None,
+):
+    """Attach proof that this turn never reached a provider boundary.
+
+    Without it the replay guard fail-closes for its own reason, which would
+    mask whether the PID identity probe reached the right verdict.
+    """
+    source = LogEntry(
+        task_id=task.id,
+        task_retry_count=task.retry_count or 0,
+        task_turn_generation=generation,
+        turn_scope="source",
+        event_type="turn_source",
+        role="system",
+        content=None,
+        raw_json=json.dumps(
+            {"original_source_log_id": None, "transport": None}
+        ),
+        actual_transport=actual_transport,
+        is_error=False,
+    )
+    db.add(source)
+    await db.flush()
+    task.turn_generation = generation
+    task.turn_source_log_id = source.id
+    return source
+
+
+@pytest.mark.asyncio
+async def test_cleanup_requeues_pid_recorded_in_a_previous_boot(db_factory):
+    """A PID from an earlier boot is provably dead even if the number answers.
+
+    This is the reported failure: after a host restart an unrelated process
+    answered PID 590565, so the owning task was permanently failed.
+    """
+    d = _make_dispatcher(db_factory)
+    live_pid = os.getpid()
+
+    async with db_factory() as db:
+        task = Task(title="previous boot owner", status="executing", retry_count=0)
+        db.add(task)
+        await db.flush()
+        await _add_unstarted_turn_source(db, task)
+        owner = Instance(
+            name="previous-boot-owner",
+            status="running",
+            pid=live_pid,
+            current_task_id=task.id,
+            process_identity=_encoded_identity(live_pid, 4242, _OTHER_BOOT_ID),
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        task_id, owner_id = task.id, owner.id
+
+    # No os.kill patch: the boot id alone proves death, and the live PID would
+    # otherwise be misread as this generation still running.
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert task.status == "pending", task.error_message
+        assert task.instance_id is None
+        assert owner.pid is None
+        assert owner.process_identity is None
+        assert owner.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_releases_previous_boot_pid_but_keeps_transport_boundary(
+    db_factory,
+):
+    """PID recovery must not weaken the independent provider-effect fence."""
+
+    d = _make_dispatcher(db_factory)
+    live_pid = os.getpid()
+
+    async with db_factory() as db:
+        task = Task(
+            title="previous boot after provider boundary",
+            status="executing",
+            retry_count=0,
+        )
+        db.add(task)
+        await db.flush()
+        await _add_unstarted_turn_source(
+            db,
+            task,
+            actual_transport="claude_pty",
+        )
+        owner = Instance(
+            name="previous-boot-provider-owner",
+            status="running",
+            pid=live_pid,
+            current_task_id=task.id,
+            process_identity=_encoded_identity(
+                live_pid,
+                4242,
+                _OTHER_BOOT_ID,
+            ),
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        task_id, owner_id = task.id, owner.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert task.status == "failed"
+        assert "exact turn selected transport claude_pty" in task.error_message
+        assert "Unmanaged process PID" not in task.error_message
+        assert task.instance_id is None
+        assert owner.status == "error"
+        assert owner.pid is None
+        assert owner.process_identity is None
+        assert owner.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_requeues_reused_pid_with_different_start_ticks(db_factory):
+    """Same boot, same PID number, different start time: the owner is gone."""
+    d = _make_dispatcher(db_factory)
+    live_pid = os.getpid()
+
+    from backend.services import process_identity as pi
+
+    current = pi.read_process_identity(live_pid)
+
+    async with db_factory() as db:
+        task = Task(title="reused pid owner", status="executing", retry_count=0)
+        db.add(task)
+        await db.flush()
+        await _add_unstarted_turn_source(db, task)
+        owner = Instance(
+            name="reused-pid-owner",
+            status="running",
+            pid=live_pid,
+            current_task_id=task.id,
+            process_identity=_encoded_identity(
+                live_pid,
+                current.start_ticks + 9999,
+                current.boot_id,
+            ),
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        task_id, owner_id = task.id, owner.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert task.status == "pending", task.error_message
+        assert task.instance_id is None
+        assert owner.pid is None
+
+
+@pytest.mark.asyncio
+async def test_cleanup_still_fails_closed_for_exact_matching_identity(db_factory):
+    """The safety property: a genuinely live generation is never requeued."""
+    d = _make_dispatcher(db_factory)
+    live_pid = os.getpid()
+
+    from backend.services import process_identity as pi
+
+    current = pi.read_process_identity(live_pid)
+
+    async with db_factory() as db:
+        task = Task(title="live owner", status="executing")
+        db.add(task)
+        await db.flush()
+        owner = Instance(
+            name="live-owner",
+            status="running",
+            pid=live_pid,
+            current_task_id=task.id,
+            process_identity=_encoded_identity(
+                live_pid,
+                current.start_ticks,
+                current.boot_id,
+            ),
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        task_id, owner_id = task.id, owner.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert task.status == "failed"
+        assert "may still be running" in task.error_message
+        # Owner evidence must survive so an operator can reconcile it.
+        assert owner.pid == live_pid
+
+
+@pytest.mark.asyncio
+async def test_cleanup_fails_closed_when_identity_pid_does_not_match(db_factory):
+    """A stale identity written for another PID must not prove death.
+
+    The PID is embedded in the persisted value so that a write site which
+    updates the PID without refreshing identity degrades to the conservative
+    probe instead of silently authorizing duplicate execution.
+    """
+    d = _make_dispatcher(db_factory)
+    live_pid = os.getpid()
+
+    async with db_factory() as db:
+        task = Task(title="mismatched identity", status="executing")
+        db.add(task)
+        await db.flush()
+        owner = Instance(
+            name="mismatched-identity-owner",
+            status="running",
+            pid=live_pid,
+            current_task_id=task.id,
+            # Identity recorded for a *different* PID, in a dead boot.
+            process_identity=_encoded_identity(
+                live_pid + 1,
+                4242,
+                _OTHER_BOOT_ID,
+            ),
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        task_id = task.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.status == "failed"
+        assert "may still be running" in task.error_message
+
+
+@pytest.mark.asyncio
+async def test_cleanup_treats_null_pid_as_nothing_alive(db_factory):
+    """A NULL PID records no process, so there is nothing that can be alive.
+
+    The identity probe reports ``unknown`` for a missing PID because it cannot
+    prove death from an absent value. Callers must keep the original NULL check
+    ahead of it, otherwise owner-only rows that never held a process would be
+    quarantined as live evidence and pin their task forever.
+    """
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(title="owner without pid", status="executing", retry_count=0)
+        db.add(task)
+        await db.flush()
+        await _add_unstarted_turn_source(db, task)
+        owner = Instance(
+            name="pidless-owner",
+            status="error",
+            pid=None,
+            process_identity=None,
+            current_task_id=task.id,
+        )
+        db.add(owner)
+        await db.flush()
+        task.instance_id = owner.id
+        await db.commit()
+        task_id, owner_id = task.id, owner.id
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        owner = await db.get(Instance, owner_id)
+        assert task.status == "pending", task.error_message
+        assert task.instance_id is None
+        assert owner.current_task_id is None

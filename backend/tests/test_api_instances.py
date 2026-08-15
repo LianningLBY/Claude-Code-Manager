@@ -1,6 +1,7 @@
 """Tests for Instance and Dispatcher API endpoints."""
 import asyncio
 import json
+import os
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -310,7 +311,7 @@ async def test_delete_instance_reconciles_definitively_dead_pid(
         patch("backend.main.instance_manager", mock_im),
         patch("backend.main.ralph_loop", mock_rl),
         patch(
-            "backend.services.task_queue.os.kill",
+            "backend.services.process_identity.os.kill",
             side_effect=ProcessLookupError,
         ) as probe,
     ):
@@ -345,7 +346,7 @@ async def test_delete_instance_preserves_pid_that_may_be_alive(
     with (
         patch("backend.main.instance_manager", mock_im),
         patch("backend.main.ralph_loop", mock_rl),
-        patch("backend.services.task_queue.os.kill", return_value=None),
+        patch("backend.services.process_identity.os.kill", return_value=None),
     ):
         response = await client.delete(f"/api/instances/{instance_id}")
 
@@ -355,6 +356,87 @@ async def test_delete_instance_preserves_pid_that_may_be_alive(
         instance = await db.get(Instance, instance_id)
         assert instance.pid == 45672
         assert instance.current_task_id == task_id
+
+
+@pytest.mark.asyncio
+async def test_delete_instance_frees_slot_when_pid_is_from_a_previous_boot(
+    client, session_factory,
+):
+    """A reused PID number must not pin a capacity slot forever.
+
+    The recorded boot id proves the owning process died with the old boot, so
+    the row is reconciled even though the PID number still answers.
+    """
+    from backend.services.process_identity import (
+        ProcessIdentity,
+        encode_process_identity,
+    )
+
+    live_pid = os.getpid()
+    identity = encode_process_identity(
+        ProcessIdentity(
+            pid=live_pid,
+            start_ticks=4242,
+            boot_id="11111111-1111-4111-8111-111111111111",
+        )
+    )
+    async with session_factory() as db:
+        instance = Instance(
+            name="previous-boot-orphan",
+            status="error",
+            pid=live_pid,
+            process_identity=identity,
+        )
+        db.add(instance)
+        await db.commit()
+        instance_id = instance.id
+
+    mock_im = _make_mock_instance_manager(is_running_val=False)
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+    ):
+        response = await client.delete(f"/api/instances/{instance_id}")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        assert await db.get(Instance, instance_id) is None
+
+
+@pytest.mark.asyncio
+async def test_delete_instance_preserves_exactly_matching_live_identity(
+    client, session_factory,
+):
+    """The safety property: a provably live generation is still protected."""
+    from backend.services import process_identity as pi
+    from backend.services.process_identity import encode_process_identity
+
+    live_pid = os.getpid()
+    current = pi.read_process_identity(live_pid)
+    async with session_factory() as db:
+        instance = Instance(
+            name="live-identity-orphan",
+            status="error",
+            pid=live_pid,
+            process_identity=encode_process_identity(current),
+        )
+        db.add(instance)
+        await db.commit()
+        instance_id = instance.id
+
+    mock_im = _make_mock_instance_manager(is_running_val=False)
+    mock_rl = _make_mock_ralph_loop()
+    with (
+        patch("backend.main.instance_manager", mock_im),
+        patch("backend.main.ralph_loop", mock_rl),
+    ):
+        response = await client.delete(f"/api/instances/{instance_id}")
+
+    assert response.status_code == 409
+    assert "may still be alive" in response.json()["detail"]
+    async with session_factory() as db:
+        assert (await db.get(Instance, instance_id)).pid == live_pid
 
 
 @pytest.mark.asyncio
@@ -547,7 +629,7 @@ async def test_cleanup_refuses_terminal_row_with_dirty_owner_metadata(
         patch("backend.main.instance_manager", mock_im),
         patch("backend.main.ralph_loop", mock_rl),
         patch("backend.main.dispatcher", mock_dispatcher),
-        patch("backend.services.task_queue.os.kill", return_value=None) as probe,
+        patch("backend.services.process_identity.os.kill", return_value=None) as probe,
     ):
         response = await client.delete("/api/instances/cleanup")
 
@@ -588,7 +670,7 @@ async def test_cleanup_reconciles_dead_terminal_pid(
         patch("backend.main.ralph_loop", mock_rl),
         patch("backend.main.dispatcher", mock_dispatcher),
         patch(
-            "backend.services.task_queue.os.kill",
+            "backend.services.process_identity.os.kill",
             side_effect=ProcessLookupError,
         ) as probe,
     ):

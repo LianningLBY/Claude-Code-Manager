@@ -38,6 +38,10 @@ from backend.services.cancellation import (
     finish_awaitable,
 )
 from backend.services.codex_models import clamp_codex_effort
+from backend.services.process_identity import (
+    capture_process_identity,
+    persisted_process_is_definitively_dead,
+)
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.task_queue import task_retry_not_superseded_predicate
@@ -5419,6 +5423,7 @@ class InstanceManager:
                     .where(*instance_identity)
                     .values(
                         pid=process.pid,
+                        process_identity=capture_process_identity(process.pid),
                         status="running",
                         current_task_id=task_id,
                         provider=provider,
@@ -5556,6 +5561,7 @@ class InstanceManager:
                                 .values(
                                     status="idle",
                                     pid=None,
+                                    process_identity=None,
                                     current_task_id=None,
                                 )
                             )
@@ -5566,6 +5572,9 @@ class InstanceManager:
                                 .values(
                                     status="error",
                                     pid=getattr(process, "pid", None),
+                                    process_identity=capture_process_identity(
+                                        getattr(process, "pid", None)
+                                    ),
                                     current_task_id=task_id,
                                 )
                             )
@@ -6938,6 +6947,7 @@ class InstanceManager:
                     .where(*instance_identity)
                     .values(
                         pid=pid,
+                        process_identity=capture_process_identity(pid),
                         status="running",
                         current_task_id=task_id,
                         provider="claude",
@@ -7147,6 +7157,7 @@ class InstanceManager:
                                 .values(
                                     status="idle",
                                     pid=None,
+                                    process_identity=None,
                                     current_task_id=None,
                                 )
                             )
@@ -7157,6 +7168,9 @@ class InstanceManager:
                                 .values(
                                     status="error",
                                     pid=(getattr(process, "pid", None) or None),
+                                    process_identity=capture_process_identity(
+                                        getattr(process, "pid", None) or None
+                                    ),
                                     current_task_id=task_id,
                                 )
                             )
@@ -9924,6 +9938,9 @@ class InstanceManager:
                 .values(
                     status="running",
                     pid=(getattr(process, "pid", 0) or 0),
+                    process_identity=capture_process_identity(
+                        getattr(process, "pid", 0) or 0
+                    ),
                     current_task_id=task_id,
                     provider="claude",
                 )
@@ -10153,8 +10170,11 @@ class InstanceManager:
             task.completed_at = None
             task.error_message = None
             task.pty_background_generation = generation
+
+            pid = getattr(process, "pid", 0) or 0
             instance.status = "running"
-            instance.pid = getattr(process, "pid", 0) or 0
+            instance.pid = pid
+            instance.process_identity = capture_process_identity(pid)
             instance.current_task_id = task_id
             instance.provider = "claude"
             await db.flush()
@@ -10325,6 +10345,7 @@ class InstanceManager:
                             else "error"
                         ),
                         pid=None,
+                        process_identity=None,
                         current_task_id=None,
                     )
                 )
@@ -11010,6 +11031,7 @@ class InstanceManager:
                             .values(
                                 status=recovery_status,
                                 pid=None,
+                                process_identity=None,
                                 current_task_id=None,
                             )
                         )
@@ -11035,6 +11057,9 @@ class InstanceManager:
                             .values(
                                 status="error",
                                 pid=getattr(process, "pid", None),
+                                process_identity=capture_process_identity(
+                                    getattr(process, "pid", None)
+                                ),
                                 current_task_id=task_id,
                             )
                         )
@@ -12149,6 +12174,7 @@ class InstanceManager:
                 .values(
                     status=new_status,
                     pid=None,
+                    process_identity=None,
                     current_task_id=None,
                 )
             )
@@ -16286,6 +16312,9 @@ class InstanceManager:
                         .values(
                             status="error",
                             pid=getattr(process, "pid", None),
+                            process_identity=capture_process_identity(
+                                getattr(process, "pid", None)
+                            ),
                             current_task_id=task_id,
                         )
                     )
@@ -16677,18 +16706,16 @@ class InstanceManager:
         )
 
     @staticmethod
-    def _pid_is_definitely_gone(pid: int | None) -> bool:
-        """Return True only when the OS proves an exact PID no longer exists."""
+    def _pid_is_definitely_gone(
+        pid: int | None,
+        persisted_identity: str | None,
+    ) -> bool:
+        """Return True only when the exact persisted process is gone."""
 
-        if not isinstance(pid, int) or pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return True
-        except (PermissionError, OSError):
-            return False
-        return False
+        return persisted_process_is_definitively_dead(
+            pid,
+            persisted_identity,
+        )
 
     async def reconcile_dead_reverse_task_owner(
         self,
@@ -16757,7 +16784,36 @@ class InstanceManager:
                 ) is not None
             ):
                 return False
-            if not self._pid_is_definitely_gone(expected_pid):
+            # Snapshot the identity from the same exact reverse-owner row. The
+            # later writer predicate repeats it, so a concurrent generation
+            # cannot lend its boot/start proof to this cleanup decision.
+            async with self.db_factory() as identity_db:
+                identity_row = (
+                    await identity_db.execute(
+                        select(Instance.process_identity).where(
+                            Instance.id == instance_id,
+                            Instance.current_task_id == expected_task_id,
+                            (
+                                Instance.pid.is_(None)
+                                if expected_pid is None
+                                else Instance.pid == expected_pid
+                            ),
+                            (
+                                Instance.started_at.is_(None)
+                                if expected_started_at is None
+                                else Instance.started_at == expected_started_at
+                            ),
+                        )
+                    )
+                ).one_or_none()
+                await identity_db.rollback()
+            if identity_row is None:
+                return False
+            expected_process_identity = identity_row.process_identity
+            if not self._pid_is_definitely_gone(
+                expected_pid,
+                expected_process_identity,
+            ):
                 return False
 
             async with self.db_factory() as db:
@@ -16776,6 +16832,12 @@ class InstanceManager:
                         Instance.started_at.is_(None)
                         if expected_started_at is None
                         else Instance.started_at == expected_started_at
+                    ),
+                    (
+                        Instance.process_identity.is_(None)
+                        if expected_process_identity is None
+                        else Instance.process_identity
+                        == expected_process_identity
                     ),
                 ]
                 lease_valid_at = (
@@ -16827,10 +16889,17 @@ class InstanceManager:
                             else Instance.started_at
                             == expected_started_at
                         ),
+                        (
+                            Instance.process_identity.is_(None)
+                            if expected_process_identity is None
+                            else Instance.process_identity
+                            == expected_process_identity
+                        ),
                     )
                     .values(
                         status="idle",
                         pid=None,
+                        process_identity=None,
                         current_task_id=None,
                     )
                 )
@@ -17153,7 +17222,8 @@ class InstanceManager:
                                     is not _EXPECTED_GENERATION_UNSET
                                     and owner.pid == expected_pid
                                     and self._pid_is_definitely_gone(
-                                        expected_pid
+                                        expected_pid,
+                                        owner.process_identity,
                                     )
                                 )
                                 or self._has_reapable_pty_background_state(
@@ -18265,6 +18335,7 @@ class InstanceManager:
                         "error" if task_status == "failed" else "idle"
                     ),
                     pid=None,
+                    process_identity=None,
                     current_task_id=None,
                 )
             )

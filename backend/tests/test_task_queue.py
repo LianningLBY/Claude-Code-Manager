@@ -2731,7 +2731,7 @@ async def test_delete_task_preserves_possible_live_orphan_owner(queue):
     await queue.db.commit()
     task_id, instance_id = task.id, instance.id
 
-    with patch("backend.services.task_queue.os.kill", return_value=None):
+    with patch("backend.services.process_identity.os.kill", return_value=None):
         assert await queue.delete(task_id) is False
 
     queue.db.expire_all()
@@ -3023,7 +3023,7 @@ async def test_delete_task_preserves_orphan_when_pid_probe_is_denied(queue):
     task_id, instance_id = task.id, instance.id
 
     with patch(
-        "backend.services.task_queue.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=PermissionError("not permitted"),
     ):
         assert await queue.delete(task_id) is False
@@ -3053,7 +3053,7 @@ async def test_delete_task_detaches_definitively_dead_orphan(queue):
     task_id, instance_id = task.id, instance.id
 
     with patch(
-        "backend.services.task_queue.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         assert await queue.delete(task_id) is True

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shlex
 import signal
 import stat
 from typing import Iterable
@@ -26,6 +27,7 @@ _BRANCH_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}\Z")
 _MAX_GIT_OUTPUT = 2 * 1024 * 1024
 _MAX_GITDIR_POINTER_BYTES = 4096
 _MAX_GIT_CONFIG_BYTES = 1024 * 1024
+_CCM_GIT_CREDENTIALS_DIR = Path.home() / ".ccm-task-git-credentials"
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _SCP_GITHUB_RE = re.compile(
     r"(?:[A-Za-z0-9_.-]+@)?github\.com:"
@@ -474,6 +476,40 @@ def _unsafe_git_config_key(key: str, value: str) -> bool:
     return key.startswith("tar.") and key.endswith(".command")
 
 
+def _is_ccm_managed_ssh_command(value: str) -> bool:
+    """Accept only CCM's own private-key command from its managed key vault."""
+
+    try:
+        argv = shlex.split(value, posix=True)
+    except ValueError:
+        return False
+    if len(argv) < 3 or argv[0] != "ssh" or argv[1] != "-i":
+        return False
+    key_path = Path(argv[2])
+    if (
+        not key_path.is_absolute()
+        or key_path.parent != _CCM_GIT_CREDENTIALS_DIR
+        or key_path.is_symlink()
+        or not key_path.is_file()
+        or key_path.stat().st_uid != os.geteuid()
+        or stat.S_IMODE(key_path.stat().st_mode) & 0o077
+    ):
+        return False
+    allowed_options = {
+        "BatchMode=yes",
+        "IdentitiesOnly=yes",
+        "StrictHostKeyChecking=yes",
+        "StrictHostKeyChecking=no",
+    }
+    remainder = argv[3:]
+    if len(remainder) % 2:
+        return False
+    return all(
+        remainder[index] == "-o" and remainder[index + 1] in allowed_options
+        for index in range(0, len(remainder), 2)
+    )
+
+
 async def _read_safe_git_config(
     config_path: Path,
     *,
@@ -517,7 +553,14 @@ async def _read_safe_git_config(
             and allowed_hooks_path is not None
             and os.path.abspath(value) == str(allowed_hooks_path)
         )
-        if not canonical_default_hooks and _unsafe_git_config_key(key, value):
+        managed_ssh_command = key == "core.sshcommand" and _is_ccm_managed_ssh_command(
+            value
+        )
+        if (
+            not canonical_default_hooks
+            and not managed_ssh_command
+            and _unsafe_git_config_key(key, value)
+        ):
             category = "external Git filters" if key.startswith("filter.") else key
             raise DeliveryWorkspaceConflict(
                 f"Repository contains unsafe Git configuration: {category} ({key})"

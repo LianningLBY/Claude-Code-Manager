@@ -76,9 +76,25 @@ async def test_prepare_is_idempotent_and_adopts_exact_workspace(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_prepare_allows_safe_controller_worktree_config(tmp_path):
+async def test_prepare_allows_safe_controller_worktree_config(tmp_path, monkeypatch):
     repo, _remote = _repository(tmp_path)
     _git(repo, "config", "core.hooksPath", str(repo / ".git" / "hooks"))
+    managed_keys = tmp_path / ".ccm-task-git-credentials"
+    managed_keys.mkdir()
+    deploy_key = managed_keys / "repo-github"
+    deploy_key.write_text("test-key\n", encoding="utf-8")
+    deploy_key.chmod(0o600)
+    monkeypatch.setattr(
+        delivery_workspace,
+        "_CCM_GIT_CREDENTIALS_DIR",
+        managed_keys,
+    )
+    _git(
+        repo,
+        "config",
+        "core.sshCommand",
+        f"ssh -i {deploy_key} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes",
+    )
     worktree_config = repo / ".git" / "config.worktree"
     _git(repo, "config", "--file", str(worktree_config), "user.name", "Local User")
 
@@ -103,6 +119,28 @@ async def test_prepare_rejects_unsafe_controller_worktree_config(tmp_path):
             repo_path=str(repo),
             run_id=177,
             branch="ccm/delivery/177-unsafe-worktree-config",
+            base_branch="main",
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_ssh_key_outside_ccm_managed_vault(tmp_path):
+    repo, _remote = _repository(tmp_path)
+    outside_key = tmp_path / "outside-key"
+    outside_key.write_text("test-key\n", encoding="utf-8")
+    outside_key.chmod(0o600)
+    _git(
+        repo,
+        "config",
+        "core.sshCommand",
+        f"ssh -i {outside_key} -o IdentitiesOnly=yes",
+    )
+
+    with pytest.raises(DeliveryWorkspaceConflict, match="core.sshcommand"):
+        await DeliveryWorkspaceManager(allow_local_remotes=True).prepare(
+            repo_path=str(repo),
+            run_id=178,
+            branch="ccm/delivery/178-outside-key",
             base_branch="main",
         )
 

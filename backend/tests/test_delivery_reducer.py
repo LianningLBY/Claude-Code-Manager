@@ -117,6 +117,24 @@ def test_developer_no_progress_starts_a_fresh_plan_cycle():
     assert reduction.effects == ("request_plan",)
 
 
+def test_report_completion_ends_delivery_successfully():
+    state = DeliveryState(
+        phase="coding",
+        activity="running",
+        state_version=8,
+    )
+
+    reduction = _reduce(state, "report_completed")
+
+    assert reduction.state == DeliveryState(
+        phase="done",
+        activity="terminal",
+        outcome="success",
+        state_version=9,
+    )
+    assert reduction.effects == ()
+
+
 def test_frontend_review_can_be_explicitly_skipped_before_start():
     state = DeliveryState(phase="frontend_review", activity="ready")
 
@@ -283,7 +301,9 @@ def test_stale_version_is_rejected_before_transition():
         DeliveryState(phase="planning", activity="ready", state_version=True),
         DeliveryState(phase="planning", activity="ready", state_version=1.5),
         DeliveryState(phase="done", activity="terminal", outcome=None),
-        DeliveryState(phase="done", activity="terminal", outcome="success", error_code="bad"),
+        DeliveryState(
+            phase="done", activity="terminal", outcome="success", error_code="bad"
+        ),
         DeliveryState(phase="planning", activity="waiting", wait_reason=None),
         DeliveryState(phase="planning", activity="ready", wait_reason="stale"),
         DeliveryState(

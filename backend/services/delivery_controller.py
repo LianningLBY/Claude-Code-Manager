@@ -39,6 +39,7 @@ from backend.models.delivery import (
     DeliveryTurn,
 )
 from backend.models.instance import Instance
+from backend.models.log_entry import LogEntry
 from backend.models.plan import PlanVersion
 from backend.models.pr_monitor import (
     MonitoredRepo,
@@ -95,6 +96,7 @@ _TASK_TERMINAL_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "stopped", "conflict"}
 )
 _TASK_REUSABLE_STATUSES = _TASK_TERMINAL_STATUSES | {"delivery_waiting"}
+_REPORT_COMPLETE_MARKER = "DELIVERY_RESULT: REPORT_COMPLETE"
 _CAPABILITY_PENDING_STATUSES = frozenset(
     {"queued", "running", "waiting_user", "cancelling"}
 )
@@ -1651,6 +1653,10 @@ class DeliveryController:
             "uncommitted: the Delivery Controller exclusively creates the fenced "
             "commit, pushes it, and creates or updates the pull request. Do not run "
             "git commit, push, create, merge, or modify a pull request.\n\n"
+            "If the approved plan is intentionally report-only and the Requirements "
+            "are fully satisfied without repository changes, finish your final response "
+            f"with the exact standalone line `{_REPORT_COMPLETE_MARKER}`. Do not emit "
+            "that marker when implementation, fixes, tests, or repository changes remain.\n\n"
             f"Requirements:\n{context.requirements}\n\n"
             f"Approved plan:\n{plan.content}\n\n"
             f"Cycle trigger evidence (JSON):\n{trigger}"
@@ -1972,7 +1978,31 @@ class DeliveryController:
                 )
 
             progressed = snapshot.head_sha != turn.progress_signature_before
-            run.no_progress_count = 0 if progressed else run.no_progress_count + 1
+            report_completed = False
+            if not progressed:
+                final_message = await db.scalar(
+                    select(LogEntry.content)
+                    .where(
+                        LogEntry.task_id == task.id,
+                        LogEntry.task_retry_count == task.retry_count,
+                        LogEntry.task_turn_generation == turn.generation,
+                        LogEntry.event_type == "message",
+                        LogEntry.role == "assistant",
+                        LogEntry.is_error.is_(False),
+                    )
+                    .order_by(LogEntry.id.desc())
+                    .limit(1)
+                )
+                report_completed = bool(
+                    final_message
+                    and re.search(
+                        rf"(?m)^{re.escape(_REPORT_COMPLETE_MARKER)}\s*$",
+                        final_message,
+                    )
+                )
+            run.no_progress_count = (
+                0 if progressed or report_completed else run.no_progress_count + 1
+            )
             turn.status = "completed"
             turn.active_run_id = None
             turn.task_instance_id = task.instance_id
@@ -2006,7 +2036,24 @@ class DeliveryController:
                     "Delivery cycle budget was exhausted"
                 )
 
-            if failure_code is not None and failure_message is not None:
+            if report_completed:
+                complete_cycle(cycle)
+                await apply_run_event(
+                    db,
+                    run=run,
+                    event=DeliveryReducerEvent("report_completed"),
+                    actor_kind="developer",
+                    actor_id=str(task.id),
+                    metadata={
+                        "turn_id": turn.id,
+                        "head_sha": snapshot.head_sha,
+                        "head_tree_sha": snapshot.head_tree_sha,
+                        "progressed": False,
+                    },
+                )
+                task.status = "completed"
+                task.error_message = None
+            elif failure_code is not None and failure_message is not None:
                 complete_cycle(cycle, status="failed")
                 await apply_run_event(
                     db,
@@ -3124,9 +3171,7 @@ class DeliveryController:
                     await apply_run_event(
                         db,
                         run=run,
-                        event=DeliveryReducerEvent(
-                            "frontend_review_profile_passed"
-                        ),
+                        event=DeliveryReducerEvent("frontend_review_profile_passed"),
                         actor_kind="test_harness",
                         actor_id=harness_run_id,
                         metadata={
@@ -3135,9 +3180,7 @@ class DeliveryController:
                                 "preview_profile_id"
                             ],
                             "next_preview_profile_id": (
-                                cycle.frontend_review_profile_ids[
-                                    next_profile_index
-                                ]
+                                cycle.frontend_review_profile_ids[next_profile_index]
                             ),
                             "evidence_count": len(evidence),
                         },

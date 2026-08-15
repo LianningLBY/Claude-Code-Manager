@@ -19,6 +19,7 @@ from backend.models.delivery import (
     DeliveryTurn,
 )
 from backend.models.instance import Instance
+from backend.models.log_entry import LogEntry
 from backend.models.plan import Plan, PlanVersion
 from backend.models.pr_monitor import (
     MonitoredRepo,
@@ -1019,6 +1020,35 @@ async def _complete_code(db_factory, workspace, run_id, head, tree):
         await db.commit()
 
 
+async def _complete_report_only(db_factory, workspace, run_id):
+    await _complete_code(
+        db_factory,
+        workspace,
+        run_id,
+        workspace.head_sha,
+        workspace.tree_sha,
+    )
+    async with db_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        task = await db.get(Task, run.developer_task_id)
+        db.add(
+            LogEntry(
+                instance_id=task.instance_id,
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                task_turn_generation=run.turn_count,
+                event_type="message",
+                role="assistant",
+                content=(
+                    "Read-only inspection completed with findings.\n\n"
+                    "DELIVERY_RESULT: REPORT_COMPLETE"
+                ),
+                is_error=False,
+            )
+        )
+        await db.commit()
+
+
 async def _add_active_harness_run(
     db_factory,
     task_id: int,
@@ -1101,10 +1131,13 @@ async def _finish_code_with_dispatcher(
             False,
         )
     else:
-        assert await dispatcher._retry_or_fail_mode_task(
-            generation,
-            "Exit code: 1",
-        ) == "failed"
+        assert (
+            await dispatcher._retry_or_fail_mode_task(
+                generation,
+                "Exit code: 1",
+            )
+            == "failed"
+        )
     await dispatcher._reset_instance_if_stale(instance_id, generation)
 
     async with db_factory() as db:
@@ -2624,6 +2657,85 @@ async def test_developer_no_progress_replans_then_fails_at_threshold(
         assert failed.error_code == "delivery_no_progress"
         assert task.status == "failed"
     assert len(capabilities.created) == 2
+
+
+@pytest.mark.asyncio
+async def test_report_only_developer_completion_ends_successfully_without_commit(
+    db_session,
+    db_factory,
+):
+    run, _repo = await _scope(db_session, max_cycles=4, max_no_progress=2)
+    workspace = FakeWorkspace()
+    capabilities = FakeCapabilities(db_factory)
+    controller = _controller(
+        db_factory,
+        workspace,
+        capabilities,
+        FakePublisher(db_factory),
+    )
+
+    await _to_coding_pending(controller, run.id)
+    await _complete_report_only(db_factory, workspace, run.id)
+    assert await controller.reconcile_run(run.id)
+
+    async with db_factory() as db:
+        completed = await db.get(DeliveryRun, run.id)
+        cycle = await db.get(DeliveryCycle, completed.current_cycle_id)
+        task = await db.get(Task, completed.developer_task_id)
+        assert (completed.phase, completed.activity, completed.outcome) == (
+            "done",
+            "terminal",
+            "success",
+        )
+        assert completed.cycle_count == 1
+        assert completed.no_progress_count == 0
+        assert cycle.status == "completed"
+        assert task.status == "completed"
+        assert workspace.commit_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_report_marker_from_an_older_turn_does_not_complete_current_turn(
+    db_session,
+    db_factory,
+):
+    run, _repo = await _scope(db_session, max_cycles=4, max_no_progress=2)
+    workspace = FakeWorkspace()
+    controller = _controller(
+        db_factory,
+        workspace,
+        FakeCapabilities(db_factory),
+        FakePublisher(db_factory),
+    )
+
+    await _to_coding_pending(controller, run.id)
+    await _complete_code(db_factory, workspace, run.id, BASE_SHA, workspace.tree_sha)
+    async with db_factory() as db:
+        current = await db.get(DeliveryRun, run.id)
+        task = await db.get(Task, current.developer_task_id)
+        db.add(
+            LogEntry(
+                instance_id=task.instance_id,
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                task_turn_generation=current.turn_count - 1,
+                event_type="message",
+                role="assistant",
+                content="DELIVERY_RESULT: REPORT_COMPLETE",
+                is_error=False,
+            )
+        )
+        await db.commit()
+
+    assert await controller.reconcile_run(run.id)
+    async with db_factory() as db:
+        replanning = await db.get(DeliveryRun, run.id)
+        assert (replanning.phase, replanning.activity, replanning.outcome) == (
+            "planning",
+            "ready",
+            None,
+        )
+        assert replanning.no_progress_count == 1
 
 
 @pytest.mark.asyncio

@@ -257,6 +257,31 @@ async def test_mark_runtime_cleaned_is_idempotent_for_same_exact_snapshot(db_fac
 
 
 @pytest.mark.asyncio
+async def test_mark_runtime_cleaned_wins_over_concurrent_cleanup_failure(db_factory):
+    step = await _create_step(db_factory, provider="codex")
+    receipt = await _create_receipt(
+        db_factory,
+        step,
+        status="launching",
+        codex_home="/srv/codex/racing-cleanup",
+        codex_thread_id="thread-racing-cleanup",
+    )
+    exact = runtime_receipts._snapshot(receipt)
+
+    async with db_factory() as db:
+        persisted = await db.get(PlanAgentRuntimeReceipt, receipt.id)
+        assert persisted is not None
+        persisted.status = "cleanup_failed"
+        persisted.cleanup_error = "concurrent reconciliation remained uncertain"
+        persisted.cleaned_at = None
+        await db.commit()
+
+    await runtime_receipts.mark_runtime_cleaned(db_factory, exact)
+
+    assert await _receipt_status(db_factory, receipt.id) == ("cleaned", None)
+
+
+@pytest.mark.asyncio
 async def test_runtime_generation_accepts_contiguous_redundant_identities(db_factory):
     step = await _create_step(db_factory, run_id=201, generation=9)
     await _create_receipt(

@@ -806,7 +806,11 @@ async def mark_runtime_cleaned(
             )
             await db.commit()
             return
-        if receipt.status != expected.status:
+        # A concurrent reconciler may fail closed while the retained live
+        # runner is still completing the exact same cleanup. Once that runner
+        # has actually removed the process/thread, its success is authoritative
+        # as long as the durable runtime identity still matches.
+        if receipt.status not in {expected.status, "cleanup_failed"}:
             raise PlanRuntimeReceiptError(
                 f"Plan runtime receipt #{expected.id} state changed during cleanup"
             )
